@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-21
-**Scope:** 1768 tracked files (1149 `.py`, 313 `.md`, 306 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-22
+**Scope:** 1780 tracked files (1160 `.py`, 314 `.md`, 306 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -175,7 +175,7 @@ Repo entry points and standard project files.
   - `class AuthMethod`; `class CallerRole`; `class CallerContext`
 - **kestrel_sovereign/bootstrap/__init__.py** — Bootstrap module for Kestrel agent wake-up and personality discovery.
 - **kestrel_sovereign/bootstrap/service.py** — Bootstrap Service for Kestrel agent wake-up and personality discovery.
-  - `class BootstrapState`; `class BootstrapService`
+  - `class BootstrapState`; `class RestartDiscoveryResult`; `class BootstrapService`
 - **kestrel_sovereign/cli.py** — Unified Kestrel CLI for host and agent management.
   - `def cmd_list(args)`; `def cmd_create(args)`; `def cmd_shell(args)`; `def cmd_ask(args)`; `def cmd_health(args)`; `def cmd_doctor(args)`; `def cmd_storage(args)`; `def cmd_tool_log(args)`; `…`
 - **kestrel_sovereign/cli_agent_docker.py** — ``kestrel agent docker {create,chat,retire}`` CLI command — sub-PR 3.2 of epic #1050 (bash-to-Python port of ``scripts/sovereign-agent.sh``).
@@ -290,7 +290,7 @@ Repo entry points and standard project files.
   - `class TaskHandler`; `def parse_docstring_params(docstring)`; `class Feature`; `def tool(name, description, category, command_prefix)`
 - **kestrel_sovereign/features/bootstrap/__init__.py** — Bootstrap feature for agent wake-up, discovery commands, and file convention.
 - **kestrel_sovereign/features/bootstrap/feature.py** — Bootstrap Feature - Commands for agent wake-up and discovery management.
-  - `async def rename_agent_core(agent, new_name)`; `class BootstrapFeature`
+  - `class RenameOutcome`; `async def rename_agent_core(agent, new_name)`; `class BootstrapFeature`
 - **kestrel_sovereign/features/bootstrap/loader.py** — Bootstrap file loader for Kestrel agents.
   - `def truncate_content(content, max_chars)`; `class BootstrapLoader`
 - **kestrel_sovereign/features/bridge/__init__.py** — KestrelClaw Bridge Feature.
@@ -467,7 +467,7 @@ Repo entry points and standard project files.
   - `class ScheduledTask`; `class ExecutionRecord`; `class SchedulerRunner`
 - **kestrel_sovereign/features/security/__init__.py** — Kestrel Security Feature - Permission management and approval queue.
 - **kestrel_sovereign/features/security/approval_queue.py** — Kestrel Security - Queue-based Approval System.
-  - `class ApprovalStatus`; `class ApprovalRequest`; `class ApprovalQueue`
+  - `class ApprovalStatus`; `class ApprovalRequest`; `class DecisionResult`; `class ApprovalQueue`
 - **kestrel_sovereign/features/security/component.yaml** — (configuration)
 - **kestrel_sovereign/features/security/feature.py** — Kestrel Security Feature - Main feature class.
   - `def default_permission_for_feature(feature_name, fallback)`; `class SecurityFeature`
@@ -513,10 +513,14 @@ Repo entry points and standard project files.
   - `class TalonRuntimeError`; `class TalonPolicy`; `class TalonPreference`; `class TalonRuntimeRequest`; `class TalonExecution`; `class TalonInvocation`; `def normalize_backend(value)`; `def normalize_auth_lane(value)`; `…`
 - **kestrel_sovereign/features/talon/verification.py** — Test-evidence verification for the Agent/Talon review loop.
   - `class VerificationState`; `def normalize_command(command)`; `def is_allowlisted(command, allowlist)`; `class CommandExecution`; `class TestCommandResult`; `class CIStatus`; `class VerificationEvidence`; `def classify_execution(command, execution)`; `…`
+- **kestrel_sovereign/features/talon/wait_provider.py** — Waitable provider for Talon jobs (``talon:<job_id>``).
+  - `class TalonWaitable`
 - **kestrel_sovereign/features/tasks/__init__.py** — Task monitoring feature for A2A background tasks.
 - **kestrel_sovereign/features/tasks/component.yaml** — (configuration)
 - **kestrel_sovereign/features/tasks/feature.py** — Task Feature - Execute workflows and monitor background tasks.
   - `class TaskFeature`
+- **kestrel_sovereign/features/tasks/wait_provider.py** — Waitable provider for A2A background tasks (``task:<task_id>``).
+  - `class TaskWaitable`
 - **kestrel_sovereign/features/todo/__init__.py** — Active todo queue feature.
 - **kestrel_sovereign/features/todo/feature.py** — Durable active todo queue for operational work tracking.
   - `class TodoFeature`
@@ -729,6 +733,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/prompts/signals/heartbeat.md** — [HEARTBEAT] Read HEARTBEAT.md if it exists.
 - **kestrel_sovereign/prompts/signals/restart_completed.md** — [RESTART_COMPLETED] The Kestrel host you requested be restarted has come back up.
 - **kestrel_sovereign/prompts/signals/talon_job_complete.md** — [TALON_JOB_COMPLETE] Background Talon job `{payload[job_id]}` reached terminal state `{payload[status]}` (returncode `{payload[returncode]}`).
+- **kestrel_sovereign/prompts/signals/wait_complete.md** — [WAIT_COMPLETE] An async wait you were tracking has reached a terminal state.
 - **kestrel_sovereign/prompts/signals/webhook_stripe_deposit.md** — [STRIPE_DEPOSIT] An external Stripe webhook has reported a crypto deposit.
 - **kestrel_sovereign/prompts/soul_generation_prompt.md** — SOUL.md Generation Prompt — Generate a SOUL.md file for a Kestrel agent based on a discovery conversation with their Sovereign.
 - **kestrel_sovereign/prompts/system_prompt.md** — Kestrel System Prompt — You are Kestrel, a sovereign AI agent.
@@ -865,7 +870,9 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/signals/sources/system_resumed.py** — Source registration for host resume / suspend recovery (#1545).
   - `def build_system_resumed_registration()`
 - **kestrel_sovereign/signals/sources/talon.py** — Signal source for Talon background-job state transitions.
-  - `def build_talon_job_complete_registration()`; `def build_signal_for_completed_job(job_id, info)`
+  - `def build_talon_job_complete_registration()`
+- **kestrel_sovereign/signals/sources/wait.py** — Generic signal source for async-waitable terminal-state transitions.
+  - `def build_wait_complete_registration()`
 - **kestrel_sovereign/signals/sources/wallet.py** — Source registration for the Stripe crypto-onramp deposit-complete webhook (Phase 6 of #889).
   - `def build_stripe_deposit_registration()`; `def build_signal_for_deposit(session, target_agent)`
 - **kestrel_sovereign/signals/store.py** — signal_log persistence.
@@ -951,6 +958,8 @@ Repo entry points and standard project files.
   - `class AsyncRAGStore`
 - **kestrel_sovereign/storage/async_storage.py** — Async Storage - Unified async storage interface for Kestrel.
   - `def get_default_agent_data_dir()`; `class AsyncStorage`
+- **kestrel_sovereign/storage/async_wait_signal_store.py** — Durable dedup/delivery ledger for the generic wait reconciler (Wave 2 of #1860).
+  - `class WaitSignalState`; `class WaitSignalStore`
 - **kestrel_sovereign/storage/bm25_index.py** — BM25 search index for RAG fallback/boost.
   - `class BM25Result`; `class BM25Index`; `class AsyncBM25Index`; `def create_bm25_index()`; `def create_async_bm25_index()`
 - **kestrel_sovereign/storage/car_builder.py** — CAR v1 (Content Addressable aRchive) builder and reader.
@@ -1079,6 +1088,11 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/ui/__init__.py** — —
 - **kestrel_sovereign/ui/theme_loader.py** — Theme/locale label resolver for the UI theme + i18n system (epic #986).
   - `class ThemeNotFoundError`; `class ThemeBundle`; `def load_theme(theme, locale)`; `def list_available_themes()`; `def clear_cache()`
+- **kestrel_sovereign/waits/__init__.py** — Generic wait engine — one poll loop for every feature's blocking wait.
+- **kestrel_sovereign/waits/engine.py** — The generic wait poll loop and provider registry.
+  - `def parse_ref(ref)`; `async def run_wait_loop(provider, handle)`; `class WaitRegistry`
+- **kestrel_sovereign/waits/reconciler.py** — The generic wait reconciler — Wave 2 of the unified-wait epic (#1860).
+  - `class WaitReconciler`; `async def run_wait_reconcile(agent)`; `async def register_wait_watch(agent, ref)`
 
 ## `endpoints/`
 
@@ -1858,6 +1872,8 @@ Repo entry points and standard project files.
   - `def test_personal_lore_absent_from_constitution(path, phrase)`
 - **tests/test_privacy_modes.py** — Comprehensive tests for Kestrel's 5-level privacy system.
   - `class TestEphemeralSession`; `class TestPrivacyModes`; `class TestPrivacyModeTransitions`; `class TestPrivacyAgent`; `class TestPIIFiltering`; `class TestBackupIntegration`
+- **tests/test_wait_engine.py** — Tests for the generic wait engine (kestrel_sovereign.waits.engine).
+  - `class TestParseRef`; `class TestRunWaitLoop`; `class TestWaitRegistry`
 - **tests/unit/__init__.py** — —
 - **tests/unit/storage/__init__.py** — —
 - **tests/unit/storage/test_db_backends.py** — Tests for database backend abstraction layer.
@@ -1903,7 +1919,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_prefix_consolidation.py** — Regression tests for the /agent → /api/agent prefix consolidation (#871).
   - `def test_canonical_api_agent_prefix_serves_agent_routes()`; `def test_deprecated_agent_prefix_still_resolves(caplog)`; `def test_deprecation_log_dedupes_per_path_and_ua()`
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
-  - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_surfaces_route_cap_when_binding(monkeypatch)`; `def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch)`; `def test_context_status_route_cap_absent_when_no_cap(monkeypatch)`; `def test_context_status_route_cap_shown_regardless_of_model_window(monkeypatch)`; `…`
+  - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_wires_read_only_memory_retriever()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_surfaces_route_cap_when_binding(monkeypatch)`; `def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch)`; `def test_context_status_route_cap_absent_when_no_cap(monkeypatch)`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_messages_with_trailing_system_marks_last_stable_turn()`; `…`
 - **tests/unit/test_anthropic_oauth_delegation.py** — Unit tests for Claude Code credential delegation (anthropic:plan).
@@ -1951,7 +1967,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_bootstrap_model_defaults.py** — Contracts for bootstrap/example model selection defaults.
   - `def test_demo_kestrel_toml_uses_auto_selection_with_hints()`; `def test_run_docker_remote_does_not_inject_hidden_default_model()`
 - **tests/unit/test_bootstrap_service.py** — Unit tests for the Bootstrap Service.
-  - `class MockDB`; `class MockLLMService`; `def mock_db()`; `def mock_llm()`; `def temp_agent_dir(tmp_path)`; `def bootstrap_service(mock_db, mock_llm, temp_agent_dir)`; `class TestBootstrapState`; `class TestWakeUpMessage`; `…`
+  - `class MockDB`; `class FailingHistoryClearDB`; `class MockLLMService`; `def mock_db()`; `def mock_llm()`; `def temp_agent_dir(tmp_path)`; `def bootstrap_service(mock_db, mock_llm, temp_agent_dir)`; `class TestBootstrapState`; `…`
 - **tests/unit/test_brain_router.py** — Tests for LLMService GPU backend routing functionality.
   - `class FakeRemoteClient`; `async def test_switch_backend_to_remote_gpu(monkeypatch)`; `async def test_generate_uses_remote_backend(monkeypatch)`; `async def test_remote_failure_falls_back_to_cloud(monkeypatch)`
 - **tests/unit/test_bridge_feature.py** — Unit Tests for the KestrelClaw Bridge Feature (#157).
@@ -2411,6 +2427,8 @@ Repo entry points and standard project files.
   - `def test_env_int_parsing(monkeypatch)`; `async def test_compacts_and_resets_when_over_threshold()`; `async def test_no_compaction_below_threshold()`; `async def test_thread_not_reset_when_compaction_not_applied()`; `async def test_noop_when_primary_is_not_codex()`; `async def test_noop_when_session_has_no_codex_occupancy()`; `async def test_threshold_env_override(monkeypatch)`; `async def test_compact_session_real_generate_signature_and_session_tagging()`; `…`
 - **tests/unit/test_openai_thinking_channel.py** — —
   - `def test_non_streaming_split_extracts_think_tags()`; `def test_non_streaming_split_preserves_untagged_prose_as_visible()`; `def test_non_streaming_split_preserves_visible_content_with_reasoning_field()`; `def test_streaming_splitter_preserves_untagged_prose_as_visible()`; `def test_streaming_splitter_preserves_prose_after_closing_think_tag()`; `def test_streaming_splitter_buffers_split_closing_think_tag()`; `async def test_streaming_response_yields_reasoning_content_as_thinking_delta()`; `async def test_openai_compatible_adapter_uses_configured_provider_name()`
+- **tests/unit/test_orchestrator_hook_arg_rewrites.py** — —
+  - `async def test_dispatch_direct_tool_executes_with_pre_tool_use_rewrite()`; `async def test_dispatch_feature_tool_executes_with_pre_tool_use_rewrite()`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
   - `def test_no_traversal_rejects_dotdot()`; `def test_no_traversal_rejects_nul()`; `def test_no_traversal_allows_clean_paths()`; `def test_resolve_realpath_canonicalizes(tmp_path)`; `def test_resolve_realpath_follows_symlink(tmp_path)`; `def test_resolve_realpath_rejects_traversal(tmp_path)`; `def test_resolve_realpath_handles_nonexistent_leaf(tmp_path)`; `def test_resolve_realpath_expands_user()`; `…`
 - **tests/unit/test_paths.py** — Unit tests for :mod:`kestrel_sovereign.paths`.
@@ -2498,7 +2516,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_remote_gpu_mandate_gate.py** — Regression suite for #734 — remote-GPU shortcut must honor the mandate.
   - `def test_remote_first_allowed_with_no_mandate_and_no_override()`; `def test_remote_first_allowed_with_bare_model_override()`; `def test_remote_first_allowed_rejects_vendor_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_route_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_selector_without_slash()`; `def test_remote_first_allowed_rejects_mandate_with_vendor()`; `def test_remote_first_allowed_rejects_mandate_with_route()`; `def test_remote_first_allowed_with_model_only_mandate()`; `…`
 - **tests/unit/test_rename_command.py** — Unit tests for the rename command.
-  - `class MockStorage`; `class MockDB`; `class MockAgent`; `class MockNode`; `def mock_agent()`; `def temp_agent_dir(tmp_path)`; `class TestRenameValidation`; `class TestRenameExecution`; `…`
+  - `class MockStorage`; `class FailingAddNodeStorage`; `class MockDB`; `class FailingDB`; `class MockAgent`; `class MockNode`; `def mock_agent()`; `def temp_agent_dir(tmp_path)`; `…`
 - **tests/unit/test_resolve_session_id.py** — ``resolve_session_id`` is the public surface that lets the streaming endpoint echo the effective session_id back to the client.
   - `async def test_resolve_returns_explicit_value_unchanged()`; `async def test_resolve_derives_when_caller_passes_none()`; `async def test_resolve_propagates_none_when_derive_returns_none()`; `async def test_privacy_wrapper_resolve_passes_through_for_ephemeral()`; `async def test_privacy_wrapper_resolve_passes_through_for_isolated()`; `async def test_privacy_wrapper_resolve_delegates_for_normal()`
 - **tests/unit/test_respond_to_a2a_task.py** — Direct contracts for ``TaskFeature.respond_to_a2a_task``.
@@ -2624,7 +2642,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_signals_stripe_source.py** — Phase 6 of #889: Stripe deposit-complete webhook — the first UNTRUSTED COGNITION source.
   - `async def components(tmp_path)`; `def test_registration_is_untrusted_cognition_with_sanitizer()`; `def test_registration_without_sanitizer_would_be_rejected()`; `def test_sanitizer_drops_unallowlisted_fields()`; `def test_sanitizer_strips_control_characters_from_strings()`; `def test_sanitizer_caps_string_length()`; `def test_sanitizer_replaces_malformed_wallet_address_with_placeholder()`; `def test_sanitizer_normalizes_amounts()`; `…`
 - **tests/unit/test_signals_talon_source.py** — Tests for the talon.job_complete signal source (#1510).
-  - `def test_source_name_is_canonical()`; `def test_registration_shape()`; `def test_schema_requires_job_id_and_status()`; `def test_schema_rejects_non_dict()`; `def test_schema_injects_defaults_for_prompt_template_placeholders()`; `def test_builder_emits_cognition_signal_with_dedupe_key()`; `def test_builder_coerces_non_string_payload_fields()`; `def test_dedupe_key_changes_with_status_correction()`
+  - `def test_source_name_is_canonical()`; `def test_registration_shape()`; `def test_schema_requires_job_id_and_status()`; `def test_schema_rejects_non_dict()`; `def test_schema_injects_defaults_for_prompt_template_placeholders()`
 - **tests/unit/test_signals_ui_emit.py** — Phase 7 of #889: UI side-channel SSE emit for non-INTERNAL signals.
   - `async def components(tmp_path)`; `async def test_internal_signal_does_not_emit_ui_event(components)`; `async def test_user_visible_signal_emits_signal_completed(components)`; `async def test_admin_visible_signal_also_emits(components)`; `async def test_payload_carries_routing_fields(components)`; `async def test_payload_excludes_raw_artifact_and_action_result(components)`; `async def test_payload_includes_result_summary_when_source_sets_callback(components)`; `async def test_payload_result_summary_is_none_when_source_omits_callback(tmp_path)`; `…`
 - **tests/unit/test_skills_feature.py** — Unit tests for SkillsFeature and Skill serialization.
@@ -2728,7 +2746,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_talon_verification.py** — Tests for the Talon test-evidence verification layer (#1542).
   - `class TestAllowlist`; `class TestClassifyExecution`; `class TestClassifyDenial`; `class TestVerifierFlow`; `class TestEvidenceAggregation`; `class TestRealApprovalQueueProvenance`
 - **tests/unit/test_task_wait.py** — Tests for ``TaskFeature.wait`` — the generic bounded wait primitive.
-  - `class TestGenericWait`
+  - `class TestGenericWait`; `class TestUnifiedWaitTarget`; `class TestWaitModeSignal`
 - **tests/unit/test_tasks_subscribe_endpoint.py** — ``GET /api/agent/api/agent/tasks/{task_id}/subscribe`` — sender-side push ingress for the async ``send_a2a_question`` resumption design (#1444).
   - `def app_with_subscribe(monkeypatch)`; `def test_subscribe_returns_404_when_task_manager_missing(app_with_subscribe)`; `def test_subscribe_returns_404_for_unknown_task(app_with_subscribe)`; `def test_subscribe_streams_snapshot_then_terminal(app_with_subscribe)`; `def test_subscribe_forwards_keepalive_frames(app_with_subscribe)`; `def test_subscribe_response_headers_match_sse_contract(app_with_subscribe)`
 - **tests/unit/test_telemetry.py** — Tests for kestrel_sovereign.telemetry module.
@@ -2767,6 +2785,10 @@ Repo entry points and standard project files.
   - `def test_spec_rejects_non_positive_dimension()`; `def test_spec_rejects_tenant_key_not_in_required_keys()`; `def test_factory_picks_pg_for_postgresql()`; `def test_factory_falls_back_to_pure_python_for_sqlite()`; `def test_factory_falls_back_to_pure_python_for_unknown_dialect()`; `async def test_pure_python_raises_when_required_filter_missing()`; `async def test_pure_python_raises_when_filter_is_none()`; `async def test_pure_python_raises_on_wrong_size_embedding()`; `…`
 - **tests/unit/test_verify_policy.py** — verify_policy tests — Wave 1 sub-PR 4 (#916).
   - `def test_archival_import_defaults_to_legacy_allowed()`; `def test_live_identity_defaults_to_legacy_allowed_pre_wave_2()`; `def test_new_identity_issuance_defaults_to_hybrid_required()`; `def test_constitution_checkpoint_defaults_to_pq_required()`; `def test_every_context_has_a_default()`; `def test_legacy_allowed_accepts_classical_only()`; `def test_legacy_allowed_accepts_pq_only()`; `def test_legacy_allowed_accepts_hybrid()`; `…`
+- **tests/unit/test_wait_reconciler.py** — Tests for the generic wait reconciler (Wave 2 of #1860).
+  - `async def test_emits_one_signal_per_transition(tmp_path)`; `async def test_no_signal_for_pending_handles(tmp_path)`; `async def test_records_ok_as_delivered_and_locks_outcome(tmp_path)`; `async def test_coalesced_counts_as_delivered(tmp_path)`; `async def test_corrected_native_status_resignals_within_same_outcome(tmp_path)`; `async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(tmp_path)`; `async def test_hard_fail_locks_signaled(tmp_path)`; `async def test_dispatcher_raises_records_soft_failure(tmp_path)`; `…`
+- **tests/unit/test_wait_signal_store.py** — CRUD tests for ``WaitSignalStore`` (Wave 2 of #1860).
+  - `async def test_get_missing_returns_none(tmp_path)`; `async def test_record_pending_then_get(tmp_path)`; `async def test_record_pending_preserves_signaled_outcome(tmp_path)`; `async def test_record_delivery_locks_outcome_and_clears_pending(tmp_path)`; `async def test_record_delivery_soft_fail_does_not_lock_outcome(tmp_path)`; `async def test_list_pending_filters_to_unharvested(tmp_path)`; `async def test_clear_pending_nulls_only_pending_fields(tmp_path)`; `async def test_start_watch_creates_row(tmp_path)`; `…`
 - **tests/unit/test_web_search_feature.py** — Unit tests for WebSearchFeature and WebSearchTool.
   - `class TestWebSearchTool`; `class TestWebSearchFeature`; `class TestWebSearchIntegration`
 - **tests/unit/test_webhooks_feature.py** — Unit tests for the generic Webhook Receiver feature (#156).
