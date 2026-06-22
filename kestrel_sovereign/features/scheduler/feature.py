@@ -37,6 +37,8 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     restart_coordinator   -- execute pending restart requests (#1512)
     github_pr_watch       -- poll a GitHub PR/issue, wake on relevant
                              state/comment/check/merge changes (#1618)
+    bootstrap_timeout_check -- flag agents left bootstrap_state=pending
+                              past the timeout (#378)
 
 Any loaded feature tool can also be scheduled by its tool name.
 
@@ -138,6 +140,7 @@ class SchedulerFeature(Feature):
                     "github_pr_watch": self._run_github_pr_watch,
                     "sleep": self._handle_sleep,
                     "wait_reconcile": self._run_wait_reconcile,
+                    "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
                 },
             )
             for reg in cron_registrations:
@@ -787,6 +790,25 @@ class SchedulerFeature(Feature):
 
         result = await run_wait_reconcile(self.agent)
         return json.dumps(result.data or {}, default=str)
+
+    async def _run_bootstrap_timeout_check(self, args: dict) -> str:
+        """Built-in handler for the optional bootstrap timeout watchdog."""
+        from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending
+
+        threshold_seconds = int(args.get("threshold_seconds") or 3600)
+        stale = await warn_stale_bootstrap_pending(
+            self.agent,
+            threshold_seconds=threshold_seconds,
+            context="scheduler",
+        )
+        return json.dumps(
+            stale or {
+                "is_stale": False,
+                "status": "ok",
+                "threshold_seconds": threshold_seconds,
+            },
+            default=str,
+        )
 
     # ------------------------------------------------------------------
     # github_pr_watch (#1618)

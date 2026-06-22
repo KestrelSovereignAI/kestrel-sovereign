@@ -327,6 +327,64 @@ async def check_context_budget(agent) -> Dict[str, Any]:
         }
 
 
+async def check_bootstrap_state(agent, threshold_seconds: int = 3600) -> Dict[str, Any]:
+    """Check whether first-contact bootstrap is stuck in PENDING."""
+    start = time.monotonic()
+
+    bootstrap_service = getattr(agent, "bootstrap_service", None)
+    if bootstrap_service is None:
+        return {
+            "name": "bootstrap_state",
+            "status": "pass",
+            "message": "Bootstrap service not configured",
+            "duration_ms": _elapsed(start),
+        }
+
+    storage = getattr(agent, "storage", None)
+    agent_node = None
+    if storage is not None:
+        try:
+            agent_node = await storage.get_node(getattr(agent, "agent_id", None))
+        except Exception as exc:
+            logger.debug("Bootstrap health check could not load agent node: %s", exc)
+
+    try:
+        stale = await bootstrap_service.check_pending_timeout(
+            agent_node=agent_node,
+            storage=storage,
+            threshold_seconds=threshold_seconds,
+            mark_stale=False,
+        )
+    except Exception as exc:
+        return {
+            "name": "bootstrap_state",
+            "status": "warn",
+            "message": f"Bootstrap state check failed: {exc}",
+            "duration_ms": _elapsed(start),
+        }
+
+    if stale.is_stale:
+        age_minutes = (stale.age_seconds or 0) / 60.0
+        return {
+            "name": "bootstrap_state",
+            "status": "warn",
+            "message": (
+                "bootstrap_state is pending for "
+                f"{age_minutes:.1f} minutes; status=stale_bootstrap"
+            ),
+            "duration_ms": _elapsed(start),
+            "details": stale.to_dict(),
+        }
+
+    return {
+        "name": "bootstrap_state",
+        "status": "pass",
+        "message": f"Bootstrap state OK: {stale.state.value}",
+        "duration_ms": _elapsed(start),
+        "details": stale.to_dict(),
+    }
+
+
 def _elapsed(start: float) -> float:
     """Return elapsed time in milliseconds since start."""
     return round((time.monotonic() - start) * 1000, 2)

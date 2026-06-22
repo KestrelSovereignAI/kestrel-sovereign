@@ -120,6 +120,10 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # SchedulerFeature._run_github_pr_watch. Per-watch config (repo, pr,
     # triggers, notify) travels in the scheduled task's args_json.
     ("github_pr_watch", SignalMode.ACTION, frozenset()),
+    # Bootstrap watchdog (#378). ACTION — no LLM cost. Checks whether a
+    # never-contacted agent is still bootstrap_state=pending past the timeout
+    # and escalates status to stale_bootstrap.
+    ("bootstrap_timeout_check", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
 ]
 
 
