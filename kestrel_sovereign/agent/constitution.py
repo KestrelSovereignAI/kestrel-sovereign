@@ -5,7 +5,7 @@ import json
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 from datetime import datetime, timezone
 
 from kestrel_sovereign.storage import GraphNode
@@ -729,14 +729,128 @@ class ConstitutionMixin:
         logging.warning(f"EXITING SAFE MODE. Authorization: {authorization or 'none provided'}")
         return "Safe mode deactivated. Please verify system integrity."
 
-    def _trusted_sovereign_did_document(self) -> Optional[dict]:
-        """Return the trusted genesis/root DID document for amendment checks."""
-        identity = getattr(self, "identity", None)
-        if identity is not None:
-            did_doc = getattr(identity, "legacy_did_document", None)
-            if did_doc:
+    def _trusted_sovereign_did_document(
+        self,
+        agent_node: Optional[GraphNode] = None,
+    ) -> Optional[dict]:
+        """Return the trusted Sovereign root DID document for amendments.
+
+        The amendment signer must be an authority outside the running agent's
+        own signing identity. Never fall back to ``self.identity``: the agent
+        holds that private key and accepting it would make reanchor
+        self-authorizing.
+        """
+        self_dids = self._agent_signing_dids()
+
+        for did_doc in self._configured_sovereign_root_did_documents(agent_node):
+            if self._is_external_sovereign_doc(did_doc, self_dids):
                 return dict(did_doc)
+
+        controller = self._controller_did()
+        if controller and controller not in self_dids:
+            resolver = getattr(self, "a2a_did_resolver", None)
+            if callable(resolver):
+                try:
+                    did_doc = resolver(controller)
+                except Exception:
+                    logging.exception(
+                        "Failed to resolve Sovereign controller DID %s", controller
+                    )
+                    did_doc = None
+                if self._is_external_sovereign_doc(did_doc, self_dids):
+                    return dict(did_doc)
         return None
+
+    def _agent_signing_dids(self) -> set[str]:
+        dids: set[str] = set()
+        agent_id = getattr(self, "agent_id", None)
+        if isinstance(agent_id, str) and agent_id:
+            dids.add(agent_id)
+
+        identity = getattr(self, "identity", None)
+        if identity is None:
+            return dids
+        for attr in ("legacy_did", "new_did", "signing_did"):
+            value = getattr(identity, attr, None)
+            if isinstance(value, str) and value:
+                dids.add(value)
+        did_doc = getattr(identity, "legacy_did_document", None)
+        if isinstance(did_doc, Mapping):
+            doc_id = did_doc.get("id")
+            if isinstance(doc_id, str) and doc_id:
+                dids.add(doc_id)
+        return dids
+
+    def _configured_sovereign_root_did_documents(
+        self,
+        agent_node: Optional[GraphNode],
+    ) -> list[Mapping[str, Any]]:
+        candidates: list[Mapping[str, Any]] = []
+
+        for attr in (
+            "sovereign_root_did_document",
+            "trusted_sovereign_did_document",
+        ):
+            value = getattr(self, attr, None)
+            if isinstance(value, Mapping):
+                candidates.append(value)
+
+        props = getattr(agent_node, "properties", None)
+        if not isinstance(props, Mapping):
+            return candidates
+
+        for key in (
+            "sovereign_root_did_document",
+            "trusted_sovereign_did_document",
+        ):
+            value = props.get(key)
+            if isinstance(value, Mapping):
+                candidates.append(value)
+
+        root_did = props.get("sovereign_root_did")
+        public_key_hex = props.get("sovereign_root_public_key_hex")
+        if isinstance(root_did, str) and isinstance(public_key_hex, str):
+            candidates.append(
+                {
+                    "id": root_did,
+                    "publicKey": [
+                        {
+                            "id": f"{root_did}#keys-1",
+                            "type": "EcdsaSecp256k1VerificationKey2019",
+                            "controller": root_did,
+                            "publicKeyHex": public_key_hex,
+                        }
+                    ],
+                }
+            )
+        return candidates
+
+    def _controller_did(self) -> Optional[str]:
+        identity = getattr(self, "identity", None)
+        did_doc = getattr(identity, "legacy_did_document", None)
+        if not isinstance(did_doc, Mapping):
+            return None
+        controller = did_doc.get("controller")
+        if isinstance(controller, str) and controller:
+            return controller
+        return None
+
+    @staticmethod
+    def _is_external_sovereign_doc(
+        did_doc: Any,
+        self_dids: set[str],
+    ) -> bool:
+        if not isinstance(did_doc, Mapping):
+            return False
+        did = did_doc.get("id")
+        if not isinstance(did, str) or not did:
+            return False
+        if did in self_dids:
+            logging.critical(
+                "Refusing to trust agent-owned DID %s as Sovereign root", did
+            )
+            return False
+        return True
 
     async def reanchor_constitution(
         self,
@@ -816,7 +930,7 @@ class ConstitutionMixin:
         except Exception as e:
             return f"Error: Failed to read signed amendment artifact: {e}"
 
-        trusted_did_document = self._trusted_sovereign_did_document()
+        trusted_did_document = self._trusted_sovereign_did_document(agent_node)
         if not trusted_did_document:
             return "Error: Trusted Sovereign root DID document not available."
 

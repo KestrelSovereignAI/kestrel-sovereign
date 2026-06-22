@@ -20,6 +20,12 @@ ROOT_DID_DOCUMENT = did_document_from_legacy_public_key(
     ROOT_DID,
     ROOT_KEYPAIR.public_key,
 )
+AGENT_KEYPAIR = _SUITE.generate_keypair()
+AGENT_DID = "did:pkh:eip155:1:0x000000000000000000000000000000000000a587"
+AGENT_DID_DOCUMENT = did_document_from_legacy_public_key(
+    AGENT_DID,
+    AGENT_KEYPAIR.public_key,
+)
 
 
 def _make_agent(stored_hash="oldhash", safe_mode=False):
@@ -28,10 +34,18 @@ def _make_agent(stored_hash="oldhash", safe_mode=False):
     agent._safe_mode = safe_mode
     agent._get_timestamp = MagicMock(return_value="2026-04-06T00:00:00Z")
     agent.extension = None
-    agent.identity = SimpleNamespace(legacy_did_document=ROOT_DID_DOCUMENT)
+    agent.agent_id = AGENT_DID
+    agent.identity = SimpleNamespace(
+        legacy_did=AGENT_DID,
+        signing_did=AGENT_DID,
+        legacy_did_document=AGENT_DID_DOCUMENT,
+    )
 
     node = MagicMock()
-    node.properties = {"constitution_hash": stored_hash}
+    node.properties = {
+        "constitution_hash": stored_hash,
+        "sovereign_root_did_document": ROOT_DID_DOCUMENT,
+    }
     agent.storage = AsyncMock()
     agent.storage.get_node = AsyncMock(return_value=node)
     agent.storage.store_file = AsyncMock()
@@ -45,6 +59,18 @@ def _make_agent(stored_hash="oldhash", safe_mode=False):
     agent._trusted_sovereign_did_document = (
         ConstitutionMixin._trusted_sovereign_did_document.__get__(agent, KestrelAgent)
     )
+    agent._agent_signing_dids = ConstitutionMixin._agent_signing_dids.__get__(
+        agent, KestrelAgent
+    )
+    agent._configured_sovereign_root_did_documents = (
+        ConstitutionMixin._configured_sovereign_root_did_documents.__get__(
+            agent, KestrelAgent
+        )
+    )
+    agent._controller_did = ConstitutionMixin._controller_did.__get__(
+        agent, KestrelAgent
+    )
+    agent._is_external_sovereign_doc = ConstitutionMixin._is_external_sovereign_doc
     agent._get_governing_constitution = ConstitutionMixin._get_governing_constitution.__get__(
         agent, KestrelAgent
     )
@@ -156,6 +182,31 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reanchor_accepts_controller_resolved_sovereign_root(tmp_path):
+    """Spawned/controller agents can resolve the Sovereign root via host DID registry."""
+    agent, node = _make_agent(stored_hash="oldhash")
+    agent.identity.legacy_did_document = {
+        **AGENT_DID_DOCUMENT,
+        "controller": ROOT_DID,
+    }
+    node.properties = {"constitution_hash": "oldhash"}
+    agent.a2a_did_resolver = lambda did: ROOT_DID_DOCUMENT if did == ROOT_DID else None
+    agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
+    artifact_path = _write_artifact(tmp_path)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(FAKE_CONSTITUTION, artifact_path.read_bytes())
+
+        result = await agent.reanchor_constitution(
+            expected_hash=FAKE_HASH[:8],
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "re-anchored successfully" in result.lower()
+    assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
+
+
+@pytest.mark.asyncio
 async def test_reanchor_rejects_wrongly_signed_artifact(tmp_path):
     """Re-anchor refuses artifacts not signed by the trusted Sovereign root key."""
     agent, _ = _make_agent(stored_hash="oldhash")
@@ -172,6 +223,54 @@ async def test_reanchor_rejects_wrongly_signed_artifact(tmp_path):
 
     assert "error" in result.lower()
     assert "signed amendment verification failed" in result.lower()
+    agent.storage.store_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reanchor_rejects_agent_owned_signature(tmp_path):
+    """An agent-owned legacy key must never authorize its own re-anchor."""
+    agent, _ = _make_agent(stored_hash="oldhash")
+    artifact_path = _write_artifact(
+        tmp_path,
+        keypair=AGENT_KEYPAIR,
+        did=AGENT_DID,
+    )
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(FAKE_CONSTITUTION, artifact_path.read_bytes())
+
+        result = await agent.reanchor_constitution(
+            expected_hash=FAKE_HASH[:8],
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "error" in result.lower()
+    assert "signed amendment verification failed" in result.lower()
+    assert "not trusted sovereign did" in result.lower()
+    agent.storage.store_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reanchor_rejects_self_identity_as_trust_anchor(tmp_path):
+    """The agent's DID document is not a Sovereign root trust source."""
+    agent, node = _make_agent(stored_hash="oldhash")
+    node.properties["sovereign_root_did_document"] = AGENT_DID_DOCUMENT
+    artifact_path = _write_artifact(
+        tmp_path,
+        keypair=AGENT_KEYPAIR,
+        did=AGENT_DID,
+    )
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(FAKE_CONSTITUTION, artifact_path.read_bytes())
+
+        result = await agent.reanchor_constitution(
+            expected_hash=FAKE_HASH[:8],
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "error" in result.lower()
+    assert "trusted sovereign root did document not available" in result.lower()
     agent.storage.store_file.assert_not_called()
 
 
