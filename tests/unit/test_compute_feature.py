@@ -628,6 +628,25 @@ class TestDestructivePolicy:
 
         with pytest.raises(AgentDataProtectionError):
             policy.rewrite_bash_script(f": > {other_db}")
+
+    def test_rewrite_bash_blocks_compound_mv_of_other_agent_data(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test compound shell lines cannot hide mv against another agent."""
+        current = tmp_path / "agent_data" / "emma"
+        other = tmp_path / "agent_data" / "claw"
+        current.mkdir(parents=True)
+        other.mkdir()
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        with pytest.raises(AgentDataProtectionError):
+            policy.rewrite_bash_script(f"true; mv {other} /tmp/claw")
+
+        with pytest.raises(AgentDataProtectionError):
+            policy.rewrite_bash_script(f"echo hi && mv {other} /tmp/claw")
     
     def test_rewrite_bash_script(self, temp_trash_dir):
         """Test rewriting entire bash script."""
@@ -728,6 +747,108 @@ print("Done")
         audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
         entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
         assert entries[-1]["decision"] == "allowed"
+
+    def test_python_wrapper_blocks_open_truncate_other_agent_database(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test builtins.open truncation is blocked for another agent database."""
+        current = tmp_path / "agent_data" / "emma"
+        other_db = tmp_path / "agent_data" / "claw" / "kestrel_prime.db"
+        current.mkdir(parents=True)
+        other_db.parent.mkdir()
+        other_db.write_text("memory")
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                f"with open({str(other_db)!r}, 'w') as handle:\n"
+                "    handle.write('gone')\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert other_db.read_text() == "memory"
+        audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
+        entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
+        assert entries[-1]["action"] == "open_truncate"
+        assert entries[-1]["decision"] == "blocked"
+
+    def test_python_wrapper_blocks_rename_other_agent_data(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test os.rename is blocked for another agent data directory."""
+        current = tmp_path / "agent_data" / "emma"
+        other = tmp_path / "agent_data" / "claw"
+        current.mkdir(parents=True)
+        other.mkdir()
+        (other / "kestrel_prime.db").write_text("memory")
+        destination = tmp_path / "claw-moved"
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import os\n"
+                f"os.rename({str(other)!r}, {str(destination)!r})\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert (other / "kestrel_prime.db").exists()
+        assert not destination.exists()
+
+    def test_python_wrapper_blocks_truncate_other_agent_database(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test os.truncate is blocked for another agent database."""
+        current = tmp_path / "agent_data" / "emma"
+        other_db = tmp_path / "agent_data" / "claw" / "kestrel_prime.db"
+        current.mkdir(parents=True)
+        other_db.parent.mkdir()
+        other_db.write_text("memory")
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import os\n"
+                f"os.truncate({str(other_db)!r}, 0)\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert other_db.read_text() == "memory"
 
 
 # =============================================================================

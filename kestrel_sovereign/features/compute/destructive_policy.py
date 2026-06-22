@@ -291,23 +291,25 @@ class DestructiveOperationPolicy:
         line: str,
         script_workdir: Optional[str] = None,
     ) -> None:
-        """Reject obvious shell mutations against other agents' data."""
+        """Reject shell access to another agent's data path in any pipeline segment."""
         stripped = line.strip()
-        try:
-            parts = shlex.split(stripped)
-        except ValueError:
-            parts = stripped.split()
-        if not parts:
+        if not stripped:
             return
 
-        command = parts[0]
-        if command in {"mv", "truncate", "unlink", "rmdir"}:
-            for token in parts[1:]:
-                if token.startswith("-"):
-                    continue
+        try:
+            lexer = shlex.shlex(stripped, posix=True, punctuation_chars=";&|")
+            lexer.whitespace_split = True
+            parts = list(lexer)
+        except ValueError:
+            parts = stripped.split()
+
+        for token in parts:
+            if not token or set(token) <= {";", "&", "|"}:
+                continue
+            for target in self._shell_token_candidate_paths(token):
                 self.assert_agent_data_deletion_allowed(
-                    self._resolve_shell_target(token, script_workdir),
-                    command,
+                    self._resolve_shell_target(target, script_workdir),
+                    "shell",
                 )
 
         for match in re.finditer(r'(?:^|[^0-9])(?:>>?|<>)\s*([^\s;&|]+)', line):
@@ -317,6 +319,21 @@ class DestructiveOperationPolicy:
                     self._resolve_shell_target(target, script_workdir),
                     "redirect",
                 )
+
+    def _shell_token_candidate_paths(self, token: str) -> List[str]:
+        """Extract possible path payloads from a shell token."""
+        candidates = [token]
+
+        if "=" in token:
+            _, value = token.split("=", 1)
+            if value:
+                candidates.append(value)
+
+        stripped = token.lstrip("0123456789<>")
+        if stripped and stripped != token:
+            candidates.append(stripped)
+
+        return candidates
     
     def rewrite_bash_script(self, content: str, workdir: Optional[str] = None) -> str:
         """
@@ -383,6 +400,7 @@ import sys as _kestrel_sys
 # Import modules directly BEFORE any user code runs
 import shutil as _kestrel_shutil_original
 import os as _kestrel_os_original
+import builtins as _kestrel_builtins_original
 import json as _kestrel_json
 from pathlib import Path as _KestrelPathOriginal
 from datetime import datetime as _kestrel_datetime, timezone as _kestrel_timezone
@@ -462,8 +480,15 @@ def _kestrel_is_deletable(path: str) -> bool:
 # Store original functions ONCE
 _kestrel_original_remove = _kestrel_os_original.remove
 _kestrel_original_unlink = _kestrel_os_original.unlink
+_kestrel_original_rename = _kestrel_os_original.rename
+_kestrel_original_replace = _kestrel_os_original.replace
+_kestrel_original_truncate = _kestrel_os_original.truncate
+_kestrel_original_open = _kestrel_builtins_original.open
 _kestrel_original_rmtree = _kestrel_shutil_original.rmtree
+_kestrel_original_path_open = _KestrelPathOriginal.open
 _kestrel_original_path_unlink = _KestrelPathOriginal.unlink
+_kestrel_original_path_rename = _KestrelPathOriginal.rename
+_kestrel_original_path_replace = _KestrelPathOriginal.replace
 
 def _kestrel_safe_remove(path, *args, **kwargs):
     """Move to trash instead of deleting (unless in temp workspace)."""
@@ -496,6 +521,48 @@ def _kestrel_safe_rmtree(path, *args, **kwargs):
     """Safe rmtree that moves to trash."""
     _kestrel_safe_remove(path)
 
+def _kestrel_safe_rename(src, dst, *args, **kwargs):
+    """Block renames that move or overwrite another agent's data."""
+    src_path = _KestrelPathOriginal(src).expanduser().resolve()
+    dst_path = _KestrelPathOriginal(dst).expanduser().resolve()
+    _kestrel_assert_agent_data_allowed(src_path, "rename")
+    _kestrel_assert_agent_data_allowed(dst_path, "rename")
+    return _kestrel_original_rename(src, dst, *args, **kwargs)
+
+def _kestrel_safe_replace(src, dst, *args, **kwargs):
+    """Block replaces that move or overwrite another agent's data."""
+    src_path = _KestrelPathOriginal(src).expanduser().resolve()
+    dst_path = _KestrelPathOriginal(dst).expanduser().resolve()
+    _kestrel_assert_agent_data_allowed(src_path, "replace")
+    _kestrel_assert_agent_data_allowed(dst_path, "replace")
+    return _kestrel_original_replace(src, dst, *args, **kwargs)
+
+def _kestrel_safe_truncate(path, length, *args, **kwargs):
+    """Block truncate calls against another agent's data."""
+    try:
+        p = _KestrelPathOriginal(path).expanduser().resolve()
+    except TypeError:
+        return _kestrel_original_truncate(path, length, *args, **kwargs)
+    _kestrel_assert_agent_data_allowed(p, "truncate")
+    return _kestrel_original_truncate(path, length, *args, **kwargs)
+
+def _kestrel_safe_open(file, mode="r", *args, **kwargs):
+    """Block builtins.open calls that would truncate another agent's data."""
+    if isinstance(mode, str) and "w" in mode:
+        try:
+            p = _KestrelPathOriginal(file).expanduser().resolve()
+        except TypeError:
+            return _kestrel_original_open(file, mode, *args, **kwargs)
+        _kestrel_assert_agent_data_allowed(p, "open_truncate")
+    return _kestrel_original_open(file, mode, *args, **kwargs)
+
+def _kestrel_path_safe_open(self, mode="r", *args, **kwargs):
+    """Block Path.open calls that would truncate another agent's data."""
+    if isinstance(mode, str) and "w" in mode:
+        p = _KestrelPathOriginal(self).expanduser().resolve()
+        _kestrel_assert_agent_data_allowed(p, "open_truncate")
+    return _kestrel_original_path_open(self, mode, *args, **kwargs)
+
 def _kestrel_path_safe_unlink(self, missing_ok=False):
     """Safe Path.unlink that moves to trash."""
     try:
@@ -503,6 +570,22 @@ def _kestrel_path_safe_unlink(self, missing_ok=False):
     except FileNotFoundError:
         if not missing_ok:
             raise
+
+def _kestrel_path_safe_rename(self, target):
+    """Safe Path.rename that blocks another agent's data."""
+    source = _KestrelPathOriginal(self).expanduser().resolve()
+    dest = _KestrelPathOriginal(target).expanduser().resolve()
+    _kestrel_assert_agent_data_allowed(source, "rename")
+    _kestrel_assert_agent_data_allowed(dest, "rename")
+    return _kestrel_original_path_rename(self, target)
+
+def _kestrel_path_safe_replace(self, target):
+    """Safe Path.replace that blocks another agent's data."""
+    source = _KestrelPathOriginal(self).expanduser().resolve()
+    dest = _KestrelPathOriginal(target).expanduser().resolve()
+    _kestrel_assert_agent_data_allowed(source, "replace")
+    _kestrel_assert_agent_data_allowed(dest, "replace")
+    return _kestrel_original_path_replace(self, target)
 
 def _kestrel_apply_patches():
     """Apply patches to os, shutil, and pathlib modules in sys.modules."""
@@ -514,6 +597,12 @@ def _kestrel_apply_patches():
     import os
     os.remove = _kestrel_safe_remove
     os.unlink = _kestrel_safe_remove
+    os.rename = _kestrel_safe_rename
+    os.replace = _kestrel_safe_replace
+    os.truncate = _kestrel_safe_truncate
+
+    import builtins
+    builtins.open = _kestrel_safe_open
     
     # Patch shutil module  
     import shutil
@@ -521,12 +610,21 @@ def _kestrel_apply_patches():
     
     # Patch pathlib.Path class
     import pathlib
+    pathlib.Path.open = _kestrel_path_safe_open
     pathlib.Path.unlink = _kestrel_path_safe_unlink
+    pathlib.Path.rename = _kestrel_path_safe_rename
+    pathlib.Path.replace = _kestrel_path_safe_replace
     # Also patch PurePath descendants
     if hasattr(pathlib, 'PosixPath'):
+        pathlib.PosixPath.open = _kestrel_path_safe_open
         pathlib.PosixPath.unlink = _kestrel_path_safe_unlink
+        pathlib.PosixPath.rename = _kestrel_path_safe_rename
+        pathlib.PosixPath.replace = _kestrel_path_safe_replace
     if hasattr(pathlib, 'WindowsPath'):
+        pathlib.WindowsPath.open = _kestrel_path_safe_open
         pathlib.WindowsPath.unlink = _kestrel_path_safe_unlink
+        pathlib.WindowsPath.rename = _kestrel_path_safe_rename
+        pathlib.WindowsPath.replace = _kestrel_path_safe_replace
     
     _KESTREL_PATCHED = True
 
