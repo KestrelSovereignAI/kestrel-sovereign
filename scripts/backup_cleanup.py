@@ -1156,6 +1156,7 @@ async def apply_plan(
             manifest_index_hash=manifest_index_hash,
             policy_version=policy_version,
         )
+    lighthouse_failures = 0
     if lighthouse_rows:
         for row in lighthouse_rows:
             deal_status = None
@@ -1178,6 +1179,7 @@ async def apply_plan(
                     policy_version=policy_version,
                     deal_status=deal_status,
                 )
+                lighthouse_failures += 1
                 continue
             try:
                 delete_result = await lighthouse_client.delete_file(str(file_id))
@@ -1191,6 +1193,7 @@ async def apply_plan(
                     policy_version=policy_version,
                     deal_status=deal_status,
                 )
+                lighthouse_failures += 1
                 continue
             _append_audit(
                 audit_log,
@@ -1201,6 +1204,15 @@ async def apply_plan(
                 policy_version=policy_version,
                 deal_status=deal_status,
             )
+    # Non-zero exit if any Lighthouse delete failed, so automation doesn't read
+    # a partial cleanup as success (all rows were still attempted + audited).
+    if lighthouse_failures:
+        logger.error(
+            "%s Lighthouse deletion(s) failed; see audit log %s",
+            lighthouse_failures,
+            audit_log,
+        )
+        return 1
     return 0
 
 

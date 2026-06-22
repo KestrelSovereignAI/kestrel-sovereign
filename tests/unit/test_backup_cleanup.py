@@ -847,7 +847,8 @@ async def test_lighthouse_delete_missing_file_id_is_audited_and_skipped(tmp_path
         audit_log=audit_log,
     )
 
-    assert rc == 0
+    # A planned delete with no upload id is requested-but-undeleted -> non-zero.
+    assert rc == 1
     assert client.deleted == []
     entry = json.loads(audit_log.read_text().strip())
     assert entry["key"] == "cid-old"
@@ -886,13 +887,33 @@ async def test_lighthouse_delete_failure_is_audited_and_batch_continues(tmp_path
         audit_log=audit_log,
     )
 
-    assert rc == 0
+    # Batch continues through the failure (both attempted), but the run reports
+    # non-zero so automation doesn't treat a partial cleanup as success.
+    assert rc == 1
     assert client.deleted == ["file-cid-deletes", "file-cid-fails"]
     entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
     by_key = {entry["key"]: entry for entry in entries}
     assert by_key["cid-fails"]["result"] == "failed"
     assert by_key["cid-fails"]["delete_call_result"]["file_id"] == "file-cid-fails"
     assert by_key["cid-deletes"]["result"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_apply_plan_returns_zero_when_all_lighthouse_deletes_succeed(tmp_path):
+    rows = [
+        _attributed_snapshot("cid-a", "agent-a", 900),
+        _attributed_snapshot("cid-new", "agent-a", 1),
+    ]
+    plan = backup_cleanup.build_delete_plan(
+        rows, _expire_everything_policy(), quarantine_state={"objects": {}}, now=NOW
+    )
+    rc = await backup_cleanup.apply_plan(
+        plan,
+        lighthouse_client=AsyncDeleteClient(),
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=tmp_path / "audit.jsonl",
+    )
+    assert rc == 0
 
 
 def test_delete_plan_preserves_newest_and_live_manifest_referenced_objects():
