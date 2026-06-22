@@ -581,6 +581,37 @@ class TestChangeAwareSnapshot:
         await sync.stop()
 
     @pytest.mark.asyncio
+    async def test_completed_snapshot_fingerprint_is_recorded(self, temp_db, tmp_path, monkeypatch):
+        """Snapshot reads can touch SQLite WAL/SHM metadata. The stored
+        fingerprint must describe the completed pass so the next unchanged
+        cycle can skip."""
+        current_fingerprint = {"value": "before-snapshot"}
+
+        class MetadataTouchingTarget(MockSyncTarget):
+            async def sync_snapshot(self, db_path: Path) -> SyncResult:
+                result = await super().sync_snapshot(db_path)
+                current_fingerprint["value"] = "after-snapshot"
+                return result
+
+        target = MetadataTouchingTarget(name="touching")
+        sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))
+        monkeypatch.setattr(
+            sync,
+            "_compute_db_fingerprint",
+            lambda: current_fingerprint["value"],
+        )
+        sync.add_target(target)
+        await sync.start()
+
+        first = await sync.snapshot_if_changed()
+        assert first["touching"].success
+        assert sync._state.last_fingerprint == "after-snapshot"
+
+        second = await sync.snapshot_if_changed()
+        assert "__unchanged__" in second
+        await sync.stop()
+
+    @pytest.mark.asyncio
     async def test_force_snapshot_always_runs(self, temp_db, mock_target, tmp_path):
         """force_snapshot keeps its unconditional contract (explicit backups)."""
         sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))
