@@ -1,0 +1,44 @@
+# kestrel serve — local model registry (EXAMPLE / schema reference)
+#
+# Copy to `serve_models.toml` (gitignored) and edit paths for THIS host, or
+# point $KESTREL_SERVE_REGISTRY at your own file. `kestrel serve` resolves:
+#   $KESTREL_SERVE_REGISTRY  ->  ./serve_models.toml  ->  ~/.kestrel/serve_models.toml
+#
+# Only one model runs at a time (they share `port` and cannot co-reside in RAM).
+# `kestrel serve up <name>` refuses to start if est_ram_gb (+margin) > free RAM;
+# `switch` stops the current model first. `gguf` may be a glob — a sharded model
+# auto-selects its `*-00001-of-*.gguf` first shard, so shard counts never need
+# hand-editing.
+
+default_port = 8001
+
+# --- Kimi (stock Homebrew llama.cpp) ------------------------------------------
+[models."kimi-k2.6"]
+gguf = "/PATH/TO/models/Kimi-K2.6-GGUF/UD-Q2_K_XL/Kimi-K2.6-UD-Q2_K_XL-*.gguf"
+binary = "llama-server"            # bare name => resolved on PATH (Homebrew)
+ctx_size = 131072
+kv_cache_type = "q8_0"
+reasoning_format = "deepseek"
+est_ram_gb = 470
+env = { LLAMA_SET_ROWS = "1" }
+
+# --- GLM-5.2 (stock Homebrew llama.cpp) ---------------------------------------
+[models."glm-5.2"]
+gguf = "/PATH/TO/models/GLM-5.2-GGUF/UD-Q2_K_XL/GLM-5.2-UD-Q2_K_XL-*.gguf"
+binary = "llama-server"
+ctx_size = 131072
+kv_cache_type = "q8_0"
+reasoning_format = "deepseek"
+est_ram_gb = 300
+env = { LLAMA_SET_ROWS = "1" }
+
+# --- DeepSeek V4-Flash (antirez Metal fork — NOT mainline llama.cpp) ----------
+# V4 needs the antirez fork built with Metal; its GGUF uses standard expert
+# quant types with working Metal kernels. (Mainline/nisparks fail on Metal.)
+[models."v4-flash"]
+gguf = "/PATH/TO/models/DeepSeek-V4-Flash-antirez/*Q4KExperts*chat-v2.gguf"
+binary = "/PATH/TO/llama.cpp-v4-antirez/build/bin/llama-server"
+ctx_size = 131072
+reasoning_format = "deepseek"      # embedded chat template; no kv_cache_type override
+est_ram_gb = 200
+env = { LLAMA_SET_ROWS = "1" }

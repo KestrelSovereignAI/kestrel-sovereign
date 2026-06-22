@@ -197,3 +197,6 @@ tests/e2e/simpletuner/playwright.config.cjs
 /_*.md
 /_*.json
 /_*.js
+
+# Local model registry for `kestrel serve` (host-specific paths)
+serve_models.toml
