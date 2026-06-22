@@ -256,3 +256,50 @@ def verify_identity_isolation(
         "another agent's database is a security violation (cross-agent data "
         "access, false-attribution writes, potential identity contamination)."
     )
+
+
+async def warn_stale_bootstrap_pending(
+    agent: Any,
+    *,
+    threshold_seconds: int = 3600,
+    context: str = "startup",
+) -> Optional[dict]:
+    """Log and persist a warning when bootstrap is PENDING past the timeout.
+
+    Unlike provider/identity lifecycle checks, this does not refuse startup:
+    an untouched agent can still be recovered by first contact or an explicit
+    ``!skip-discovery``. The important part is making the stuck state visible
+    to startup logs, heartbeat history, and the graph/metadata status.
+    """
+    bootstrap_service = getattr(agent, "bootstrap_service", None)
+    if bootstrap_service is None:
+        return None
+
+    storage = getattr(agent, "storage", None)
+    agent_node = None
+    if storage is not None:
+        try:
+            agent_node = await storage.get_node(getattr(agent, "agent_id", None))
+        except Exception as exc:
+            logger.debug("Could not load agent node for bootstrap timeout check: %s", exc)
+
+    stale = await bootstrap_service.check_pending_timeout(
+        agent_node=agent_node,
+        storage=storage,
+        threshold_seconds=threshold_seconds,
+        mark_stale=True,
+    )
+    if not stale.is_stale:
+        return None
+
+    agent_name = getattr(agent, "_agent_name", None) or getattr(agent, "agent_id", "unknown")
+    age_minutes = (stale.age_seconds or 0) / 60.0
+    logger.warning(
+        "Bootstrap stale: agent %s has bootstrap_state='pending' for %.1f minutes "
+        "(threshold %.1f minutes); status escalated to stale_bootstrap during %s",
+        agent_name,
+        age_minutes,
+        threshold_seconds / 60.0,
+        context,
+    )
+    return stale.to_dict()

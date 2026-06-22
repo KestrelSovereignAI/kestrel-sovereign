@@ -971,8 +971,8 @@ async def health_detailed(request: Request):
     if not health_feature:
         # Fallback: run checks directly without the feature
         from kestrel_sovereign.features.health.checks import (
-            check_database, check_llm_service, check_memory_system,
-            check_disk_space, check_context_budget,
+            check_bootstrap_state, check_context_budget, check_database,
+            check_disk_space, check_llm_service, check_memory_system,
         )
         db = None
         if hasattr(agent, 'storage') and agent.storage:
@@ -984,6 +984,7 @@ async def health_detailed(request: Request):
             await check_memory_system(agent),
             await check_disk_space(),
             await check_context_budget(agent),
+            await check_bootstrap_state(agent),
         ]
         statuses = [c.get("status") for c in checks]
         if "fail" in statuses:

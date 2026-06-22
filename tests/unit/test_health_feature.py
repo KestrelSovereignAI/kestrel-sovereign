@@ -17,9 +17,13 @@ import asyncio
 import json
 import pytest
 import pytest_asyncio
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sovereign.bootstrap.service import BootstrapService, BootstrapState
 from kestrel_sovereign.features.health.checks import (
+    check_bootstrap_state,
     check_context_budget,
     check_database,
     check_disk_space,
@@ -86,6 +90,40 @@ def _make_agent(db=None, agent_id="test-heartbeat-agent"):
     agent.features = []
 
     return agent
+
+
+@dataclass
+class _Node:
+    node_id: str
+    properties: dict
+
+
+class _Storage:
+    def __init__(self, node):
+        self.node = node
+        self.saved = None
+
+    async def get_node(self, node_id):
+        return self.node if node_id == self.node.node_id else None
+
+    async def add_node(self, node):
+        self.saved = node
+        self.node = node
+
+
+class _MetadataDB:
+    def __init__(self):
+        self.data = {}
+
+    async def fetchall(self, query, params=None):
+        key = (params[0], params[1]) if params and len(params) >= 2 else None
+        if key in self.data:
+            return [(self.data[key],)]
+        return []
+
+    async def execute(self, query, params=None):
+        if params and len(params) >= 4:
+            self.data[(params[0], params[1])] = params[2]
 
 
 # ============================================================================
@@ -290,6 +328,57 @@ class TestCheckContextBudget:
         assert "10.0%" in result["message"]
 
 
+class TestCheckBootstrapState:
+    @pytest.mark.asyncio
+    async def test_pass_when_bootstrap_complete(self, tmp_path):
+        agent_id = "did:test:complete"
+        db = _MetadataDB()
+        service = BootstrapService(
+            db=db,
+            agent_id=agent_id,
+            agent_name="Complete",
+            llm_service=object(),
+            agent_data_path=tmp_path,
+        )
+        await service.set_bootstrap_state(BootstrapState.COMPLETE)
+        agent = _make_agent(agent_id=agent_id)
+        agent.bootstrap_service = service
+        agent.storage = _Storage(_Node(agent_id, {"bootstrap_state": "complete"}))
+
+        result = await check_bootstrap_state(agent)
+
+        assert result["name"] == "bootstrap_state"
+        assert result["status"] == "pass"
+        assert "complete" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_warn_when_pending_past_threshold(self, tmp_path):
+        agent_id = "did:test:stale-bootstrap-health"
+        node = _Node(
+            agent_id,
+            {
+                "bootstrap_state": "pending",
+                "created_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            },
+        )
+        service = BootstrapService(
+            db=_MetadataDB(),
+            agent_id=agent_id,
+            agent_name="Stale",
+            llm_service=object(),
+            agent_data_path=tmp_path,
+        )
+        agent = _make_agent(agent_id=agent_id)
+        agent.bootstrap_service = service
+        agent.storage = _Storage(node)
+
+        result = await check_bootstrap_state(agent, threshold_seconds=3600)
+
+        assert result["status"] == "warn"
+        assert "stale_bootstrap" in result["message"]
+        assert result["details"]["is_stale"] is True
+
+
 # ============================================================================
 # Overall Status Derivation Tests
 # ============================================================================
@@ -404,7 +493,7 @@ class TestHeartbeatCheck:
 
     @pytest.mark.asyncio
     async def test_returns_all_checks(self, feature):
-        """health_check returns results for all 5 checks."""
+        """health_check returns results for all liveness checks."""
         from kestrel_sdk.tools.result import ToolResultStatus
         result = await feature.health_check()
         assert result.status is ToolResultStatus.OK
@@ -420,6 +509,7 @@ class TestHeartbeatCheck:
         assert "memory_system" in check_names
         assert "disk_space" in check_names
         assert "context_budget" in check_names
+        assert "bootstrap_state" in check_names
 
     @pytest.mark.asyncio
     async def test_persists_to_db(self, feature):

@@ -1371,6 +1371,13 @@ class KestrelAgent(
                 agent_data_path=agent_data_dir,
             )
             logging.info("BootstrapService initialized")
+            from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending
+
+            await warn_stale_bootstrap_pending(
+                self,
+                threshold_seconds=BootstrapService.DEFAULT_PENDING_TIMEOUT_SECONDS,
+                context="startup",
+            )
 
             # Load persisted model preference from database and register persistence callback
             await self._load_model_preference()
