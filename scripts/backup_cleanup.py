@@ -520,16 +520,18 @@ def classify_inventory_record(record: BackupRecord) -> ClassifiedRecord:
             "high",
             f"CID found in manifest index as {record.metadata['manifest_cid_kind']}",
         )
-    # GCS is the EXPEDIENT tier: objects are attributed to an agent by bucket
-    # path (kestrel/<agent>/snapshots/<ts>.db), not by a Lighthouse manifest.
-    # Such path-attributed snapshots are retention-managed (eligible only past
-    # retention; newest-per-agent + live pointers stay protected), NOT quarantine.
-    if record.store == "gcs" and record.agent_id:
+    # GCS is the EXPEDIENT tier: snapshot objects are attributed to an agent by
+    # bucket path (kestrel/<agent>/snapshots/<ts>.db), not by a Lighthouse
+    # manifest. Only the .../<agent>/snapshots/... shape is retention-managed
+    # (eligible past retention; newest-per-agent + live pointers protected).
+    # Other GCS objects (e.g. raw .../<agent>/kestrel_prime.db) fall through to
+    # the legacy/quarantine branches below — they are NOT auto-deletable.
+    if record.store == "gcs" and record.agent_id and "/snapshots/" in record.key:
         return ClassifiedRecord(
             record,
             "attributed_snapshot",
             "high",
-            "GCS object attributed to agent by bucket path",
+            "GCS snapshot attributed to agent by bucket path",
         )
     if filename in {"kestrel_prime.db", "kestrel_prime.db-wal"} or filename.endswith(
         "-wal"

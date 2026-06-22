@@ -888,3 +888,19 @@ def test_delete_plan_prunes_old_gcs_snapshot_but_protects_newest():
     deleted = _delete_keys(plan)
     assert "gs://bucket/kestrel/agent-a/snapshots/old.db" in deleted
     assert "gs://bucket/kestrel/agent-a/snapshots/new.db" not in deleted  # newest protected
+
+
+def test_gcs_raw_db_outside_snapshots_stays_quarantine():
+    # A GCS raw DB NOT under .../snapshots/ must NOT become attributed (would
+    # bypass legacy quarantine). It stays a legacy_private_candidate.
+    raw = _record(
+        "gs://bucket/kestrel/agent-a/kestrel_prime.db",
+        "agent-a",
+        900,
+        store="gcs",
+        name="kestrel_prime.db",
+    )
+    assert (
+        backup_cleanup.classify_inventory_record(raw).inventory_class
+        == "legacy_private_candidate"
+    )
