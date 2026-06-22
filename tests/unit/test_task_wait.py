@@ -1,9 +1,12 @@
-"""Tests for ``TaskFeature.wait`` — the generic bounded wait primitive.
+"""Tests for the single generic ``wait`` tool (WaitFeature) and its
+dispatch to feature-registered Waitable providers (e.g. TaskFeature).
 
-#1541: agents were shelling out to ``sleep`` between polls during
-autonomous work loops. ``wait`` is the native replacement: a bounded,
-audited pause that enforces a conservative maximum duration and reports
-the observed elapsed time.
+#1541: agents shelled out to ``sleep`` between polls; ``wait`` is the
+native bounded pause. #1860: ``wait`` became the ONE generic waiter —
+``wait("<kind>:<handle>")`` dispatches to whichever feature registered
+that kind. The tool lives on its own MANDATORY ``WaitFeature`` (not on
+TaskFeature) so it is present even for agent profiles that don't load
+tasks.
 """
 
 from types import SimpleNamespace
@@ -12,6 +15,7 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.tasks.feature import TaskFeature
+from kestrel_sovereign.features.wait.feature import WaitFeature
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.waits import WaitRegistry
 
@@ -19,6 +23,13 @@ from kestrel_sovereign.waits import WaitRegistry
 class _StubAgent:
     def __init__(self):
         self.wait_registry = WaitRegistry()
+
+
+def _wait_feature(agent=None):
+    """A WaitFeature bound to ``agent`` (the tool reads agent.wait_registry)."""
+    f = WaitFeature(agent=None)
+    f.agent = agent
+    return f
 
 
 async def _make_db_agent(tmp_path):
@@ -33,11 +44,27 @@ async def _make_db_agent(tmp_path):
     )
 
 
-class TestGenericWait:
+async def _register_task_provider(agent, *, status="completed"):
+    """Register a TaskFeature's ``task`` provider on ``agent`` with a stubbed
+    status read, and return the TaskFeature (so the provider polls the stub)."""
+    task_feature = TaskFeature(agent=None)
+    task_feature.agent = agent
+    await task_feature.post_all_features_loaded(agent)
+
+    async def fake_status(task_id):
+        return {
+            "ok": True, "task_id": task_id, "status": status,
+            "task_type": "demo", "artifacts": [], "message": "done",
+        }
+
+    task_feature._get_task_status_data = fake_status
+    return task_feature
+
+
+class TestGenericWaitSleep:
     @pytest.mark.asyncio
     async def test_zero_duration_returns_immediately(self):
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(duration_seconds=0, reason="probe")
+        result = await _wait_feature().wait(duration_seconds=0, reason="probe")
         assert result.status is ToolResultStatus.OK
         assert result.data["requested_seconds"] == 0
         assert result.data["reason"] == "probe"
@@ -45,79 +72,53 @@ class TestGenericWait:
 
     @pytest.mark.asyncio
     async def test_short_wait_reports_elapsed(self):
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(duration_seconds=1)
+        result = await _wait_feature().wait(duration_seconds=1)
         assert result.status is ToolResultStatus.OK
-        # Observed elapsed should be at least the requested duration.
         assert result.data["elapsed_seconds"] >= 1
         assert result.data["requested_seconds"] == 1
 
     @pytest.mark.asyncio
     async def test_max_duration_rejected(self):
-        feature = TaskFeature(agent=None)
-        too_long = TaskFeature._MAX_WAIT_SECONDS + 1
-        result = await feature.wait(duration_seconds=too_long)
+        too_long = WaitFeature._MAX_WAIT_SECONDS + 1
+        result = await _wait_feature().wait(duration_seconds=too_long)
         assert result.status is ToolResultStatus.ERROR
         assert "exceeds the maximum" in result.error
         assert result.data["requested_seconds"] == too_long
-        assert result.data["max_seconds"] == TaskFeature._MAX_WAIT_SECONDS
+        assert result.data["max_seconds"] == WaitFeature._MAX_WAIT_SECONDS
 
     @pytest.mark.asyncio
     async def test_negative_duration_rejected(self):
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(duration_seconds=-5)
+        result = await _wait_feature().wait(duration_seconds=-5)
         assert result.status is ToolResultStatus.ERROR
         assert "must be >= 0" in result.error
 
     @pytest.mark.asyncio
     async def test_non_integer_duration_rejected(self):
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(duration_seconds="soon")
+        result = await _wait_feature().wait(duration_seconds="soon")
         assert result.status is ToolResultStatus.ERROR
         assert "must be an integer" in result.error
 
 
 class TestUnifiedWaitTarget:
-    """The single `wait` tool dispatches `target="<kind>:<handle>"` to the
-    agent's wait_registry — the unified interface replacing per-feature
-    waiters."""
+    """`wait("<kind>:<handle>")` dispatches to the agent's wait_registry."""
 
     @pytest.mark.asyncio
-    async def test_target_dispatches_to_registry(self, monkeypatch):
+    async def test_target_dispatches_to_registered_provider(self):
         agent = _StubAgent()
-        feature = TaskFeature(agent=None)
-        feature.agent = agent
-
-        # Register a TaskFeature provider whose status read is stubbed
-        # to "completed" so the engine returns OK immediately.
-        await feature.post_all_features_loaded(agent)
-
-        async def fake_status(task_id):
-            return {
-                "ok": True, "task_id": task_id, "status": "completed",
-                "task_type": "demo", "artifacts": [], "message": "done",
-            }
-
-        monkeypatch.setattr(feature, "_get_task_status_data", fake_status)
-        # The provider registered above wraps THIS feature instance, so
-        # the monkeypatched method is the one the engine polls.
-        result = await feature.wait(target="task:abc123", timeout_seconds=5)
+        await _register_task_provider(agent, status="completed")
+        result = await _wait_feature(agent).wait(target="task:abc123", timeout_seconds=5)
         assert result.status is ToolResultStatus.OK
         assert result.data["ref"] == "task:abc123"
 
     @pytest.mark.asyncio
     async def test_target_without_registry_errors(self):
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(target="task:abc", timeout_seconds=5)
+        result = await _wait_feature(agent=None).wait(target="task:abc", timeout_seconds=5)
         assert result.status is ToolResultStatus.ERROR
         assert "wait engine unavailable" in result.error
 
     @pytest.mark.asyncio
     async def test_unknown_kind_errors(self):
-        agent = _StubAgent()
-        feature = TaskFeature(agent=None)
-        feature.agent = agent
-        result = await feature.wait(target="bogus:xyz", timeout_seconds=5)
+        result = await _wait_feature(_StubAgent()).wait(target="bogus:xyz", timeout_seconds=5)
         assert result.status is ToolResultStatus.ERROR
         assert "no wait provider for kind 'bogus'" in result.error
 
@@ -125,18 +126,19 @@ class TestUnifiedWaitTarget:
     async def test_numeric_target_is_bounded_sleep(self):
         """`!wait 5` binds the token positionally to `target`; a bare
         number must still mean a bounded pause, not a malformed ref."""
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(target="0", reason="legacy positional")
+        result = await _wait_feature().wait(target="0", reason="legacy positional")
         assert result.status is ToolResultStatus.OK
         assert result.data["requested_seconds"] == 0
         assert result.data["reason"] == "legacy positional"
 
     @pytest.mark.asyncio
-    async def test_post_load_registers_task_provider(self):
+    async def test_task_feature_registers_task_provider(self):
+        """The task provider registration lives on TaskFeature (the kind is
+        only available when tasks is loaded), but the wait TOOL does not."""
         agent = _StubAgent()
-        feature = TaskFeature(agent=None)
-        feature.agent = agent
-        await feature.post_all_features_loaded(agent)
+        task_feature = TaskFeature(agent=None)
+        task_feature.agent = agent
+        await task_feature.post_all_features_loaded(agent)
         assert "task" in agent.wait_registry.kinds()
 
 
@@ -148,52 +150,39 @@ class TestWaitModeSignal:
     @pytest.mark.asyncio
     async def test_signal_mode_registers_watch_and_returns_immediately(self, tmp_path):
         agent = await _make_db_agent(tmp_path)
-        feature = TaskFeature(agent=None)
-        feature.agent = agent
-        # Register the task provider so the kind validates.
-        await feature.post_all_features_loaded(agent)
-
-        result = await feature.wait(target="task:abc123", mode="signal")
+        await _register_task_provider(agent)
+        result = await _wait_feature(agent).wait(target="task:abc123", mode="signal")
         assert result.status is ToolResultStatus.OK
         assert result.data["mode"] == "signal"
         assert result.data["watching"] is True
         assert result.data["ref"] == "task:abc123"
 
-        # A durable watch row was persisted (watching=1, not yet signaled).
         store = agent._wait_reconciler._store
-        watched = await store.list_watched()
-        keys = {(w.kind, w.handle) for w in watched}
+        keys = {(w.kind, w.handle) for w in await store.list_watched()}
         assert ("task", "abc123") in keys
 
     @pytest.mark.asyncio
     async def test_signal_mode_unknown_kind_errors(self, tmp_path):
         agent = await _make_db_agent(tmp_path)
-        feature = TaskFeature(agent=None)
-        feature.agent = agent
-        result = await feature.wait(target="bogus:xyz", mode="signal")
+        result = await _wait_feature(agent).wait(target="bogus:xyz", mode="signal")
         assert result.status is ToolResultStatus.ERROR
         assert "no wait provider for kind 'bogus'" in result.error
 
     @pytest.mark.asyncio
     async def test_signal_mode_requires_target(self):
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(duration_seconds=5, mode="signal")
+        result = await _wait_feature().wait(duration_seconds=5, mode="signal")
         assert result.status is ToolResultStatus.ERROR
         assert "requires a target" in result.error
 
     @pytest.mark.asyncio
     async def test_signal_mode_numeric_target_is_not_a_handle(self):
-        """A bare numeric token is a bounded sleep, not a handle — so
-        mode='signal' with it must fail the no-target validation."""
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(target="5", mode="signal")
+        result = await _wait_feature().wait(target="5", mode="signal")
         assert result.status is ToolResultStatus.ERROR
         assert "requires a target" in result.error
 
     @pytest.mark.asyncio
     async def test_invalid_mode_errors(self):
-        feature = TaskFeature(agent=None)
-        result = await feature.wait(target="task:abc", mode="bogus")
+        result = await _wait_feature().wait(target="task:abc", mode="bogus")
         assert result.status is ToolResultStatus.ERROR
         assert "mode must be 'block' or 'signal'" in result.error
 
@@ -201,18 +190,8 @@ class TestWaitModeSignal:
     async def test_block_mode_is_default(self, tmp_path):
         """Default mode stays blocking — no watch row is created."""
         agent = await _make_db_agent(tmp_path)
-        feature = TaskFeature(agent=None)
-        feature.agent = agent
-        await feature.post_all_features_loaded(agent)
-
-        async def fake_status(task_id):
-            return {
-                "ok": True, "task_id": task_id, "status": "completed",
-                "task_type": "demo", "artifacts": [], "message": "done",
-            }
-
-        feature._get_task_status_data = fake_status
-        result = await feature.wait(target="task:abc123", timeout_seconds=5)
+        await _register_task_provider(agent)
+        result = await _wait_feature(agent).wait(target="task:abc123", timeout_seconds=5)
         assert result.status is ToolResultStatus.OK
         # Blocking path doesn't lazily build a reconciler/watch row.
         assert getattr(agent, "_wait_reconciler", None) is None
