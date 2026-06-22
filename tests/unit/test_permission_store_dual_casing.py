@@ -49,6 +49,20 @@ def test_resolve_levels_deny_wins():
     assert _most_permissive([PermissionLevel.AUTO, PermissionLevel.DENY]) is PermissionLevel.DENY
 
 
+def test_resolve_levels_always_ask_wins_over_allow():
+    """ALWAYS_ASK is a safety rail, not a normal ASK fallback. A stale ALLOW
+    under a legacy casing must not erase the operator's intent to force a
+    prompt for destructive work."""
+    assert (
+        _most_permissive([PermissionLevel.ALWAYS_ASK, PermissionLevel.ALLOW])
+        is PermissionLevel.ALWAYS_ASK
+    )
+    assert (
+        _most_permissive([PermissionLevel.AUTO, PermissionLevel.ALWAYS_ASK])
+        is PermissionLevel.ALWAYS_ASK
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_permission_finds_pascalcase_when_queried_pascal(tmp_path):
     db_path = str(tmp_path / "perms.db")

@@ -24,7 +24,7 @@ class SetPermissionRequest(BaseModel):
     """Request to set a tool permission."""
     feature: str
     tool: Optional[str] = None
-    level: str  # "allow", "auto", "deny", "ask", "session"
+    level: str  # "allow", "auto", "always_ask", "deny", "ask", "session"
 
 
 class SetFeaturePermissionRequest(BaseModel):
@@ -234,7 +234,7 @@ async def set_tool_permission(request: Request, data: SetPermissionRequest):
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid level '{data.level}'. Use: allow, auto, deny, ask, session"
+            detail=f"Invalid level '{data.level}'. Use: allow, auto, always_ask, deny, ask, session"
         )
 
     if level == PermissionLevel.DENY:
@@ -277,7 +277,7 @@ async def set_feature_permission(request: Request, data: SetFeaturePermissionReq
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid level '{data.level}'. Use: allow, auto, deny, ask, session"
+            detail=f"Invalid level '{data.level}'. Use: allow, auto, always_ask, deny, ask, session"
         )
 
     if level == PermissionLevel.DENY:
@@ -333,19 +333,19 @@ async def get_auto_mode(request: Request):
     """
     Get global Auto mode status.
 
-    Global Auto is session-scoped. While enabled, non-DENY tool
-    permissions behave as AUTO, so human approval is skipped after
-    earlier constitutional, honesty, and security hooks do not flag.
+    Global Auto is session-scoped. While enabled, tool permissions other
+    than DENY and ALWAYS_ASK behave as AUTO, so human approval is skipped
+    after earlier constitutional, honesty, and security hooks do not flag.
     """
     security = get_security_feature(request)
     enabled = security.permission_store.get_global_auto_mode()
     return AutoModeResponse(
         enabled=enabled,
         warning=(
-            "Global Auto skips human approval for non-DENY tools when earlier "
-            "constitutional, honesty, and security hooks do not flag the call. "
-            "It is session-scoped and is not a guarantee that every risk has "
-            "been detected."
+            "Global Auto skips human approval for tools that are not DENY or "
+            "ALWAYS_ASK when earlier constitutional, honesty, and security "
+            "hooks do not flag the call. It is session-scoped and is not a "
+            "guarantee that every risk has been detected."
         ),
     )
 
@@ -356,8 +356,9 @@ async def set_auto_mode(request: Request, data: AutoModeRequest):
     """
     Enable or disable global Auto mode for this server session.
 
-    Explicit DENY permissions remain DENY. All other configured or
-    unregistered tools resolve as AUTO while this switch is enabled.
+    Explicit DENY and ALWAYS_ASK permissions remain DENY/ALWAYS_ASK. All
+    other configured or unregistered tools resolve as AUTO while this switch
+    is enabled.
     """
     security = get_security_feature(request)
     security.permission_store.set_global_auto_mode(data.enabled)
@@ -371,10 +372,10 @@ async def set_auto_mode(request: Request, data: AutoModeRequest):
     return AutoModeResponse(
         enabled=security.permission_store.get_global_auto_mode(),
         warning=(
-            "Global Auto skips human approval for non-DENY tools when earlier "
-            "constitutional, honesty, and security hooks do not flag the call. "
-            "It is session-scoped and is not a guarantee that every risk has "
-            "been detected."
+            "Global Auto skips human approval for tools that are not DENY or "
+            "ALWAYS_ASK when earlier constitutional, honesty, and security "
+            "hooks do not flag the call. It is session-scoped and is not a "
+            "guarantee that every risk has been detected."
         ),
     )
 

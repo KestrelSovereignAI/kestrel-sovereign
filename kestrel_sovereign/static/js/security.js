@@ -445,6 +445,7 @@ export const Security = {
                                     ">
                                 <option value="allow" ${tool.level === 'allow' ? 'selected' : ''}>${kicon('check-box')} Allow</option>
                                 <option value="auto" ${tool.level === 'auto' ? 'selected' : ''}>${kicon('shield')} Auto</option>
+                                <option value="always_ask" ${tool.level === 'always_ask' ? 'selected' : ''}>${kicon('question')} Always Ask</option>
                                 <option value="ask" ${tool.level === 'ask' ? 'selected' : ''}>${kicon('empty-box')} Ask</option>
                                 <option value="deny" ${tool.level === 'deny' ? 'selected' : ''}>${kicon('x-box')} Deny</option>
                             </select>
@@ -460,6 +461,7 @@ export const Security = {
         const icons = {
             'allow_all': kicon('check-box'),
             'auto_all': kicon('shield'),
+            'always_ask_all': kicon('question'),
             'deny_all': kicon('x-box'),
             'ask_all': kicon('empty-box'),
             'session_all': kicon('half-circle'),
@@ -468,6 +470,7 @@ export const Security = {
         const labels = {
             'allow_all': 'Allow All',
             'auto_all': 'Auto All',
+            'always_ask_all': 'Always Ask All',
             'deny_all': 'Deny All',
             'ask_all': 'Ask All',
             'session_all': 'Session All',
@@ -522,12 +525,13 @@ export const Security = {
     },
 
     async cycleFeaturePermission(featureName, currentState) {
-        // Cycle: mixed -> ask -> auto -> allow -> deny -> ask
+        // Cycle: mixed -> ask -> auto -> allow -> always_ask -> deny -> ask
         const nextLevel = {
             'mixed': 'ask',
             'ask_all': 'auto',
             'auto_all': 'allow',
-            'allow_all': 'deny',
+            'allow_all': 'always_ask',
+            'always_ask_all': 'deny',
             'deny_all': 'ask',
             'session_all': 'ask'
         }[currentState] || 'ask';

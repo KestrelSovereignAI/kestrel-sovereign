@@ -127,7 +127,11 @@ class SecurityHook(Hook):
             logger.info(f"Auto-denied: {feature_name}.{tool_name}")
             return HookOutput.deny(f"Blocked by policy: {feature_name}.{tool_name}")
 
-        if level in (PermissionLevel.ASK, PermissionLevel.SESSION):
+        if level in (
+            PermissionLevel.ASK,
+            PermissionLevel.ALWAYS_ASK,
+            PermissionLevel.SESSION,
+        ):
             # Queue for approval and wait.  As of #785 the queue itself
             # owns scope persistence and audit-row writes — we just need
             # to translate the (approved, scope) result into a HookOutput.

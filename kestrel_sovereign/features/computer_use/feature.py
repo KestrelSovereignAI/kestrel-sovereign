@@ -91,14 +91,9 @@ _DEFAULT_AUTO_APPROVED_BINS = ["ls", "cat", "rg"]
 # operator can authorize specific cleanups. Hard-deny on ``rm`` was
 # overcautious in an operator-in-the-loop system.
 #
-# Auto-mode interaction (per codex review on #1739, tracked at #1741):
-# the deny-list is the ONLY tier that survives global auto-mode today —
-# under auto-mode, anything not on the deny-list flows through as
-# ``PermissionLevel.AUTO`` and the queue silently approves. Operators
-# running with auto-mode ON who want ``rm`` to still prompt should
-# either (a) add ``"rm"`` to ``denied_binaries`` (hard-refuse), or
-# (b) wait for #1741's ``ALWAYS_ASK`` primitive that's exempt from
-# auto-mode downgrade.
+# Auto-mode interaction (#1741): destructive-class queue entries can use
+# ``PermissionLevel.ALWAYS_ASK`` so they still prompt under global auto-mode
+# without forcing the binary into this hard-deny list.
 _DEFAULT_DENIED_BINS = ["dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
