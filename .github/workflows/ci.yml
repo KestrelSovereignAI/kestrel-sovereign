@@ -192,6 +192,7 @@ jobs:
         timeout-minutes: 20
         env:
           KESTREL_AUDIT_MODE: skip
+          KESTREL_SKIP_REACHABILITY_PROBE: "1"
           KESTREL_DATA_KEY: "ci-test-encryption-key-32-chars!!"
           DATABASE_URL: ${{ env.DATABASE_URL }}
           REDIS_URL: ${{ env.REDIS_URL }}
