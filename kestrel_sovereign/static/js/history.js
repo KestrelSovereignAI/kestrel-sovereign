@@ -641,6 +641,7 @@ function renderAssistantWithParts(msg, content, parts) {
     const paneEl = visiblePane ? visiblePane.element : null;
     const segments = splitContentByParts(content, parts);
     let anchored = false;
+    let firstPartNode = null;
     // Every bubble of this multi-bubble message carries the same
     // ``data-message-id`` so a delete removes ALL of them, not just the anchor
     // (codex P2). Only the anchor (first rendered prose bubble) gets the id
@@ -651,7 +652,9 @@ function renderAssistantWithParts(msg, content, parts) {
     };
     for (const seg of segments) {
         if (seg.kind === 'part') {
-            tag(appendMessagePart(seg.part.type, seg.part.data, paneEl));
+            const pnode = appendMessagePart(seg.part.type, seg.part.data, paneEl);
+            tag(pnode);
+            if (!firstPartNode) firstPartNode = pnode;
             continue;
         }
         const slicedTools = sliceTools(seg.start, seg.end);
@@ -673,6 +676,44 @@ function renderAssistantWithParts(msg, content, parts) {
         tag(node);
         anchored = true;
     }
+    // A part-only message (empty/whitespace content) produced no prose anchor —
+    // attach the delete/purge controls + model footer to the first part bubble
+    // so the row stays manageable from history like every other row (codex P2).
+    if (!anchored && firstPartNode) {
+        attachAssistantControls(firstPartNode, msg.id, { model: msg.model, provider: msg.provider });
+    }
+}
+
+// #1914: attach the standard assistant-row controls (soft-delete + permanent
+// purge buttons, model footer) to an arbitrary bubble node. Used for a
+// part-only message whose anchor is a component bubble rather than a prose
+// bubble built by addMessageToChat. Mirrors addMessageToChat's affordances.
+function attachAssistantControls(node, messageId, modelMetadata) {
+    if (!node) return;
+    if (messageId) {
+        node.dataset.messageId = messageId;
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'msg-delete-btn';
+        deleteBtn.title = 'Move to trash';
+        deleteBtn.textContent = '✕';
+        deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+            window.deleteMessage(messageId, node);
+        };
+        node.appendChild(deleteBtn);
+
+        const purgeBtn = document.createElement('button');
+        purgeBtn.className = 'msg-purge-btn';
+        purgeBtn.title = 'Delete permanently (cannot be restored)';
+        purgeBtn.textContent = '⊘';
+        purgeBtn.onclick = (e) => {
+            e.stopPropagation();
+            window.purgeMessage(messageId, node);
+        };
+        node.appendChild(purgeBtn);
+    }
+    const footer = renderModelFooterHtml(modelMetadata);
+    if (footer) node.insertAdjacentHTML('beforeend', footer);
 }
 
 function addMessageToChat(
