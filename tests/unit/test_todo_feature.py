@@ -294,9 +294,12 @@ async def test_todo_rollup_counts_active_items_and_github_talon_links():
     ]
 
 
-def _other_session_node(todo_id, *, status="in_progress", **kw):
-    """A todo owned by a DIFFERENT session than the agent's active one."""
-    node = _todo_node(todo_id, status=status, **kw)
+def _other_session_node(todo_id, *, status="in_progress", scope="global", **kw):
+    """A todo owned by a DIFFERENT session than the agent's active one.
+
+    Defaults to scope='global' since cross-session rollup only surfaces
+    non-session-scoped loops."""
+    node = _todo_node(todo_id, status=status, scope=scope, **kw)
     node.properties["source_turn"] = {"turn_id": "t9", "session_id": "other-session"}
     return node
 
@@ -314,6 +317,7 @@ class TestActivePreturnItems:
             _other_session_node("todo:g1", status="in_progress"),  # other → global
             _other_session_node("todo:g2", status="waiting"),      # other → global
             _other_session_node("todo:g3", status="open"),         # other + open → excluded
+            _other_session_node("todo:g4", status="in_progress", scope="session"),  # other + session-scoped → excluded
             _todo_node("todo:done", status="done"),          # terminal → excluded
             _todo_node("todo:sup", status="open", superseded_by="todo:x"),  # superseded → excluded
         ]

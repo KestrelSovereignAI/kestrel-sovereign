@@ -221,7 +221,10 @@ class TodoFeature(Feature):
                 item_session = (item.get("source_turn") or {}).get("session_id")
                 if session_id is not None and item_session == session_id:
                     session_items.append(item)
-                elif status in {"in_progress", "waiting"}:
+                elif status in {"in_progress", "waiting"} and item.get("scope") != "session":
+                    # Cross-session rollup is for non-session-scoped loops only.
+                    # A scope='session' todo belongs to ITS conversation —
+                    # surfacing it elsewhere breaks scoping (codex review r3).
                     global_active.append(item)
         return {"session": session_items, "global_active": global_active}
 
