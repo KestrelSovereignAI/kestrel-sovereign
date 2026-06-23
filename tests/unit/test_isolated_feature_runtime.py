@@ -244,6 +244,13 @@ async def test_route_link_qr_persists_png_and_emits_sse(tmp_path):
     assert data["caption"] == "Scan me"
     assert isinstance(data["ts"], int) and data["ts"] > 0
 
+    # Also recorded as sticky current-state so every new SSE client (not just
+    # the one connected now) replays it.
+    agent.set_sticky_event.assert_called_once()
+    sticky_args = agent.set_sticky_event.call_args.args
+    assert sticky_args[0] == "channel_link_qr:whatsapp"
+    assert sticky_args[1] == "channel_link_qr"
+
 
 @pytest.mark.asyncio
 async def test_route_link_qr_rejects_malformed_payloads(tmp_path):
