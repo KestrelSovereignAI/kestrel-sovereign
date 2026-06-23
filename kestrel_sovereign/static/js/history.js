@@ -9,6 +9,7 @@ import {
     updateContextStatus,
     wipeAgentChatPane,
     renderAgentContentHtml,
+    renderModelFooterHtml,
     messageAttachmentsHtml,
     handleRestartStatus,
 } from './chat.js';
@@ -465,6 +466,9 @@ window.loadConversation = async function(sessionId) {
                 // #1662: user-turn attachment refs (persisted on metadata) so
                 // their thumbnails survive a reload.
                 msg.role === 'user' ? (msg.metadata?.attachments || null) : null,
+                msg.role === 'assistant'
+                    ? { model: msg.model, provider: msg.provider }
+                    : null,
             );
         });
 
@@ -600,6 +604,7 @@ function addMessageToChat(
     preludeContent = '',
     bodyHtml = null,
     attachments = null,
+    modelMetadata = null,
 ) {
     // Append into the visible (mounted) agent's pane element — the
     // viewport (#chat-container) is now the scroll host and panes are
@@ -720,6 +725,10 @@ function addMessageToChat(
         if (attachments && attachments.length) {
             const stripHtml = messageAttachmentsHtml(attachments);
             if (stripHtml) messageDiv.insertAdjacentHTML('beforeend', stripHtml);
+        }
+        if (role === 'assistant') {
+            const footer = renderModelFooterHtml(modelMetadata);
+            if (footer) messageDiv.insertAdjacentHTML('beforeend', footer);
         }
     }
 

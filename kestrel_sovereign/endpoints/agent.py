@@ -142,7 +142,14 @@ async def invoke_agent(request: Request):
             session_id=effective_session_id,
             caller=caller,
         )
-        return {"response": response, "session_id": effective_session_id}
+        # Extract model/provider identity for frontend footer rendering (#1373)
+        identity = agent._conversation_response_identity(use_last_identity=True)
+        return {
+            "response": response,
+            "session_id": effective_session_id,
+            "model": identity.get("model"),
+            "provider": identity.get("provider"),
+        }
     except HTTPException:
         raise
     except Exception as e:
