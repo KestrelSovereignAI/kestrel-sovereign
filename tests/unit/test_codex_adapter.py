@@ -154,10 +154,10 @@ class TestTurnInputBuilder:
             },
         ])
         assert out == [
-            {"type": "input_text", "text": "What is shown?"},
+            {"type": "text", "text": "What is shown?"},
             {
-                "type": "input_image",
-                "image_url": "data:image/png;base64,AAAA",
+                "type": "image",
+                "url": "data:image/png;base64,AAAA",
                 "detail": "low",
             },
         ]
@@ -177,8 +177,8 @@ class TestTurnInputBuilder:
             fresh_thread=False,
         )
         assert out == [
-            {"type": "input_text", "text": "Describe this"},
-            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "text", "text": "Describe this"},
+            {"type": "image", "url": "data:image/png;base64,AAAA"},
         ]
 
     def test_fresh_thread_keeps_transcript_then_multimodal_parts(self):
@@ -200,12 +200,12 @@ class TestTurnInputBuilder:
             fresh_thread=True,
         )
         assert isinstance(out, list)
-        assert out[0]["type"] == "input_text"
+        assert out[0]["type"] == "text"
         assert "Conversation so far" in out[0]["text"]
         assert "user: remember: tortoise" in out[0]["text"]
         assert out[1:] == [
-            {"type": "input_text", "text": "What color is this?"},
-            {"type": "input_image", "image_url": "data:image/png;base64,BBBB"},
+            {"type": "text", "text": "What color is this?"},
+            {"type": "image", "url": "data:image/png;base64,BBBB"},
         ]
 
 
@@ -445,8 +445,8 @@ class TestAdapterTextPath:
             if method == "turn/start"
         ][0]
         assert turn_params["input"] == [
-            {"type": "input_text", "text": "Describe this image."},
-            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "text", "text": "Describe this image."},
+            {"type": "image", "url": "data:image/png;base64,AAAA"},
         ]
 
     @pytest.mark.asyncio

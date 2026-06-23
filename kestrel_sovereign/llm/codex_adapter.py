@@ -196,7 +196,7 @@ def _content_to_codex_input_parts(content: Any) -> List[Dict[str, Any]]:
     (``{"type": "image_url", "image_url": {"url": "data:..."}}``). Codex's
     app-server expects turn input where the matching text part is
     ``{"type": "text", "text": "..."}`` and image part is
-    ``{"type": "image", "image_url": "data:..."}``.
+    ``{"type": "image", "url": "data:..."}``.
     """
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
@@ -224,7 +224,7 @@ def _content_to_codex_input_parts(content: Any) -> List[Dict[str, Any]]:
             if url:
                 item: Dict[str, Any] = {
                     "type": "image",
-                    "image_url": url,
+                    "url": url,
                 }
                 if detail:
                     item["detail"] = detail

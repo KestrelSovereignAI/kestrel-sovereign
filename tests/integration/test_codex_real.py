@@ -108,10 +108,10 @@ async def test_vision_call_gpt55_real():
     """Live multimodal smoke: Chat image_url input reaches Codex as an
     input_image part and the model can answer from the image."""
     adapter = CodexAdapter()
+    # 10x10 solid red PNG (more reliably identified than 1x1)
     red_png = (
         "data:image/png;base64,"
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4"
-        "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAE0lEQVR4nGP8z4APMOGVZRip0gBBLAETee26JgAAAABJRU5ErkJggg=="
     )
     try:
         resp = await adapter.get_response(
