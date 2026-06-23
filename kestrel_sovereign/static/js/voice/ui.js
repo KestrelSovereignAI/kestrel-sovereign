@@ -24,7 +24,7 @@
  */
 
 import API from '../api.js';
-import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml } from '../chat.js';
+import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml, subscribeSSE } from '../chat.js';
 import { getOrCreateChatPane } from '../ui.js';
 import { Events } from './events.js';
 import {
@@ -249,6 +249,29 @@ export function initVoiceUI() {
   window.addEventListener('pagehide', onLeave);
   window.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') onLeave();
+  });
+
+  // Progressive tool disclosure (#1315): subscribe to tool updates from the
+  // backend. When the orchestrator explores a feature for the first time,
+  // it emits a tools_updated event. For realtime sessions, we forward this
+  // as a session.update over the data channel to refresh the LLM's tool set.
+  subscribeSSE('tools_updated', (evt) => {
+    try {
+      const data = JSON.parse(evt.data);
+      const { tools } = data;
+
+      // Apply to the active realtime session (if any)
+      const session = activeSession();
+      if (!session?.client || session.client.path !== 'realtime') return;
+
+      // Call updateTools on the realtime client to push the new tool list
+      // over the WebRTC data channel as a session.update message
+      if (typeof session.client.updateTools === 'function') {
+        session.client.updateTools(tools);
+      }
+    } catch (err) {
+      console.error('Failed to handle tools_updated event:', err);
+    }
   });
 }
 

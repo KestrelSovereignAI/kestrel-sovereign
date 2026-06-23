@@ -1097,6 +1097,11 @@ class OrchestratorEngineMixin:
         exec_duration_ms = int((time.time() - exec_start) * 1000)
         self._register_explored_feature_tools(feature)
 
+        # Emit tool update event for progressive disclosure (#1315)
+        # After exploring a feature for the first time, notify connected clients
+        # (particularly realtime voice sessions) of the updated tool registry
+        await self._emit_tool_update_event(session_id)
+
         # --- POST_TOOL_USE hook (inner envelope; parity with chat path) ---
         inner_post = HookInput(
             session_id=session_id,
@@ -1145,6 +1150,33 @@ class OrchestratorEngineMixin:
         await self.hooks_manager.execute_hooks_parallel(
             HookEvent.POST_SUBAGENT_CALL, post_input,
         )
+
+    async def _emit_tool_update_event(self, session_id: str) -> None:
+        """Emit a tools_updated SSE event for progressive disclosure (#1315).
+
+        Called after _register_explored_feature_tools to notify connected
+        clients (particularly realtime voice sessions) that the bounded tool
+        registry has changed. Clients can then push a session.update over
+        their data channel to refresh the LLM's advertised tool set.
+        """
+        try:
+            # Build the updated bounded tool list (same view the voice session
+            # would get on initial mint)
+            tools = self.build_progressive_tool_schemas(
+                include_direct_tools=False,
+                max_direct_tools=60,
+            )
+
+            await self.emit_event("tools_updated", {
+                "session_id": session_id,
+                "tools": tools,
+            })
+        except Exception as e:
+            # Never let event emission break the tool execution path
+            logging.warning(
+                "Failed to emit tools_updated event for session %s: %s",
+                session_id, e, exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Shared helpers used by both streaming and non-streaming loops
