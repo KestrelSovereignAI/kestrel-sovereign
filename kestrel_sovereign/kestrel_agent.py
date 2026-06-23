@@ -1995,7 +1995,9 @@ Expected Duration: {expected_duration}
             # DISCOVERY branch (below) and the normal process_input
             # path.
             await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
-            await self.privacy_agent.add_conversation("assistant", wake_up_msg, session_id=session_id)
+            await self._persist_assistant_conversation(
+                wake_up_msg, session_id=session_id,
+            )
 
             logging.info(f"[BOOTSTRAP] Agent waking up - entering discovery mode")
             return wake_up_msg
@@ -2072,7 +2074,12 @@ Expected Duration: {expected_duration}
 
             # Store user message and response in conversation history
             await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
-            await self.privacy_agent.add_conversation("assistant", response, session_id=session_id)
+            await self._persist_assistant_conversation(
+                response,
+                session_id=session_id,
+                response=response,
+                use_last_identity=True,
+            )
 
             if is_complete:
                 if wants_avatar:
@@ -2093,7 +2100,9 @@ Expected Duration: {expected_duration}
                             logging.warning(f"Failed to generate avatar: {e}", exc_info=True)
                             completion_msg += "\n\n(Avatar generation had an issue - you can try again with !avatar)"
 
-                    await self.privacy_agent.add_conversation("assistant", completion_msg, session_id=session_id)
+                    await self._persist_assistant_conversation(
+                        completion_msg, session_id=session_id,
+                    )
                     await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                     # Reload SOUL.md into context builder
                     if hasattr(self, 'context_builder'):
@@ -2103,7 +2112,9 @@ Expected Duration: {expected_duration}
                 else:
                     # Discovery complete without avatar
                     completion_msg = await self.bootstrap_service.complete_bootstrap()
-                    await self.privacy_agent.add_conversation("assistant", completion_msg, session_id=session_id)
+                    await self._persist_assistant_conversation(
+                        completion_msg, session_id=session_id,
+                    )
                     await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                     # Reload SOUL.md into context builder
                     if hasattr(self, 'context_builder'):
@@ -2400,6 +2411,54 @@ Expected Duration: {expected_duration}
             ):
                 return adapter
         return None
+
+    def _conversation_response_identity(
+        self,
+        response=None,
+        *,
+        use_last_identity: bool = False,
+    ) -> dict:
+        """Return the resolved provider/model for the latest LLM response."""
+        model = getattr(response, "model", None) if response is not None else None
+        provider = (
+            getattr(response, "provider", None) if response is not None else None
+        )
+        if use_last_identity and (not model or not provider):
+            llm = getattr(self, "llm_service", None)
+            get_identity = getattr(llm, "get_last_response_identity", None)
+            if callable(get_identity):
+                identity = get_identity() or {}
+                model = model or identity.get("model")
+                provider = provider or identity.get("provider")
+        return {"model": model, "provider": provider}
+
+    async def _persist_assistant_conversation(
+        self,
+        content: str,
+        *,
+        session_id: Optional[str] = None,
+        response=None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        use_last_identity: bool = False,
+    ) -> None:
+        """Persist an assistant row with resolved model/provider columns."""
+        identity = self._conversation_response_identity(
+            response,
+            use_last_identity=use_last_identity or response is not None,
+        )
+        kwargs = {"session_id": session_id}
+        resolved_model = model or identity.get("model")
+        resolved_provider = provider or identity.get("provider")
+        if resolved_model is not None:
+            kwargs["model"] = resolved_model
+        if resolved_provider is not None:
+            kwargs["provider"] = resolved_provider
+        await self.privacy_agent.add_conversation(
+            "assistant",
+            content,
+            **kwargs,
+        )
 
     async def _maybe_compact_codex_thread(
         self, session_id: Optional[str],
@@ -2851,7 +2910,9 @@ Expected Duration: {expected_duration}
                 response_text = hook_output.updated_input["response_text"]
 
         # Store agent response (linked to session for resumed conversations)
-        await self.privacy_agent.add_conversation("assistant", response_text, session_id=session_id)
+        await self._persist_assistant_conversation(
+            response_text, session_id=session_id, response=response,
+        )
 
         # Post-response memory pipeline:
         # Phase 1 (sync): Emotional tagging — CPU-bound, safe inline

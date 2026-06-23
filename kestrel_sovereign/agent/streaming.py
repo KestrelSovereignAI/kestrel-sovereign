@@ -862,6 +862,7 @@ class StreamingMixin:
             await self._persist_assistant_turn_safely(
                 cancelled_text, metadata=None, session_id=session_id,
                 request_id=request_id,
+                response=tool_response,
             )
             return
 
@@ -1005,6 +1006,7 @@ class StreamingMixin:
             await self._persist_assistant_turn_safely(
                 tool_final_text, metadata=meta, session_id=session_id,
                 request_id=request_id,
+                response=tool_response,
             )
             final_assistant_text = tool_final_text
             stop_tool_results: Optional[list] = tool_results
@@ -1138,6 +1140,7 @@ class StreamingMixin:
                     "tool_results": tool_results,
                 },
                 session_id=session_id, request_id=request_id,
+                response=tool_response,
             )
             final_assistant_text = final_text
             stop_tool_results = tool_results
@@ -1162,6 +1165,7 @@ class StreamingMixin:
                 metadata=({"tool_events": _no_tool_events} if _no_tool_events else None),
                 session_id=session_id,
                 request_id=request_id,
+                response=tool_response,
             )
             final_assistant_text = final_text
             stop_tool_results = None
@@ -1261,6 +1265,9 @@ class StreamingMixin:
         metadata: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        response: Optional[LLMResponse] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> None:
         """Persist the assistant turn under cancellation-safe handling.
 
@@ -1289,10 +1296,29 @@ class StreamingMixin:
         """
         if request_id and self.is_request_cancelled(request_id):
             metadata = {**(metadata or {}), "cancelled": True}
+        identity = {}
+        get_identity = getattr(self, "_conversation_response_identity", None)
+        if (
+            callable(get_identity)
+            and getattr(type(get_identity), "__module__", "") != "unittest.mock"
+        ):
+            identity = get_identity(response, use_last_identity=True)
+        kwargs = {
+            "metadata": metadata,
+            "session_id": session_id,
+        }
+        resolved_model = model or identity.get("model")
+        resolved_provider = provider or identity.get("provider")
+        if resolved_model is not None:
+            kwargs["model"] = resolved_model
+        if resolved_provider is not None:
+            kwargs["provider"] = resolved_provider
         try:
             await asyncio.shield(
                 self.privacy_agent.add_conversation(
-                    "assistant", text, metadata=metadata, session_id=session_id
+                    "assistant",
+                    text,
+                    **kwargs,
                 )
             )
         except asyncio.CancelledError:

@@ -209,7 +209,9 @@ class AsyncStorage:
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
                                session_id: Optional[str] = None,
-                               rendered_content: Optional[str] = None) -> None:
+                               rendered_content: Optional[str] = None,
+                               model: Optional[str] = None,
+                               provider: Optional[str] = None) -> None:
         """Add a conversation message.
 
         Args:
@@ -220,12 +222,16 @@ class AsyncStorage:
                        This allows resuming old conversations beyond the 30-min gap.
             rendered_content: Write-once transport bytes for byte-stable
                 cache replay (#1402); see AsyncConversationStore.add_conversation.
+            model: Concrete model that produced this message.
+            provider: Resolved provider route that produced this message.
         """
         if not self._initialized:
             await self.initialize()
         await self.conversation.add_conversation(
             role, content, metadata, session_id,
             rendered_content=rendered_content,
+            model=model,
+            provider=provider,
         )
     
     async def get_conversation_history(
@@ -694,16 +700,34 @@ class AsyncStorage:
                 # Use async database to read from backup
                 import aiosqlite
                 async with aiosqlite.connect(backup_db_path) as backup_conn:
+                    info_cursor = await backup_conn.execute(
+                        "PRAGMA table_info(conversation_history)"
+                    )
+                    backup_info = await info_cursor.fetchall()
+                    backup_cols = [
+                        row[1]
+                        for row in backup_info
+                    ]
+                    has_model = "model" in backup_cols
+                    has_provider = "provider" in backup_cols
                     cursor = await backup_conn.execute(
-                        "SELECT role, content, metadata FROM conversation_history"
+                        "SELECT role, content, metadata"
+                        + (", model" if has_model else ", NULL AS model")
+                        + (", provider" if has_provider else ", NULL AS provider")
+                        + " FROM conversation_history"
                     )
                     conversations = await cursor.fetchall()
 
-                    for role, content, metadata_json in conversations:
+                    for role, content, metadata_json, model, provider in conversations:
                         # Insert directly into current database with agent_id
                         await self.db.execute_commit(
-                            f"INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, {self._now_sql()})",
-                            (self.agent_id, role, content, metadata_json)
+                            f"INSERT INTO conversation_history "
+                            f"(agent_id, role, content, model, provider, metadata, created_at) "
+                            f"VALUES (?, ?, ?, ?, ?, ?, {self._now_sql()})",
+                            (
+                                self.agent_id, role, content, model, provider,
+                                metadata_json,
+                            )
                         )
                         stats["messages_restored"] += 1
         finally:

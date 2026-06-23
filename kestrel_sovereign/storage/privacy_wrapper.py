@@ -359,7 +359,9 @@ class PrivacyEnforcingStorage:
     
     async def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = None,
                                session_id: Optional[str] = None,
-                               rendered_content: Optional[str] = None) -> None:
+                               rendered_content: Optional[str] = None,
+                               model: Optional[str] = None,
+                               provider: Optional[str] = None) -> None:
         """
         Add a conversation entry, respecting privacy mode.
 
@@ -403,7 +405,9 @@ class PrivacyEnforcingStorage:
                 "role": role,
                 "content": processed_content,
                 "metadata": metadata,
-                "session_id": session_id
+                "session_id": session_id,
+                "model": model,
+                "provider": provider,
             }
             if processed_rendered is not None:
                 entry["rendered_content"] = processed_rendered
@@ -414,6 +418,8 @@ class PrivacyEnforcingStorage:
             await self._storage.add_conversation(
                 role, processed_content, metadata, session_id,
                 rendered_content=processed_rendered,
+                model=model,
+                provider=provider,
             )
     
     async def resolve_session_id(self, provided: Optional[str]) -> Optional[str]:
@@ -475,6 +481,8 @@ class PrivacyEnforcingStorage:
                 conv.get("metadata"),
                 conv.get("session_id"),
                 rendered_content=conv.get("rendered_content"),
+                model=conv.get("model"),
+                provider=conv.get("provider"),
             )
             count += 1
         self._session_conversations.clear()
@@ -625,7 +633,8 @@ class PrivacyEnforcingStorage:
         In ISOLATED mode, returns session-local conversations as tuple rows.
         In other modes, queries the persistent database.
 
-        Returns rows as tuples: (id, role, content, metadata, created_at)
+        Returns rows as tuples:
+        (id, role, content, metadata, created_at, model, provider)
         """
         bounded_limit = max(1, min(int(limit), 1000))
 
@@ -643,11 +652,13 @@ class PrivacyEnforcingStorage:
                     conv.get("content", ""),
                     json.dumps(conv.get("metadata", {})) if conv.get("metadata") else None,
                     conv.get("created_at", None),
+                    conv.get("model"),
+                    conv.get("provider"),
                 ))
             return rows
 
         return await self._storage.db.fetchall("""
-            SELECT id, role, content, metadata, created_at
+            SELECT id, role, content, metadata, created_at, model, provider
             FROM conversation_history
             WHERE agent_id = ? AND deleted_at IS NULL
             ORDER BY created_at DESC
@@ -697,7 +708,8 @@ class PrivacyEnforcingStorage:
         """
         Get conversation messages starting from a given time, respecting privacy.
 
-        Returns rows as tuples: (id, role, content, metadata, created_at)
+        Returns rows as tuples:
+        (id, role, content, metadata, created_at, model, provider)
         """
         if self._privacy_config.is_ephemeral():
             return []
@@ -711,11 +723,13 @@ class PrivacyEnforcingStorage:
                     conv.get("content", ""),
                     json.dumps(conv.get("metadata", {})) if conv.get("metadata") else None,
                     conv.get("created_at", None),
+                    conv.get("model"),
+                    conv.get("provider"),
                 ))
             return rows[:limit]
 
         return await self._storage.db.fetchall("""
-            SELECT id, role, content, metadata, created_at
+            SELECT id, role, content, metadata, created_at, model, provider
             FROM conversation_history
             WHERE agent_id = ? AND created_at >= ? AND deleted_at IS NULL
             ORDER BY created_at ASC

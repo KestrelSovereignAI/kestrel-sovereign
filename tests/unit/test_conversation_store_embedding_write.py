@@ -97,9 +97,9 @@ def test_format_pgvector_text_round_trips():
 @pytest.mark.asyncio
 async def test_add_conversation_without_service_uses_legacy_insert():
     """No embedding service on the active provider (e.g. Anthropic,
-    which has no embedding API) — emit the pre-existing column list
+    which has no embedding API) — emit the non-vector column list
     (no ``embedding_vec``) so a deployment without an embedding-capable
-    provider keeps working unchanged."""
+    provider still persists chat rows."""
     store, db = _make_store(embedding_service=None)
     await store.add_conversation(role="assistant", content="hello world")
 
@@ -107,8 +107,26 @@ async def test_add_conversation_without_service_uses_legacy_insert():
     assert "embedding_vec" not in sql, (
         f"legacy path must omit embedding_vec column, got: {sql!r}"
     )
-    # 5 bound positional params (agent_id, role, content, rendered_content, metadata).
-    assert len(params) == 5
+    # 7 bound positional params:
+    # agent_id, role, content, rendered_content, model, provider, metadata.
+    assert len(params) == 7
+
+
+@pytest.mark.asyncio
+async def test_add_conversation_writes_model_provider_columns():
+    store, db = _make_store(embedding_service=None)
+    await store.add_conversation(
+        role="assistant",
+        content="hello world",
+        model="gpt-5.5",
+        provider="openai:plan",
+    )
+
+    sql, params = _insert_call(db)
+    assert "model" in sql
+    assert "provider" in sql
+    assert params[4] == "gpt-5.5"
+    assert params[5] == "openai:plan"
 
 
 # ----------------------------------------------------------------- embed write path
@@ -297,7 +315,7 @@ async def test_add_conversation_falls_back_when_migration_not_run(
     With #1477 the write path tries three shapes in order:
     1. ``embedding_vec`` + ``embedding_profile_id`` — fails (no vec col).
     2. ``embedding_vec`` only — also fails (no vec col).
-    3. legacy column list — succeeds.
+    3. non-vector column list — succeeds.
 
     The row must still land regardless."""
     embedding = [0.1, 0.2, 0.3, 0.4]
