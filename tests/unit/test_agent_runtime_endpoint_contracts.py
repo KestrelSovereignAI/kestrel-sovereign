@@ -94,9 +94,9 @@ def test_context_status_reports_whole_window_utilization_and_warning_band():
     bands key off the whole-window figure. Codex-reviewed change to
     the endpoint contract (PR #1306, Emma-acked)."""
     history = [
-        {"content": "a" * 1000},
-        {"content": "b" * 1200},
-        {"content": "c" * 700},
+        {"role": "user", "content": "a" * 1000},
+        {"role": "assistant", "content": "b" * 1200, "model": "gpt-5", "provider": "openai:api"},
+        {"role": "user", "content": "c" * 700},
     ]
     agent = MagicMock()
     agent.get_current_model = MagicMock(return_value="gpt-5")
@@ -108,27 +108,36 @@ def test_context_status_reports_whole_window_utilization_and_warning_band():
     # Endpoint now delegates to ContextBuilder.measure_context_breakdown
     # (#1308 source of truth). Stub it to a payload that produces ~97%
     # utilization so the critical-band logic kicks in.
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(2900, 2976)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=4000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    response = client.get(
-                        "/api/agent/context-status?session_id=session-1",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=4000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        response = client.get(
+                            "/api/agent/context-status?session_id=session-1",
+                            headers=_api_headers(),
+                        )
         assert response.status_code == 200
         payload = response.json()
+        # #1372: context status now returns per-turn model/provider identity
         assert payload["model"] == "gpt-5"
+        assert payload["provider"] == "openai:api"
+        assert payload["context_model"] == "openai:api/gpt-5"
+        assert payload["model_source"] == "assistant_turn"
         assert payload["message_count"] == 3
         assert payload["total_tokens"] == 2900
         assert payload["context_limit"] == 4000
@@ -149,8 +158,8 @@ def test_context_status_reports_whole_window_utilization_and_warning_band():
             session_id="session-1",
         )
         # ``include_rag=False`` is the cheap-poll default.
-        ctx_builder.measure_context_breakdown.assert_awaited_once()
-        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        ctx_builder_mock.measure_context_breakdown.assert_awaited_once()
+        kw = ctx_builder_mock.measure_context_breakdown.call_args.kwargs
         assert kw["include_rag"] is False
         assert kw["memory_retriever"] is None
     finally:
@@ -625,7 +634,11 @@ def test_context_status_returns_idle_shape_when_no_session_id():
         # Model / limits should still reflect the agent's configuration so
         # the UI can decide what budget to show when a session eventually
         # IS selected.
+        # #1372: idle shape returns current preference, not per-turn stamp
         assert payload["model"] == "gpt-5"
+        assert payload["provider"] is None
+        assert payload["context_model"] == "gpt-5"
+        assert payload["model_source"] == "current_preference"
         assert payload["context_limit"] == 4000
         assert payload["response_reserve"] == 1024
         assert payload["total_budget"] == 4000 - 1024
