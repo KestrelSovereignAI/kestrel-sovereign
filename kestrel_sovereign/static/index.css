@@ -70,6 +70,10 @@ nav {
     box-shadow: var(--card-shadow);
 }
 
+.console-chrome-hidden nav {
+    display: none;
+}
+
 .nav-brand {
     display: flex;
     align-items: center;

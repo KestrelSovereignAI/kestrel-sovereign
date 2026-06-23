@@ -5,12 +5,17 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 
 import {
     createApiClient,
     resolveCapability,
     CAPABILITY_KEYS,
 } from '../../kestrel_sovereign/static/js/api_client.mjs';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 function createStorage(initial = {}) {
     const store = new Map(Object.entries(initial));
@@ -63,7 +68,7 @@ test('CAPABILITY_KEYS lists every canonical key from the issue', () => {
     // ships, add its key here and have the panel guard its init() with
     // API.hasCapability(key).
     const expected = [
-        'chat', 'identity', 'constitution', 'privacy', 'memory', 'tasks',
+        'chrome', 'chat', 'identity', 'constitution', 'privacy', 'memory', 'tasks',
         'sovereignty', 'storage', 'wallet', 'conversations', 'keys',
         'audit', 'permissions', 'multi_agent', 'spawn', 'featureStore', 'metrics',
         'voice',
@@ -192,6 +197,33 @@ test('loadConversations short-circuits when conversations capability is off', ()
 test('voice capability defaults on and respects host opt-out', () => {
     assert.equal(makeClient().hasCapability('voice'), true);
     assert.equal(makeClient({ capabilities: { voice: false } }).hasCapability('voice'), false);
+});
+
+test('chrome:false hides console chrome without disabling chat', () => {
+    const client = makeClient({ capabilities: { chrome: false, chat: true } });
+    assert.equal(client.hasCapability('chrome'), false);
+    assert.equal(client.hasCapability('chat'), true);
+
+    const appSrc = readFileSync(
+        resolve(here, '../../kestrel_sovereign/static/js/app.js'),
+        'utf8',
+    );
+    assert.match(appSrc, /hasCapability\('chrome'\)/);
+    assert.match(appSrc, /console-chrome-hidden/);
+
+    const css = readFileSync(
+        resolve(here, '../../kestrel_sovereign/static/index.css'),
+        'utf8',
+    );
+    assert.match(css, /\.console-chrome-hidden\s+nav\s*\{[\s\S]*display:\s*none;/);
+
+    const html = readFileSync(
+        resolve(here, '../../kestrel_sovereign/static/index.html'),
+        'utf8',
+    );
+    assert.match(html, /<nav>/);
+    assert.match(html, /class="nav-brand"/);
+    assert.match(html, /class="panel active" id="panel-chat"/);
 });
 
 // --- nav rendering: initNavigation removes hidden tabs from the DOM ---

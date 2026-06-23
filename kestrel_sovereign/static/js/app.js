@@ -45,6 +45,10 @@ async function init() {
     // Initialize authentication first (fetches API key from server)
     await API.init();
 
+    if (!API.hasCapability('chrome')) {
+        document.body.classList.add('console-chrome-hidden');
+    }
+
     // Set up lazy loaders for navigation (panels loaded on tab click)
     setLazyLoaders({
         loadConstitution,
