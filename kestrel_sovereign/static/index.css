@@ -378,8 +378,13 @@ nav {
     background: var(--bg-tertiary);
 }
 
+.conversation-item .conversation-meta-row {
+    padding-right: 2rem;
+}
+
 /* Hover-reveal delete affordance on conversation rows (#715). */
-.conversation-item .conv-delete-btn {
+.conversation-item .conv-delete-btn,
+.conversation-item .conv-rename-btn {
     display: none;
     position: absolute;
     top: 0.5rem;
@@ -396,7 +401,15 @@ nav {
     padding: 0;
 }
 
-.conversation-item:hover .conv-delete-btn {
+.conversation-item .conv-rename-btn {
+    right: 0.5rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+
+.conversation-item:hover .conv-delete-btn,
+.conversation-item:hover .conv-rename-btn {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -404,6 +417,18 @@ nav {
 
 .conversation-item .conv-delete-btn:hover {
     background: #dc2626;
+}
+
+.conversation-item .conv-rename-btn:hover {
+    background: var(--accent-color);
+    color: white;
+    border-color: var(--accent-color);
+}
+
+.conversation-item.active .conv-rename-btn {
+    background: rgba(255, 255, 255, 0.16);
+    color: white;
+    border-color: rgba(255, 255, 255, 0.35);
 }
 
 .conversation-item.active {
