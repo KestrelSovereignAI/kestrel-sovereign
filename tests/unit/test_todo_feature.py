@@ -327,6 +327,28 @@ class TestActivePreturnItems:
         assert {i["id"] for i in items["global_active"]} == {"todo:g1", "todo:g2"}
 
     @pytest.mark.asyncio
+    async def test_active_items_sorted_newest_first(self):
+        # Status-grouped gather must not bury newer in_progress under older
+        # blocked items: merged lists are recency-sorted before the display cap.
+        agent = _make_agent()
+        feature = await _make_feature(agent)
+
+        def _node(tid, status, updated):
+            n = _todo_node(tid, status=status)
+            n.properties["updated_at"] = updated
+            return n
+
+        nodes = [
+            _node("todo:old_blocked", "blocked", "2026-06-01T00:00:00+00:00"),
+            _node("todo:new_ip", "in_progress", "2026-06-22T00:00:00+00:00"),
+            _node("todo:mid_waiting", "waiting", "2026-06-10T00:00:00+00:00"),
+        ]
+        agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(return_value=nodes)
+        items = await feature.active_preturn_items()
+        ids = [i["id"] for i in items["session"]]
+        assert ids == ["todo:new_ip", "todo:mid_waiting", "todo:old_blocked"]
+
+    @pytest.mark.asyncio
     async def test_empty_when_no_active_todos(self):
         feature = await _make_feature()  # query returns [] by default
         assert await feature.active_preturn_items() == {"session": [], "global_active": []}

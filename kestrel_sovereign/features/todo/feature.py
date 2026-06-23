@@ -226,6 +226,16 @@ class TodoFeature(Feature):
                     # A scope='session' todo belongs to ITS conversation —
                     # surfacing it elsewhere breaks scoping (codex review r3).
                     global_active.append(item)
+
+        # The per-status gather concatenates results status-by-status, so the
+        # merged lists are status-grouped, not globally newest-first. Re-sort by
+        # recency so the downstream display cap surfaces the MOST RECENT active
+        # loops rather than whichever status sorted first (codex review r4).
+        def _recency(it: Dict[str, Any]) -> str:
+            return str(it.get("updated_at") or it.get("created_at") or "")
+
+        session_items.sort(key=_recency, reverse=True)
+        global_active.sort(key=_recency, reverse=True)
         return {"session": session_items, "global_active": global_active}
 
     @tool(
