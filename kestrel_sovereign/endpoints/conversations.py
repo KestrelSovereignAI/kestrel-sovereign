@@ -249,6 +249,8 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
 
         for row in rows:
             msg_id, role, content, metadata_json, created_at = row[0], row[1], row[2], row[3], row[4]
+            model = row[5] if len(row) > 5 else None
+            provider = row[6] if len(row) > 6 else None
 
             try:
                 if isinstance(created_at, str):
@@ -321,14 +323,18 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
             ):
                 display_content = extract_raw_user_content(display_content)
 
-            messages.append({
+            message = {
                 "id": msg_id,
                 "role": role,
                 "content": display_content,
                 "encrypted": is_encrypted or decryption_failed,
                 "metadata": _public_metadata(meta),
                 "created_at": timestamp.isoformat()
-            })
+            }
+            if role == "assistant":
+                message["model"] = model
+                message["provider"] = provider
+            messages.append(message)
 
             last_timestamp = timestamp
             is_first_message = False

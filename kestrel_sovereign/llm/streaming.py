@@ -721,6 +721,9 @@ class StreamingMixin:
             try:
                 self._ensure_remote_active()
                 model = self._scrub_auto(model_override) or self._remote_config.model
+                self._stamp_response_identity(
+                    None, model=model, provider="remote_gpu",
+                )
                 if hasattr(self._remote_adapter, "get_streaming_response_with_tools"):
                     async for item in self._remote_adapter.get_streaming_response_with_tools(
                         client=self._remote_client,
@@ -729,6 +732,10 @@ class StreamingMixin:
                         tools=tools,
                         cancel_token=cancel_token,
                     ):
+                        if isinstance(item, LLMResponse):
+                            self._stamp_response_identity(
+                                item, model=model, provider="remote_gpu",
+                            )
                         yield item
                     return
             except Exception as exc:
@@ -753,6 +760,9 @@ class StreamingMixin:
                 adapter = provider["adapter"]
                 model = self._resolve_concrete_model(target_model, provider)
                 provider_name = provider["name"]
+                self._stamp_response_identity(
+                    None, model=model, provider=provider_name,
+                )
 
                 logger.info(f"Attempting streaming with tools from {provider_name} with {model}")
 
@@ -803,6 +813,9 @@ class StreamingMixin:
                             **kwargs
                         ):
                             if isinstance(item, LLMResponse):
+                                self._stamp_response_identity(
+                                    item, model=model, provider=provider_name,
+                                )
                                 final_response = item
                             yield item
                     finally:
@@ -843,6 +856,9 @@ class StreamingMixin:
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
                             cancel_token=cancel_token,
+                        )
+                        self._stamp_response_identity(
+                            response, model=model, provider=provider_name,
                         )
                         # adapter.get_response does not meter (only the service's
                         # non-streaming path does), so record it here too.

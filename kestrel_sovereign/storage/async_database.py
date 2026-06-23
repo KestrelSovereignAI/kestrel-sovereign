@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     rendered_content TEXT DEFAULT NULL,
+    model TEXT DEFAULT NULL,
+    provider TEXT DEFAULT NULL,
     metadata TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP DEFAULT NULL
@@ -661,6 +663,16 @@ class AsyncDatabase:
         # them on first read.
         await self._migrate_add_column(
             "conversation_history", "rendered_content", "TEXT DEFAULT NULL"
+        )
+        # #1370: assistant messages now stamp the exact resolved
+        # route/model that produced the text. Nullable by design:
+        # legacy rows predate the signal, restore/import rows may not
+        # carry it, and UI/API consumers must tolerate missing values.
+        await self._migrate_add_column(
+            "conversation_history", "model", "TEXT DEFAULT NULL"
+        )
+        await self._migrate_add_column(
+            "conversation_history", "provider", "TEXT DEFAULT NULL"
         )
         # #1710 follow-up: if a pending A2A question observes a terminal
         # answer but fails to enqueue the local resumption signal, keep the

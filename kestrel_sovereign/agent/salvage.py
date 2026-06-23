@@ -262,12 +262,14 @@ async def salvage_messages(
             # after the insert.
             await db.execute_commit(
                 f"INSERT INTO conversation_history "
-                f"(agent_id, role, content, metadata, created_at) "
-                f"VALUES (?, ?, ?, ?, {conv_store._now_sql()})",
+                f"(agent_id, role, content, model, provider, metadata, created_at) "
+                f"VALUES (?, ?, ?, ?, ?, ?, {conv_store._now_sql()})",
                 (
                     conv_store.agent_id,
                     "system",
                     "",  # body fills in on durable-folded
+                    None,
+                    None,
                     json.dumps(marker_metadata),
                 ),
             )

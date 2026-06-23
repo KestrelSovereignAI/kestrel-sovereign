@@ -14,6 +14,7 @@ import os
 import time
 import asyncio
 import inspect
+from contextvars import ContextVar
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
@@ -59,6 +60,9 @@ from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign.telemetry import optional_span
 
 logger = logging.getLogger(__name__)
+_LAST_RESPONSE_IDENTITY: ContextVar[Optional[Dict[str, Optional[str]]]] = (
+    ContextVar("kestrel_last_response_identity", default=None)
+)
 
 
 async def _wait_for_close_result(result: Any) -> None:
@@ -338,6 +342,38 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Cleared by restarting the service (picks up rotated keys). Keys
         # are provider route names (matches provider["name"]).
         self._disabled_routes: dict[str, str] = {}
+
+    def _stamp_response_identity(
+        self,
+        response: Any,
+        *,
+        model: Optional[str],
+        provider: Optional[str],
+    ) -> None:
+        """Attach the resolved route/model to an LLM response object.
+
+        Conversation persistence needs the route that actually answered
+        after fallback, not the user's requested selector. The service is
+        the one layer that knows that value for every adapter, so it
+        records it here and exposes the same fields to callers that
+        receive a full ``LLMResponse``.
+        """
+        identity = {"model": model, "provider": provider}
+        _LAST_RESPONSE_IDENTITY.set(identity)
+        if isinstance(response, LLMResponse):
+            try:
+                setattr(response, "model", model)
+                setattr(response, "provider", provider)
+            except Exception:
+                logger.debug(
+                    "Could not stamp LLMResponse identity provider=%s model=%s",
+                    provider, model,
+                    exc_info=True,
+                )
+
+    def get_last_response_identity(self) -> Dict[str, Optional[str]]:
+        """Return the most recent resolved LLM route/model identity."""
+        return dict(_LAST_RESPONSE_IDENTITY.get() or {})
 
     def set_preference_persistence_callback(self, callback) -> None:
         """Set the persistence callback for model preference.
@@ -1724,6 +1760,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             tool_executor=tool_executor,
             cancel_token=cancel_token,
         )
+        self._stamp_response_identity(
+            response, model=model_to_use, provider=provider["name"],
+        )
 
         # Calculate duration and log to observability
         duration_ms = int((time.time() - start_time) * 1000)
@@ -2215,6 +2254,9 @@ No other text or formatting.
                         response_format=response_format,
                         cancel_token=cancel_token,
                     )
+                    self._stamp_response_identity(
+                        response, model=model, provider="remote_gpu",
+                    )
                     if llm_span:
                         llm_span.set_attribute("llm.provider", "remote_gpu")
                         llm_span.set_attribute("llm.model_used", model)
@@ -2300,6 +2342,9 @@ No other text or formatting.
                     tools=tools,
                     response_format=response_format,
                     cancel_token=cancel_token,
+                )
+                self._stamp_response_identity(
+                    response, model=model, provider="remote_gpu",
                 )
                 await self._meter_message_response(
                     response, "remote_gpu", model,
@@ -2437,6 +2482,9 @@ No other text or formatting.
                     session_id=session_id,
                     tool_executor=tool_executor,
                     cancel_token=cancel_token,
+                )
+                self._stamp_response_identity(
+                    response, model=model, provider=provider["name"],
                 )
                 await self._meter_message_response(
                     response, provider["name"], model,

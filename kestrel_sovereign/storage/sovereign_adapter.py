@@ -848,6 +848,8 @@ class SovereignStorageAdapter:
                     # backups (no key) default to NULL and get lazily split
                     # by AsyncConversationStore on first read.
                     rendered = msg.get("rendered_content")
+                    model = msg.get("model")
+                    provider = msg.get("provider")
                     # Preserve the ORIGINAL timestamp (#1725) from
                     # metadata.timestamp instead of collapsing every restored row
                     # to import-time "now" (which broke session grouping +
@@ -856,17 +858,25 @@ class SovereignStorageAdapter:
                     if created_at is not None:
                         await self.db.execute(
                             "INSERT INTO conversation_history "
-                            "(agent_id, role, content, rendered_content, metadata, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (self.agent_id, msg["role"], msg["content"], rendered,
-                             metadata_json, created_at),
+                            "(agent_id, role, content, rendered_content, model, "
+                            "provider, metadata, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                self.agent_id, msg["role"], msg["content"],
+                                rendered, model, provider, metadata_json,
+                                created_at,
+                            ),
                         )
                     else:
                         await self.db.execute(
                             f"INSERT INTO conversation_history "
-                            f"(agent_id, role, content, rendered_content, metadata, created_at) "
-                            f"VALUES (?, ?, ?, ?, ?, {self._now_sql()})",
-                            (self.agent_id, msg["role"], msg["content"], rendered, metadata_json),
+                            f"(agent_id, role, content, rendered_content, model, "
+                            f"provider, metadata, created_at) "
+                            f"VALUES (?, ?, ?, ?, ?, ?, ?, {self._now_sql()})",
+                            (
+                                self.agent_id, msg["role"], msg["content"],
+                                rendered, model, provider, metadata_json,
+                            ),
                         )
 
             # Asset restoration (#1391) — runs AFTER conversation

@@ -292,6 +292,39 @@ def test_get_conversation_filters_pre_tool_reasoning_from_metadata():
         _restore_app(app, original)
 
 
+def test_get_conversation_surfaces_assistant_model_provider():
+    now = datetime(2026, 6, 23, 10, 0, 0)
+    rows = [
+        (21, "user", "hello", "{}", now, None, None),
+        (
+            22,
+            "assistant",
+            "hi",
+            "{}",
+            now + timedelta(seconds=1),
+            "gpt-5.5",
+            "openai:plan",
+        ),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversation_start = AsyncMock(return_value=(now,))
+    storage.query_conversation_messages = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/conversations/21", headers=_api_headers())
+        assert response.status_code == 200
+        messages = response.json()["messages"]
+        assert "model" not in messages[0]
+        assert messages[1]["model"] == "gpt-5.5"
+        assert messages[1]["provider"] == "openai:plan"
+    finally:
+        _restore_app(app, original)
+
+
 def test_get_conversation_unwraps_sent_form_user_content():
     """Rows written with metadata.sent_form=True carry the full rendered
     sent-form (<retrieved_context>.../<user_input>... wrappers). The

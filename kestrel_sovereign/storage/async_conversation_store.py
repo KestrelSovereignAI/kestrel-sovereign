@@ -636,7 +636,9 @@ class AsyncConversationStore:
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
                                session_id: Optional[str] = None,
-                               rendered_content: Optional[str] = None) -> None:
+                               rendered_content: Optional[str] = None,
+                               model: Optional[str] = None,
+                               provider: Optional[str] = None) -> None:
         """Add a conversation message with per-agent encryption.
 
         Args:
@@ -654,6 +656,9 @@ class AsyncConversationStore:
                 template. The history-load path emits this verbatim so the
                 prefix bytes match what the LLM saw at send time. Encrypted
                 with the same per-agent key as ``content``.
+            model: Concrete model that produced this message. Intended for
+                assistant rows; nullable for user/system and legacy rows.
+            provider: Resolved provider route that produced this message.
         """
         meta = dict(metadata) if metadata else {}
 
@@ -719,6 +724,8 @@ class AsyncConversationStore:
             metadata=json.dumps(meta) if meta else None,
             embedding=embedding_vec_val,
             embedding_profile_id=profile_id,
+            model=model,
+            provider=provider,
         )
 
         # Upsert the profile descriptor into the registry table so
@@ -818,6 +825,8 @@ class AsyncConversationStore:
         metadata: Optional[str],
         embedding: Optional[List[float]],
         embedding_profile_id: Optional[str] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> None:
         """Persist a conversation row, optionally co-writing
         ``embedding_vec`` and ``embedding_profile_id``.
@@ -833,22 +842,27 @@ class AsyncConversationStore:
           ``PurePythonBackend`` reads back.
 
         When ``embedding`` is ``None`` (no service / failure / empty
-        content) we fall back to the legacy column list — preserving
-        bit-identical INSERT shape with prior versions so any tooling
-        sniffing the SQL surface keeps working. ``embedding_profile_id``
-        is always written alongside ``embedding_vec`` — they share
-        the same row state (#1477).
+        content) we fall back to the non-vector column list. The
+        model/provider columns stay in that base list so every
+        assistant write path can stamp the generator identity even
+        when embeddings are unavailable. ``embedding_profile_id`` is
+        always written alongside ``embedding_vec`` — they share the
+        same row state (#1477).
         """
-        base_cols = "agent_id, role, content, rendered_content, metadata, created_at"
+        base_cols = (
+            "agent_id, role, content, rendered_content, model, provider, "
+            "metadata, created_at"
+        )
         base_vals_suffix = f", {self._now_sql()}"
         base_params = (
-            self.agent_id, role, content, rendered_content, metadata,
+            self.agent_id, role, content, rendered_content, model, provider,
+            metadata,
         )
 
         if embedding is None:
             sql = (
                 f"INSERT INTO conversation_history ({base_cols}) "
-                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix})"
+                f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
             )
             await self.db.execute_commit(sql, base_params)
             return
@@ -869,7 +883,7 @@ class AsyncConversationStore:
             sql = (
                 f"INSERT INTO conversation_history "
                 f"({base_cols}, embedding_vec, embedding_profile_id) "
-                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder}, ?)"
+                f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder}, ?)"
             )
             await self.db.execute_commit(
                 sql, base_params + (emb_bind, embedding_profile_id),
@@ -891,7 +905,7 @@ class AsyncConversationStore:
                 sql = (
                     f"INSERT INTO conversation_history "
                     f"({base_cols}, embedding_vec) "
-                    f"VALUES (?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder})"
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder})"
                 )
                 await self.db.execute_commit(sql, base_params + (emb_bind,))
             except Exception as e2:
@@ -908,7 +922,7 @@ class AsyncConversationStore:
                 )
                 sql = (
                     f"INSERT INTO conversation_history ({base_cols}) "
-                    f"VALUES (?, ?, ?, ?, ?{base_vals_suffix})"
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
                 )
                 await self.db.execute_commit(sql, base_params)
 
@@ -1097,7 +1111,8 @@ class AsyncConversationStore:
             # rendered_content (#1402) appended at row[5] so existing
             # positional accesses on metadata/created_at don't shift.
             rows = await self.db.fetchall(
-                "SELECT id, role, content, metadata, created_at, rendered_content "
+                "SELECT id, role, content, metadata, created_at, rendered_content, "
+                "model, provider "
                 "FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL "
                 "ORDER BY id DESC LIMIT ?",
@@ -1138,6 +1153,10 @@ class AsyncConversationStore:
                 'content': content,
                 'created_at': row[4]
             }
+            if len(row) > 6:
+                entry['model'] = row[6]
+            if len(row) > 7:
+                entry['provider'] = row[7]
             if rendered_content is not None:
                 entry['rendered_content'] = rendered_content
             cleaned_meta = remove_enc_flag(meta)
@@ -1195,9 +1214,9 @@ class AsyncConversationStore:
 
         Returns:
             List of raw rows
-            (id, role, content, metadata, created_at, rendered_content)
-            — rendered_content (#1402) appended so existing positional
-            accesses below don't shift.
+            (id, role, content, metadata, created_at, rendered_content,
+            model, provider) — rendered_content/model/provider are appended
+            so existing positional accesses below don't shift.
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
         from datetime import datetime
@@ -1223,7 +1242,8 @@ class AsyncConversationStore:
             if start_row:
                 start_time = start_row[0]
                 all_rows = await self.db.fetchall(
-                    f"""SELECT id, role, content, metadata, created_at, rendered_content
+                    f"""SELECT id, role, content, metadata, created_at,
+                              rendered_content, model, provider
                        FROM conversation_history
                        WHERE agent_id = ? AND created_at >= ?{del_clause}
                        ORDER BY created_at ASC
@@ -1238,7 +1258,8 @@ class AsyncConversationStore:
         # an ordinary UUID this is a no-op.
         esc = _escape_like_session_value(session_id)
         resumed_rows = await self.db.fetchall(
-            f"""SELECT id, role, content, metadata, created_at, rendered_content
+            f"""SELECT id, role, content, metadata, created_at, rendered_content,
+                      model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
                ORDER BY created_at ASC
@@ -1248,7 +1269,8 @@ class AsyncConversationStore:
 
         # Also try without space after colon (JSON formatting varies)
         resumed_rows_alt = await self.db.fetchall(
-            f"""SELECT id, role, content, metadata, created_at, rendered_content
+            f"""SELECT id, role, content, metadata, created_at, rendered_content,
+                      model, provider
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
                ORDER BY created_at ASC
