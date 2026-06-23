@@ -2279,11 +2279,64 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // (welded) prose already accumulated — record absolute
                     // positions so the renderer places each card correctly.
                     const chunkBase = fullContent.length;
-                    fullContent += chunk;
-                    if (tools && tools.length) {
+                    // Record this packet's tool events (absolute positions) for
+                    // the offset range [lo, hi) of the clean chunk text.
+                    const pushToolsInRange = (lo, hi) => {
+                        if (!tools || !tools.length) return;
                         for (const t of tools) {
-                            pane.toolEvents.push({ ...t, pos: chunkBase + (t.pos || 0) });
+                            const tp = t.pos || 0;
+                            if (tp >= lo && tp < hi) {
+                                pane.toolEvents.push({ ...t, pos: chunkBase + tp });
+                            }
                         }
+                    };
+                    // #1914: paint the current streaming bubble with the live
+                    // slice; never spawns an empty bubble (so a part seal with no
+                    // trailing prose doesn't leave a blank bubble below it).
+                    const paintLiveSlice = () => {
+                        if (!(isPaneFresh() && ownsStream())) return;
+                        const baseline = pane.streamBaseline || 0;
+                        const slice = fullContent.slice(baseline);
+                        if (!slice && !paneStreamToolEvents(pane).length) return;
+                        if (!pane.streamingMsgDiv) {
+                            pane.streamingMsgDiv = addMessageStreaming('agent', pane.element);
+                        }
+                        updateStreamingMessage(
+                            pane.streamingMsgDiv, slice,
+                            pane.element, pane.thinkingItems,
+                            paneStreamToolEvents(pane),
+                        );
+                    };
+                    if (haveParts) {
+                        // #1914: a stream packet can coalesce prose + PART + more
+                        // prose. Split the chunk at each part's clean-text offset
+                        // so every component renders at its position — paint the
+                        // prose up to the part, render the part as its own bubble
+                        // (sealing the prose above it), then continue. This keeps
+                        // the live order identical to the persisted/reload order.
+                        const sortedParts = parts.slice()
+                            .sort((a, b) => (a.pos || 0) - (b.pos || 0));
+                        let segCursor = 0;
+                        for (const part of sortedParts) {
+                            const cut = Math.max(
+                                segCursor, Math.min(chunk.length, part.pos || 0),
+                            );
+                            fullContent += chunk.slice(segCursor, cut);
+                            pushToolsInRange(segCursor, cut);
+                            segCursor = cut;
+                            pane.streamRawContentLength = fullContent.length;
+                            paintLiveSlice();
+                            if (isPaneFresh() && ownsStream()) {
+                                flushStreamParts(pane, [part]);
+                            }
+                        }
+                        // Trailing prose after the last part opens a fresh bubble.
+                        fullContent += chunk.slice(segCursor);
+                        pushToolsInRange(segCursor, chunk.length);
+                        paintLiveSlice();
+                    } else {
+                        fullContent += chunk;
+                        pushToolsInRange(0, chunk.length);
                     }
                     // Advance the dynamic status word: an in-flight tool's
                     // verb, or "Writing…" once answer prose flows. A revise
@@ -2350,7 +2403,10 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // #1573: also gate on `ownsStream()` — a prior
                     // turn that was interrupted must not paint (or
                     // recreate) the new turn's bubble while it unwinds.
-                    if (isPaneFresh() && ownsStream()) {
+                    // #1914: when the packet had parts, the segmented block
+                    // above already painted every prose segment and the trailing
+                    // remainder around the part bubbles, so skip this paint.
+                    if (!haveParts && isPaneFresh() && ownsStream()) {
                         // #1560 stream-boundary: if a restart_status
                         // landed mid-stream, ``handleRestartStatus``
                         // nulled ``pane.streamingMsgDiv``; open a
@@ -2369,15 +2425,6 @@ export async function sendMessage(overrideText, overrideAgent) {
                             pane.element, pane.thinkingItems,
                             paneStreamToolEvents(pane),
                         );
-                    }
-                    // #1914: render any typed component parts in this packet as
-                    // their OWN bubbles, in stream order. Each seals the prose
-                    // bubble above it (so it lands chronologically below) and
-                    // the next prose chunk opens a fresh bubble — mirroring the
-                    // restart-status interrupt. Gated like the paint above so a
-                    // detached/superseded pane doesn't spawn stray bubbles.
-                    if (haveParts && isPaneFresh() && ownsStream()) {
-                        flushStreamParts(pane, parts);
                     }
                 }
                 if (isPaneFresh() && ownsStream() && pane.streamingMsgDiv) {
