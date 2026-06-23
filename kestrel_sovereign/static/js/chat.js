@@ -2166,6 +2166,11 @@ export async function sendMessage(overrideText, overrideAgent) {
             pane.toolEvents = [];
             pane.toolEventsBaseline = 0;
             let fullContent = '';
+            // #1914: thinking bubbles render in only ONE bubble of a
+            // multi-bubble (parts) turn. Set once the bubble that owns the
+            // reasoning is finalized, so later segments + the trailing finalize
+            // don't duplicate it.
+            let thinkingClaimed = false;
 
             try {
                 // Pass dispatchAgent EXPLICITLY to streamInvoke so the
@@ -2306,9 +2311,32 @@ export async function sendMessage(overrideText, overrideAgent) {
                         }
                         updateStreamingMessage(
                             pane.streamingMsgDiv, slice,
-                            pane.element, pane.thinkingItems,
+                            pane.element,
+                            // #1914: only the unclaimed (first) bubble shows
+                            // reasoning, so it isn't repeated in later segments.
+                            thinkingClaimed ? [] : pane.thinkingItems,
                             paneStreamToolEvents(pane),
                         );
+                    };
+                    // #1914: finalize the prose/tool bubble being sealed before a
+                    // part so its final-only render passes (mermaid/math/code
+                    // highlight) run live, not only on reload. Reasoning is folded
+                    // into whichever bubble first claims it.
+                    const finalizeBeforePart = async () => {
+                        if (!(isPaneFresh() && ownsStream() && pane.streamingMsgDiv)) return;
+                        const segBaseline = pane.streamBaseline || 0;
+                        const hasContent = fullContent.length > segBaseline;
+                        const hasCards =
+                            ((pane.toolEvents || []).length - (pane.toolEventsBaseline || 0)) > 0;
+                        if (!hasContent && !hasCards) return;
+                        const includeThinking = !thinkingClaimed;
+                        await finalizeStreamingMessage(
+                            pane.streamingMsgDiv, fullContent.slice(segBaseline), pane,
+                            { includeThinking },
+                        );
+                        if (includeThinking && pane.thinkingItems && pane.thinkingItems.length) {
+                            thinkingClaimed = true;
+                        }
                     };
                     if (haveParts) {
                         // #1914: a stream packet can coalesce prose + PART + more
@@ -2340,6 +2368,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                             segCursor = cut;
                             pane.streamRawContentLength = fullContent.length;
                             paintLiveSlice();
+                            await finalizeBeforePart();
                             if (isPaneFresh() && ownsStream()) {
                                 flushStreamParts(pane, [part]);
                             }
@@ -2450,6 +2479,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                     const slice = fullContent.slice(baseline);
                     await finalizeStreamingMessage(
                         pane.streamingMsgDiv, slice, pane,
+                        // #1914: if a pre-part bubble already claimed the
+                        // reasoning, don't duplicate it on the trailing bubble.
+                        { includeThinking: !thinkingClaimed },
                     );
                 }
                 if (isCurrentVisible()) {
@@ -3355,7 +3387,14 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     // any already shown in a pre-restart bubble.
     const toolEvents = (pane && includePaneArtifacts) ? paneStreamToolEvents(pane) : null;
     await finalizeAgentContent(contentDiv, content, toolEvents);
-    const thinkingItems = (pane && includePaneArtifacts && pane.thinkingItems) ? pane.thinkingItems : [];
+    // #1914: thinking bubbles belong to ONE bubble of a multi-bubble (parts)
+    // turn, not every sealed segment. ``includeThinking`` (defaults to
+    // ``includePaneArtifacts`` so existing callers are unchanged) lets the
+    // parts path finalize a pre-part bubble without re-prepending reasoning.
+    const includeThinking = opts.includeThinking !== undefined
+        ? opts.includeThinking
+        : includePaneArtifacts;
+    const thinkingItems = (pane && includeThinking && pane.thinkingItems) ? pane.thinkingItems : [];
     if (thinkingItems.length) {
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);
