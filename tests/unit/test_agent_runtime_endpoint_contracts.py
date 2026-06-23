@@ -177,26 +177,31 @@ def test_context_status_full_query_param_runs_rag():
     agent.llm_service = None
     agent.tool_registry = None
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(100, 2976)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=4000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    resp = client.get(
-                        "/api/agent/context-status?session_id=session-1&full=true",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=4000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        resp = client.get(
+                            "/api/agent/context-status?session_id=session-1&full=true",
+                            headers=_api_headers(),
+                        )
         assert resp.status_code == 200
-        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        kw = ctx_builder_mock.measure_context_breakdown.call_args.kwargs
         assert kw["include_rag"] is True
     finally:
         _restore_app(app, original)
@@ -234,24 +239,29 @@ def test_context_status_full_path_wires_read_only_memory_retriever():
             },
         )
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(side_effect=measured_with_memory)
-    agent.context_builder = ctx_builder
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(side_effect=measured_with_memory)
+    agent.context_builder = MagicMock()
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=4000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    resp = client.get(
-                        "/api/agent/context-status?session_id=session-1&full=true",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=4000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        resp = client.get(
+                            "/api/agent/context-status?session_id=session-1&full=true",
+                            headers=_api_headers(),
+                        )
         assert resp.status_code == 200
-        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        kw = ctx_builder_mock.measure_context_breakdown.call_args.kwargs
         assert kw["memory_retriever"] is not None
         memory_manager.retrieve_memories.assert_awaited_once_with(
             query="sunny weather",
@@ -285,26 +295,31 @@ def test_context_status_full_path_uses_last_user_turn_as_rag_query():
     agent.llm_service = None
     agent.tool_registry = None
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(50, 2976)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=4000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    resp = client.get(
-                        "/api/agent/context-status?session_id=session-1&full=true",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=4000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        resp = client.get(
+                            "/api/agent/context-status?session_id=session-1&full=true",
+                            headers=_api_headers(),
+                        )
         assert resp.status_code == 200
-        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        kw = ctx_builder_mock.measure_context_breakdown.call_args.kwargs
         # The latest user turn is wrapped in sent-form; the endpoint
         # unwraps it via ``extract_raw_user_content``. Either form
         # (raw or unwrapped "latest user question") is acceptable —
@@ -328,24 +343,29 @@ def test_context_status_full_path_labels_rag_when_no_user_turn_available():
     agent.llm_service = None
     agent.tool_registry = None
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(50, 2976)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=4000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    resp = client.get(
-                        "/api/agent/context-status?session_id=session-1&full=true",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=4000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        resp = client.get(
+                            "/api/agent/context-status?session_id=session-1&full=true",
+                            headers=_api_headers(),
+                        )
         payload = resp.json()
         rag = payload["breakdown"]["sections"]["rag"]
         assert "query_used_label" in rag
@@ -361,7 +381,10 @@ def test_context_status_surfaces_route_cap_when_binding(monkeypatch):
     fires."""
     from kestrel_sovereign.llm import model_catalog
 
-    history = [{"content": "x" * 1000}]
+    history = [
+        {"role": "user", "content": "x" * 500},
+        {"role": "assistant", "content": "y" * 500, "model": "gpt-5.5", "provider": "openai:plan"},
+    ]
     agent = MagicMock()
     agent.get_current_model = MagicMock(return_value="openai:plan/gpt-5.5")
     agent.storage.get_conversation_history = AsyncMock(return_value=history)
@@ -369,11 +392,11 @@ def test_context_status_surfaces_route_cap_when_binding(monkeypatch):
     agent.llm_service = None
     agent.tool_registry = None
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(15000, 250_000)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     fake_catalog = MagicMock()
     fake_catalog.get_route_context_cap = MagicMock(return_value=32768)
@@ -384,16 +407,21 @@ def test_context_status_surfaces_route_cap_when_binding(monkeypatch):
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=256_000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    response = client.get(
-                        "/api/agent/context-status?session_id=session-1",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=256_000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        response = client.get(
+                            "/api/agent/context-status?session_id=session-1",
+                            headers=_api_headers(),
+                        )
         assert response.status_code == 200
         payload = response.json()
         rc = payload.get("route_cap")
@@ -426,7 +454,10 @@ def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch):
     round 1 P2 on #1503)."""
     from kestrel_sovereign.llm import model_catalog
 
-    history = [{"content": "x" * 1000}]
+    history = [
+        {"role": "user", "content": "x" * 500},
+        {"role": "assistant", "content": "y" * 500, "model": "gpt-5.5", "provider": "openai:plan"},
+    ]
     agent = MagicMock()
     agent.get_current_model = MagicMock(return_value="openai:plan/gpt-5.5")
     agent.storage.get_conversation_history = AsyncMock(return_value=history)
@@ -434,11 +465,11 @@ def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch):
     agent.llm_service = None
     agent.tool_registry = None
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(15000, 250_000)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     fake_catalog = MagicMock()
     fake_catalog.get_route_context_cap = MagicMock(return_value=32768)
@@ -449,16 +480,21 @@ def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch):
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=256_000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    response = client.get(
-                        "/api/agent/context-status?session_id=session-1&full=true",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=256_000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        response = client.get(
+                            "/api/agent/context-status?session_id=session-1&full=true",
+                            headers=_api_headers(),
+                        )
         rc = response.json()["route_cap"]
         assert rc is not None
         assert rc["includes_rag"] is True
@@ -472,7 +508,10 @@ def test_context_status_route_cap_absent_when_no_cap(monkeypatch):
     indicator."""
     from kestrel_sovereign.llm import model_catalog
 
-    history = [{"content": "x" * 1000}]
+    history = [
+        {"role": "user", "content": "x" * 500},
+        {"role": "assistant", "content": "y" * 500, "model": "claude-opus-4-7", "provider": "anthropic:api"},
+    ]
     agent = MagicMock()
     agent.get_current_model = MagicMock(return_value="anthropic:api/claude-opus-4-7")
     agent.storage.get_conversation_history = AsyncMock(return_value=history)
@@ -480,11 +519,11 @@ def test_context_status_route_cap_absent_when_no_cap(monkeypatch):
     agent.llm_service = None
     agent.tool_registry = None
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(5000, 250_000)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     fake_catalog = MagicMock()
     fake_catalog.get_route_context_cap = MagicMock(return_value=None)
@@ -495,16 +534,21 @@ def test_context_status_route_cap_absent_when_no_cap(monkeypatch):
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=256_000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    response = client.get(
-                        "/api/agent/context-status?session_id=session-1",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=256_000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        response = client.get(
+                            "/api/agent/context-status?session_id=session-1",
+                            headers=_api_headers(),
+                        )
         assert response.json().get("route_cap") is None
     finally:
         _restore_app(app, original)
@@ -518,7 +562,10 @@ def test_context_status_route_cap_shown_regardless_of_model_window(monkeypatch):
     cap on the very routes TokenCounter already routes to)."""
     from kestrel_sovereign.llm import model_catalog
 
-    history = [{"content": "x" * 1000}]
+    history = [
+        {"role": "user", "content": "x" * 500},
+        {"role": "assistant", "content": "y" * 500, "model": "gpt-5.5", "provider": "openai:plan-pro"},
+    ]
     agent = MagicMock()
     agent.get_current_model = MagicMock(return_value="openai:plan-pro/gpt-5.5")
     agent.storage.get_conversation_history = AsyncMock(return_value=history)
@@ -526,11 +573,11 @@ def test_context_status_route_cap_shown_regardless_of_model_window(monkeypatch):
     agent.llm_service = None
     agent.tool_registry = None
 
-    ctx_builder = MagicMock()
-    ctx_builder.measure_context_breakdown = AsyncMock(
+    ctx_builder_mock = MagicMock()
+    ctx_builder_mock.measure_context_breakdown = AsyncMock(
         return_value=_breakdown_payload(5000, 250_000)
     )
-    agent.context_builder = ctx_builder
+    agent.context_builder = MagicMock()
 
     fake_catalog = MagicMock()
     fake_catalog.get_route_context_cap = MagicMock(return_value=512_000)
@@ -541,16 +588,21 @@ def test_context_status_route_cap_shown_regardless_of_model_window(monkeypatch):
 
     app, original = _prepare_app(agent)
     try:
+        # #1372: endpoint creates a fresh ContextBuilder with the per-turn model
         with patch(
-            "kestrel_sovereign.agent.token_counter.get_token_counter",
-            return_value=_CounterStub(context_limit=256_000),
+            "kestrel_sovereign.agent.context_builder.ContextBuilder",
+            return_value=ctx_builder_mock,
         ):
-            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
-                with TestClient(app) as client:
-                    response = client.get(
-                        "/api/agent/context-status?session_id=session-1",
-                        headers=_api_headers(),
-                    )
+            with patch(
+                "kestrel_sovereign.agent.token_counter.get_token_counter",
+                return_value=_CounterStub(context_limit=256_000),
+            ):
+                with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                    with TestClient(app) as client:
+                        response = client.get(
+                            "/api/agent/context-status?session_id=session-1",
+                            headers=_api_headers(),
+                        )
         rc = response.json()["route_cap"]
         assert rc is not None
         assert rc["route"] == "openai:plan-pro"
