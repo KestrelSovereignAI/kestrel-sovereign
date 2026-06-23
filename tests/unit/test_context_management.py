@@ -22,6 +22,7 @@ from kestrel_sovereign.agent.token_budget import (
     TokenBudget, AdaptiveTokenBudget, TokenAllocation,
     create_budget, DEFAULT_ALLOCATION, RESPONSE_RESERVE
 )
+from kestrel_sovereign.endpoints.agent import _latest_assistant_model_identity
 from kestrel_sovereign.storage.bm25_index import BM25Index, BM25_AVAILABLE
 
 
@@ -118,6 +119,48 @@ class TestTokenCounter:
         count = counter.count(text)
         # Should be ~10 tokens (40 / 4)
         assert count == 10
+
+
+class TestContextStatusModelIdentity:
+    def test_latest_assistant_stamp_drives_context_model(self):
+        history = [
+            {
+                "role": "assistant",
+                "content": "old",
+                "model": "gpt-4",
+                "provider": "openai:api",
+            },
+            {"role": "user", "content": "switching dropdown now"},
+            {
+                "role": "assistant",
+                "content": "voice",
+                "model": "gpt-4o-realtime-preview",
+                "provider": "openai:realtime",
+            },
+        ]
+
+        identity = _latest_assistant_model_identity(history)
+
+        assert identity["model"] == "gpt-4o-realtime-preview"
+        assert identity["provider"] == "openai:realtime"
+        assert identity["context_model"] == "openai:realtime/gpt-4o-realtime-preview"
+        assert identity["model_source"] == "assistant_turn"
+
+    def test_legacy_assistant_stamp_is_explicit_unknown(self):
+        identity = _latest_assistant_model_identity([
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "legacy",
+                "model": None,
+                "provider": None,
+            },
+        ])
+
+        assert identity["model"] is None
+        assert identity["provider"] is None
+        assert identity["context_model"] == "legacy/unknown"
+        assert identity["model_source"] == "legacy_assistant_turn"
 
 
 class TestTokenBudget:

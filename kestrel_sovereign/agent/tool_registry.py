@@ -78,6 +78,41 @@ class ToolRegistryMixin:
         )
         return tools
 
+    def build_progressive_tool_schemas(
+        self,
+        *,
+        include_direct_tools: bool = True,
+        max_direct_tools: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the current progressive-disclosure tool view.
+
+        Non-chat transports such as voice realtime use the same registry
+        state as the chat orchestrator: feature dispatcher tools are visible
+        first, and direct ``@tool`` schemas appear only after the feature has
+        been explored through subagent dispatch.  ``max_direct_tools`` caps the
+        direct-tool portion of this view for sessions that need a smaller
+        transport-level tool budget without mutating the chat registry.
+        """
+        tools = self._build_feature_tools()
+        if not include_direct_tools:
+            return tools
+
+        hidden_tools = self._hidden_context_tools()
+        hidden_features = self._hidden_context_features()
+        direct_tools = [
+            tool_def
+            for tool_def in self._direct_tool_defs
+            if not self._direct_tool_hidden_from_context(
+                tool_def,
+                hidden_tools=hidden_tools,
+                hidden_features=hidden_features,
+            )
+        ]
+        if max_direct_tools is not None and max_direct_tools >= 0:
+            direct_tools = direct_tools[-max_direct_tools:]
+        tools.extend(direct_tools)
+        return tools
+
     def _visible_features_by_tool_name(self) -> Dict[str, Any]:
         """Return feature dispatch targets currently visible to the LLM."""
         return {

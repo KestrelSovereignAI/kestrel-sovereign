@@ -19,6 +19,9 @@ Implemented paths:
   specifically.
 - ``HOST_MASTER_PROVISIONED`` for OpenRouter LLM — mints a per-agent
   child key under the host's master OpenRouter key.
+- ``USER_BYOK`` for OpenRouter LLM — decrypts a stored user BYOK
+  credential with a per-request passphrase and returns a no-fallback
+  resolver for that request only.
 - ``SELF_WALLET`` for Lighthouse storage — signs Lighthouse's wallet
   auth message with the agent's secp256k1 key, creates an API key, and
   stores it in ServiceKeyStorage.
@@ -133,6 +136,8 @@ class FoundationPayerResolver:
         self,
         agent_did: str,
         resource_class: ResourceClass,
+        *,
+        user_passphrase: Optional[str] = None,
     ) -> ResolvedResource:
         if not agent_did:
             raise ValueError("agent_did is required for resolve_for")
@@ -200,6 +205,47 @@ class FoundationPayerResolver:
                 "should already mark this combination NOT_IMPLEMENTED — "
                 "if you're reaching this gate, the matrix is stale or "
                 "the SDK pin is too loose."
+            )
+
+        if spec.kind is PayerKind.USER_BYOK:
+            if resource_class is not ResourceClass.LLM or spec.vendor != "openrouter":
+                raise NotImplementedError(
+                    f"PayerKind.USER_BYOK resolution for "
+                    f"({resource_class.value}, vendor={spec.vendor!r}) is not yet "
+                    "implemented. USER_BYOK currently resolves OpenRouter LLM "
+                    "credentials only."
+                )
+            if self._db is None:
+                from kestrel_sdk.payer_policy import PayerPolicyError
+
+                raise PayerPolicyError(
+                    "PayerPolicy.llm.kind = USER_BYOK for openrouter, but no "
+                    "agent database was provided. The encrypted BYOK credential "
+                    "would have nowhere to be read from."
+                )
+            if not user_passphrase:
+                from kestrel_sovereign.security.exceptions import PassphraseRequiredError
+
+                raise PassphraseRequiredError(
+                    "PayerPolicy.llm.kind = USER_BYOK requires a per-request "
+                    "user passphrase. The platform cannot decrypt this key."
+                )
+            from kestrel_sovereign.security.user_byok_key_storage import (
+                UserBYOKKeyResolutionService,
+                UserBYOKKeyStorage,
+            )
+
+            storage = UserBYOKKeyStorage(self._db, agent_did)
+            if not await storage.has_key(spec.vendor):
+                from kestrel_sdk.payer_policy import PayerPolicyError
+
+                raise PayerPolicyError(
+                    "PayerPolicy.llm.kind = USER_BYOK for openrouter, but no "
+                    "zero-knowledge BYOK key is configured for this agent."
+                )
+            return ResolvedResource(
+                enabled=True,
+                key_resolver=UserBYOKKeyResolutionService(storage, user_passphrase),
             )
 
         # Side-effect for delegated-master OpenRouter LLM: mint a per-agent

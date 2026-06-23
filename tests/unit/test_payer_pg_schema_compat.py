@@ -75,3 +75,13 @@ def test_sponsor_master_keys_conflict_targets_master_did_provider():
         "VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)"
     )
     assert _on_conflict_target(q) == "master_did, provider_id"
+
+
+def test_user_byok_keys_conflict_targets_agent_provider():
+    q = (
+        "INSERT OR REPLACE INTO user_byok_service_keys "
+        "(id, agent_did, provider_id, encrypted_key, key_salt, key_nonce, "
+        "key_hash, kdf, kdf_iterations, is_active, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'PBKDF2-SHA256', ?, 1, CURRENT_TIMESTAMP)"
+    )
+    assert _on_conflict_target(q) == "agent_did, provider_id"

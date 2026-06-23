@@ -301,7 +301,10 @@ allow-direct-references = true
 # Hatchling silently skipped the missing dirs at build time so the
 # published wheel was always correct; the listing was just misleading.
 # Caught in the Noel post-launch review (2026-05-06).
-packages = ["kestrel_sovereign"]
+packages = ["kestrel_sovereign", "kestrel_sdk"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_sovereign", "kestrel_sdk"]
 
 [tool.hatch.build.targets.sdist]
-include = ["kestrel_sovereign/**/*"]
+include = ["kestrel_sovereign/**/*", "kestrel_sdk/**/*"]

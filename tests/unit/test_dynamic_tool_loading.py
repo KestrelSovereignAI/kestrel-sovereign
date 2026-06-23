@@ -313,6 +313,51 @@ class TestBuildAllTools:
 
         assert agent._visible_features_by_tool_name() == {}
 
+    def test_progressive_tool_view_initially_exposes_only_dispatchers(self, agent):
+        """Realtime/session mint callers can avoid flattening every direct tool."""
+        feature = _make_mock_feature(
+            "model_agent",
+            [_make_mock_tool("list_models"), _make_mock_tool("get_current_model")],
+        )
+        agent.features = {"ModelAgent": feature}
+
+        tools = agent.build_progressive_tool_schemas(include_direct_tools=False)
+
+        names = [t["function"]["name"] for t in tools]
+        assert names == ["model_agent"]
+
+    def test_progressive_tool_view_adds_direct_tools_after_exploration(self, agent):
+        """After first feature dispatch, direct tools become visible in the view."""
+        feature = _make_mock_feature(
+            "model_agent",
+            [_make_mock_tool("list_models"), _make_mock_tool("get_current_model")],
+        )
+        agent.features = {"ModelAgent": feature}
+
+        agent._register_explored_feature_tools(feature)
+        tools = agent.build_progressive_tool_schemas()
+
+        names = [t["function"]["name"] for t in tools]
+        assert "model_agent" not in names
+        assert names == ["list_models", "get_current_model"]
+
+    def test_progressive_tool_view_caps_direct_tools_without_mutating_registry(self, agent):
+        """Transport sessions can keep a smaller direct-tool LRU budget."""
+        feature = _make_mock_feature(
+            "wide_feature",
+            [_make_mock_tool(f"tool_{i}") for i in range(65)],
+        )
+        agent.features = {"WideFeature": feature}
+
+        agent._register_explored_feature_tools(feature)
+        tools = agent.build_progressive_tool_schemas(max_direct_tools=60)
+
+        names = [t["function"]["name"] for t in tools]
+        assert len(names) == 60
+        assert names[0] == "tool_5"
+        assert names[-1] == "tool_64"
+        assert len(agent._direct_tools) == 65
+
     @pytest.mark.asyncio
     async def test_disable_feature_removes_runtime_tool_registrations(self, agent):
         """Runtime feature removal clears dispatchers, direct tools, and context hides."""
