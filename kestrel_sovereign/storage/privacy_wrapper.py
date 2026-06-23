@@ -552,6 +552,24 @@ class PrivacyEnforcingStorage:
         """Get incoming edges to a node."""
         return await self._storage.get_edges_to(node_id)
 
+    # === Private Agent Identity Resources ===
+
+    async def create_agent_resource_version(self, *args, **kwargs):
+        """Create a private identity-resource version."""
+        return await self._storage.create_agent_resource_version(*args, **kwargs)
+
+    async def get_current_agent_resource(self, *args, **kwargs):
+        """Read the current private identity resource."""
+        return await self._storage.get_current_agent_resource(*args, **kwargs)
+
+    async def get_agent_resource_public_metadata(self, *args, **kwargs):
+        """Read public, body-free identity-resource metadata."""
+        return await self._storage.get_agent_resource_public_metadata(*args, **kwargs)
+
+    async def promote_soul_seed(self, *args, **kwargs):
+        """Promote local SOUL.md seed/cache content into canonical storage."""
+        return await self._storage.promote_soul_seed(*args, **kwargs)
+
     # === RAG Storage ===
     
     async def chunk_document(self, content_hash: str) -> int:

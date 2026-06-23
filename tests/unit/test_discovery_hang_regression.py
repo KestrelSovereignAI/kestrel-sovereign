@@ -100,12 +100,14 @@ async def test_process_discovery_message_times_out_on_llm_hang():
     db.fetchall = AsyncMock(return_value=[])
     db.execute = AsyncMock()
 
+    mock_storage = MagicMock()
     service = BootstrapService(
         db=db,
         agent_id="did:test:hang",
         agent_name="HangAgent",
         llm_service=HangingLLM(),
         agent_data_path=None,
+        storage=mock_storage,
     )
     # Tighten the timeout for the test so we don't actually wait 60s.
     service.DISCOVERY_LLM_TIMEOUT_SECONDS = 0.5

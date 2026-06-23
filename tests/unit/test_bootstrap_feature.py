@@ -76,6 +76,7 @@ def mock_agent():
     agent.bootstrap_service.agent_name = "TestAgent"
     agent.bootstrap_service.agent_data_path = None
     agent.context_builder = MagicMock()
+    agent.context_builder.load_canonical_soul_resource = AsyncMock(return_value=True)
     return agent
 
 

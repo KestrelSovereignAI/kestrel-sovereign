@@ -22,6 +22,11 @@ from .async_conversation_store import AsyncConversationStore
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge
 from .async_rag_store import AsyncRAGStore
+from .agent_resource_store import (
+    AgentResourceStore,
+    AgentResourceVersion,
+    SOUL_MARKDOWN_RESOURCE_TYPE,
+)
 from .db import DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
@@ -116,6 +121,7 @@ class AsyncStorage:
         self.destructive_audit: Optional[DestructiveAuditLog] = None
         self.graph: Optional[AsyncGraphStore] = None
         self.rag: Optional[AsyncRAGStore] = None
+        self.agent_resources: Optional[AgentResourceStore] = None
         self._initialized = False
 
     @classmethod
@@ -167,6 +173,10 @@ class AsyncStorage:
             )
             self.graph = AsyncGraphStore(self.db)
             self.rag = AsyncRAGStore(self.db, llm_service=self.llm_service)
+            self.agent_resources = (
+                AgentResourceStore(self.db, self.agent_id)
+                if self.agent_id else None
+            )
             self._initialized = True
             logger.info(f"AsyncStorage initialized ({self.backend_type}): {self.db_path or 'PostgreSQL'}")
     
@@ -617,6 +627,113 @@ class AsyncStorage:
             await self.initialize()
         failures = await self.conversation.get_all_audit_failures()
         return await self.rag.search_case_law(query, failures, top_k)
+
+    # --- Private Agent Identity Resources ---
+
+    def _require_agent_resource_store(self) -> AgentResourceStore:
+        if not self.agent_resources:
+            raise ValueError("agent_id is required for private agent resources")
+        return self.agent_resources
+
+    async def create_agent_resource_version(
+        self,
+        resource_type: str,
+        content: str,
+        *,
+        created_by: str,
+        source: str,
+        make_current: bool = True,
+        signature: Optional[Dict[str, Any]] = None,
+        anchoring_metadata: Optional[Dict[str, Any]] = None,
+        public_metadata: Optional[Dict[str, Any]] = None,
+    ) -> AgentResourceVersion:
+        """Create an encrypted private identity-resource version."""
+        if not self._initialized:
+            await self.initialize()
+        resource = await self._require_agent_resource_store().create_version(
+            resource_type,
+            content,
+            created_by=created_by,
+            source=source,
+            make_current=make_current,
+            signature=signature,
+            anchoring_metadata=anchoring_metadata,
+            public_metadata=public_metadata,
+        )
+        if resource_type == SOUL_MARKDOWN_RESOURCE_TYPE:
+            await self._record_soul_resource_reference(resource)
+        return resource
+
+    async def get_current_agent_resource(
+        self,
+        resource_type: str = SOUL_MARKDOWN_RESOURCE_TYPE,
+    ) -> Optional[AgentResourceVersion]:
+        """Load the current encrypted private identity resource."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._require_agent_resource_store().get_current(resource_type)
+
+    async def get_agent_resource_public_metadata(
+        self,
+        resource_type: str = SOUL_MARKDOWN_RESOURCE_TYPE,
+    ) -> Optional[Dict[str, Any]]:
+        """Return hash/pointer metadata without private resource contents."""
+        if not self._initialized:
+            await self.initialize()
+        return await self._require_agent_resource_store().get_public_metadata(
+            resource_type
+        )
+
+    async def promote_soul_seed(
+        self,
+        content: str,
+        *,
+        created_by: Optional[str] = None,
+        source: str = "agent_data/SOUL.md",
+    ) -> AgentResourceVersion:
+        """Promote a local SOUL.md seed/cache body into canonical storage."""
+        if not self._initialized:
+            await self.initialize()
+        resource = await self._require_agent_resource_store().promote_soul_seed(
+            content,
+            created_by=created_by or self.agent_id,
+            source=source,
+        )
+        await self._record_soul_resource_reference(resource)
+        return resource
+
+    async def _record_soul_resource_reference(
+        self, resource: AgentResourceVersion
+    ) -> None:
+        """Record body-free KG facts that the SOUL resource exists."""
+        properties = {
+            "agent_id": self.agent_id,
+            "resource_id": resource.resource_id,
+            "resource_type": resource.resource_type,
+            "current_version": resource.version,
+            "content_hash": resource.content_hash,
+            "content_bytes": resource.content_bytes,
+            "private_body": True,
+            "created_at": datetime.now(UTC).isoformat(),
+            "provenance": resource.provenance,
+        }
+        await self.add_node(
+            GraphNode(
+                node_id=f"{self.agent_id}#soul",
+                node_type="agent_identity_resource",
+                label="Private SOUL resource",
+                properties=properties,
+            )
+        )
+        try:
+            await self.add_edge(
+                self.agent_id,
+                f"{self.agent_id}#soul",
+                "has_private_identity_resource",
+                {"resource_type": resource.resource_type},
+            )
+        except Exception:
+            logger.debug("Agent graph node missing while linking SOUL resource")
     
     # --- Backup/Restore Operations ---
     

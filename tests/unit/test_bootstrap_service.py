@@ -125,12 +125,15 @@ def temp_agent_dir(tmp_path):
 @pytest.fixture
 def bootstrap_service(mock_db, mock_llm, temp_agent_dir):
     """Create a BootstrapService for testing."""
+    # Create a minimal mock storage
+    mock_storage = MagicMock()
     return BootstrapService(
         db=mock_db,
         agent_id="did:pkh:eip155:1:0x123",
         agent_name="TestAgent",
         llm_service=mock_llm,
         agent_data_path=temp_agent_dir,
+        storage=mock_storage,
     )
 
 
@@ -604,12 +607,14 @@ class TestSkipAndRestart:
     ):
         """A DB write failure must not look like a confirmed reset."""
         db = FailingHistoryClearDB()
+        mock_storage = MagicMock()
         service = BootstrapService(
             db=db,
             agent_id="did:pkh:eip155:1:0x123",
             agent_name="TestAgent",
             llm_service=mock_llm,
             agent_data_path=temp_agent_dir,
+            storage=mock_storage,
         )
         await service._save_discovery_history([
             {"role": "user", "content": "Test message"},
