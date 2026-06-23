@@ -681,6 +681,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `GET /api/skills`
   - `GET /api/skills/{skill_id}/schema`
 - [`kestrel_sovereign/endpoints/files.py`](kestrel_sovereign/endpoints/files.py)
+  - `GET /api/agent/channels/{channel_type}/link-qr.png`
   - `GET /api/files/{content_hash}`
   - `HEAD /api/files/{content_hash}`
 - [`kestrel_sovereign/endpoints/github.py`](kestrel_sovereign/endpoints/github.py)

@@ -671,6 +671,14 @@ async def notifications_sse(request: Request):
                 for ev_type, ev_data in agent.get_pending_events():
                     yield f"event: {ev_type}\ndata: {json.dumps(ev_data)}\n\n"
 
+            # Replay sticky current-state aux events (e.g. a channel pairing QR,
+            # #1825) so EVERY new chat session shows them, not only the client
+            # connected when they were produced. Not drained — they persist
+            # until cleared (e.g. on link success).
+            if hasattr(agent, "get_sticky_events"):
+                for ev_type, ev_data in agent.get_sticky_events():
+                    yield f"event: {ev_type}\ndata: {json.dumps(ev_data)}\n\n"
+
             ping_interval = SSE_PING_INTERVAL_SECONDS
             # Wave 5C: revising events are time-sensitive — the chat
             # UI uses them to retract pre-tool prose BEFORE post-tool

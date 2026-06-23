@@ -206,6 +206,78 @@ def _isolated_runtime():
 
 
 @pytest.mark.asyncio
+async def test_route_link_qr_persists_png_and_emits_sse(tmp_path):
+    """A channel.link_qr event is written to the agent data dir as a PNG and an
+    SSE channel_link_qr event is emitted pointing at the serving endpoint."""
+    import base64
+
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    emitted = []
+
+    async def emit_event(event_type, data):
+        emitted.append((event_type, data))
+
+    agent.emit_event = emit_event
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+
+    png = b"\x89PNG\r\n\x1a\n" + b"fake-qr-bytes"
+    await feature._route_link_qr(
+        {
+            "channel_type": "WhatsApp",  # mixed case → normalized to lowercase
+            "png_b64": base64.b64encode(png).decode("ascii"),
+            "caption": "Scan me",
+        }
+    )
+
+    out = tmp_path / "agent" / "channel_link_artifacts" / "whatsapp_link_qr.png"
+    assert out.exists()
+    assert out.read_bytes() == png
+
+    assert len(emitted) == 1
+    event_type, data = emitted[0]
+    assert event_type == "channel_link_qr"
+    assert data["channel_type"] == "whatsapp"
+    assert data["path"] == "/api/agent/channels/whatsapp/link-qr.png"
+    assert data["caption"] == "Scan me"
+    assert isinstance(data["ts"], int) and data["ts"] > 0
+
+    # Also recorded as sticky current-state so every new SSE client (not just
+    # the one connected now) replays it.
+    agent.set_sticky_event.assert_called_once()
+    sticky_args = agent.set_sticky_event.call_args.args
+    assert sticky_args[0] == "channel_link_qr:whatsapp"
+    assert sticky_args[1] == "channel_link_qr"
+
+
+@pytest.mark.asyncio
+async def test_route_link_qr_rejects_malformed_payloads(tmp_path):
+    """Bad channel_type / missing PNG / traversal attempts are dropped, no emit."""
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    emitted = []
+
+    async def emit_event(event_type, data):
+        emitted.append((event_type, data))
+
+    agent.emit_event = emit_event
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+
+    # missing png
+    await feature._route_link_qr({"channel_type": "whatsapp"})
+    # path-traversal / invalid channel type
+    await feature._route_link_qr({"channel_type": "../etc", "png_b64": "AAAA"})
+    # non-dict
+    await feature._route_link_qr(None)
+
+    assert emitted == []
+    assert not (tmp_path / "agent" / "channel_link_artifacts").exists()
+
+
+@pytest.mark.asyncio
 async def test_proxy_forwards_host_config_into_client(monkeypatch, tmp_path):
     """Persisted host config is loaded and handed to the client (-> initialize handshake)."""
     agent = Mock()

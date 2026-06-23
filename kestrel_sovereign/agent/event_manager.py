@@ -349,3 +349,30 @@ class EventManagerMixin:
         drained = list(buf)
         buf.clear()
         return drained
+
+    # ------------------------------------------------------------------
+    # Sticky aux events (current-state replay)
+    # ------------------------------------------------------------------
+    #
+    # Some aux renders are CURRENT STATE, not one-shot: a channel pairing QR
+    # should appear in any chat session opened while the channel is unlinked,
+    # not only for the one client that happened to be connected when it was
+    # produced (``emit_event``'s pending buffer is drain-once). These are
+    # replayed to EVERY new SSE connection until cleared.
+
+    def set_sticky_event(self, key: str, event_type: str, data: Dict[str, Any]) -> None:
+        """Record a current-state aux event, replayed to every new SSE client."""
+        sticky = getattr(self, "_sticky_events", None)
+        if sticky is None:
+            sticky = {}
+            self._sticky_events = sticky
+        sticky[key] = (event_type, data)
+
+    def clear_sticky_event(self, key: str) -> None:
+        sticky = getattr(self, "_sticky_events", None)
+        if sticky:
+            sticky.pop(key, None)
+
+    def get_sticky_events(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return current-state aux events for replay on SSE connect (not drained)."""
+        return list(getattr(self, "_sticky_events", {}).values())

@@ -678,6 +678,13 @@ export function createApiClient({
         buildAgentUrl(path) {
             return applyHostAgentPrefix(path, state.selectedHostAgent);
         },
+        // Build a URL pinned to a SPECIFIC agent rather than the currently
+        // selected one. Needed when a request must target the agent that owns
+        // a notification stream (e.g. a QR image), not whatever pane is mounted
+        // now — the selection can change before a late SSE event is handled.
+        buildAgentUrlFor(path, agentName) {
+            return applyHostAgentPrefix(path, agentName || state.selectedHostAgent);
+        },
         getContextStatus: (sessionId = null, { full = false } = {}) => {
             const parts = [];
             if (sessionId) parts.push(`session_id=${encodeURIComponent(sessionId)}`);

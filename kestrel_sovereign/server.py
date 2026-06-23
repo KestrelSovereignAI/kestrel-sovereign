@@ -743,7 +743,14 @@ async def auth_middleware(request: Request, call_next):
         # original path if it was accessed earlier in the same middleware call chain.
         api_key_query = request.query_params.get("api_key")
         _scope_path = request.scope.get("path", request.url.path)
-        if api_key_query and any(_scope_path == p or _scope_path.endswith(p) for p in SSE_PATHS):
+        # Browser-rendered images (an <img> can't set headers) need the same
+        # query-param auth as SSE: the channel pairing-QR endpoint is fetched by
+        # `<img src=...>` from the chat. Matched narrowly by suffix so the
+        # query-key path doesn't widen to arbitrary endpoints (#1825).
+        _query_key_ok = any(
+            _scope_path == p or _scope_path.endswith(p) for p in SSE_PATHS
+        ) or _scope_path.endswith("/link-qr.png")
+        if api_key_query and _query_key_ok:
             if secrets.compare_digest(api_key_query, expected_key):
                 request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
                 return await call_next(request)

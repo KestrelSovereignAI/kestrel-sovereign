@@ -285,10 +285,14 @@ async def auth_middleware(request: Request, call_next):
     if user_email:
         return await call_next(request)
 
-    # Check query parameter for SSE endpoints only (EventSource can't send headers)
-    # Restricted to SSE paths to avoid leaking keys in URL logs on other endpoints
+    # Check query parameter for endpoints a browser fetches without headers:
+    # SSE (EventSource) and the channel pairing-QR <img> (#1825). Restricted to
+    # these suffixes to avoid leaking keys in URL logs on other endpoints.
     api_key_query = request.query_params.get("api_key")
-    if api_key_query and any(request.url.path.endswith(s) for s in SSE_PATH_SUFFIXES):
+    _query_key_ok = any(request.url.path.endswith(s) for s in SSE_PATH_SUFFIXES) or (
+        request.url.path.endswith("/link-qr.png")
+    )
+    if api_key_query and _query_key_ok:
         if secrets.compare_digest(api_key_query, expected_key):
             return await call_next(request)
 
