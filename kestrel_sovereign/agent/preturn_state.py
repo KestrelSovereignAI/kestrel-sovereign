@@ -22,6 +22,7 @@ plumbing rather than adding a parallel injection path.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -395,13 +396,27 @@ async def _active_todo_section(agent: Any) -> Optional[str]:
     if not session and not global_active:
         return None
 
+    def _inert(text: Any, max_len: int) -> str:
+        # Todo title/terminal_condition are free-form and (transitively)
+        # user-influenceable, but get injected into system context on EVERY
+        # future turn — so treat them as inert data, not instructions (codex
+        # review). Collapse whitespace, drop non-printable/control chars
+        # (incl. the 0x1e stream-sentinel and anything that could fake the
+        # operational framing), single-quote, and cap length.
+        s = re.sub(r"\s+", " ", str(text or "")).strip()
+        s = "".join(ch for ch in s if ch.isprintable())
+        s = s.replace('"', "'")
+        return s[:max_len]
+
     def _fmt(it: Dict[str, Any]) -> str:
-        title = str(it.get("title") or it.get("id") or "todo").strip().replace("\n", " ")
+        title = _inert(it.get("title") or it.get("id") or "todo", 100)
+        # status comes from a controlled vocabulary (TODO_STATUSES), not free
+        # text, so it's safe unquoted.
         status = str(it.get("status") or "open")
-        line = f"  - [{status}] {title[:100]}"
-        tc = str(it.get("terminal_condition") or "").strip().replace("\n", " ")
+        line = f'  - [{status}] "{title}"'
+        tc = _inert(it.get("terminal_condition"), 120)
         if tc:
-            line += f" (done when: {tc[:120]})"
+            line += f' (done when: "{tc}")'
         return line
 
     lines: List[str] = []
