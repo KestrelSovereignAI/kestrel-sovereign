@@ -243,6 +243,51 @@ async def test_inline_executed_tool_emitted_part_drained_and_persisted():
 
 
 @pytest.mark.asyncio
+async def test_inline_part_lands_after_tool_done_sentinel_before_text():
+    """A Codex inline tool emits its part while running, then the adapter yields
+    the tool's done sentinel, then answer text. The part must land AFTER the
+    done sentinel (so it renders below the completed tool card) but BEFORE the
+    answer prose."""
+    from kestrel_sovereign.agent.parts import emit_part
+    from kestrel_sovereign.agent.streaming import _build_tool_sentinel
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    add_convo_calls = []
+    agent = _make_agent(add_convo_calls)
+
+    done_sentinel = _build_tool_sentinel("done", "todo_add", ms=5)
+
+    async def mock_stream_with_tool_detection(**kwargs):
+        yield "Working. "
+        # Tool ran inside the call: emit its part, THEN the adapter surfaces the
+        # tool's done sentinel as its own string item.
+        emit_part("todo", {"title": "x"})
+        yield done_sentinel
+        yield "All done."
+        yield LLMResponse(content="", tool_calls=[])
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
+    _bind(agent)
+
+    yielded = []
+    async for chunk in agent.process_input_streaming("go", session_id="s7"):
+        yielded.append(chunk)
+
+    joined = "".join(yielded)
+    done_at = joined.index("\x1eKESTREL:TOOL:")
+    part_at = joined.index("\x1eKESTREL:PART:")
+    text_at = joined.index("All done.")
+    assert done_at < part_at < text_at
+
+    # Persisted: the tool card's seq precedes the part's seq (same position).
+    metadata = [c for c in add_convo_calls if c["role"] == "assistant"][0]["metadata"]
+    tool_seq = metadata["tool_events"][0]["seq"]
+    part_seq = metadata["parts"][0]["seq"]
+    assert tool_seq < part_seq
+
+
+@pytest.mark.asyncio
 async def test_parts_dropped_when_post_response_hook_blocks_text():
     """If a POST_RESPONSE hook rewrites/blocks the assistant text (audit denial),
     the component parts must NOT persist — otherwise reload would render the

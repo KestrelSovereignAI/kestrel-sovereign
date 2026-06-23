@@ -303,20 +303,24 @@ def _finalize_component_parts(parts: list, text: str) -> list:
     return result
 
 
-def _drain_part_sentinels(full_response: list):
-    """Drain buffered component parts (#1914) into PART sentinels — yield each
-    for the live stream AND append it to ``full_response`` so the inline /
-    no-tool persist path records it, position-stamped, like the orchestrator
-    path captures its drained sentinels from the post-tool chunks. Called at the
-    TOP of each inline stream iteration (so a part emitted while the adapter was
-    resumed lands at the tool boundary, before the next text chunk) and once
-    after the loop (to catch parts from the final resume).
+def _flush_part_list(pending: list, full_response: list):
+    """Emit the accumulated ``pending`` component parts (#1914) as PART
+    sentinels — yield each for the live stream AND append to ``full_response``
+    so the inline / no-tool persist path records it, position-stamped, like the
+    orchestrator path captures its drained sentinels from the post-tool chunks.
+
+    The inline loop accumulates parts (drained at each resume) and flushes them
+    here right before the NEXT visible text — but AFTER any tool ``done``/``error``
+    sentinel items — so a component lands after its producing tool's card and
+    before the post-tool answer prose, in both live order and persisted ``seq``.
+    Clears ``pending`` once emitted.
     """
-    for part in drain_parts():
+    for part in pending:
         sentinel = build_part_sentinel(part)
         if sentinel:
             full_response.append(sentinel)
             yield sentinel
+    pending.clear()
 
 
 _TOOL_EVENT_PHASE = {"start": "start", "complete": "done", "error": "error"}
@@ -850,6 +854,10 @@ class StreamingMixin:
         # user cancels before tools run) never persists a dangling `\n\n`
         # the client never rendered.
         pending_visible_boundary = False
+        # #1914: parts emitted by inline-executed tools accumulate here and flush
+        # right before the next VISIBLE text (after any tool done/error
+        # sentinels), so each component lands after its producing tool's card.
+        pending_parts: list = []
 
         # #1662 eager vision: resolve this turn's inline (pasted/dropped) image
         # attachments to bytes so the LLM service can fold them into the user
@@ -887,12 +895,21 @@ class StreamingMixin:
             # path below and the cancellation marker lands in metadata.
             if request_id and self.is_request_cancelled(request_id):
                 break
-            # #1914: flush any part an inline tool emitted while the adapter was
-            # resumed to produce THIS item — before the item's own text — so the
-            # component lands at the tool boundary, not after the post-tool prose.
-            for _ps in _drain_part_sentinels(full_response):
-                yield _ps
+            # #1914: accumulate any part an inline tool emitted while the adapter
+            # was resumed to produce THIS item. They flush right before the next
+            # VISIBLE text below — AFTER this item if it's a tool sentinel — so a
+            # component lands after its producing tool's card, not before it.
+            pending_parts.extend(drain_parts())
             if isinstance(item, str):
+                # #1914: a component emitted by the tool that produced THIS
+                # visible text flushes here — after any tool done/error sentinel
+                # items already appended to full_response, before this answer
+                # prose — so it lands after its producing tool's card. A
+                # sentinel-only item (the tool's done marker) is NOT visible, so
+                # the parts wait for the real text that follows it.
+                if pending_parts and item.strip() and not is_only_sentinels(item):
+                    for _ps in _flush_part_list(pending_parts, full_response):
+                        yield _ps
                 # #1547: materialize a pending revise boundary lazily —
                 # only when real post-marker text lands, and only when it
                 # would otherwise weld two non-whitespace chars. Mirrors
@@ -952,10 +969,12 @@ class StreamingMixin:
                 # Tool calls detected at end of stream
                 tool_response = item
 
-        # #1914: flush any part the FINAL resume produced — the loop-top drain
-        # only sees parts buffered before the NEXT item, so the last item's
-        # parts need a post-loop flush.
-        for _ps in _drain_part_sentinels(full_response):
+        # #1914: flush any still-pending parts (a turn that ended on its tool
+        # with no trailing visible text never hit the in-loop flush) plus parts
+        # the FINAL resume produced. They append at the end of full_response —
+        # after the tool's done sentinel — preserving tool-before-part order.
+        pending_parts.extend(drain_parts())
+        for _ps in _flush_part_list(pending_parts, full_response):
             yield _ps
 
         # Log LLM response
