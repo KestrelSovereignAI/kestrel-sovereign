@@ -1,7 +1,8 @@
 import asyncio
+import inspect
 import logging
 import os
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -40,13 +41,19 @@ class SovereigntyFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!export-sovereignty"
     )
-    async def export_sovereignty(self, storage_tier: str = "ipfs", encrypt: bool = True) -> ToolResult:
+    async def export_sovereignty(
+        self,
+        storage_tier: str = "ipfs",
+        encrypt: bool = True,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> ToolResult:
         """
         Export agent state to IPFS/Filecoin.
 
         Args:
             storage_tier: 'local', 'ipfs', or 'filecoin' (default: 'ipfs')
             encrypt: Whether to encrypt the backup (default: True)
+            on_progress: Optional callback(bytes_sent, total_bytes)
 
         Returns:
             ToolResult.ok with CID + tier + size on a clean export, PARTIAL
@@ -85,6 +92,12 @@ class SovereigntyFeature(Feature):
 
         # Create backup blob
         backup_blob = await self.agent.storage.create_backup_blob(include_db=True)
+        progress = self._build_progress_reporter(
+            on_progress=on_progress,
+            tier=tier_enum.value,
+            total_bytes=len(backup_blob),
+        )
+        progress(0, len(backup_blob))
 
         # Store via adapter
         adapter = FilecoinAdapter()
@@ -93,8 +106,10 @@ class SovereigntyFeature(Feature):
             backup_blob,
             storage_tier=tier_enum,
             encrypt=encrypt,
-            metadata={"agent": self.agent.agent_id}
+            metadata={"agent": self.agent.agent_id},
+            on_progress=progress,
         )
+        progress(len(backup_blob), len(backup_blob))
 
         # Record graph receipt
         node_id = await self.agent.storage.record_backup_artifact(self.agent.agent_id, result)
@@ -192,6 +207,75 @@ class SovereigntyFeature(Feature):
             )
 
         return ToolResult.ok(confirmation, data=data)
+
+    def _build_progress_reporter(
+        self,
+        *,
+        on_progress: Optional[Callable[[int, int], None]],
+        tier: str,
+        total_bytes: int,
+    ) -> Callable[[int, int], None]:
+        """Create a thread-safe progress reporter for export uploads."""
+        loop = asyncio.get_running_loop()
+        agent_id = getattr(self.agent, "agent_id", None)
+        last_logged_percent = -10
+        last_emitted_percent = -1
+
+        def _call_user_callback(sent: int, total: int) -> None:
+            if not callable(on_progress):
+                return
+            try:
+                maybe_awaitable = on_progress(sent, total)
+                if inspect.isawaitable(maybe_awaitable):
+                    loop.call_soon_threadsafe(
+                        asyncio.create_task, maybe_awaitable
+                    )
+            except Exception:
+                logger.debug("Sovereignty export progress callback failed", exc_info=True)
+
+        async def _emit(sent: int, total: int, percent: int) -> None:
+            emit_event = getattr(self.agent, "emit_event", None)
+            if emit_event is None:
+                return
+            await emit_event(
+                "sovereignty_export_progress",
+                {
+                    "agent_id": agent_id,
+                    "tier": tier,
+                    "bytes_sent": sent,
+                    "total_bytes": total,
+                    "percent": percent,
+                },
+            )
+
+        def _report(sent: int, upload_total: int) -> None:
+            nonlocal last_logged_percent, last_emitted_percent
+            total = upload_total or total_bytes or 0
+            if total <= 0:
+                normalized_sent = sent
+                percent = 0
+            else:
+                normalized_sent = min(max(sent, 0), total)
+                percent = int((normalized_sent / total) * 100)
+
+            _call_user_callback(normalized_sent, total)
+
+            if percent >= last_logged_percent + 10 or percent in (0, 100):
+                last_logged_percent = percent
+                logger.info(
+                    "Sovereignty export upload progress: %s/%s bytes (%s%%)",
+                    normalized_sent,
+                    total,
+                    percent,
+                )
+
+            if percent != last_emitted_percent:
+                last_emitted_percent = percent
+                loop.call_soon_threadsafe(
+                    asyncio.create_task, _emit(normalized_sent, total, percent)
+                )
+
+        return _report
 
     @tool(
         name="import_sovereignty",

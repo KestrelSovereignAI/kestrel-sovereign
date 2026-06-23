@@ -13,11 +13,49 @@ Lighthouse REST API reference:
 """
 
 import logging
+from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class _ProgressBytesIO(BytesIO):
+    """BytesIO wrapper that reports file-byte progress as upload clients read."""
+
+    def __init__(
+        self,
+        content: bytes,
+        on_progress: Optional[Callable[[int, int], None]],
+        *,
+        chunk_size: int = 64 * 1024,
+    ):
+        super().__init__(content)
+        self._total = len(content)
+        self._sent = 0
+        self._on_progress = on_progress
+        self._chunk_size = chunk_size
+        self._report(0)
+
+    def _report(self, sent: int) -> None:
+        if self._on_progress is None:
+            return
+        try:
+            self._on_progress(sent, self._total)
+        except Exception:
+            logger.debug("Lighthouse upload progress callback failed", exc_info=True)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None:
+            size = -1
+        if size is not None and size > self._chunk_size:
+            size = self._chunk_size
+        chunk = super().read(size)
+        if chunk:
+            self._sent += len(chunk)
+            self._report(min(self._sent, self._total))
+        return chunk
 
 
 class LighthouseRestClient:
@@ -85,7 +123,10 @@ class LighthouseRestClient:
             httpx.HTTPStatusError: On API errors
         """
         client = await self._get_client()
-        files = {"file": (filename, content)}
+        file_content = (
+            _ProgressBytesIO(content, on_progress) if on_progress else content
+        )
+        files = {"file": (filename, file_content)}
 
         response = await client.post(
             f"{self.UPLOAD_URL}/api/v0/add",
@@ -106,6 +147,7 @@ class LighthouseRestClient:
         car_bytes: bytes,
         tag: str = "kestrel-storage",
         filename: str = "export.car",
+        on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> Dict[str, Any]:
         """
         Upload CAR (Content Addressable aRchive) file.
@@ -117,12 +159,16 @@ class LighthouseRestClient:
             car_bytes: CAR v1 file bytes
             tag: Tag for organizing uploads
             filename: Name for the uploaded CAR file
+            on_progress: Optional callback(bytes_sent, total_bytes)
 
         Returns:
             Dict with 'Hash' (CID), 'Name', and 'Size' keys
         """
         client = await self._get_client()
-        files = {"file": (filename, car_bytes, "application/vnd.ipld.car")}
+        file_content = (
+            _ProgressBytesIO(car_bytes, on_progress) if on_progress else car_bytes
+        )
+        files = {"file": (filename, file_content, "application/vnd.ipld.car")}
 
         response = await client.post(
             f"{self.UPLOAD_URL}/api/v0/add",

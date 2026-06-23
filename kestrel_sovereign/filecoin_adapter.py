@@ -5,12 +5,13 @@ Provides decentralized storage while maintaining local caching for performance.
 """
 
 import hashlib
+from io import BytesIO
 import json
 import logging
 import zlib
 from pathlib import Path
 import os
-from typing import Dict, Optional, Tuple, Any
+from typing import Callable, Dict, Optional, Tuple, Any
 import requests
 
 from kestrel_sovereign.kestrel_config.constants import (
@@ -42,6 +43,43 @@ def _looks_like_sha256(value: str) -> bool:
     if not isinstance(value, str) or len(value) != 64:
         return False
     return all(c in "0123456789abcdef" for c in value.lower())
+
+
+class _ProgressBytesIO(BytesIO):
+    """BytesIO wrapper that reports file-byte progress as requests reads."""
+
+    def __init__(
+        self,
+        content: bytes,
+        on_progress: Optional[Callable[[int, int], None]],
+        *,
+        chunk_size: int = 64 * 1024,
+    ):
+        super().__init__(content)
+        self._total = len(content)
+        self._sent = 0
+        self._on_progress = on_progress
+        self._chunk_size = chunk_size
+        self._report(0)
+
+    def _report(self, sent: int) -> None:
+        if self._on_progress is None:
+            return
+        try:
+            self._on_progress(sent, self._total)
+        except Exception:
+            logging.debug("IPFS upload progress callback failed", exc_info=True)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None:
+            size = -1
+        if size is not None and size > self._chunk_size:
+            size = self._chunk_size
+        chunk = super().read(size)
+        if chunk:
+            self._sent += len(chunk)
+            self._report(min(self._sent, self._total))
+        return chunk
 
 
 class FilecoinAdapter:
@@ -125,7 +163,8 @@ class FilecoinAdapter:
                      content: bytes, 
                      storage_tier: StorageTier = StorageTier.IPFS,
                      encrypt: bool = False,
-                     metadata: Optional[Dict] = None) -> StorageResult:
+                     metadata: Optional[Dict] = None,
+                     on_progress: Optional[Callable[[int, int], None]] = None) -> StorageResult:
         """
         Store content in decentralized storage based on tier.
         
@@ -134,6 +173,7 @@ class FilecoinAdapter:
             storage_tier: Where to store the content
             encrypt: Whether to encrypt before storage
             metadata: Additional metadata
+            on_progress: Optional callback(bytes_sent, total_bytes)
             
         Returns:
             StorageResult with storage details
@@ -149,6 +189,7 @@ class FilecoinAdapter:
         
         # Compress content for efficiency
         compressed_content = zlib.compress(final_content, level=6)
+        self._report_progress(on_progress, 0, len(compressed_content))
         
         result = StorageResult(
             content_hash=content_hash,
@@ -163,6 +204,7 @@ class FilecoinAdapter:
         if storage_tier == StorageTier.LOCAL_ONLY:
             self._store_local_cache(content_hash, compressed_content, metadata,
                                     tier=result.tier, cid=result.cid)
+            self._report_progress(on_progress, len(compressed_content), len(compressed_content))
 
         elif storage_tier == StorageTier.IPFS:
             if not self.ipfs_is_available():
@@ -170,9 +212,10 @@ class FilecoinAdapter:
                 result.tier = StorageTier.LOCAL_ONLY
                 self._store_local_cache(content_hash, compressed_content, metadata,
                                         tier=result.tier, cid=result.cid)
+                self._report_progress(on_progress, len(compressed_content), len(compressed_content))
                 return result
 
-            ipfs_cid = self._store_ipfs(compressed_content, metadata)
+            ipfs_cid = self._store_ipfs(compressed_content, metadata, on_progress=on_progress)
             result.cid = ipfs_cid
             # Also cache locally for performance
             self._store_local_cache(content_hash, compressed_content, metadata,
@@ -184,10 +227,11 @@ class FilecoinAdapter:
                 result.tier = StorageTier.LOCAL_ONLY
                 self._store_local_cache(content_hash, compressed_content, metadata,
                                         tier=result.tier, cid=result.cid)
+                self._report_progress(on_progress, len(compressed_content), len(compressed_content))
                 return result
 
             # First store in IPFS
-            ipfs_cid = self._store_ipfs(compressed_content, metadata)
+            ipfs_cid = self._store_ipfs(compressed_content, metadata, on_progress=on_progress)
             result.cid = ipfs_cid
 
             # Then create Filecoin deal for permanent storage
@@ -200,6 +244,19 @@ class FilecoinAdapter:
         
         logging.info(f"📁 Stored content: {content_hash[:16]}... -> {storage_tier.value}")
         return result
+
+    def _report_progress(
+        self,
+        on_progress: Optional[Callable[[int, int], None]],
+        sent: int,
+        total: int,
+    ) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(sent, total)
+        except Exception:
+            logging.debug("Filecoin/IPFS upload progress callback failed", exc_info=True)
     
     def retrieve_content(self, 
                          content_hash: str, 
@@ -528,11 +585,19 @@ class FilecoinAdapter:
                 return f.read()
         return None
     
-    def _store_ipfs(self, content: bytes, metadata: Optional[Dict] = None) -> str:
+    def _store_ipfs(
+        self,
+        content: bytes,
+        metadata: Optional[Dict] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> str:
         """Store content in IPFS and return CID"""
         try:
             # Add content to IPFS
-            files = {'file': content}
+            file_content = (
+                _ProgressBytesIO(content, on_progress) if on_progress else content
+            )
+            files = {'file': ('content.bin', file_content)}
             response = requests.post(
                 f"{self.ipfs_api_url}/api/v0/add",
                 files=files,

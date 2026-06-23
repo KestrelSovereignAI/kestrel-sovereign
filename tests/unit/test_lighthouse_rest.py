@@ -48,6 +48,33 @@ class TestLighthouseRestClient:
         assert result["Size"] == "1024"
 
     @pytest.mark.asyncio
+    async def test_upload_progress_callback_reads_file_bytes(self, client, mock_response):
+        resp = mock_response(json_data={"data": {"Hash": "QmTest123", "Name": "test.bin", "Size": "131072"}})
+        progress = []
+
+        async def fake_post(*args, **kwargs):
+            file_obj = kwargs["files"]["file"][1]
+            while file_obj.read(16 * 1024):
+                pass
+            return resp
+
+        with patch.object(client, "_get_client") as mock_get:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(side_effect=fake_post)
+            mock_get.return_value = mock_http
+
+            await client.upload(
+                b"x" * (128 * 1024),
+                "test.bin",
+                tag="test",
+                on_progress=lambda sent, total: progress.append((sent, total)),
+            )
+
+        assert progress[0] == (0, 128 * 1024)
+        assert progress[-1] == (128 * 1024, 128 * 1024)
+        assert len(progress) > 2
+
+    @pytest.mark.asyncio
     async def test_upload_car(self, client, mock_response):
         resp = mock_response(json_data={"data": {"Hash": "QmCarTest", "Size": "2048"}})
 
@@ -65,6 +92,33 @@ class TestLighthouseRestClient:
         assert result["Hash"] == "QmCarTest"
         files = mock_http.post.await_args.kwargs["files"]
         assert files["file"][0] == "kestrel_state__agent-1__20260620_120000.car"
+
+    @pytest.mark.asyncio
+    async def test_upload_car_progress_callback_reads_file_bytes(self, client, mock_response):
+        resp = mock_response(json_data={"data": {"Hash": "QmCarTest", "Size": "131072"}})
+        progress = []
+
+        async def fake_post(*args, **kwargs):
+            file_obj = kwargs["files"]["file"][1]
+            while file_obj.read(32 * 1024):
+                pass
+            return resp
+
+        with patch.object(client, "_get_client") as mock_get:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(side_effect=fake_post)
+            mock_get.return_value = mock_http
+
+            await client.upload_car(
+                b"c" * (128 * 1024),
+                tag="test",
+                filename="export.car",
+                on_progress=lambda sent, total: progress.append((sent, total)),
+            )
+
+        assert progress[0] == (0, 128 * 1024)
+        assert progress[-1] == (128 * 1024, 128 * 1024)
+        assert len(progress) > 2
 
     @pytest.mark.asyncio
     async def test_download(self, client, mock_response):
