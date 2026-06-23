@@ -715,6 +715,40 @@ class KestrelAgent(
         from kestrel_sovereign.services.payer_resolver import open_host_db
         return await open_host_db(storage_path=self.storage_path)
 
+    async def _load_or_promote_soul_resource(
+        self, agent_data_dir: Optional[str]
+    ) -> None:
+        """Prefer canonical encrypted SOUL, else promote a disk seed/cache."""
+        try:
+            loaded = await self.context_builder.load_canonical_soul_resource()
+            if loaded:
+                return
+        except Exception as exc:
+            logging.warning("Canonical SOUL resource load failed: %s", exc)
+
+        if not agent_data_dir:
+            return
+        soul_path = Path(agent_data_dir) / "SOUL.md"
+        if not soul_path.exists():
+            return
+        try:
+            content = soul_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logging.warning("SOUL.md seed read failed during promotion: %s", exc)
+            return
+        if not content.strip():
+            return
+        try:
+            await self.storage.promote_soul_seed(
+                content,
+                created_by=self.agent_id,
+                source=str(soul_path),
+            )
+            await self.context_builder.load_canonical_soul_resource()
+            logging.info("Promoted SOUL.md seed into canonical private resource")
+        except Exception as exc:
+            logging.warning("SOUL.md seed promotion failed: %s", exc)
+
     async def initialize(self) -> None:
         """Async initialization of storage and features."""
         if self._raw_storage is None:
@@ -1436,6 +1470,7 @@ class KestrelAgent(
                 consolidator=self.memory_consolidator,
                 agent_data_path=agent_data_dir
             )
+            await self._load_or_promote_soul_resource(agent_data_dir)
 
             # Initialize unified context manager (orchestrates all context sources).
             # Model identity derived lazily from llm_service.get_active_model_id().
@@ -1465,6 +1500,7 @@ class KestrelAgent(
                 agent_name=self._agent_name,
                 llm_service=self.llm_service,
                 agent_data_path=agent_data_dir,
+                storage=self.storage,
             )
             logging.info("BootstrapService initialized")
             from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending
@@ -2202,7 +2238,9 @@ Expected Duration: {expected_duration}
                     await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                     # Reload SOUL.md into context builder
                     if hasattr(self, 'context_builder'):
-                        self.context_builder._load_soul_md()
+                        loaded = await self.context_builder.load_canonical_soul_resource()
+                        if not loaded:
+                            self.context_builder._load_soul_md()
                     logging.info(f"[BOOTSTRAP] Discovery complete with avatar")
                     return completion_msg
                 else:
@@ -2214,7 +2252,9 @@ Expected Duration: {expected_duration}
                     await self.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
                     # Reload SOUL.md into context builder
                     if hasattr(self, 'context_builder'):
-                        self.context_builder._load_soul_md()
+                        loaded = await self.context_builder.load_canonical_soul_resource()
+                        if not loaded:
+                            self.context_builder._load_soul_md()
                     logging.info(f"[BOOTSTRAP] Discovery complete")
                     return completion_msg
 

@@ -264,6 +264,26 @@ class ContextBuilder:
         """Backward-compatible method -- delegates to reload."""
         self._bootstrap_loader.reload()
 
+    async def load_canonical_soul_resource(self) -> bool:
+        """Load the current private SOUL resource into bootstrap context.
+
+        The runtime prompt continues to consume ``SOUL.md`` through the
+        bootstrap cache for backward compatibility, but initialized agents
+        prefer the encrypted canonical identity resource over the disk seed.
+        """
+        getter = getattr(self.storage, "get_current_agent_resource", None)
+        if getter is None:
+            return False
+        try:
+            resource = await getter()
+        except Exception as e:
+            logger.warning("Failed to load canonical SOUL resource: %s", e)
+            return False
+        if resource is None or not getattr(resource, "content", None):
+            return False
+        self._soul_content = resource.content
+        return True
+
     async def retrieve_context(
         self, query: str, min_score: Optional[float] = None
     ) -> str:

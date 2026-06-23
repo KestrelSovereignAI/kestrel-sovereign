@@ -33,6 +33,11 @@ from .async_conversation_store import AsyncConversationStore
 from .destructive_audit import DestructiveAuditLog, destructive_audit_caller
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge
 from .async_rag_store import AsyncRAGStore
+from .agent_resource_store import (
+    AgentResourceStore,
+    AgentResourceVersion,
+    SOUL_MARKDOWN_RESOURCE_TYPE,
+)
 from .bm25_index import BM25Index, AsyncBM25Index, BM25_AVAILABLE
 
 # Import privacy wrapper
@@ -87,6 +92,9 @@ __all__ = [
     "DestructiveAuditLog",
     "AsyncGraphStore",
     "AsyncRAGStore",
+    "AgentResourceStore",
+    "AgentResourceVersion",
+    "SOUL_MARKDOWN_RESOURCE_TYPE",
     # BM25 search
     "BM25Index",
     "AsyncBM25Index",

@@ -15,6 +15,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
+from kestrel_sovereign.storage.agent_resource_store import (
+    SOUL_MARKDOWN_RESOURCE_TYPE,
+)
+
 logger = logging.getLogger(__name__)
 
 #: Cap on how many prior turns we seed into discovery history (#1490).
@@ -119,6 +123,7 @@ class BootstrapService:
         agent_name: str,
         llm_service,
         agent_data_path: Path,
+        storage,
     ):
         """
         Initialize the bootstrap service.
@@ -129,12 +134,14 @@ class BootstrapService:
             agent_name: The agent's current name
             llm_service: LLM service for generating responses
             agent_data_path: Path to agent's data directory (for SOUL.md)
+            storage: Storage facade for accessing agent resources
         """
         self.db = db
         self.agent_id = agent_id
         self.agent_name = agent_name
         self.llm_service = llm_service
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
+        self.storage = storage
 
         # Load prompts
         self._discovery_prompt = self._load_prompt(DISCOVERY_PROMPT_FILE)
@@ -168,6 +175,10 @@ class BootstrapService:
             if soul_path.exists() and soul_path.stat().st_size > 0:
                 await self._ensure_complete("SOUL.md exists")
                 return False
+
+        if await self._has_canonical_soul_resource():
+            await self._ensure_complete("canonical SOUL resource exists")
+            return False
 
         # Existing conversation history means this is not a new agent
         try:
@@ -394,12 +405,27 @@ class BootstrapService:
             if soul_path.exists() and soul_path.stat().st_size > 0:
                 return True
 
+        if await self._has_canonical_soul_resource():
+            return True
+
         try:
             history_count = await self.db.fetchall(
                 "SELECT COUNT(*) FROM conversations WHERE agent_id = ?",
                 (self.agent_id,),
             )
             return bool(history_count and history_count[0][0] > 0)
+        except Exception:
+            return False
+
+    async def _has_canonical_soul_resource(self) -> bool:
+        try:
+            if not self.storage.agent_resources:
+                return False
+            return bool(
+                await self.storage.agent_resources.get_current(
+                    SOUL_MARKDOWN_RESOURCE_TYPE
+                )
+            )
         except Exception:
             return False
 
@@ -854,7 +880,7 @@ Your preferences matter - tell me what works and what doesn't.
 
     async def save_soul_md(self, content: str) -> bool:
         """
-        Save SOUL.md to the agent's data directory.
+        Save SOUL.md seed/cache and promote it to the canonical resource.
 
         Returns:
             True if saved successfully
@@ -868,10 +894,22 @@ Your preferences matter - tell me what works and what doesn't.
             soul_path.parent.mkdir(parents=True, exist_ok=True)
             soul_path.write_text(content, encoding="utf-8")
             logger.info(f"Saved SOUL.md to {soul_path}")
+            await self._promote_soul_resource(content, source=str(soul_path))
             return True
         except Exception as e:
             logger.error(f"Failed to save SOUL.md: {e}")
             return False
+
+    async def _promote_soul_resource(self, content: str, *, source: str) -> None:
+        """Best-effort promotion of SOUL.md content into private resources."""
+        try:
+            await self.storage.promote_soul_seed(
+                content,
+                created_by=self.agent_id,
+                source=source,
+            )
+        except Exception as exc:
+            logger.warning("Failed to promote SOUL.md to private resource: %s", exc)
 
     async def complete_bootstrap(self, avatar_description: Optional[str] = None) -> str:
         """

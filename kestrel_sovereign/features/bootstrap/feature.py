@@ -247,8 +247,19 @@ async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
 
     if updated:
         soul_path.write_text(content, encoding="utf-8")
+        storage = getattr(agent, "storage", None)
+        if storage and hasattr(storage, "promote_soul_seed"):
+            await storage.promote_soul_seed(
+                content,
+                created_by=getattr(agent, "agent_id", getattr(agent, "did", "")),
+                source=f"rename:{soul_path}",
+            )
         if hasattr(agent, 'context_builder'):
-            agent.context_builder._load_soul_md()
+            loaded = False
+            if hasattr(agent.context_builder, "load_canonical_soul_resource"):
+                loaded = await agent.context_builder.load_canonical_soul_resource()
+            if not loaded:
+                agent.context_builder._load_soul_md()
         return True
 
     return False
@@ -842,7 +853,11 @@ class BootstrapFeature(Feature):
         cb_reload_error: Optional[str] = None
         if hasattr(self.agent, 'context_builder'):
             try:
-                self.agent.context_builder._load_soul_md()
+                loaded = False
+                if hasattr(self.agent.context_builder, "load_canonical_soul_resource"):
+                    loaded = await self.agent.context_builder.load_canonical_soul_resource()
+                if not loaded:
+                    self.agent.context_builder._load_soul_md()
             except Exception as e:
                 logger.error(
                     f"skip_discovery: bootstrap skipped but SOUL.md "

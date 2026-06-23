@@ -352,6 +352,34 @@ CREATE TABLE IF NOT EXISTS agent_metadata (
 
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_agent ON agent_metadata(agent_id);
 
+-- Private resources attached to a local agent identity record. Resource
+-- contents are encrypted before storage; public metadata must only contain
+-- safe pointers/hashes/provenance and never the private body.
+CREATE TABLE IF NOT EXISTS agent_identity_resources (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    is_current INTEGER DEFAULT 0,
+    content_ciphertext BLOB NOT NULL,
+    content_hash TEXT NOT NULL,
+    content_bytes INTEGER NOT NULL,
+    encryption TEXT NOT NULL,
+    provenance TEXT,
+    public_metadata TEXT,
+    anchoring_metadata TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(agent_id, resource_type, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_identity_resources_agent
+    ON agent_identity_resources(agent_id, resource_type);
+CREATE INDEX IF NOT EXISTS idx_agent_identity_resources_current
+    ON agent_identity_resources(agent_id, resource_type, is_current);
+CREATE INDEX IF NOT EXISTS idx_agent_identity_resources_resource
+    ON agent_identity_resources(resource_id);
+
 -- Bootstrap Config: Per-agent configuration for bootstrap file loading convention
 CREATE TABLE IF NOT EXISTS bootstrap_config (
     id TEXT PRIMARY KEY,
