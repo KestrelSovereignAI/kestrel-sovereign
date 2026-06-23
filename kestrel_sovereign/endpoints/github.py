@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,11 @@ router = APIRouter(tags=["github"])
 
 _CACHE_TTL_SECONDS = 300
 _repo_cache: dict[tuple[Any, ...], tuple[float, list[str]]] = {}
+
+# Characters permitted in a repo-scoped GitHub API path. Anything outside this
+# set (notably `%` and `\`) is rejected before the path is treated as
+# repo-scoped, closing percent-encoded traversal bypasses.
+_SAFE_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+")
 
 
 def clear_repo_cache() -> None:
@@ -220,10 +226,17 @@ def _repo_scoped_slug(path: str) -> str | None:
     ``user/...`` and so on — is an organization/user/global endpoint that the
     server token must not reach through this proxy. Those return ``None``.
     """
+    # Repo-scoped GitHub API paths only ever use these characters. Forbidding
+    # everything else rejects the entire traversal-bypass class in one rule:
+    # percent-encoding (`%2e%2e`, double-encoded `%252e`), backslashes, and
+    # any other byte httpx/GitHub might normalize into a different upstream
+    # path that escapes the repo-scope check.
+    if not _SAFE_PATH_RE.fullmatch(path):
+        return None
     parts = [segment for segment in path.split("/") if segment]
     # Reject dot-segment traversal: httpx normalizes `repos/o/r/../../user`
-    # to `https://api.github.com/user`, which would otherwise escape the
-    # repo-scope check and reach global endpoints with the host token.
+    # to `https://api.github.com/user`, which would otherwise reach global
+    # endpoints with the host token.
     if any(segment in {".", ".."} for segment in parts):
         return None
     if len(parts) >= 3 and parts[0] == "repos":

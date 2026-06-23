@@ -133,6 +133,25 @@ async def test_github_repos_endpoint_returns_plain_slug_list(monkeypatch):
     assert response.json() == ["KestrelSovereignAI/kestrel-sovereign"]
 
 
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("repos/KestrelSovereignAI/kestrel-sovereign/issues", "KestrelSovereignAI/kestrel-sovereign"),
+        ("repos/owner/repo", "owner/repo"),
+        ("repos/owner/repo.io/issues", "owner/repo.io"),
+        ("users/octocat/repos", None),
+        ("orgs/KestrelSovereignAI/repos", None),
+        ("repos/owner", None),
+        ("repos/owner/repo/../../../user", None),
+        ("repos/owner/repo/%2e%2e/%2e%2e/user", None),
+        ("repos/owner/repo/%2F..%2F..%2Fuser", None),
+        ("repos/owner/repo/%5c..%5c..%5cuser", None),
+    ],
+)
+def test_repo_scoped_slug_parsing(path, expected):
+    assert github_endpoints._repo_scoped_slug(path) == expected
+
+
 def _scoped_proxy_app(monkeypatch, *, handler, config):
     """Build a FastAPI app whose proxy uses a mock-backed shared client."""
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
@@ -251,6 +270,10 @@ async def test_proxy_rejects_repo_not_in_scope(monkeypatch):
         # Dot-segment traversal: httpx would normalize this to /user.
         "repos/KestrelSovereignAI/kestrel-sovereign/../../../user",
         "repos/KestrelSovereignAI/kestrel-sovereign/%2e%2e/%2e%2e/user",
+        # Double-encoded — Starlette decodes once, leaving %2e%2e segments.
+        "repos/KestrelSovereignAI/kestrel-sovereign/%252e%252e/%252e%252e/user",
+        # Backslash traversal.
+        "repos/KestrelSovereignAI/kestrel-sovereign/%5c..%5c..%5cuser",
     ],
 )
 async def test_proxy_rejects_non_repo_scoped_paths(monkeypatch, path):
