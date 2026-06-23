@@ -62,6 +62,7 @@ async def test_streaming_persists_post_tool_content_and_pre_tool_metadata():
     mock_agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     mock_agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     mock_agent.hooks_manager = None  # skip USER_PROMPT_SUBMIT hook
+    mock_agent.operator_signal_producer = None  # #1497: skip producer seam
     mock_agent._get_governing_constitution = AsyncMock(return_value="")
     mock_agent.check_solvency = AsyncMock(return_value="test-model")
     mock_agent._build_all_tools = MagicMock(return_value=[])
@@ -204,6 +205,7 @@ async def test_streaming_no_tool_calls_persists_full_response_unchanged():
     mock_agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     mock_agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     mock_agent.hooks_manager = None  # skip USER_PROMPT_SUBMIT hook
+    mock_agent.operator_signal_producer = None  # #1497: skip producer seam
     mock_agent._get_governing_constitution = AsyncMock(return_value="")
     mock_agent.check_solvency = AsyncMock(return_value="test-model")
     mock_agent._build_all_tools = MagicMock(return_value=[])
