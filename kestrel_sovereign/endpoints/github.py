@@ -8,6 +8,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -20,10 +21,10 @@ router = APIRouter(tags=["github"])
 _CACHE_TTL_SECONDS = 300
 _repo_cache: dict[tuple[Any, ...], tuple[float, list[str]]] = {}
 
-# Characters permitted in a repo-scoped GitHub API path. Anything outside this
-# set (notably `%` and `\`) is rejected before the path is treated as
-# repo-scoped, closing percent-encoded traversal bypasses.
-_SAFE_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+")
+# GitHub owner/repo segment grammar. The scope-defining segments must match
+# this exactly; arbitrary characters here would let traversal or alternate
+# separators slip into the part of the path that decides the repo scope.
+_REPO_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def clear_repo_cache() -> None:
@@ -218,30 +219,47 @@ async def github_repos(
     return await discover_accessible_repos(org=org, include_private=include_private)
 
 
-def _repo_scoped_slug(path: str) -> str | None:
-    """Return the ``owner/repo`` slug for a repo-scoped GitHub API path.
+def _repo_scoped_request(path: str) -> tuple[str, str] | None:
+    """Validate a repo-scoped GitHub API path and return ``(slug, upstream)``.
 
     Only ``repos/{owner}/{repo}[/...]`` paths are repo-scoped. Every other
     shape — ``orgs/...``, ``users/...``, ``search/...``, ``gists/...``,
     ``user/...`` and so on — is an organization/user/global endpoint that the
-    server token must not reach through this proxy. Those return ``None``.
+    server token must not reach through this proxy; those return ``None``.
+
+    The path is fully percent-decoded first (defeating single/double/n-times
+    encoded ``..`` and ``/`` traversal), any dot or empty segment is rejected,
+    and the upstream path is then *rebuilt* by re-encoding the validated
+    segments. Forwarding this normalized path — instead of the raw, attacker
+    controlled one — means httpx/GitHub cannot normalize it back into a global
+    endpoint that escapes the repo scope. Arbitrary in-repo content (file
+    paths with spaces, refs containing ``@``/``+``) still passes through.
+
+    Returns ``(owner/repo, upstream_path)`` or ``None`` if not repo-scoped.
     """
-    # Repo-scoped GitHub API paths only ever use these characters. Forbidding
-    # everything else rejects the entire traversal-bypass class in one rule:
-    # percent-encoding (`%2e%2e`, double-encoded `%252e`), backslashes, and
-    # any other byte httpx/GitHub might normalize into a different upstream
-    # path that escapes the repo-scope check.
-    if not _SAFE_PATH_RE.fullmatch(path):
+    # Fully decode so encoded traversal (`%2e%2e`, `%252e%252e`, `%2f`) is
+    # collapsed to its literal form before we inspect segments.
+    decoded = path
+    for _ in range(5):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+
+    segments = decoded.split("/")
+    # No traversal and no empty segments (which imply `//` or stray slashes
+    # that httpx would also normalize away).
+    if any(segment in {"", ".", ".."} for segment in segments):
         return None
-    parts = [segment for segment in path.split("/") if segment]
-    # Reject dot-segment traversal: httpx normalizes `repos/o/r/../../user`
-    # to `https://api.github.com/user`, which would otherwise reach global
-    # endpoints with the host token.
-    if any(segment in {".", ".."} for segment in parts):
+    if len(segments) < 3 or segments[0] != "repos":
         return None
-    if len(parts) >= 3 and parts[0] == "repos":
-        return f"{parts[1]}/{parts[2]}"
-    return None
+
+    owner, repo = segments[1], segments[2]
+    if not _REPO_SEGMENT_RE.fullmatch(owner) or not _REPO_SEGMENT_RE.fullmatch(repo):
+        return None
+
+    upstream = "/".join(quote(segment, safe="") for segment in segments)
+    return f"{owner}/{repo}", upstream
 
 
 @router.get("/api/github/{path:path}")
@@ -258,8 +276,8 @@ async def github_proxy(path: str, request: Request):
     if not token:
         return JSONResponse({"error": "No GITHUB_TOKEN configured"}, status_code=503)
 
-    slug = _repo_scoped_slug(path)
-    if slug is None:
+    scoped = _repo_scoped_request(path)
+    if scoped is None:
         return JSONResponse(
             {
                 "error": (
@@ -269,8 +287,9 @@ async def github_proxy(path: str, request: Request):
             },
             status_code=403,
         )
+    slug, upstream = scoped
 
-    gh_url = f"https://api.github.com/{path}"
+    gh_url = f"https://api.github.com/{upstream}"
     if request.url.query:
         gh_url += f"?{request.url.query}"
 

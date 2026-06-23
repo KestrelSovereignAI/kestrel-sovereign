@@ -134,7 +134,7 @@ async def test_github_repos_endpoint_returns_plain_slug_list(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "path,expected",
+    "path,expected_slug",
     [
         ("repos/KestrelSovereignAI/kestrel-sovereign/issues", "KestrelSovereignAI/kestrel-sovereign"),
         ("repos/owner/repo", "owner/repo"),
@@ -144,12 +144,37 @@ async def test_github_repos_endpoint_returns_plain_slug_list(monkeypatch):
         ("repos/owner", None),
         ("repos/owner/repo/../../../user", None),
         ("repos/owner/repo/%2e%2e/%2e%2e/user", None),
+        ("repos/owner/repo/%252e%252e/%252e%252e/user", None),
         ("repos/owner/repo/%2F..%2F..%2Fuser", None),
-        ("repos/owner/repo/%5c..%5c..%5cuser", None),
+        # Backslashes are not path separators; re-encoding keeps them confined
+        # to owner/repo, so this stays in scope rather than escaping.
+        ("repos/owner/repo/%5cuser", "owner/repo"),
     ],
 )
-def test_repo_scoped_slug_parsing(path, expected):
-    assert github_endpoints._repo_scoped_slug(path) == expected
+def test_repo_scoped_request_slug(path, expected_slug):
+    result = github_endpoints._repo_scoped_request(path)
+    if expected_slug is None:
+        assert result is None
+    else:
+        assert result is not None
+        assert result[0] == expected_slug
+
+
+@pytest.mark.parametrize(
+    "path,expected_upstream",
+    [
+        # Spaces in a file path are decoded by FastAPI then re-encoded for upstream.
+        ("repos/o/r/contents/docs/My File.md", "repos/o/r/contents/docs/My%20File.md"),
+        # `@` and `+` in a ref survive (still confined to o/r).
+        ("repos/o/r/commits/feature@1.0+build", "repos/o/r/commits/feature%401.0%2Bbuild"),
+        # Already-safe path is forwarded unchanged.
+        ("repos/o/r/issues", "repos/o/r/issues"),
+    ],
+)
+def test_repo_scoped_request_rebuilds_safe_upstream(path, expected_upstream):
+    result = github_endpoints._repo_scoped_request(path)
+    assert result is not None
+    assert result[1] == expected_upstream
 
 
 def _scoped_proxy_app(monkeypatch, *, handler, config):
@@ -272,8 +297,6 @@ async def test_proxy_rejects_repo_not_in_scope(monkeypatch):
         "repos/KestrelSovereignAI/kestrel-sovereign/%2e%2e/%2e%2e/user",
         # Double-encoded — Starlette decodes once, leaving %2e%2e segments.
         "repos/KestrelSovereignAI/kestrel-sovereign/%252e%252e/%252e%252e/user",
-        # Backslash traversal.
-        "repos/KestrelSovereignAI/kestrel-sovereign/%5c..%5c..%5cuser",
     ],
 )
 async def test_proxy_rejects_non_repo_scoped_paths(monkeypatch, path):
