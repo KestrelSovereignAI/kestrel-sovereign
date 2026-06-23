@@ -525,6 +525,67 @@ class ProxyFeature(Feature):
 
         if event_name in {"channel.inbound", "inbound", "message.inbound"}:
             await self._route_inbound(data)
+        elif event_name in {"channel.link_qr", "link_qr", "channel.qr"}:
+            await self._route_link_qr(data)
+
+    async def _route_link_qr(self, payload: Any) -> None:
+        """Persist a channel pairing-QR PNG and push it to the chat over SSE.
+
+        Isolated channel features emit ``channel.link_qr`` with the QR rendered
+        as a PNG (base64) when a pairing code is produced. The host writes it
+        under the agent data dir (served by ``/api/agent/channels/{type}/
+        link-qr.png``) and emits a ``channel_link_qr`` event so the chat paints
+        a scannable image bubble — independent of whatever the LLM says in its
+        prose (an LLM reliably paraphrases a QR away). The browser appends an
+        api_key + the ``ts`` to the path to cache-bust the rotated QR.
+        """
+        if not isinstance(payload, dict):
+            return
+        import base64
+
+        channel_type = str(payload.get("channel_type") or "").strip().lower()
+        png_b64 = payload.get("png_b64") or payload.get("png")
+        if (
+            not channel_type
+            or not re.fullmatch(r"[a-z0-9_]{1,32}", channel_type)
+            or not png_b64
+        ):
+            logger.warning("Dropping malformed channel.link_qr from %s", self.name)
+            return
+        try:
+            png_bytes = base64.b64decode(png_b64)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("channel.link_qr from %s had undecodable PNG: %s", self.name, exc)
+            return
+
+        out = (
+            _agent_data_dir(self.agent)
+            / "channel_link_artifacts"
+            / f"{channel_type}_link_qr.png"
+        )
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(png_bytes)
+        except OSError as exc:
+            logger.warning("Failed to persist channel.link_qr PNG for %s: %s", self.name, exc)
+            return
+
+        emit = getattr(self.agent, "emit_event", None)
+        if not callable(emit):
+            return
+        import time
+
+        await _maybe_await(
+            emit(
+                "channel_link_qr",
+                {
+                    "channel_type": channel_type,
+                    "path": f"/api/agent/channels/{channel_type}/link-qr.png",
+                    "ts": int(time.time() * 1000),
+                    "caption": payload.get("caption") or "",
+                },
+            )
+        )
 
     async def _route_inbound(self, payload: Any) -> None:
         channel = self._channel_feature()

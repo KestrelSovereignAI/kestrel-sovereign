@@ -1248,6 +1248,17 @@ export function connectNotifications() {
             }
         });
 
+        // #1825: an isolated channel feature (e.g. WhatsApp) pushes its pairing
+        // QR to the host, which emits `channel_link_qr`. Paint it as a scannable
+        // image bubble here so linking works regardless of the LLM's prose.
+        notificationEventSource.addEventListener('channel_link_qr', (e) => {
+            try {
+                handleChannelLinkQr(JSON.parse(e.data));
+            } catch (err) {
+                console.error('Failed to handle channel_link_qr event:', err);
+            }
+        });
+
         notificationEventSource.addEventListener('ping', () => {
             // Keepalive - no action needed
         });
@@ -1572,6 +1583,74 @@ export function handleRestartStatus(payload, targetEl = null) {
     const accent = RESTART_STATE_ACCENTS[state] || RESTART_STATE_ACCENTS.pending;
     div.style.borderLeftColor = accent;
     renderRestartStatusBody(div, payload);
+    target.appendChild(div);
+    const c = getChatContainer();
+    if (c) c.scrollTop = c.scrollHeight;
+}
+
+/**
+ * Render a channel pairing QR as a chat-visible image bubble (#1825).
+ *
+ * Isolated channel features (e.g. WhatsApp) push their pairing QR to the
+ * host, which serves it as a PNG and emits a `channel_link_qr` SSE event.
+ * Painting the QR from the event — not from the agent's prose — means the
+ * scannable code reaches the chat regardless of how the LLM summarizes the
+ * tool result (it reliably paraphrases a QR away). The QR rotates (~20s), so
+ * a fresh event for the same channel updates the existing bubble in place
+ * (cache-busted via `ts`) rather than stacking duplicates.
+ */
+export function handleChannelLinkQr(payload, targetEl = null) {
+    if (!payload || typeof payload !== 'object') return;
+    const channelType = String(payload.channel_type || '').trim().toLowerCase();
+    const path = String(payload.path || '');
+    if (!channelType || !path.startsWith('/api/')) return;
+
+    const target = targetEl || notificationPaneElement();
+    if (!target) return;
+
+    // Build an authed, cache-busted image URL: multi-agent routing prefix via
+    // buildAgentUrl, api_key for standalone hosts, ts to defeat no-store reuse.
+    const base = deps().api.buildAgentUrl(path);
+    const apiKey = deps().api.getApiKey();
+    const ts = payload.ts || 0;
+    const sep = base.includes('?') ? '&' : '?';
+    let url = `${base}${sep}ts=${encodeURIComponent(ts)}`;
+    if (apiKey) url += `&api_key=${encodeURIComponent(apiKey)}`;
+
+    const caption = String(payload.caption || 'Scan this QR with your phone to link.');
+
+    let div = target.querySelector(
+        `.channel-qr-message[data-channel-type="${cssAttrEscape(channelType)}"]`,
+    );
+    if (div) {
+        // Rotated QR — swap the image in place, keep the bubble.
+        const img = div.querySelector('img.channel-qr-image');
+        if (img) img.src = url;
+        return;
+    }
+
+    div = document.createElement('div');
+    div.className = 'message agent-message channel-qr-message';
+    div.dataset.channelType = channelType;
+
+    const attribution = document.createElement('div');
+    attribution.className = 'channel-qr-attribution';
+    attribution.innerHTML =
+        `${deps().kicon('bird')} <span>${deps().escapeHtml(caption)}</span>`;
+    div.appendChild(attribution);
+
+    const img = document.createElement('img');
+    img.className = 'channel-qr-image';
+    img.alt = `${channelType} pairing QR`;
+    img.src = url;
+    img.style.maxWidth = '320px';
+    img.style.width = '100%';
+    img.style.imageRendering = 'pixelated';
+    img.style.background = '#fff';
+    img.style.padding = '12px';
+    img.style.borderRadius = '8px';
+    div.appendChild(img);
+
     target.appendChild(div);
     const c = getChatContainer();
     if (c) c.scrollTop = c.scrollHeight;

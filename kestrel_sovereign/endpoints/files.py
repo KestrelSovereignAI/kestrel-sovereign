@@ -4,13 +4,56 @@ Serves stored files (avatars, documents, etc.) via content-addressable hashes.
 """
 
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 import logging
+import re
+from pathlib import Path
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["files"])
+
+# Channel types are short lowercase identifiers; the regex doubles as a
+# path-traversal guard for the artifact filename built from it.
+_CHANNEL_TYPE_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+
+
+def channel_artifact_path(agent, channel_type: str, name: str) -> Path | None:
+    """Resolve a channel linking artifact path under the agent's data dir.
+
+    Isolated channel features (e.g. WhatsApp) push their pairing QR PNG to the
+    host, which persists it here so the chat UI can render it over http (the
+    sanitizer blocks ``data:`` image URIs). Mirrors ``_agent_data_dir`` in
+    ``features/isolated_runtime`` (agent data dir = storage DB's parent).
+    """
+    storage_path = getattr(agent, "storage_path", None)
+    if not storage_path:
+        return None
+    base = Path(storage_path).expanduser().resolve().parent
+    return base / "channel_link_artifacts" / f"{channel_type}_{name}"
+
+
+@router.get("/api/agent/channels/{channel_type}/link-qr.png")
+async def serve_channel_link_qr(channel_type: str, request: Request):
+    """Serve the current pairing QR PNG for an isolated channel feature.
+
+    The image is rendered into the chat by ``handleChannelLinkQr`` (chat.js)
+    off a ``channel_link_qr`` SSE event; an http(s) ``<img>`` survives the
+    DOMPurify sanitizer where an inline ``data:`` URI would be stripped.
+    Served ``no-store`` because the QR rotates (~20s) and is single-use.
+    """
+    if not _CHANNEL_TYPE_RE.match(channel_type):
+        raise HTTPException(status_code=400, detail="Invalid channel type")
+    agent = get_agent(request)
+    path = channel_artifact_path(agent, channel_type, "link_qr.png")
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="No pairing QR available")
+    return FileResponse(
+        str(path),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @router.get("/api/files/{content_hash}")
