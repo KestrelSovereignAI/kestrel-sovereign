@@ -54,6 +54,74 @@ import { Events, makeEvent } from './events.js';
 // 400s with the SDP body — the browser sees "SDP exchange failed:
 // HTTP 400".  See kestrel-voice-openai#16 (Beta -> GA migration).
 const REALTIME_SDP_URL = 'https://api.openai.com/v1/realtime/calls';
+export const DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS = 3000;
+
+export function resolveToolProgressHintDelay(config = globalThis.KestrelVoiceConfig) {
+  const raw = config?.tool_progress_hint_delay_ms ?? config?.toolBridgeDelayMs;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS;
+}
+
+export function buildToolProgressHintMessages({
+  callId = '',
+  toolName = 'tool',
+  phase = 'working',
+} = {}) {
+  const safeTool = toolName || 'tool';
+  const prompt = phase === 'still_working'
+    ? 'The tool is still running. Briefly reassure the user that you are still working on it. Do not answer the original request yet.'
+    : 'The tool is taking a moment. Briefly acknowledge that you are checking it. Do not answer the original request yet.';
+
+  return [
+    {
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: `[Kestrel voice tool status: ${phase}; tool=${safeTool}; call_id=${callId}] ${prompt}`,
+        }],
+      },
+    },
+    {
+      type: 'response.create',
+      response: {
+        instructions: 'Say one short bridge phrase, such as "Let me check that." Do not mention internal tool names or status markers.',
+      },
+    },
+  ];
+}
+
+export function createToolProgressHintScheduler({
+  delayMs = DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS,
+  sendHint,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+} = {}) {
+  if (typeof sendHint !== 'function') {
+    throw new Error('createToolProgressHintScheduler requires sendHint');
+  }
+
+  function start(payload = {}) {
+    let fired = false;
+    let done = false;
+    const timer = setTimeoutFn(() => {
+      if (done || fired) return;
+      fired = true;
+      sendHint({ phase: 'working', ...payload });
+    }, delayMs);
+
+    return {
+      finish() {
+        done = true;
+        if (!fired) clearTimeoutFn(timer);
+      },
+    };
+  }
+
+  return { start };
+}
 
 /**
  * @param {Object} opts
@@ -470,6 +538,12 @@ export async function createRealtimeClient({
     sendJSON({ type: 'response.create' });
   }
 
+  function sendToolProgressHint(payload = {}) {
+    for (const msg of buildToolProgressHintMessages(payload)) {
+      sendJSON(msg);
+    }
+  }
+
   /** Input-level sampling for the UI meter. Returns 0..1. */
   function getInputLevel() {
     if (!micStream || !pc) return 0;
@@ -500,6 +574,7 @@ export async function createRealtimeClient({
     cancelResponse,
     updateInstructions,
     commitToolResult,
+    sendToolProgressHint,
     whenPersisted,
     recordToolEvent,
     getInputLevel,
