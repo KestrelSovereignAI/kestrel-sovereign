@@ -748,7 +748,7 @@ async def test_orchestrator_loop_timeout_surfaces_failed_marker(monkeypatch):
     # #1659: the follow-up timeout surfaces as a typed error tool sentinel
     # (rendered as a tool-card error), not emoji prose.
     from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-    _clean, parts = _parse_stream_sentinels(text)
+    _clean, parts, _ = _parse_stream_sentinels(text)
     assert any(
         p["phase"] == "error" and "timeout" in (p.get("detail") or "")
         for p in parts
@@ -850,7 +850,7 @@ async def test_orchestrator_loop_timeout_marker_precedes_separator():
         )
         # #1659: typed error sentinel instead of the ❌ emoji marker.
         from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-        _clean, parts = _parse_stream_sentinels(text)
+        _clean, parts, _ = _parse_stream_sentinels(text)
         assert any(
             p["phase"] == "error" and "timeout" in (p.get("detail") or "")
             for p in parts

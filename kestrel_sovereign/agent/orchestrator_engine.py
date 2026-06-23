@@ -33,6 +33,7 @@ from kestrel_sdk.llm import ToolCallStarted
 # applies uniformly to first-level AND multi-iteration tool calls
 # (codex P1 on PR #1346: follow-up pre-tool prose was streamed without
 # the honesty-layer clear).
+from kestrel_sovereign.agent.parts import build_part_sentinel, drain_parts
 from kestrel_sovereign.agent.streaming import (
     _build_revise_sentinel,
     _build_tool_sentinel,
@@ -2266,6 +2267,17 @@ class OrchestratorEngineMixin:
                         yield _build_tool_sentinel(
                             'error', ev.get('tool', ''), detail=ev.get('error'),
                         )
+
+            # #1914: drain any typed component parts the tools in this batch
+            # emitted via ``emit_part`` and yield them as in-band PART sentinels
+            # — placed right after the tool cards resolve so each component
+            # bubble lands in stream order at the point its tool ran. Drained
+            # (not just read) so a part is emitted exactly once even across
+            # multiple tool iterations in the same turn.
+            for part in drain_parts():
+                sentinel = build_part_sentinel(part)
+                if sentinel:
+                    yield sentinel
 
             if _cancelled():
                 # Tool batch finished cleanly; skip synthesis. The user

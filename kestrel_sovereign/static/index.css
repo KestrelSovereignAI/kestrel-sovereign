@@ -1233,6 +1233,31 @@ nav {
     border-left: 3px solid var(--accent-color);
 }
 
+/* #1914: typed component parts render as their own agent bubbles. The
+   built-in ``notice`` core renderer; feature renderers (todo #1894, …) add
+   their own classes. Accent reflects the notice level. */
+.part-notice {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.5rem 0.65rem;
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    border-left: 3px solid var(--accent-color);
+}
+.part-notice-success { border-left-color: #22c55e; }
+.part-notice-warning { border-left-color: #f59e0b; }
+.part-notice-error { border-left-color: #ef4444; }
+.part-notice-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+.part-notice-body {
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .tool-activity-expandable {
     display: block;
 }

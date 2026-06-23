@@ -34,7 +34,7 @@ def test_parse_strips_tool_and_records_position():
         + _build_tool_sentinel("start", "web_search", index=0)
         + "Here is the answer."
     )
-    clean, parts = _parse_stream_sentinels(text)
+    clean, parts, _ = _parse_stream_sentinels(text)
     assert clean == "Let me search.Here is the answer."
     assert len(parts) == 1
     assert parts[0]["phase"] == "start"
@@ -49,7 +49,7 @@ def test_parse_preserves_ms_and_detail_and_error():
         + _build_tool_sentinel("done", "shell", ms=42)
         + _build_tool_sentinel("error", "deploy", detail="boom")
     )
-    clean, parts = _parse_stream_sentinels(text)
+    clean, parts, _ = _parse_stream_sentinels(text)
     assert clean == ""
     assert [p["phase"] for p in parts] == ["start", "done", "error"]
     assert parts[0]["detail"] == "git status"
@@ -61,7 +61,7 @@ def test_parse_preserves_ms_and_detail_and_error():
 
 def test_base_offset_shifts_positions():
     text = "post" + _build_tool_sentinel("start", "t")
-    _clean, parts = _parse_stream_sentinels(text, base_offset=100)
+    _clean, parts, _ = _parse_stream_sentinels(text, base_offset=100)
     assert parts[0]["pos"] == 100 + len("post")
 
 
@@ -73,7 +73,7 @@ def test_tool_and_revise_coexist_weld_preserved():
         + _build_tool_sentinel("start", "search", index=0)
         + "answer"
     )
-    clean, parts = _parse_stream_sentinels(text)
+    clean, parts, _ = _parse_stream_sentinels(text)
     assert clean == "thinking\n\nanswer"  # revise welded; tool stripped, no weld
     assert len(parts) == 1
     assert parts[0]["name"] == "search"
@@ -100,7 +100,7 @@ def test_tool_parts_to_events_maps_to_metadata_shape():
         + _build_tool_sentinel("done", "shell", ms=9)
         + _build_tool_sentinel("error", "deploy", detail="boom")
     )
-    _clean, parts = _parse_stream_sentinels(stream)
+    _clean, parts, _ = _parse_stream_sentinels(stream)
     events = _tool_parts_to_events(parts)
     assert events[0]["type"] == "start" and events[0]["tool"] == "shell"
     assert events[0]["pos"] == len("ran")

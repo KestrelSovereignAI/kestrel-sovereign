@@ -12,6 +12,8 @@ import {
     renderModelFooterHtml,
     messageAttachmentsHtml,
     handleRestartStatus,
+    appendMessagePart,
+    splitContentByParts,
 } from './chat.js';
 
 // #1659: tool cards on reload come from the structured, position-stamped
@@ -431,6 +433,16 @@ window.loadConversation = async function(sessionId) {
             let toolHtml = '';
             let bodyHtml = null;
             const content = msg.content;
+            // #1914: an assistant turn that emitted typed component parts
+            // re-renders as interleaved bubbles — prose runs (each with its own
+            // tool cards) and the component bubbles between them — mirroring the
+            // live stream. Handled in its own path; skips the single-bubble path.
+            const parts = msg.metadata?.parts;
+            if (msg.role === 'assistant' && !isEncrypted
+                && Array.isArray(parts) && parts.length) {
+                renderAssistantWithParts(msg, content, parts);
+                return;
+            }
             if (msg.role === 'assistant' && !isEncrypted) {
                 const toolEvents = msg.metadata?.tool_events;
                 const hasPos = !!toolEvents
@@ -594,6 +606,52 @@ window.purgeMessage = async function(messageId, messageDiv) {
         Toast.error(`Failed to permanently delete: ${e.message}`);
     }
 };
+
+// #1914: re-render an assistant turn that emitted typed component parts as
+// interleaved bubbles — prose segments (each carrying its slice of the
+// position-stamped tool cards) and the component bubbles between them — so a
+// reload matches the live multi-bubble stream. The message id, delete
+// affordances, and model footer anchor on the FIRST rendered prose bubble; a
+// bare prose segment (e.g. the gap between two adjacent parts) is skipped so no
+// empty bubble appears.
+function renderAssistantWithParts(msg, content, parts) {
+    const toolEvents = msg.metadata?.tool_events;
+    const hasPosTools = Array.isArray(toolEvents)
+        && toolEvents.some((e) => typeof e.pos === 'number');
+    const sliceTools = (start, end) => {
+        if (!hasPosTools) return null;
+        return toolEvents
+            .filter((e) => typeof e.pos === 'number' && e.pos >= start && e.pos < end)
+            .map((e) => ({ ...e, pos: e.pos - start }));
+    };
+    const visiblePane = state.chatPanes.get(state.mountedChatAgent);
+    const paneEl = visiblePane ? visiblePane.element : null;
+    const segments = splitContentByParts(content, parts);
+    let anchored = false;
+    for (const seg of segments) {
+        if (seg.kind === 'part') {
+            appendMessagePart(seg.part.type, seg.part.data, paneEl);
+            continue;
+        }
+        const slicedTools = sliceTools(seg.start, seg.end);
+        if (!String(seg.text || '').trim() && !(slicedTools && slicedTools.length)) {
+            continue;
+        }
+        const segBody = renderAgentContentHtml(seg.text, { toolEvents: slicedTools });
+        addMessageToChat(
+            'assistant',
+            seg.text,
+            false,
+            anchored ? null : msg.id,
+            '',
+            '',
+            segBody,
+            null,
+            anchored ? null : { model: msg.model, provider: msg.provider },
+        );
+        anchored = true;
+    }
+}
 
 function addMessageToChat(
     role,
