@@ -476,7 +476,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `check_sovereignty_status` | `!check-sovereignty-status` | `system` |  | 20 | `enabled` |
-| `export_sovereignty` | `!export-sovereignty` | `system` | `storage_tier`, `encrypt` | 99 | `enabled` |
+| `export_sovereignty` | `!export-sovereignty` | `system` | `storage_tier`, `encrypt`, `on_progress` | 142 | `enabled` |
 | `import_sovereignty` | `!import-sovereignty` | `system` | `cid` | 32 | `enabled` |
 
 ### `spawn` (SpawnFeature)
@@ -616,7 +616,6 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 - `GET /`
 - `GET /api/auth/key`
-- `GET /api/github/{path:path}`
 - `GET /health`
 - `GET /health/detailed`
 
@@ -684,6 +683,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - [`kestrel_sovereign/endpoints/files.py`](kestrel_sovereign/endpoints/files.py)
   - `GET /api/files/{content_hash}`
   - `HEAD /api/files/{content_hash}`
+- [`kestrel_sovereign/endpoints/github.py`](kestrel_sovereign/endpoints/github.py)
+  - `GET /api/github/repos`
+  - `GET /api/github/{path:path}`
 - [`kestrel_sovereign/endpoints/memories.py`](kestrel_sovereign/endpoints/memories.py)
   - `GET /api/identity-chain`
   - `GET /api/memories`
@@ -948,7 +950,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!skill save` | `skills` | `<insight_id> <steps_json> <verification> [tags_json]` | Promote a reflection insight into a saved skill |
 | `!skill show` | `skills` | `<skill_id>` | Show the full content of an extracted skill |
 | `!check-sovereignty-status` | `sovereignty` |  | Check the status of sovereignty backups. |
-| `!export-sovereignty` | `sovereignty` | `[storage_tier] [encrypt]` | Export the agent's entire state to IPFS/Filecoin for sovereignty backup. |
+| `!export-sovereignty` | `sovereignty` | `[storage_tier] [encrypt] [on_progress]` | Export the agent's entire state to IPFS/Filecoin for sovereignty backup. |
 | `!import-sovereignty` | `sovereignty` | `<cid>` | Restore the agent's state from an IPFS CID. |
 | `!state-of-mind` | `state_of_mind` |  | Get the current constitutional governance state for this agent |
 | `!dispatch` | `strategic_memory` | `[mode]` | Pick the highest-priority issue from strategic memory and dispatch it to Talon via the Agent Mesh Protocol. Works with any signal source (morning, hygiene, event-driven, on-demand). |
@@ -993,6 +995,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!wellness-history` | `wellness` | `[limit]` | View wellness trends over time |
 
 <!-- END AUTO-GENERATED FEATURE INVENTORY -->
+
 
 
 
