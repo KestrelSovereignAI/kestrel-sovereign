@@ -1388,10 +1388,14 @@ async def chat_completions(request: Request):
         if model_from_request and model_from_request not in ("kestrel-local", "auto"):
             model_override = model_from_request
 
+        # Extract user_passphrase for USER_BYOK agents
+        user_passphrase = data.get("user_passphrase")
+
         assistant_text = await agent.process_input(
             user_input,
             model_override=model_override,
             caller=get_caller(request),
+            user_passphrase=user_passphrase,
         )
 
         # Report the model that was actually routed, not just what the
