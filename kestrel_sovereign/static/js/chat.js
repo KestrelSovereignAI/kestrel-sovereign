@@ -609,6 +609,7 @@ function chatComponentApi() {
         setChatDeps,
         normalizeToolEvents,
         renderAgentContentHtml,
+        renderModelFooterHtml,
         renderToolCardsHtml,
         setChatRoot,
         registerHeaderAction,
@@ -2281,7 +2282,10 @@ export async function sendMessage(overrideText, overrideAgent) {
                         pane.sessionId = response.session_id;
                     }
                     if (isPaneFresh()) {
-                        await addMessage('agent', response.response, pane.element);
+                        await addMessage(
+                            'agent', response.response, pane.element, null,
+                            { model: response.model, provider: response.provider },
+                        );
                     }
                     if (isCurrentVisible()) {
                         await checkForModelChange(response.response);
@@ -2296,7 +2300,10 @@ export async function sendMessage(overrideText, overrideAgent) {
                 pane.sessionId = response.session_id;
             }
             if (isPaneFresh()) {
-                await addMessage('agent', response.response, pane.element);
+                await addMessage(
+                    'agent', response.response, pane.element, null,
+                    { model: response.model, provider: response.provider },
+                );
             }
             if (isCurrentVisible()) {
                 await checkForModelChange(response.response);
@@ -3017,6 +3024,42 @@ export function addMessageStreaming(role, paneElement = null) {
     return div;
 }
 
+function currentModelSelection() {
+    const s = deps().state || {};
+    const modelSelect = document.getElementById('model-selector');
+    const providerSelect = document.getElementById('provider-selector');
+    return {
+        model: s.selectedModel || modelSelect?.value || '',
+        provider: s.selectedVendor || s.selectedProvider || providerSelect?.value || '',
+    };
+}
+
+function modelFooterShouldRender(model, provider) {
+    if (!model && !provider) return false;
+    const current = currentModelSelection();
+    if (model && current.model && model !== current.model) return true;
+    if (provider && current.provider && provider !== current.provider) return true;
+    return !current.model && !current.provider;
+}
+
+function modelFooterLabel(model, provider) {
+    if (model && provider) return `${model} · ${provider}`;
+    return model || provider || '';
+}
+
+export function renderModelFooterHtml(metadata = {}) {
+    const model = String(metadata?.model || '').trim();
+    const provider = String(metadata?.provider || '').trim();
+    const label = modelFooterLabel(model, provider);
+    if (!label || !modelFooterShouldRender(model, provider)) return '';
+    return `<div class="message-model-footer">via ${deps().escapeHtml(label)}</div>`;
+}
+
+function appendModelFooter(messageDiv, metadata = {}) {
+    const html = renderModelFooterHtml(metadata);
+    if (html) messageDiv.insertAdjacentHTML('beforeend', html);
+}
+
 function renderThinkingBubbles(thinkingItems = []) {
     if (!thinkingItems || thinkingItems.length === 0) return '';
     return thinkingItems.map((item, idx) => {
@@ -3114,6 +3157,9 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);
     }
+    if (opts.model || opts.provider) {
+        appendModelFooter(msgDiv, opts);
+    }
     if (!mounted && pane && /```mermaid/.test(content)) {
         // Mark the pane so mountChatPane re-runs the mermaid pass.
         pane.hasUnrenderedMermaid = true;
@@ -3146,7 +3192,7 @@ export function messageAttachmentsHtml(atts) {
     return `<div class="message-attachments">${items}</div>`;
 }
 
-export async function addMessage(role, content, paneElement = null, attachments = null) {
+export async function addMessage(role, content, paneElement = null, attachments = null, metadata = null) {
     const target = resolvePaneElement(paneElement);
     const div = document.createElement('div');
     div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
@@ -3170,6 +3216,9 @@ export async function addMessage(role, content, paneElement = null, attachments 
         const strip = document.createElement('div');
         strip.innerHTML = messageAttachmentsHtml(attachments);
         if (strip.firstChild) div.appendChild(strip.firstChild);
+    }
+    if (role !== 'user') {
+        appendModelFooter(div, metadata);
     }
     if (target) target.appendChild(div);
 

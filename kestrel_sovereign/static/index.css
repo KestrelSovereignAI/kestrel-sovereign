@@ -963,6 +963,16 @@ nav {
     border-bottom-left-radius: 4px;
 }
 
+.message-model-footer {
+    margin-top: 0.45rem;
+    padding-top: 0.35rem;
+    border-top: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+}
+
 /* #1522: autonomous cognition wake (A2A reply resumption, scheduled
    wake, etc.) rendered live into the active pane. A subtle accent +
    attribution header distinguishes it from a reply to a user prompt. */

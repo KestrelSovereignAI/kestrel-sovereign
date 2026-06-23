@@ -967,6 +967,8 @@ function handleClientEvent(agent, ev, startSeq) {
 function finalizeAgentTurn(session, text) {
   const div = session.agentMsgDiv;
   const buf = text || '';
+  const realtimeModel = session.client?.session?.model || '';
+  const realtimeMetadata = realtimeModel ? { model: realtimeModel, provider: 'openai' } : null;
   session.agentMsgDiv = null;
   session.agentTextBuffer = '';
   // Track that this voice session produced a real, persisted turn so
@@ -974,7 +976,7 @@ function finalizeAgentTurn(session, text) {
   // Backend persistence keys off the same finalized turns.
   if (buf.trim()) session.persistedAny = true;
   if (!div) {
-    if (buf.trim()) addMessage('agent', buf, paneForSession(session).element);
+    if (buf.trim()) addMessage('agent', buf, paneForSession(session).element, null, realtimeMetadata);
     return;
   }
   // Use the chat module's finalizer so markdown / code blocks / mermaid get
@@ -982,9 +984,10 @@ function finalizeAgentTurn(session, text) {
   // pane targeting AND deferred-mermaid-on-mount work for a detached pane,
   // but with includePaneArtifacts:false so this pane's text-chat thinking
   // bubbles / tool cards aren't prepended onto the voice bubble.
-  finalizeStreamingMessage(div, buf, paneForSession(session), { includePaneArtifacts: false }).catch((err) =>
-    console.error('[voice/ui] finalize failed:', err),
-  );
+  finalizeStreamingMessage(
+    div, buf, paneForSession(session),
+    { includePaneArtifacts: false, ...(realtimeMetadata || {}) },
+  ).catch((err) => console.error('[voice/ui] finalize failed:', err));
 }
 
 
