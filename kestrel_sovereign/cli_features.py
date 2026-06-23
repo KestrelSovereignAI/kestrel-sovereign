@@ -63,6 +63,7 @@ def cmd_feature(args) -> int:
     """Dispatch feature subcommands."""
     feature_commands = {
         "list": cmd_feature_list,
+        "inventory": cmd_feature_inventory,
         "install": cmd_feature_install,
         "upgrade": cmd_feature_upgrade,
         "sync": cmd_feature_sync,
@@ -78,10 +79,38 @@ def cmd_feature(args) -> int:
     if handler is None:
         print(
             "Usage: kestrel feature "
-            "{list|install|upgrade|sync|status|enable|disable|info|scaffold|skills}"
+            "{list|inventory|install|upgrade|sync|status|enable|disable|info|scaffold|skills}"
         )
         return 1
     return handler(args)
+
+
+def cmd_feature_inventory(args) -> int:
+    """Generate the discovered feature/tool/endpoint/command inventory."""
+    from kestrel_sovereign.feature_inventory import (
+        build_inventory,
+        render_inventory_json,
+        render_inventory_markdown,
+        write_canonical_inventory,
+    )
+
+    if args.write:
+        write_canonical_inventory()
+        print("Wrote KESTREL_FEATURES.md")
+        return 0
+
+    inventory = build_inventory()
+    output = (
+        render_inventory_json(inventory)
+        if args.format == "json"
+        else render_inventory_markdown(inventory)
+    )
+    if args.output:
+        Path(args.output).write_text(output, encoding="utf-8")
+        print(f"Wrote {args.output}")
+    else:
+        print(output, end="")
+    return 0
 
 
 def cmd_feature_list(args) -> int:
@@ -1088,11 +1117,32 @@ def cmd_feature_skills(args) -> int:
 
 def add_feature_subparser(subparsers) -> None:
     """Register the ``kestrel feature ...`` subcommands on ``subparsers``."""
-    # kestrel feature {list|install|upgrade|sync|status|enable|disable|info|scaffold|skills}
+    # kestrel feature {list|inventory|install|upgrade|sync|status|enable|disable|info|scaffold|skills}
     feature_p = subparsers.add_parser("feature", help="Manage features")
     feature_sub = feature_p.add_subparsers(dest="feature_command")
 
     feature_sub.add_parser("list", help="List features with status")
+
+    feat_inventory = feature_sub.add_parser(
+        "inventory",
+        help="Generate discovered feature/tool/endpoint/command inventory",
+    )
+    feat_inventory.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Output format (default: markdown)",
+    )
+    feat_inventory.add_argument(
+        "--output",
+        default=None,
+        help="Write output to a file instead of stdout",
+    )
+    feat_inventory.add_argument(
+        "--write",
+        action="store_true",
+        help="Regenerate KESTREL_FEATURES.md in place",
+    )
 
     feat_install = feature_sub.add_parser("install", help="Install a feature package")
     feat_install.add_argument("name", help="Feature name (e.g. cloud, voice)")
@@ -1169,4 +1219,3 @@ def add_feature_subparser(subparsers) -> None:
 # them back) loads. Every `cli.<name>` reference above resolves at call time,
 # so binding `cli` here at end-of-module is safe.
 from kestrel_sovereign import cli  # noqa: E402
-
