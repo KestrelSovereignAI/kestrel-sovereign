@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 
 import {
   DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS,
+  buildRealtimeToolsSessionUpdate,
   buildToolProgressHintMessages,
   createToolProgressHintScheduler,
   resolveToolProgressHintDelay,
@@ -97,4 +98,24 @@ test('tool progress hint uses conversation item plus response create', () => {
   assert.match(messages[0].item.content[0].text, /subagent_dispatch/);
   assert.equal(messages[1].type, 'response.create');
   assert.match(messages[1].response.instructions, /one short bridge phrase/);
+});
+
+test('realtime tool disclosure update uses session.update tools payload', () => {
+  const tools = [{
+    type: 'function',
+    function: {
+      name: 'memory_feature',
+      description: 'Dispatch to memory',
+      parameters: { type: 'object' },
+    },
+  }];
+
+  assert.deepEqual(buildRealtimeToolsSessionUpdate(tools), {
+    type: 'session.update',
+    session: { tools },
+  });
+  assert.deepEqual(buildRealtimeToolsSessionUpdate(null), {
+    type: 'session.update',
+    session: { tools: [] },
+  });
 });

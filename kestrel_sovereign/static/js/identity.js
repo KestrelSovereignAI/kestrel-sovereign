@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 import { mountAgentVoiceControls, onAgentSwitch as onVoiceAgentSwitch, reapplyActiveSelectorLock } from './voice/ui.js';
@@ -1304,6 +1304,13 @@ window.loadConversation = async function(sessionId, options = {}) {
             }
 
             messageDiv.appendChild(contentDiv);
+            if (msg.role === 'assistant') {
+                const footer = renderModelFooterHtml({
+                    model: msg.model,
+                    provider: msg.provider,
+                });
+                if (footer) messageDiv.insertAdjacentHTML('beforeend', footer);
+            }
             chatContainer.appendChild(messageDiv);
         }
 

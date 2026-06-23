@@ -70,6 +70,10 @@ _KIND_DESCRIPTIONS: dict[PayerKind, str] = {
     PayerKind.NONE: "do not use this resource for any agent",
 }
 
+# Add USER_BYOK if available (local overlay extends SDK with this kind)
+if hasattr(PayerKind, "USER_BYOK"):
+    _KIND_DESCRIPTIONS[PayerKind.USER_BYOK] = "zero-knowledge user passphrase key (no platform caps/rotation)"
+
 
 def run(ctx: SetupContext) -> None:
     """Configure PayerPolicy in kestrel.toml [payments]."""

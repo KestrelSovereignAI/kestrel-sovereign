@@ -93,6 +93,15 @@ export function buildToolProgressHintMessages({
   ];
 }
 
+export function buildRealtimeToolsSessionUpdate(tools = []) {
+  return {
+    type: 'session.update',
+    session: {
+      tools: Array.isArray(tools) ? tools : [],
+    },
+  };
+}
+
 export function createToolProgressHintScheduler({
   delayMs = DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS,
   sendHint,
@@ -523,6 +532,15 @@ export async function createRealtimeClient({
   }
 
   /**
+   * Replace the session's advertised realtime tools mid-call. The server owns
+   * progressive disclosure and sends the current bounded registry view; the
+   * browser only forwards it over the existing data channel.
+   */
+  function updateTools(tools) {
+    sendJSON(buildRealtimeToolsSessionUpdate(tools));
+  }
+
+  /**
    * Return a tool's result to a pending call_id so the model continues.
    * `result` will be JSON-stringified; pass a plain serializable value.
    */
@@ -573,6 +591,7 @@ export async function createRealtimeClient({
     sendText,
     cancelResponse,
     updateInstructions,
+    updateTools,
     commitToolResult,
     sendToolProgressHint,
     whenPersisted,

@@ -609,6 +609,7 @@ function chatComponentApi() {
         setChatDeps,
         normalizeToolEvents,
         renderAgentContentHtml,
+        renderModelFooterHtml,
         renderToolCardsHtml,
         setChatRoot,
         registerHeaderAction,
@@ -2281,7 +2282,10 @@ export async function sendMessage(overrideText, overrideAgent) {
                         pane.sessionId = response.session_id;
                     }
                     if (isPaneFresh()) {
-                        await addMessage('agent', response.response, pane.element);
+                        await addMessage(
+                            'agent', response.response, pane.element, null,
+                            { model: response.model, provider: response.provider },
+                        );
                     }
                     if (isCurrentVisible()) {
                         await checkForModelChange(response.response);
@@ -2296,7 +2300,10 @@ export async function sendMessage(overrideText, overrideAgent) {
                 pane.sessionId = response.session_id;
             }
             if (isPaneFresh()) {
-                await addMessage('agent', response.response, pane.element);
+                await addMessage(
+                    'agent', response.response, pane.element, null,
+                    { model: response.model, provider: response.provider },
+                );
             }
             if (isCurrentVisible()) {
                 await checkForModelChange(response.response);
@@ -2427,6 +2434,7 @@ export async function updateContextStatus() {
 
         const status = await deps().api.getContextStatus(sessionId);
         const { message_count, utilization_percent, status: contextState, warnings, route_cap, codex_thread } = status;
+        const modelLabel = formatContextModelLabel(status);
 
         // #1844: on openai:plan, codex holds the conversation thread
         // server-side while Kestrel sends only incremental turns — so
@@ -2541,8 +2549,8 @@ export async function updateContextStatus() {
                   onclick="window.openContextBreakdownPopup()"
                   onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
                   style="cursor: pointer; user-select: none;"
-                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
-                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}%${routeCapBadge}${compactButton}
+                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used · ${_esc(modelLabel)}${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
+                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}% <span style="opacity:0.75;font-size:0.65rem;">${_esc(modelLabel)}</span>${routeCapBadge}${compactButton}
             </span>
         `;
 
@@ -2684,6 +2692,16 @@ function _esc(value) {
         .replace(/'/g, '&#39;');
 }
 
+function formatContextModelLabel(status) {
+    if (!status || status.model_source === 'no_assistant_turn') {
+        return 'No assistant turn';
+    }
+    if (!status.model) {
+        return 'Legacy turn · model unknown';
+    }
+    return status.provider ? `${status.provider}/${status.model}` : status.model;
+}
+
 /** Render the layered breakdown HTML for ``openContextBreakdownPopup``. */
 function renderContextBreakdown(status) {
     const fmt = (n) => Number(n || 0).toLocaleString();
@@ -2695,6 +2713,7 @@ function renderContextBreakdown(status) {
     const total = breakdown.total_measured || 0;
     const budget = breakdown.total_budget || 1;
     const pct = (n) => ((n / budget) * 100).toFixed(1);
+    const modelLabel = formatContextModelLabel(status);
 
     // ``badge`` text is hard-coded by the renderer (never user-supplied)
     // — colors come from the renderer too. Safe to inline.
@@ -2955,7 +2974,7 @@ function renderContextBreakdown(status) {
                 </div>
                 <div style="text-align:right; color:var(--text-secondary)">
                     <div>${fmt(total)} / ${fmt(budget)} tokens</div>
-                    <div style="font-size:0.7rem; margin-top:0.15rem">${_esc(breakdown.model || '')} · reserve ${fmt(breakdown.response_reserve || 0)} · limit ${fmt(breakdown.context_limit || 0)}</div>
+                    <div style="font-size:0.7rem; margin-top:0.15rem">${_esc(modelLabel)} · reserve ${fmt(breakdown.response_reserve || 0)} · limit ${fmt(breakdown.context_limit || 0)}</div>
                 </div>
             </div>
             ${codexThreadBlock}
@@ -3015,6 +3034,42 @@ export function addMessageStreaming(role, paneElement = null) {
     }
 
     return div;
+}
+
+function currentModelSelection() {
+    const s = deps().state || {};
+    const modelSelect = document.getElementById('model-selector');
+    const providerSelect = document.getElementById('provider-selector');
+    return {
+        model: s.selectedModel || modelSelect?.value || '',
+        provider: s.selectedVendor || s.selectedProvider || providerSelect?.value || '',
+    };
+}
+
+function modelFooterShouldRender(model, provider) {
+    if (!model && !provider) return false;
+    const current = currentModelSelection();
+    if (model && current.model && model !== current.model) return true;
+    if (provider && current.provider && provider !== current.provider) return true;
+    return !current.model && !current.provider;
+}
+
+function modelFooterLabel(model, provider) {
+    if (model && provider) return `${model} · ${provider}`;
+    return model || provider || '';
+}
+
+export function renderModelFooterHtml(metadata = {}) {
+    const model = String(metadata?.model || '').trim();
+    const provider = String(metadata?.provider || '').trim();
+    const label = modelFooterLabel(model, provider);
+    if (!label || !modelFooterShouldRender(model, provider)) return '';
+    return `<div class="message-model-footer">via ${deps().escapeHtml(label)}</div>`;
+}
+
+function appendModelFooter(messageDiv, metadata = {}) {
+    const html = renderModelFooterHtml(metadata);
+    if (html) messageDiv.insertAdjacentHTML('beforeend', html);
 }
 
 function renderThinkingBubbles(thinkingItems = []) {
@@ -3114,6 +3169,9 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);
     }
+    if (opts.model || opts.provider) {
+        appendModelFooter(msgDiv, opts);
+    }
     if (!mounted && pane && /```mermaid/.test(content)) {
         // Mark the pane so mountChatPane re-runs the mermaid pass.
         pane.hasUnrenderedMermaid = true;
@@ -3146,7 +3204,7 @@ export function messageAttachmentsHtml(atts) {
     return `<div class="message-attachments">${items}</div>`;
 }
 
-export async function addMessage(role, content, paneElement = null, attachments = null) {
+export async function addMessage(role, content, paneElement = null, attachments = null, metadata = null) {
     const target = resolvePaneElement(paneElement);
     const div = document.createElement('div');
     div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
@@ -3170,6 +3228,9 @@ export async function addMessage(role, content, paneElement = null, attachments 
         const strip = document.createElement('div');
         strip.innerHTML = messageAttachmentsHtml(attachments);
         if (strip.firstChild) div.appendChild(strip.firstChild);
+    }
+    if (role !== 'user') {
+        appendModelFooter(div, metadata);
     }
     if (target) target.appendChild(div);
 

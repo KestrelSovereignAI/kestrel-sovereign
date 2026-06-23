@@ -35,6 +35,37 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 # Regex strips invalid JSON escape sequences (e.g. \! from zsh shells)
 _INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')
 
+LEGACY_CONTEXT_MODEL = "legacy/unknown"
+
+
+def _latest_assistant_model_identity(
+    history: list[Dict[str, Any]],
+) -> Dict[str, Optional[str]]:
+    """Return the latest assistant turn's stamped model/provider identity."""
+    for row in reversed(history):
+        if (row.get("role") or "").lower() != "assistant":
+            continue
+        model = row.get("model") or None
+        provider = row.get("provider") or None
+        if model and provider:
+            context_model = f"{provider}/{model}"
+        elif model:
+            context_model = model
+        else:
+            context_model = LEGACY_CONTEXT_MODEL
+        return {
+            "model": model,
+            "provider": provider,
+            "context_model": context_model,
+            "model_source": "assistant_turn" if model else "legacy_assistant_turn",
+        }
+    return {
+        "model": None,
+        "provider": None,
+        "context_model": LEGACY_CONTEXT_MODEL,
+        "model_source": "no_assistant_turn",
+    }
+
 
 async def _parse_json_body(request: Request) -> dict:
     """Parse JSON body, recovering from common shell-escaping issues."""
@@ -84,6 +115,7 @@ async def invoke_agent(request: Request):
         model_override = data.get("model")
         provider_override = data.get("provider")
         session_id = data.get("session_id")
+        user_passphrase = data.get("user_passphrase")
 
         if user_input is None:
             raise HTTPException(status_code=400, detail="Input not provided.")
@@ -110,8 +142,16 @@ async def invoke_agent(request: Request):
             model_override=model_override,
             session_id=effective_session_id,
             caller=caller,
+            user_passphrase=user_passphrase,
         )
-        return {"response": response, "session_id": effective_session_id}
+        # Extract model/provider identity for frontend footer rendering (#1373)
+        identity = agent._conversation_response_identity(use_last_identity=True)
+        return {
+            "response": response,
+            "session_id": effective_session_id,
+            "model": identity.get("model"),
+            "provider": identity.get("provider"),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -808,14 +848,7 @@ async def get_context_status(
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
         from kestrel_sovereign.kestrel_config.constants import MAX_CONVERSATION_HISTORY_LIMIT
 
-        # 1. Get CURRENT model (respects mandate/preference system)
-        current_model = agent.get_current_model()
-
-        # 2. Create token counter for current model (gets correct context limit)
-        counter = get_token_counter(current_model)
-        context_limit = counter.get_context_limit()
-
-        # 2b. No active session → return an idle shape.  Previously passing
+        # 1. No active session → return an idle shape.  Previously passing
         # session_id=None into get_conversation_history leaked the agent's
         # cross-session aggregate count and falsely rolled utilization to
         # 100%, which surfaced in the chat footer as "472 msgs · 100%
@@ -823,8 +856,14 @@ async def get_context_status(
         # is only meaningful for an active conversation; with none, there's
         # nothing to report.
         if not session_id:
+            current_model = agent.get_current_model()
+            counter = get_token_counter(current_model)
+            context_limit = counter.get_context_limit()
             return {
                 "model": current_model,
+                "provider": None,
+                "context_model": current_model,
+                "model_source": "current_preference",
                 "message_count": 0,
                 "total_tokens": 0,
                 "context_limit": context_limit,
@@ -839,21 +878,37 @@ async def get_context_status(
                 "silently_pruned_path_active": False,
             }
 
-        # 3. Get conversation history for the specified session
+        # 2. Get conversation history for the specified session
         history = await agent.storage.get_conversation_history(
             limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id
         )
         message_count = len(history)
+
+        # 3. Budget against the actual model/provider stamped on the latest
+        # assistant turn in this session. This intentionally does not consult
+        # the current dropdown/model preference: a Realtime turn followed by a
+        # text dropdown change must still show Realtime's window until another
+        # assistant turn is written. Legacy/restored rows may have null stamps;
+        # in that case use a neutral placeholder rather than impersonating the
+        # current preference.
+        model_identity = _latest_assistant_model_identity(history)
+        current_model = model_identity["context_model"] or LEGACY_CONTEXT_MODEL
+        counter = get_token_counter(current_model)
+        context_limit = counter.get_context_limit()
 
         # 4. Run the canonical per-section measurement (A / #1308).
         # ``measure_context_breakdown`` is the single source of truth
         # for what the LLM call would actually see — popup and pill
         # cannot drift from production accounting (Emma's "popup must
         # reflect what the model sees" invariant from PR #1306).
-        ctx_builder = getattr(agent, 'context_builder', None)
-        if ctx_builder is None:
-            from kestrel_sovereign.agent.context_builder import ContextBuilder
-            ctx_builder = ContextBuilder(storage=agent.storage)
+        from kestrel_sovereign.agent.context_builder import ContextBuilder
+        agent_ctx_builder = getattr(agent, 'context_builder', None)
+        ctx_builder = ContextBuilder(
+            storage=agent.storage,
+            model=current_model,
+            consolidator=getattr(agent_ctx_builder, "consolidator", None),
+            agent_data_path=getattr(agent_ctx_builder, "agent_data_path", None),
+        )
 
         # Constitution and state-of-mind for the measurement match the
         # production call path. Best-effort fetch — failure here only
@@ -1139,7 +1194,10 @@ async def get_context_status(
             logger.debug(f"codex thread occupancy probe failed: {e}")
 
         return {
-            "model": current_model,
+            "model": model_identity["model"],
+            "provider": model_identity["provider"],
+            "context_model": current_model,
+            "model_source": model_identity["model_source"],
             "message_count": message_count,
             "total_tokens": total_measured,  # honest whole-window total
             "context_limit": context_limit,
