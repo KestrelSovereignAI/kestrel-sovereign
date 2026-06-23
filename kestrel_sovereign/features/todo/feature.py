@@ -153,6 +153,55 @@ class TodoFeature(Feature):
             )
         )
 
+    async def active_preturn_items(
+        self, limit: int = 200,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Active todos for pre-turn context injection (#1907 — the deferred
+        #1832 follow-up).
+
+        Returns ``{"session": [...], "global_active": [...]}``:
+        - ``session``: every active (non-terminal, non-superseded) todo whose
+          ``source_turn.session_id`` matches the current session — so the agent
+          sees what THIS conversation still owes.
+        - ``global_active``: active ``in_progress``/``waiting`` todos from OTHER
+          sessions — the cross-session loops that must survive wakes/restarts.
+
+        Non-tool (plain dicts, not a ``ToolResult``) so the always-on
+        operational pre-turn block can render it. Best-effort: empty lists on
+        any failure — must never break a turn.
+        """
+        empty: Dict[str, List[Dict[str, Any]]] = {"session": [], "global_active": []}
+        graph = self._graph()
+        if graph is None:
+            return empty
+        session_id = self._current_session_id()
+        try:
+            nodes = await graph.query_nodes_by_type_and_property(
+                TODO_NODE_TYPE,
+                filters={"agent_id": self.agent_id},
+                order_by_created=True,
+                limit=limit,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("active_preturn_items query failed: %s", e)
+            return empty
+
+        session_items: List[Dict[str, Any]] = []
+        global_active: List[Dict[str, Any]] = []
+        for node in nodes:
+            item = self._shape(node)
+            if item.get("superseded_by"):
+                continue
+            status = item.get("status", "open")
+            if status in TERMINAL_STATUSES or status not in OPEN_STATUSES:
+                continue
+            item_session = (item.get("source_turn") or {}).get("session_id")
+            if session_id is not None and item_session == session_id:
+                session_items.append(item)
+            elif status in {"in_progress", "waiting"}:
+                global_active.append(item)
+        return {"session": session_items, "global_active": global_active}
+
     @tool(
         name="todo_add",
         description=(

@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -368,18 +368,70 @@ async def _codex_decline_section(agent: Any) -> Optional[str]:
     )
 
 
-async def build_operational_state_block(agent: Any) -> Optional[str]:
-    """Always-on operational lifecycle context (#1571, #1581).
+async def _active_todo_section(agent: Any) -> Optional[str]:
+    """Surface active TodoFeature items so unfinished durable loops stay
+    visible across signal wakes, restarts, and delayed tool callbacks
+    (#1907 — the deferred #1832 pre-turn-injection follow-up).
 
-    Required operational typed events — restart_status (#1571) plus
-    codex sandbox-approval declines (#1581) — must surface in the
-    agent's turn context even when the optional proactive
-    ``[preturn_state]`` block is disabled. This block is minimal,
-    DID-scoped, non-instructional, and silently returns ``None``
-    when there is nothing to report.
+    Without this, the durable todo queue (#1843) is pull-only: the model only
+    sees unfinished work if it remembers to call ``todo_rollup``. Here it rides
+    the always-on operational block alongside restart-status, so every wake
+    re-surfaces what the agent still owes. Bounded + non-instructional: a
+    summary header plus a capped list with each item's terminal condition (so
+    the agent knows what "done" means and doesn't stop after a poll when the
+    real condition is "wait until merged + restarted"). ``None`` when nothing
+    is active.
+    """
+    feat = _get_feature(agent, "TodoFeature")
+    if feat is None or not hasattr(feat, "active_preturn_items"):
+        return None
+    try:
+        items = await feat.active_preturn_items()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("preturn_state: active todos failed: %s", exc)
+        return None
+    session = items.get("session") or []
+    global_active = items.get("global_active") or []
+    if not session and not global_active:
+        return None
+
+    def _fmt(it: Dict[str, Any]) -> str:
+        title = str(it.get("title") or it.get("id") or "todo").strip().replace("\n", " ")
+        status = str(it.get("status") or "open")
+        line = f"  - [{status}] {title[:100]}"
+        tc = str(it.get("terminal_condition") or "").strip().replace("\n", " ")
+        if tc:
+            line += f" (done when: {tc[:120]})"
+        return line
+
+    lines: List[str] = []
+    if session:
+        lines.append(f"Active todos — this session ({len(session)}):")
+        lines.extend(_fmt(it) for it in session[:6])
+    if global_active:
+        lines.append(
+            f"Active todos — other sessions, in_progress/waiting ({len(global_active)}):"
+        )
+        lines.extend(_fmt(it) for it in global_active[:6])
+    return _truncate_to_tokens("\n".join(lines), 300)
+
+
+async def build_operational_state_block(agent: Any) -> Optional[str]:
+    """Always-on operational lifecycle context (#1571, #1581, #1907).
+
+    Required operational typed events — restart_status (#1571), codex
+    sandbox-approval declines (#1581), and active-todo rollups (#1907) — must
+    surface in the agent's turn context even when the optional proactive
+    ``[preturn_state]`` block is disabled. This block is minimal, DID-scoped,
+    non-instructional, and silently returns ``None`` when there is nothing to
+    report.
     """
     lines: List[str] = []
-    for section in (_restart_status_section, _codex_decline_section):
+    for section in (
+        _restart_status_section,
+        _codex_decline_section,
+        _active_todo_section,
+    ):
         try:
             line = await section(agent)
         except Exception as exc:  # noqa: BLE001 - never break a turn
