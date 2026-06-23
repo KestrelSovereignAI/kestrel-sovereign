@@ -2427,6 +2427,7 @@ export async function updateContextStatus() {
 
         const status = await deps().api.getContextStatus(sessionId);
         const { message_count, utilization_percent, status: contextState, warnings, route_cap, codex_thread } = status;
+        const modelLabel = formatContextModelLabel(status);
 
         // #1844: on openai:plan, codex holds the conversation thread
         // server-side while Kestrel sends only incremental turns — so
@@ -2541,8 +2542,8 @@ export async function updateContextStatus() {
                   onclick="window.openContextBreakdownPopup()"
                   onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
                   style="cursor: pointer; user-select: none;"
-                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
-                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}%${routeCapBadge}${compactButton}
+                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used · ${_esc(modelLabel)}${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
+                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}% <span style="opacity:0.75;font-size:0.65rem;">${_esc(modelLabel)}</span>${routeCapBadge}${compactButton}
             </span>
         `;
 
@@ -2684,6 +2685,16 @@ function _esc(value) {
         .replace(/'/g, '&#39;');
 }
 
+function formatContextModelLabel(status) {
+    if (!status || status.model_source === 'no_assistant_turn') {
+        return 'No assistant turn';
+    }
+    if (!status.model) {
+        return 'Legacy turn · model unknown';
+    }
+    return status.provider ? `${status.provider}/${status.model}` : status.model;
+}
+
 /** Render the layered breakdown HTML for ``openContextBreakdownPopup``. */
 function renderContextBreakdown(status) {
     const fmt = (n) => Number(n || 0).toLocaleString();
@@ -2695,6 +2706,7 @@ function renderContextBreakdown(status) {
     const total = breakdown.total_measured || 0;
     const budget = breakdown.total_budget || 1;
     const pct = (n) => ((n / budget) * 100).toFixed(1);
+    const modelLabel = formatContextModelLabel(status);
 
     // ``badge`` text is hard-coded by the renderer (never user-supplied)
     // — colors come from the renderer too. Safe to inline.
@@ -2955,7 +2967,7 @@ function renderContextBreakdown(status) {
                 </div>
                 <div style="text-align:right; color:var(--text-secondary)">
                     <div>${fmt(total)} / ${fmt(budget)} tokens</div>
-                    <div style="font-size:0.7rem; margin-top:0.15rem">${_esc(breakdown.model || '')} · reserve ${fmt(breakdown.response_reserve || 0)} · limit ${fmt(breakdown.context_limit || 0)}</div>
+                    <div style="font-size:0.7rem; margin-top:0.15rem">${_esc(modelLabel)} · reserve ${fmt(breakdown.response_reserve || 0)} · limit ${fmt(breakdown.context_limit || 0)}</div>
                 </div>
             </div>
             ${codexThreadBlock}
