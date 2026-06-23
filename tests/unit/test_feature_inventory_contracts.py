@@ -63,10 +63,28 @@ def test_discover_features_matches_unique_class_inventory():
     for cls in discover_entrypoint_feature_classes().values():
         expected_names.add(cls.__name__)
     features = discover_features(_mock_agent())
-    discovered_names = {feature.__class__.__name__ for feature in features}
 
-    assert discovered_names == expected_names
-    assert len(features) == len(expected_names)
+    # Isolated-venv features have no importable in-process class — discover_features
+    # represents each installed isolated-venv runtime by a programmatically built
+    # ProxyFeature (skipped by find_feature_class / entry-point class discovery).
+    # Model that third path explicitly so an installed isolated feature (e.g.
+    # WhatsAppFeature on a host that has it) doesn't break this contract.
+    from kestrel_sovereign.feature_registry import discover_installed_feature_runtimes
+
+    isolated_runtimes = [
+        runtime
+        for runtime in discover_installed_feature_runtimes().values()
+        if runtime.runtime == "isolated-venv"
+    ]
+    proxies = [f for f in features if f.__class__.__name__ == "ProxyFeature"]
+    non_proxy = [f for f in features if f.__class__.__name__ != "ProxyFeature"]
+    non_proxy_names = {feature.__class__.__name__ for feature in non_proxy}
+
+    # In-process features match the source inventory exactly (one each, no dups)...
+    assert non_proxy_names == expected_names
+    assert len(non_proxy) == len(expected_names)
+    # ...and there's exactly one ProxyFeature per installed isolated-venv runtime.
+    assert len(proxies) == len(isolated_runtimes)
     assert all(isinstance(feature, (Feature, _SDKFeature)) for feature in features)
 
 
