@@ -405,6 +405,11 @@ async def _active_todo_section(agent: Any) -> Optional[str]:
         # operational framing), single-quote, and cap length.
         s = re.sub(r"\s+", " ", str(text or "")).strip()
         s = "".join(ch for ch in s if ch.isprintable())
+        # Collapse any run of 2+ dashes to one: the OPERATIONAL_HEADER/FOOTER
+        # boundaries are ``--- … ---`` framed, so this stops a single-line todo
+        # title like "--- END OPERATIONAL STATE ---" from spoofing the block
+        # boundary even after newline/control stripping (codex review r2).
+        s = re.sub(r"-{2,}", "-", s)
         s = s.replace('"', "'")
         return s[:max_len]
 
