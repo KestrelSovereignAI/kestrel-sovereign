@@ -357,6 +357,8 @@ class KestrelAgent(
         self.storage = None
 
         self.llm_service = llm_service or LLMService()
+        from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
+        self.operator_signal_producer = OperatorSignalProducer(self)
         # Claim this LLMService for this agent. If an externally-provided
         # llm_service was already claimed by another agent (the adversarial-
         # test sharing pattern), this raises LLMServiceAlreadyAttachedError
@@ -2766,6 +2768,16 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.warning(f"Failed to fetch reflection guidance: {e}")
 
+        state_of_mind = None
+        if self.llm_service and hasattr(self.llm_service, "get_state_of_mind"):
+            try:
+                state_of_mind = self.llm_service.get_state_of_mind()
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "Failed to resolve StateOfMind for operator signal: %s",
+                    exc,
+                )
+
         context_result = await self.context_manager.build_context(
             query=user_input,
             constitution=constitution,
@@ -2914,6 +2926,46 @@ Expected Duration: {expected_duration}
         messages.extend(context_result.messages)  # Add conversation history
         messages.append({"role": "user", "content": prompt})
 
+        producer = getattr(self, "operator_signal_producer", None)
+        if producer is not None:
+            operator_batch = await producer.collect_for_turn(
+                session_id=session_id,
+                llm_service=self.llm_service,
+                model_override=effective_model,
+                force_local_only=force_local_only,
+                budget_summary=context_result.budget_summary,
+                state_of_mind=state_of_mind,
+            )
+        else:
+            from kestrel_sovereign.agent.operator_signals import OperatorSignalBatch
+            operator_batch = OperatorSignalBatch.empty()
+        if operator_batch.has_events:
+            messages.append(
+                {"role": operator_batch.role, "content": operator_batch.content}
+            )
+            try:
+                await self.privacy_agent.add_conversation(
+                    operator_batch.role,
+                    operator_batch.content,
+                    metadata={
+                        "sent_form": True,
+                        "operator_signal": True,
+                        "operator_signal_sources": [
+                            event.source for event in operator_batch.events
+                        ],
+                        "operator_signal_fallback": operator_batch.fallback,
+                    },
+                    session_id=session_id,
+                    rendered_content=operator_batch.content,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "Failed to persist operator signal turn; continuing "
+                    "with in-flight delivery only: %s",
+                    exc,
+                    exc_info=True,
+                )
+
         logging.debug(f"[CONTEXT] Sending {len(messages)} messages to LLM (1 system + {len(context_result.messages)} history + 1 user)")
 
         # Generate response with full conversation context. ``session_id``
@@ -2934,6 +2986,7 @@ Expected Duration: {expected_duration}
             model_override=effective_model,
             tools=feature_tools if feature_tools else None,
             session_id=session_id,
+            keep_trailing_system=operator_batch.keep_trailing_system,
             tool_executor=self._make_inline_tool_executor(session_id or ""),
         )
 

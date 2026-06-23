@@ -2303,6 +2303,7 @@ No other text or formatting.
         force_local_only: bool = False,
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
+        keep_trailing_system: bool = False,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
     ) -> Union[str, LLMResponse]:
@@ -2480,6 +2481,7 @@ No other text or formatting.
                     response_format=response_format,
                     extra_body=provider_cache_body(provider),
                     session_id=session_id,
+                    keep_trailing_system=keep_trailing_system,
                     tool_executor=tool_executor,
                     cancel_token=cancel_token,
                 )

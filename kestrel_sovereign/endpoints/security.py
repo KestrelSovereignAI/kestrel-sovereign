@@ -369,6 +369,10 @@ async def set_auto_mode(request: Request, data: AutoModeRequest):
         decision="global_auto_enabled" if data.enabled else "global_auto_disabled",
         user_choice="session",
     )
+    agent = get_agent(request)
+    producer = getattr(agent, "operator_signal_producer", None)
+    if producer is not None and hasattr(producer, "enqueue_auto_mode"):
+        producer.enqueue_auto_mode(data.enabled)
     return AutoModeResponse(
         enabled=security.permission_store.get_global_auto_mode(),
         warning=(
