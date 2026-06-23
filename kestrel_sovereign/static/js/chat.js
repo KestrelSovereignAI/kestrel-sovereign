@@ -2279,17 +2279,16 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // (welded) prose already accumulated — record absolute
                     // positions so the renderer places each card correctly.
                     const chunkBase = fullContent.length;
-                    // Record this packet's tool events (absolute positions) for
-                    // the offset range [lo, hi) of the clean chunk text.
-                    const pushToolsInRange = (lo, hi) => {
-                        if (!tools || !tools.length) return;
+                    // Record ALL of this packet's tool events at absolute
+                    // positions — unchanged from the pre-#1914 path so tool-only
+                    // packets and trailing done/error markers (``pos`` == chunk
+                    // end) still render. Segmentation below only splits prose
+                    // around parts; tool cards stay pos-driven.
+                    if (tools && tools.length) {
                         for (const t of tools) {
-                            const tp = t.pos || 0;
-                            if (tp >= lo && tp < hi) {
-                                pane.toolEvents.push({ ...t, pos: chunkBase + tp });
-                            }
+                            pane.toolEvents.push({ ...t, pos: chunkBase + (t.pos || 0) });
                         }
-                    };
+                    }
                     // #1914: paint the current streaming bubble with the live
                     // slice; never spawns an empty bubble (so a part seal with no
                     // trailing prose doesn't leave a blank bubble below it).
@@ -2322,7 +2321,6 @@ export async function sendMessage(overrideText, overrideAgent) {
                                 segCursor, Math.min(chunk.length, part.pos || 0),
                             );
                             fullContent += chunk.slice(segCursor, cut);
-                            pushToolsInRange(segCursor, cut);
                             segCursor = cut;
                             pane.streamRawContentLength = fullContent.length;
                             paintLiveSlice();
@@ -2332,11 +2330,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                         }
                         // Trailing prose after the last part opens a fresh bubble.
                         fullContent += chunk.slice(segCursor);
-                        pushToolsInRange(segCursor, chunk.length);
                         paintLiveSlice();
                     } else {
                         fullContent += chunk;
-                        pushToolsInRange(0, chunk.length);
                     }
                     // Advance the dynamic status word: an in-flight tool's
                     // verb, or "Writing…" once answer prose flows. A revise
