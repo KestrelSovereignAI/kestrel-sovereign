@@ -5,6 +5,11 @@ asks the bird to read HEARTBEAT.md and respond. Today this is a direct
 call to `agent.process_input`; under the dispatcher it becomes a COGNITION
 signal — race-safe via Phase 2's turn lifecycle, audit-logged via Phase 1's
 signal_log.
+
+Heartbeat opts into require_constitution_echo=True because it is a
+recurring autonomous COGNITION path. The dispatcher registers the
+ephemeral phantom tool for each turn and verifies the receipt before
+accepting the heartbeat response.
 """
 
 from __future__ import annotations
@@ -112,6 +117,9 @@ def build_heartbeat_registration(
         # directly in the side-channel event.
         result_summary=_heartbeat_result_summary,
         retention_days=14,
+        constitution_injection="full",
+        require_constitution_echo=True,
+        prompt_template_format="claude_code",
     )
 
 

@@ -1060,8 +1060,8 @@ async def test_constitution_mixin_verify_echo_local_format_extracts_json():
 
 @pytest.mark.asyncio
 async def test_constitution_mixin_verify_echo_claude_code_returns_missing():
-    """Phase 1 default returns MISSING for claude_code format —
-    Phase 2 wires the phantom-tool receipt channel."""
+    """claude_code format ignores user-visible response text; only the
+    phantom tool-call channel can verify receipt."""
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
     from kestrel_sovereign.signals.constitution_canary import (
         CanaryStatus,
@@ -1083,6 +1083,42 @@ async def test_constitution_mixin_verify_echo_claude_code_returns_missing():
         response="some assistant text containing " + canary,
     )
     assert result is CanaryStatus.MISSING
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_claude_code_tool_receipt():
+    """Phase 2 claude_code verifier scans the captured phantom
+    `_constitution_receipt` tool calls."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        CanaryStatus,
+        PHANTOM_RECEIPT_ARG_NAME,
+        PHANTOM_RECEIPT_TOOL_NAME,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+    agent = _Agent()
+    agent._constitution_receipt_tool_calls = [
+        {
+            "name": PHANTOM_RECEIPT_TOOL_NAME,
+            "arguments": {PHANTOM_RECEIPT_ARG_NAME: canary},
+        }
+    ]
+    result = agent.verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="claude_code",
+        signal_id="sig_x",
+        response="assistant text without canary",
+    )
+    assert result is CanaryStatus.VERIFIED
 
 
 @pytest.mark.asyncio

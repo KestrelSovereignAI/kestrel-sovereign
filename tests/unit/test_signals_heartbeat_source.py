@@ -27,6 +27,11 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
+from kestrel_sovereign.signals.constitution_canary import (
+    PHANTOM_RECEIPT_ARG_NAME,
+    PHANTOM_RECEIPT_TOOL_NAME,
+    verify_in_tool_calls,
+)
 from kestrel_sovereign.signals.sources.heartbeat import (
     PROMPT_TEMPLATE,
     SOURCE_NAME,
@@ -47,14 +52,29 @@ class _FakeAgent:
         self._did = did
         self.background_tasks = []
         self.process_input_calls = []
+        self.process_input_kwargs = []
         self.process_input_return = "HEARTBEAT_OK"
+        self.receipt_tool_calls = []
+        self.receipt_tool_registered = False
 
     @property
     def did(self) -> str:
         return self._did
 
-    async def process_input(self, prompt):
+    async def process_input(self, prompt, **kwargs):
         self.process_input_calls.append(prompt)
+        self.process_input_kwargs.append(kwargs)
+        addendum = kwargs.get("system_prompt_addendum") or ""
+        import re
+
+        match = re.search(r"[0-9a-f]{16}", addendum)
+        if self.receipt_tool_registered and match:
+            self.receipt_tool_calls.append(
+                {
+                    "name": PHANTOM_RECEIPT_TOOL_NAME,
+                    "arguments": {PHANTOM_RECEIPT_ARG_NAME: match.group(0)},
+                }
+            )
         return self.process_input_return
 
     def _track_background_task(self, coro, *, name):
@@ -63,6 +83,31 @@ class _FakeAgent:
         task = asyncio.create_task(coro, name=name)
         self.background_tasks.append(task)
         return task
+
+    async def _get_governing_constitution(self):
+        return "ARTICLE I: test constitution"
+
+    def get_constitution_hash(self):
+        return "constitution_hash_for_heartbeat_tests"
+
+    def get_anchored_doctrine_bundle_hash(self):
+        return "doctrine_bundle"
+
+    def compute_live_doctrine_bundle_hash(self):
+        return "doctrine_bundle"
+
+    def register_constitution_receipt_tool(self, *, canary, signal_id):
+        self.receipt_tool_registered = True
+        self.receipt_tool_calls = []
+
+    def clear_constitution_receipt_tool(self):
+        self.receipt_tool_registered = False
+
+    def verify_constitution_echo(
+        self, *, canary, prompt_template_format, signal_id, response=None
+    ):
+        assert prompt_template_format == "claude_code"
+        return verify_in_tool_calls(self.receipt_tool_calls, canary)
 
 
 @pytest.fixture
@@ -104,6 +149,9 @@ def test_heartbeat_registration_shape():
     assert reg.allowed_modes == frozenset({SignalMode.COGNITION})
     assert reg.trust == Trust.TRUSTED
     assert reg.prompt_template == PROMPT_TEMPLATE
+    assert reg.constitution_injection == "full"
+    assert reg.require_constitution_echo is True
+    assert reg.prompt_template_format == "claude_code"
     # CONVERSATION must NOT be declared — turn lifecycle owns it.
     from kestrel_sdk.signals import ResourceLock
     assert ResourceLock.CONVERSATION not in reg.resources
@@ -352,6 +400,10 @@ async def test_heartbeat_dispatch_calls_process_input_with_rendered_prompt(compo
     rendered = agent.process_input_calls[0]
     assert "[HEARTBEAT]" in rendered
     assert "Check pending tasks" in rendered
+    kwargs = agent.process_input_kwargs[0]
+    assert "system_prompt_addendum" in kwargs
+    assert PHANTOM_RECEIPT_TOOL_NAME in kwargs["system_prompt_addendum"]
+    assert agent.receipt_tool_registered is False
 
 
 @pytest.mark.asyncio
@@ -403,6 +455,77 @@ async def test_heartbeat_dispatch_writes_signal_log_with_redaction(components):
     # store_raw_trusted=False on heartbeat → payload_raw is null even for
     # TRUSTED sources, so HEARTBEAT.md content never lands in the log.
     assert raw is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_echo_missing_fails_dispatch(components):
+    agent, registry, dispatcher, _backend = components
+    registry.register(
+        build_heartbeat_registration(
+            interval_seconds=1800,
+            active_hours_start=None,
+            active_hours_end=None,
+        )
+    )
+    agent.process_input_return = "HEARTBEAT_OK"
+
+    async def _no_receipt_process_input(prompt, **kwargs):
+        agent.process_input_calls.append(prompt)
+        agent.process_input_kwargs.append(kwargs)
+        return "HEARTBEAT_OK"
+
+    agent.process_input = _no_receipt_process_input
+
+    signal = Signal(
+        source=SOURCE_NAME,
+        kind="tick",
+        mode=SignalMode.COGNITION,
+        payload={"heartbeat_md": "Check pending tasks"},
+        target_agent=agent.did,
+    )
+    result = await dispatcher.dispatch_signal(signal)
+
+    assert result.status == Status.FAILED
+    assert result.error == "constitution_not_received"
+    assert agent.receipt_tool_registered is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_wrong_echo_fails_dispatch(components):
+    agent, registry, dispatcher, _backend = components
+    registry.register(
+        build_heartbeat_registration(
+            interval_seconds=1800,
+            active_hours_start=None,
+            active_hours_end=None,
+        )
+    )
+
+    async def _wrong_receipt_process_input(prompt, **kwargs):
+        agent.process_input_calls.append(prompt)
+        agent.process_input_kwargs.append(kwargs)
+        agent.receipt_tool_calls.append(
+            {
+                "name": PHANTOM_RECEIPT_TOOL_NAME,
+                "arguments": {PHANTOM_RECEIPT_ARG_NAME: "0" * 16},
+            }
+        )
+        return "HEARTBEAT_OK"
+
+    agent.process_input = _wrong_receipt_process_input
+
+    signal = Signal(
+        source=SOURCE_NAME,
+        kind="tick",
+        mode=SignalMode.COGNITION,
+        payload={"heartbeat_md": "Check pending tasks"},
+        target_agent=agent.did,
+    )
+    result = await dispatcher.dispatch_signal(signal)
+
+    assert result.status == Status.FAILED
+    assert result.error == "constitution_not_received"
+    assert agent.receipt_tool_registered is False
 
 
 @pytest.mark.asyncio

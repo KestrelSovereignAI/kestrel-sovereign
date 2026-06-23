@@ -1018,6 +1018,33 @@ class SignalDispatcher:
                 audit=audit,
             )
 
+        receipt_tool_registered = False
+        if (
+            registration.require_constitution_echo
+            and registration.prompt_template_format == "claude_code"
+            and audit.canary is not None
+        ):
+            register_receipt = getattr(
+                self._agent, "register_constitution_receipt_tool", None
+            )
+            if not callable(register_receipt):
+                return self._fail(
+                    signal,
+                    start,
+                    Status.DROPPED_VALIDATION,
+                    error=(
+                        "require_constitution_echo=True for claude_code "
+                        "but agent cannot register the ephemeral "
+                        "_constitution_receipt tool"
+                    ),
+                    registration=registration,
+                    audit=audit,
+                )
+            value = register_receipt(canary=audit.canary, signal_id=signal.id)
+            if asyncio.iscoroutine(value):
+                await value
+            receipt_tool_registered = True
+
         # Set the in-flight turn's causation chain (already extended
         # with this hop's frame in step 2 of the pipeline) so outbound
         # A2A tasks created during the turn carry the lineage forward
@@ -1084,6 +1111,14 @@ class SignalDispatcher:
                 )
             else:
                 result = await self._agent.process_input(prompt)
+        except Exception:
+            if receipt_tool_registered:
+                clear_receipt = getattr(
+                    self._agent, "clear_constitution_receipt_tool", None
+                )
+                if callable(clear_receipt):
+                    clear_receipt()
+            raise
         finally:
             if clear_chain is not None:
                 clear_chain(token)
@@ -1126,6 +1161,13 @@ class SignalDispatcher:
             await self._verify_canary_post_dispatch(
                 signal, registration, audit, response=result
             )
+            if receipt_tool_registered:
+                clear_receipt = getattr(
+                    self._agent, "clear_constitution_receipt_tool", None
+                )
+                if callable(clear_receipt):
+                    clear_receipt()
+                receipt_tool_registered = False
             if audit.echo_canary_status is CanaryStatus.VERIFIED:
                 record_echo_verified(signal.source)
             else:
@@ -1138,6 +1180,13 @@ class SignalDispatcher:
                     registration=registration,
                     audit=audit,
                 )
+
+        if receipt_tool_registered:
+            clear_receipt = getattr(
+                self._agent, "clear_constitution_receipt_tool", None
+            )
+            if callable(clear_receipt):
+                clear_receipt()
 
         return self._success(
             signal,
