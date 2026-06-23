@@ -1564,9 +1564,15 @@ function sealStreamingBubble(paneObj) {
         const live = paneObj.streamingMsgDiv;
         const rawLen = Number(paneObj.streamRawContentLength) || 0;
         const baseline = paneObj.streamBaseline || 0;
-        if (rawLen <= baseline) {
+        // #1914: a bubble can hold tool cards with no prose (``rawLen`` doesn't
+        // advance for tool-only packets). Treat it as blank ONLY when it has
+        // neither prose nor tool cards — otherwise removing it would drop the
+        // tool card for the common ``tool done → PART → answer`` ordering.
+        const toolCardsInBubble =
+            (paneObj.toolEvents || []).length - (paneObj.toolEventsBaseline || 0);
+        if (rawLen <= baseline && toolCardsInBubble <= 0) {
             // Boundary hit during the no-content preamble — the bubble was
-            // just allocated and no raw content has been written into it yet.
+            // just allocated and nothing (prose or card) was written into it.
             // Removing it (rather than finalizing) avoids a blank assistant
             // bubble sitting above the interrupting element.
             live.remove();
