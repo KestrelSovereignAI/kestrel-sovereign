@@ -514,6 +514,11 @@ function stripStreamSentinels(chunk) {
     // #1914: typed component parts ({type,data,id?}) parsed out of this chunk,
     // each stamped with its clean-text offset like a tool event.
     const parts = [];
+    // #1914: a shared monotonic counter over TOOL and PART sentinels in this
+    // packet records their WIRE order, so the streaming loop can interleave
+    // tool cards and component bubbles exactly as they arrived even when both
+    // sit at the same clean-text offset (e.g. tool-done, PART, tool-start).
+    let seq = 0;
     let pos = 0;
     // #1547: a revise sentinel marks the boundary between the agent's
     // pre-revision prose and its post-revision (post-tool) synthesis.
@@ -579,7 +584,7 @@ function stripStreamSentinels(chunk) {
                 if (payload && payload.phase) {
                     // pos = offset into THIS packet's clean text; the loop
                     // adds the cumulative content length to make it absolute.
-                    tools.push({ ...payload, pos: textBefore.length });
+                    tools.push({ ...payload, pos: textBefore.length, seq: seq++ });
                 }
             } catch (_) {
                 // Malformed UI metadata should not corrupt visible text.
@@ -590,7 +595,7 @@ function stripStreamSentinels(chunk) {
                 // A part needs a string ``type`` (renderer key); drop anything
                 // malformed so a bad PART payload never breaks the stream.
                 if (payload && typeof payload.type === 'string') {
-                    parts.push({ ...payload, pos: textBefore.length });
+                    parts.push({ ...payload, pos: textBefore.length, seq: seq++ });
                 }
             } catch (_) {
                 // Malformed UI metadata should not corrupt visible text.
@@ -2279,16 +2284,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // (welded) prose already accumulated — record absolute
                     // positions so the renderer places each card correctly.
                     const chunkBase = fullContent.length;
-                    // Record ALL of this packet's tool events at absolute
-                    // positions — unchanged from the pre-#1914 path so tool-only
-                    // packets and trailing done/error markers (``pos`` == chunk
-                    // end) still render. Segmentation below only splits prose
-                    // around parts; tool cards stay pos-driven.
-                    if (tools && tools.length) {
-                        for (const t of tools) {
-                            pane.toolEvents.push({ ...t, pos: chunkBase + (t.pos || 0) });
-                        }
-                    }
+                    const recordTool = (t) => {
+                        pane.toolEvents.push({ ...t, pos: chunkBase + (t.pos || 0) });
+                    };
                     // #1914: paint the current streaming bubble with the live
                     // slice; never spawns an empty bubble (so a part seal with no
                     // trailing prose doesn't leave a blank bubble below it).
@@ -2308,15 +2306,27 @@ export async function sendMessage(overrideText, overrideAgent) {
                     };
                     if (haveParts) {
                         // #1914: a stream packet can coalesce prose + PART + more
-                        // prose. Split the chunk at each part's clean-text offset
-                        // so every component renders at its position — paint the
-                        // prose up to the part, render the part as its own bubble
-                        // (sealing the prose above it), then continue. This keeps
-                        // the live order identical to the persisted/reload order.
+                        // prose (and even tool sentinels). Split the chunk at each
+                        // part's clean-text offset so every component renders at
+                        // its position, AND record tool events in WIRE order (by
+                        // ``seq``) relative to the parts — a tool emitted before a
+                        // part lands in the bubble above it; one emitted after
+                        // lands in the bubble below. Keeps the live order identical
+                        // to the persisted/reload order.
                         const sortedParts = parts.slice()
-                            .sort((a, b) => (a.pos || 0) - (b.pos || 0));
+                            .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+                        // Tools are already in wire order in ``tools``; walk them
+                        // in lockstep, flushing those that precede each part.
+                        let toolIdx = 0;
+                        const recordToolsBeforeSeq = (limitSeq) => {
+                            while (toolIdx < tools.length
+                                && (tools[toolIdx].seq || 0) < limitSeq) {
+                                recordTool(tools[toolIdx++]);
+                            }
+                        };
                         let segCursor = 0;
                         for (const part of sortedParts) {
+                            recordToolsBeforeSeq(part.seq || 0);
                             const cut = Math.max(
                                 segCursor, Math.min(chunk.length, part.pos || 0),
                             );
@@ -2328,10 +2338,16 @@ export async function sendMessage(overrideText, overrideAgent) {
                                 flushStreamParts(pane, [part]);
                             }
                         }
+                        // Tools after the last part belong to the trailing bubble.
+                        while (toolIdx < tools.length) recordTool(tools[toolIdx++]);
                         // Trailing prose after the last part opens a fresh bubble.
                         fullContent += chunk.slice(segCursor);
                         paintLiveSlice();
                     } else {
+                        // No parts: record all tool events (unchanged from the
+                        // pre-#1914 path — tool-only packets and trailing
+                        // done/error markers at ``pos`` == chunk end still render).
+                        if (tools && tools.length) for (const t of tools) recordTool(t);
                         fullContent += chunk;
                     }
                     // Advance the dynamic status word: an in-flight tool's

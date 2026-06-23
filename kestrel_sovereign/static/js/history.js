@@ -566,6 +566,29 @@ window.toggleHistorySidebar = function() {
     }
 };
 
+// #1914: a typed-part message renders as several sibling bubbles that all
+// carry the same ``data-message-id``. Fade+remove every node for the id (not
+// just the clicked one) so a delete doesn't orphan the part/extra-prose
+// bubbles. Falls back to the passed node when none are tagged (single-bubble
+// messages predating this path / non-id bubbles).
+function fadeRemoveMessageNodes(messageId, fallbackDiv) {
+    let nodes = [];
+    if (messageId && typeof document.querySelectorAll === 'function') {
+        // Escape the id for an attribute selector (quotes/backslashes).
+        const sel = String(messageId).replace(/(["\\])/g, '\\$1');
+        nodes = Array.from(
+            document.querySelectorAll(`.message[data-message-id="${sel}"]`),
+        );
+    }
+    if (!nodes.length && fallbackDiv) nodes = [fallbackDiv];
+    for (const node of nodes) {
+        node.style.transition = 'opacity 0.2s, transform 0.2s';
+        node.style.opacity = '0';
+        node.style.transform = 'scale(0.95)';
+        setTimeout(() => node.remove(), 200);
+    }
+}
+
 window.deleteMessage = async function(messageId, messageDiv) {
     // Soft-delete (#763) — moves the message to Trash, recoverable from
     // the trash sub-view (#765).
@@ -573,12 +596,7 @@ window.deleteMessage = async function(messageId, messageDiv) {
 
     try {
         await API.deleteMessage(messageId);
-        if (messageDiv) {
-            messageDiv.style.transition = 'opacity 0.2s, transform 0.2s';
-            messageDiv.style.opacity = '0';
-            messageDiv.style.transform = 'scale(0.95)';
-            setTimeout(() => messageDiv.remove(), 200);
-        }
+        fadeRemoveMessageNodes(messageId, messageDiv);
         Toast.info('Message moved to trash');
     } catch (e) {
         Toast.error(`Failed to delete message: ${e.message}`);
@@ -595,12 +613,7 @@ window.purgeMessage = async function(messageId, messageDiv) {
 
     try {
         await API.purgeMessage(messageId, 'user-initiated-ui');
-        if (messageDiv) {
-            messageDiv.style.transition = 'opacity 0.2s, transform 0.2s';
-            messageDiv.style.opacity = '0';
-            messageDiv.style.transform = 'scale(0.95)';
-            setTimeout(() => messageDiv.remove(), 200);
-        }
+        fadeRemoveMessageNodes(messageId, messageDiv);
         Toast.info('Message permanently deleted');
     } catch (e) {
         Toast.error(`Failed to permanently delete: ${e.message}`);
@@ -628,9 +641,17 @@ function renderAssistantWithParts(msg, content, parts) {
     const paneEl = visiblePane ? visiblePane.element : null;
     const segments = splitContentByParts(content, parts);
     let anchored = false;
+    // Every bubble of this multi-bubble message carries the same
+    // ``data-message-id`` so a delete removes ALL of them, not just the anchor
+    // (codex P2). Only the anchor (first rendered prose bubble) gets the id
+    // passed to addMessageToChat — and thus the delete/purge affordances — so
+    // the buttons aren't duplicated across bubbles.
+    const tag = (node) => {
+        if (node && msg.id) node.dataset.messageId = msg.id;
+    };
     for (const seg of segments) {
         if (seg.kind === 'part') {
-            appendMessagePart(seg.part.type, seg.part.data, paneEl);
+            tag(appendMessagePart(seg.part.type, seg.part.data, paneEl));
             continue;
         }
         const slicedTools = sliceTools(seg.start, seg.end);
@@ -638,7 +659,7 @@ function renderAssistantWithParts(msg, content, parts) {
             continue;
         }
         const segBody = renderAgentContentHtml(seg.text, { toolEvents: slicedTools });
-        addMessageToChat(
+        const node = addMessageToChat(
             'assistant',
             seg.text,
             false,
@@ -649,6 +670,7 @@ function renderAssistantWithParts(msg, content, parts) {
             null,
             anchored ? null : { model: msg.model, provider: msg.provider },
         );
+        tag(node);
         anchored = true;
     }
 }
@@ -791,4 +813,5 @@ function addMessageToChat(
     }
 
     target.appendChild(messageDiv);
+    return messageDiv;
 }
