@@ -25,6 +25,7 @@ const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
 // Object-shaped values are supported via dot-paths (e.g. ``keys.agent``):
 // any sub-key absent from the host config is treated as ``true``.
 export const CAPABILITY_KEYS = Object.freeze({
+    chrome: true,         // console brand/nav chrome; set false for chat-only embeds
     chat: true,
     identity: true,
     constitution: true,

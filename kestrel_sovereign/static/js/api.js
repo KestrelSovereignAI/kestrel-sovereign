@@ -13,6 +13,7 @@ import {
 //     fetchFn?: (url, options) => Response,
 //     capabilities?: {
 //       // Boolean for simple on/off — missing keys default to true
+//       chrome: false,
 //       chat: false,
 //       multi_agent: false,
 //       spawn: false,
