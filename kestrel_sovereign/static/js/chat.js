@@ -1259,6 +1259,20 @@ export function connectNotifications() {
             }
         });
 
+        // Channel linked — retract the pairing QR bubble.
+        notificationEventSource.addEventListener('channel_link_cleared', (e) => {
+            try {
+                const { channel_type } = JSON.parse(e.data);
+                const ct = String(channel_type || '').trim().toLowerCase();
+                if (!ct) return;
+                document
+                    .querySelectorAll(`.channel-qr-message[data-channel-type="${cssAttrEscape(ct)}"]`)
+                    .forEach((el) => el.remove());
+            } catch (err) {
+                console.error('Failed to handle channel_link_cleared event:', err);
+            }
+        });
+
         notificationEventSource.addEventListener('ping', () => {
             // Keepalive - no action needed
         });
