@@ -209,18 +209,12 @@ def test_heartbeat_active_end_boundary_stays_active():
     registry = SourceRegistry()
     registry.register(reg)
 
-    class _Stub:
-        did = "did:test:boundary"
-        def __init__(self):
-            self.calls = []
-        async def process_input(self, prompt):
-            self.calls.append(prompt)
-            return "HEARTBEAT_OK"
-        def _track_background_task(self, coro, *, name):
-            import asyncio
-            return asyncio.create_task(coro, name=name)
-
-    agent = _Stub()
+    # Heartbeat now requests constitution_injection="full" + echo, so the
+    # agent must register/echo the phantom receipt for the turn to be
+    # accepted. Use _FakeAgent (which echoes the canary) so this timing
+    # boundary test stays robust whether or not the doctrine bundle is
+    # globally active in the surrounding suite.
+    agent = _FakeAgent(did="did:test:boundary")
 
     import asyncio
 
