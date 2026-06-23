@@ -280,5 +280,68 @@ async def test_parts_dropped_when_post_response_hook_blocks_text():
     assert "parts" not in metadata
 
 
+@pytest.mark.asyncio
+async def test_part_position_uses_utf16_offset_after_emoji():
+    """A part after a non-BMP char (emoji) must persist a UTF-16 offset, since
+    history reload feeds ``pos`` to JS ``String.slice`` (UTF-16 code units).
+    "\U0001F422 " is 2 code points but 3 UTF-16 units (surrogate pair + space)."""
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    add_convo_calls = []
+    agent = _make_agent(add_convo_calls)
+
+    part_sentinel = build_part_sentinel({"type": "notice", "data": {"body": "x"}})
+
+    async def mock_stream_with_tool_detection(**kwargs):
+        yield "\U0001F422 "  # turtle emoji + space
+        yield part_sentinel
+        yield "tail"
+        yield LLMResponse(content="", tool_calls=[])
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
+    _bind(agent)
+
+    async for _ in agent.process_input_streaming("hi", session_id="s5"):
+        pass
+
+    metadata = [c for c in add_convo_calls if c["role"] == "assistant"][0]["metadata"]
+    # Code-point offset would be 2 ("🐢 "); UTF-16 offset is 3.
+    assert metadata["parts"][0]["pos"] == 3
+
+
+@pytest.mark.asyncio
+async def test_post_response_hook_emitted_part_is_persisted():
+    """A part emitted by a POST_RESPONSE hook (after streaming) is drained and
+    persisted at the end of the text, rather than silently lost."""
+    from kestrel_sovereign.agent.parts import emit_part
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    add_convo_calls = []
+    agent = _make_agent(add_convo_calls)
+
+    def _hook(text, sid, **_):
+        emit_part("notice", {"body": "from hook"})
+        return text
+
+    agent._fire_post_response_hook = AsyncMock(side_effect=_hook)
+
+    async def mock_stream_with_tool_detection(**kwargs):
+        yield "Hello there."
+        yield LLMResponse(content="", tool_calls=[])
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
+    _bind(agent)
+
+    async for _ in agent.process_input_streaming("hi", session_id="s6"):
+        pass
+
+    metadata = [c for c in add_convo_calls if c["role"] == "assistant"][0]["metadata"]
+    assert metadata["parts"] == [
+        {"type": "notice", "data": {"body": "from hook"}, "pos": len("Hello there.")}
+    ]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

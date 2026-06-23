@@ -241,6 +241,33 @@ def _tool_parts_to_events(parts: list) -> list:
     return events
 
 
+def _utf16_offset(text: str, cp_offset: int) -> int:
+    """Convert a Python code-point offset into the UTF-16 code-unit offset that
+    JS ``String.slice`` uses (#1914). A part after a non-BMP char (e.g. an emoji
+    🐢 — one code point, two UTF-16 units) would otherwise be stored an index too
+    short, splitting the surrogate pair and misplacing the bubble on reload.
+    """
+    return len(text[:cp_offset].encode("utf-16-le")) // 2
+
+
+def _finalize_component_parts(parts: list, text: str) -> list:
+    """Finalize component parts for persistence (#1914):
+
+    1. Convert each ``pos`` from a code-point offset into the persisted ``text``
+       to the UTF-16 offset the browser slices with on reload.
+    2. Append any parts a POST_RESPONSE hook emitted after streaming — they're
+       still buffered on the collector, so drain them here and position them at
+       the end of ``text`` (they carry no in-stream offset). Persist-only: the
+       live stream is already closed, so these surface on reload.
+    """
+    result = [{**p, "pos": _utf16_offset(text, p.get("pos", 0))} for p in parts]
+    hook_parts = drain_parts()
+    if hook_parts:
+        end = _utf16_offset(text, len(text))
+        result.extend({**p, "pos": end} for p in hook_parts)
+    return result
+
+
 _TOOL_EVENT_PHASE = {"start": "start", "complete": "done", "error": "error"}
 
 
@@ -1048,6 +1075,9 @@ class StreamingMixin:
             # removed. Drop them whenever the hook changed the text.
             if tool_final_text != post_tool_text:
                 component_parts = []
+            # #1914: UTF-16-offset the positions for the browser + fold in any
+            # parts a POST_RESPONSE hook emitted.
+            component_parts = _finalize_component_parts(component_parts, tool_final_text)
             # tool_results carry the structured call/result envelopes;
             # persisting them alongside tool_events means a future
             # conversation-history reader can reconstruct *which tools
@@ -1209,6 +1239,10 @@ class StreamingMixin:
             # persisted content and would leak blocked structured data on reload.
             if final_text != post_tool_text:
                 inline_post_components = []
+            # #1914: UTF-16-offset + fold in hook-emitted parts.
+            inline_post_components = _finalize_component_parts(
+                inline_post_components, final_text
+            )
             # See parallel comment in the has_tool_calls branch above:
             # tool_results in the persisted metadata preserves the
             # actual call envelopes (id, name, arguments, summarized
@@ -1258,6 +1292,9 @@ class StreamingMixin:
             # persisting them would leak blocked structured data on reload.
             if final_text != _no_tool_pre_hook_text:
                 no_tool_components = []
+            # #1914: UTF-16-offset + fold in any parts the POST_RESPONSE hook
+            # emitted (the collector is still active while the hook runs).
+            no_tool_components = _finalize_component_parts(no_tool_components, final_text)
             _no_tool_events = _tool_parts_to_events(tool_parts)
             # #1914: a turn can emit component parts without dispatching tools
             # (e.g. a feature emitting a card from a hook). Persist them here so
