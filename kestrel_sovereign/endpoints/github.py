@@ -212,12 +212,45 @@ async def github_repos(
     return await discover_accessible_repos(org=org, include_private=include_private)
 
 
+def _repo_scoped_slug(path: str) -> str | None:
+    """Return the ``owner/repo`` slug for a repo-scoped GitHub API path.
+
+    Only ``repos/{owner}/{repo}[/...]`` paths are repo-scoped. Every other
+    shape — ``orgs/...``, ``users/...``, ``search/...``, ``gists/...``,
+    ``user/...`` and so on — is an organization/user/global endpoint that the
+    server token must not reach through this proxy. Those return ``None``.
+    """
+    parts = [segment for segment in path.split("/") if segment]
+    if len(parts) >= 3 and parts[0] == "repos":
+        return f"{parts[1]}/{parts[2]}"
+    return None
+
+
 @router.get("/api/github/{path:path}")
 async def github_proxy(path: str, request: Request):
-    """Proxy GitHub API requests using the server-side GitHub token."""
+    """Proxy repo-scoped GitHub API requests using the server-side token.
+
+    The proxy is constrained to the same resolved repository set as
+    ``/api/github/repos`` (configured ``[github]`` orgs/include_repos minus
+    exclude_repos). Non-repo paths and repositories outside that scope are
+    rejected so an authenticated caller cannot amplify the host token beyond
+    the intended discovery surface.
+    """
     token = _github_token()
     if not token:
         return JSONResponse({"error": "No GITHUB_TOKEN configured"}, status_code=503)
+
+    slug = _repo_scoped_slug(path)
+    if slug is None:
+        return JSONResponse(
+            {
+                "error": (
+                    "Only repos/{owner}/{repo} paths are permitted via this "
+                    "proxy; organization, user, and global endpoints are blocked"
+                )
+            },
+            status_code=403,
+        )
 
     gh_url = f"https://api.github.com/{path}"
     if request.url.query:
@@ -229,6 +262,20 @@ async def github_proxy(path: str, request: Request):
         client = httpx.AsyncClient()
 
     try:
+        # Resolve the allowlist with the same logic as /api/github/repos and
+        # require the requested repo to be in it before proxying.
+        allowed = await discover_accessible_repos(client=client)
+        if slug.lower() not in {repo.lower() for repo in allowed}:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Repository '{slug}' is outside the configured GitHub "
+                        "scope"
+                    )
+                },
+                status_code=403,
+            )
+
         response = await client.get(
             gh_url,
             headers={
@@ -239,6 +286,8 @@ async def github_proxy(path: str, request: Request):
             timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
         )
         return JSONResponse(content=response.json(), status_code=response.status_code)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
     finally:
