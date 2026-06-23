@@ -7,6 +7,7 @@ are an agent-operated queue for active loops across turns and wakes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -152,6 +153,90 @@ class TodoFeature(Feature):
                 properties=props,
             )
         )
+
+    async def active_preturn_items(
+        self, limit: int = 200,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Active todos for pre-turn context injection (#1907 — the deferred
+        #1832 follow-up).
+
+        Returns ``{"session": [...], "global_active": [...]}``:
+        - ``session``: every active (non-terminal, non-superseded) todo whose
+          ``source_turn.session_id`` matches the current session — so the agent
+          sees what THIS conversation still owes.
+        - ``global_active``: active ``in_progress``/``waiting`` todos from OTHER
+          sessions — the cross-session loops that must survive wakes/restarts.
+
+        Non-tool (plain dicts, not a ``ToolResult``) so the always-on
+        operational pre-turn block can render it. Best-effort: empty lists on
+        any failure — must never break a turn.
+
+        Queries each ACTIVE status directly (the status column is indexed) and
+        merges, rather than fetching an unfiltered page and filtering in
+        memory: otherwise a backlog of newer terminal/superseded rows could
+        fill ``limit`` and bury the very active loops this path exists to
+        surface (codex review). ``limit`` is per-status.
+        """
+        empty: Dict[str, List[Dict[str, Any]]] = {"session": [], "global_active": []}
+        graph = self._graph()
+        if graph is None:
+            return empty
+        session_id = self._current_session_id()
+
+        async def _by_status(status: str) -> List[GraphNode]:
+            try:
+                return await graph.query_nodes_by_type_and_property(
+                    TODO_NODE_TYPE,
+                    filters={"agent_id": self.agent_id, "status": status},
+                    order_by_created=True,
+                    limit=limit,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("active_preturn_items[%s] query failed: %s", status, e)
+                return []
+
+        # OPEN_STATUSES are the only non-terminal statuses; querying just these
+        # means terminal rows can never crowd out active ones.
+        results = await asyncio.gather(
+            *[_by_status(s) for s in sorted(OPEN_STATUSES)]
+        )
+
+        session_items: List[Dict[str, Any]] = []
+        global_active: List[Dict[str, Any]] = []
+        seen: set = set()
+        for batch in results:
+            for node in batch:
+                item = self._shape(node)
+                tid = item.get("id")
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                if item.get("superseded_by"):
+                    continue
+                status = item.get("status", "open")
+                # Defense-in-depth: we queried active statuses, but don't trust
+                # a backend that ignores the filter to never return terminal rows.
+                if status in TERMINAL_STATUSES or status not in OPEN_STATUSES:
+                    continue
+                item_session = (item.get("source_turn") or {}).get("session_id")
+                if session_id is not None and item_session == session_id:
+                    session_items.append(item)
+                elif status in {"in_progress", "waiting"} and item.get("scope") != "session":
+                    # Cross-session rollup is for non-session-scoped loops only.
+                    # A scope='session' todo belongs to ITS conversation —
+                    # surfacing it elsewhere breaks scoping (codex review r3).
+                    global_active.append(item)
+
+        # The per-status gather concatenates results status-by-status, so the
+        # merged lists are status-grouped, not globally newest-first. Re-sort by
+        # recency so the downstream display cap surfaces the MOST RECENT active
+        # loops rather than whichever status sorted first (codex review r4).
+        def _recency(it: Dict[str, Any]) -> str:
+            return str(it.get("updated_at") or it.get("created_at") or "")
+
+        session_items.sort(key=_recency, reverse=True)
+        global_active.sort(key=_recency, reverse=True)
+        return {"session": session_items, "global_active": global_active}
 
     @tool(
         name="todo_add",

@@ -79,7 +79,10 @@ def test_invoke_agent_e2e(client: TestClient, api_key: str):
     # 1. Check health before invoking (health endpoint doesn't require auth)
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "agent_initialized": True}
+    data = response.json()
+    # Check required fields; llm_reachability is optional (added in #1265)
+    assert data["status"] == "ok"
+    assert data["agent_initialized"] is True
 
     # 2. Invoke the agent with API key
     payload = {"input": "Hello, who are you?"}

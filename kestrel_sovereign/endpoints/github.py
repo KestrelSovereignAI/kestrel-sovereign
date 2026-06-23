@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -18,6 +20,11 @@ router = APIRouter(tags=["github"])
 
 _CACHE_TTL_SECONDS = 300
 _repo_cache: dict[tuple[Any, ...], tuple[float, list[str]]] = {}
+
+# GitHub owner/repo segment grammar. The scope-defining segments must match
+# this exactly; arbitrary characters here would let traversal or alternate
+# separators slip into the part of the path that decides the repo scope.
+_REPO_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def clear_repo_cache() -> None:
@@ -212,14 +219,77 @@ async def github_repos(
     return await discover_accessible_repos(org=org, include_private=include_private)
 
 
+def _repo_scoped_request(path: str) -> tuple[str, str] | None:
+    """Validate a repo-scoped GitHub API path and return ``(slug, upstream)``.
+
+    Only ``repos/{owner}/{repo}[/...]`` paths are repo-scoped. Every other
+    shape — ``orgs/...``, ``users/...``, ``search/...``, ``gists/...``,
+    ``user/...`` and so on — is an organization/user/global endpoint that the
+    server token must not reach through this proxy; those return ``None``.
+
+    The path is fully percent-decoded first (defeating single/double/n-times
+    encoded ``..`` and ``/`` traversal), any dot or empty segment is rejected,
+    and the upstream path is then *rebuilt* by re-encoding the validated
+    segments. Forwarding this normalized path — instead of the raw, attacker
+    controlled one — means httpx/GitHub cannot normalize it back into a global
+    endpoint that escapes the repo scope. Arbitrary in-repo content (file
+    paths with spaces, refs containing ``@``/``+``) still passes through.
+
+    Returns ``(owner/repo, upstream_path)`` or ``None`` if not repo-scoped.
+    """
+    # Fully decode so encoded traversal (`%2e%2e`, `%252e%252e`, `%2f`) is
+    # collapsed to its literal form before we inspect segments.
+    decoded = path
+    for _ in range(5):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+
+    segments = decoded.split("/")
+    # No traversal and no empty segments (which imply `//` or stray slashes
+    # that httpx would also normalize away).
+    if any(segment in {"", ".", ".."} for segment in segments):
+        return None
+    if len(segments) < 3 or segments[0] != "repos":
+        return None
+
+    owner, repo = segments[1], segments[2]
+    if not _REPO_SEGMENT_RE.fullmatch(owner) or not _REPO_SEGMENT_RE.fullmatch(repo):
+        return None
+
+    upstream = "/".join(quote(segment, safe="") for segment in segments)
+    return f"{owner}/{repo}", upstream
+
+
 @router.get("/api/github/{path:path}")
 async def github_proxy(path: str, request: Request):
-    """Proxy GitHub API requests using the server-side GitHub token."""
+    """Proxy repo-scoped GitHub API requests using the server-side token.
+
+    The proxy is constrained to the same resolved repository set as
+    ``/api/github/repos`` (configured ``[github]`` orgs/include_repos minus
+    exclude_repos). Non-repo paths and repositories outside that scope are
+    rejected so an authenticated caller cannot amplify the host token beyond
+    the intended discovery surface.
+    """
     token = _github_token()
     if not token:
         return JSONResponse({"error": "No GITHUB_TOKEN configured"}, status_code=503)
 
-    gh_url = f"https://api.github.com/{path}"
+    scoped = _repo_scoped_request(path)
+    if scoped is None:
+        return JSONResponse(
+            {
+                "error": (
+                    "Only repos/{owner}/{repo} paths are permitted via this "
+                    "proxy; organization, user, and global endpoints are blocked"
+                )
+            },
+            status_code=403,
+        )
+    slug, upstream = scoped
+
+    gh_url = f"https://api.github.com/{upstream}"
     if request.url.query:
         gh_url += f"?{request.url.query}"
 
@@ -229,6 +299,20 @@ async def github_proxy(path: str, request: Request):
         client = httpx.AsyncClient()
 
     try:
+        # Resolve the allowlist with the same logic as /api/github/repos and
+        # require the requested repo to be in it before proxying.
+        allowed = await discover_accessible_repos(client=client)
+        if slug.lower() not in {repo.lower() for repo in allowed}:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Repository '{slug}' is outside the configured GitHub "
+                        "scope"
+                    )
+                },
+                status_code=403,
+            )
+
         response = await client.get(
             gh_url,
             headers={
@@ -239,6 +323,8 @@ async def github_proxy(path: str, request: Request):
             timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
         )
         return JSONResponse(content=response.json(), status_code=response.status_code)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
     finally:
