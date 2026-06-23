@@ -637,6 +637,7 @@ class StreamingMixin:
         session_id: Optional[str] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         images: Optional[List[Union[str, bytes]]] = None,
+        keep_trailing_system: bool = False,
         cancel_token: Optional[CancelToken] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
@@ -789,6 +790,8 @@ class StreamingMixin:
                         kwargs["tool_executor"] = tool_executor
                     if cancel_token is not None:
                         kwargs["cancel_token"] = cancel_token
+                    if keep_trailing_system:
+                        kwargs["keep_trailing_system"] = True
 
                     # Meter the streamed turn from its terminal LLMResponse.
                     # The `finally` records even if the consumer stops iterating
@@ -855,6 +858,7 @@ class StreamingMixin:
                             tools=tools,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
+                            keep_trailing_system=keep_trailing_system,
                             cancel_token=cancel_token,
                         )
                         self._stamp_response_identity(
@@ -881,6 +885,7 @@ class StreamingMixin:
                             messages=adapter_messages,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
+                            keep_trailing_system=keep_trailing_system,
                             cancel_token=cancel_token,
                         ):
                             yield chunk

@@ -440,9 +440,9 @@ class ContextManager:
             history = await self.conversation_manager.get_conversation_history()
         message_count = len(history)
 
-        # Get constitutional awareness (state of mind includes prompt adaptation).
-        # Resolved BEFORE the budget so the elastic budget can include
-        # state-of-mind tokens in the measured mandatory floor.
+        # Get constitutional awareness. Prompt adaptation is stable enough for
+        # the top-level prefix; mutable StateOfMind fields are delivered by the
+        # operator-signal producer as append-only turn facts.
         prompt_adaptation = None
         state_of_mind = None
         if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
@@ -465,7 +465,7 @@ class ContextManager:
         # is loud, not silent. Codex round 1 #4.
         raw_mandatory = self.context_builder.measure_mandatory_system_tokens(
             constitution=constitution,
-            state_of_mind=state_of_mind,
+            state_of_mind=None,
             prompt_adaptation=prompt_adaptation,
         )
         try:
@@ -550,7 +550,7 @@ class ContextManager:
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
-                state_of_mind=state_of_mind,
+                state_of_mind=None,
                 budget_bytes=effective_budget,
                 anchored_doctrine=anchored_doctrine,
             )
@@ -567,7 +567,7 @@ class ContextManager:
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
-                state_of_mind=state_of_mind,
+                state_of_mind=None,
                 system_prompt_addendum=system_prompt_addendum,
             )
         system_tokens = self.counter.count(system_prompt)
@@ -1047,7 +1047,8 @@ class ContextManager:
         In EPHEMERAL mode, no history or memories are retrieved.
         Only the system prompt and constitution are included.
         """
-        # Get constitutional awareness (state of mind includes prompt adaptation)
+        # Get constitutional awareness. Mutable StateOfMind delivery is handled
+        # by the operator-signal producer, not the stable top-level prefix.
         prompt_adaptation = None
         state_of_mind = None
         if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
@@ -1090,7 +1091,7 @@ class ContextManager:
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
-                state_of_mind=state_of_mind,
+                state_of_mind=None,
                 budget_bytes=effective_budget,
                 anchored_doctrine=anchored_doctrine,
             )
@@ -1106,7 +1107,7 @@ class ContextManager:
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
-                state_of_mind=state_of_mind,
+                state_of_mind=None,
                 system_prompt_addendum=system_prompt_addendum,
             )
 

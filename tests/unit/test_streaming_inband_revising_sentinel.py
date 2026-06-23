@@ -138,6 +138,7 @@ def _build_mock_agent():
     agent.user_prompt_template.format.return_value = "rendered"
     agent._current_request_id = "req-abc"
     agent.emit_event = AsyncMock()
+    agent.operator_signal_producer = None
 
     ctx = MagicMock()
     ctx.system_prompt = "system"
