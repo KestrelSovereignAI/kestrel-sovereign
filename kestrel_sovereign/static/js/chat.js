@@ -1265,7 +1265,12 @@ export function connectNotifications() {
                 const { channel_type } = JSON.parse(e.data);
                 const ct = String(channel_type || '').trim().toLowerCase();
                 if (!ct) return;
-                document
+                // Scope to the notification stream's pane (same target the QR
+                // render path uses) so we don't retract another agent's QR
+                // bubble after a pane switch (codex #1825).
+                const pane = notificationPaneElement();
+                if (!pane) return;
+                pane
                     .querySelectorAll(`.channel-qr-message[data-channel-type="${cssAttrEscape(ct)}"]`)
                     .forEach((el) => el.remove());
             } catch (err) {
