@@ -85,12 +85,14 @@ class _InMemoryDb:
     async def execute_commit(self, sql, params=()):
         sql_l = sql.strip().lower()
         if sql_l.startswith("insert into conversation_history"):
-            agent_id, role, content, metadata = params[:4]
+            agent_id, role, content, model, provider, metadata = params[:6]
             row = {
                 "id": self._next_id,
                 "agent_id": agent_id,
                 "role": role,
                 "content": content,
+                "model": model,
+                "provider": provider,
                 "metadata": metadata,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
