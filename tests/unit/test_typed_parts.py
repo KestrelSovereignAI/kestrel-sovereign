@@ -172,6 +172,23 @@ def test_parser_handles_tool_and_part_together():
     assert parts[0]["pos"] == 2  # after "ab"
 
 
+def test_rebase_events_for_parts_origin_and_utf16():
+    # When a turn carries parts, tool cards are rebased onto the same post-tool
+    # UTF-16 origin as the parts so the reload merge orders both consistently.
+    from kestrel_sovereign.agent.streaming import _rebase_events_for_parts
+
+    text = "\U0001F422 done"  # turtle emoji (1 cp / 2 UTF-16 units) + " done"
+    # A post event at code-point offset 3 ("🐢 d") with no pre-tool retraction
+    # (base 0) → UTF-16 offset 4 (2 + 1 + 1).
+    out = _rebase_events_for_parts([{"type": "complete", "tool": "x", "pos": 3}], 0, text)
+    assert out[0]["pos"] == 4
+    # A pre-half event (pos below the retracted ``base``) clamps to 0.
+    out2 = _rebase_events_for_parts([{"type": "start", "tool": "y", "pos": 1}], 5, text)
+    assert out2[0]["pos"] == 0
+    # Non-dict / posless events pass through untouched.
+    assert _rebase_events_for_parts([{"type": "start"}, "x"], 0, text) == [{"type": "start"}, "x"]
+
+
 def test_parser_stamps_shared_wire_order_seq():
     # A shared monotonic ``seq`` across TOOL and PART sentinels records wire
     # order, so the reload renderer can interleave same-position items. Here a

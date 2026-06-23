@@ -261,6 +261,23 @@ def _utf16_offset(text: str, cp_offset: int) -> int:
     return len(text[:cp_offset].encode("utf-16-le")) // 2
 
 
+def _rebase_events_for_parts(events: list, base: int, text: str) -> list:
+    """Rebase ``tool_events`` onto the persisted post-tool ``text`` (subtract the
+    retracted pre-half length ``base``) and convert each ``pos`` to a UTF-16
+    offset — so tool cards share the SAME origin AND unit as the component parts
+    persisted alongside them (#1914). The reload renderer merges both by ``pos``,
+    so a mixed unit/origin would mis-order or split the bubbles (e.g. after an
+    emoji). Applied ONLY when a turn carries parts, so the tool-card-only persist
+    path is unchanged. Returns a new list; non-dict / posless events pass through.
+    """
+    out = []
+    for ev in events or []:
+        if isinstance(ev, dict) and isinstance(ev.get("pos"), int):
+            ev = {**ev, "pos": _utf16_offset(text, max(0, ev["pos"] - base))}
+        out.append(ev)
+    return out
+
+
 def _finalize_component_parts(parts: list, text: str) -> list:
     """Finalize component parts for persistence (#1914):
 
@@ -1108,6 +1125,13 @@ class StreamingMixin:
             # #1914: UTF-16-offset the positions for the browser + fold in any
             # parts a POST_RESPONSE hook emitted.
             component_parts = _finalize_component_parts(component_parts, tool_final_text)
+            # #1914: when this turn carries parts, rebase the tool cards onto the
+            # same post-tool UTF-16 origin so the reload merge orders both
+            # streams consistently (``post_base`` is the retracted pre half).
+            if component_parts:
+                tool_events = _rebase_events_for_parts(
+                    tool_events, post_base, tool_final_text,
+                )
             # tool_results carry the structured call/result envelopes;
             # persisting them alongside tool_events means a future
             # conversation-history reader can reconstruct *which tools
@@ -1273,6 +1297,12 @@ class StreamingMixin:
             inline_post_components = _finalize_component_parts(
                 inline_post_components, final_text
             )
+            # #1914: when parts ride along, rebase the tool cards onto the same
+            # post-tool UTF-16 origin so the reload merge stays consistent.
+            if inline_post_components:
+                synth_tool_events = _rebase_events_for_parts(
+                    synth_tool_events, inline_pre_len, final_text,
+                )
             # See parallel comment in the has_tool_calls branch above:
             # tool_results in the persisted metadata preserves the
             # actual call envelopes (id, name, arguments, summarized
@@ -1326,6 +1356,11 @@ class StreamingMixin:
             # emitted (the collector is still active while the hook runs).
             no_tool_components = _finalize_component_parts(no_tool_components, final_text)
             _no_tool_events = _tool_parts_to_events(tool_parts)
+            # #1914: with parts present, convert the tool cards to the same
+            # UTF-16 origin (base 0 here — no pre-tool retraction) so the reload
+            # merge orders both consistently.
+            if no_tool_components:
+                _no_tool_events = _rebase_events_for_parts(_no_tool_events, 0, final_text)
             # #1914: a turn can emit component parts without dispatching tools
             # (e.g. a feature emitting a card from a hook). Persist them here so
             # those bubbles survive reload too. ``final_text`` is the clean
