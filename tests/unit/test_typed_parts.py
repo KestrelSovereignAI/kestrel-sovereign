@@ -255,5 +255,46 @@ async def test_collector_visible_across_nested_async_generators():
     assert drain_parts() == []
 
 
+# --------------------------------------------------------------------------
+# per-tool part association (multi-tool batch ordering)
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_tool_batch_associates_parts_per_tool():
+    """In a multi-tool serial batch, each tool's emitted part is associated with
+    that tool's terminal event index — so the streaming caller can yield the
+    component bubble right after its producing tool's card, not after the whole
+    batch. (#1914)"""
+    from unittest.mock import MagicMock
+
+    from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+
+    self_obj = MagicMock()
+    self_obj._partition_tool_calls = MagicMock(return_value=[(False, ["tcA", "tcB"])])
+
+    async def fake_dispatch(tc, *args, tool_events=None, **kwargs):
+        # Simulate a tool recording start+complete and emitting one part.
+        tool_events.append({"type": "start", "tool": tc})
+        emit_part("todo", {"which": tc})
+        tool_events.append({"type": "complete", "tool": tc, "ms": 1})
+
+    self_obj._dispatch_tool_call = fake_dispatch
+
+    tool_events: list = []
+    buf: list = []
+    with part_collector():
+        await OrchestratorEngineMixin._execute_tool_batch(
+            self_obj, ["tcA", "tcB"], {}, set(), [], 0, None,
+            tool_events=tool_events, tool_results=[], streaming=True,
+            session_id="s", part_emit_buffer=buf,
+        )
+
+    # tcA's complete is at index 1, tcB's complete at index 3.
+    assert buf == [
+        (1, [{"type": "todo", "data": {"which": "tcA"}}]),
+        (3, [{"type": "todo", "data": {"which": "tcB"}}]),
+    ]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

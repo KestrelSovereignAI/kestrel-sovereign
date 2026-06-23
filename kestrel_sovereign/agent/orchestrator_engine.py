@@ -1838,9 +1838,17 @@ class OrchestratorEngineMixin:
         tool_results: Optional[list] = None,
         streaming: bool = False,
         session_id: str = "orchestrator",
+        part_emit_buffer: Optional[list] = None,
     ):
         """
         Execute a batch of tool calls, using parallelism where safe.
+
+        #1914: when ``part_emit_buffer`` is provided, parts emitted via
+        ``emit_part`` are drained after EACH tool (serial) — or after the gather
+        (parallel, where order is undefined) — and recorded as
+        ``(terminal_tool_event_index, [parts])`` so the streaming caller can
+        yield each component bubble right after its producing tool's card,
+        instead of bunching all parts after the whole batch.
 
         Partitions into parallel/serial batches. Parallel batches use
         asyncio.gather with a semaphore. All tool results are appended
@@ -1852,6 +1860,16 @@ class OrchestratorEngineMixin:
         """
         batches = self._partition_tool_calls(tool_calls, features_by_tool_name)
 
+        def _collect_parts():
+            # #1914: associate the parts a tool just emitted with its terminal
+            # event (the last appended tool_event), so the caller can interleave
+            # the component bubble right after that tool's card.
+            if part_emit_buffer is None or not tool_events:
+                return
+            drained = drain_parts()
+            if drained:
+                part_emit_buffer.append((len(tool_events) - 1, drained))
+
         if len(batches) == 1 and not batches[0][0]:
             # Single serial batch (most common case) — no overhead
             for tc in batches[0][1]:
@@ -1861,6 +1879,7 @@ class OrchestratorEngineMixin:
                     tool_events=tool_events, tool_results=tool_results,
                     streaming=streaming, session_id=session_id,
                 )
+                _collect_parts()
             return
 
         semaphore = asyncio.Semaphore(MAX_TOOL_CONCURRENCY)
@@ -1875,6 +1894,7 @@ class OrchestratorEngineMixin:
                         tool_events=tool_events, tool_results=tool_results,
                         streaming=streaming, session_id=session_id,
                     )
+                    _collect_parts()
             else:
                 # Parallel execution of concurrency-safe direct tools
                 logging.info(
@@ -1920,6 +1940,9 @@ class OrchestratorEngineMixin:
                     messages.extend(per_tool_messages[i])
                     if per_tool_results is not None and tool_results is not None:
                         tool_results.extend(per_tool_results[i])
+                # Parallel tools have no defined relative order, so drain their
+                # parts once after the gather and attach to the last event.
+                _collect_parts()
 
     # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler
@@ -2245,20 +2268,44 @@ class OrchestratorEngineMixin:
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._visible_known_tool_names()
             events_before = len(tool_events) if tool_events is not None else 0
+            # #1914: per-tool part associations recorded by _execute_tool_batch,
+            # as (terminal_event_index, [parts]). Lets us yield each component
+            # bubble right after its producing tool's card in a multi-tool batch.
+            part_emit_buffer: list = []
             await self._execute_tool_batch(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
-                session_id=session_id,
+                session_id=session_id, part_emit_buffer=part_emit_buffer,
             )
+            _parts_by_event_index: dict = {}
+            for _evt_idx, _evt_parts in part_emit_buffer:
+                _parts_by_event_index.setdefault(_evt_idx, []).extend(_evt_parts)
+            _emitted_any_part = False
+
+            def _yield_parts_for(_idx):
+                nonlocal _emitted_any_part
+                _out = []
+                for _part in _parts_by_event_index.get(_idx, []):
+                    _sentinel = build_part_sentinel(_part)
+                    if _sentinel:
+                        _emitted_any_part = True
+                        _out.append(_sentinel)
+                return _out
+
             # #1659: _execute_tool_batch isn't a generator, so it records the
             # batch's outcome into tool_events (complete/error) but can't yield
             # the terminal sentinels itself. Emit them here from the events it
             # just appended so the live cards resolve out of "running" — and so
             # error/validation-failure paths (which only append to tool_events)
             # surface as error cards live, not just on reload.
+            # #1914: right after each tool's terminal sentinel, yield the parts
+            # that tool emitted, so a component bubble lands at the point its
+            # producing tool ran even within a multi-tool batch.
             if tool_events is not None:
-                for ev in tool_events[events_before:]:
+                for _abs_i, ev in enumerate(
+                    tool_events[events_before:], start=events_before,
+                ):
                     if ev.get('type') == 'complete':
                         yield _build_tool_sentinel(
                             'done', ev.get('tool', ''), ms=ev.get('ms'),
@@ -2267,19 +2314,16 @@ class OrchestratorEngineMixin:
                         yield _build_tool_sentinel(
                             'error', ev.get('tool', ''), detail=ev.get('error'),
                         )
+                    for _ps in _yield_parts_for(_abs_i):
+                        yield _ps
 
-            # #1914: drain any typed component parts the tools in this batch
-            # emitted via ``emit_part`` and yield them as in-band PART sentinels
-            # — placed right after the tool cards resolve so each component
-            # bubble lands in stream order at the point its tool ran. Drained
-            # (not just read) so a part is emitted exactly once even across
-            # multiple tool iterations in the same turn.
-            _emitted_any_part = False
-            for part in drain_parts():
-                sentinel = build_part_sentinel(part)
-                if sentinel:
-                    yield sentinel
-                    _emitted_any_part = True
+            # Safety net: any parts not associated with a yielded event index
+            # (e.g. an event index past the slice) still get emitted once.
+            _seen_idx = set(range(events_before, len(tool_events or [])))
+            for _idx in sorted(_parts_by_event_index):
+                if _idx not in _seen_idx:
+                    for _ps in _yield_parts_for(_idx):
+                        yield _ps
             if _emitted_any_part:
                 # A part seals the tool bubble, so the follow-up answer opens a
                 # fresh bubble. The ``\n---\n`` tool/answer separator is only
