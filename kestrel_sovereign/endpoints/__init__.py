@@ -16,6 +16,7 @@ from .metrics import router as metrics_router
 from .observability import router as observability_router
 from .features import router as features_router
 from .ui import router as ui_router
+from .github import router as github_router
 
 # Feature-contributed routers (voice, spawn) are no longer
 # imported here. They are mounted dynamically via Feature.get_router()
@@ -36,4 +37,5 @@ __all__ = [
     "observability_router",
     "features_router",
     "ui_router",
+    "github_router",
 ]
