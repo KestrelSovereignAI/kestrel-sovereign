@@ -24,6 +24,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_conversation_store,
     resolve_feature_database,
 )
+from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -108,6 +109,15 @@ class MemoryFeature(Feature):
         # Agent identity (DID is the canonical source of truth)
         self.agent_id = self.agent.did
         logger.info(f"MemoryFeature initialized for agent: {self.agent_id[:30]}...")
+
+    async def post_all_features_loaded(self, agent):
+        """Subscribe memory application attestation to the sleep cycle."""
+        hooks = getattr(agent, "sleep_hooks", None)
+        if hooks is None:
+            agent.sleep_hooks = []
+            hooks = agent.sleep_hooks
+        if not any(isinstance(hook, ReflectionSleepHook) for hook in hooks):
+            hooks.append(ReflectionSleepHook())
 
     @property
     def memory_system(self):
