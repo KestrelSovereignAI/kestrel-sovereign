@@ -248,6 +248,9 @@ async def test_proxy_rejects_repo_not_in_scope(monkeypatch):
         "search/issues",
         "user",
         "repos/KestrelSovereignAI",
+        # Dot-segment traversal: httpx would normalize this to /user.
+        "repos/KestrelSovereignAI/kestrel-sovereign/../../../user",
+        "repos/KestrelSovereignAI/kestrel-sovereign/%2e%2e/%2e%2e/user",
     ],
 )
 async def test_proxy_rejects_non_repo_scoped_paths(monkeypatch, path):

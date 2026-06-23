@@ -221,6 +221,11 @@ def _repo_scoped_slug(path: str) -> str | None:
     server token must not reach through this proxy. Those return ``None``.
     """
     parts = [segment for segment in path.split("/") if segment]
+    # Reject dot-segment traversal: httpx normalizes `repos/o/r/../../user`
+    # to `https://api.github.com/user`, which would otherwise escape the
+    # repo-scope check and reach global endpoints with the host token.
+    if any(segment in {".", ".."} for segment in parts):
+        return None
     if len(parts) >= 3 and parts[0] == "repos":
         return f"{parts[1]}/{parts[2]}"
     return None
