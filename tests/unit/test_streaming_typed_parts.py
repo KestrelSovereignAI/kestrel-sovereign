@@ -219,20 +219,27 @@ async def test_inline_executed_tool_emitted_part_drained_and_persisted():
     async for chunk in agent.process_input_streaming("update todos", session_id="s3"):
         yielded.append(chunk)
 
-    # The drained part reaches the live client as a PART sentinel.
-    assert any("\x1eKESTREL:PART:" in c for c in yielded)
+    # The drained part reaches the live client as a PART sentinel, and it lands
+    # at the tool boundary — BEFORE the post-tool prose ("Added it."), not after.
+    part_idx = next(i for i, c in enumerate(yielded) if "\x1eKESTREL:PART:" in c)
+    added_idx = next(i for i, c in enumerate(yielded) if "Added it." in c)
+    assert part_idx < added_idx
 
     assistant_inserts = [c for c in add_convo_calls if c["role"] == "assistant"]
     assert len(assistant_inserts) == 1
     persisted = assistant_inserts[0]["content"]
     metadata = assistant_inserts[0].get("metadata") or {}
     assert "\x1eKESTREL:PART:" not in persisted
+    # The honesty layer retracts the pre-tool prose ("Updating. ") to metadata;
+    # the persisted content is the post-tool answer, and the part sits at its
+    # start (pos 0) — the tool boundary, matching the live stream order.
+    assert persisted == "Added it."
     assert "parts" in metadata
     assert len(metadata["parts"]) == 1
     assert metadata["parts"][0]["type"] == "todo"
     assert metadata["parts"][0]["data"] == {"title": "ship #1914"}
     assert metadata["parts"][0]["id"] == "t1"
-    assert isinstance(metadata["parts"][0].get("pos"), int)
+    assert metadata["parts"][0]["pos"] == 0
 
 
 @pytest.mark.asyncio

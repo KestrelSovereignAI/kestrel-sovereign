@@ -279,6 +279,22 @@ def _finalize_component_parts(parts: list, text: str) -> list:
     return result
 
 
+def _drain_part_sentinels(full_response: list):
+    """Drain buffered component parts (#1914) into PART sentinels — yield each
+    for the live stream AND append it to ``full_response`` so the inline /
+    no-tool persist path records it, position-stamped, like the orchestrator
+    path captures its drained sentinels from the post-tool chunks. Called at the
+    TOP of each inline stream iteration (so a part emitted while the adapter was
+    resumed lands at the tool boundary, before the next text chunk) and once
+    after the loop (to catch parts from the final resume).
+    """
+    for part in drain_parts():
+        sentinel = build_part_sentinel(part)
+        if sentinel:
+            full_response.append(sentinel)
+            yield sentinel
+
+
 _TOOL_EVENT_PHASE = {"start": "start", "complete": "done", "error": "error"}
 
 
@@ -847,6 +863,11 @@ class StreamingMixin:
             # path below and the cancellation marker lands in metadata.
             if request_id and self.is_request_cancelled(request_id):
                 break
+            # #1914: flush any part an inline tool emitted while the adapter was
+            # resumed to produce THIS item — before the item's own text — so the
+            # component lands at the tool boundary, not after the post-tool prose.
+            for _ps in _drain_part_sentinels(full_response):
+                yield _ps
             if isinstance(item, str):
                 # #1547: materialize a pending revise boundary lazily —
                 # only when real post-marker text lands, and only when it
@@ -907,20 +928,11 @@ class StreamingMixin:
                 # Tool calls detected at end of stream
                 tool_response = item
 
-            # #1914: surface component parts emitted by an inline-executed tool
-            # (codex app-server bridge). The tool runs INSIDE this LLM call and
-            # buffers parts via ``emit_part``; drain them here and stream each as
-            # a PART sentinel — also appending to ``full_response`` so the inline
-            # persist path records it (position-stamped) the same way the
-            # orchestrator path captures its own drained sentinels from the
-            # post-tool chunks. No-op on the orchestrator path: no tool has
-            # executed yet, so the collector stays empty until the orchestrator
-            # drains it later.
-            for _emitted_part in drain_parts():
-                _part_sentinel = build_part_sentinel(_emitted_part)
-                if _part_sentinel:
-                    full_response.append(_part_sentinel)
-                    yield _part_sentinel
+        # #1914: flush any part the FINAL resume produced — the loop-top drain
+        # only sees parts buffered before the NEXT item, so the last item's
+        # parts need a post-loop flush.
+        for _ps in _drain_part_sentinels(full_response):
+            yield _ps
 
         # Log LLM response
         llm_duration = int((time.time() - llm_start) * 1000)
