@@ -123,7 +123,7 @@ class BootstrapService:
         agent_name: str,
         llm_service,
         agent_data_path: Path,
-        storage,
+        storage=None,
     ):
         """
         Initialize the bootstrap service.

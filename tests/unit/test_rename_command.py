@@ -76,6 +76,12 @@ class MockAgent:
         self._raw_storage = MagicMock()
         self._raw_storage.db = MockDB()
         self.context_builder = MagicMock()
+        # #1612 added an awaited canonical-SOUL-resource load in the rename
+        # path; the mock must be awaitable. Return False so rename falls back
+        # to the seed _load_soul_md() path this test exercises.
+        self.context_builder.load_canonical_soul_resource = AsyncMock(
+            return_value=False
+        )
         self.bootstrap_service = MagicMock()
         self.bootstrap_service.agent_name = agent_name
         self.bootstrap_service.agent_data_path = None
