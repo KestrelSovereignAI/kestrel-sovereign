@@ -24,6 +24,7 @@ Covers:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -32,6 +33,8 @@ from kestrel_sovereign.storage.memory_retriever import (
     MemoryRetriever,
     _cosine_unit,
 )
+from kestrel_sovereign.storage.sqla import build_conversation_message_spec
+from kestrel_sovereign.storage.vector import PgVectorBackend, get_vector_backend
 
 
 # ----------------------------------------------------------------- _cosine_unit
@@ -224,6 +227,110 @@ async def test_retrieve_calls_aembed_once_and_batches_row_load():
     # Single batched call with both ids.
     (called_ids,) = conv.get_message_embeddings.call_args.args
     assert set(called_ids) == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_retrieve_uses_vector_backend_for_semantic_component(monkeypatch):
+    """When a SQLAlchemy factory is available, retrieve() gets semantic
+    cosine scores from the shared vector backend instead of the bespoke
+    row-embedding SELECT path."""
+    svc = MagicMock()
+    svc.aembed = AsyncMock(return_value=[1.0, 0.0])
+    svc.current_profile_id = MagicMock(return_value="profile-a")
+
+    conv = MagicMock()
+    conv.db = MagicMock()
+    conv.embedding_service = svc
+    conv.get_conversation_history = AsyncMock(return_value=[
+        {"id": 1, "role": "assistant", "content": "unrelated words",
+         "metadata": {}, "created_at": None},
+        {"id": 2, "role": "assistant", "content": "fooquery",
+         "metadata": {}, "created_at": None},
+    ])
+    conv.get_message_embeddings = AsyncMock(return_value={})
+    conv.atomic_increment_metadata_counter = AsyncMock()
+
+    factory = MagicMock()
+    factory.engine = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.sqla.make_session_factory",
+        lambda db: factory,
+    )
+
+    class FakeBackend:
+        async def knn(self, query_embedding, k, filter=None):
+            self.query_embedding = query_embedding
+            self.k = k
+            self.filter = filter
+            return [("1", 1.0)]
+
+    fake_backend = FakeBackend()
+
+    def fake_get_vector_backend(session_factory, spec):
+        assert session_factory is factory
+        assert spec.dimension == 2
+        return fake_backend
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.vector.get_vector_backend",
+        fake_get_vector_backend,
+    )
+
+    retriever = MemoryRetriever(conv)
+    results = await retriever.retrieve(
+        "fooquery", agent_id="agent-a", limit=2, min_score=0.0,
+    )
+
+    conv.get_message_embeddings.assert_not_awaited()
+    assert fake_backend.k == 2
+    assert fake_backend.filter == {
+        "agent_id": "agent-a",
+        "deleted_at": None,
+        "embedding_profile_id": "profile-a",
+    }
+    assert results[0]["id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retrieve_pg_factory_uses_pgvector_backend(monkeypatch):
+    """Postgres session factories dispatch memory retrieval to PgVectorBackend."""
+    svc = MagicMock()
+    svc.aembed = AsyncMock(return_value=[1.0, 0.0])
+
+    conv = MagicMock()
+    conv.db = MagicMock()
+    conv.embedding_service = svc
+    conv.get_conversation_history = AsyncMock(return_value=[
+        {"id": 1, "role": "assistant", "content": "alpha",
+         "metadata": {}, "created_at": None},
+    ])
+    conv.get_message_embeddings = AsyncMock(return_value={})
+    conv.atomic_increment_metadata_counter = AsyncMock()
+
+    factory = MagicMock()
+    factory.engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.sqla.make_session_factory",
+        lambda db: factory,
+    )
+
+    spec = build_conversation_message_spec(dimension=2)
+    assert isinstance(get_vector_backend(factory, spec), PgVectorBackend)
+
+    backend_instances = []
+
+    async def fake_knn(self, query_embedding, k, filter=None):
+        backend_instances.append(self)
+        return [("1", 1.0)]
+
+    monkeypatch.setattr(PgVectorBackend, "knn", fake_knn)
+
+    retriever = MemoryRetriever(conv)
+    await retriever.retrieve("question", agent_id="agent-a", min_score=0.0)
+
+    assert backend_instances
+    assert isinstance(backend_instances[0], PgVectorBackend)
+    conv.get_message_embeddings.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,7 @@ See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
 import asyncio
 import logging
 import math
+import struct
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Sequence, Tuple
 import json
@@ -107,6 +108,16 @@ def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
     return max(0.0, min(1.0, (raw + 1.0) / 2.0))
 
 
+def _pack_embedding(embedding: Sequence[float]) -> bytes:
+    """Pack an embedding into the vector-backend float32 byte shape."""
+    return struct.pack(f"<{len(embedding)}f", *embedding)
+
+
+def _similarity_to_unit(similarity: float) -> float:
+    """Normalize backend cosine similarity from ``[-1, 1]`` to ``[0, 1]``."""
+    return max(0.0, min(1.0, (float(similarity) + 1.0) / 2.0))
+
+
 class MemoryRetriever:
     """
     Retrieves memories using human-like weighting.
@@ -146,6 +157,7 @@ class MemoryRetriever:
         self.conversations = conversation_store
         self.linker = linker
         self._access_update_tasks: set[asyncio.Task[None]] = set()
+        self._sqla_factory_unavailable = False
 
     async def retrieve(
         self,
@@ -195,37 +207,45 @@ class MemoryRetriever:
         # for every row in this call.
         query_embedding = await self._embed_query(query)
 
-        # If we have a query embedding, hydrate the row embeddings for
-        # the slice in one batched SELECT so we can apply cosine in
-        # ``_score_semantic`` without a per-row IO. Rows missing an
-        # embedding (legacy, pre-Phase-2-migration, or rows written
-        # while Ollama was down) get a None and fall back to keyword
-        # overlap naturally.
-        row_embeddings: Dict[Any, List[float]] = {}
+        # #1477 — only compare rows stamped with the current embedding
+        # profile id. Cross-profile rows return as absent from the vector
+        # signal and naturally fall through to keyword overlap.
+        current_profile_id: Optional[str] = None
+        embedding_service_for_profile = getattr(
+            self.conversations, "embedding_service", None
+        )
+        if embedding_service_for_profile is not None and hasattr(
+            embedding_service_for_profile, "current_profile_id"
+        ):
+            try:
+                current_profile_id = (
+                    embedding_service_for_profile.current_profile_id()
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "current_profile_id() failed during retriever load: %s",
+                    exc,
+                )
+
+        # If we have a query embedding, ask the sovereign vector backend for
+        # per-row semantic similarities. We still score the full recent-history
+        # slice below so emotional/importance/recency/access/certainty ranking
+        # semantics stay unchanged; kNN only supplies the semantic component.
+        semantic_similarities: Dict[str, float] = {}
         if query_embedding is not None:
-            ids = [m.get("id") for m in history if m.get("id") is not None]
-            # #1477 — only load rows stamped with the current
-            # embedding profile id. Cross-profile rows return as
-            # absent (no entry in the dict) → ``_score_semantic``
-            # naturally falls through to keyword overlap for those
-            # rows. ``None`` (no service / no profile metadata)
-            # means "no filter" — preserves legacy behavior.
-            current_profile_id: Optional[str] = None
-            embedding_service_for_profile = getattr(
-                self.conversations, "embedding_service", None
+            semantic_similarities = await self._semantic_similarities_via_vector_backend(
+                query_embedding=query_embedding,
+                agent_id=agent_id,
+                current_profile_id=current_profile_id,
+                k=len(history),
             )
-            if embedding_service_for_profile is not None and hasattr(
-                embedding_service_for_profile, "current_profile_id"
-            ):
-                try:
-                    current_profile_id = (
-                        embedding_service_for_profile.current_profile_id()
-                    )
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug(
-                        "current_profile_id() failed during retriever "
-                        "load: %s", exc,
-                    )
+
+        # SQLAlchemy/vector backend unavailable (in-memory SQLite, from_pool,
+        # migration in progress, optional pgvector package missing, etc.) falls
+        # back to the pre-#1448 batched row-embedding read and local cosine.
+        row_embeddings: Dict[Any, List[float]] = {}
+        if query_embedding is not None and not semantic_similarities:
+            ids = [m.get("id") for m in history if m.get("id") is not None]
             try:
                 row_embeddings = await self.conversations.get_message_embeddings(
                     ids, embedding_profile_id=current_profile_id,
@@ -298,6 +318,7 @@ class MemoryRetriever:
                 expanded_concepts=expanded_concepts,
                 query_embedding=query_embedding,
                 content_embedding=row_embeddings.get(msg.get("id")),
+                semantic_similarity=semantic_similarities.get(str(msg.get("id"))),
             )
 
             if score >= min_score:
@@ -358,6 +379,7 @@ class MemoryRetriever:
         expanded_concepts: List[str],
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
+        semantic_similarity: Optional[float] = None,
     ) -> float:
         """
         Calculate weighted retrieval score.
@@ -388,6 +410,7 @@ class MemoryRetriever:
             content, query, expanded_concepts,
             query_embedding=query_embedding,
             content_embedding=content_embedding,
+            semantic_similarity=semantic_similarity,
         )
 
         # 2. Emotional score (mood congruence)
@@ -428,6 +451,7 @@ class MemoryRetriever:
         expanded_concepts: List[str],
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
+        semantic_similarity: Optional[float] = None,
     ) -> float:
         """
         Score semantic relevance.
@@ -453,6 +477,16 @@ class MemoryRetriever:
         scores are normalised into the same 0..1 band so this doesn't
         produce a discontinuity in the final ranking.
         """
+        if semantic_similarity is not None:
+            content_lower = content.lower()
+            concept_score = 0.0
+            if expanded_concepts:
+                concept_matches = sum(
+                    1 for c in expanded_concepts if c in content_lower
+                )
+                concept_score = min(1.0, concept_matches / len(expanded_concepts))
+            return semantic_similarity * 0.7 + concept_score * 0.3
+
         if query_embedding is not None and content_embedding is not None:
             cosine = _cosine_unit(query_embedding, content_embedding)
             if cosine is not None:
@@ -500,6 +534,78 @@ class MemoryRetriever:
 
         # Combine: 70% keyword, 30% concept
         return keyword_score * 0.7 + concept_score * 0.3
+
+    def _get_vector_session_factory(self):
+        """Build/reuse the SQLAlchemy factory backing vector search."""
+        if self._sqla_factory_unavailable:
+            return None
+
+        db = getattr(self.conversations, "db", None)
+        if db is None:
+            self._sqla_factory_unavailable = True
+            return None
+
+        try:
+            from kestrel_sovereign.storage.sqla import make_session_factory
+
+            return make_session_factory(db)
+        except Exception as e:
+            logger.info(
+                "SQLAlchemy session factory unavailable for memory retrieval "
+                "vector search (%s); falling back to legacy row embeddings.",
+                e,
+            )
+            self._sqla_factory_unavailable = True
+            return None
+
+    async def _semantic_similarities_via_vector_backend(
+        self,
+        query_embedding: List[float],
+        agent_id: str,
+        current_profile_id: Optional[str],
+        k: int,
+    ) -> Dict[str, float]:
+        """Return normalized semantic similarities from the vector backend.
+
+        Empty dict means "no vector signal"; the caller falls back to the
+        existing keyword/row-embedding path.
+        """
+        if k <= 0:
+            return {}
+
+        session_factory = self._get_vector_session_factory()
+        if session_factory is None:
+            return {}
+
+        try:
+            from kestrel_sovereign.storage.sqla import build_conversation_message_spec
+            from kestrel_sovereign.storage.vector import get_vector_backend
+
+            spec = build_conversation_message_spec(dimension=len(query_embedding))
+            backend = get_vector_backend(session_factory, spec)
+            filter_kwargs: Dict[str, Any] = {
+                "agent_id": agent_id,
+                "deleted_at": None,
+            }
+            if current_profile_id is not None:
+                filter_kwargs["embedding_profile_id"] = current_profile_id
+
+            top_k = await backend.knn(
+                _pack_embedding(query_embedding),
+                k=k,
+                filter=filter_kwargs,
+            )
+        except Exception as e:
+            logger.warning(
+                "Vector-backend memory retrieval failed (%s); falling back to "
+                "legacy row-embedding path.", e,
+            )
+            return {}
+
+        return {
+            str(row_id): _similarity_to_unit(similarity)
+            for row_id, similarity in top_k
+        }
 
     async def _embed_query(self, query: str) -> Optional[List[float]]:
         """Embed the retrieval query with the conversation store's
