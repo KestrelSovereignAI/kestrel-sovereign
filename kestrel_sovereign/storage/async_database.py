@@ -258,6 +258,27 @@ CREATE TABLE IF NOT EXISTS agent_service_keys (
 CREATE INDEX IF NOT EXISTS idx_agent_service_keys_agent ON agent_service_keys(agent_did);
 CREATE INDEX IF NOT EXISTS idx_agent_service_keys_provider ON agent_service_keys(provider_id);
 
+-- Zero-knowledge user BYOK credentials. The platform stores only ciphertext
+-- plus per-row KDF salt and AEAD nonce. Decryption requires a per-request user
+-- passphrase and never falls back to KESTREL_DATA_KEY or any host/user master.
+CREATE TABLE IF NOT EXISTS user_byok_service_keys (
+    id TEXT PRIMARY KEY,
+    agent_did TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    encrypted_key TEXT NOT NULL,
+    key_salt TEXT NOT NULL,
+    key_nonce TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    kdf TEXT NOT NULL DEFAULT 'PBKDF2-SHA256',
+    kdf_iterations INTEGER NOT NULL DEFAULT 600000,
+    is_active INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(agent_did, provider_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_byok_keys_agent ON user_byok_service_keys(agent_did);
+CREATE INDEX IF NOT EXISTS idx_user_byok_keys_provider ON user_byok_service_keys(provider_id);
+
 -- Host (operator) master credentials for the HOST_MASTER_PROVISIONED
 -- payer-policy path. Single host per deployment. Sponsor and
 -- user-master variants are modeled separately if/when needed. See

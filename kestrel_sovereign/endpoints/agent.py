@@ -84,6 +84,7 @@ async def invoke_agent(request: Request):
         model_override = data.get("model")
         provider_override = data.get("provider")
         session_id = data.get("session_id")
+        user_passphrase = data.get("user_passphrase")
 
         if user_input is None:
             raise HTTPException(status_code=400, detail="Input not provided.")
@@ -110,6 +111,7 @@ async def invoke_agent(request: Request):
             model_override=model_override,
             session_id=effective_session_id,
             caller=caller,
+            user_passphrase=user_passphrase,
         )
         return {"response": response, "session_id": effective_session_id}
     except HTTPException:

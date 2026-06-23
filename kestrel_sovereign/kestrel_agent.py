@@ -715,6 +715,48 @@ class KestrelAgent(
         from kestrel_sovereign.services.payer_resolver import open_host_db
         return await open_host_db(storage_path=self.storage_path)
 
+    async def _maybe_refresh_user_byok_resolver(self, user_passphrase: str | None) -> None:
+        """Re-resolve LLM provider if using USER_BYOK and passphrase is provided.
+
+        USER_BYOK agents require a per-request passphrase to decrypt their provider
+        credentials. This method re-resolves the LLM key resolver with the fresh
+        passphrase for each request. Non-BYOK agents and requests without a passphrase
+        are no-ops.
+
+        Args:
+            user_passphrase: The per-request passphrase for zero-knowledge BYOK decryption.
+        """
+        if not user_passphrase:
+            return
+
+        # Check if we're using USER_BYOK for LLM
+        from kestrel_sdk.payer_policy import PayerKind, ResourceClass
+        policy = self._resolve_payer_policy()
+        if policy.llm.kind != PayerKind.USER_BYOK:
+            return
+
+        # Re-resolve with the passphrase
+        from kestrel_sovereign.services.payer_resolver import FoundationPayerResolver
+        host_db = await self._resolve_host_db()
+        resolver = FoundationPayerResolver(
+            policy,
+            db=self._raw_storage.db if self._raw_storage else None,
+            host_db=host_db,
+        )
+        resolved = await resolver.resolve_for(
+            self.did,
+            ResourceClass.LLM,
+            user_passphrase=user_passphrase,
+        )
+
+        # Update the LLM service's key resolver
+        if resolved.enabled and resolved.key_resolver and hasattr(self, 'llm_service'):
+            self.llm_service.key_resolver = resolved.key_resolver
+            logging.info(
+                f"Refreshed USER_BYOK LLM resolver for agent {self.did[:30]}... "
+                f"with per-request passphrase"
+            )
+
     async def initialize(self) -> None:
         """Async initialization of storage and features."""
         if self._raw_storage is None:
@@ -1401,6 +1443,8 @@ class KestrelAgent(
                 if (
                     _exc_name == "PayerPolicyError"
                     or _exc_name == "UnsupportedCombinationError"
+                    or _exc_name == "PassphraseRequiredError"
+                    or _exc_name == "DecryptionError"
                     or "OpenRouterProvisioning" in _exc_name
                 ):
                     logging.error(
@@ -2247,7 +2291,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -2267,6 +2311,8 @@ Expected Duration: {expected_duration}
                                     COGNITION dispatches without touching the
                                     cache-stable system-prompt prefix or polluting
                                     persisted user-turn content.
+            user_passphrase: Optional per-request passphrase for USER_BYOK agents.
+                             Required for PayerKind.USER_BYOK to decrypt provider keys.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
@@ -2276,6 +2322,9 @@ Expected Duration: {expected_duration}
 
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
+
+        # USER_BYOK: Refresh LLM resolver with per-request passphrase
+        await self._maybe_refresh_user_byok_resolver(user_passphrase)
 
         # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands
         if self._safe_mode:
