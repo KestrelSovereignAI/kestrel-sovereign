@@ -82,6 +82,7 @@ async def test_attachments_persist_on_user_turn_metadata():
     mock_agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
     mock_agent.user_prompt_template = MagicMock()
     mock_agent.user_prompt_template.format.return_value = "rendered prompt"
+    mock_agent.operator_signal_producer = None
 
     context_result = MagicMock()
     context_result.system_prompt = "system"
@@ -156,6 +157,7 @@ async def test_no_attachments_means_no_attachments_key():
     mock_agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
     mock_agent.user_prompt_template = MagicMock()
     mock_agent.user_prompt_template.format.return_value = "rendered prompt"
+    mock_agent.operator_signal_producer = None
     context_result = MagicMock()
     context_result.system_prompt = "system"
     context_result.dynamic_user_context = "ctx"

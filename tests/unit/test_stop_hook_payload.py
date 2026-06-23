@@ -74,6 +74,7 @@ def _build_streaming_mock_agent(*, stop_captured: list, hooks_present: bool = Tr
     agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
     agent.user_prompt_template = MagicMock()
     agent.user_prompt_template.format.return_value = "rendered"
+    agent.operator_signal_producer = None
 
     ctx = MagicMock()
     ctx.system_prompt = "system"
