@@ -106,6 +106,15 @@ class _FakeService(StreamingMixin):
     def __init__(self):
         self._track_model_usage = AsyncMock()
         self._log_llm_call = AsyncMock()
+        self._disabled_routes = {}
+
+    def _stamp_response_identity(self, response, *, model, provider):
+        """Stub for #1370 model/provider stamping."""
+        pass
+
+    def _maybe_disable_route(self, provider, exc):
+        """Stub for route disabling logic."""
+        pass
 
 
 def test_record_streamed_usage_meters_terminal_response():
@@ -170,6 +179,7 @@ class _RoutingService(StreamingMixin):
         self._backend = None          # not REMOTE_GPU -> skip remote branch
         self._remote_client = None
         self._adapter = adapter
+        self._disabled_routes = {}
 
     def _check_policy(self):
         pass
@@ -186,6 +196,14 @@ class _RoutingService(StreamingMixin):
 
     def _resolve_concrete_model(self, target_model, provider):
         return target_model
+
+    def _stamp_response_identity(self, response, *, model, provider):
+        """Stub for #1370 model/provider stamping."""
+        pass
+
+    def _maybe_disable_route(self, provider, exc):
+        """Stub for route disabling logic."""
+        pass
 
 
 def test_stream_with_tool_detection_records_usage_exactly_once(monkeypatch):
