@@ -27,7 +27,11 @@ import API from '../api.js';
 import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml } from '../chat.js';
 import { getOrCreateChatPane } from '../ui.js';
 import { Events } from './events.js';
-import { createRealtimeClient } from './realtime.js';
+import {
+  createRealtimeClient,
+  createToolProgressHintScheduler,
+  resolveToolProgressHintDelay,
+} from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
 import { State, nextStateForEvent } from './state-machine.js';
 
@@ -1080,6 +1084,13 @@ async function handleToolCall(session, ev) {
   // tool card survive a reload, exactly like text chat. pos=0: realtime runs
   // tools before the spoken reply, so cards render above its prose.
   sessionClient.recordToolEvent?.({ type: 'start', tool: toolName, pos: 0 });
+  const progressHint = createToolProgressHintScheduler({
+    delayMs: resolveToolProgressHintDelay(),
+    sendHint: (payload) => sessionClient.sendToolProgressHint?.(payload),
+  }).start({
+    callId: ev.call_id || '',
+    toolName,
+  });
 
   let body;
   try {
@@ -1101,6 +1112,8 @@ async function handleToolCall(session, ev) {
     }
   } catch (err) {
     body = { error: `tool dispatch threw: ${err.message}` };
+  } finally {
+    progressHint.finish();
   }
 
   // Close out the card: error envelope -> error glyph, otherwise complete.
