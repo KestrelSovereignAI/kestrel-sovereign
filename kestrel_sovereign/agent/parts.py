@@ -88,9 +88,17 @@ def _sanitize_type(part_type: Any) -> Optional[str]:
 
 def _serialized_size_ok(part: dict) -> Optional[str]:
     """Serialize ``part`` and enforce the size cap. Returns the JSON payload on
-    success, ``None`` on failure (non-serializable or oversized)."""
+    success, ``None`` on failure (non-serializable, oversized, or non-finite).
+
+    ``allow_nan=False`` rejects ``NaN``/``Infinity``: Python's default emits the
+    non-standard tokens ``NaN``/``Infinity`` which the browser's ``JSON.parse``
+    throws on — that would make the live component silently vanish despite
+    ``emit_part`` reporting success. Reject it here instead.
+    """
     try:
-        payload = json.dumps(part, separators=(",", ":"), ensure_ascii=False)
+        payload = json.dumps(
+            part, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
     except (TypeError, ValueError):
         return None
     if len(payload.encode("utf-8")) > MAX_PART_PAYLOAD_BYTES:

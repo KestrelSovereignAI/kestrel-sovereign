@@ -13,7 +13,6 @@ import {
     messageAttachmentsHtml,
     handleRestartStatus,
     appendMessagePart,
-    splitContentByParts,
 } from './chat.js';
 
 // #1659: tool cards on reload come from the structured, position-stamped
@@ -628,46 +627,45 @@ window.purgeMessage = async function(messageId, messageDiv) {
 // bare prose segment (e.g. the gap between two adjacent parts) is skipped so no
 // empty bubble appears.
 function renderAssistantWithParts(msg, content, parts) {
+    const text = String(content || '');
+    const len = text.length;
+    const clampPos = (p) => Math.max(0, Math.min(len, typeof p === 'number' ? p : len));
     const toolEventsRaw = msg.metadata?.tool_events;
-    const sortedTools = Array.isArray(toolEventsRaw)
-        ? toolEventsRaw
-            .filter((e) => typeof e.pos === 'number')
-            .slice()
-            .sort((a, b) => a.pos - b.pos)
+    const tools = Array.isArray(toolEventsRaw)
+        ? toolEventsRaw.filter((e) => typeof e.pos === 'number')
         : [];
-    let toolCursor = 0;
-    // Consume tool events with pos <= ``end`` (INCLUSIVE) for the current prose
-    // segment, rebased onto it. Inclusive at the boundary so a tool sharing a
-    // part's pos — the common ``tool done → PART → prose`` order — renders in
-    // the bubble BEFORE the part, matching stream order. Walks in pos order, so
-    // each tool lands in exactly one segment (and trailing tools at pos == len
-    // aren't dropped).
-    const takeTools = (start, end) => {
-        const out = [];
-        while (toolCursor < sortedTools.length && sortedTools[toolCursor].pos <= end) {
-            const t = sortedTools[toolCursor++];
-            out.push({ ...t, pos: Math.max(0, t.pos - start) });
-        }
-        return out.length ? out : null;
-    };
+    const validParts = (Array.isArray(parts) ? parts : [])
+        .filter((p) => p && typeof p.type === 'string');
+    // Merge tool events and parts into ONE wire-ordered timeline: primary key
+    // ``pos`` (text offset), tie-broken by ``seq`` (the shared wire-order
+    // counter persisted by the server) so a tool card and a part at the SAME
+    // offset interleave exactly as they streamed — e.g. ``tool done → PART →
+    // next tool`` with no prose between renders [tool][part][tool], not all
+    // tools then the part. #1914
+    const timeline = [
+        ...tools.map((t) => ({ kind: 'tool', pos: clampPos(t.pos), seq: t.seq || 0, item: t })),
+        ...validParts.map((p) => ({ kind: 'part', pos: clampPos(p.pos), seq: p.seq || 0, item: p })),
+    ].sort((a, b) => (a.pos - b.pos) || (a.seq - b.seq));
+
     const visiblePane = state.chatPanes.get(state.mountedChatAgent);
     const paneEl = visiblePane ? visiblePane.element : null;
-    const segments = splitContentByParts(content, parts);
     let anchored = false;
     let firstPartNode = null;
     // Every bubble of this multi-bubble message carries the same
     // ``data-message-id`` so a delete removes ALL of them, not just the anchor
-    // (codex P2). Only the anchor (first rendered prose bubble) gets the id
-    // passed to addMessageToChat — and thus the delete/purge affordances — so
-    // the buttons aren't duplicated across bubbles.
+    // (codex P2). Only the anchor (first rendered bubble) gets the id +
+    // delete/purge affordances + model footer, so they aren't duplicated.
     const tag = (node) => {
         if (node && msg.id) node.dataset.messageId = msg.id;
     };
-    const renderProseBubble = (text, slicedTools) => {
-        const segBody = renderAgentContentHtml(text, { toolEvents: slicedTools });
+    const renderProseBubble = (segText, segTools) => {
+        if (!String(segText || '').trim() && !(segTools && segTools.length)) return;
+        const segBody = renderAgentContentHtml(segText, {
+            toolEvents: segTools && segTools.length ? segTools : null,
+        });
         const node = addMessageToChat(
             'assistant',
-            text,
+            segText,
             false,
             anchored ? null : msg.id,
             '',
@@ -679,34 +677,28 @@ function renderAssistantWithParts(msg, content, parts) {
         tag(node);
         anchored = true;
     };
-    for (const seg of segments) {
-        if (seg.kind === 'part') {
-            // Render any not-yet-shown tool cards at/<= this part's position in
-            // their own bubble BEFORE the part, so the live tool-done → PART
-            // order survives reload even when no prose precedes the part (the
-            // common ``tool done → PART → answer`` with the part at pos 0). When
-            // a prose segment already consumed them (inclusive end), this is a
-            // no-op.
-            const leadTools = takeTools(seg.part.pos || 0, seg.part.pos || 0);
-            if (leadTools) renderProseBubble('', leadTools);
-            const pnode = appendMessagePart(seg.part.type, seg.part.data, paneEl);
-            tag(pnode);
-            if (!firstPartNode) firstPartNode = pnode;
+
+    let cursor = 0;       // text offset where the current prose run starts
+    let segTools = [];    // tool events accumulated for the current prose run
+    for (const ev of timeline) {
+        if (ev.kind === 'tool') {
+            // Tool cards render by position within their prose bubble; rebase.
+            segTools.push({ ...ev.item, pos: Math.max(0, ev.pos - cursor) });
             continue;
         }
-        const slicedTools = takeTools(seg.start, seg.end);
-        if (!String(seg.text || '').trim() && !slicedTools) {
-            continue;
-        }
-        renderProseBubble(seg.text, slicedTools);
+        // A part closes the current prose run (text + its tool cards) into a
+        // bubble, then renders the component as its own bubble.
+        renderProseBubble(text.slice(cursor, ev.pos), segTools);
+        cursor = ev.pos;
+        segTools = [];
+        const pnode = appendMessagePart(ev.item.type, ev.item.data, paneEl);
+        tag(pnode);
+        if (!firstPartNode) firstPartNode = pnode;
     }
-    // Tool events past the last prose boundary (e.g. a part-only message whose
-    // tool cards never reached a prose segment) render in a trailing bubble so
-    // they aren't dropped on reload.
-    if (toolCursor < sortedTools.length) {
-        renderProseBubble('', sortedTools.slice(toolCursor).map((t) => ({ ...t, pos: 0 })));
-    }
-    // A part-only message (empty/whitespace content) produced no prose anchor —
+    // Trailing prose + any tool cards after the last part.
+    renderProseBubble(text.slice(cursor), segTools);
+
+    // A part-only message (empty content) produced no prose/tool anchor —
     // attach the delete/purge controls + model footer to the first part bubble
     // so the row stays manageable from history like every other row (codex P2).
     if (!anchored && firstPartNode) {

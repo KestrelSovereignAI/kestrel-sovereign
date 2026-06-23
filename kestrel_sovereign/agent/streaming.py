@@ -160,6 +160,13 @@ def _parse_stream_sentinels(text: str, base_offset: int = 0):
     result = ""
     tool_parts: list = []
     parts: list = []
+    # #1914: a shared monotonic counter over TOOL and PART sentinels records
+    # their WIRE order. ``pos`` can't disambiguate a tool and a part at the same
+    # clean-text offset (the common ``tool done → PART → next tool`` with no
+    # prose between); ``seq`` lets the reload renderer interleave them exactly as
+    # they streamed. (Per-call, so only items from the same parse are compared —
+    # same-offset collisions only ever occur within one stream half.)
+    seq = 0
     i = 0
     n = len(text)
     weld_pending = False  # a removed revise sentinel awaits its next visible char
@@ -191,6 +198,8 @@ def _parse_stream_sentinels(text: str, base_offset: int = 0):
                 evt = json.loads(payload)
                 if isinstance(evt, dict):
                     evt["pos"] = base_offset + len(result)
+                    evt["seq"] = seq
+                    seq += 1
                     tool_parts.append(evt)
             except (ValueError, TypeError):
                 pass
@@ -203,6 +212,8 @@ def _parse_stream_sentinels(text: str, base_offset: int = 0):
                 # or persist a junk component.
                 if isinstance(part, dict) and isinstance(part.get("type"), str):
                     part["pos"] = base_offset + len(result)
+                    part["seq"] = seq
+                    seq += 1
                     parts.append(part)
             except (ValueError, TypeError):
                 pass
@@ -287,6 +298,7 @@ def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
     """
     consumed = [False] * len(parts)
     last_pos = 0
+    last_seq = 0
     for ev in tool_events:
         if not isinstance(ev, dict):
             continue
@@ -304,7 +316,13 @@ def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
             pos = parts[matched].get("pos")
             if isinstance(pos, int):
                 last_pos = pos
+            # #1914: carry the wire-order ``seq`` too so reload can interleave a
+            # tool card and a same-position part in the order they streamed.
+            mseq = parts[matched].get("seq")
+            if isinstance(mseq, int):
+                last_seq = mseq
         ev["pos"] = last_pos
+        ev["seq"] = last_seq
     return tool_events
 
 

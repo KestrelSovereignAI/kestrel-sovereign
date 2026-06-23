@@ -173,9 +173,11 @@ async def test_no_tool_turn_persists_emitted_part():
     metadata = assistant_inserts[0].get("metadata") or {}
     assert persisted == "All set."
     assert "\x1eKESTREL:PART:" not in persisted
-    assert metadata.get("parts") == [
-        {"type": "notice", "data": {"body": "hello"}, "pos": 0}
-    ]
+    parts_md = metadata.get("parts")
+    assert len(parts_md) == 1
+    assert {k: v for k, v in parts_md[0].items() if k != "seq"} == {
+        "type": "notice", "data": {"body": "hello"}, "pos": 0,
+    }
 
 
 @pytest.mark.asyncio

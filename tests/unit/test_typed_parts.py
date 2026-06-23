@@ -81,6 +81,21 @@ def test_emit_part_rejects_oversized():
         assert drain_parts() == []
 
 
+def test_emit_part_rejects_non_finite_numbers():
+    # NaN/Infinity serialize to non-standard JSON tokens the browser's
+    # JSON.parse rejects, which would make the live component silently vanish.
+    # Reject them at emit time instead.
+    with part_collector():
+        assert emit_part("chart", {"v": float("nan")}) is False
+        assert emit_part("chart", {"v": float("inf")}) is False
+        assert emit_part("chart", {"v": float("-inf")}) is False
+        assert drain_parts() == []
+
+
+def test_build_part_sentinel_rejects_non_finite():
+    assert build_part_sentinel({"type": "chart", "data": {"v": float("inf")}}) is None
+
+
 # --------------------------------------------------------------------------
 # build_part_sentinel — wire format
 # --------------------------------------------------------------------------
@@ -157,6 +172,23 @@ def test_parser_handles_tool_and_part_together():
     assert parts[0]["pos"] == 2  # after "ab"
 
 
+def test_parser_stamps_shared_wire_order_seq():
+    # A shared monotonic ``seq`` across TOOL and PART sentinels records wire
+    # order, so the reload renderer can interleave same-position items. Here a
+    # tool-done, a PART, and a tool-start all sit at offset 0 (no prose between).
+    from kestrel_sovereign.agent.streaming import _build_tool_sentinel
+
+    done = _build_tool_sentinel("done", "todo_add", ms=5)
+    part = build_part_sentinel({"type": "todo", "data": {"t": 1}})
+    start = _build_tool_sentinel("start", "web_search", index=0)
+    clean, tool_parts, parts = _parse_stream_sentinels(done + part + start)
+    assert clean == ""
+    # Wire order: done (0) < part (1) < start (2), all at pos 0.
+    assert [tp["seq"] for tp in tool_parts] == [0, 2]
+    assert parts[0]["seq"] == 1
+    assert all(tp["pos"] == 0 for tp in tool_parts) and parts[0]["pos"] == 0
+
+
 def test_roundtrip_emit_to_parse():
     # End-to-end wire contract: a part emitted + built into a sentinel is
     # recovered intact (minus the added ``pos``) by the streaming parser.
@@ -166,7 +198,9 @@ def test_roundtrip_emit_to_parse():
     sentinel = build_part_sentinel(part)
     clean, _tools, parsed = _parse_stream_sentinels("p" + sentinel + "q")
     assert clean == "pq"
-    recovered = {k: v for k, v in parsed[0].items() if k != "pos"}
+    # ``pos`` (clean-text offset) and ``seq`` (wire order) are stamped by the
+    # parser; the rest must round-trip intact.
+    recovered = {k: v for k, v in parsed[0].items() if k not in ("pos", "seq")}
     assert recovered == {"type": "todo", "data": {"title": "ship #1914"}, "id": "z9"}
 
 
