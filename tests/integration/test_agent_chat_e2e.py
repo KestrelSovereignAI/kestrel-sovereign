@@ -78,7 +78,9 @@ def test_health_endpoint(client: TestClient):
 
     assert response.status_code == 200
     data = response.json()
-    assert data == {"status": "ok", "agent_initialized": True}
+    # Check required fields; llm_reachability is optional (added in #1265)
+    assert data["status"] == "ok"
+    assert data["agent_initialized"] is True
 
 
 def test_agent_invoke_basic_chat(client: TestClient, api_key: str):

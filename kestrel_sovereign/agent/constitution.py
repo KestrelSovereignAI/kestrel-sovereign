@@ -362,10 +362,9 @@ class ConstitutionMixin:
           JSON extraction.
         - `local`: `response` is the raw model text; parse JSON and
           look for `_canary` field via `verify_in_json_response`.
-        - `claude_code`: returns MISSING. Phase 2 wires the phantom
-          tool registration so the receipt is captured via the
-          tool-call channel; Phase 1 sources opting into echo on this
-          format must implement their own verifier.
+        - `claude_code`: scans the per-turn phantom
+          `_constitution_receipt` tool-call records captured by
+          KestrelAgent.
         - `bare`: returns MISSING — caller-responsibility, the default
           can't know how to parse.
 
@@ -378,6 +377,7 @@ class ConstitutionMixin:
             CanaryStatus,
             verify_in_json_response,
             verify_in_structured_response,
+            verify_in_tool_calls,
         )
 
         # Map format → field name. Codex uses `constitution_canary`,
@@ -408,7 +408,11 @@ class ConstitutionMixin:
                 )
             return CanaryStatus.MISSING
 
-        # claude_code / bare → no Phase-1 default verifier.
+        if prompt_template_format == "claude_code":
+            tool_calls = getattr(self, "_constitution_receipt_tool_calls", [])
+            return verify_in_tool_calls(tool_calls, canary)
+
+        # bare → caller-responsibility.
         return CanaryStatus.MISSING
 
     def _init_constitution_audit_tracking(self):

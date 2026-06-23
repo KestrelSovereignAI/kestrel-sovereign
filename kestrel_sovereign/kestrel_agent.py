@@ -463,6 +463,8 @@ class KestrelAgent(
         self._direct_tools: dict = {}
         self._direct_tool_defs: list = []
         self._tool_to_feature: dict = {}  # tool_name -> feature tool_name
+        self._constitution_receipt_tool_calls: list[dict] = []
+        self._constitution_receipt_expected: Optional[dict] = None
         # #1580 (D): pinned features are exempt from LRU eviction.
         # Populated by `_promote_startup_feature_tools` for every
         # feature whose `promote_tools_on_startup = True` (Peers /
@@ -474,6 +476,100 @@ class KestrelAgent(
 
         # Initialize constitution audit tracking
         self._init_constitution_audit_tracking()
+
+    def register_constitution_receipt_tool(
+        self, *, canary: str, signal_id: str
+    ) -> None:
+        """Expose the per-turn phantom constitution receipt tool.
+
+        The dispatcher calls this only for claude_code COGNITION
+        dispatches with require_constitution_echo=True. The tool is
+        removed by clear_constitution_receipt_tool after verification,
+        so it never becomes a durable user-facing capability.
+        """
+        from kestrel_sovereign.signals.constitution_canary import (
+            PHANTOM_RECEIPT_ARG_NAME,
+            PHANTOM_RECEIPT_TOOL_NAME,
+        )
+
+        self._constitution_receipt_tool_calls = []
+        self._constitution_receipt_expected = {
+            "canary": canary,
+            "signal_id": signal_id,
+        }
+        self._direct_tools[PHANTOM_RECEIPT_TOOL_NAME] = None
+        self._tool_to_feature[PHANTOM_RECEIPT_TOOL_NAME] = (
+            PHANTOM_RECEIPT_TOOL_NAME
+        )
+        self._direct_tool_defs = [
+            tool_def for tool_def in self._direct_tool_defs
+            if tool_def.get("function", {}).get("name")
+            != PHANTOM_RECEIPT_TOOL_NAME
+        ]
+        self._direct_tool_defs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": PHANTOM_RECEIPT_TOOL_NAME,
+                    "description": (
+                        "Confirm receipt of the current turn's "
+                        "constitutional system prompt. Operational "
+                        "metadata only; produces no user-visible work."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            PHANTOM_RECEIPT_ARG_NAME: {
+                                "type": "string",
+                                "description": (
+                                    "The exact constitution receipt "
+                                    "canary supplied in the system prompt."
+                                ),
+                            }
+                        },
+                        "required": [PHANTOM_RECEIPT_ARG_NAME],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+
+    def clear_constitution_receipt_tool(self) -> None:
+        """Remove the per-turn phantom receipt tool from the tool catalog."""
+        from kestrel_sovereign.signals.constitution_canary import (
+            PHANTOM_RECEIPT_TOOL_NAME,
+        )
+
+        self._direct_tools.pop(PHANTOM_RECEIPT_TOOL_NAME, None)
+        self._tool_to_feature.pop(PHANTOM_RECEIPT_TOOL_NAME, None)
+        self._direct_tool_defs = [
+            tool_def for tool_def in self._direct_tool_defs
+            if tool_def.get("function", {}).get("name")
+            != PHANTOM_RECEIPT_TOOL_NAME
+        ]
+        self._constitution_receipt_tool_calls = []
+        self._constitution_receipt_expected = None
+
+    async def _handle_constitution_receipt_tool(
+        self, *, canary: str = ""
+    ) -> dict:
+        """No-op handler for the phantom constitution receipt tool."""
+        from kestrel_sovereign.signals.constitution_canary import (
+            PHANTOM_RECEIPT_ARG_NAME,
+            PHANTOM_RECEIPT_TOOL_NAME,
+        )
+
+        self._constitution_receipt_tool_calls.append(
+            {
+                "name": PHANTOM_RECEIPT_TOOL_NAME,
+                "arguments": {PHANTOM_RECEIPT_ARG_NAME: canary},
+            }
+        )
+        expected = self._constitution_receipt_expected or {}
+        return {
+            "success": True,
+            "recorded": canary == expected.get("canary"),
+        }
 
     @staticmethod
     def _derive_legacy_key_id(did: str) -> Optional[str]:

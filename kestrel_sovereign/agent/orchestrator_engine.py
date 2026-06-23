@@ -707,6 +707,19 @@ class OrchestratorEngineMixin:
                 ``ValueError`` raised by a tool's own argument validation
                 isn't misreported as "tool not found".
         """
+        from kestrel_sovereign.signals.constitution_canary import (
+            PHANTOM_RECEIPT_TOOL_NAME,
+        )
+
+        if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
+            handler = getattr(self, "_handle_constitution_receipt_tool", None)
+            if not callable(handler):
+                raise ToolNotRegisteredError(
+                    f"Tool {tool_name!r} is not registered with any enabled "
+                    "feature on this agent"
+                )
+            return await handler(**(args or {}))
+
         found_tool, found_feature = self._resolve_named_tool(tool_name)
         if found_tool is None:
             # Subagent-dispatcher fallback. Every feature that supports
@@ -1210,6 +1223,41 @@ class OrchestratorEngineMixin:
         log_prefix = "[ORCHESTRATOR-STREAM]" if streaming else "[ORCHESTRATOR]"
         dispatch_start = time.time()
         dispatch_meta: Dict[str, Optional[str]] = {}
+
+        from kestrel_sovereign.signals.constitution_canary import (
+            PHANTOM_RECEIPT_TOOL_NAME,
+        )
+
+        if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
+            handler = getattr(self, "_handle_constitution_receipt_tool", None)
+            if not callable(handler):
+                result = {
+                    "success": False,
+                    "error": "constitution receipt handler unavailable",
+                }
+            else:
+                result = await handler(**args)
+            result_json = json.dumps(result)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result_json,
+                }
+            )
+            if tool_results is not None:
+                tool_results.append(
+                    {
+                        "tool_call_id": tool_call.id,
+                        "name": tool_name,
+                        "arguments": args,
+                        "result": {
+                            "success": bool(result.get("success")),
+                            "status": "ok" if result.get("success") else "error",
+                        },
+                    }
+                )
+            return result
 
         # Validate tool arguments before execution
         is_valid, validation_error = validate_tool_arguments(
