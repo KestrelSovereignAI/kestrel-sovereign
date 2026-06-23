@@ -706,8 +706,9 @@ class StreamingMixin:
                     "signal: %s",
                     exc,
                 )
+        from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
         producer = getattr(self, "operator_signal_producer", None)
-        if producer is not None:
+        if isinstance(producer, OperatorSignalProducer):
             operator_batch = await producer.collect_for_turn(
                 session_id=session_id,
                 llm_service=self.llm_service,
