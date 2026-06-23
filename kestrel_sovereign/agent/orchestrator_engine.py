@@ -2274,10 +2274,22 @@ class OrchestratorEngineMixin:
             # bubble lands in stream order at the point its tool ran. Drained
             # (not just read) so a part is emitted exactly once even across
             # multiple tool iterations in the same turn.
+            _emitted_any_part = False
             for part in drain_parts():
                 sentinel = build_part_sentinel(part)
                 if sentinel:
                     yield sentinel
+                    _emitted_any_part = True
+            if _emitted_any_part:
+                # A part seals the tool bubble, so the follow-up answer opens a
+                # fresh bubble. The ``\n---\n`` tool/answer separator is only
+                # stripped by the renderer when it directly follows tool cards in
+                # the SAME bubble — orphaned at the top of the post-part bubble it
+                # renders as a raw horizontal rule (and persists into post-tool
+                # content, breaking the tool-before-part order on reload). The
+                # part bubble already delimits tool activity from the answer, so
+                # suppress the separator for this turn.
+                followup_separator_emitted = True
 
             if _cancelled():
                 # Tool batch finished cleanly; skip synthesis. The user
