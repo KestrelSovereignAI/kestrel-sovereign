@@ -65,11 +65,14 @@ _KIND_DESCRIPTIONS: dict[PayerKind, str] = {
     PayerKind.HOST_ENV: "host env var (today's behavior)",
     PayerKind.HOST_MASTER_PROVISIONED: "host master account, child credential per agent",
     PayerKind.USER_MASTER_PROVISIONED: "user's master account",
-    PayerKind.USER_BYOK: "zero-knowledge user passphrase key (no platform caps/rotation)",
     PayerKind.SPONSOR: "sponsor's master account",
     PayerKind.SELF_WALLET: "agent's own wallet (e.g. x402)",
     PayerKind.NONE: "do not use this resource for any agent",
 }
+
+# Add USER_BYOK if available (local overlay extends SDK with this kind)
+if hasattr(PayerKind, "USER_BYOK"):
+    _KIND_DESCRIPTIONS[PayerKind.USER_BYOK] = "zero-knowledge user passphrase key (no platform caps/rotation)"
 
 
 def run(ctx: SetupContext) -> None:

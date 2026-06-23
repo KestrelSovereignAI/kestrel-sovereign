@@ -222,6 +222,7 @@ for _resource in ResourceClass:
     _set(_resource, "*", PayerKind.NONE, SupportStatus.READY)
     _set(_resource, "*", PayerKind.HOST_ENV, SupportStatus.READY)
 
+_set(ResourceClass.LLM, "openrouter", PayerKind.NONE, SupportStatus.READY)
 _set(ResourceClass.LLM, "openrouter", PayerKind.HOST_ENV, SupportStatus.READY)
 _set(ResourceClass.LLM, "openrouter", PayerKind.HOST_MASTER_PROVISIONED, SupportStatus.READY)
 _set(ResourceClass.LLM, "openrouter", PayerKind.USER_MASTER_PROVISIONED, SupportStatus.READY)
@@ -250,13 +251,20 @@ def status_for(
     vendor: str,
     kind: PayerKind,
 ) -> SupportStatus:
+    """Return the support status for a (resource, vendor, kind) triple.
+
+    Looks up the exact triple in SUPPORT_MATRIX. If not found, returns
+    NOT_IMPLEMENTED. The wildcard vendor "*" is only matched when
+    explicitly requested in the policy (e.g., compute/tools/comms), not
+    as a fallback for unknown vendors.
+    """
     if isinstance(resource_class, str):
         resource_class = ResourceClass(resource_class)
     if isinstance(kind, str):
         kind = PayerKind(kind)
     return SUPPORT_MATRIX.get(
         _key(resource_class, vendor, kind),
-        SUPPORT_MATRIX.get(_key(resource_class, "*", kind), SupportStatus.NOT_IMPLEMENTED),
+        SupportStatus.NOT_IMPLEMENTED,
     )
 
 
