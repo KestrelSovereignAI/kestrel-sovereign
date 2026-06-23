@@ -233,5 +233,52 @@ async def test_inline_executed_tool_emitted_part_drained_and_persisted():
     assert isinstance(metadata["parts"][0].get("pos"), int)
 
 
+@pytest.mark.asyncio
+async def test_parts_dropped_when_post_response_hook_blocks_text():
+    """If a POST_RESPONSE hook rewrites/blocks the assistant text (audit denial),
+    the component parts must NOT persist — otherwise reload would render the
+    structured bubbles next to the blocked placeholder, leaking what the hook
+    removed."""
+    from kestrel_sdk.llm import ToolCallStarted
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    add_convo_calls = []
+    agent = _make_agent(add_convo_calls)
+    # The hook BLOCKS: it replaces the post-tool text with a denial placeholder.
+    agent._fire_post_response_hook = AsyncMock(
+        side_effect=lambda text, sid, **_: "[Response blocked by audit]"
+    )
+
+    async def mock_stream_with_tool_detection(**kwargs):
+        yield "Updating. "
+        yield ToolCallStarted(index=0, id="tc1", name="todo_add")
+        yield LLMResponse(
+            content="", tool_calls=[ToolCall(id="tc1", name="todo_add", arguments={})],
+        )
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = mock_stream_with_tool_detection
+
+    part_sentinel = build_part_sentinel({"type": "todo", "data": {"secret": "x"}})
+
+    async def mock_orchestrator_streaming(**kwargs):
+        yield "Done "
+        yield part_sentinel
+        yield "now."
+
+    agent._handle_orchestrator_response_streaming = mock_orchestrator_streaming
+    _bind(agent)
+
+    async for _ in agent.process_input_streaming("update", session_id="s4"):
+        pass
+
+    assistant_inserts = [c for c in add_convo_calls if c["role"] == "assistant"]
+    assert len(assistant_inserts) == 1
+    metadata = assistant_inserts[0].get("metadata") or {}
+    assert assistant_inserts[0]["content"] == "[Response blocked by audit]"
+    # The blocked turn must NOT carry the structured part the hook scrubbed.
+    assert "parts" not in metadata
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

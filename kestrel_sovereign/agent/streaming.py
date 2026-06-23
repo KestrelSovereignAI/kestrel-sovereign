@@ -1040,6 +1040,14 @@ class StreamingMixin:
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
+            # #1914 (codex P1): a POST_RESPONSE hook can rewrite or BLOCK the
+            # assistant text (e.g. an audit denial → "[Response blocked ...]").
+            # The component parts were positioned against the ORIGINAL post-tool
+            # prose; persisting them would re-render the structured bubbles next
+            # to replaced/blocked text on reload — leaking exactly what the hook
+            # removed. Drop them whenever the hook changed the text.
+            if tool_final_text != post_tool_text:
+                component_parts = []
             # tool_results carry the structured call/result envelopes;
             # persisting them alongside tool_events means a future
             # conversation-history reader can reconstruct *which tools
@@ -1196,6 +1204,11 @@ class StreamingMixin:
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
+            # #1914 (codex P1): drop component parts when a POST_RESPONSE hook
+            # rewrote/blocked the text — their positions no longer match the
+            # persisted content and would leak blocked structured data on reload.
+            if final_text != post_tool_text:
+                inline_post_components = []
             # See parallel comment in the has_tool_calls branch above:
             # tool_results in the persisted metadata preserves the
             # actual call envelopes (id, name, arguments, summarized
@@ -1236,9 +1249,15 @@ class StreamingMixin:
             final_text, tool_parts, no_tool_components = _parse_stream_sentinels(
                 "".join(full_response)
             )
+            _no_tool_pre_hook_text = final_text
             final_text = await self._fire_post_response_hook(
                 final_text, session_id,
             )
+            # #1914 (codex P1): drop parts when a POST_RESPONSE hook rewrote or
+            # blocked the text — their positions reference the original prose, so
+            # persisting them would leak blocked structured data on reload.
+            if final_text != _no_tool_pre_hook_text:
+                no_tool_components = []
             _no_tool_events = _tool_parts_to_events(tool_parts)
             # #1914: a turn can emit component parts without dispatching tools
             # (e.g. a feature emitting a card from a hook). Persist them here so
