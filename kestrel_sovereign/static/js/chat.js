@@ -1623,8 +1623,15 @@ export function handleChannelLinkQr(payload, targetEl = null) {
     if (!target) return;
 
     // Build an authed, cache-busted image URL: multi-agent routing prefix via
-    // buildAgentUrl, api_key for standalone hosts, ts to defeat no-store reuse.
-    const base = deps().api.buildAgentUrl(path);
+    // buildAgentUrlFor, api_key for standalone hosts, ts to defeat no-store
+    // reuse. Pin the prefix to the notification stream's agent (NOT the current
+    // selection): a late event handled after an agent switch must still fetch
+    // the QR from the agent whose pane the bubble lands in (codex #1825).
+    const base = (deps().api.buildAgentUrlFor || deps().api.buildAgentUrl).call(
+        deps().api,
+        path,
+        notificationAgent,
+    );
     const apiKey = deps().api.getApiKey();
     const ts = payload.ts || 0;
     const sep = base.includes('?') ? '&' : '?';
