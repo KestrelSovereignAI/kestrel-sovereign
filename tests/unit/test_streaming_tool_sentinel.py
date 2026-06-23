@@ -104,8 +104,13 @@ def test_tool_parts_to_events_maps_to_metadata_shape():
     events = _tool_parts_to_events(parts)
     assert events[0]["type"] == "start" and events[0]["tool"] == "shell"
     assert events[0]["pos"] == len("ran")
-    assert events[1] == {"type": "complete", "tool": "shell", "pos": len("ran"), "ms": 9}
+    # #1914: the shared wire-order ``seq`` is carried through (start=0, done=1,
+    # error=2) so reload can interleave same-position tool cards and parts.
+    assert events[1] == {
+        "type": "complete", "tool": "shell", "pos": len("ran"), "ms": 9, "seq": 1,
+    }
     assert events[2]["type"] == "error" and events[2]["error"] == "boom"
+    assert [e["seq"] for e in events] == [0, 1, 2]
 
 
 def test_stamp_positions_matches_by_phase_and_name():

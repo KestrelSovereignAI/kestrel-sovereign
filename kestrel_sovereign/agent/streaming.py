@@ -237,18 +237,25 @@ def _tool_parts_to_events(parts: list) -> list:
         phase = p.get("phase")
         name = p.get("name", "")
         pos = p.get("pos")
+        # #1914: carry the shared wire-order ``seq`` so the reload merge can
+        # interleave a tool card and a same-position part in stream order.
+        seq = p.get("seq")
         if phase == "start":
-            events.append({"type": "start", "tool": name, "pos": pos})
+            ev = {"type": "start", "tool": name, "pos": pos}
         elif phase == "done":
             ev = {"type": "complete", "tool": name, "pos": pos}
             if p.get("ms") is not None:
                 ev["ms"] = p["ms"]
-            events.append(ev)
         elif phase == "error":
-            events.append({
+            ev = {
                 "type": "error", "tool": name,
                 "error": p.get("detail") or "", "pos": pos,
-            })
+            }
+        else:
+            continue
+        if isinstance(seq, int):
+            ev["seq"] = seq
+        events.append(ev)
     return events
 
 
