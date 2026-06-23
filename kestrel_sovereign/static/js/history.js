@@ -239,7 +239,14 @@ function renderConversationItem(conv) {
     const isActive = state.currentSessionId === conv.session_id;
     const time = new Date(conv.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const preview = conv.preview || 'Empty conversation';
+    const displayName = (conv.name || '').trim();
+    const displayText = displayName || preview;
     const isEncryptedPreview = conv.preview_encrypted;
+    const sessionIdJs = escapeHtml(JSON.stringify(conv.session_id));
+    const title = displayName
+        ? `${displayName} — ${conv.preview || 'Empty conversation'}`
+        : (conv.preview || '');
+    const editIcon = typeof kicon === 'function' ? kicon('pencil') : '✎';
 
     const previewStyle = isEncryptedPreview
         ? `font-family: 'Monaco', 'Menlo', 'Courier New', monospace; color: #22c55e;`
@@ -248,8 +255,8 @@ function renderConversationItem(conv) {
 
     return `
         <div class="conversation-item ${isActive ? 'active' : ''}"
-             data-session-id="${conv.session_id}"
-             onclick="loadConversation('${conv.session_id}')"
+             data-session-id="${escapeHtml(conv.session_id)}"
+             onclick="loadConversation(${sessionIdJs})"
              style="
                 background: ${isActive ? 'var(--accent-color)' : (isEncryptedPreview ? 'linear-gradient(135deg, #1a1a2e, #16213e)' : 'var(--bg-secondary)')};
                 color: ${isActive ? 'white' : 'var(--text-primary)'};
@@ -261,7 +268,7 @@ function renderConversationItem(conv) {
              "
              onmouseover="if(!this.classList.contains('active')) this.style.borderColor='var(--accent-color)'"
              onmouseout="if(!this.classList.contains('active')) this.style.borderColor='${borderColor}'">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.375rem;">
+            <div class="conversation-meta-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.375rem;">
                 <span style="font-size: 0.75rem; opacity: ${isActive ? '0.9' : '0.7'};">
                     ${isEncryptedPreview ? '\u{1F510} ' : ''}${time}
                 </span>
@@ -271,18 +278,56 @@ function renderConversationItem(conv) {
                     padding: 0.125rem 0.5rem;
                     border-radius: 10px;
                 ">${conv.message_count} msgs</span>
+                <button type="button"
+                    class="conv-rename-btn"
+                    title="Rename conversation"
+                    aria-label="Rename conversation"
+                    onclick="renameConversation(${sessionIdJs}, event)">
+                    ${editIcon}
+                </button>
             </div>
-            <div style="
+            <div class="conversation-preview" style="
                 font-size: 0.8rem;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
                 opacity: ${isActive ? '1' : '0.9'};
                 ${previewStyle}
-            " title="${escapeHtml(conv.preview || '')}">${escapeHtml(preview)}</div>
+            " title="${escapeHtml(title)}">${escapeHtml(displayText)}</div>
         </div>
     `;
 }
+
+window.renameConversation = async function(sessionId, event) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    const conv = (state.conversations || []).find(c => c.session_id === sessionId);
+    if (!conv) return;
+
+    const currentName = conv.name || '';
+    const nextName = prompt('Rename conversation', currentName);
+    if (nextName === null) return;
+
+    try {
+        const result = await API.renameConversation(sessionId, nextName);
+        const finalName = result.name || null;
+        if (finalName) {
+            conv.name = finalName;
+        } else {
+            delete conv.name;
+        }
+        renderConversationHistory({
+            conversations: state.conversations,
+            encrypted_at_rest: state.encryptedAtRest,
+        });
+        Toast.success(finalName ? 'Conversation renamed' : 'Conversation name cleared');
+    } catch (e) {
+        Toast.error(`Failed to rename conversation: ${e.message}`);
+    }
+};
 
 window.loadConversation = async function(sessionId) {
     // Don't reload the conversation we're already viewing — preserves in-flight content
