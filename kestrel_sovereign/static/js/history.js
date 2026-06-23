@@ -681,6 +681,14 @@ function renderAssistantWithParts(msg, content, parts) {
     };
     for (const seg of segments) {
         if (seg.kind === 'part') {
+            // Render any not-yet-shown tool cards at/<= this part's position in
+            // their own bubble BEFORE the part, so the live tool-done → PART
+            // order survives reload even when no prose precedes the part (the
+            // common ``tool done → PART → answer`` with the part at pos 0). When
+            // a prose segment already consumed them (inclusive end), this is a
+            // no-op.
+            const leadTools = takeTools(seg.part.pos || 0, seg.part.pos || 0);
+            if (leadTools) renderProseBubble('', leadTools);
             const pnode = appendMessagePart(seg.part.type, seg.part.data, paneEl);
             tag(pnode);
             if (!firstPartNode) firstPartNode = pnode;
