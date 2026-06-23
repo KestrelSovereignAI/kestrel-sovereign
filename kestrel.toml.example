@@ -65,6 +65,16 @@ model       = "auto"
 size = 1
 
 # =============================================================================
+# GitHub integration
+# =============================================================================
+# Used by /api/github/repos for dashboard repo discovery. API credentials
+# belong in .env as GITHUB_TOKEN, GH_TOKEN, or GITHUB_PAT.
+[github]
+orgs = ["KestrelSovereignAI"]
+include_repos = ["jaslogic1/RemoteCares"]
+exclude_repos = []
+
+# =============================================================================
 # Model Catalog - Manual Overrides Only
 # =============================================================================
 # Concrete discovered model lists live in model_discovery_cache.json.

@@ -538,6 +538,7 @@ from kestrel_sovereign.endpoints import (
     observability_router,
     features_router,
     ui_router,
+    github_router,
 )
 from kestrel_sovereign.endpoints.rasa_shim import router as rasa_shim_router
 
@@ -563,49 +564,7 @@ app.include_router(observability_router)
 app.include_router(features_router)
 app.include_router(ui_router)
 app.include_router(rasa_shim_router)
-
-
-# --- GitHub API Proxy (for Portfolio Dashboard) ---
-
-@app.get("/api/github/{path:path}")
-async def github_proxy(path: str, request: Request):
-    """Proxy GitHub API requests using server-side GITHUB_TOKEN."""
-    import httpx
-
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        # Same resolution order as load_dotenv at module top: CWD/.env first
-        # (the operator's project), then <package-dir>/.env for source clones
-        # that drop a .env next to the moved package.
-        for env_path in (Path.cwd() / ".env", Path(__file__).parent / ".env"):
-            if env_path.exists():
-                for line in env_path.read_text().splitlines():
-                    if line.startswith("GITHUB_TOKEN="):
-                        token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        break
-                if token:
-                    break
-    if not token:
-        return JSONResponse({"error": "No GITHUB_TOKEN configured"}, status_code=503)
-
-    gh_url = f"https://api.github.com/{path}"
-    if request.url.query:
-        gh_url += f"?{request.url.query}"
-
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(
-                gh_url,
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github.v3+json",
-                    "User-Agent": "kestrel-host",
-                },
-                timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
-            )
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=502)
+app.include_router(github_router)
 
 
 # Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}

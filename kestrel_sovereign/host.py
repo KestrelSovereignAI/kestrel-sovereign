@@ -201,9 +201,11 @@ from kestrel_sovereign.endpoints.auth_oauth import (
     oauth,
 )
 from kestrel_sovereign.endpoints.ui import router as ui_router
+from kestrel_sovereign.endpoints.github import router as github_router
 
 app.include_router(auth_oauth_router)
 app.include_router(ui_router)
+app.include_router(github_router)
 register_oauth(app)
 
 
@@ -245,7 +247,7 @@ async def auth_middleware(request: Request, call_next):
         public_paths.add("/api/auth/key")
     # OAuth endpoints must be reachable without existing auth
     auth_paths = {"/auth/login", "/auth/callback", "/auth/logout", "/auth/me", "/auth/token"}
-    static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/github/", "/api/ui/")
+    static_prefixes = ("/static", "/js/", "/shared/", "/utils/", "/api/ui/")
 
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
@@ -377,47 +379,6 @@ async def get_bootstrap_key(request: Request):
         "header": API_KEY_NAME,
         "usage": "Include as 'X-API-Key' header or 'Authorization: Bearer <key>'",
     }
-
-
-# --- GitHub API Proxy (for dashboard) ---
-
-@app.get("/api/github/{path:path}")
-async def github_proxy(path: str, request: Request):
-    """Proxy GitHub API requests using server-side token."""
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        # Try .env file in the resolved project dir.
-        env_path = PROJECT_DIR / ".env"
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("GITHUB_TOKEN="):
-                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-    if not token:
-        return JSONResponse({"error": "No GITHUB_TOKEN configured on server"}, status_code=503)
-
-    gh_url = f"https://api.github.com/{path}"
-    if request.url.query:
-        gh_url += f"?{request.url.query}"
-
-    client: httpx.AsyncClient = request.app.state.http_client
-    try:
-        resp = await client.get(
-            gh_url,
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "kestrel-host",
-            },
-            timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
-        )
-        return JSONResponse(
-            content=resp.json(),
-            status_code=resp.status_code,
-        )
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
-
 
 @app.get("/health")
 async def health_check(request: Request):

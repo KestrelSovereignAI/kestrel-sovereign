@@ -25,6 +25,7 @@ const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
 // Object-shaped values are supported via dot-paths (e.g. ``keys.agent``):
 // any sub-key absent from the host config is treated as ``true``.
 export const CAPABILITY_KEYS = Object.freeze({
+    chrome: true,         // console brand/nav chrome; set false for chat-only embeds
     chat: true,
     identity: true,
     constitution: true,
@@ -407,6 +408,10 @@ export function createApiClient({
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
         getConversations: (decrypt = true) => client.request(`/api/conversations?decrypt=${decrypt}`),
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
+        renameConversation: (sessionId, name) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ name }),
+        }),
         // Recent restart_status lifecycle events for repainting the bubble
         // trail on conversation reload (#1816). Scoped to the session so a
         // restart filed from one conversation never repaints in another.
