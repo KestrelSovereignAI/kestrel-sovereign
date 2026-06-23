@@ -535,6 +535,70 @@ def cmd_storage(args) -> int:
     return handler(args)
 
 
+async def _run_auth_login(args) -> int:
+    """Run an interactive provider login flow with SIGINT cancellation."""
+    route = (args.route or "").strip().lower()
+    if route != "openai:plan":
+        print(
+            "error: only `--route openai:plan` has an interactive login "
+            "flow in this release.",
+            file=sys.stderr,
+        )
+        return 2
+
+    import signal
+
+    from kestrel_sovereign.llm.cancellation import AuthCancellationToken
+    from kestrel_sovereign.llm.codex_app_server import (
+        CodexAppServerCancelled,
+        CodexAppServerClient,
+    )
+
+    token = AuthCancellationToken()
+    loop = asyncio.get_running_loop()
+    old_handler = None
+    used_loop_signal_handler = False
+
+    def _cancel_login() -> None:
+        token.cancel()
+
+    try:
+        try:
+            loop.add_signal_handler(signal.SIGINT, _cancel_login)
+            used_loop_signal_handler = True
+        except (NotImplementedError, RuntimeError):
+            old_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, lambda _signum, _frame: _cancel_login())
+
+        client = CodexAppServerClient()
+        try:
+            await client.ensure_started(cancellation_token=token)
+        except CodexAppServerCancelled:
+            print(f"{route} login cancelled.")
+            return 130
+        finally:
+            await client.aclose()
+    finally:
+        if used_loop_signal_handler:
+            try:
+                loop.remove_signal_handler(signal.SIGINT)
+            except (NotImplementedError, RuntimeError):
+                pass
+        elif old_handler is not None:
+            signal.signal(signal.SIGINT, old_handler)
+
+    print(f"{route} login ready.")
+    return 0
+
+
+def cmd_auth(args) -> int:
+    """Dispatch auth subcommands."""
+    if args.auth_command == "login":
+        return asyncio.run(_run_auth_login(args))
+    print("Usage: kestrel auth login --route openai:plan")
+    return 1
+
+
 def cmd_tool_log(args) -> int:
     """Query structured tool dispatch logs."""
     subcommands = {
@@ -1425,6 +1489,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print machine-readable JSON"
     )
 
+    # kestrel auth login --route openai:plan
+    auth_p = subparsers.add_parser(
+        "auth", help="Interactive authentication helpers"
+    )
+    auth_sub = auth_p.add_subparsers(dest="auth_command")
+    auth_login_p = auth_sub.add_parser(
+        "login", help="Run an interactive provider login flow"
+    )
+    auth_login_p.add_argument(
+        "--route",
+        required=True,
+        help="Provider route to authenticate (currently: openai:plan)",
+    )
+
     # kestrel tool-dispatches {failure-rate,recent-failures}
     tool_log_p = subparsers.add_parser(
         "tool-dispatches",
@@ -1709,6 +1787,7 @@ def main() -> int:
         "health": cmd_health,
         "doctor": cmd_doctor,
         "storage": cmd_storage,
+        "auth": cmd_auth,
         "tool-dispatches": cmd_tool_log,
         "tool-log": cmd_tool_log,
         "setup": cmd_setup,

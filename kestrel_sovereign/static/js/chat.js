@@ -1149,7 +1149,8 @@ export function connectNotifications() {
     // active; only skip when none of them are.
     const needed = deps().api.hasCapability('chat')
         || deps().api.hasCapability('permissions')
-        || deps().api.hasCapability('audit');
+        || deps().api.hasCapability('audit')
+        || deps().api.hasCapability('sovereignty');
     if (!needed) return;
     if (notificationEventSource) {
         notificationEventSource.close();

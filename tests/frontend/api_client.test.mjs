@@ -151,6 +151,26 @@ test('request hits canonical paths — no companion-prefix rewriting (#863)', as
     assert.equal(client.isMultiAgentMode(), false);
 });
 
+test('renameConversation patches the conversation display name', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        success: true,
+        session_id: 'sess/abc',
+        name: 'Renamed Thread',
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-secret' },
+    });
+
+    await client.init();
+    const result = await client.renameConversation('sess/abc', 'Renamed Thread');
+
+    assert.equal(result.name, 'Renamed Thread');
+    assert.equal(fetchFn.calls[0].url, '/api/conversations/sess%2Fabc');
+    assert.equal(fetchFn.calls[0].options.method, 'PATCH');
+    assert.equal(fetchFn.calls[0].options.body, JSON.stringify({ name: 'Renamed Thread' }));
+});
+
 test('request with API key refreshes bootstrap key once and retries the original request', async () => {
     const fetchFn = createFetchQueue(
         jsonResponse(401, { detail: 'expired key' }),

@@ -40,7 +40,12 @@ import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from .cancellation import CancelToken, raise_if_cancelled
+from .cancellation import (
+    AuthCancellationToken,
+    CancelToken,
+    await_or_auth_cancelled,
+    raise_if_cancelled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,10 @@ class CodexAppServerConnectionClosed(CodexAppServerTransportError):
     as a transport error: the connection died, which is what the
     fallback escalation rule cares about.
     """
+
+
+class CodexAppServerCancelled(CodexAppServerError):
+    """Interactive Codex auth/login flow was explicitly cancelled."""
 
 
 def resolve_codex_binary() -> str:
@@ -227,17 +236,30 @@ class CodexAppServerClient:
         self._closed_error: Optional[BaseException] = None
         self._start_lock = asyncio.Lock()
         self._initialized = False
+        self._auth_cancellation_token: Optional[AuthCancellationToken] = None
 
     # ---------------------------------------------------------------- lifecycle
-    async def ensure_started(self) -> None:
+    def _auth_cancelled(self) -> CodexAppServerCancelled:
+        return CodexAppServerCancelled("codex login cancelled")
+
+    async def ensure_started(
+        self,
+        *,
+        cancellation_token: Optional[AuthCancellationToken] = None,
+    ) -> None:
         if self._initialized:
             return
         async with self._start_lock:
             if self._initialized:
                 return
-            await self._spawn()
-            await self._handshake()
-            self._initialized = True
+            previous_token = self._auth_cancellation_token
+            self._auth_cancellation_token = cancellation_token
+            try:
+                await self._spawn()
+                await self._handshake(cancellation_token=cancellation_token)
+                self._initialized = True
+            finally:
+                self._auth_cancellation_token = previous_token
 
     async def _spawn(self) -> None:
         # Isolate ``CODEX_HOME`` to a kestrel-managed directory so codex
@@ -411,7 +433,11 @@ class CodexAppServerClient:
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
-    async def _handshake(self) -> None:
+    async def _handshake(
+        self,
+        *,
+        cancellation_token: Optional[AuthCancellationToken] = None,
+    ) -> None:
         result = await self._request_unguarded(
             "initialize",
             {
@@ -423,6 +449,7 @@ class CodexAppServerClient:
                 "capabilities": {"experimentalApi": True},
             },
             timeout=30,
+            cancellation_token=cancellation_token,
         )
         ua = (result or {}).get("userAgent", "")
         detected = _parse_user_agent_version(ua)
@@ -449,8 +476,13 @@ class CodexAppServerClient:
         if login_params is not None:
             try:
                 await self._request_unguarded(
-                    "account/login/start", login_params, timeout=30,
+                    "account/login/start",
+                    login_params,
+                    timeout=30,
+                    cancellation_token=cancellation_token,
                 )
+            except CodexAppServerCancelled:
+                raise
             except CodexAppServerError as e:
                 logger.warning(
                     "codex account/login/start failed (continuing — auth "
@@ -538,7 +570,11 @@ class CodexAppServerClient:
             params["chatgptPlanType"] = plan_type
         return params
 
-    async def _refresh_chatgpt_tokens(self) -> Optional[dict]:
+    async def _refresh_chatgpt_tokens(
+        self,
+        *,
+        cancellation_token: Optional[AuthCancellationToken] = None,
+    ) -> Optional[dict]:
         """Drive the OAuth refresh-token flow against the OpenAI auth
         endpoint, persist the new tokens back to ``auth.json``, and
         return the same shape as :meth:`_load_chatgpt_login_params`.
@@ -556,6 +592,8 @@ class CodexAppServerClient:
         disk or the refresh exchange fails — the caller should error
         out cleanly in that case rather than send an empty token.
         """
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled(self._auth_cancelled)
         user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
         user_codex_home = (
             Path(user_codex_home_env) if user_codex_home_env
@@ -585,18 +623,24 @@ class CodexAppServerClient:
         try:
             import httpx
             async with httpx.AsyncClient(timeout=20) as client:
+                if cancellation_token is not None:
+                    cancellation_token.raise_if_cancelled(self._auth_cancelled)
                 # OAuth token endpoints (including OpenAI's) require
                 # ``application/x-www-form-urlencoded``, not JSON. Use
                 # httpx's ``data=`` so the body is form-encoded with
                 # the right Content-Type. Codex review #1394 P1.
-                resp = await client.post(
-                    token_url,
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": client_id,
-                        "scope": "openid profile email offline_access",
-                    },
+                resp = await await_or_auth_cancelled(
+                    client.post(
+                        token_url,
+                        data={
+                            "grant_type": "refresh_token",
+                            "refresh_token": refresh_token,
+                            "client_id": client_id,
+                            "scope": "openid profile email offline_access",
+                        },
+                    ),
+                    cancellation_token,
+                    self._auth_cancelled,
                 )
                 if resp.status_code != 200:
                     logger.warning(
@@ -844,9 +888,16 @@ class CodexAppServerClient:
                 q.put_nowait(msg)
 
     async def _handle_server_request(
-        self, mid: Any, method: str, params: dict
+        self,
+        mid: Any,
+        method: str,
+        params: dict,
+        *,
+        cancellation_token: Optional[AuthCancellationToken] = None,
     ) -> None:
         tid = (params or {}).get("threadId")
+        if cancellation_token is None:
+            cancellation_token = getattr(self, "_auth_cancellation_token", None)
         # Mark this thread as awaiting our reply for the whole lifetime
         # of the handler. The idle watchdog treats a positive count as
         # "not an upstream stall" and keeps waiting rather than tripping
@@ -873,7 +924,9 @@ class CodexAppServerClient:
                 # ``auth.json`` — otherwise long-running sessions would
                 # 401 again immediately because nothing else is
                 # refreshing the file. Codex review #1394 P1.
-                refreshed = await self._refresh_chatgpt_tokens()
+                refreshed = await self._refresh_chatgpt_tokens(
+                    cancellation_token=cancellation_token
+                )
                 if refreshed is not None:
                     result = {
                         "accessToken": refreshed["accessToken"],
@@ -934,6 +987,8 @@ class CodexAppServerClient:
             else:
                 result = {}
             self._send({"id": mid, "result": result})
+        except CodexAppServerCancelled:
+            raise
         except Exception as e:
             logger.warning("codex server-request %s failed: %s", method, e)
             try:
@@ -1073,19 +1128,36 @@ class CodexAppServerClient:
         return await self._request_unguarded(method, params, timeout=timeout)
 
     async def _request_unguarded(
-        self, method: str, params: Optional[dict] = None, *, timeout: float = 120,
+        self,
+        method: str,
+        params: Optional[dict] = None,
+        *,
+        timeout: float = 120,
+        cancellation_token: Optional[AuthCancellationToken] = None,
     ) -> Any:
         """Send a request without going through ``ensure_started``.
         For use from inside ``_handshake`` where the start lock is
         already held — calling ``request`` from there would deadlock.
         """
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled(self._auth_cancelled)
         mid = self._next_id
         self._next_id += 1
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[mid] = fut
         self._send({"id": mid, "method": method, "params": params or {}})
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            return await asyncio.wait_for(
+                await_or_auth_cancelled(
+                    fut,
+                    cancellation_token,
+                    self._auth_cancelled,
+                ),
+                timeout=timeout,
+            )
+        except CodexAppServerCancelled:
+            self._pending.pop(mid, None)
+            raise
         except asyncio.TimeoutError as e:
             self._pending.pop(mid, None)
             raise CodexAppServerTransportError(

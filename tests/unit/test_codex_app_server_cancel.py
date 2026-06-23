@@ -12,11 +12,14 @@ cancellation into ``TimeoutError``. Codex review of an earlier draft
 flagged this, leading to the narrower scope landed here.
 """
 import asyncio
+import json
 
 import pytest
 
+from kestrel_sovereign.llm.cancellation import AuthCancellationToken
 from kestrel_sovereign.llm.codex_app_server import (
     CodexAppServerClient,
+    CodexAppServerCancelled,
     CodexAppServerError,
 )
 
@@ -29,10 +32,15 @@ def _stub_client() -> CodexAppServerClient:
     c._pending = {}
     c._turn_sinks = {}
     c._server_request_handlers = {}
+    c._inflight_server_requests = {}
     c._closed_error = None
+    c._client_version = "test"
     c._next_id = 1
     c._sent = []
     c._send = lambda obj: c._sent.append(obj)
+    c.notify = lambda method, params=None: c._sent.append(
+        {"method": method, "params": params or {}}
+    )
     return c
 
 
@@ -103,3 +111,77 @@ async def test_request_unguarded_normal_response_unaffected():
     mid = next(iter(c._pending))
     c._dispatch({"id": mid, "result": {"pong": True}})
     assert await task == {"pong": True}
+
+
+@pytest.mark.asyncio
+async def test_auth_token_firing_during_handshake_raises_typed_cancel():
+    """Interactive auth cancellation is translated only when the
+    explicit auth token fires. The pending initialize RPC is cleaned up
+    and the caller gets a domain error suitable for one-line CLI output.
+    """
+    c = _stub_client()
+    token = AuthCancellationToken()
+
+    task = asyncio.create_task(c._handshake(cancellation_token=token))
+    await asyncio.sleep(0)
+    assert len(c._pending) == 1
+
+    token.cancel()
+
+    with pytest.raises(CodexAppServerCancelled, match="login cancelled"):
+        await task
+    assert c._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_auth_token_firing_during_token_refresh_raises_typed_cancel(
+    tmp_path, monkeypatch
+):
+    """The OAuth refresh path also honors the explicit login abort
+    token while preserving the raw-cancellation behavior for non-auth
+    callers.
+    """
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "refresh-me",
+                    "account_id": "acct_123",
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    import httpx
+
+    class SlowAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, *args, **kwargs):
+            await asyncio.sleep(60)
+
+    monkeypatch.setattr(httpx, "AsyncClient", SlowAsyncClient)
+
+    c = _stub_client()
+    token = AuthCancellationToken()
+    task = asyncio.create_task(
+        c._refresh_chatgpt_tokens(cancellation_token=token)
+    )
+    await asyncio.sleep(0)
+
+    token.cancel()
+
+    with pytest.raises(CodexAppServerCancelled, match="login cancelled"):
+        await task
