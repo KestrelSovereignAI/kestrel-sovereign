@@ -333,12 +333,14 @@ class TestCheckBootstrapState:
     async def test_pass_when_bootstrap_complete(self, tmp_path):
         agent_id = "did:test:complete"
         db = _MetadataDB()
+        mock_storage = MagicMock()
         service = BootstrapService(
             db=db,
             agent_id=agent_id,
             agent_name="Complete",
             llm_service=object(),
             agent_data_path=tmp_path,
+            storage=mock_storage,
         )
         await service.set_bootstrap_state(BootstrapState.COMPLETE)
         agent = _make_agent(agent_id=agent_id)
@@ -361,12 +363,14 @@ class TestCheckBootstrapState:
                 "created_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
             },
         )
+        mock_storage = MagicMock()
         service = BootstrapService(
             db=_MetadataDB(),
             agent_id=agent_id,
             agent_name="Stale",
             llm_service=object(),
             agent_data_path=tmp_path,
+            storage=mock_storage,
         )
         agent = _make_agent(agent_id=agent_id)
         agent.bootstrap_service = service

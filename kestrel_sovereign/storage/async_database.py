@@ -353,7 +353,7 @@ CREATE TABLE IF NOT EXISTS agent_metadata (
 CREATE INDEX IF NOT EXISTS idx_agent_metadata_agent ON agent_metadata(agent_id);
 
 -- Private resources attached to a local agent identity record. Resource
--- contents are encrypted before storage; public metadata must only contain
+-- contents are encrypted before storage. Public metadata must only contain
 -- safe pointers/hashes/provenance and never the private body.
 CREATE TABLE IF NOT EXISTS agent_identity_resources (
     id TEXT PRIMARY KEY,
