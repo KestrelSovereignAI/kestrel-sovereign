@@ -884,7 +884,7 @@ class TestToolActivityMarkers:
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
         from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-        _clean, parts = _parse_stream_sentinels(stream)
+        _clean, parts, _ = _parse_stream_sentinels(stream)
         phases = [(p["phase"], p["name"]) for p in parts]
         assert ("start", "shell") in phases
         assert ("done", "shell") in phases
@@ -912,7 +912,7 @@ class TestToolActivityMarkers:
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
         from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-        _clean, parts = _parse_stream_sentinels(stream)
+        _clean, parts, _ = _parse_stream_sentinels(stream)
         assert ("error", "shell") in [(p["phase"], p["name"]) for p in parts]
 
     @pytest.mark.asyncio
@@ -972,7 +972,7 @@ class TestToolActivityMarkers:
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
         from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-        _clean, parts = _parse_stream_sentinels(stream)
+        _clean, parts, _ = _parse_stream_sentinels(stream)
         starts = [p for p in parts if p["phase"] == "start" and p["name"] == "shell"]
         dones = [p for p in parts if p["phase"] == "done" and p["name"] == "shell"]
         assert len(starts) == 1
@@ -1014,7 +1014,7 @@ class TestToolActivityMarkers:
         stream = "".join(c for c in chunks if isinstance(c, str))
         # Both calls must appear — start + done each.
         from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-        _clean, parts = _parse_stream_sentinels(stream)
+        _clean, parts, _ = _parse_stream_sentinels(stream)
         assert len([p for p in parts if p["phase"] == "start"]) == 2
         assert len([p for p in parts if p["phase"] == "done"]) == 2
 
@@ -1056,7 +1056,7 @@ class TestToolActivityMarkers:
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
         from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-        _clean, parts = _parse_stream_sentinels(stream)
+        _clean, parts, _ = _parse_stream_sentinels(stream)
         phases = [(p["phase"], p["name"]) for p in parts]
         assert ("start", "memory_search") in phases
         assert ("done", "memory_search") in phases

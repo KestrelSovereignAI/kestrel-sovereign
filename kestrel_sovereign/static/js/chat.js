@@ -54,10 +54,17 @@ const THINKING_SENTINEL_SUFFIX = '\x1e';
 // visible prose like the others; the structured payload drives tool cards.
 const TOOL_SENTINEL_PREFIX = '\x1eKESTREL:TOOL:';
 const TOOL_SENTINEL_SUFFIX = '\x1e';
+// #1914: typed component-part sentinel — pairs with parts.py
+// build_part_sentinel. Payload {type,data,id?}. Stripped from visible prose
+// like the others; each parsed part is rendered as its OWN message bubble via
+// appendMessagePart (the registered renderer for ``type``), in stream order.
+const PART_SENTINEL_PREFIX = '\x1eKESTREL:PART:';
+const PART_SENTINEL_SUFFIX = '\x1e';
 const STREAM_SENTINELS = [
     { kind: 'revise', prefix: REVISE_SENTINEL_PREFIX, suffix: REVISE_SENTINEL_SUFFIX },
     { kind: 'thinking', prefix: THINKING_SENTINEL_PREFIX, suffix: THINKING_SENTINEL_SUFFIX },
     { kind: 'tool', prefix: TOOL_SENTINEL_PREFIX, suffix: TOOL_SENTINEL_SUFFIX },
+    { kind: 'part', prefix: PART_SENTINEL_PREFIX, suffix: PART_SENTINEL_SUFFIX },
 ];
 
 function renderToolActivityLineHtml(line) {
@@ -202,6 +209,64 @@ function buildToolSegmentsByPos(content, cards) {
     }
     if (cursor < len) pushProse(text.slice(cursor));
     return segments;
+}
+
+// #1914: split an assistant message's content at typed-part positions into
+// ordered segments — prose runs and the parts between them — so a reload can
+// re-render each component as its OWN bubble in document order (mirroring the
+// live ``flushStreamParts`` interrupt). Each prose segment carries its
+// [start,end) range in the content coordinate space so the caller can slice the
+// message's position-stamped tool events into the right bubble. Returns a
+// single whole-content prose segment when there are no parts.
+export function splitContentByParts(content, parts) {
+    const text = String(content || '');
+    const len = text.length;
+    const valid = (Array.isArray(parts) ? parts : [])
+        .filter((p) => p && typeof p.type === 'string');
+    const sorted = [...valid].sort((a, b) => (a.pos || 0) - (b.pos || 0));
+    const clamp = (p) => Math.max(0, Math.min(len, p == null ? len : p));
+    const segments = [];
+    let cursor = 0;
+    for (const part of sorted) {
+        const pos = clamp(part.pos);
+        if (pos > cursor) {
+            segments.push({ kind: 'prose', text: text.slice(cursor, pos), start: cursor, end: pos });
+            cursor = pos;
+        }
+        segments.push({ kind: 'part', part });
+    }
+    if (cursor < len || segments.length === 0) {
+        segments.push({ kind: 'prose', text: text.slice(cursor), start: cursor, end: len });
+    }
+    return segments;
+}
+
+// #1914: a safe, generic core part renderer — a system "notice" card. Proves
+// the typed-part system is console-wired (no longer host-only) and gives a
+// real registered renderer the path can exercise. Feature-specific renderers
+// (todo #1894, citations, A2A artifacts, …) register additively on top. All
+// text is escaped — part data is host/agent-influenceable, so the renderer
+// OWNS sanitization (the registry contract).
+function noticePartRenderer(data) {
+    const esc = deps().escapeHtml;
+    const d = (data && typeof data === 'object') ? data : { body: data };
+    const levels = ['info', 'success', 'warning', 'error'];
+    const level = levels.includes(d.level) ? d.level : 'info';
+    const title = d.title == null ? '' : String(d.title);
+    const body = d.body == null ? '' : String(d.body);
+    const titleHtml = title ? `<div class="part-notice-title">${esc(title)}</div>` : '';
+    const bodyHtml = body ? `<div class="part-notice-body">${esc(body)}</div>` : '';
+    return `<div class="part-notice part-notice-${level}">${titleHtml}${bodyHtml}</div>`;
+}
+
+/**
+ * Register the console's built-in core part renderers (#1914). Called from
+ * ``initChat`` so the standalone sovereign console — not just Frinz-style
+ * embedders — renders typed component bubbles. Idempotent: re-registering a
+ * type overwrites, so a host may override a core renderer after init.
+ */
+export function registerCoreParts() {
+    registerPartRenderer('notice', noticePartRenderer);
 }
 
 // ============================================================================
@@ -446,6 +511,14 @@ function stripStreamSentinels(chunk) {
     let sawSentinel = false;
     const thoughts = [];
     const tools = [];
+    // #1914: typed component parts ({type,data,id?}) parsed out of this chunk,
+    // each stamped with its clean-text offset like a tool event.
+    const parts = [];
+    // #1914: a shared monotonic counter over TOOL and PART sentinels in this
+    // packet records their WIRE order, so the streaming loop can interleave
+    // tool cards and component bubbles exactly as they arrived even when both
+    // sit at the same clean-text offset (e.g. tool-done, PART, tool-start).
+    let seq = 0;
     let pos = 0;
     // #1547: a revise sentinel marks the boundary between the agent's
     // pre-revision prose and its post-revision (post-tool) synthesis.
@@ -511,7 +584,18 @@ function stripStreamSentinels(chunk) {
                 if (payload && payload.phase) {
                     // pos = offset into THIS packet's clean text; the loop
                     // adds the cumulative content length to make it absolute.
-                    tools.push({ ...payload, pos: textBefore.length });
+                    tools.push({ ...payload, pos: textBefore.length, seq: seq++ });
+                }
+            } catch (_) {
+                // Malformed UI metadata should not corrupt visible text.
+            }
+        } else if (found.kind === 'part') {
+            try {
+                const payload = JSON.parse(payloadText);
+                // A part needs a string ``type`` (renderer key); drop anything
+                // malformed so a bad PART payload never breaks the stream.
+                if (payload && typeof payload.type === 'string') {
+                    parts.push({ ...payload, pos: textBefore.length, seq: seq++ });
                 }
             } catch (_) {
                 // Malformed UI metadata should not corrupt visible text.
@@ -533,6 +617,7 @@ function stripStreamSentinels(chunk) {
         sawSentinel,
         thoughts,
         tools,
+        parts,
         reviseBoundaryPending,
         leadingReviseBoundary,
     };
@@ -614,7 +699,9 @@ function chatComponentApi() {
         setChatRoot,
         registerHeaderAction,
         registerPartRenderer,
+        registerCoreParts,
         appendMessagePart,
+        splitContentByParts,
         mountChatPane,
         wipeAgentChatPane,
         initChat,
@@ -1023,6 +1110,10 @@ export function initChat() {
     // the intent legible and keeps SharedModelSelector / autocomplete from
     // initializing in a host that doesn't render any of it.
     if (!deps().api.hasCapability('chat')) return;
+    // #1914: wire the console's core typed-part renderers so component bubbles
+    // (notice today; todo via #1894, citations, …) render in the standalone
+    // sovereign console, not only in Frinz-style embedders.
+    registerCoreParts();
     chatContainer = el('chat-container');
     messageInput = el('message-input');
     sendButton = el('send-button');
@@ -1487,6 +1578,78 @@ const RESTART_STATE_ACCENTS = {
 };
 
 /**
+ * Stream-boundary interrupt (#1560, generalized #1914): seal the pane's
+ * in-flight assistant bubble at its CURRENT content so a non-prose element
+ * (restart-status bubble, typed component part) can land below it in
+ * chronological order, then null the streaming pointer so the streaming loop
+ * opens a fresh bubble for any subsequent chunk.
+ *
+ * Without this the interrupting element appears below the live bubble while
+ * the agent's text keeps filling the bubble above — making the bubble above
+ * look chronologically later than the one below.
+ */
+function sealStreamingBubble(paneObj) {
+    if (!paneObj || !paneObj.streamingMsgDiv) return;
+    try {
+        const live = paneObj.streamingMsgDiv;
+        const rawLen = Number(paneObj.streamRawContentLength) || 0;
+        const baseline = paneObj.streamBaseline || 0;
+        // #1914: a bubble can hold tool cards with no prose (``rawLen`` doesn't
+        // advance for tool-only packets). Treat it as blank ONLY when it has
+        // neither prose nor tool cards — otherwise removing it would drop the
+        // tool card for the common ``tool done → PART → answer`` ordering.
+        const toolCardsInBubble =
+            (paneObj.toolEvents || []).length - (paneObj.toolEventsBaseline || 0);
+        if (rawLen <= baseline && toolCardsInBubble <= 0) {
+            // Boundary hit during the no-content preamble — the bubble was
+            // just allocated and nothing (prose or card) was written into it.
+            // Removing it (rather than finalizing) avoids a blank assistant
+            // bubble sitting above the interrupting element.
+            live.remove();
+        } else {
+            const contentDiv = live.querySelector('.message-content');
+            if (contentDiv) contentDiv.classList.remove('streaming');
+            // Use the RAW cumulative content length the streaming loop
+            // publishes, not the rendered ``textContent.length`` — markdown /
+            // code fences / thinking bubbles make the rendered length diverge
+            // from the raw string, which would corrupt
+            // ``fullContent.slice(streamBaseline)`` on the next chunk write.
+            paneObj.streamBaseline = rawLen;
+        }
+        // #1659: tool cards already rendered in the sealed bubble belong to it —
+        // snapshot the count so the post-boundary bubble only renders tool
+        // events that arrive AFTER here. Index-based (not pos-based) so a
+        // tool-only packet, which doesn't advance the content length, can't
+        // collide with the baseline and re-render an already-shown card.
+        paneObj.toolEventsBaseline = (paneObj.toolEvents || []).length;
+        paneObj.streamingMsgDiv = null;
+    } catch (err) {
+        console.warn('sealStreamingBubble: stream-boundary finalize failed', err);
+    }
+}
+
+/**
+ * Render each typed component part (#1914) emitted in a packet as its own
+ * agent bubble, in stream order. Seals the in-flight prose bubble first so the
+ * component lands chronologically below it; the next prose chunk opens a fresh
+ * bubble (``sealStreamingBubble`` nulls ``streamingMsgDiv``). Delegates the
+ * markup to the registered renderer for ``part.type`` via ``appendMessagePart``
+ * (which already isolates a throwing renderer and falls back to escaped text).
+ */
+function flushStreamParts(paneObj, parts) {
+    if (!paneObj || !Array.isArray(parts)) return;
+    for (const part of parts) {
+        if (!part || typeof part.type !== 'string') continue;
+        sealStreamingBubble(paneObj);
+        try {
+            appendMessagePart(part.type, part.data, paneObj.element);
+        } catch (err) {
+            console.error('flushStreamParts: appendMessagePart failed', err);
+        }
+    }
+}
+
+/**
  * Render a restart/update lifecycle event as a chat-visible system
  * bubble (#1551).
  *
@@ -1550,46 +1713,7 @@ export function handleRestartStatus(payload, targetEl = null) {
     // bubble while the agent's text continues filling the bubble
     // above — making the bubble above look chronologically later
     // than the bubble below.
-    if (paneObj && paneObj.streamingMsgDiv) {
-        try {
-            const live = paneObj.streamingMsgDiv;
-            const rawLen = Number(paneObj.streamRawContentLength) || 0;
-            const baseline = paneObj.streamBaseline || 0;
-            if (rawLen <= baseline) {
-                // Codex P2 round 1: stream-boundary hit during the
-                // no-content preamble — the bubble was just
-                // allocated and the streaming loop has not written
-                // any raw content into it yet. Removing it (rather
-                // than finalizing) avoids a blank assistant bubble
-                // sitting above the status.
-                live.remove();
-            } else {
-                const contentDiv = live.querySelector('.message-content');
-                if (contentDiv) contentDiv.classList.remove('streaming');
-                // Codex P1 round 1: use the RAW cumulative content
-                // length the streaming loop publishes, not the
-                // rendered ``textContent.length`` — markdown / code
-                // fences / thinking bubbles make the rendered length
-                // diverge from the raw string length, which would
-                // corrupt ``fullContent.slice(streamBaseline)`` on
-                // the next chunk write.
-                paneObj.streamBaseline = rawLen;
-            }
-            // #1659: the tool cards already rendered in the bubble we just
-            // sealed/removed belong to it — snapshot the count so the
-            // post-boundary bubble only renders tool events that arrive AFTER
-            // here. Index-based (not pos-based) so a tool-only packet, which
-            // doesn't advance the content length, can't collide with the
-            // baseline and re-render an already-shown card.
-            paneObj.toolEventsBaseline = (paneObj.toolEvents || []).length;
-            paneObj.streamingMsgDiv = null;
-        } catch (err) {
-            console.warn(
-                'restart_status: stream-boundary finalize failed',
-                err,
-            );
-        }
-    }
+    sealStreamingBubble(paneObj);
 
     const div = document.createElement('div');
     div.className = 'message restart-status-message';
@@ -2147,6 +2271,11 @@ export async function sendMessage(overrideText, overrideAgent) {
             pane.toolEvents = [];
             pane.toolEventsBaseline = 0;
             let fullContent = '';
+            // #1914: thinking bubbles render in only ONE bubble of a
+            // multi-bubble (parts) turn. Set once the bubble that owns the
+            // reasoning is finalized, so later segments + the trailing finalize
+            // don't duplicate it.
+            let thinkingClaimed = false;
 
             try {
                 // Pass dispatchAgent EXPLICITLY to streamInvoke so the
@@ -2190,7 +2319,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // Strip any complete sentinels in processable.
                     // Revise markers and thinking markers are wire
                     // metadata; visible prose stays in the accumulator.
-                    let { textBefore, textAfter, sawSentinel, thoughts, tools, reviseBoundaryPending, leadingReviseBoundary } =
+                    let { textBefore, textAfter, sawSentinel, thoughts, tools, parts, reviseBoundaryPending, leadingReviseBoundary } =
                         stripStreamSentinels(processable);
                     if (thoughts.length) {
                         appendThinkingItems(pane.thinkingItems, thoughts);
@@ -2236,7 +2365,11 @@ export async function sendMessage(overrideText, overrideAgent) {
                     }
                     const chunk = sawSentinel ? textBefore + textAfter : textBefore;
                     const haveTools = tools && tools.length;
-                    if (!chunk && !haveTools) {
+                    // #1914: a PART-only packet (a component bubble emitted as
+                    // its own sentinel yield) must also fall through so the
+                    // bubble renders now — like a tool-only packet.
+                    const haveParts = parts && parts.length;
+                    if (!chunk && !haveTools && !haveParts) {
                         // Metadata-only packet (revise/think, no visible text
                         // and no tool event): a revise sentinel still arms the
                         // boundary for the next packet (#1547) and surfaces
@@ -2267,11 +2400,95 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // (welded) prose already accumulated — record absolute
                     // positions so the renderer places each card correctly.
                     const chunkBase = fullContent.length;
-                    fullContent += chunk;
-                    if (tools && tools.length) {
-                        for (const t of tools) {
-                            pane.toolEvents.push({ ...t, pos: chunkBase + (t.pos || 0) });
+                    const recordTool = (t) => {
+                        pane.toolEvents.push({ ...t, pos: chunkBase + (t.pos || 0) });
+                    };
+                    // #1914: paint the current streaming bubble with the live
+                    // slice; never spawns an empty bubble (so a part seal with no
+                    // trailing prose doesn't leave a blank bubble below it).
+                    const paintLiveSlice = () => {
+                        if (!(isPaneFresh() && ownsStream())) return;
+                        const baseline = pane.streamBaseline || 0;
+                        const slice = fullContent.slice(baseline);
+                        if (!slice && !paneStreamToolEvents(pane).length) return;
+                        if (!pane.streamingMsgDiv) {
+                            pane.streamingMsgDiv = addMessageStreaming('agent', pane.element);
                         }
+                        updateStreamingMessage(
+                            pane.streamingMsgDiv, slice,
+                            pane.element,
+                            // #1914: only the unclaimed (first) bubble shows
+                            // reasoning, so it isn't repeated in later segments.
+                            thinkingClaimed ? [] : pane.thinkingItems,
+                            paneStreamToolEvents(pane),
+                        );
+                    };
+                    // #1914: finalize the prose/tool bubble being sealed before a
+                    // part so its final-only render passes (mermaid/math/code
+                    // highlight) run live, not only on reload. Reasoning is folded
+                    // into whichever bubble first claims it.
+                    const finalizeBeforePart = async () => {
+                        if (!(isPaneFresh() && ownsStream() && pane.streamingMsgDiv)) return;
+                        const segBaseline = pane.streamBaseline || 0;
+                        const hasContent = fullContent.length > segBaseline;
+                        const hasCards =
+                            ((pane.toolEvents || []).length - (pane.toolEventsBaseline || 0)) > 0;
+                        if (!hasContent && !hasCards) return;
+                        const includeThinking = !thinkingClaimed;
+                        await finalizeStreamingMessage(
+                            pane.streamingMsgDiv, fullContent.slice(segBaseline), pane,
+                            { includeThinking },
+                        );
+                        if (includeThinking && pane.thinkingItems && pane.thinkingItems.length) {
+                            thinkingClaimed = true;
+                        }
+                    };
+                    if (haveParts) {
+                        // #1914: a stream packet can coalesce prose + PART + more
+                        // prose (and even tool sentinels). Split the chunk at each
+                        // part's clean-text offset so every component renders at
+                        // its position, AND record tool events in WIRE order (by
+                        // ``seq``) relative to the parts — a tool emitted before a
+                        // part lands in the bubble above it; one emitted after
+                        // lands in the bubble below. Keeps the live order identical
+                        // to the persisted/reload order.
+                        const sortedParts = parts.slice()
+                            .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+                        // Tools are already in wire order in ``tools``; walk them
+                        // in lockstep, flushing those that precede each part.
+                        let toolIdx = 0;
+                        const recordToolsBeforeSeq = (limitSeq) => {
+                            while (toolIdx < tools.length
+                                && (tools[toolIdx].seq || 0) < limitSeq) {
+                                recordTool(tools[toolIdx++]);
+                            }
+                        };
+                        let segCursor = 0;
+                        for (const part of sortedParts) {
+                            recordToolsBeforeSeq(part.seq || 0);
+                            const cut = Math.max(
+                                segCursor, Math.min(chunk.length, part.pos || 0),
+                            );
+                            fullContent += chunk.slice(segCursor, cut);
+                            segCursor = cut;
+                            pane.streamRawContentLength = fullContent.length;
+                            paintLiveSlice();
+                            await finalizeBeforePart();
+                            if (isPaneFresh() && ownsStream()) {
+                                flushStreamParts(pane, [part]);
+                            }
+                        }
+                        // Tools after the last part belong to the trailing bubble.
+                        while (toolIdx < tools.length) recordTool(tools[toolIdx++]);
+                        // Trailing prose after the last part opens a fresh bubble.
+                        fullContent += chunk.slice(segCursor);
+                        paintLiveSlice();
+                    } else {
+                        // No parts: record all tool events (unchanged from the
+                        // pre-#1914 path — tool-only packets and trailing
+                        // done/error markers at ``pos`` == chunk end still render).
+                        if (tools && tools.length) for (const t of tools) recordTool(t);
+                        fullContent += chunk;
                     }
                     // Advance the dynamic status word: an in-flight tool's
                     // verb, or "Writing…" once answer prose flows. A revise
@@ -2338,7 +2555,10 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // #1573: also gate on `ownsStream()` — a prior
                     // turn that was interrupted must not paint (or
                     // recreate) the new turn's bubble while it unwinds.
-                    if (isPaneFresh() && ownsStream()) {
+                    // #1914: when the packet had parts, the segmented block
+                    // above already painted every prose segment and the trailing
+                    // remainder around the part bubbles, so skip this paint.
+                    if (!haveParts && isPaneFresh() && ownsStream()) {
                         // #1560 stream-boundary: if a restart_status
                         // landed mid-stream, ``handleRestartStatus``
                         // nulled ``pane.streamingMsgDiv``; open a
@@ -2364,6 +2584,9 @@ export async function sendMessage(overrideText, overrideAgent) {
                     const slice = fullContent.slice(baseline);
                     await finalizeStreamingMessage(
                         pane.streamingMsgDiv, slice, pane,
+                        // #1914: if a pre-part bubble already claimed the
+                        // reasoning, don't duplicate it on the trailing bubble.
+                        { includeThinking: !thinkingClaimed },
                     );
                 }
                 if (isCurrentVisible()) {
@@ -3269,7 +3492,14 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     // any already shown in a pre-restart bubble.
     const toolEvents = (pane && includePaneArtifacts) ? paneStreamToolEvents(pane) : null;
     await finalizeAgentContent(contentDiv, content, toolEvents);
-    const thinkingItems = (pane && includePaneArtifacts && pane.thinkingItems) ? pane.thinkingItems : [];
+    // #1914: thinking bubbles belong to ONE bubble of a multi-bubble (parts)
+    // turn, not every sealed segment. ``includeThinking`` (defaults to
+    // ``includePaneArtifacts`` so existing callers are unchanged) lets the
+    // parts path finalize a pre-part bubble without re-prepending reasoning.
+    const includeThinking = opts.includeThinking !== undefined
+        ? opts.includeThinking
+        : includePaneArtifacts;
+    const thinkingItems = (pane && includeThinking && pane.thinkingItems) ? pane.thinkingItems : [];
     if (thinkingItems.length) {
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);

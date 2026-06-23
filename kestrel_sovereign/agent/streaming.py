@@ -8,6 +8,13 @@ from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sovereign.agent.parts import (
+    PART_SENTINEL_PREFIX,
+    PART_SENTINEL_SUFFIX,
+    build_part_sentinel,
+    drain_parts,
+    part_collector,
+)
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
@@ -77,12 +84,20 @@ THINKING_SENTINEL_SUFFIX = "\x1e"
 TOOL_SENTINEL_PREFIX = "\x1eKESTREL:TOOL:"
 TOOL_SENTINEL_SUFFIX = "\x1e"
 
-# All three sentinel classes share the \x1e suffix and are mutually
-# exclusive in the stream; this tuple drives every strip/extract loop.
+# #1914: typed component parts (todo cards, citations, A2A artifacts, …) ride
+# the same in-band channel. Payload: {"type":str,"data":any,"id":str?}. Like
+# TOOL/THINK/REVISE the sentinel is NEVER persisted in assistant text — the
+# position-stamped ``parts`` metadata is the single source of truth for
+# re-rendering each component bubble, live and on reload. Constants imported
+# from :mod:`kestrel_sovereign.agent.parts` (the emit/collect side).
+#
+# All sentinel classes share the \x1e suffix and are mutually exclusive in the
+# stream; this tuple drives every strip/extract loop.
 _ALL_SENTINEL_PREFIXES = (
     REVISE_SENTINEL_PREFIX,
     THINKING_SENTINEL_PREFIX,
     TOOL_SENTINEL_PREFIX,
+    PART_SENTINEL_PREFIX,
 )
 _SENTINEL_SUFFIX = REVISE_SENTINEL_SUFFIX  # "\x1e" — identical for all
 
@@ -116,31 +131,42 @@ def is_only_sentinels(text: str) -> bool:
     from materializing a pending revise paragraph boundary — sentinels
     are wire bytes, not the visible text the weld waits for.
     """
-    clean, _ = _parse_stream_sentinels(text)
+    clean, _, _ = _parse_stream_sentinels(text)
     return text != "" and clean == ""
 
 
 def _parse_stream_sentinels(text: str, base_offset: int = 0):
-    """Strip all in-band sentinels from ``text`` and extract structured
-    tool parts, in a single pass.
+    """Strip all in-band sentinels from ``text`` and extract structured tool
+    parts AND typed component parts, in a single pass.
 
-    Returns ``(clean_text, tool_parts)`` where ``tool_parts`` is a list
-    of the TOOL sentinel payloads, each augmented with ``pos`` — the
-    character offset into ``clean_text`` (plus ``base_offset``) at which
-    the tool sentinel sat. ``pos`` is what lets the renderer place a tool
-    card back at the right point between prose segments, live and on
-    reload, without the marker living in the prose.
+    Returns ``(clean_text, tool_parts, parts)``:
+
+    * ``tool_parts`` — the TOOL sentinel payloads (#1659), each augmented with
+      ``pos``, the character offset into ``clean_text`` (plus ``base_offset``)
+      at which the tool sentinel sat. ``pos`` lets the renderer place a tool
+      card back at the right point between prose segments, live and on reload.
+    * ``parts`` — the PART sentinel payloads (#1914), each ``{type,data,id?}``
+      augmented with the same ``pos`` so a typed component bubble re-renders in
+      document order on reload.
 
     REVISE sentinels weld a ``\\n\\n`` paragraph boundary at their point
-    (mirroring the chat client's ``stripStreamSentinels`` — #1547); THINK
-    and TOOL sentinels are stripped without welding (they are not prose
-    boundaries). Operates on a complete string, so the cross-packet edge
-    cases the client handles don't arise here.
+    (mirroring the chat client's ``stripStreamSentinels`` — #1547); THINK, TOOL
+    and PART sentinels are stripped without welding (they are not prose
+    boundaries). Operates on a complete string, so the cross-packet edge cases
+    the client handles don't arise here.
     """
     if not any(p in text for p in _ALL_SENTINEL_PREFIXES):
-        return text, []
+        return text, [], []
     result = ""
     tool_parts: list = []
+    parts: list = []
+    # #1914: a shared monotonic counter over TOOL and PART sentinels records
+    # their WIRE order. ``pos`` can't disambiguate a tool and a part at the same
+    # clean-text offset (the common ``tool done → PART → next tool`` with no
+    # prose between); ``seq`` lets the reload renderer interleave them exactly as
+    # they streamed. (Per-call, so only items from the same parse are compared —
+    # same-offset collisions only ever occur within one stream half.)
+    seq = 0
     i = 0
     n = len(text)
     weld_pending = False  # a removed revise sentinel awaits its next visible char
@@ -172,13 +198,29 @@ def _parse_stream_sentinels(text: str, base_offset: int = 0):
                 evt = json.loads(payload)
                 if isinstance(evt, dict):
                     evt["pos"] = base_offset + len(result)
+                    evt["seq"] = seq
+                    seq += 1
                     tool_parts.append(evt)
+            except (ValueError, TypeError):
+                pass
+        elif nxt_prefix == PART_SENTINEL_PREFIX:
+            payload = text[nxt_idx + len(nxt_prefix):close]
+            try:
+                part = json.loads(payload)
+                # A part must carry a string ``type`` (the renderer key); drop
+                # anything malformed so a bad PART payload can't corrupt prose
+                # or persist a junk component.
+                if isinstance(part, dict) and isinstance(part.get("type"), str):
+                    part["pos"] = base_offset + len(result)
+                    part["seq"] = seq
+                    seq += 1
+                    parts.append(part)
             except (ValueError, TypeError):
                 pass
         elif nxt_prefix == REVISE_SENTINEL_PREFIX:
             weld_pending = True
         i = close + len(_SENTINEL_SUFFIX)
-    return result, tool_parts
+    return result, tool_parts, parts
 
 
 def _tool_parts_to_events(parts: list) -> list:
@@ -195,19 +237,90 @@ def _tool_parts_to_events(parts: list) -> list:
         phase = p.get("phase")
         name = p.get("name", "")
         pos = p.get("pos")
+        # #1914: carry the shared wire-order ``seq`` so the reload merge can
+        # interleave a tool card and a same-position part in stream order.
+        seq = p.get("seq")
         if phase == "start":
-            events.append({"type": "start", "tool": name, "pos": pos})
+            ev = {"type": "start", "tool": name, "pos": pos}
         elif phase == "done":
             ev = {"type": "complete", "tool": name, "pos": pos}
             if p.get("ms") is not None:
                 ev["ms"] = p["ms"]
-            events.append(ev)
         elif phase == "error":
-            events.append({
+            ev = {
                 "type": "error", "tool": name,
                 "error": p.get("detail") or "", "pos": pos,
-            })
+            }
+        else:
+            continue
+        if isinstance(seq, int):
+            ev["seq"] = seq
+        events.append(ev)
     return events
+
+
+def _utf16_offset(text: str, cp_offset: int) -> int:
+    """Convert a Python code-point offset into the UTF-16 code-unit offset that
+    JS ``String.slice`` uses (#1914). A part after a non-BMP char (e.g. an emoji
+    🐢 — one code point, two UTF-16 units) would otherwise be stored an index too
+    short, splitting the surrogate pair and misplacing the bubble on reload.
+    """
+    return len(text[:cp_offset].encode("utf-16-le")) // 2
+
+
+def _rebase_events_for_parts(events: list, base: int, text: str) -> list:
+    """Rebase ``tool_events`` onto the persisted post-tool ``text`` (subtract the
+    retracted pre-half length ``base``) and convert each ``pos`` to a UTF-16
+    offset — so tool cards share the SAME origin AND unit as the component parts
+    persisted alongside them (#1914). The reload renderer merges both by ``pos``,
+    so a mixed unit/origin would mis-order or split the bubbles (e.g. after an
+    emoji). Applied ONLY when a turn carries parts, so the tool-card-only persist
+    path is unchanged. Returns a new list; non-dict / posless events pass through.
+    """
+    out = []
+    for ev in events or []:
+        if isinstance(ev, dict) and isinstance(ev.get("pos"), int):
+            ev = {**ev, "pos": _utf16_offset(text, max(0, ev["pos"] - base))}
+        out.append(ev)
+    return out
+
+
+def _finalize_component_parts(parts: list, text: str) -> list:
+    """Finalize component parts for persistence (#1914):
+
+    1. Convert each ``pos`` from a code-point offset into the persisted ``text``
+       to the UTF-16 offset the browser slices with on reload.
+    2. Append any parts a POST_RESPONSE hook emitted after streaming — they're
+       still buffered on the collector, so drain them here and position them at
+       the end of ``text`` (they carry no in-stream offset). Persist-only: the
+       live stream is already closed, so these surface on reload.
+    """
+    result = [{**p, "pos": _utf16_offset(text, p.get("pos", 0))} for p in parts]
+    hook_parts = drain_parts()
+    if hook_parts:
+        end = _utf16_offset(text, len(text))
+        result.extend({**p, "pos": end} for p in hook_parts)
+    return result
+
+
+def _flush_part_list(pending: list, full_response: list):
+    """Emit the accumulated ``pending`` component parts (#1914) as PART
+    sentinels — yield each for the live stream AND append to ``full_response``
+    so the inline / no-tool persist path records it, position-stamped, like the
+    orchestrator path captures its drained sentinels from the post-tool chunks.
+
+    The inline loop accumulates parts (drained at each resume) and flushes them
+    here right before the NEXT visible text — but AFTER any tool ``done``/``error``
+    sentinel items — so a component lands after its producing tool's card and
+    before the post-tool answer prose, in both live order and persisted ``seq``.
+    Clears ``pending`` once emitted.
+    """
+    for part in pending:
+        sentinel = build_part_sentinel(part)
+        if sentinel:
+            full_response.append(sentinel)
+            yield sentinel
+    pending.clear()
 
 
 _TOOL_EVENT_PHASE = {"start": "start", "complete": "done", "error": "error"}
@@ -229,6 +342,7 @@ def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
     """
     consumed = [False] * len(parts)
     last_pos = 0
+    last_seq = 0
     for ev in tool_events:
         if not isinstance(ev, dict):
             continue
@@ -246,7 +360,13 @@ def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
             pos = parts[matched].get("pos")
             if isinstance(pos, int):
                 last_pos = pos
+            # #1914: carry the wire-order ``seq`` too so reload can interleave a
+            # tool card and a same-position part in the order they streamed.
+            mseq = parts[matched].get("seq")
+            if isinstance(mseq, int):
+                last_seq = mseq
         ev["pos"] = last_pos
+        ev["seq"] = last_seq
     return tool_events
 
 
@@ -344,7 +464,7 @@ def _strip_and_weld_revise_sentinels(text: str) -> str:
     that only want the cleaned text keep this name; the tool-part
     extraction is ignored here.
     """
-    clean, _tool_parts = _parse_stream_sentinels(text)
+    clean, _tool_parts, _parts = _parse_stream_sentinels(text)
     return clean
 
 
@@ -498,11 +618,15 @@ class StreamingMixin:
             transition_lock = self._get_privacy_transition_lock()
             async with transition_lock:
                 async with self._turn_lifecycle():
-                    async for chunk in self._process_input_streaming_traced_locked(
-                        user_input, model_override, session_id, _otel_span,
-                        request_id=request_id, attachments=attachments,
-                    ):
-                        yield chunk
+                    # #1914: bind a per-turn part buffer so tools/features can
+                    # ``emit_part`` typed component bubbles; the orchestrator
+                    # drains it into PART sentinels at the point each tool ran.
+                    with part_collector():
+                        async for chunk in self._process_input_streaming_traced_locked(
+                            user_input, model_override, session_id, _otel_span,
+                            request_id=request_id, attachments=attachments,
+                        ):
+                            yield chunk
         except Exception as exc:
             end_span(_otel_span, error=exc)
             raise
@@ -781,6 +905,10 @@ class StreamingMixin:
         # user cancels before tools run) never persists a dangling `\n\n`
         # the client never rendered.
         pending_visible_boundary = False
+        # #1914: parts emitted by inline-executed tools accumulate here and flush
+        # right before the next VISIBLE text (after any tool done/error
+        # sentinels), so each component lands after its producing tool's card.
+        pending_parts: list = []
 
         # #1662 eager vision: resolve this turn's inline (pasted/dropped) image
         # attachments to bytes so the LLM service can fold them into the user
@@ -819,7 +947,21 @@ class StreamingMixin:
             # path below and the cancellation marker lands in metadata.
             if request_id and self.is_request_cancelled(request_id):
                 break
+            # #1914: accumulate any part an inline tool emitted while the adapter
+            # was resumed to produce THIS item. They flush right before the next
+            # VISIBLE text below — AFTER this item if it's a tool sentinel — so a
+            # component lands after its producing tool's card, not before it.
+            pending_parts.extend(drain_parts())
             if isinstance(item, str):
+                # #1914: a component emitted by the tool that produced THIS
+                # visible text flushes here — after any tool done/error sentinel
+                # items already appended to full_response, before this answer
+                # prose — so it lands after its producing tool's card. A
+                # sentinel-only item (the tool's done marker) is NOT visible, so
+                # the parts wait for the real text that follows it.
+                if pending_parts and item.strip() and not is_only_sentinels(item):
+                    for _ps in _flush_part_list(pending_parts, full_response):
+                        yield _ps
                 # #1547: materialize a pending revise boundary lazily —
                 # only when real post-marker text lands, and only when it
                 # would otherwise weld two non-whitespace chars. Mirrors
@@ -879,6 +1021,14 @@ class StreamingMixin:
                 # Tool calls detected at end of stream
                 tool_response = item
 
+        # #1914: flush any still-pending parts (a turn that ended on its tool
+        # with no trailing visible text never hit the in-loop flush) plus parts
+        # the FINAL resume produced. They append at the end of full_response —
+        # after the tool's done sentinel — preserving tool-before-part order.
+        pending_parts.extend(drain_parts())
+        for _ps in _flush_part_list(pending_parts, full_response):
+            yield _ps
+
         # Log LLM response
         llm_duration = int((time.time() - llm_start) * 1000)
         has_tool_calls = tool_response is not None and tool_response.has_tool_calls
@@ -910,7 +1060,7 @@ class StreamingMixin:
         if has_tool_calls and request_id and self.is_request_cancelled(request_id):
             # #1659: strip any codex inline tool sentinels from the
             # partial pre-tool text before persisting.
-            cancelled_text, _ = _parse_stream_sentinels("".join(full_response))
+            cancelled_text, _, _ = _parse_stream_sentinels("".join(full_response))
             await self._persist_assistant_turn_safely(
                 cancelled_text, metadata=None, session_id=session_id,
                 request_id=request_id,
@@ -973,10 +1123,10 @@ class StreamingMixin:
             # half can carry codex inline tool sentinels (emitted on the LLM
             # stream itself); the post half carries the orchestrator's
             # per-batch start sentinels plus any follow-up revise sentinels.
-            pre_tool_text, pre_parts = _parse_stream_sentinels(
+            pre_tool_text, pre_parts, pre_components = _parse_stream_sentinels(
                 "".join(full_response)
             )
-            post_tool_text, post_parts = _parse_stream_sentinels(
+            post_tool_text, post_parts, post_components = _parse_stream_sentinels(
                 "".join(tool_response_chunks)
             )
             # Materialize the pre/post seam boundary armed by the first
@@ -1007,6 +1157,15 @@ class StreamingMixin:
                 + [{**p, "pos": post_base + p["pos"]} for p in post_parts]
             )
             _stamp_tool_event_positions(tool_events, combined_parts)
+            # #1914: typed component parts are positioned relative to the
+            # PERSISTED content (``tool_final_text`` — the post-tool synthesis),
+            # NOT the pre+post combined text, so a reload places each component
+            # bubble correctly against the prose it sits in. The collector is
+            # drained by the orchestrator AFTER the tool batch, so parts only
+            # ever ride the post-tool stream; ``post_components`` already index
+            # the post half. (Any pre-half PART bytes index retracted pre-tool
+            # prose that isn't persisted in content, so they're not carried.)
+            component_parts = list(post_components)
             # Narration check (#1042 layer 3): the hook receives the
             # pre-tool prose snapshot taken at the first ToolCallStarted
             # marker boundary, plus the tool calls + result envelopes.
@@ -1033,6 +1192,24 @@ class StreamingMixin:
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
+            # #1914 (codex P1): a POST_RESPONSE hook can rewrite or BLOCK the
+            # assistant text (e.g. an audit denial → "[Response blocked ...]").
+            # The component parts were positioned against the ORIGINAL post-tool
+            # prose; persisting them would re-render the structured bubbles next
+            # to replaced/blocked text on reload — leaking exactly what the hook
+            # removed. Drop them whenever the hook changed the text.
+            if tool_final_text != post_tool_text:
+                component_parts = []
+            # #1914: UTF-16-offset the positions for the browser + fold in any
+            # parts a POST_RESPONSE hook emitted.
+            component_parts = _finalize_component_parts(component_parts, tool_final_text)
+            # #1914: when this turn carries parts, rebase the tool cards onto the
+            # same post-tool UTF-16 origin so the reload merge orders both
+            # streams consistently (``post_base`` is the retracted pre half).
+            if component_parts:
+                tool_events = _rebase_events_for_parts(
+                    tool_events, post_base, tool_final_text,
+                )
             # tool_results carry the structured call/result envelopes;
             # persisting them alongside tool_events means a future
             # conversation-history reader can reconstruct *which tools
@@ -1043,7 +1220,7 @@ class StreamingMixin:
             # here (every adapter that goes through the multi-iteration
             # tool loop). Close it in both branches uniformly.
             meta: Optional[Dict[str, Any]] = None
-            if tool_events or tool_results or pre_tool_text:
+            if tool_events or tool_results or pre_tool_text or component_parts:
                 meta = {}
                 if pre_tool_text:
                     meta['pre_tool_reasoning'] = {
@@ -1055,6 +1232,8 @@ class StreamingMixin:
                     meta['tool_events'] = tool_events
                 if tool_results:
                     meta['tool_results'] = tool_results
+                if component_parts:
+                    meta['parts'] = component_parts
             await self._persist_assistant_turn_safely(
                 tool_final_text, metadata=meta, session_id=session_id,
                 request_id=request_id,
@@ -1149,7 +1328,7 @@ class StreamingMixin:
             # persisted text and recover their positions to stamp onto the
             # synthesized events (inline_executed order == start-sentinel
             # order on the wire).
-            context_replay_text, inline_parts = _parse_stream_sentinels(
+            context_replay_text, inline_parts, inline_components = _parse_stream_sentinels(
                 "".join(full_response)
             )
             _stamp_tool_event_positions(synth_tool_events, inline_parts)
@@ -1162,17 +1341,46 @@ class StreamingMixin:
             )[0]
             post_tool_text = context_replay_text
             seam = ""
+            # Bytes trimmed off the front of context_replay to get the persisted
+            # post-tool content — used to rebase component-part positions onto
+            # it (#1914), so a reload places each bubble against the prose it
+            # actually sits in rather than the retracted pre-tool half.
+            inline_pre_len = 0
             if pre_tool_text and context_replay_text.startswith(pre_tool_text):
                 post_tool_text = context_replay_text[len(pre_tool_text):]
+                inline_pre_len = len(pre_tool_text)
                 if post_tool_text.startswith("\n\n"):
                     seam = "\n\n"
                     post_tool_text = post_tool_text[2:]
+                    inline_pre_len += 2
+            # #1914: rebase inline component parts onto the persisted post-tool
+            # content; drop any landing in the retracted pre-tool region.
+            inline_post_components = [
+                {**p, "pos": p["pos"] - inline_pre_len}
+                for p in inline_components
+                if p.get("pos", 0) >= inline_pre_len
+            ]
             final_text = await self._fire_post_response_hook(
                 post_tool_text, session_id,
                 pre_tool_prose=pre_tool_text,
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
+            # #1914 (codex P1): drop component parts when a POST_RESPONSE hook
+            # rewrote/blocked the text — their positions no longer match the
+            # persisted content and would leak blocked structured data on reload.
+            if final_text != post_tool_text:
+                inline_post_components = []
+            # #1914: UTF-16-offset + fold in hook-emitted parts.
+            inline_post_components = _finalize_component_parts(
+                inline_post_components, final_text
+            )
+            # #1914: when parts ride along, rebase the tool cards onto the same
+            # post-tool UTF-16 origin so the reload merge stays consistent.
+            if inline_post_components:
+                synth_tool_events = _rebase_events_for_parts(
+                    synth_tool_events, inline_pre_len, final_text,
+                )
             # See parallel comment in the has_tool_calls branch above:
             # tool_results in the persisted metadata preserves the
             # actual call envelopes (id, name, arguments, summarized
@@ -1190,6 +1398,9 @@ class StreamingMixin:
                     } if pre_tool_text else {}),
                     "tool_events": synth_tool_events,
                     "tool_results": tool_results,
+                    # #1914: component parts emitted during the inline turn,
+                    # rebased onto the persisted post-tool content.
+                    **({"parts": inline_post_components} if inline_post_components else {}),
                 },
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
@@ -1207,14 +1418,41 @@ class StreamingMixin:
             # webSearch) that don't populate executed_tool_calls land here with
             # their TOOL sentinels embedded — build tool_events from them so the
             # cards survive reload rather than vanishing once stripped.
-            final_text, tool_parts = _parse_stream_sentinels("".join(full_response))
+            final_text, tool_parts, no_tool_components = _parse_stream_sentinels(
+                "".join(full_response)
+            )
+            _no_tool_pre_hook_text = final_text
             final_text = await self._fire_post_response_hook(
                 final_text, session_id,
             )
+            # #1914 (codex P1): drop parts when a POST_RESPONSE hook rewrote or
+            # blocked the text — their positions reference the original prose, so
+            # persisting them would leak blocked structured data on reload.
+            if final_text != _no_tool_pre_hook_text:
+                no_tool_components = []
+            # #1914: UTF-16-offset + fold in any parts the POST_RESPONSE hook
+            # emitted (the collector is still active while the hook runs).
+            no_tool_components = _finalize_component_parts(no_tool_components, final_text)
             _no_tool_events = _tool_parts_to_events(tool_parts)
+            # #1914: with parts present, convert the tool cards to the same
+            # UTF-16 origin (base 0 here — no pre-tool retraction) so the reload
+            # merge orders both consistently.
+            if no_tool_components:
+                _no_tool_events = _rebase_events_for_parts(_no_tool_events, 0, final_text)
+            # #1914: a turn can emit component parts without dispatching tools
+            # (e.g. a feature emitting a card from a hook). Persist them here so
+            # those bubbles survive reload too. ``final_text`` is the clean
+            # persisted content, so the parts' ``pos`` index it directly.
+            _no_tool_meta: Optional[Dict[str, Any]] = None
+            if _no_tool_events or no_tool_components:
+                _no_tool_meta = {}
+                if _no_tool_events:
+                    _no_tool_meta["tool_events"] = _no_tool_events
+                if no_tool_components:
+                    _no_tool_meta["parts"] = no_tool_components
             await self._persist_assistant_turn_safely(
                 final_text,
-                metadata=({"tool_events": _no_tool_events} if _no_tool_events else None),
+                metadata=_no_tool_meta,
                 session_id=session_id,
                 request_id=request_id,
                 response=tool_response,

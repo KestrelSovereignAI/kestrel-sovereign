@@ -12,6 +12,7 @@ import {
     renderModelFooterHtml,
     messageAttachmentsHtml,
     handleRestartStatus,
+    appendMessagePart,
 } from './chat.js';
 
 // #1659: tool cards on reload come from the structured, position-stamped
@@ -431,6 +432,16 @@ window.loadConversation = async function(sessionId) {
             let toolHtml = '';
             let bodyHtml = null;
             const content = msg.content;
+            // #1914: an assistant turn that emitted typed component parts
+            // re-renders as interleaved bubbles — prose runs (each with its own
+            // tool cards) and the component bubbles between them — mirroring the
+            // live stream. Handled in its own path; skips the single-bubble path.
+            const parts = msg.metadata?.parts;
+            if (msg.role === 'assistant' && !isEncrypted
+                && Array.isArray(parts) && parts.length) {
+                renderAssistantWithParts(msg, content, parts);
+                return;
+            }
             if (msg.role === 'assistant' && !isEncrypted) {
                 const toolEvents = msg.metadata?.tool_events;
                 const hasPos = !!toolEvents
@@ -554,6 +565,29 @@ window.toggleHistorySidebar = function() {
     }
 };
 
+// #1914: a typed-part message renders as several sibling bubbles that all
+// carry the same ``data-message-id``. Fade+remove every node for the id (not
+// just the clicked one) so a delete doesn't orphan the part/extra-prose
+// bubbles. Falls back to the passed node when none are tagged (single-bubble
+// messages predating this path / non-id bubbles).
+function fadeRemoveMessageNodes(messageId, fallbackDiv) {
+    let nodes = [];
+    if (messageId && typeof document.querySelectorAll === 'function') {
+        // Escape the id for an attribute selector (quotes/backslashes).
+        const sel = String(messageId).replace(/(["\\])/g, '\\$1');
+        nodes = Array.from(
+            document.querySelectorAll(`.message[data-message-id="${sel}"]`),
+        );
+    }
+    if (!nodes.length && fallbackDiv) nodes = [fallbackDiv];
+    for (const node of nodes) {
+        node.style.transition = 'opacity 0.2s, transform 0.2s';
+        node.style.opacity = '0';
+        node.style.transform = 'scale(0.95)';
+        setTimeout(() => node.remove(), 200);
+    }
+}
+
 window.deleteMessage = async function(messageId, messageDiv) {
     // Soft-delete (#763) — moves the message to Trash, recoverable from
     // the trash sub-view (#765).
@@ -561,12 +595,7 @@ window.deleteMessage = async function(messageId, messageDiv) {
 
     try {
         await API.deleteMessage(messageId);
-        if (messageDiv) {
-            messageDiv.style.transition = 'opacity 0.2s, transform 0.2s';
-            messageDiv.style.opacity = '0';
-            messageDiv.style.transform = 'scale(0.95)';
-            setTimeout(() => messageDiv.remove(), 200);
-        }
+        fadeRemoveMessageNodes(messageId, messageDiv);
         Toast.info('Message moved to trash');
     } catch (e) {
         Toast.error(`Failed to delete message: ${e.message}`);
@@ -583,17 +612,131 @@ window.purgeMessage = async function(messageId, messageDiv) {
 
     try {
         await API.purgeMessage(messageId, 'user-initiated-ui');
-        if (messageDiv) {
-            messageDiv.style.transition = 'opacity 0.2s, transform 0.2s';
-            messageDiv.style.opacity = '0';
-            messageDiv.style.transform = 'scale(0.95)';
-            setTimeout(() => messageDiv.remove(), 200);
-        }
+        fadeRemoveMessageNodes(messageId, messageDiv);
         Toast.info('Message permanently deleted');
     } catch (e) {
         Toast.error(`Failed to permanently delete: ${e.message}`);
     }
 };
+
+// #1914: re-render an assistant turn that emitted typed component parts as
+// interleaved bubbles — prose segments (each carrying its slice of the
+// position-stamped tool cards) and the component bubbles between them — so a
+// reload matches the live multi-bubble stream. The message id, delete
+// affordances, and model footer anchor on the FIRST rendered prose bubble; a
+// bare prose segment (e.g. the gap between two adjacent parts) is skipped so no
+// empty bubble appears.
+function renderAssistantWithParts(msg, content, parts) {
+    const text = String(content || '');
+    const len = text.length;
+    const clampPos = (p) => Math.max(0, Math.min(len, typeof p === 'number' ? p : len));
+    const toolEventsRaw = msg.metadata?.tool_events;
+    const tools = Array.isArray(toolEventsRaw)
+        ? toolEventsRaw.filter((e) => typeof e.pos === 'number')
+        : [];
+    const validParts = (Array.isArray(parts) ? parts : [])
+        .filter((p) => p && typeof p.type === 'string');
+    // Merge tool events and parts into ONE wire-ordered timeline: primary key
+    // ``pos`` (text offset), tie-broken by ``seq`` (the shared wire-order
+    // counter persisted by the server) so a tool card and a part at the SAME
+    // offset interleave exactly as they streamed — e.g. ``tool done → PART →
+    // next tool`` with no prose between renders [tool][part][tool], not all
+    // tools then the part. #1914
+    const timeline = [
+        ...tools.map((t) => ({ kind: 'tool', pos: clampPos(t.pos), seq: t.seq || 0, item: t })),
+        ...validParts.map((p) => ({ kind: 'part', pos: clampPos(p.pos), seq: p.seq || 0, item: p })),
+    ].sort((a, b) => (a.pos - b.pos) || (a.seq - b.seq));
+
+    const visiblePane = state.chatPanes.get(state.mountedChatAgent);
+    const paneEl = visiblePane ? visiblePane.element : null;
+    let anchored = false;
+    let firstPartNode = null;
+    // Every bubble of this multi-bubble message carries the same
+    // ``data-message-id`` so a delete removes ALL of them, not just the anchor
+    // (codex P2). Only the anchor (first rendered bubble) gets the id +
+    // delete/purge affordances + model footer, so they aren't duplicated.
+    const tag = (node) => {
+        if (node && msg.id) node.dataset.messageId = msg.id;
+    };
+    const renderProseBubble = (segText, segTools) => {
+        if (!String(segText || '').trim() && !(segTools && segTools.length)) return;
+        const segBody = renderAgentContentHtml(segText, {
+            toolEvents: segTools && segTools.length ? segTools : null,
+        });
+        const node = addMessageToChat(
+            'assistant',
+            segText,
+            false,
+            anchored ? null : msg.id,
+            '',
+            '',
+            segBody,
+            null,
+            anchored ? null : { model: msg.model, provider: msg.provider },
+        );
+        tag(node);
+        anchored = true;
+    };
+
+    let cursor = 0;       // text offset where the current prose run starts
+    let segTools = [];    // tool events accumulated for the current prose run
+    for (const ev of timeline) {
+        if (ev.kind === 'tool') {
+            // Tool cards render by position within their prose bubble; rebase.
+            segTools.push({ ...ev.item, pos: Math.max(0, ev.pos - cursor) });
+            continue;
+        }
+        // A part closes the current prose run (text + its tool cards) into a
+        // bubble, then renders the component as its own bubble.
+        renderProseBubble(text.slice(cursor, ev.pos), segTools);
+        cursor = ev.pos;
+        segTools = [];
+        const pnode = appendMessagePart(ev.item.type, ev.item.data, paneEl);
+        tag(pnode);
+        if (!firstPartNode) firstPartNode = pnode;
+    }
+    // Trailing prose + any tool cards after the last part.
+    renderProseBubble(text.slice(cursor), segTools);
+
+    // A part-only message (empty content) produced no prose/tool anchor —
+    // attach the delete/purge controls + model footer to the first part bubble
+    // so the row stays manageable from history like every other row (codex P2).
+    if (!anchored && firstPartNode) {
+        attachAssistantControls(firstPartNode, msg.id, { model: msg.model, provider: msg.provider });
+    }
+}
+
+// #1914: attach the standard assistant-row controls (soft-delete + permanent
+// purge buttons, model footer) to an arbitrary bubble node. Used for a
+// part-only message whose anchor is a component bubble rather than a prose
+// bubble built by addMessageToChat. Mirrors addMessageToChat's affordances.
+function attachAssistantControls(node, messageId, modelMetadata) {
+    if (!node) return;
+    if (messageId) {
+        node.dataset.messageId = messageId;
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'msg-delete-btn';
+        deleteBtn.title = 'Move to trash';
+        deleteBtn.textContent = '✕';
+        deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+            window.deleteMessage(messageId, node);
+        };
+        node.appendChild(deleteBtn);
+
+        const purgeBtn = document.createElement('button');
+        purgeBtn.className = 'msg-purge-btn';
+        purgeBtn.title = 'Delete permanently (cannot be restored)';
+        purgeBtn.textContent = '⊘';
+        purgeBtn.onclick = (e) => {
+            e.stopPropagation();
+            window.purgeMessage(messageId, node);
+        };
+        node.appendChild(purgeBtn);
+    }
+    const footer = renderModelFooterHtml(modelMetadata);
+    if (footer) node.insertAdjacentHTML('beforeend', footer);
+}
 
 function addMessageToChat(
     role,
@@ -733,4 +876,5 @@ function addMessageToChat(
     }
 
     target.appendChild(messageDiv);
+    return messageDiv;
 }
