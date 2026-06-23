@@ -178,5 +178,60 @@ async def test_no_tool_turn_persists_emitted_part():
     ]
 
 
+@pytest.mark.asyncio
+async def test_inline_executed_tool_emitted_part_drained_and_persisted():
+    """On the codex app-server inline path, a feature tool runs INSIDE the LLM
+    call and emits a part via ``emit_part`` (buffered on the collector). The
+    streaming layer must drain it into a live PART sentinel AND persist it to
+    metadata — otherwise inline-tool parts (the openai:plan path, e.g. todo
+    tools on Emma) silently vanish.
+    """
+    from kestrel_sdk.llm import ToolCallStarted
+    from kestrel_sovereign.agent.parts import emit_part
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    add_convo_calls = []
+    agent = _make_agent(add_convo_calls)
+    agent._make_inline_tool_executor = MagicMock(return_value=None)
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent.context_manager.build_context.return_value.degraded_mode = False
+
+    async def stream(**kwargs):
+        yield "Updating. "
+        # The inline tool fires its marker, then (simulating its body) emits a
+        # component part into the active per-turn collector.
+        yield ToolCallStarted(index=0, id="tc1", name="todo_add")
+        emit_part("todo", {"title": "ship #1914"}, part_id="t1")
+        yield "Added it."
+        resp = LLMResponse(content="", tool_calls=None)
+        resp.executed_tool_calls = [
+            {"id": "tc1", "name": "todo_add", "arguments": {}, "result": {"ok": True}}
+        ]
+        yield resp
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
+    _bind(agent)
+
+    yielded = []
+    async for chunk in agent.process_input_streaming("update todos", session_id="s3"):
+        yielded.append(chunk)
+
+    # The drained part reaches the live client as a PART sentinel.
+    assert any("\x1eKESTREL:PART:" in c for c in yielded)
+
+    assistant_inserts = [c for c in add_convo_calls if c["role"] == "assistant"]
+    assert len(assistant_inserts) == 1
+    persisted = assistant_inserts[0]["content"]
+    metadata = assistant_inserts[0].get("metadata") or {}
+    assert "\x1eKESTREL:PART:" not in persisted
+    assert "parts" in metadata
+    assert len(metadata["parts"]) == 1
+    assert metadata["parts"][0]["type"] == "todo"
+    assert metadata["parts"][0]["data"] == {"title": "ship #1914"}
+    assert metadata["parts"][0]["id"] == "t1"
+    assert isinstance(metadata["parts"][0].get("pos"), int)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

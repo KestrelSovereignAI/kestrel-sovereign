@@ -11,6 +11,8 @@ from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.agent.parts import (
     PART_SENTINEL_PREFIX,
     PART_SENTINEL_SUFFIX,
+    build_part_sentinel,
+    drain_parts,
     part_collector,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
@@ -859,6 +861,21 @@ class StreamingMixin:
             elif isinstance(item, LLMResponse):
                 # Tool calls detected at end of stream
                 tool_response = item
+
+            # #1914: surface component parts emitted by an inline-executed tool
+            # (codex app-server bridge). The tool runs INSIDE this LLM call and
+            # buffers parts via ``emit_part``; drain them here and stream each as
+            # a PART sentinel — also appending to ``full_response`` so the inline
+            # persist path records it (position-stamped) the same way the
+            # orchestrator path captures its own drained sentinels from the
+            # post-tool chunks. No-op on the orchestrator path: no tool has
+            # executed yet, so the collector stays empty until the orchestrator
+            # drains it later.
+            for _emitted_part in drain_parts():
+                _part_sentinel = build_part_sentinel(_emitted_part)
+                if _part_sentinel:
+                    full_response.append(_part_sentinel)
+                    yield _part_sentinel
 
         # Log LLM response
         llm_duration = int((time.time() - llm_start) * 1000)
