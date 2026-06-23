@@ -127,6 +127,10 @@ class _RecordingHost(StreamingMixin):
     def _check_model_tool_support(self, providers, tools, model_override=None):
         return tools
 
+    def _stamp_response_identity(self, response, *, model, provider):
+        """Stub for #1370: StreamingMixin now calls this method."""
+        pass
+
 
 def _provider(name: str, adapter: Any) -> dict:
     return {
