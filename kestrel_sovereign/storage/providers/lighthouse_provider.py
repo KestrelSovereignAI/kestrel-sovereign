@@ -31,7 +31,7 @@ import os
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from kestrel_sovereign.storage.providers.base import (
     CryostasisCapable,
@@ -166,6 +166,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         content: bytes,
         metadata: Optional[Dict[str, Any]] = None,
         encrypt: bool = True,
+        on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> StorageResult:
         """
         Store content in Lighthouse (IPFS + optional Filecoin).
@@ -174,6 +175,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             content: Raw content bytes
             metadata: Optional metadata (filename, content_type, etc.)
             encrypt: Whether to encrypt before storing
+            on_progress: Optional callback(bytes_sent, total_bytes)
 
         Returns:
             StorageResult with CID and storage details
@@ -199,6 +201,7 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
             content=final_content,
             filename=filename,
             tag=tag,
+            on_progress=on_progress,
         )
 
         cid = upload_response.get("Hash")

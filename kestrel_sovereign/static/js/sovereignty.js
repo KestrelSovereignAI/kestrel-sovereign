@@ -9,6 +9,7 @@
 
 import API from './api.js';
 import { state, Toast, Modal, formatBytes } from './ui.js';
+import { subscribeSSE } from './chat.js';
 
 // Re-export from related modules
 export { loadLocalFiles } from './files.js';
@@ -26,6 +27,75 @@ function showLoading(elementId) {
 function showError(elementId, message) {
     const el = document.getElementById(elementId);
     if (el) el.innerHTML = `<div style="color: var(--error); padding: 1rem;">${message}</div>`;
+}
+
+let progressSubscribed = false;
+
+function ensureProgressElement() {
+    let progress = document.getElementById('sovereignty-export-progress');
+    if (progress) return progress;
+
+    const exportList = document.getElementById('export-list');
+    if (!exportList?.parentElement) return null;
+
+    progress = document.createElement('div');
+    progress.id = 'sovereignty-export-progress';
+    progress.style.cssText = `
+        display: none;
+        margin-bottom: 1rem;
+        padding: 0.875rem 1rem;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-secondary);
+    `;
+    progress.innerHTML = `
+        <div style="display: flex; justify-content: space-between; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.875rem;">
+            <span style="font-weight: 500;">Export upload</span>
+            <span id="sovereignty-export-progress-label" style="color: var(--text-secondary);">0%</span>
+        </div>
+        <div style="height: 8px; background: var(--bg-tertiary); border-radius: 999px; overflow: hidden;">
+            <div id="sovereignty-export-progress-bar" style="height: 100%; width: 0%; background: var(--accent-color); transition: width 0.2s;"></div>
+        </div>
+    `;
+    exportList.parentElement.insertBefore(progress, exportList);
+    return progress;
+}
+
+function updateExportProgress(data) {
+    const progress = ensureProgressElement();
+    if (!progress) return;
+
+    const percent = Math.max(0, Math.min(100, Number(data.percent || 0)));
+    const sent = Number(data.bytes_sent || 0);
+    const total = Number(data.total_bytes || 0);
+    const label = document.getElementById('sovereignty-export-progress-label');
+    const bar = document.getElementById('sovereignty-export-progress-bar');
+
+    progress.style.display = 'block';
+    if (bar) bar.style.width = `${percent}%`;
+    if (label) {
+        const sizeLabel = total > 0 ? ` (${formatBytes(sent)} / ${formatBytes(total)})` : '';
+        label.textContent = `${percent}%${sizeLabel}`;
+    }
+
+    if (percent >= 100) {
+        setTimeout(() => {
+            progress.style.display = 'none';
+            if (bar) bar.style.width = '0%';
+        }, 1800);
+    }
+}
+
+function initProgressEvents() {
+    if (progressSubscribed) return;
+    subscribeSSE('sovereignty_export_progress', (event) => {
+        try {
+            updateExportProgress(JSON.parse(event.data));
+        } catch (err) {
+            console.error('Failed to parse sovereignty export progress:', err);
+        }
+    });
+    progressSubscribed = true;
 }
 
 // ============================================================================
@@ -495,6 +565,8 @@ function showImportModal() {
 
 // Attach button handlers
 export function initSovereigntyButtons() {
+    initProgressEvents();
+
     document.getElementById('btn-export-ipfs')?.addEventListener('click', () => {
         showExportModal();
     });
