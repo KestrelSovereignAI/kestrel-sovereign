@@ -190,18 +190,19 @@ def _image_url_from_part(
 
 
 def _content_to_codex_input_parts(content: Any) -> List[Dict[str, Any]]:
-    """Convert OpenAI chat content parts to Responses-API input parts.
+    """Convert OpenAI chat content parts to Codex turn input parts.
 
     Kestrel's upstream vision path carries images in Chat Completions shape
     (``{"type": "image_url", "image_url": {"url": "data:..."}}``). Codex's
-    app-server forwards turn input to the Responses API, where the matching
-    part is ``{"type": "input_image", "image_url": "data:..."}``.
+    app-server expects turn input where the matching text part is
+    ``{"type": "text", "text": "..."}`` and image part is
+    ``{"type": "image", "image_url": "data:..."}``.
     """
     if isinstance(content, str):
-        return [{"type": "input_text", "text": content}]
+        return [{"type": "text", "text": content}]
     if not isinstance(content, list):
         text = "" if content is None else str(content)
-        return [{"type": "input_text", "text": text}]
+        return [{"type": "text", "text": text}]
 
     out: List[Dict[str, Any]] = []
     for part in content:
@@ -216,13 +217,13 @@ def _content_to_codex_input_parts(content: Any) -> List[Dict[str, Any]]:
         if ptype in ("text", "input_text"):
             text = part.get("text")
             if text:
-                out.append({"type": "input_text", "text": str(text)})
+                out.append({"type": "text", "text": str(text)})
             continue
         if ptype in ("image_url", "input_image"):
             url, detail = _image_url_from_part(part)
             if url:
                 item: Dict[str, Any] = {
-                    "type": "input_image",
+                    "type": "image",
                     "image_url": url,
                 }
                 if detail:
@@ -292,7 +293,7 @@ def _build_turn_input(
     )
     if latest_has_images:
         parts = _content_to_codex_input_parts(latest)
-        return [{"type": "input_text", "text": prefix}, *parts]
+        return [{"type": "text", "text": prefix}, *parts]
     return prefix + latest_text
 
 
@@ -954,7 +955,7 @@ class CodexAdapter(LLMAdapter):
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
             notes=(
                 "Codex app-server tools are executed through dynamic tool events.",
-                "OpenAI image_url parts are translated to Responses input_image parts.",
+                "OpenAI image_url parts are translated to Codex image parts.",
             ),
         )
 
