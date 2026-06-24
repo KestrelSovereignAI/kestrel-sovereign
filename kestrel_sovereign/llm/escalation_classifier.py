@@ -74,6 +74,17 @@ class EscalationOutcome(str, Enum):
     attributes the outcome. Surfaces in the narrative as
     "could not be confirmed"."""
 
+    VALIDATION_ERROR = "validation_error"
+    """The tool ran and rejected its ARGUMENTS — a bad enum value,
+    missing required field, wrong type/shape (e.g. ``scope must be one
+    of …``, ``metadata must be an object``, ``title is required``).
+    This is NOT a denial, sandbox refusal, or policy block: the tool
+    executed and validated the input. It MUST short-circuit ahead of
+    the audit/pattern checks so a stale ``user_denied`` audit row from
+    an unrelated prior call cannot mislabel a plain bad-argument error
+    as a user denial (the agent would then wrongly stop and apologise
+    instead of fixing the argument and retrying)."""
+
 
 # Recent-decision audit row shape. Callers pass a list of dicts (or
 # any Mapping) sourced from ``PermissionStore.get_audit_log`` so
@@ -144,6 +155,65 @@ _POLICY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"blocked.+policy", re.IGNORECASE),
     re.compile(r"approval.+no.+decision", re.IGNORECASE),
 )
+
+
+# Input-validation / bad-argument patterns. These mean the tool RAN and
+# rejected its arguments — a deterministic "fix your input and retry" error
+# that is categorically NOT a denial / sandbox / policy / tooling failure.
+# Matched FIRST (ahead of the audit) so a stale unrelated ``user_denied`` row
+# can't relabel a plain bad-argument error as a user denial.
+#
+# Deliberately NARROW: anchored on the distinctive idioms Kestrel @tool
+# validators emit, not broad English. ``classify_escalation_failure`` also
+# runs over command/shell stderr, so vague fragments like ``is required`` are
+# avoided — ``sudo: a password is required`` / ``authentication is required``
+# are real auth/policy failures, not argument errors (codex review). Even when
+# one of these DOES match a command's own argument-validation stderr, the
+# resulting "fix the argument and retry" guidance is still correct for that
+# case — the harm we're guarding against is mislabelling a denial/sandbox/auth
+# refusal, which these patterns don't touch.
+_VALIDATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Enum validators: "<field> must be one of a, b, c[, got 'x']"
+    re.compile(r"\bmust be one of\b", re.IGNORECASE),
+    # Shape validator: "<field> must be structured as an object"
+    re.compile(r"\bmust be structured\b", re.IGNORECASE),
+    # Type validators: "<field> must be a list|an object|an integer|…"
+    re.compile(
+        r"\bmust be an? (?:object|dict|list|array|string|integer|number|"
+        r"boolean|bool|mapping|float)\b",
+        re.IGNORECASE,
+    ),
+    # Range validator: "<field> must be in [1, 100], got 5"
+    re.compile(r"\bmust be in \[", re.IGNORECASE),
+    # NB: every Kestrel validator message that appends ", got <value>" also
+    # carries one of the "must be …" clauses above, so a bare ", got …" matcher
+    # is redundant here — and would misread ordinary failures like
+    # "AssertionError: expected 2 rows, got 1" as argument errors (codex review).
+)
+
+# Required-field validators emit a bare "<field> is required" (e.g.
+# ``title is required``). The phrase is deeply ambiguous — it also covers
+# command/auth stderr ("a password is required") and env/config dependency
+# errors ("GCP_PROJECT_ID is required for Cloud Run deployments"). It is matched
+# as a tool-argument error ONLY when ALL of these hold (codex review rounds 3–4):
+#   * the failing tool is NOT a command/shell-execution context;
+#   * the field is a lowercase identifier (tool params are ``snake_case``;
+#     env vars are ``UPPER_SNAKE`` and so excluded);
+#   * the message is JUST "<field> is required" with no trailing "for …/to …"
+#     clause (a config-dependency error carries one; a param error does not);
+#   * the field is not an auth/consent/credential word.
+_REQUIRED_FIELD_PATTERN: re.Pattern[str] = re.compile(
+    r"^([a-z][a-z0-9_]*) is required\.?$",
+)
+_NON_FIELD_REQUIRED_WORDS: frozenset[str] = frozenset({
+    "authentication", "authorization", "password", "passphrase", "token",
+    "credential", "credentials", "login", "permission", "permissions",
+    "approval", "consent", "key", "secret", "subscription", "account",
+})
+_COMMAND_EXECUTION_CONTEXTS: frozenset[str] = frozenset({
+    "bash", "sh", "shell", "compute", "commandexecution", "command_execution",
+    "filechange", "file_change", "codex_native", "run_command", "execute",
+})
 
 
 # Audit decision values that constitute a real user denial. Mirrors
@@ -217,6 +287,39 @@ def classify_escalation_failure(
     window is timely (the security feature ages out stale rows).
     """
     raw = (raw_error or "").strip()
+
+    # 0. Input-validation errors short-circuit EVERYTHING. The tool ran and
+    # rejected its arguments, so this is categorically not a denial / sandbox /
+    # policy / tooling failure — and crucially, classifying it ahead of the
+    # audit stops a stale unrelated ``user_denied`` row from mislabelling a
+    # plain bad-argument error as a user denial (Emma's todo scope-validation
+    # report). The recovery guidance is "fix the argument and retry", not
+    # "respect the user's denial and stop".
+    if raw:
+        is_validation = any(p.search(raw) for p in _VALIDATION_PATTERNS)
+        # Required-field ("<field> is required") — tightly bounded; see
+        # _REQUIRED_FIELD_PATTERN.
+        if not is_validation:
+            m = _REQUIRED_FIELD_PATTERN.match(raw)
+            if m is not None:
+                field = m.group(1).lower()
+                in_command_ctx = (
+                    tool_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
+                    or feature_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
+                )
+                is_validation = (
+                    field not in _NON_FIELD_REQUIRED_WORDS and not in_command_ctx
+                )
+        if is_validation:
+            return EscalationDecision(
+                outcome=EscalationOutcome.VALIDATION_ERROR,
+                reason=(
+                    "the tool rejected its arguments (input validation); "
+                    "no execution, denial, or block occurred"
+                ),
+                evidence_source="raw_error",
+                raw_error=raw,
+            )
 
     # 1. Audit first. The audit is the source of truth.
     if recent_decisions is not None:
@@ -331,6 +434,12 @@ def format_escalation_outcome(
             f"The escalation{cmd_suffix} could not run due to a "
             f"tooling error — not by an explicit user denial. "
             f"{decision.reason.capitalize()}."
+        )
+    if decision.outcome == EscalationOutcome.VALIDATION_ERROR:
+        return (
+            f"The tool call{cmd_suffix} failed input validation — a bad or "
+            f"missing argument, NOT a user denial or block. "
+            f"{decision.reason.capitalize()}. Correct the argument and retry."
         )
     return (
         f"The escalation{cmd_suffix} outcome could not be confirmed. "

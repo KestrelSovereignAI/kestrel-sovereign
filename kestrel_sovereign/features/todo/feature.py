@@ -611,7 +611,9 @@ class TodoFeature(Feature):
     ) -> ToolResult:
         """Complete, cancel, or supersede a todo."""
         if outcome not in {"done", "cancelled", "superseded"}:
-            return ToolResult.failed("outcome must be done, cancelled, or superseded")
+            return ToolResult.failed(
+                f"outcome must be one of cancelled, done, superseded, got {outcome!r}"
+            )
         node, err = await self._get_owned_node(todo_id)
         if err:
             return ToolResult.failed(err)
