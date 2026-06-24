@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import filecmp
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -155,76 +156,233 @@ def select_pages(
 
 
 # --------------------------------------------------------------------------- #
-# Mintlify emitter
+# Emitters
 # --------------------------------------------------------------------------- #
+# An emitter turns the selected pages into a full site tree (returned as a
+# ``{relative_path: file_contents}`` mapping). The build/check pipeline is
+# emitter-agnostic, so adding a renderer never touches the publish gate.
+#
+# GitHub Pages serves static HTML, so the production emitter is Starlight
+# (Astro) — its output compiles to a static `dist/`. Mintlify is kept only as a
+# preview/prototyping format (it is a hosted SaaS and cannot deploy to Pages).
+# --------------------------------------------------------------------------- #
+SITE_TITLE = "Kestrel Sovereign"
+GITHUB_ORG_URL = "https://github.com/KestrelSovereignAI"
+# Project-pages default. For a custom domain (CNAME) override to "" via --base.
+DEFAULT_PAGES_BASE = "/kestrel-sovereign"
+
+
+def _slugify_segment(segment: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", segment.lower()).strip("-")
+    return slug or "page"
+
+
 def _site_slug(rel: str) -> str:
-    """``docs/user-documentation/FOO.md`` -> ``user-documentation/FOO``."""
+    """``docs/user-documentation/FOO_BAR.md`` -> ``user-documentation/foo-bar``.
+
+    Emit Starlight's canonical (lowercase, hyphenated) slug form so the content
+    id, sidebar entry, and inter-page links all agree — Starlight slugifies
+    paths on its own, and a raw ``README`` would not resolve.
+    """
     p = Path(rel)
     if p.parts and p.parts[0] == "docs":
         p = Path(*p.parts[1:])
-    return p.with_suffix("").as_posix()
+    return "/".join(_slugify_segment(seg) for seg in p.with_suffix("").parts)
 
 
 def _yaml_quote(value: str) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def render_mintlify_page(page: dict[str, Any]) -> str:
-    """Rewrite an OKF doc into a Mintlify MDX page (frontmatter + banner)."""
-    lines = ["---", f"title: {_yaml_quote(page['title'])}"]
-    if page["description"]:
-        lines.append(f"description: {_yaml_quote(page['description'])}")
-    lines.append("---")
-    lines.append("")
-
-    banner = STATUS_BANNER.get(page["status"])
-    if banner:
-        kind, text = banner
-        tag = {"warning": "Warning", "info": "Info"}.get(kind, "Note")
-        lines.append(f"<{tag}>{text}</{tag}>")
-        lines.append("")
-
-    body = page["body"].lstrip("\n")
-    # Drop a leading duplicate H1 — Mintlify renders the title from frontmatter.
-    body_lines = body.splitlines()
-    if body_lines and body_lines[0].strip().startswith("# "):
-        body_lines = body_lines[1:]
-        while body_lines and not body_lines[0].strip():
-            body_lines = body_lines[1:]
-    lines.append("\n".join(body_lines).rstrip())
-    lines.append("")
-    return "\n".join(lines)
+def _strip_leading_h1(body: str) -> str:
+    """Themes render the title from frontmatter; drop a duplicate leading H1."""
+    lines = body.lstrip("\n").splitlines()
+    if lines and lines[0].strip().startswith("# "):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    return "\n".join(lines).rstrip()
 
 
-def build_navigation(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_group: dict[str, list[str]] = {}
+def _grouped(pages: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    by_group: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
-        by_group.setdefault(page["type"], []).append(_site_slug(page["rel"]))
+        by_group.setdefault(page["type"], []).append(page)
 
     def group_key(name: str) -> tuple[int, str]:
         return (GROUP_ORDER.index(name) if name in GROUP_ORDER else len(GROUP_ORDER), name)
 
-    nav = []
-    for group in sorted(by_group, key=group_key):
-        nav.append({"group": group, "pages": sorted(by_group[group])})
-    return nav
+    return [
+        (group, sorted(by_group[group], key=lambda p: _site_slug(p["rel"])))
+        for group in sorted(by_group, key=group_key)
+    ]
 
 
-def render_mint_json(pages: list[dict[str, Any]]) -> str:
-    config = {
-        "$schema": "https://mintlify.com/schema.json",
-        "name": "Kestrel Sovereign",
-        "colors": {"primary": "#0F766E", "light": "#14B8A6", "dark": "#0F766E"},
-        "navigation": build_navigation(pages),
-        "footerSocials": {"github": "https://github.com/KestrelSovereignAI"},
-    }
-    return json.dumps(config, indent=2) + "\n"
+class StarlightEmitter:
+    """Emit an Astro + Starlight project that builds to static HTML for Pages."""
+
+    name = "starlight"
+
+    def __init__(self, base: str = DEFAULT_PAGES_BASE) -> None:
+        self.base = base.rstrip("/")
+
+    def render_page(self, page: dict[str, Any]) -> str:
+        lines = ["---", f"title: {_yaml_quote(page['title'])}"]
+        if page["description"]:
+            lines += [f"description: {_yaml_quote(page['description'])}"]
+        lines += ["---", ""]
+
+        banner = STATUS_BANNER.get(page["status"])
+        if banner:
+            kind, text = banner
+            directive = {"warning": "caution", "info": "note"}.get(kind, "note")
+            lines += [f":::{directive}", text, ":::", ""]
+
+        lines += [_strip_leading_h1(page["body"]), ""]
+        return "\n".join(lines)
+
+    def tree(self, pages: list[dict[str, Any]]) -> dict[str, str]:
+        files: dict[str, str] = {}
+        for page in pages:
+            files[f"src/content/docs/{_site_slug(page['rel'])}.md"] = self.render_page(page)
+        files["src/content/docs/index.md"] = self._landing(pages)
+        files["astro.config.mjs"] = self._astro_config(pages)
+        files["src/content.config.ts"] = _STARLIGHT_CONTENT_CONFIG
+        files["package.json"] = _STARLIGHT_PACKAGE_JSON
+        files["tsconfig.json"] = _STARLIGHT_TSCONFIG
+        files[".gitignore"] = "node_modules/\ndist/\n.astro/\n"
+        return files
+
+    def _landing(self, pages: list[dict[str, Any]]) -> str:
+        lines = [
+            "---",
+            f"title: {_yaml_quote(SITE_TITLE)}",
+            'description: "Sovereign AI agents you own and run yourself."',
+            "---",
+            "",
+            "Generated from the OKF documentation corpus. Browse by section:",
+            "",
+        ]
+        for group, group_pages in _grouped(pages):
+            lines.append(f"## {group}")
+            lines.append("")
+            for page in group_pages:
+                slug = _site_slug(page["rel"])
+                lines.append(f"- [{page['title']}]({self.base}/{slug}/)")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _astro_config(self, pages: list[dict[str, Any]]) -> str:
+        sidebar = [
+            {
+                "label": group,
+                "items": [
+                    {"label": page["title"], "slug": _site_slug(page["rel"])}
+                    for page in group_pages
+                ],
+            }
+            for group, group_pages in _grouped(pages)
+        ]
+        sidebar_json = json.dumps(sidebar, indent=6)
+        return _STARLIGHT_ASTRO_CONFIG.format(
+            base=self.base or "/",
+            title=json.dumps(SITE_TITLE),
+            github=json.dumps(GITHUB_ORG_URL),
+            sidebar=sidebar_json,
+        )
 
 
-# --------------------------------------------------------------------------- #
-# Build / check
-# --------------------------------------------------------------------------- #
-EMITTERS = {"mintlify": (render_mint_json, render_mintlify_page, "mdx")}
+class MintlifyEmitter:
+    """Preview-only emitter. Mintlify is hosted SaaS — not for Pages deploys."""
+
+    name = "mintlify"
+
+    def render_page(self, page: dict[str, Any]) -> str:
+        lines = ["---", f"title: {_yaml_quote(page['title'])}"]
+        if page["description"]:
+            lines += [f"description: {_yaml_quote(page['description'])}"]
+        lines += ["---", ""]
+        banner = STATUS_BANNER.get(page["status"])
+        if banner:
+            kind, text = banner
+            tag = {"warning": "Warning", "info": "Info"}.get(kind, "Note")
+            lines += [f"<{tag}>{text}</{tag}>", ""]
+        lines += [_strip_leading_h1(page["body"]), ""]
+        return "\n".join(lines)
+
+    def tree(self, pages: list[dict[str, Any]]) -> dict[str, str]:
+        files = {f"{_site_slug(p['rel'])}.mdx": self.render_page(p) for p in pages}
+        nav = [
+            {"group": group, "pages": [_site_slug(p["rel"]) for p in group_pages]}
+            for group, group_pages in _grouped(pages)
+        ]
+        files["mint.json"] = json.dumps(
+            {
+                "$schema": "https://mintlify.com/schema.json",
+                "name": SITE_TITLE,
+                "colors": {"primary": "#0F766E", "light": "#14B8A6", "dark": "#0F766E"},
+                "navigation": nav,
+                "footerSocials": {"github": GITHUB_ORG_URL},
+            },
+            indent=2,
+        ) + "\n"
+        return files
+
+
+_STARLIGHT_PACKAGE_JSON = """{
+  "name": "kestrel-sovereign-docs",
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.30.0",
+    "astro": "^5.1.0",
+    "sharp": "^0.33.5"
+  }
+}
+"""
+
+_STARLIGHT_TSCONFIG = """{
+  "extends": "astro/tsconfigs/strict"
+}
+"""
+
+_STARLIGHT_CONTENT_CONFIG = """import { defineCollection } from 'astro:content';
+import { docsLoader } from '@astrojs/starlight/loaders';
+import { docsSchema } from '@astrojs/starlight/schema';
+
+export const collections = {
+  docs: defineCollection({ loader: docsLoader(), schema: docsSchema() }),
+};
+"""
+
+_STARLIGHT_ASTRO_CONFIG = """// @ts-check
+import {{ defineConfig }} from 'astro/config';
+import starlight from '@astrojs/starlight';
+
+// Generated by scripts/build_docs_site.py — do not edit by hand.
+export default defineConfig({{
+  site: 'https://kestrelsovereignai.github.io',
+  base: '{base}',
+  integrations: [
+    starlight({{
+      title: {title},
+      social: {{ github: {github} }},
+      sidebar: {sidebar},
+    }}),
+  ],
+}});
+"""
+
+
+EMITTERS: dict[str, Any] = {
+    "starlight": StarlightEmitter,
+    "mintlify": MintlifyEmitter,
+}
 
 
 def build_site(
@@ -232,10 +390,12 @@ def build_site(
     docs_root: Path,
     site_root: Path,
     emitter: str,
+    base: str,
     include_stale: bool,
     check: bool,
 ) -> int:
-    render_manifest, render_page, ext = EMITTERS[emitter]
+    emitter_cls = EMITTERS[emitter]
+    renderer = emitter_cls(base) if emitter == "starlight" else emitter_cls()
     pages, skipped = select_pages(docs_root, include_stale=include_stale)
 
     if not pages:
@@ -248,13 +408,10 @@ def build_site(
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
 
-    (staging / ("mint.json" if emitter == "mintlify" else "manifest.json")).write_text(
-        render_manifest(pages), encoding="utf-8"
-    )
-    for page in pages:
-        out = staging / (_site_slug(page["rel"]) + "." + ext)
+    for rel_path, contents in renderer.tree(pages).items():
+        out = staging / rel_path
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render_page(page), encoding="utf-8")
+        out.write_text(contents, encoding="utf-8")
 
     print(f"Selected {len(pages)} pages for the {emitter} site; skipped {len(skipped)}.")
     for rel, reason in skipped[:15]:
@@ -307,7 +464,12 @@ def main() -> int:
     parser.add_argument("command", choices=("build", "check"), help="build or verify the site")
     parser.add_argument("--docs-root", type=Path, default=DEFAULT_DOCS_ROOT)
     parser.add_argument("--site-root", type=Path, default=DEFAULT_SITE_ROOT)
-    parser.add_argument("--emitter", choices=tuple(EMITTERS), default="mintlify")
+    parser.add_argument("--emitter", choices=tuple(EMITTERS), default="starlight")
+    parser.add_argument(
+        "--base",
+        default=DEFAULT_PAGES_BASE,
+        help='GitHub Pages base path (starlight). Use "" for a custom domain.',
+    )
     parser.add_argument(
         "--include-stale",
         action="store_true",
@@ -319,6 +481,7 @@ def main() -> int:
         docs_root=args.docs_root.resolve(),
         site_root=args.site_root.resolve(),
         emitter=args.emitter,
+        base=args.base,
         include_stale=args.include_stale,
         check=args.command == "check",
     )

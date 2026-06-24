@@ -70,14 +70,30 @@ def test_stale_status_blocked_by_default_but_allowed_with_flag(docs: Path):
 def test_stale_page_renders_a_banner(docs: Path):
     stale_pages, _ = build_docs_site.select_pages(docs, include_stale=True)
     page = next(p for p in stale_pages if "stale.md" in p["rel"])
-    rendered = build_docs_site.render_mintlify_page(page)
-    assert "<Warning>" in rendered
+    rendered = build_docs_site.StarlightEmitter().render_page(page)
+    assert ":::caution" in rendered
 
 
-def test_mint_json_groups_by_type(docs: Path):
+def test_starlight_tree_has_config_and_grouped_sidebar(docs: Path):
     import json
 
     pages, _ = build_docs_site.select_pages(docs, include_stale=True)
-    nav = json.loads(build_docs_site.render_mint_json(pages))["navigation"]
+    tree = build_docs_site.StarlightEmitter().tree(pages)
+    assert "package.json" in tree
+    assert "src/content.config.ts" in tree
+    assert "src/content/docs/index.md" in tree
+
+    config = tree["astro.config.mjs"]
+    assert '"User Guide"' in config  # sidebar group label
+    # base path flows into the generated Astro config
+    assert "/kestrel-sovereign" in config
+
+
+def test_mintlify_emitter_groups_by_type(docs: Path):
+    import json
+
+    pages, _ = build_docs_site.select_pages(docs, include_stale=True)
+    tree = build_docs_site.MintlifyEmitter().tree(pages)
+    nav = json.loads(tree["mint.json"])["navigation"]
     groups = {g["group"] for g in nav}
     assert "User Guide" in groups
