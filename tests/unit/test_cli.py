@@ -127,6 +127,54 @@ class TestArgumentParsing:
         assert args.name == "myagent"
         assert args.port == 9000
 
+    def test_create_test_flag_defaults_false(self):
+        """'create <name>' without --test parses test=False."""
+        parser = build_parser()
+        args = parser.parse_args(["create", "myagent"])
+        assert args.test is False
+
+    def test_create_with_test_flag(self):
+        """'create <name> --test' parses test=True."""
+        parser = build_parser()
+        args = parser.parse_args(["create", "myagent", "--test"])
+        assert args.command == "create"
+        assert args.name == "myagent"
+        assert args.test is True
+
+    def test_cmd_create_passes_test_instance_through(self, tmp_path):
+        """cmd_create must forward --test to create_agent(is_test_instance=...)."""
+        captured = {}
+
+        def fake_create_agent(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(did="did:test", port=8777, already_existed=False)
+
+        args = MagicMock(name="myagent", port=None, test=True)
+        args.name = "myagent"
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=tmp_path), \
+             patch("kestrel_sovereign.setup.steps.agent.create_agent", fake_create_agent):
+            rc = cmd_create(args)
+
+        assert rc == 0
+        assert captured["is_test_instance"] is True
+
+    def test_cmd_create_default_is_not_test_instance(self, tmp_path):
+        """Without --test, cmd_create forwards is_test_instance=False."""
+        captured = {}
+
+        def fake_create_agent(**kwargs):
+            captured.update(kwargs)
+            return MagicMock(did="did:test", port=8777, already_existed=False)
+
+        args = MagicMock(port=None, test=False)
+        args.name = "myagent"
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=tmp_path), \
+             patch("kestrel_sovereign.setup.steps.agent.create_agent", fake_create_agent):
+            rc = cmd_create(args)
+
+        assert rc == 0
+        assert captured["is_test_instance"] is False
+
     def test_shell_with_name(self):
         """'shell <name>' should parse agent name."""
         parser = build_parser()

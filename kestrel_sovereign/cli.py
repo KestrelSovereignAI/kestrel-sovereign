@@ -137,7 +137,9 @@ def cmd_create(args) -> int:
             print("Inception aborted to avoid anchoring an unsigned contract.")
             return 1
 
-    print(f"\U0001F985 Creating new Kestrel agent: {name}")
+    is_test_instance = bool(getattr(args, "test", False))
+    suffix = " (test instance)" if is_test_instance else ""
+    print(f"\U0001F985 Creating new Kestrel agent: {name}{suffix}")
     if contract is not None and contract.enabled:
         print("   Amendment VIII active \u2014 Sovereign-authored contract will be anchored.")
 
@@ -149,6 +151,7 @@ def cmd_create(args) -> int:
             autostart=True,
             port=args.port,
             emancipation_contract=contract,
+            is_test_instance=is_test_instance,
         )
     except Exception as exc:  # noqa: BLE001 \u2014 surface inception failure verbatim
         print(f"Inception failed: {exc}")
@@ -1427,6 +1430,13 @@ def build_parser() -> argparse.ArgumentParser:
     create_p = subparsers.add_parser("create", help="Create a new agent")
     create_p.add_argument("name", help="Agent name")
     create_p.add_argument("--port", type=int, help="Override port assignment")
+    create_p.add_argument(
+        "--test",
+        action="store_true",
+        help="Tag the inceptioned agent as a test instance "
+        "(is_test_instance=True + auto test_cycle_id), so it can be "
+        "graduated/retired later. Ignored if the agent already exists.",
+    )
 
     # kestrel shell <name>
     shell_p = subparsers.add_parser("shell", help="Interactive CLI chat")
