@@ -191,6 +191,21 @@ _VALIDATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     # "AssertionError: expected 2 rows, got 1" as argument errors (codex review).
 )
 
+# Required-field validators emit a bare "<field> is required" (e.g.
+# ``title is required``). The phrase is ambiguous with command/auth stderr
+# ("a password is required", "authentication is required"), so it is matched
+# ONLY when the failing tool is NOT a command/shell-execution context AND the
+# message is the clean Kestrel shape (a single field token at the start). For
+# command contexts "is required" is treated as a potential auth/policy signal
+# and left to the normal audit/pattern classification.
+_REQUIRED_FIELD_PATTERN: re.Pattern[str] = re.compile(
+    r"^\s*\w+ is required\b", re.IGNORECASE,
+)
+_COMMAND_EXECUTION_CONTEXTS: frozenset[str] = frozenset({
+    "bash", "sh", "shell", "compute", "commandexecution", "command_execution",
+    "filechange", "file_change", "codex_native", "run_command", "execute",
+})
+
 
 # Audit decision values that constitute a real user denial. Mirrors
 # the contract in ``features/talon/verification.classify_denial`` — keep
@@ -272,17 +287,25 @@ def classify_escalation_failure(
     # report). The recovery guidance is "fix the argument and retry", not
     # "respect the user's denial and stop".
     if raw:
-        for pattern in _VALIDATION_PATTERNS:
-            if pattern.search(raw):
-                return EscalationDecision(
-                    outcome=EscalationOutcome.VALIDATION_ERROR,
-                    reason=(
-                        "the tool rejected its arguments (input validation); "
-                        "no execution, denial, or block occurred"
-                    ),
-                    evidence_source="raw_error",
-                    raw_error=raw,
-                )
+        is_validation = any(p.search(raw) for p in _VALIDATION_PATTERNS)
+        # Required-field ("<field> is required") only counts as validation for
+        # non-command tools — see _REQUIRED_FIELD_PATTERN.
+        if not is_validation and _REQUIRED_FIELD_PATTERN.search(raw):
+            in_command_ctx = (
+                tool_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
+                or feature_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
+            )
+            is_validation = not in_command_ctx
+        if is_validation:
+            return EscalationDecision(
+                outcome=EscalationOutcome.VALIDATION_ERROR,
+                reason=(
+                    "the tool rejected its arguments (input validation); "
+                    "no execution, denial, or block occurred"
+                ),
+                evidence_source="raw_error",
+                raw_error=raw,
+            )
 
     # 1. Audit first. The audit is the source of truth.
     if recent_decisions is not None:

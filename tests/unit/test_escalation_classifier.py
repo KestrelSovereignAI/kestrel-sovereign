@@ -254,12 +254,23 @@ def test_end_to_end_1563_reproduction():
         "limit must be an integer, got 'lots'",
         "limit must be in [1, 200], got 5000",
         "outcome must be one of cancelled, done, superseded, got 'maybe'",
+        "title is required",   # required-field, feature tool
     ],
 )
 def test_input_validation_errors_classify_as_validation_error(raw):
     decision = classify_escalation_failure(raw, tool_name="todo_add", feature_name="todo")
     assert decision.outcome is EscalationOutcome.VALIDATION_ERROR
     assert decision.evidence_source == "raw_error"
+
+
+def test_required_field_is_not_validation_for_command_tools():
+    # "X is required" from a command/shell tool is a potential auth/policy
+    # signal, NOT a tool-argument error — must NOT short-circuit to validation.
+    for tool, feature in [("bash", "shell"), ("commandExecution", "codex_native")]:
+        decision = classify_escalation_failure(
+            "authentication is required", tool_name=tool, feature_name=feature,
+        )
+        assert decision.outcome is not EscalationOutcome.VALIDATION_ERROR
 
 
 @pytest.mark.parametrize(
