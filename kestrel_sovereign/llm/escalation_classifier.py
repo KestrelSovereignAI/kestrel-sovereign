@@ -161,21 +161,33 @@ _POLICY_PATTERNS: tuple[re.Pattern[str], ...] = (
 # rejected its arguments — a deterministic "fix your input and retry" error
 # that is categorically NOT a denial / sandbox / policy / tooling failure.
 # Matched FIRST (ahead of the audit) so a stale unrelated ``user_denied`` row
-# can't relabel a plain bad-argument error as a user denial. Anchored on the
-# validator idioms Kestrel @tool methods emit (``must be one of``, ``is
-# required``, ``must be a/an/structured/in …``, ``got '…'``) to avoid matching
-# arbitrary command stderr.
+# can't relabel a plain bad-argument error as a user denial.
+#
+# Deliberately NARROW: anchored on the distinctive idioms Kestrel @tool
+# validators emit, not broad English. ``classify_escalation_failure`` also
+# runs over command/shell stderr, so vague fragments like ``is required`` are
+# avoided — ``sudo: a password is required`` / ``authentication is required``
+# are real auth/policy failures, not argument errors (codex review). Even when
+# one of these DOES match a command's own argument-validation stderr, the
+# resulting "fix the argument and retry" guidance is still correct for that
+# case — the harm we're guarding against is mislabelling a denial/sandbox/auth
+# refusal, which these patterns don't touch.
 _VALIDATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Enum validators: "<field> must be one of a, b, c[, got 'x']"
     re.compile(r"\bmust be one of\b", re.IGNORECASE),
-    re.compile(r"\bis required\b", re.IGNORECASE),
-    re.compile(r"\bmust be (?:an?|the|in|structured\b|done\b|one\b)", re.IGNORECASE),
-    re.compile(r"\bmust be structured as\b", re.IGNORECASE),
+    # Shape validator: "<field> must be structured as an object"
+    re.compile(r"\bmust be structured\b", re.IGNORECASE),
+    # Type validators: "<field> must be a list|an object|an integer|…"
     re.compile(
-        r"\b(?:invalid|unsupported|malformed|unknown)\s+\w*\s*"
-        r"(?:value|argument|arg|scope|status|priority|field|parameter|format|type|shape)\b",
+        r"\bmust be an? (?:object|dict|list|array|string|integer|number|"
+        r"boolean|bool|mapping|float)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\bcannot be (?:empty|blank|null|none)\b", re.IGNORECASE),
+    # Range validator: "<field> must be in [1, 100], got 5"
+    re.compile(r"\bmust be in \[", re.IGNORECASE),
+    # The distinctive Kestrel validator suffix appending the rejected value:
+    # "…, got 'feature-review'" / "…, got 5".
+    re.compile(r",\s*got\s+(?:['\"]|-?\d)", re.IGNORECASE),
 )
 
 

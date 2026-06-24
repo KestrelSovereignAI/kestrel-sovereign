@@ -251,15 +251,33 @@ def test_end_to_end_1563_reproduction():
         "priority must be one of high, low, normal, urgent, got 'medium'",
         "metadata must be an object",
         "links must be a list",
-        "title is required",
         "limit must be an integer, got 'lots'",
-        "outcome must be done, cancelled, or superseded",
+        "limit must be in [1, 200], got 5000",
+        "outcome must be one of cancelled, done, superseded, got 'maybe'",
     ],
 )
 def test_input_validation_errors_classify_as_validation_error(raw):
     decision = classify_escalation_failure(raw, tool_name="todo_add", feature_name="todo")
     assert decision.outcome is EscalationOutcome.VALIDATION_ERROR
     assert decision.evidence_source == "raw_error"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Real auth/policy/sandbox failures must NOT be read as argument errors
+        # (codex review: "is required" / "a password is required" are not
+        # tool-argument validation).
+        "sudo: a password is required",
+        "authentication is required",
+        "error: a token is required to push",
+        'tool returned Rejected("rejected by user")',
+        "permission denied (publickey)",
+    ],
+)
+def test_non_validation_failures_not_misread_as_validation(raw):
+    decision = classify_escalation_failure(raw, tool_name="bash", feature_name="shell")
+    assert decision.outcome is not EscalationOutcome.VALIDATION_ERROR
 
 
 def test_validation_error_short_circuits_stale_user_denial_row():
