@@ -184,6 +184,32 @@ def test_tool_call_emitted_as_text_detected():
     )
 
 
+def test_tool_call_as_text_detector_ignores_documentation_and_examples():
+    """The detector requires a real invocation shape and exempts code, so an
+    answer that merely DISCUSSES or quotes the markup is not treated as an
+    unexecuted tool call (codex P2: avoid needless repair turns)."""
+    # Bare tag mentions in prose — no invocation shape.
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        "Use the <invoke> element inside a <function_calls> block to call a tool."
+    )
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        "The <tool_call> and <tool_use> tags wrap structured calls."
+    )
+    # A real invocation, but shown as a fenced code example — documentation.
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        'Here is the syntax:\n```\n<invoke name="todo_add">'
+        '<parameter name="title">x</parameter></invoke>\n```'
+    )
+    # A real invocation quoted in an inline code span — still documentation.
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        'You write `<invoke name="todo_add">` to call it.'
+    )
+    # But a raw, real invocation (not in code) still triggers.
+    assert OrchestratorEngineMixin._tool_call_emitted_as_text(
+        '<invoke name="todo_add"><parameter name="title">x</parameter></invoke>'
+    )
+
+
 @pytest.mark.asyncio
 async def test_tool_call_as_text_gets_repaired_and_executed():
     """A model that writes <function_calls>/<invoke> markup as TEXT (no

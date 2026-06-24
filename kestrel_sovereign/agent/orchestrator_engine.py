@@ -81,14 +81,27 @@ CONTINUATION_INTENT_RE = re.compile(
 # happens the framework sees only text: no tool runs, yet the model often
 # narrates fabricated success ("got ID 4 … no errors"). Detect the textual
 # form so the same repair turn that handles a narrated-but-uncalled tool also
-# nudges the model to re-emit the call as a real structured tool_use. Matched
-# case-insensitively against the raw assistant text; the tags are distinctive
-# enough that false positives on normal prose are vanishingly unlikely.
+# nudges the model to re-emit the call as a real structured tool_use.
+#
+# The pattern requires an actual *invocation shape*, not a bare tag mention, so
+# answers that merely DISCUSS this markup ("the `<invoke>` tag", "`<tool_call>`
+# syntax") don't trip it: an ``<invoke>``/``<tool_use>`` carrying a ``name=``
+# attribute, a ``<function_calls>`` wrapper immediately enclosing an
+# ``<invoke>``, or a ``<tool_call>`` opening a JSON/named payload. Callers also
+# strip fenced/inline code first (see ``_tool_call_emitted_as_text``) so
+# documentation examples in code blocks are exempt.
 TOOL_CALL_AS_TEXT_RE = re.compile(
-    r"<\s*(?:function_calls|invoke|tool_call|tool_use)\b"
-    r"|\bfunction_calls\s*>",
-    re.IGNORECASE,
+    r"<\s*invoke\b[^>]*\bname\s*="
+    r"|<\s*tool_use\b[^>]*\bname\s*="
+    r"|<\s*function_calls\s*>\s*<\s*(?:invoke|tool_call|tool_use)\b"
+    r"|<\s*tool_call\s*>\s*[\{\"]",
+    re.IGNORECASE | re.DOTALL,
 )
+
+# Fenced ```code``` blocks and inline `code` spans are stripped before the
+# tool-call-as-text check: a model making a real (mis-emitted) call writes the
+# markup raw, whereas documentation/examples of the markup live in code.
+_CODE_SPAN_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`]*`", re.DOTALL)
 
 TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this turn is still in progress, but you did not emit a tool call.
 
@@ -421,13 +434,21 @@ class OrchestratorEngineMixin:
             return False
         return bool(
             CONTINUATION_INTENT_RE.search(content)
-            or TOOL_CALL_AS_TEXT_RE.search(content)
+            or OrchestratorEngineMixin._tool_call_emitted_as_text(content)
         )
 
     @staticmethod
     def _tool_call_emitted_as_text(content: Optional[str]) -> bool:
-        """True when assistant text contains literal tool-call markup."""
-        return bool(content and TOOL_CALL_AS_TEXT_RE.search(content))
+        """True when assistant text contains a literal tool-call *invocation*.
+
+        Fenced/inline code is stripped first so documentation or examples that
+        merely quote the markup (in ``` blocks or `backticks`) don't count —
+        only a raw, real invocation shape does.
+        """
+        if not content:
+            return False
+        stripped = _CODE_SPAN_RE.sub(" ", content)
+        return bool(TOOL_CALL_AS_TEXT_RE.search(stripped))
 
     @staticmethod
     def _append_missing_tool_call_repair(messages: list, content: str) -> list:
