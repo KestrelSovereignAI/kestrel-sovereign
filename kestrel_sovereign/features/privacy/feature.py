@@ -235,7 +235,9 @@ class PrivacyAgent:
 
     async def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = None,
                                session_id: Optional[str] = None,
-                               rendered_content: Optional[str] = None):
+                               rendered_content: Optional[str] = None,
+                               model: Optional[str] = None,
+                               provider: Optional[str] = None):
         """
         Adds a conversation entry according to the current privacy config.
         This is the central method for enforcing privacy rules.
@@ -249,6 +251,8 @@ class PrivacyAgent:
             rendered_content: Write-once transport bytes for byte-stable
                 cache replay (#1402); anonymized identically to ``content``
                 when redaction is in force.
+            model: Resolved model id that produced an assistant turn (#1906).
+            provider: Resolved provider/route for an assistant turn (#1906).
         """
         config = self._privacy_config
 
@@ -296,6 +300,7 @@ class PrivacyAgent:
         await self.storage.add_conversation(
             role, final_content, metadata, session_id,
             rendered_content=final_rendered,
+            model=model, provider=provider,
         )
 
     async def get_conversation_history(self, limit: int = 100, session_id: str = None) -> List[Dict]:
