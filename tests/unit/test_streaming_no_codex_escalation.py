@@ -106,9 +106,26 @@ class _RecordingHost(StreamingMixin):
         # the route would skip the harness on every later turn.
         self.disabled_attempts: List[str] = []
         self._mandate_preference = {}
+        self._mandate_fallbacks: List[dict] = []
 
     def _check_policy(self) -> None:
         return None
+
+    def _available_providers(self):
+        # Mirror LLMService: drop session-disabled routes. Tests don't
+        # exercise disabled routes here, so this is just the full list.
+        return [
+            p for p in self.providers
+            if p.get("name") not in self._disabled_routes
+        ]
+
+    # ``resolve_routing_meta`` and ``_match_selector`` are inherited from
+    # ``StreamingMixin`` — tests exercise the SAME code path production does.
+
+    def _filter_providers_by_selector(self, providers, selector):
+        # Mirror LLMService's selector filter via the StreamingMixin helper so
+        # the stub resolver below matches production resolution semantics.
+        return self._match_selector(providers, selector)
 
     def resolve_provider_routing(
         self,
@@ -116,7 +133,45 @@ class _RecordingHost(StreamingMixin):
         model_override: Optional[str] = None,
         force_local_only: bool = False,
     ):
-        return list(self.providers), None
+        # Honor an explicit vendor-prefixed override / mandate the way the
+        # real resolver does, so tests can drive a genuine single-route
+        # explicit selection through the streaming loops.
+        providers = self._available_providers()
+        target_model = None
+        selector = None
+        if model_override and ("/" in model_override or ":" in model_override):
+            selector = (
+                model_override.split("/", 1)[0]
+                if "/" in model_override else model_override
+            )
+            if "/" in model_override:
+                target_model = model_override.split("/", 1)[1]
+        else:
+            pref = self._mandate_preference or {}
+            if pref.get("model") and pref.get("vendor"):
+                pref_route = pref.get("route")
+                selector = (
+                    f"{pref['vendor']}:{pref_route}"
+                    if pref_route else pref["vendor"]
+                )
+                target_model = pref["model"]
+        if selector:
+            matched = self._filter_providers_by_selector(providers, selector)
+            if matched:
+                return matched, target_model
+            # Mandate with declared fallbacks: build the fallback chain.
+            if self._mandate_fallbacks:
+                fb_providers = []
+                for fb in self._mandate_fallbacks:
+                    fb_vendor = fb.get("vendor") or fb.get("provider")
+                    fb_match = self._filter_providers_by_selector(
+                        providers, fb_vendor
+                    ) if fb_vendor else []
+                    if fb_match:
+                        fb_providers.append(fb_match[0])
+                if fb_providers:
+                    return fb_providers, None
+        return list(providers), target_model
 
     def _resolve_concrete_model(self, target_model, provider):
         return provider.get("model", "test-model")
@@ -692,3 +747,187 @@ def test_configured_routes_exhausted_unconfigured_before_configured():
     # The intervening anthropic route must be skipped before dispatch.
     assert host._skip_unconfigured_route(providers[1]) is True
     assert host._skip_unconfigured_route(providers[2]) is False
+
+
+# ---------------------------------------------------------------------------
+# Codex re-review P1: a SINGLETON incidental chain is NOT an explicit
+# selection. The operator configured route_priority=[openai:*] but every
+# openai route failed to initialize / is disabled, leaving exactly ONE
+# incidental credentialed route (anthropic, never asked for). Before the fix
+# ``len(providers) == 1`` set ``mandate_restricted=True`` and BYPASSED
+# ``_skip_unconfigured_route`` — so the request still went to the unconfigured
+# vendor. The fix gates the bypass on a REAL explicit-selection signal, not
+# list length, so the incidental singleton is still skipped/raises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_singleton_incidental_unconfigured_route_is_skipped_not_attempted():
+    """route_priority names only openai, but the only surviving route is the
+    incidental anthropic one. It must be SKIPPED (never attempted), raising
+    the no-routes diagnostic — not silently answered from anthropic."""
+    host = _build_configured_host(
+        [
+            ("anthropic:api", "ok", None),  # incidental, sole survivor
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    with pytest.raises(LLMStreamingError):
+        async for chunk in host.get_streaming_response(
+            system_prompt="sys", user_prompt="hi",
+        ):
+            chunks.append(chunk)
+    # anthropic is the only route but unconfigured -> never attempted.
+    assert host.attempted == [], host.attempted
+    assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_singleton_incidental_unconfigured_route_skipped_stream_with_tool_detection():
+    """Same P1 scenario through stream_with_tool_detection."""
+    host = _build_configured_host(
+        [
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    from kestrel_sovereign.llm.remote_backend import BackendType
+    host._backend = BackendType.LOCAL
+    host._remote_client = None
+    chunks = []
+    with pytest.raises(LLMStreamingError):
+        async for chunk in host.stream_with_tool_detection(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+        ):
+            chunks.append(chunk)
+    assert host.attempted == [], host.attempted
+
+
+@pytest.mark.asyncio
+async def test_genuine_explicit_single_route_selection_still_attempts_its_route():
+    """A genuine explicit selection (vendor-prefixed override) of the SOLE
+    route must still be ATTEMPTED — even when its vendor is outside
+    route_priority. The operator/user explicitly asked for THIS route."""
+    host = _build_configured_host(
+        [
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+        model_override="anthropic/claude-haiku-4-5",
+    ):
+        chunks.append(chunk)
+    # Explicitly selected -> attempted despite not being in route_priority.
+    assert host.attempted == ["anthropic:api"], host.attempted
+    assert chunks == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_single_route_failure_raises_loudly_not_silent_fallthrough():
+    """A genuine explicit single-route selection that FAILS must raise the
+    specific 'Selected route ... failed' error — never fall through to the
+    incidental default chain."""
+    host = _build_configured_host(
+        [
+            ("anthropic:api", "raise", RuntimeError("anthropic 500")),
+            ("openai:api", "ok", None),  # incidental survivor; must not be hit
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    with pytest.raises(LLMStreamingError) as ei:
+        async for chunk in host.get_streaming_response(
+            system_prompt="sys", user_prompt="hi",
+            model_override="anthropic/claude-haiku-4-5",
+        ):
+            chunks.append(chunk)
+    assert host.attempted == ["anthropic:api"], host.attempted
+    assert "Selected route" in str(ei.value)
+    assert ei.value.provider == "anthropic:api"
+
+
+# ---------------------------------------------------------------------------
+# Codex re-review P2: the authorized-vendor set must include operator-declared
+# _mandate_fallbacks, even when those vendors are NOT in route_priority.
+# Before the fix ``_configured_route_vendors`` only read static route_priority,
+# so a mandate fallback to a vendor outside it was wrongly skipped ->
+# "All providers failed". The fix unions route_priority + the selected route's
+# vendor + the mandate-fallback vendors.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mandate_fallback_vendor_outside_route_priority_is_attempted():
+    """Mandate pins openai but it's unavailable; the operator declared an
+    anthropic fallback. anthropic is NOT in route_priority, yet because it's
+    an explicitly-declared mandate fallback it must be ATTEMPTED, not skipped."""
+    host = _build_configured_host(
+        [
+            ("anthropic:api", "ok", None),  # the declared mandate fallback
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    # Mandate pins openai (no openai route present -> resolver uses fallbacks).
+    host._mandate_preference = {
+        "vendor": "openai", "route": None, "model": "gpt-5-mini",
+    }
+    host._mandate_fallbacks = [{"vendor": "anthropic", "model": "claude-haiku-4-5"}]
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+    ):
+        chunks.append(chunk)
+    assert host.attempted == ["anthropic:api"], host.attempted
+    assert chunks == ["ok"]
+
+
+def test_resolve_routing_meta_unions_mandate_fallback_vendors():
+    """Helper-level: configured_vendors includes route_priority + mandate
+    vendor + fallback vendors; a bare singleton chain is NOT explicit."""
+    host = _RecordingHost([
+        _provider("anthropic:api", _OkAdapter(_RecordingHost([]), "anthropic:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    host._mandate_preference = {
+        "vendor": "openai", "route": None, "model": "gpt-5-mini",
+    }
+    host._mandate_fallbacks = [{"vendor": "anthropic", "model": "claude-haiku-4-5"}]
+    explicit, vendors = host.resolve_routing_meta()
+    # openai (route_priority + mandate vendor) and anthropic (fallback) both in.
+    assert "openai" in vendors
+    assert "anthropic" in vendors
+    # Mandate openai didn't match any available route (only anthropic present)
+    # -> fell to the fallback CHAIN -> NOT an explicit single-route selection.
+    assert explicit is False
+
+
+def test_resolve_routing_meta_explicit_for_vendor_prefixed_override():
+    """A vendor-prefixed model_override that matches a real route is an
+    explicit selection."""
+    host = _RecordingHost([
+        _provider("anthropic:api", _OkAdapter(_RecordingHost([]), "anthropic:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan"]}
+    explicit, vendors = host.resolve_routing_meta(
+        model_override="anthropic/claude-haiku-4-5",
+    )
+    assert explicit is True
+    assert "anthropic" in vendors  # selected vendor folded in
+    assert "openai" in vendors     # route_priority retained
+
+
+def test_resolve_routing_meta_singleton_incidental_is_not_explicit():
+    """A lone incidental credentialed route (no override, no matching mandate)
+    is NOT an explicit selection — list length must not imply selection."""
+    host = _RecordingHost([
+        _provider("anthropic:api", _OkAdapter(_RecordingHost([]), "anthropic:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    explicit, vendors = host.resolve_routing_meta()
+    assert explicit is False
+    assert vendors == {"openai"}

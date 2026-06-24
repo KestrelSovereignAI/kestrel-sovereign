@@ -1988,23 +1988,28 @@ No other text or formatting.
             model_override=effective_override,
             force_local_only=force_local_only,
         )
+        explicit_selection, configured_vendors = self.resolve_routing_meta(
+            model_override=effective_override,
+            force_local_only=force_local_only,
+        )
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
-        mandate_restricted = len(available_providers) == 1
         errors = {}
         for provider_index, provider in enumerate(available_providers):
-            if not mandate_restricted and self._skip_unconfigured_route(provider):
+            if not explicit_selection and self._skip_unconfigured_route(
+                provider, configured_vendors
+            ):
                 logger.warning(
-                    "Skipping unconfigured-vendor route %s (vendor %s not in "
-                    "route_priority) in get_response; refusing blind "
+                    "Skipping unconfigured-vendor route %s (vendor %s not "
+                    "authorized) in get_response; refusing blind "
                     "cross-vendor fallback.",
                     provider.get("name"), provider.get("vendor"),
                 )
                 errors[provider["name"]] = LLMServiceError(
                     f"Route {provider['name']} skipped: vendor "
-                    f"{provider.get('vendor')} not in route_priority"
+                    f"{provider.get('vendor')} not in authorized vendor set"
                 )
                 continue
             try:
@@ -2065,7 +2070,9 @@ No other text or formatting.
                     error_message=str(e),
                 )
 
-                if self._configured_routes_exhausted(available_providers, provider_index):
+                if self._configured_routes_exhausted(
+                    available_providers, provider_index, configured_vendors
+                ):
                     # Operator's preferred-vendor routes are exhausted; every
                     # remaining candidate is an unconfigured vendor (which the
                     # top-of-loop guard skips). Surface the failure loudly
@@ -2454,6 +2461,15 @@ No other text or formatting.
                 else:
                     target_selector = pref_model
 
+        # Did the caller/operator pin ONE concrete route deliberately?
+        # This loop resolves routing inline (it does not call
+        # resolve_provider_routing), so we track the explicit-selection signal
+        # here directly: True only when a vendor-prefixed selector actually
+        # narrowed ``providers`` to the matched route(s). A singleton that
+        # arises incidentally (e.g. force_local_only left one local route, or
+        # only one credentialed route survived) is NOT an explicit selection
+        # and must still be subject to the unconfigured-route skip.
+        explicit_selection = False
         target_model = None
         if target_selector:
             resolved = self._resolve_model_selector(target_selector, providers=providers)
@@ -2463,6 +2479,7 @@ No other text or formatting.
                 matched = self._filter_providers_by_selector(providers, target_provider)
                 if matched:
                     providers = matched
+                    explicit_selection = True
                     logger.info(f"Model mandate: using {target_provider} with {target_model}")
                 elif model_override:
                     # Same disabled-route helpful error as in
@@ -2492,19 +2509,29 @@ No other text or formatting.
                         f"Available: {[p['name'] for p in providers]}"
                     )
 
-        # Same no-silent-fallback rule as the streaming paths: if routing
-        # was narrowed to one provider (by mandate, route, or override),
-        # failure raises with the *specific* provider+error. No cascade to
-        # an unrelated backend. Never hand the caller a response from a
-        # model they didn't ask for.
-        mandate_restricted = len(providers) == 1
+        # Same no-silent-fallback rule as the streaming paths: if the caller
+        # explicitly pinned a single route (by mandate, route, or override),
+        # failure raises with the *specific* provider+error. No cascade to an
+        # unrelated backend. ``explicit_selection`` is the real pinned-route
+        # signal computed above — NOT ``len(providers) == 1``, which would also
+        # fire for an incidental singleton (an unconfigured vendor that happens
+        # to be the only credentialed route left) and wrongly bypass the
+        # unconfigured-route skip. ``configured_vendors`` is the authorized set
+        # from resolve_routing_meta: route_priority + the selected route's
+        # vendor + any operator-declared mandate-fallback vendor.
+        _, configured_vendors = self.resolve_routing_meta(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
         last_error = None
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
-            if not mandate_restricted and self._skip_unconfigured_route(provider):
+            if not explicit_selection and self._skip_unconfigured_route(
+                provider, configured_vendors
+            ):
                 logger.warning(
-                    "Skipping unconfigured-vendor route %s (vendor %s not in "
-                    "route_priority) in generate_with_messages; refusing blind "
+                    "Skipping unconfigured-vendor route %s (vendor %s not "
+                    "authorized) in generate_with_messages; refusing blind "
                     "cross-vendor fallback.",
                     provider.get("name"), provider.get("vendor"),
                 )
@@ -2548,11 +2575,13 @@ No other text or formatting.
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)
                 last_error = e
-                if mandate_restricted:
+                if explicit_selection:
                     raise LLMServiceError(
                         f"Selected route {provider['name']} failed: {e}"
                     ) from e
-                if self._configured_routes_exhausted(providers, provider_index):
+                if self._configured_routes_exhausted(
+                    providers, provider_index, configured_vendors
+                ):
                     # The operator's preferred-vendor routes are exhausted and
                     # every remaining candidate is an unconfigured vendor (which
                     # the top-of-loop guard skips). Don't silently answer from
