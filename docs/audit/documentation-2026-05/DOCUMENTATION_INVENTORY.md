@@ -24,14 +24,16 @@ This inventory records the OKF migration baseline. It is not a document-by-docum
 
 ## Counts
 
-- Current `docs/` markdown files: 261.
-- Current OKF corpus: 255 OKF documents validate with `scripts/docs_okf.py validate --all docs`.
+- Current `docs/` markdown files: 264.
+- Current OKF corpus: 258 OKF documents validate with `scripts/docs_okf.py validate --all docs`.
 - Reserved OKF generated views: 6 files (`docs/audit/index.md`, `docs/audit/log.md`, `docs/generated/index.md`, `docs/generated/log.md`, `docs/architecture/index.md`, `docs/architecture/log.md`).
 - 0 non-reserved markdown files are missing OKF frontmatter.
 - Previous inventory: `docs/archive/meta/DOCUMENTATION_INVENTORY_2025.md`.
 - Current audit ledger: `docs/audit/DOCUMENTATION_AUDIT_5_2026.md`.
 - OKF migration plan: `docs/audit/OKF_MIGRATION_PLAN.md`.
 - Generated OKF indexes/logs: `docs/audit/index.md`, `docs/audit/log.md`, `docs/generated/index.md`, `docs/generated/log.md`, `docs/architecture/index.md`, `docs/architecture/log.md`.
+- Current verification ledger: `docs/generated/DOC_VERIFICATION.md`.
+- Current renderer manifest: `docs/generated/RENDER_MANIFEST.json`.
 
 ## Directory Map
 
@@ -40,7 +42,7 @@ This inventory records the OKF migration baseline. It is not a document-by-docum
 | `docs/architecture/` | Architecture specs and PRDs | Add/revalidate status banners and package ownership. |
 | `docs/audit/` | Active and historical audit materials | Keep current May 2026 audit visible; mark older matrices by status; use `docs/audit/index.md` for OKF migration status. |
 | `docs/audit/issues/` | GitHub issue bodies and Talon batch inputs | Keep active batches; archive superseded batches after verification. |
-| `docs/generated/` | Generated feature docs and demo evidence | Regenerate feature docs after `KESTREL_FEATURES.md` is corrected; regenerate demo evidence after demo/eye config changes. |
+| `docs/generated/` | Generated feature docs, demo evidence, verification ledger, and render manifest | Regenerate feature docs after `KESTREL_FEATURES.md` is corrected; regenerate demo evidence after demo/eye config changes; regenerate verification surfaces after docs/code changes. |
 | `docs/guides/` | Contributor guides | Reconcile with feature/package extraction and SDK contracts. |
 | `docs/deployment/` | Operator runbooks | Confirm Cloud Run CLI behavior and external-provider boundaries. |
 | `docs/user-documentation/` | End-user explanations and guides | Add optional-package notes where needed. |
@@ -70,4 +72,6 @@ uv run python scripts/docs_okf.py inventory docs/audit/documentation-2026-05 --f
 uv run python scripts/docs_okf.py validate --all docs
 uv run python scripts/docs_okf.py index --check
 uv run python scripts/docs_okf.py log --check
+uv run python scripts/docs_verify.py audit --check
+uv run python scripts/docs_verify.py manifest --check
 ```
