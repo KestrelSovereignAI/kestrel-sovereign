@@ -268,9 +268,29 @@ def test_required_field_is_not_validation_for_command_tools():
     # signal, NOT a tool-argument error — must NOT short-circuit to validation.
     for tool, feature in [("bash", "shell"), ("commandExecution", "codex_native")]:
         decision = classify_escalation_failure(
-            "authentication is required", tool_name=tool, feature_name=feature,
+            "name is required", tool_name=tool, feature_name=feature,
         )
         assert decision.outcome is not EscalationOutcome.VALIDATION_ERROR
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Env/config dependency errors (carry an ENV_VAR name and/or a trailing
+        # "for …" clause) are NOT tool-argument errors even on a feature tool.
+        "GCP_PROJECT_ID is required for Cloud Run deployments",
+        "AZURE_SUBSCRIPTION_ID is required to deploy",
+        # Auth/credential words are not argument fields.
+        "authentication is required",
+        "password is required",
+        "token is required",
+    ],
+)
+def test_env_and_auth_required_not_validation_even_for_feature_tools(raw):
+    decision = classify_escalation_failure(
+        raw, tool_name="deploy", feature_name="deploy",
+    )
+    assert decision.outcome is not EscalationOutcome.VALIDATION_ERROR
 
 
 @pytest.mark.parametrize(

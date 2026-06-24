@@ -192,15 +192,24 @@ _VALIDATION_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 # Required-field validators emit a bare "<field> is required" (e.g.
-# ``title is required``). The phrase is ambiguous with command/auth stderr
-# ("a password is required", "authentication is required"), so it is matched
-# ONLY when the failing tool is NOT a command/shell-execution context AND the
-# message is the clean Kestrel shape (a single field token at the start). For
-# command contexts "is required" is treated as a potential auth/policy signal
-# and left to the normal audit/pattern classification.
+# ``title is required``). The phrase is deeply ambiguous — it also covers
+# command/auth stderr ("a password is required") and env/config dependency
+# errors ("GCP_PROJECT_ID is required for Cloud Run deployments"). It is matched
+# as a tool-argument error ONLY when ALL of these hold (codex review rounds 3–4):
+#   * the failing tool is NOT a command/shell-execution context;
+#   * the field is a lowercase identifier (tool params are ``snake_case``;
+#     env vars are ``UPPER_SNAKE`` and so excluded);
+#   * the message is JUST "<field> is required" with no trailing "for …/to …"
+#     clause (a config-dependency error carries one; a param error does not);
+#   * the field is not an auth/consent/credential word.
 _REQUIRED_FIELD_PATTERN: re.Pattern[str] = re.compile(
-    r"^\s*\w+ is required\b", re.IGNORECASE,
+    r"^([a-z][a-z0-9_]*) is required\.?$",
 )
+_NON_FIELD_REQUIRED_WORDS: frozenset[str] = frozenset({
+    "authentication", "authorization", "password", "passphrase", "token",
+    "credential", "credentials", "login", "permission", "permissions",
+    "approval", "consent", "key", "secret", "subscription", "account",
+})
 _COMMAND_EXECUTION_CONTEXTS: frozenset[str] = frozenset({
     "bash", "sh", "shell", "compute", "commandexecution", "command_execution",
     "filechange", "file_change", "codex_native", "run_command", "execute",
@@ -288,14 +297,19 @@ def classify_escalation_failure(
     # "respect the user's denial and stop".
     if raw:
         is_validation = any(p.search(raw) for p in _VALIDATION_PATTERNS)
-        # Required-field ("<field> is required") only counts as validation for
-        # non-command tools — see _REQUIRED_FIELD_PATTERN.
-        if not is_validation and _REQUIRED_FIELD_PATTERN.search(raw):
-            in_command_ctx = (
-                tool_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
-                or feature_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
-            )
-            is_validation = not in_command_ctx
+        # Required-field ("<field> is required") — tightly bounded; see
+        # _REQUIRED_FIELD_PATTERN.
+        if not is_validation:
+            m = _REQUIRED_FIELD_PATTERN.match(raw)
+            if m is not None:
+                field = m.group(1).lower()
+                in_command_ctx = (
+                    tool_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
+                    or feature_name.strip().lower() in _COMMAND_EXECUTION_CONTEXTS
+                )
+                is_validation = (
+                    field not in _NON_FIELD_REQUIRED_WORDS and not in_command_ctx
+                )
         if is_validation:
             return EscalationDecision(
                 outcome=EscalationOutcome.VALIDATION_ERROR,
