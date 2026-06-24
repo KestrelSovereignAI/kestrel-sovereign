@@ -74,12 +74,32 @@ CONTINUATION_INTENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Some models (notably Anthropic-family) occasionally emit tool-call *syntax*
+# as literal assistant TEXT instead of as a structured ``tool_use`` block —
+# e.g. ``<function_calls><invoke name="todo_add">…</invoke></function_calls>``
+# or a bare ``<invoke name="…">``/``<tool_call>{…}</tool_call>``. When that
+# happens the framework sees only text: no tool runs, yet the model often
+# narrates fabricated success ("got ID 4 … no errors"). Detect the textual
+# form so the same repair turn that handles a narrated-but-uncalled tool also
+# nudges the model to re-emit the call as a real structured tool_use. Matched
+# case-insensitively against the raw assistant text; the tags are distinctive
+# enough that false positives on normal prose are vanishingly unlikely.
+TOOL_CALL_AS_TEXT_RE = re.compile(
+    r"<\s*(?:function_calls|invoke|tool_call|tool_use)\b"
+    r"|\bfunction_calls\s*>",
+    re.IGNORECASE,
+)
+
 TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this turn is still in progress, but you did not emit a tool call.
 
 Continue the same turn now:
 - If the work requires an available tool, emit the tool call now.
 - If no tool is needed or available, provide the final answer now.
 - Do not describe a future tool call without making it."""
+
+TOOL_CALL_AS_TEXT_REPAIR_PROMPT = """Your previous message contained tool-call markup (for example <function_calls>/<invoke>/<tool_call>) written as plain text. That is NOT a real tool call — nothing was executed, so any result you described was fabricated.
+
+Make the call for real now using the structured tool-calling mechanism (emit an actual tool_use block), or, if no tool is needed, give the final answer with no tool-call markup. Do not write tool-call tags as text again."""
 
 
 def _init_constants():
@@ -385,17 +405,47 @@ class OrchestratorEngineMixin:
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
-        """Return True when assistant text promises more tool-backed work."""
+        """Return True when assistant text promises more tool-backed work.
+
+        Covers two no-structured-tool-call failure modes that both warrant a
+        single repair turn:
+
+        * the model *narrates* a future tool call ("let me check the repo…")
+          but emits no ``tool_use`` block, and
+        * the model writes tool-call *syntax* as literal text (e.g.
+          ``<function_calls><invoke name="…">…``) instead of a structured
+          call — which executes nothing and tends to be followed by
+          fabricated success.
+        """
         if not content:
             return False
-        return bool(CONTINUATION_INTENT_RE.search(content))
+        return bool(
+            CONTINUATION_INTENT_RE.search(content)
+            or TOOL_CALL_AS_TEXT_RE.search(content)
+        )
+
+    @staticmethod
+    def _tool_call_emitted_as_text(content: Optional[str]) -> bool:
+        """True when assistant text contains literal tool-call markup."""
+        return bool(content and TOOL_CALL_AS_TEXT_RE.search(content))
 
     @staticmethod
     def _append_missing_tool_call_repair(messages: list, content: str) -> list:
-        """Return a repaired message list for one no-tool continuation retry."""
+        """Return a repaired message list for one no-tool continuation retry.
+
+        Picks the repair directive by failure mode: a literal tool-call-as-text
+        emission gets the sterner prompt that explicitly calls out the
+        fabricated-result risk, while a plain narrated continuation gets the
+        general completion nudge.
+        """
         repaired = list(messages)
         repaired.append({"role": "assistant", "content": content or ""})
-        repaired.append({"role": "user", "content": TURN_COMPLETION_REPAIR_PROMPT})
+        repair_prompt = (
+            TOOL_CALL_AS_TEXT_REPAIR_PROMPT
+            if OrchestratorEngineMixin._tool_call_emitted_as_text(content)
+            else TURN_COMPLETION_REPAIR_PROMPT
+        )
+        repaired.append({"role": "user", "content": repair_prompt})
         return repaired
 
     async def _repair_premature_turn_yield(
