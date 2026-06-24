@@ -463,7 +463,7 @@ async def test_no_silent_swap_to_unconfigured_vendor_get_streaming_response():
     assert chunks == []
     msg = str(ei.value)
     assert "refusing to silently swap vendors" in msg
-    assert "anthropic" in msg
+    assert "unconfigured vendors" in msg
     assert ei.value.provider == "openai:api"
 
 
@@ -551,8 +551,110 @@ async def test_no_silent_swap_stream_with_tool_detection():
     assert "refusing to silently swap vendors" in str(ei.value)
 
 
-def test_helper_classifies_silent_cross_vendor_swap():
-    """Unit-level coverage of the decision helper across the key shapes."""
+# ---------------------------------------------------------------------------
+# Codex P2 regression: an UNCONFIGURED vendor positioned BEFORE a later
+# CONFIGURED route in the chain. The old "no configured route remains" guard
+# returned False here (a configured route still lay ahead) and the loop tried
+# the unconfigured vendor FIRST — exactly the blind cross-vendor answer the
+# guard exists to prevent. The fix skips unconfigured candidates before
+# dispatch, so they are NEVER attempted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_vendor_before_configured_is_skipped_get_streaming_response():
+    """priority=[openai:plan, openai:api]; chain orders the auto-appended
+    anthropic route BEFORE openai:api. openai:plan fails -> anthropic must be
+    SKIPPED (never attempted) and openai:api tried instead."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", CodexAppServerError("codex turn failed")),
+            ("anthropic:api", "ok", None),   # unconfigured, positioned first
+            ("openai:api", "ok", None),       # configured, positioned later
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+    ):
+        chunks.append(chunk)
+    # anthropic must NEVER be attempted even though it sits ahead of openai:api.
+    assert host.attempted == ["openai:plan", "openai:api"], host.attempted
+    assert chunks == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_vendor_before_only_unconfigured_left_raises():
+    """priority=[openai:plan]; chain is [openai:plan, anthropic:api, gemini:api]
+    where the only routes after the failed configured one are unconfigured. The
+    loop must raise loudly (naming openai:plan + the underlying error), never
+    answer from anthropic or gemini."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", RuntimeError("openai 500")),
+            ("anthropic:api", "ok", None),
+            ("gemini:api", "ok", None),
+        ],
+        route_priority=["openai:plan"],
+    )
+    chunks = []
+    with pytest.raises(LLMStreamingError) as ei:
+        async for chunk in host.get_streaming_response(
+            system_prompt="sys", user_prompt="hi",
+        ):
+            chunks.append(chunk)
+    assert host.attempted == ["openai:plan"], host.attempted
+    assert chunks == []
+    msg = str(ei.value)
+    assert "refusing to silently swap vendors" in msg
+    assert "openai:plan" in msg
+    assert "openai 500" in msg
+    assert ei.value.provider == "openai:plan"
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_vendor_before_configured_skipped_stream_with_tool_detection():
+    """Same P2 scenario through stream_with_tool_detection."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", CodexAppServerError("codex turn failed")),
+            ("anthropic:api", "ok", None),
+            ("openai:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    from kestrel_sovereign.llm.remote_backend import BackendType
+    host._backend = BackendType.LOCAL
+    host._remote_client = None
+    chunks = []
+    async for chunk in host.stream_with_tool_detection(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+    ):
+        chunks.append(chunk)
+    assert host.attempted == ["openai:plan", "openai:api"], host.attempted
+    assert chunks == ["ok"]
+
+
+def test_skip_unconfigured_route_helper():
+    """``_skip_unconfigured_route`` decides per-candidate (before dispatch)
+    whether a route's vendor is one the operator configured."""
+    host = _RecordingHost([])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    assert host._skip_unconfigured_route({"name": "openai:plan", "vendor": "openai"}) is False
+    assert host._skip_unconfigured_route({"name": "openai:api", "vendor": "openai"}) is False
+    # anthropic is auto-appended (credentialed) but unchosen -> skip it.
+    assert host._skip_unconfigured_route({"name": "anthropic:api", "vendor": "anthropic"}) is True
+    # No route_priority configured -> never skip (legacy default chain).
+    host.config = {}
+    assert host._skip_unconfigured_route({"name": "anthropic:api", "vendor": "anthropic"}) is False
+
+
+def test_configured_routes_exhausted_helper():
+    """``_configured_routes_exhausted`` raises (True) only when a configured
+    route failed and NO remaining route is from a configured vendor — even if
+    an unconfigured route sits between the failed one and the chain end."""
     host = _RecordingHost([])
     host.config = {"route_priority": ["openai:plan", "openai:api"]}
     providers = [
@@ -561,9 +663,32 @@ def test_helper_classifies_silent_cross_vendor_swap():
         {"name": "anthropic:api", "vendor": "anthropic"},
     ]
     # openai:plan failed, openai:api still ahead -> legitimate same-vendor.
-    assert host._is_silent_cross_vendor_fallback(providers, 0) is False
-    # openai:api failed, only anthropic (unconfigured) left -> blocked.
-    assert host._is_silent_cross_vendor_fallback(providers, 1) is True
-    # No route_priority configured -> never block (legacy behavior).
+    assert host._configured_routes_exhausted(providers, 0) is False
+    # openai:api failed, only anthropic (unconfigured) left -> exhausted.
+    assert host._configured_routes_exhausted(providers, 1) is True
+    # No route_priority configured -> never raise (legacy behavior).
     host.config = {}
-    assert host._is_silent_cross_vendor_fallback(providers, 1) is False
+    assert host._configured_routes_exhausted(providers, 1) is False
+
+
+def test_configured_routes_exhausted_unconfigured_before_configured():
+    """Codex P2 scenario at the helper level: an unconfigured vendor sits
+    BEFORE the next configured route. The helper must NOT report exhaustion
+    yet (a legitimate configured candidate still lies ahead), but the
+    unconfigured candidate must be skipped at the loop's top so it's never
+    attempted first."""
+    host = _RecordingHost([])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    # priority=[openai:plan, openai:api]; chain orders anthropic BEFORE openai:api.
+    providers = [
+        {"name": "openai:plan", "vendor": "openai"},
+        {"name": "anthropic:api", "vendor": "anthropic"},  # unconfigured, ahead
+        {"name": "openai:api", "vendor": "openai"},         # configured, later
+    ]
+    # openai:plan (idx 0) failed: a configured route (openai:api) still lies
+    # ahead, so this is NOT exhaustion — the loop should keep going (skipping
+    # anthropic) and reach openai:api.
+    assert host._configured_routes_exhausted(providers, 0) is False
+    # The intervening anthropic route must be skipped before dispatch.
+    assert host._skip_unconfigured_route(providers[1]) is True
+    assert host._skip_unconfigured_route(providers[2]) is False

@@ -1992,8 +1992,21 @@ No other text or formatting.
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
+        mandate_restricted = len(available_providers) == 1
         errors = {}
         for provider_index, provider in enumerate(available_providers):
+            if not mandate_restricted and self._skip_unconfigured_route(provider):
+                logger.warning(
+                    "Skipping unconfigured-vendor route %s (vendor %s not in "
+                    "route_priority) in get_response; refusing blind "
+                    "cross-vendor fallback.",
+                    provider.get("name"), provider.get("vendor"),
+                )
+                errors[provider["name"]] = LLMServiceError(
+                    f"Route {provider['name']} skipped: vendor "
+                    f"{provider.get('vendor')} not in route_priority"
+                )
+                continue
             try:
                 provider_name = provider['name']
                 logger.info(f"Attempting provider: {provider_name}")
@@ -2052,23 +2065,22 @@ No other text or formatting.
                     error_message=str(e),
                 )
 
-                if self._is_silent_cross_vendor_fallback(available_providers, provider_index):
-                    # Operator's preferred-vendor routes are exhausted; the
-                    # only remaining candidates are a different vendor. Surface
-                    # the failure loudly instead of silently answering from an
-                    # unconfigured vendor (feedback_no_blind_fallbacks).
-                    next_vendor = available_providers[provider_index + 1].get("vendor")
+                if self._configured_routes_exhausted(available_providers, provider_index):
+                    # Operator's preferred-vendor routes are exhausted; every
+                    # remaining candidate is an unconfigured vendor (which the
+                    # top-of-loop guard skips). Surface the failure loudly
+                    # instead of silently answering from an unconfigured vendor
+                    # (feedback_no_blind_fallbacks).
                     logger.error(
-                        "Refusing silent cross-vendor fallback in get_response: "
-                        "preferred vendor %s route %s failed and the only "
-                        "remaining routes are vendor %s. Error: %s",
-                        available_providers[0].get("vendor"), provider["name"],
-                        next_vendor, e,
+                        "Configured routes exhausted in get_response: preferred "
+                        "vendor %s route %s failed and every remaining route is "
+                        "an unconfigured vendor. Error: %s",
+                        available_providers[0].get("vendor"), provider["name"], e,
                     )
                     raise LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
-                        f"only remaining routes are a different vendor "
-                        f"({next_vendor}); refusing to silently swap vendors. "
+                        f"only remaining routes are unconfigured vendors; "
+                        f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
                     ) from e
 
@@ -2489,6 +2501,14 @@ No other text or formatting.
         last_error = None
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
+            if not mandate_restricted and self._skip_unconfigured_route(provider):
+                logger.warning(
+                    "Skipping unconfigured-vendor route %s (vendor %s not in "
+                    "route_priority) in generate_with_messages; refusing blind "
+                    "cross-vendor fallback.",
+                    provider.get("name"), provider.get("vendor"),
+                )
+                continue
             last_provider_name = provider["name"]
             try:
                 model = target_model or provider["model"]
@@ -2532,24 +2552,22 @@ No other text or formatting.
                     raise LLMServiceError(
                         f"Selected route {provider['name']} failed: {e}"
                     ) from e
-                if self._is_silent_cross_vendor_fallback(providers, provider_index):
+                if self._configured_routes_exhausted(providers, provider_index):
                     # The operator's preferred-vendor routes are exhausted and
-                    # the only remaining candidates are a DIFFERENT vendor.
-                    # Don't silently answer from an unconfigured vendor —
-                    # surface the failure loudly (feedback_no_blind_fallbacks).
-                    next_vendor = providers[provider_index + 1].get("vendor")
+                    # every remaining candidate is an unconfigured vendor (which
+                    # the top-of-loop guard skips). Don't silently answer from
+                    # an unconfigured vendor — surface the failure loudly
+                    # (feedback_no_blind_fallbacks).
                     logger.error(
-                        "Refusing silent cross-vendor fallback in "
-                        "generate_with_messages: preferred vendor %s route %s "
-                        "failed and the only remaining routes are vendor %s. "
-                        "Error: %s",
-                        providers[0].get("vendor"), provider["name"],
-                        next_vendor, e,
+                        "Configured routes exhausted in generate_with_messages: "
+                        "preferred vendor %s route %s failed and every remaining "
+                        "route is an unconfigured vendor. Error: %s",
+                        providers[0].get("vendor"), provider["name"], e,
                     )
                     raise LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
-                        f"only remaining routes are a different vendor "
-                        f"({next_vendor}); refusing to silently swap vendors. "
+                        f"only remaining routes are unconfigured vendors; "
+                        f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
                     ) from e
                 logger.warning(
