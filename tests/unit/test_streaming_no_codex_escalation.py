@@ -403,3 +403,167 @@ async def test_stream_with_tool_detection_rotates_on_generic_exception():
         chunks.append(chunk)
     assert host.attempted == ["openai:plan", "anthropic:api"]
     assert chunks == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# No silent cross-vendor fallback away from the operator's configured route.
+#
+# Regression for the blind-fallback bug: an agent configured with
+# ``route_priority = ["openai:plan", "openai:api"]`` (openai vendor only) but
+# whose host also has ANTHROPIC_API_KEY set ends up with an auto-appended
+# ``anthropic:*`` route in ``self.providers``. When the operator's openai
+# routes fail at generation, the chain must NOT silently answer from anthropic
+# — it must surface a loud, diagnostic error (feedback_no_blind_fallbacks).
+# ---------------------------------------------------------------------------
+
+
+def _build_configured_host(
+    providers_spec,
+    *,
+    route_priority,
+):
+    """Host whose ``config`` carries an operator ``route_priority``.
+
+    ``providers_spec`` is a list of ``(name, "raise"|"ok", exc_or_none)``.
+    """
+    host = _RecordingHost([])
+    host.config = {"route_priority": list(route_priority)}
+    built = []
+    for name, kind, exc in providers_spec:
+        if kind == "raise":
+            adapter = _RaisingAdapter(exc, host, name)
+        else:
+            adapter = _OkAdapter(host, name)
+        built.append(_provider(name, adapter))
+    host.providers = built
+    return host
+
+
+@pytest.mark.asyncio
+async def test_no_silent_swap_to_unconfigured_vendor_get_streaming_response():
+    """openai vendor configured; anthropic auto-appended from env. Both openai
+    routes fail -> must raise LLMStreamingError, never stream from anthropic.
+    """
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", CodexAppServerError("codex turn failed")),
+            ("openai:api", "raise", RuntimeError("openai 500")),
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    with pytest.raises(LLMStreamingError) as ei:
+        async for chunk in host.get_streaming_response(
+            system_prompt="sys", user_prompt="hi",
+        ):
+            chunks.append(chunk)
+    # anthropic must NEVER have been attempted.
+    assert host.attempted == ["openai:plan", "openai:api"], host.attempted
+    assert chunks == []
+    msg = str(ei.value)
+    assert "refusing to silently swap vendors" in msg
+    assert "anthropic" in msg
+    assert ei.value.provider == "openai:api"
+
+
+@pytest.mark.asyncio
+async def test_same_vendor_fallback_still_allowed():
+    """openai:plan -> openai:api is the operator's own vendor; allowed."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", CodexAppServerError("codex turn failed")),
+            ("openai:api", "ok", None),
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+    ):
+        chunks.append(chunk)
+    assert host.attempted == ["openai:plan", "openai:api"]
+    assert chunks == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_configured_cross_vendor_fallback_allowed():
+    """If the operator EXPLICITLY listed anthropic in route_priority, falling
+    over to it is their configured choice — not a blind swap.
+    """
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", CodexAppServerError("codex turn failed")),
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "anthropic:api"],
+    )
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+    ):
+        chunks.append(chunk)
+    assert host.attempted == ["openai:plan", "anthropic:api"]
+    assert chunks == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_no_silent_swap_stream_with_messages():
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", CodexAppServerError("codex turn failed")),
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    from kestrel_sovereign.llm.remote_backend import BackendType
+    host._backend = BackendType.LOCAL
+    host._remote_client = None
+    with pytest.raises(LLMStreamingError) as ei:
+        async for _ in host.stream_with_messages(
+            messages=[{"role": "user", "content": "hi"}],
+        ):
+            pass
+    assert host.attempted == ["openai:plan"], host.attempted
+    assert "refusing to silently swap vendors" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_no_silent_swap_stream_with_tool_detection():
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", CodexAppServerError("codex turn failed")),
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    from kestrel_sovereign.llm.remote_backend import BackendType
+    host._backend = BackendType.LOCAL
+    host._remote_client = None
+    with pytest.raises(LLMStreamingError) as ei:
+        async for _ in host.stream_with_tool_detection(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+        ):
+            pass
+    assert host.attempted == ["openai:plan"], host.attempted
+    assert "refusing to silently swap vendors" in str(ei.value)
+
+
+def test_helper_classifies_silent_cross_vendor_swap():
+    """Unit-level coverage of the decision helper across the key shapes."""
+    host = _RecordingHost([])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    providers = [
+        {"name": "openai:plan", "vendor": "openai"},
+        {"name": "openai:api", "vendor": "openai"},
+        {"name": "anthropic:api", "vendor": "anthropic"},
+    ]
+    # openai:plan failed, openai:api still ahead -> legitimate same-vendor.
+    assert host._is_silent_cross_vendor_fallback(providers, 0) is False
+    # openai:api failed, only anthropic (unconfigured) left -> blocked.
+    assert host._is_silent_cross_vendor_fallback(providers, 1) is True
+    # No route_priority configured -> never block (legacy behavior).
+    host.config = {}
+    assert host._is_silent_cross_vendor_fallback(providers, 1) is False

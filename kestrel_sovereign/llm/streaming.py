@@ -93,6 +93,77 @@ class StreamingMixin:
     - _deactivate_remote_backend(reason: Optional[str]) -> None
     """
 
+    def _configured_route_vendors(self) -> set:
+        """Vendors the operator EXPLICITLY chose via ``route_priority``.
+
+        ``ProviderRegistry.initialize_providers`` brings up every *credentialed*
+        route, but lists the operator's ``route_priority`` entries FIRST and
+        appends every other credentialed route afterward (merely because its
+        auth env happens to be set). So ``self.providers`` for an operator who
+        configured ``route_priority = ["openai:plan", "openai:api"]`` is
+        ``[openai:plan, openai:api, <anthropic:* if ANTHROPIC_API_KEY set>, ...]``.
+
+        The vendors named in ``route_priority`` are the operator's *chosen*
+        vendors; any vendor that appears ONLY because its key is in the env is
+        an auto-appended fallback the operator never asked for. Falling back to
+        the latter silently is the blind-fallback bug.
+        """
+        config = getattr(self, "config", None) or {}
+        try:
+            priority = config.get("route_priority") or []
+        except AttributeError:
+            priority = []
+        vendors = set()
+        for key in priority:
+            if isinstance(key, str) and key:
+                vendors.add(key.split(":", 1)[0])
+        return vendors
+
+    def _is_silent_cross_vendor_fallback(
+        self,
+        providers: list,
+        failed_index: int,
+    ) -> bool:
+        """True when falling through past ``providers[failed_index]`` would
+        silently answer the operator from a vendor they did NOT configure.
+
+        ``providers`` is the priority-ordered route chain. The route at
+        ``failed_index`` just failed; the loop is about to try the next
+        candidate. We block (return True) only when:
+
+          1. the failed route belongs to a vendor the operator explicitly
+             configured (it's their chosen route, not an already-degraded
+             tail of the chain), AND
+          2. there is no remaining candidate from any operator-configured
+             vendor — every route left is an auto-appended (credentialed but
+             unchosen) vendor.
+
+        Same-vendor fallback (``openai:plan`` -> ``openai:api``) and fallback
+        to ANOTHER vendor the operator DID list in ``route_priority`` both
+        stay legitimate. Only the swap to a vendor that exists purely because
+        its auth env is set — the blind cross-vendor fallback — is refused
+        (``feedback_no_blind_fallbacks``).
+
+        If the operator declared no ``route_priority`` at all, we can't tell a
+        chosen vendor from an incidental one, so we don't block — preserving
+        the historical default-chain behavior.
+        """
+        if not providers:
+            return False
+        configured_vendors = self._configured_route_vendors()
+        if not configured_vendors:
+            return False  # No explicit operator choice — keep legacy chain.
+        failed_vendor = providers[failed_index].get("vendor")
+        if failed_vendor not in configured_vendors:
+            return False  # Already past the operator's chosen vendors.
+        remaining = providers[failed_index + 1:]
+        if not remaining:
+            return False  # Nothing left — normal "all providers failed".
+        # Legitimate if any remaining route is from a vendor the operator chose.
+        if any(p.get("vendor") in configured_vendors for p in remaining):
+            return False
+        return True
+
     def _check_model_tool_support(
         self,
         providers: list,
@@ -260,7 +331,7 @@ class StreamingMixin:
 
         last_error = None
         last_provider_name = None
-        for provider in providers_to_use:
+        for provider_index, provider in enumerate(providers_to_use):
             try:
                 provider_name = provider["name"]
                 last_provider_name = provider_name
@@ -337,6 +408,22 @@ class StreamingMixin:
                     # the specific error, not a response from a different model.
                     raise LLMStreamingError(
                         f"Selected route {provider_name} failed: {e}",
+                        provider=provider_name,
+                        underlying=e,
+                    )
+                if self._is_silent_cross_vendor_fallback(providers_to_use, provider_index):
+                    next_vendor = providers_to_use[provider_index + 1].get("vendor")
+                    logger.error(
+                        "Refusing silent cross-vendor fallback: preferred "
+                        "vendor %s route %s failed and the only remaining "
+                        "routes are vendor %s. Error: %s",
+                        providers_to_use[0].get("vendor"), provider_name,
+                        next_vendor, e,
+                    )
+                    raise LLMStreamingError(
+                        f"Preferred route {provider_name} failed and the only "
+                        f"remaining routes are a different vendor "
+                        f"({next_vendor}); refusing to silently swap vendors: {e}",
                         provider=provider_name,
                         underlying=e,
                     )
@@ -479,7 +566,7 @@ class StreamingMixin:
 
         last_error = None
         last_provider_name = None
-        for provider in providers:
+        for provider_index, provider in enumerate(providers):
             try:
                 last_provider_name = provider["name"]
                 adapter = provider["adapter"]
@@ -524,6 +611,24 @@ class StreamingMixin:
                 if mandate_restricted:
                     raise LLMStreamingError(
                         f"Selected route {provider['name']} failed: {e}",
+                        provider=provider["name"],
+                        underlying=e,
+                    )
+                if self._is_silent_cross_vendor_fallback(providers, provider_index):
+                    next_vendor = providers[provider_index + 1].get("vendor")
+                    logger.error(
+                        "Refusing silent cross-vendor fallback in "
+                        "stream_with_messages: preferred vendor %s route %s "
+                        "failed and the only remaining routes are vendor %s. "
+                        "Error: %s",
+                        providers[0].get("vendor"), provider["name"],
+                        next_vendor, e,
+                    )
+                    raise LLMStreamingError(
+                        f"Preferred route {provider['name']} failed and the "
+                        f"only remaining routes are a different vendor "
+                        f"({next_vendor}); refusing to silently swap "
+                        f"vendors: {e}",
                         provider=provider["name"],
                         underlying=e,
                     )
@@ -756,7 +861,7 @@ class StreamingMixin:
 
         last_error = None
         last_provider_name = None
-        for provider in providers:
+        for provider_index, provider in enumerate(providers):
             try:
                 adapter = provider["adapter"]
                 model = self._resolve_concrete_model(target_model, provider)
@@ -908,6 +1013,24 @@ class StreamingMixin:
                 if mandate_restricted:
                     raise LLMStreamingError(
                         f"Selected route {provider['name']} failed: {e}",
+                        provider=provider["name"],
+                        underlying=e,
+                    )
+                if self._is_silent_cross_vendor_fallback(providers, provider_index):
+                    next_vendor = providers[provider_index + 1].get("vendor")
+                    logger.error(
+                        "Refusing silent cross-vendor fallback in "
+                        "stream_with_tool_detection: preferred vendor %s route "
+                        "%s failed and the only remaining routes are vendor "
+                        "%s. Error: %s",
+                        providers[0].get("vendor"), provider["name"],
+                        next_vendor, e,
+                    )
+                    raise LLMStreamingError(
+                        f"Preferred route {provider['name']} failed and the "
+                        f"only remaining routes are a different vendor "
+                        f"({next_vendor}); refusing to silently swap "
+                        f"vendors: {e}",
                         provider=provider["name"],
                         underlying=e,
                     )

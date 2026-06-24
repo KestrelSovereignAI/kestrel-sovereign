@@ -1993,7 +1993,7 @@ No other text or formatting.
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
         errors = {}
-        for provider in available_providers:
+        for provider_index, provider in enumerate(available_providers):
             try:
                 provider_name = provider['name']
                 logger.info(f"Attempting provider: {provider_name}")
@@ -2051,6 +2051,26 @@ No other text or formatting.
                     user_prompt=user_prompt,
                     error_message=str(e),
                 )
+
+                if self._is_silent_cross_vendor_fallback(available_providers, provider_index):
+                    # Operator's preferred-vendor routes are exhausted; the
+                    # only remaining candidates are a different vendor. Surface
+                    # the failure loudly instead of silently answering from an
+                    # unconfigured vendor (feedback_no_blind_fallbacks).
+                    next_vendor = available_providers[provider_index + 1].get("vendor")
+                    logger.error(
+                        "Refusing silent cross-vendor fallback in get_response: "
+                        "preferred vendor %s route %s failed and the only "
+                        "remaining routes are vendor %s. Error: %s",
+                        available_providers[0].get("vendor"), provider["name"],
+                        next_vendor, e,
+                    )
+                    raise LLMServiceError(
+                        f"Preferred route {provider['name']} failed and the "
+                        f"only remaining routes are a different vendor "
+                        f"({next_vendor}); refusing to silently swap vendors. "
+                        f"Underlying error: {e}"
+                    ) from e
 
         provider_type = "local" if force_local_only else "all"
         raise LLMAllProvidersFailedError(errors)
@@ -2468,7 +2488,7 @@ No other text or formatting.
         mandate_restricted = len(providers) == 1
         last_error = None
         last_provider_name = None
-        for provider in providers:
+        for provider_index, provider in enumerate(providers):
             last_provider_name = provider["name"]
             try:
                 model = target_model or provider["model"]
@@ -2511,6 +2531,26 @@ No other text or formatting.
                 if mandate_restricted:
                     raise LLMServiceError(
                         f"Selected route {provider['name']} failed: {e}"
+                    ) from e
+                if self._is_silent_cross_vendor_fallback(providers, provider_index):
+                    # The operator's preferred-vendor routes are exhausted and
+                    # the only remaining candidates are a DIFFERENT vendor.
+                    # Don't silently answer from an unconfigured vendor —
+                    # surface the failure loudly (feedback_no_blind_fallbacks).
+                    next_vendor = providers[provider_index + 1].get("vendor")
+                    logger.error(
+                        "Refusing silent cross-vendor fallback in "
+                        "generate_with_messages: preferred vendor %s route %s "
+                        "failed and the only remaining routes are vendor %s. "
+                        "Error: %s",
+                        providers[0].get("vendor"), provider["name"],
+                        next_vendor, e,
+                    )
+                    raise LLMServiceError(
+                        f"Preferred route {provider['name']} failed and the "
+                        f"only remaining routes are a different vendor "
+                        f"({next_vendor}); refusing to silently swap vendors. "
+                        f"Underlying error: {e}"
                     ) from e
                 logger.warning(
                     "Falling through from %s in generate_with_messages: %s",
