@@ -74,6 +74,17 @@ class EscalationOutcome(str, Enum):
     attributes the outcome. Surfaces in the narrative as
     "could not be confirmed"."""
 
+    VALIDATION_ERROR = "validation_error"
+    """The tool ran and rejected its ARGUMENTS — a bad enum value,
+    missing required field, wrong type/shape (e.g. ``scope must be one
+    of …``, ``metadata must be an object``, ``title is required``).
+    This is NOT a denial, sandbox refusal, or policy block: the tool
+    executed and validated the input. It MUST short-circuit ahead of
+    the audit/pattern checks so a stale ``user_denied`` audit row from
+    an unrelated prior call cannot mislabel a plain bad-argument error
+    as a user denial (the agent would then wrongly stop and apologise
+    instead of fixing the argument and retrying)."""
+
 
 # Recent-decision audit row shape. Callers pass a list of dicts (or
 # any Mapping) sourced from ``PermissionStore.get_audit_log`` so
@@ -143,6 +154,28 @@ _POLICY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"policy.+(blocked|denied|refused)", re.IGNORECASE),
     re.compile(r"blocked.+policy", re.IGNORECASE),
     re.compile(r"approval.+no.+decision", re.IGNORECASE),
+)
+
+
+# Input-validation / bad-argument patterns. These mean the tool RAN and
+# rejected its arguments — a deterministic "fix your input and retry" error
+# that is categorically NOT a denial / sandbox / policy / tooling failure.
+# Matched FIRST (ahead of the audit) so a stale unrelated ``user_denied`` row
+# can't relabel a plain bad-argument error as a user denial. Anchored on the
+# validator idioms Kestrel @tool methods emit (``must be one of``, ``is
+# required``, ``must be a/an/structured/in …``, ``got '…'``) to avoid matching
+# arbitrary command stderr.
+_VALIDATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bmust be one of\b", re.IGNORECASE),
+    re.compile(r"\bis required\b", re.IGNORECASE),
+    re.compile(r"\bmust be (?:an?|the|in|structured\b|done\b|one\b)", re.IGNORECASE),
+    re.compile(r"\bmust be structured as\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:invalid|unsupported|malformed|unknown)\s+\w*\s*"
+        r"(?:value|argument|arg|scope|status|priority|field|parameter|format|type|shape)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bcannot be (?:empty|blank|null|none)\b", re.IGNORECASE),
 )
 
 
@@ -217,6 +250,26 @@ def classify_escalation_failure(
     window is timely (the security feature ages out stale rows).
     """
     raw = (raw_error or "").strip()
+
+    # 0. Input-validation errors short-circuit EVERYTHING. The tool ran and
+    # rejected its arguments, so this is categorically not a denial / sandbox /
+    # policy / tooling failure — and crucially, classifying it ahead of the
+    # audit stops a stale unrelated ``user_denied`` row from mislabelling a
+    # plain bad-argument error as a user denial (Emma's todo scope-validation
+    # report). The recovery guidance is "fix the argument and retry", not
+    # "respect the user's denial and stop".
+    if raw:
+        for pattern in _VALIDATION_PATTERNS:
+            if pattern.search(raw):
+                return EscalationDecision(
+                    outcome=EscalationOutcome.VALIDATION_ERROR,
+                    reason=(
+                        "the tool rejected its arguments (input validation); "
+                        "no execution, denial, or block occurred"
+                    ),
+                    evidence_source="raw_error",
+                    raw_error=raw,
+                )
 
     # 1. Audit first. The audit is the source of truth.
     if recent_decisions is not None:
@@ -331,6 +384,12 @@ def format_escalation_outcome(
             f"The escalation{cmd_suffix} could not run due to a "
             f"tooling error — not by an explicit user denial. "
             f"{decision.reason.capitalize()}."
+        )
+    if decision.outcome == EscalationOutcome.VALIDATION_ERROR:
+        return (
+            f"The tool call{cmd_suffix} failed input validation — a bad or "
+            f"missing argument, NOT a user denial or block. "
+            f"{decision.reason.capitalize()}. Correct the argument and retry."
         )
     return (
         f"The escalation{cmd_suffix} outcome could not be confirmed. "

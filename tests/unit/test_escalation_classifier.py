@@ -236,3 +236,64 @@ def test_end_to_end_1563_reproduction():
     assert "user denied" not in text
     assert "rejected by user" not in text
     assert "sandbox" in text or "approval plumbing" in text
+
+
+# ---------------------------------------------------------------------------
+# Input-validation errors must NOT be classified as user denials / blocks.
+# Regression: a todo_add scope-validation error surfaced to the agent as
+# ``user_denied`` (Emma's report) because a stale unrelated denial row matched.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "scope must be one of agent, global, issue, repo, session, got 'feature-review'",
+        "priority must be one of high, low, normal, urgent, got 'medium'",
+        "metadata must be an object",
+        "links must be a list",
+        "title is required",
+        "limit must be an integer, got 'lots'",
+        "outcome must be done, cancelled, or superseded",
+    ],
+)
+def test_input_validation_errors_classify_as_validation_error(raw):
+    decision = classify_escalation_failure(raw, tool_name="todo_add", feature_name="todo")
+    assert decision.outcome is EscalationOutcome.VALIDATION_ERROR
+    assert decision.evidence_source == "raw_error"
+
+
+def test_validation_error_short_circuits_stale_user_denial_row():
+    # The exact shape Emma hit: a bad-scope validation error AND a stale
+    # ``user_denied`` audit row for the SAME tool from an earlier call. The
+    # validation short-circuit must win — this was an argument rejection, not a
+    # denial — so the agent fixes the scope and retries instead of stopping.
+    decision = classify_escalation_failure(
+        "scope must be one of agent, global, issue, repo, session, got 'feature-review'",
+        recent_decisions=[_audit_row(feature="todo", tool="todo_add")],
+        tool_name="todo_add",
+        feature_name="todo",
+    )
+    assert decision.outcome is EscalationOutcome.VALIDATION_ERROR
+    text = format_escalation_outcome(decision).lower()
+    assert "user denied" not in text and "denial" in text
+    assert "retry" in text
+
+
+def test_real_user_denial_still_wins_when_error_is_not_validation():
+    # No regression: a genuine sandbox/denial wording with a backing audit row
+    # is unaffected (it doesn't match the validation idioms).
+    decision = classify_escalation_failure(
+        'tool returned Rejected("rejected by user")',
+        recent_decisions=[_audit_row()],
+        tool_name="bash", feature_name="shell",
+    )
+    assert decision.outcome is EscalationOutcome.USER_DENIED
+
+
+def test_infra_failure_is_not_misread_as_validation():
+    # "Graph store not available" is an infra/tooling problem, not a bad
+    # argument — must NOT short-circuit to VALIDATION_ERROR.
+    decision = classify_escalation_failure(
+        "Graph store not available", tool_name="todo_add", feature_name="todo",
+    )
+    assert decision.outcome is not EscalationOutcome.VALIDATION_ERROR

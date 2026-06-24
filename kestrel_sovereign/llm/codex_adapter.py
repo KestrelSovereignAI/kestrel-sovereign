@@ -532,6 +532,13 @@ _RECOVERY_HINTS: Dict[str, str] = {
         "command result could not be confirmed and ask how they "
         "want to proceed. Do NOT guess that the user denied it."
     ),
+    "validation_error": (
+        "this is an input-validation error — a bad/invalid/missing "
+        "argument, NOT a denial, block, or sandbox refusal. Re-read the "
+        "tool's parameters (the raw error names the offending field and "
+        "the accepted values), correct that argument, and retry. Do NOT "
+        "stop or claim the user denied this."
+    ),
 }
 
 
