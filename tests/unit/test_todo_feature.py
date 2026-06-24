@@ -313,6 +313,45 @@ async def test_todo_complete_can_cancel_without_terminal_satisfaction():
 
 
 @pytest.mark.asyncio
+async def test_todo_complete_normalizes_outcome_synonyms():
+    # American spelling + completion synonyms LLMs reach for must map onto the
+    # canonical outcomes instead of hard-failing the call.
+    agent = _make_agent()
+    agent.storage.graph.get_node = AsyncMock(return_value=_todo_node())
+    feature = await _make_feature(agent)
+
+    # completed -> done (needs terminal satisfaction)
+    result = await feature.todo_complete(
+        todo_id="todo:1", outcome="completed", terminal_condition_satisfied=True,
+    )
+    assert result.status is ToolResultStatus.OK
+    assert agent.storage.graph.add_node.await_args[0][0].properties["status"] == "done"
+
+    # canceled (American) -> cancelled (no terminal needed)
+    agent.storage.graph.add_node.reset_mock()
+    result = await feature.todo_complete(todo_id="todo:1", outcome="canceled")
+    assert result.status is ToolResultStatus.OK
+    assert agent.storage.graph.add_node.await_args[0][0].properties["status"] == "cancelled"
+
+    # duplicate -> superseded (maps to cancelled status, like superseded)
+    agent.storage.graph.add_node.reset_mock()
+    result = await feature.todo_complete(todo_id="todo:1", outcome="duplicate")
+    assert result.status is ToolResultStatus.OK
+    assert agent.storage.graph.add_node.await_args[0][0].properties["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_todo_complete_still_rejects_invalid_outcome():
+    agent = _make_agent()
+    agent.storage.graph.get_node = AsyncMock(return_value=_todo_node())
+    feature = await _make_feature(agent)
+    result = await feature.todo_complete(todo_id="todo:1", outcome="finalize")
+    assert result.status is ToolResultStatus.ERROR
+    assert "outcome must be one of" in (result.error or "")
+    assert "cancelled" in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_todo_rollup_counts_active_items_and_github_talon_links():
     agent = _make_agent()
     agent.storage.graph.query_nodes_by_type_and_property = AsyncMock(
