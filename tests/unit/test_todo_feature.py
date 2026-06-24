@@ -114,6 +114,59 @@ async def test_todo_add_persists_session_scoped_todo_with_terminal_condition():
 
 
 @pytest.mark.asyncio
+async def test_todo_add_accepts_priority_medium_synonym():
+    # Regression: LLMs default to the universal low/medium/high taxonomy, so
+    # priority="medium" was hard-rejected even though it maps cleanly to the
+    # canonical "normal". Accept + normalize instead of failing the call.
+    feature = await _make_feature()
+    result = await feature.todo_add(title="t", priority="medium")
+    assert result.status is ToolResultStatus.OK
+    persisted = feature.agent.storage.graph.add_node.await_args[0][0]
+    assert persisted.properties["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_todo_add_normalizes_priority_and_status_synonyms():
+    feature = await _make_feature()
+    cases = [
+        ({"priority": "MEDIUM"}, "priority", "normal"),   # case-insensitive
+        ({"priority": "critical"}, "priority", "urgent"),
+        ({"priority": "p1"}, "priority", "high"),
+        ({"status": "in-progress"}, "status", "in_progress"),
+        ({"status": "todo"}, "status", "open"),
+    ]
+    for kwargs, field, expected in cases:
+        feature.agent.storage.graph.add_node.reset_mock()
+        result = await feature.todo_add(title="t", **kwargs)
+        assert result.status is ToolResultStatus.OK, (kwargs, result)
+        persisted = feature.agent.storage.graph.add_node.await_args[0][0]
+        assert persisted.properties[field] == expected, (kwargs, persisted.properties[field])
+
+
+@pytest.mark.asyncio
+async def test_todo_add_still_rejects_genuinely_invalid_priority():
+    feature = await _make_feature()
+    result = await feature.todo_add(title="t", priority="supercritical")
+    assert result.status is ToolResultStatus.ERROR
+    assert "priority must be one of" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_todo_update_normalizes_priority_synonym():
+    agent = _make_agent()
+    existing = GraphNode(
+        node_id="todo:1", node_type=TODO_NODE_TYPE, label="t",
+        properties={"id": "todo:1", "agent_id": agent.did, "title": "t", "priority": "low"},
+    )
+    agent.storage.graph.get_node = AsyncMock(return_value=existing)
+    feature = await _make_feature(agent)
+    result = await feature.todo_update(todo_id="todo:1", priority="medium")
+    assert result.status is ToolResultStatus.OK
+    persisted = feature.agent.storage.graph.add_node.await_args[0][0]
+    assert persisted.properties["priority"] == "normal"
+
+
+@pytest.mark.asyncio
 async def test_todo_add_rejects_done_status():
     feature = await _make_feature()
 

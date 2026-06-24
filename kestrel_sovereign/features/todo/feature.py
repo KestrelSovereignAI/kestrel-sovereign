@@ -29,6 +29,34 @@ TODO_STATUSES = OPEN_STATUSES | TERMINAL_STATUSES
 TODO_SCOPES = {"session", "global", "repo", "issue", "agent"}
 TODO_PRIORITIES = {"low", "normal", "high", "urgent"}
 
+# Synonyms LLMs reliably reach for that map cleanly onto the canonical sets.
+# The middle priority is ``normal`` here, but every model defaults to
+# ``medium`` (the universal low/medium/high taxonomy), so accept it rather than
+# hard-failing the call. Likewise for hyphen/space variants of ``in_progress``
+# and common status synonyms. Normalization is case-insensitive.
+_PRIORITY_ALIASES = {
+    "medium": "normal", "med": "normal", "moderate": "normal",
+    "critical": "urgent", "p0": "urgent", "p1": "high", "p2": "normal", "p3": "low",
+}
+_STATUS_ALIASES = {
+    "in-progress": "in_progress", "in progress": "in_progress",
+    "inprogress": "in_progress", "wip": "in_progress",
+    "todo": "open", "pending": "open", "active": "open",
+    "complete": "done", "completed": "done", "finished": "done",
+    "canceled": "cancelled", "cancel": "cancelled", "abandoned": "cancelled",
+}
+_SCOPE_ALIASES: dict = {}
+
+
+def _normalize_choice(value, aliases):
+    """Lower-case + map a known synonym onto its canonical enum value. Unknown
+    values pass through (lower-cased) so the validator still rejects genuine
+    typos with a helpful message. Non-strings (None) pass through untouched."""
+    if not isinstance(value, str):
+        return value
+    key = value.strip().lower()
+    return aliases.get(key, key)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -260,11 +288,22 @@ class TodoFeature(Feature):
         next_check_at: Optional[str] = None,
         source_metadata: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
-        """Create a todo item."""
+        """Create a todo item.
+
+        scope: one of session, global, repo, issue, agent (default session).
+        status: one of open, in_progress, waiting, blocked (default open).
+        priority: one of low, normal, high, urgent (default normal). Common
+        synonyms like "medium" → normal and "critical" → urgent are accepted.
+        """
         if self._graph() is None:
             return ToolResult.failed("Graph store not available")
         if not title or not str(title).strip():
             return ToolResult.failed("title is required")
+        # Accept the synonyms LLMs reach for (e.g. priority="medium") instead of
+        # hard-failing; normalized to the canonical enum before validate/store.
+        scope = _normalize_choice(scope, _SCOPE_ALIASES)
+        status = _normalize_choice(status, _STATUS_ALIASES)
+        priority = _normalize_choice(priority, _PRIORITY_ALIASES)
         for validator, value in (
             (self._validate_scope, scope),
             (self._validate_status, status),
@@ -344,10 +383,18 @@ class TodoFeature(Feature):
         superseded_by: Optional[str] = None,
         source_metadata: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
-        """Update a todo. Null fields are preserved."""
+        """Update a todo. Null fields are preserved.
+
+        scope/status/priority accept the same canonical values and synonyms as
+        todo_add (e.g. priority="medium" → normal).
+        """
         node, err = await self._get_owned_node(todo_id)
         if err:
             return ToolResult.failed(err)
+        # Normalize the same synonyms as todo_add (only non-None fields change).
+        scope = _normalize_choice(scope, _SCOPE_ALIASES)
+        status = _normalize_choice(status, _STATUS_ALIASES)
+        priority = _normalize_choice(priority, _PRIORITY_ALIASES)
         for validator, value in (
             (self._validate_scope, scope),
             (self._validate_status, status),
