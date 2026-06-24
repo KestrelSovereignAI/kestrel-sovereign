@@ -301,8 +301,15 @@ async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
         yield LLMResponse(content="ok", tool_calls=[])
 
     adapter.get_streaming_response_with_tools = _fake_stream
-    provider = {"name": "openai", "adapter": adapter, "client": MagicMock()}
-    monkeypatch.setattr(svc, "resolve_provider_routing", lambda **k: ([provider], "gpt-4o"))
+    provider = {"name": "openai:api", "vendor": "openai", "adapter": adapter,
+                "client": MagicMock()}
+    from kestrel_sovereign.llm.streaming import RoutingResolution
+    monkeypatch.setattr(
+        svc, "resolve_provider_routing",
+        lambda **k: RoutingResolution(
+            [provider], "gpt-4o", svc._compute_route_authorization(**k)
+        ),
+    )
 
     _ = [x async for x in svc.stream_with_tool_detection(
         messages=[{"role": "user", "content": "what is this?"}], images=[_PNG])]

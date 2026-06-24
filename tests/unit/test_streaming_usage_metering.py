@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sovereign.llm.adapter import LLMResponse
-from kestrel_sovereign.llm.streaming import StreamingMixin
+from kestrel_sovereign.llm.streaming import RoutingResolution, StreamingMixin
 
 
 # --------------------------------------------------------------------------
@@ -185,11 +185,10 @@ class _RoutingService(StreamingMixin):
         pass
 
     def resolve_provider_routing(self, **kwargs):
-        return (
-            [{"name": "anthropic", "client": object(),
-              "adapter": self._adapter, "is_local": False}],
-            "claude-x",
-        )
+        providers = [{"name": "anthropic", "client": object(),
+                      "adapter": self._adapter, "is_local": False}]
+        meta = self._compute_route_authorization(**kwargs)
+        return RoutingResolution(providers, "claude-x", meta)
 
     def _check_model_tool_support(self, providers, tools, model_override):
         return tools
