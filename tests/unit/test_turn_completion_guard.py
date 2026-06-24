@@ -162,6 +162,117 @@ async def test_no_tool_continuation_gets_one_repair_step():
     agent._execute_tool_batch.assert_awaited_once()
 
 
+def test_tool_call_emitted_as_text_detected():
+    """Literal tool-call markup in assistant text is recognized as unfinished
+    tool work (root cause of the `kestrel ask` tools-as-text bug)."""
+    xml = (
+        '<function_calls><invoke name="todo_add">'
+        '<parameter name="title">x</parameter></invoke></function_calls>'
+    )
+    assert OrchestratorEngineMixin._tool_call_emitted_as_text(xml)
+    assert OrchestratorEngineMixin._signals_unfinished_tool_work(xml)
+    # Other inline-syntax dialects also count.
+    assert OrchestratorEngineMixin._signals_unfinished_tool_work(
+        '<tool_call>{"name": "todo_add"}</tool_call>'
+    )
+    assert OrchestratorEngineMixin._signals_unfinished_tool_work(
+        '<invoke name="todo_add">'
+    )
+    # Plain prose without markup is NOT flagged by the text-syntax detector.
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        "I added the todo and it now has id 4."
+    )
+
+
+def test_tool_call_as_text_detector_ignores_documentation_and_examples():
+    """The detector requires a real invocation shape and exempts code, so an
+    answer that merely DISCUSSES or quotes the markup is not treated as an
+    unexecuted tool call (codex P2: avoid needless repair turns)."""
+    # Bare tag mentions in prose — no invocation shape.
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        "Use the <invoke> element inside a <function_calls> block to call a tool."
+    )
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        "The <tool_call> and <tool_use> tags wrap structured calls."
+    )
+    # A real invocation, but shown as a fenced code example — documentation.
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        'Here is the syntax:\n```\n<invoke name="todo_add">'
+        '<parameter name="title">x</parameter></invoke>\n```'
+    )
+    # A real invocation quoted in an inline code span — still documentation.
+    assert not OrchestratorEngineMixin._tool_call_emitted_as_text(
+        'You write `<invoke name="todo_add">` to call it.'
+    )
+    # But a raw, real invocation (not in code) still triggers.
+    assert OrchestratorEngineMixin._tool_call_emitted_as_text(
+        '<invoke name="todo_add"><parameter name="title">x</parameter></invoke>'
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_call_as_text_gets_repaired_and_executed():
+    """A model that writes <function_calls>/<invoke> markup as TEXT (no
+    structured tool_use) is given one repair turn that re-emits a real tool
+    call, which then executes — instead of silently fabricating success.
+
+    This is the regression for the `kestrel ask` -> /api/agent/invoke path
+    returning literal tool-call syntax with narrated fake results.
+    """
+    agent = MagicMock()
+    _bind_turn_completion_helpers(agent)
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        side_effect=[
+            # Repair turn: model now emits a REAL structured tool call.
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCall(id="call_1", name="todo_add", arguments={"title": "x"})],
+            ),
+            # Follow-up after the tool result: final answer.
+            LLMResponse(content="Added todo, id 4.", tool_calls=None),
+        ]
+    )
+    agent._build_tool_calls_msg = MagicMock(
+        return_value=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "todo_add", "arguments": '{"title": "x"}'},
+            }
+        ]
+    )
+    agent._execute_tool_batch = AsyncMock()
+    agent._build_all_tools = MagicMock(return_value=[])
+    agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools: msgs)
+
+    tools_as_text = (
+        '<function_calls><invoke name="todo_add">'
+        '<parameter name="title">x</parameter></invoke></function_calls>\n'
+        "Done — got ID 4. No tool errors."
+    )
+
+    handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
+    result = await handler(
+        response=LLMResponse(content=tools_as_text, tool_calls=None),
+        feature_tools=[_tool_schema("todo_add")],
+        system_prompt="sys",
+        force_local_only=False,
+        effective_model="claude-opus-4-8",
+        user_message="add a todo titled x",
+        session_id="session-123",
+    )
+
+    assert result == "Added todo, id 4."
+    assert agent.llm_service.generate_with_messages.await_count == 2
+    # The repair turn used the sterner tools-as-text directive.
+    repair_call = agent.llm_service.generate_with_messages.await_args_list[0].kwargs
+    assert "written as plain text" in repair_call["messages"][-1]["content"]
+    assert "fabricated" in repair_call["messages"][-1]["content"]
+    # The re-emitted structured call was actually executed.
+    agent._execute_tool_batch.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_final_no_tool_answer_does_not_repair():
     agent = MagicMock()
