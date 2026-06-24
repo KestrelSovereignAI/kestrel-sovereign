@@ -303,10 +303,16 @@ class StreamingMixin:
             override_vendor = left.split(":", 1)[0]
             if override_vendor:
                 configured_vendors.add(override_vendor)
-            # Explicit only if the selector actually narrows to a real route;
-            # if it matches nothing resolve_provider_routing raises, so this is
-            # the deliberate single-route case.
-            if self._match_selector(available, left):
+            # Explicit only when the selector pins ONE concrete route. A
+            # route-qualified selector (``vendor:route``, contains ":") names a
+            # single route by composite key, so it is always explicit when it
+            # matches. A vendor-only selector (``vendor``, no ":") matches every
+            # route for that vendor — it is explicit only if it narrows to
+            # EXACTLY ONE route. A vendor-wide selector that matches 2+ routes
+            # (e.g. "openai" → openai:plan AND openai:api) must NOT be explicit,
+            # so same-vendor fallback among the matched routes still works.
+            matched = self._match_selector(available, left)
+            if matched and (":" in left or len(matched) == 1):
                 explicit_selection = True
 
         # --- mandate branch (resolve order step 2) ---
@@ -316,12 +322,20 @@ class StreamingMixin:
         if pref.get("model") and pref_vendor:
             configured_vendors.add(pref_vendor)
             selector = f"{pref_vendor}:{pref_route}" if pref_route else pref_vendor
-            mandate_matched = bool(self._match_selector(available, selector))
-            if mandate_matched and not model_override:
-                # The mandated vendor/route pinned a concrete route — treat as
-                # an explicit selection. If it did NOT match, resolve_provider_
-                # routing uses the declared fallback CHAIN instead, which is a
-                # multi-route configured fallback, not a single pinned route.
+            mandate_matched = self._match_selector(available, selector)
+            # Explicit only when the mandate pins ONE concrete route: a
+            # route-qualified selector (``pref_route`` set → "vendor:route")
+            # names a single route, while a vendor-only mandate ("vendor")
+            # matches every route for that vendor and is explicit only if it
+            # narrows to exactly one. A vendor-wide mandate matching 2+ routes
+            # must NOT be explicit so same-vendor fallback still works. If it
+            # did NOT match, resolve_provider_routing uses the declared fallback
+            # CHAIN instead, which is a multi-route configured fallback.
+            if (
+                mandate_matched
+                and not model_override
+                and (pref_route or len(mandate_matched) == 1)
+            ):
                 explicit_selection = True
 
         # Mandate fallbacks are an operator-declared chain: their vendors are

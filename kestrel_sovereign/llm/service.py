@@ -2479,7 +2479,17 @@ No other text or formatting.
                 matched = self._filter_providers_by_selector(providers, target_provider)
                 if matched:
                     providers = matched
-                    explicit_selection = True
+                    # Explicit only when the selection pins ONE concrete route.
+                    # A route-qualified ``target_provider`` (``vendor:route``,
+                    # contains ":") names a single route by composite key, so it
+                    # is always explicit. A vendor-only ``target_provider``
+                    # (``vendor``, no ":") matches every route for that vendor —
+                    # explicit only if it narrowed to EXACTLY ONE. A vendor-wide
+                    # selector matching 2+ routes (e.g. "openai" → openai:plan
+                    # AND openai:api) must NOT be explicit, so a transient
+                    # failure of the first route still falls through to the
+                    # remaining same-vendor route(s).
+                    explicit_selection = ":" in target_provider or len(matched) == 1
                     logger.info(f"Model mandate: using {target_provider} with {target_model}")
                 elif model_override:
                     # Same disabled-route helpful error as in

@@ -931,3 +931,124 @@ def test_resolve_routing_meta_singleton_incidental_is_not_explicit():
     explicit, vendors = host.resolve_routing_meta()
     assert explicit is False
     assert vendors == {"openai"}
+
+
+# ---------------------------------------------------------------------------
+# Codex P2 (round 4): a VENDOR-WIDE selection that resolves to MULTIPLE routes
+# must NOT be marked explicit — same-vendor fallback among the matched routes
+# must still work. ``explicit_selection`` is True only when the selection pins
+# EXACTLY ONE route, OR when a route-qualified ``vendor:route`` selector was
+# asked for. A bare vendor selector ("openai") matching both openai:plan AND
+# openai:api is a multi-route vendor-wide selection -> NOT explicit, so the
+# first route's transient failure falls through to the next same-vendor route.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_routing_meta_vendor_wide_override_multi_route_not_explicit():
+    """``model_override="openai"`` with both openai:plan and openai:api
+    available matches 2 routes -> NOT explicit (same-vendor fallback intact)."""
+    host = _RecordingHost([
+        _provider("openai:plan", _OkAdapter(_RecordingHost([]), "openai:plan")),
+        _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    explicit, vendors = host.resolve_routing_meta(model_override="openai")
+    assert explicit is False
+    assert "openai" in vendors
+
+
+def test_resolve_routing_meta_route_qualified_override_is_explicit():
+    """A concrete ``vendor:route`` override pins ONE route -> explicit even
+    though other same-vendor routes exist."""
+    host = _RecordingHost([
+        _provider("openai:plan", _OkAdapter(_RecordingHost([]), "openai:plan")),
+        _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    explicit, vendors = host.resolve_routing_meta(
+        model_override="openai:api/gpt-5-mini",
+    )
+    assert explicit is True
+    assert "openai" in vendors
+
+
+def test_resolve_routing_meta_vendor_wide_mandate_multi_route_not_explicit():
+    """A vendor-only mandate ("openai", no route) matching 2 routes is NOT
+    explicit; a route-qualified mandate would be."""
+    host = _RecordingHost([
+        _provider("openai:plan", _OkAdapter(_RecordingHost([]), "openai:plan")),
+        _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    host._mandate_preference = {
+        "vendor": "openai", "route": None, "model": "gpt-5-mini",
+    }
+    explicit, vendors = host.resolve_routing_meta()
+    assert explicit is False
+    assert "openai" in vendors
+
+
+def test_resolve_routing_meta_route_qualified_mandate_is_explicit():
+    """A mandate that pins ``vendor:route`` (openai:api) is a single concrete
+    route -> explicit even with a sibling same-vendor route available."""
+    host = _RecordingHost([
+        _provider("openai:plan", _OkAdapter(_RecordingHost([]), "openai:plan")),
+        _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    host._mandate_preference = {
+        "vendor": "openai", "route": "api", "model": "gpt-5-mini",
+    }
+    explicit, vendors = host.resolve_routing_meta()
+    assert explicit is True
+    assert "openai" in vendors
+
+
+@pytest.mark.asyncio
+async def test_vendor_wide_selection_falls_through_to_same_vendor_route():
+    """End-to-end: model_override="openai" with both openai:plan and openai:api
+    available. openai:plan transiently fails -> the loop must FALL THROUGH to
+    openai:api (same vendor), NOT raise. Regresses the P2 where a vendor-wide
+    selection was wrongly marked explicit and raised on the first failure."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", RuntimeError("openai:plan 503 transient")),
+            ("openai:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+        model_override="openai",
+    ):
+        chunks.append(chunk)
+    # Vendor-wide -> fell through to the second same-vendor route.
+    assert host.attempted == ["openai:plan", "openai:api"], host.attempted
+    assert chunks == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_route_qualified_selection_is_explicit_loud_fail_no_fallthrough():
+    """End-to-end: a concrete ``openai:api`` route-qualified selection is
+    explicit. Its transient failure must raise loudly (Selected route ...
+    failed) and NEVER fall through to the sibling openai:plan route."""
+    host = _build_configured_host(
+        [
+            ("openai:api", "raise", RuntimeError("openai:api 500")),
+            ("openai:plan", "ok", None),  # sibling; must NOT be attempted
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    chunks = []
+    with pytest.raises(LLMStreamingError) as ei:
+        async for chunk in host.get_streaming_response(
+            system_prompt="sys", user_prompt="hi",
+            model_override="openai:api/gpt-5-mini",
+        ):
+            chunks.append(chunk)
+    # Only the pinned route was attempted; no fall-through to openai:plan.
+    assert host.attempted == ["openai:api"], host.attempted
+    assert chunks == []
+    assert "Selected route" in str(ei.value)
+    assert ei.value.provider == "openai:api"
