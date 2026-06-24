@@ -273,6 +273,10 @@ def test_input_validation_errors_classify_as_validation_error(raw):
         "error: a token is required to push",
         'tool returned Rejected("rejected by user")',
         "permission denied (publickey)",
+        # Ordinary command/test output with ", got N" must not be read as a
+        # tool-argument error (codex review).
+        "AssertionError: expected 2 rows, got 1",
+        "TypeError: expected str, got int",
     ],
 )
 def test_non_validation_failures_not_misread_as_validation(raw):

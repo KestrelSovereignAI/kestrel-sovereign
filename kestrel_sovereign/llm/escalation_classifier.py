@@ -185,9 +185,10 @@ _VALIDATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     # Range validator: "<field> must be in [1, 100], got 5"
     re.compile(r"\bmust be in \[", re.IGNORECASE),
-    # The distinctive Kestrel validator suffix appending the rejected value:
-    # "…, got 'feature-review'" / "…, got 5".
-    re.compile(r",\s*got\s+(?:['\"]|-?\d)", re.IGNORECASE),
+    # NB: every Kestrel validator message that appends ", got <value>" also
+    # carries one of the "must be …" clauses above, so a bare ", got …" matcher
+    # is redundant here — and would misread ordinary failures like
+    # "AssertionError: expected 2 rows, got 1" as argument errors (codex review).
 )
 
 
