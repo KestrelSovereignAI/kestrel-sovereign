@@ -62,8 +62,10 @@ This directory holds detailed documentation for kestrel-sovereign. The top-level
 - **[`generated/FEATURES_user.md`](generated/FEATURES_user.md)** — user-facing feature reference
 - **[`generated/FEATURES_investor.md`](generated/FEATURES_investor.md)** — investor-facing feature reference
 - **[`generated/DEMO_EVIDENCE.md`](generated/DEMO_EVIDENCE.md)** — generated index of executable demos and visual-review configs
+- **[`generated/DOC_VERIFICATION.md`](generated/DOC_VERIFICATION.md)** — generated verification ledger for OKF docs, local links, code references, render routing, and recent PR relevance
+- **[`generated/RENDER_MANIFEST.json`](generated/RENDER_MANIFEST.json)** — generated route manifest for public/internal/archive/excluded docs renderers
 
-Regenerate feature audience docs via `scripts/generate_feature_docs.py`; regenerate demo evidence via `scripts/generate_demo_evidence_docs.py`.
+Regenerate feature audience docs via `scripts/generate_feature_docs.py`; regenerate demo evidence via `scripts/generate_demo_evidence_docs.py`; regenerate verification surfaces via `scripts/docs_verify.py`.
 
 ## OKF metadata
 
@@ -81,7 +83,15 @@ Validation:
 uv run python scripts/docs_okf.py validate --all docs
 uv run python scripts/docs_okf.py index --check
 uv run python scripts/docs_okf.py log --check
+uv run python scripts/docs_verify.py audit --check
+uv run python scripts/docs_verify.py manifest --check
 ```
+
+`docs_okf.py` validates metadata shape. `docs_verify.py` is the stronger
+freshness gate: it checks local links, code/file references, render-channel
+routing, and relevant merged PRs in the configured recent window. A clean OKF
+validation means the corpus is machine-readable; the verification ledger shows
+which documents still need content review against code and recent changes.
 
 ## Research & references
 
