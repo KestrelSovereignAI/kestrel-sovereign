@@ -49,7 +49,7 @@ from .adapter import LLMResponse, messages_for
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
-from .streaming import StreamingMixin
+from .streaming import StreamingMixin, RoutingResolution
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
 from kestrel_sovereign.kestrel_config.constants import (
@@ -665,10 +665,18 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         *,
         model_override: Optional[str] = None,
         force_local_only: bool = False,
-    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+    ) -> RoutingResolution:
         """Resolve which routes and model to use for the next LLM call.
 
         Single source of truth for routing. All call paths funnel through here.
+
+        Returns a :class:`RoutingResolution` that unpacks as the historic
+        ``(providers, target_model)`` 2-tuple AND carries ``.meta`` — the
+        no-silent-fallback authorization (``explicit_selection`` +
+        ``authorized_vendors``) computed in this SAME pass by
+        :meth:`StreamingMixin._compute_route_authorization`. The dispatch loops
+        consume ``.meta`` instead of re-deriving it, so the two can no longer
+        drift (the root cause of the prior edge-bug rounds).
 
         Resolution order:
             1. ``model_override`` — caller-supplied ``vendor/model`` or
@@ -833,7 +841,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "OPENAI_API_KEY)."
             )
 
-        return providers_to_use, target_model
+        meta = self._compute_route_authorization(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
+        return RoutingResolution(providers_to_use, target_model, meta)
 
     @staticmethod
     def _provider_supports_embeddings(provider: Dict[str, Any]) -> bool:
@@ -1984,14 +1996,12 @@ No other text or formatting.
         # Use mandate-aware model from prompt if no explicit override
         effective_override = model_override if model_override else self._get_model_for_prompt(user_prompt)
 
-        available_providers, target_model = self.resolve_provider_routing(
+        resolution = self.resolve_provider_routing(
             model_override=effective_override,
             force_local_only=force_local_only,
         )
-        explicit_selection, configured_vendors = self.resolve_routing_meta(
-            model_override=effective_override,
-            force_local_only=force_local_only,
-        )
+        available_providers, target_model = resolution
+        explicit_selection, configured_vendors = resolution.meta
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(available_providers, tools, model_override)
@@ -2461,15 +2471,13 @@ No other text or formatting.
                 else:
                     target_selector = pref_model
 
-        # Did the caller/operator pin ONE concrete route deliberately?
-        # This loop resolves routing inline (it does not call
-        # resolve_provider_routing), so we track the explicit-selection signal
-        # here directly: True only when a vendor-prefixed selector actually
-        # narrowed ``providers`` to the matched route(s). A singleton that
-        # arises incidentally (e.g. force_local_only left one local route, or
-        # only one credentialed route survived) is NOT an explicit selection
-        # and must still be subject to the unconfigured-route skip.
-        explicit_selection = False
+        # Narrow ``providers``/``target_model`` to the pinned selector. This
+        # path resolves routing inline (it does NOT call
+        # resolve_provider_routing), but the no-silent-fallback signals
+        # (``explicit_selection`` + ``authorized_vendors``) are computed once
+        # below by the SAME shared helper resolve_provider_routing uses, so
+        # there is exactly one implementation of "what's authorized + is it
+        # explicit" across both paths.
         target_model = None
         if target_selector:
             resolved = self._resolve_model_selector(target_selector, providers=providers)
@@ -2479,17 +2487,6 @@ No other text or formatting.
                 matched = self._filter_providers_by_selector(providers, target_provider)
                 if matched:
                     providers = matched
-                    # Explicit only when the selection pins ONE concrete route.
-                    # A route-qualified ``target_provider`` (``vendor:route``,
-                    # contains ":") names a single route by composite key, so it
-                    # is always explicit. A vendor-only ``target_provider``
-                    # (``vendor``, no ":") matches every route for that vendor —
-                    # explicit only if it narrowed to EXACTLY ONE. A vendor-wide
-                    # selector matching 2+ routes (e.g. "openai" → openai:plan
-                    # AND openai:api) must NOT be explicit, so a transient
-                    # failure of the first route still falls through to the
-                    # remaining same-vendor route(s).
-                    explicit_selection = ":" in target_provider or len(matched) == 1
                     logger.info(f"Model mandate: using {target_provider} with {target_model}")
                 elif model_override:
                     # Same disabled-route helpful error as in
@@ -2522,14 +2519,17 @@ No other text or formatting.
         # Same no-silent-fallback rule as the streaming paths: if the caller
         # explicitly pinned a single route (by mandate, route, or override),
         # failure raises with the *specific* provider+error. No cascade to an
-        # unrelated backend. ``explicit_selection`` is the real pinned-route
-        # signal computed above — NOT ``len(providers) == 1``, which would also
-        # fire for an incidental singleton (an unconfigured vendor that happens
-        # to be the only credentialed route left) and wrongly bypass the
-        # unconfigured-route skip. ``configured_vendors`` is the authorized set
-        # from resolve_routing_meta: route_priority + the selected route's
-        # vendor + any operator-declared mandate-fallback vendor.
-        _, configured_vendors = self.resolve_routing_meta(
+        # unrelated backend. Both ``explicit_selection`` and
+        # ``configured_vendors`` come from the SAME shared helper
+        # resolve_provider_routing uses, so there's one implementation of the
+        # branching logic. ``explicit_selection`` is the real pinned-route
+        # signal — NOT ``len(providers) == 1``, which would also fire for an
+        # incidental singleton and wrongly bypass the unconfigured-route skip.
+        # The helper mirrors resolve_provider_routing's branch conditions:
+        # override precedence (a bare override does NOT authorize a stale
+        # mandate's vendor, P2a) and mandate fallbacks engaged ONLY when an
+        # active mandate is unmatched (no stale-fallback authorization, P2b).
+        explicit_selection, configured_vendors = self._compute_route_authorization(
             model_override=model_override,
             force_local_only=force_local_only,
         )

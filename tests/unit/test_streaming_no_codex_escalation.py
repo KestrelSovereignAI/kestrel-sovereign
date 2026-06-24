@@ -25,6 +25,7 @@ from kestrel_sovereign.llm.codex_app_server import (
 )
 from kestrel_sovereign.llm.streaming import (
     LLMStreamingError,
+    RoutingResolution,
     StreamingMixin,
     _is_harness_owned_transport_error,
 )
@@ -119,8 +120,11 @@ class _RecordingHost(StreamingMixin):
             if p.get("name") not in self._disabled_routes
         ]
 
-    # ``resolve_routing_meta`` and ``_match_selector`` are inherited from
-    # ``StreamingMixin`` — tests exercise the SAME code path production does.
+    # ``_compute_route_authorization`` and ``_match_selector`` are inherited
+    # from ``StreamingMixin`` — tests exercise the SAME code path production
+    # does. ``resolve_provider_routing`` below returns a ``RoutingResolution``
+    # whose ``.meta`` is computed by that shared helper, exactly as the real
+    # ``LLMService.resolve_provider_routing`` does.
 
     def _filter_providers_by_selector(self, providers, selector):
         # Mirror LLMService's selector filter via the StreamingMixin helper so
@@ -132,13 +136,14 @@ class _RecordingHost(StreamingMixin):
         *,
         model_override: Optional[str] = None,
         force_local_only: bool = False,
-    ):
+    ) -> RoutingResolution:
         # Honor an explicit vendor-prefixed override / mandate the way the
         # real resolver does, so tests can drive a genuine single-route
         # explicit selection through the streaming loops.
         providers = self._available_providers()
         target_model = None
         selector = None
+        chosen = None
         if model_override and ("/" in model_override or ":" in model_override):
             selector = (
                 model_override.split("/", 1)[0]
@@ -158,9 +163,9 @@ class _RecordingHost(StreamingMixin):
         if selector:
             matched = self._filter_providers_by_selector(providers, selector)
             if matched:
-                return matched, target_model
-            # Mandate with declared fallbacks: build the fallback chain.
-            if self._mandate_fallbacks:
+                chosen = (matched, target_model)
+            elif self._mandate_fallbacks:
+                # Mandate with declared fallbacks: build the fallback chain.
                 fb_providers = []
                 for fb in self._mandate_fallbacks:
                     fb_vendor = fb.get("vendor") or fb.get("provider")
@@ -170,8 +175,14 @@ class _RecordingHost(StreamingMixin):
                     if fb_match:
                         fb_providers.append(fb_match[0])
                 if fb_providers:
-                    return fb_providers, None
-        return list(providers), target_model
+                    chosen = (fb_providers, None)
+        if chosen is None:
+            chosen = (list(providers), target_model)
+        meta = self._compute_route_authorization(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
+        return RoutingResolution(chosen[0], chosen[1], meta)
 
     def _resolve_concrete_model(self, target_model, provider):
         return provider.get("model", "test-model")
@@ -897,7 +908,7 @@ def test_resolve_routing_meta_unions_mandate_fallback_vendors():
         "vendor": "openai", "route": None, "model": "gpt-5-mini",
     }
     host._mandate_fallbacks = [{"vendor": "anthropic", "model": "claude-haiku-4-5"}]
-    explicit, vendors = host.resolve_routing_meta()
+    explicit, vendors = host._compute_route_authorization()
     # openai (route_priority + mandate vendor) and anthropic (fallback) both in.
     assert "openai" in vendors
     assert "anthropic" in vendors
@@ -913,7 +924,7 @@ def test_resolve_routing_meta_explicit_for_vendor_prefixed_override():
         _provider("anthropic:api", _OkAdapter(_RecordingHost([]), "anthropic:api")),
     ])
     host.config = {"route_priority": ["openai:plan"]}
-    explicit, vendors = host.resolve_routing_meta(
+    explicit, vendors = host._compute_route_authorization(
         model_override="anthropic/claude-haiku-4-5",
     )
     assert explicit is True
@@ -928,7 +939,7 @@ def test_resolve_routing_meta_singleton_incidental_is_not_explicit():
         _provider("anthropic:api", _OkAdapter(_RecordingHost([]), "anthropic:api")),
     ])
     host.config = {"route_priority": ["openai:plan", "openai:api"]}
-    explicit, vendors = host.resolve_routing_meta()
+    explicit, vendors = host._compute_route_authorization()
     assert explicit is False
     assert vendors == {"openai"}
 
@@ -952,7 +963,7 @@ def test_resolve_routing_meta_vendor_wide_override_multi_route_not_explicit():
         _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
     ])
     host.config = {"route_priority": ["openai:plan", "openai:api"]}
-    explicit, vendors = host.resolve_routing_meta(model_override="openai")
+    explicit, vendors = host._compute_route_authorization(model_override="openai")
     assert explicit is False
     assert "openai" in vendors
 
@@ -965,7 +976,7 @@ def test_resolve_routing_meta_route_qualified_override_is_explicit():
         _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
     ])
     host.config = {"route_priority": ["openai:plan", "openai:api"]}
-    explicit, vendors = host.resolve_routing_meta(
+    explicit, vendors = host._compute_route_authorization(
         model_override="openai:api/gpt-5-mini",
     )
     assert explicit is True
@@ -983,7 +994,7 @@ def test_resolve_routing_meta_vendor_wide_mandate_multi_route_not_explicit():
     host._mandate_preference = {
         "vendor": "openai", "route": None, "model": "gpt-5-mini",
     }
-    explicit, vendors = host.resolve_routing_meta()
+    explicit, vendors = host._compute_route_authorization()
     assert explicit is False
     assert "openai" in vendors
 
@@ -999,7 +1010,7 @@ def test_resolve_routing_meta_route_qualified_mandate_is_explicit():
     host._mandate_preference = {
         "vendor": "openai", "route": "api", "model": "gpt-5-mini",
     }
-    explicit, vendors = host.resolve_routing_meta()
+    explicit, vendors = host._compute_route_authorization()
     assert explicit is True
     assert "openai" in vendors
 
@@ -1052,3 +1063,122 @@ async def test_route_qualified_selection_is_explicit_loud_fail_no_fallthrough():
     assert chunks == []
     assert "Selected route" in str(ei.value)
     assert ei.value.provider == "openai:api"
+
+
+# ---------------------------------------------------------------------------
+# Codex re-review P2 (round 5a): a BARE ``model_override`` while an UNRELATED
+# persisted mandate exists. ``resolve_provider_routing`` gives the override
+# precedence (its ``if model_override`` branch) and does NOT consult / filter
+# to the mandate vendor. The OLD ``resolve_routing_meta`` still folded the
+# mandate's vendor (and its fallbacks) into the authorized set, so
+# ``_skip_unconfigured_route`` could DROP the very route serving the override
+# whenever the mandate vendor differed. The single-source helper now returns
+# from the override branch before touching the mandate, so the override's
+# vendor is authorized and the mandate's is NOT.
+# ---------------------------------------------------------------------------
+
+
+def test_bare_override_does_not_authorize_unrelated_stored_mandate_vendor():
+    """Helper-level P2a: a bare ``vendor/model`` override authorizes the
+    override's vendor only; an unrelated stored mandate's vendor (and its
+    fallbacks) must NOT enter the authorized set."""
+    host = _RecordingHost([
+        _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
+        _provider("anthropic:api", _OkAdapter(_RecordingHost([]), "anthropic:api")),
+    ])
+    host.config = {"route_priority": []}  # no static route_priority
+    # Stored mandate pins anthropic with an unrelated fallback chain.
+    host._mandate_preference = {
+        "vendor": "anthropic", "route": None, "model": "claude-haiku-4-5",
+    }
+    host._mandate_fallbacks = [{"vendor": "vertex_ai", "model": "gemini"}]
+    # Bare override selects openai — override precedence.
+    explicit, vendors = host._compute_route_authorization(
+        model_override="openai/gpt-5-mini",
+    )
+    assert "openai" in vendors                  # the override's vendor
+    assert "anthropic" not in vendors           # P2a: stale mandate vendor excluded
+    assert "vertex_ai" not in vendors           # P2a: stale mandate fallbacks excluded
+    assert explicit is True                      # bare override matched exactly one route
+
+
+@pytest.mark.asyncio
+async def test_bare_override_route_served_not_skipped_despite_stored_mandate():
+    """End-to-end P2a: with a stored anthropic mandate, a bare ``openai/...``
+    override must be SERVED by the openai route — never skipped by the
+    unconfigured-route guard authorizing the unrelated mandate vendor."""
+    host = _build_configured_host(
+        [
+            ("openai:api", "ok", None),       # the override target — must run
+            ("anthropic:api", "ok", None),    # mandate vendor — must NOT be reached
+        ],
+        route_priority=[],
+    )
+    host._mandate_preference = {
+        "vendor": "anthropic", "route": None, "model": "claude-haiku-4-5",
+    }
+    host._mandate_fallbacks = [{"vendor": "vertex_ai", "model": "gemini"}]
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+        model_override="openai/gpt-5-mini",
+    ):
+        chunks.append(chunk)
+    assert host.attempted == ["openai:api"], host.attempted
+    assert chunks == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# Codex re-review P2 (round 5b): a STALE ``_mandate_fallbacks`` list with NO
+# active mandate (default routing). ``resolve_provider_routing`` only consults
+# ``_mandate_fallbacks`` when an ACTIVE mandate's preferred route is unmatched;
+# on a plain default-routing request it never touches them. The OLD
+# ``resolve_routing_meta`` folded fallback vendors in UNCONDITIONALLY, so a
+# leftover fallback list wrongly authorized (and, via the skip guard, could
+# wrongly drop) default providers. The single-source helper engages fallbacks
+# only inside the active-and-unmatched mandate branch.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_mandate_fallbacks_ignored_without_active_mandate():
+    """Helper-level P2b: with no active mandate, a stale ``_mandate_fallbacks``
+    list must NOT contribute vendors to the authorized set — only
+    ``route_priority`` does."""
+    host = _RecordingHost([
+        _provider("openai:plan", _OkAdapter(_RecordingHost([]), "openai:plan")),
+        _provider("openai:api", _OkAdapter(_RecordingHost([]), "openai:api")),
+    ])
+    host.config = {"route_priority": ["openai:plan", "openai:api"]}
+    host._mandate_preference = {}  # NO active mandate
+    # Leftover fallbacks from a previously-cleared mandate.
+    host._mandate_fallbacks = [{"vendor": "anthropic", "model": "claude-haiku-4-5"}]
+    explicit, vendors = host._compute_route_authorization()
+    assert vendors == {"openai"}            # only route_priority — not the stale fallback
+    assert "anthropic" not in vendors        # P2b: stale fallback vendor excluded
+    assert explicit is False
+
+
+@pytest.mark.asyncio
+async def test_stale_mandate_fallbacks_do_not_drop_default_providers():
+    """End-to-end P2b: default routing with a stale ``_mandate_fallbacks`` list.
+    The configured openai routes must still be tried (the stale fallback must
+    neither authorize an unconfigured vendor nor cause a configured route to be
+    skipped). openai:plan transiently fails -> falls through to openai:api."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", RuntimeError("openai:plan 503 transient")),
+            ("openai:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+    )
+    host._mandate_preference = {}  # NO active mandate
+    host._mandate_fallbacks = [{"vendor": "anthropic", "model": "claude-haiku-4-5"}]
+    chunks = []
+    async for chunk in host.get_streaming_response(
+        system_prompt="sys", user_prompt="hi",
+    ):
+        chunks.append(chunk)
+    # Default same-vendor chain intact; stale fallback neither authorized a new
+    # vendor nor dropped a configured route.
+    assert host.attempted == ["openai:plan", "openai:api"], host.attempted
+    assert chunks == ["ok"]

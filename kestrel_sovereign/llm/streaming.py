@@ -21,7 +21,21 @@ chat stream where it corrupts the agent's response.
 """
 import logging
 import time
-from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, AsyncIterator
+from typing import (
+    Awaitable,
+    Callable,
+    Iterator,
+    List,
+    Dict,
+    Any,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    Type,
+    AsyncIterator,
+)
 
 from pydantic import BaseModel
 
@@ -34,6 +48,67 @@ from .error_handling import LLMError
 from .provider_registry import provider_cache_body
 
 logger = logging.getLogger(__name__)
+
+
+class RoutingMeta(NamedTuple):
+    """No-silent-fallback authorization metadata for a routing decision.
+
+    Computed once by :meth:`StreamingMixin._compute_route_authorization` and
+    carried on every :class:`RoutingResolution` so the fallback loops never
+    re-derive it (the drift bug class that produced five rounds of edge cases).
+
+    * ``explicit_selection`` — True iff a SINGLE concrete route was deliberately
+      pinned (a route-qualified ``vendor:route`` override/mandate, or a
+      vendor-only selection that resolved to exactly one route). When True the
+      dispatch loops fail loudly on that route's error rather than fall through.
+      It is NEVER ``len(providers) == 1``: a lone incidental credentialed route
+      is a blind fallback target, not a deliberate selection.
+
+    * ``authorized_vendors`` — the vendors the operator/user/mandate actually
+      authorized for THIS call, computed with the SAME branch conditions
+      :meth:`LLMService.resolve_provider_routing` uses (override-precedence,
+      active-mandate match, fallback-only-when-unmatched, force_local_only).
+      Routes whose vendor is outside this set are unconfigured incidental
+      routes the blind-fallback guard must skip.
+    """
+
+    explicit_selection: bool
+    authorized_vendors: Set[str]
+
+
+class RoutingResolution:
+    """Result of :meth:`LLMService.resolve_provider_routing`.
+
+    The single source of truth for a routing decision. Unpacks as the historic
+    ``(providers, target_model)`` 2-tuple so every existing call site keeps
+    working unchanged, while also exposing :attr:`meta` — the no-silent-fallback
+    authorization computed by the SAME resolution pass. The streaming/dispatch
+    loops read ``resolution.meta`` instead of re-deriving authorization in a
+    parallel ``resolve_routing_meta`` that could drift.
+    """
+
+    __slots__ = ("providers", "target_model", "meta")
+
+    def __init__(
+        self,
+        providers: List[Dict[str, Any]],
+        target_model: Optional[str],
+        meta: RoutingMeta,
+    ) -> None:
+        self.providers = providers
+        self.target_model = target_model
+        self.meta = meta
+
+    def __iter__(self) -> Iterator[Any]:
+        # Back-compat: ``providers, target_model = resolve_provider_routing(...)``
+        yield self.providers
+        yield self.target_model
+
+    def __getitem__(self, index: int) -> Any:
+        return (self.providers, self.target_model)[index]
+
+    def __len__(self) -> int:
+        return 2
 
 
 def _is_harness_owned_transport_error(exc: BaseException) -> bool:
@@ -140,10 +215,11 @@ class StreamingMixin:
         would still be hit first.
 
         ``configured_vendors`` is the resolved authorized-vendor set from
-        :meth:`resolve_routing_meta` — the UNION of ``route_priority``, the
-        explicitly selected route's vendor, and any operator-declared
-        ``_mandate_fallbacks`` vendor. Callers pass it so a mandate fallback to
-        a vendor outside ``route_priority`` is still attempted. When omitted we
+        :meth:`_compute_route_authorization` — the vendors authorized for THIS
+        call (``route_priority`` ∪ the explicitly selected route's vendor ∪ any
+        operator-declared ``_mandate_fallbacks`` vendor that an active unmatched
+        mandate actually engages). Callers pass it so a mandate fallback to a
+        vendor outside ``route_priority`` is still attempted. When omitted we
         fall back to the static ``route_priority`` set.
 
         When the authorized set is empty we can't distinguish a chosen vendor
@@ -173,8 +249,8 @@ class StreamingMixin:
         are spent.
 
         ``configured_vendors`` is the resolved authorized-vendor set from
-        :meth:`resolve_routing_meta` (route_priority ∪ explicitly-selected
-        vendor ∪ mandate-fallback vendors); callers pass it so a mandate
+        :meth:`_compute_route_authorization` (route_priority ∪ explicitly-selected
+        vendor ∪ engaged mandate-fallback vendors); callers pass it so a mandate
         fallback to a vendor outside ``route_priority`` counts as a legitimate
         remaining candidate. When omitted we fall back to the static
         ``route_priority`` set.
@@ -220,54 +296,60 @@ class StreamingMixin:
             return [p for p in providers if p.get("name") == selector]
         return [p for p in providers if p.get("vendor") == selector]
 
-    def resolve_routing_meta(
+    def _compute_route_authorization(
         self,
         *,
         model_override: Optional[str] = None,
         force_local_only: bool = False,
-    ) -> tuple:
-        """Derive the no-silent-fallback signals for a routing decision.
+    ) -> RoutingMeta:
+        """Single implementation of "what's authorized + is it explicit".
 
-        Returns ``(explicit_selection, configured_vendors)``:
+        This is the ONE place the no-silent-fallback signals are derived. Both
+        :meth:`LLMService.resolve_provider_routing` (chat/streaming paths, which
+        wraps the result in a :class:`RoutingResolution`) and
+        :meth:`LLMService.generate_with_messages` (which resolves routing inline)
+        call it, so there is exactly one copy of the branching logic. The prior
+        ``resolve_routing_meta`` re-derived these signals in PARALLEL to
+        ``resolve_provider_routing`` and the two drifted — that drift is the root
+        cause of the five rounds of edge bugs.
 
-        * ``explicit_selection`` — True iff the caller pinned a SINGLE concrete
-          route the operator/user deliberately chose: a vendor-prefixed
-          ``model_override`` (``vendor/...`` or ``vendor:route/...``) or a
-          persisted mandate whose ``vendor`` (optionally ``route``) actually
-          matched an available route. When True the streaming/dispatch loops
-          must fail loudly on that route's error rather than fall through.
+        The branch conditions MIRROR ``resolve_provider_routing`` exactly:
 
-          Crucially this is NOT ``len(providers) == 1``. A singleton chain can
-          arise incidentally — every ``route_priority`` route failed to
-          initialize / is disabled, leaving exactly one *incidental*
-          credentialed route the operator never asked for. That singleton is a
-          blind fallback target, not an explicit selection, so it must still be
-          subject to :meth:`_skip_unconfigured_route`.
+        1. **Override precedence.** A concrete ``model_override`` (``vendor/...``
+           or ``vendor:route/...``) wins. ``resolve_provider_routing`` takes the
+           override branch and does NOT consult the persisted mandate, so when an
+           override is present we do NOT fold the mandate vendor — nor the mandate
+           fallbacks — into the authorized set (P2a). Authorizing a stale
+           mandate's vendor alongside a bare override let
+           ``_skip_unconfigured_route`` drop the very route serving the override.
 
-        * ``configured_vendors`` — the UNION of every vendor the operator/user
-          legitimately authorized: ``route_priority`` vendors, the explicitly
-          selected route's vendor (from ``model_override`` or the matched
-          mandate), every ``_mandate_fallbacks`` vendor, and — when
-          ``force_local_only`` — every local route's vendor (privacy pins those,
-          #1492). Routes whose vendor is outside this set are unconfigured
-          incidental routes that must be skipped (the blind-fallback guard).
-          Sourcing the set from the real mandate resolution — not just static
-          ``route_priority`` — means an operator-declared mandate fallback chain
-          that names a vendor outside ``route_priority`` is still attempted.
+        2. **Active-mandate match.** With no override, a persisted
+           ``{vendor, model, route?}`` mandate authorizes its vendor and — when it
+           narrows to exactly one route (route-qualified, or vendor-only matching
+           a single route) — marks the selection explicit.
 
-        Lives on ``StreamingMixin`` (alongside the other no-silent-fallback
-        helpers) so the dispatch loops in both ``service.py`` and this module
-        share one implementation. It reads host attributes
-        (``_available_providers``, ``_mandate_preference``,
-        ``_mandate_fallbacks``) defensively so process-local hosts that omit
-        them degrade to the ``route_priority``-only set.
+        3. **Fallback-only-when-unmatched.** ``_mandate_fallbacks`` vendors are
+           authorized ONLY when an active mandate exists AND its preferred route
+           did NOT match an available route — the exact condition under which
+           ``resolve_provider_routing`` builds the fallback chain. Folding stale
+           fallbacks in unconditionally (P2b) let a leftover fallback list wrongly
+           authorize/drop default providers on requests that have no active
+           mandate.
+
+        4. **force_local_only.** A deliberate privacy constraint (#1492): every
+           local route's vendor is authorized even when absent from
+           ``route_priority``.
+
+        Reads host attributes (``_available_providers``, ``_mandate_preference``,
+        ``_mandate_fallbacks``) defensively so process-local hosts that omit them
+        degrade to the ``route_priority``-only set.
         """
         # Mirror resolve_provider_routing's "auto" normalization so a bare
         # "auto" override is treated as no-override here too.
         if model_override == "auto":
             model_override = None
 
-        configured_vendors = set(self._configured_route_vendors())
+        authorized_vendors: Set[str] = set(self._configured_route_vendors())
         explicit_selection = False
 
         available_fn = getattr(self, "_available_providers", None)
@@ -279,20 +361,25 @@ class StreamingMixin:
         else:
             available = list(getattr(self, "providers", None) or [])
 
-        # ``force_local_only`` is itself a deliberate routing constraint
-        # (privacy: ISOLATED / EPHEMERAL sessions must stay on a local LLM,
-        # #1492). The local routes it pins are authorized even when their
-        # vendor (e.g. ``ollama``) is absent from ``route_priority`` — they are
-        # the operator/privacy-layer's chosen targets, not blind incidental
-        # fallbacks. Fold every local vendor into the authorized set so the
-        # unconfigured-route skip never strips the only privacy-safe route.
+        # --- force_local_only (resolve order step 3, privacy pin) ---
+        # The local routes it pins are authorized even when their vendor (e.g.
+        # ``ollama``) is absent from ``route_priority`` — they are the
+        # operator/privacy-layer's chosen targets, not blind incidental
+        # fallbacks. Fold every local vendor in so the unconfigured-route skip
+        # never strips the only privacy-safe route.
         if force_local_only:
             for p in available:
                 if p.get("is_local") and p.get("vendor"):
-                    configured_vendors.add(p["vendor"])
+                    authorized_vendors.add(p["vendor"])
 
-        # --- model_override branch (resolve order step 1) ---
-        if model_override and ("/" in model_override or ":" in model_override):
+        # A concrete vendor(:route) prefix on the override is what triggers
+        # override-precedence in resolve_provider_routing.
+        override_has_prefix = bool(
+            model_override and ("/" in model_override or ":" in model_override)
+        )
+
+        # --- 1. model_override branch (override precedence) ---
+        if override_has_prefix:
             # Vendor or vendor:route prefix. The left side before the first
             # "/" is the route selector; a bare ":" with no "/" is itself a
             # vendor:route selector with no model.
@@ -302,7 +389,7 @@ class StreamingMixin:
                 left = model_override
             override_vendor = left.split(":", 1)[0]
             if override_vendor:
-                configured_vendors.add(override_vendor)
+                authorized_vendors.add(override_vendor)
             # Explicit only when the selector pins ONE concrete route. A
             # route-qualified selector (``vendor:route``, contains ":") names a
             # single route by composite key, so it is always explicit when it
@@ -314,13 +401,19 @@ class StreamingMixin:
             matched = self._match_selector(available, left)
             if matched and (":" in left or len(matched) == 1):
                 explicit_selection = True
+            # P2a: override precedence — resolve_provider_routing ignores the
+            # persisted mandate (and therefore its fallbacks) entirely when a
+            # concrete override is present. Return now so neither the mandate
+            # vendor nor stale mandate fallbacks contaminate the authorized set.
+            return RoutingMeta(explicit_selection, authorized_vendors)
 
-        # --- mandate branch (resolve order step 2) ---
+        # --- 2. mandate branch (no override) ---
         pref = getattr(self, "_mandate_preference", None) or {}
         pref_vendor = pref.get("vendor")
         pref_route = pref.get("route")
-        if pref.get("model") and pref_vendor:
-            configured_vendors.add(pref_vendor)
+        mandate_active = bool(pref.get("model") and pref_vendor)
+        if mandate_active:
+            authorized_vendors.add(pref_vendor)
             selector = f"{pref_vendor}:{pref_route}" if pref_route else pref_vendor
             mandate_matched = self._match_selector(available, selector)
             # Explicit only when the mandate pins ONE concrete route: a
@@ -328,25 +421,23 @@ class StreamingMixin:
             # names a single route, while a vendor-only mandate ("vendor")
             # matches every route for that vendor and is explicit only if it
             # narrows to exactly one. A vendor-wide mandate matching 2+ routes
-            # must NOT be explicit so same-vendor fallback still works. If it
-            # did NOT match, resolve_provider_routing uses the declared fallback
-            # CHAIN instead, which is a multi-route configured fallback.
-            if (
-                mandate_matched
-                and not model_override
-                and (pref_route or len(mandate_matched) == 1)
-            ):
+            # must NOT be explicit so same-vendor fallback still works.
+            if mandate_matched and (pref_route or len(mandate_matched) == 1):
                 explicit_selection = True
 
-        # Mandate fallbacks are an operator-declared chain: their vendors are
-        # configured even when absent from route_priority. Always fold them in
-        # so a fallback to a vendor outside route_priority is attempted.
-        for fb in (getattr(self, "_mandate_fallbacks", None) or []):
-            fb_vendor = fb.get("vendor") or fb.get("provider")
-            if fb_vendor:
-                configured_vendors.add(fb_vendor)
+            # --- 3. mandate fallbacks (only when the mandate is active AND
+            # its preferred route did NOT match) — the exact condition under
+            # which resolve_provider_routing builds the fallback chain. P2b:
+            # NEVER fold these in for a default-routing request with no active
+            # mandate, or a stale fallback list would wrongly authorize/drop
+            # default providers.
+            if not mandate_matched:
+                for fb in (getattr(self, "_mandate_fallbacks", None) or []):
+                    fb_vendor = fb.get("vendor") or fb.get("provider")
+                    if fb_vendor:
+                        authorized_vendors.add(fb_vendor)
 
-        return explicit_selection, configured_vendors
+        return RoutingMeta(explicit_selection, authorized_vendors)
 
     def _check_model_tool_support(
         self,
@@ -507,14 +598,12 @@ class StreamingMixin:
             Text chunks as they arrive
         """
         self._check_policy()
-        providers_to_use, target_model = self.resolve_provider_routing(
+        resolution = self.resolve_provider_routing(
             model_override=model_override,
             force_local_only=force_local_only,
         )
-        explicit_selection, configured_vendors = self.resolve_routing_meta(
-            model_override=model_override,
-            force_local_only=force_local_only,
-        )
+        providers_to_use, target_model = resolution
+        explicit_selection, configured_vendors = resolution.meta
 
         last_error = None
         last_provider_name = None
@@ -754,14 +843,12 @@ class StreamingMixin:
                 self._deactivate_remote_backend(reason=str(exc))
 
         # Fall back to standard providers — use centralized routing
-        providers, target_model = self.resolve_provider_routing(
+        resolution = self.resolve_provider_routing(
             model_override=model_override,
             force_local_only=force_local_only,
         )
-        explicit_selection, configured_vendors = self.resolve_routing_meta(
-            model_override=model_override,
-            force_local_only=force_local_only,
-        )
+        providers, target_model = resolution
+        explicit_selection, configured_vendors = resolution.meta
 
         last_error = None
         last_provider_name = None
@@ -1057,14 +1144,12 @@ class StreamingMixin:
                 self._deactivate_remote_backend(reason=str(exc))
 
         # Use centralized provider routing
-        providers, target_model = self.resolve_provider_routing(
+        resolution = self.resolve_provider_routing(
             model_override=model_override,
             force_local_only=force_local_only,
         )
-        explicit_selection, configured_vendors = self.resolve_routing_meta(
-            model_override=model_override,
-            force_local_only=force_local_only,
-        )
+        providers, target_model = resolution
+        explicit_selection, configured_vendors = resolution.meta
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(providers, tools, model_override)
