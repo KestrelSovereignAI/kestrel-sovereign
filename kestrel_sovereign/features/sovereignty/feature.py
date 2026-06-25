@@ -37,7 +37,9 @@ class SovereigntyFeature(Feature):
 
     @tool(
         name="export_sovereignty",
-        description="Export the agent's entire state to IPFS/Filecoin for sovereignty backup.",
+        description="Export the agent's entire state to IPFS/Filecoin for sovereignty backup. "
+                    "storage_tier must be one of 'local', 'ipfs' (default), or 'filecoin'; an "
+                    "unrecognized value is rejected (it is NOT silently defaulted to ipfs).",
         category=ToolCategory.SYSTEM,
         command_prefix="!export-sovereignty"
     )
@@ -53,7 +55,10 @@ class SovereigntyFeature(Feature):
         Args:
             storage_tier: 'local', 'ipfs', or 'filecoin' (default: 'ipfs')
             encrypt: Whether to encrypt the backup (default: True)
-            on_progress: Optional callback(bytes_sent, total_bytes)
+            on_progress: Optional callback(bytes_sent, total_bytes). Not
+                LLM-supplied (an LLM can't pass a callable); retained for
+                internal callers and the export-progress SSE pipeline,
+                which has dedicated test coverage.
 
         Returns:
             ToolResult.ok with CID + tier + size on a clean export, PARTIAL
@@ -62,13 +67,43 @@ class SovereigntyFeature(Feature):
             ToolResult.failed when a paid storage tier cannot be accounted
             for through a wallet.
         """
-        # Map tier string
+        # Validate storage_tier explicitly. The old code resolved this via
+        # ``tier_map.get(storage_tier.lower(), StorageTier.IPFS)``, so a
+        # typo'd / unknown tier SILENTLY fell through to IPFS — the agent
+        # could believe it kept the backup local-only while it was actually
+        # (attempted to be) published to the network, or vice-versa. Reject
+        # unknown / wrong-type tiers loudly. Only an explicitly omitted value
+        # (None or empty/whitespace string) keeps the documented default
+        # ('ipfs'); a falsy non-string such as ``false``/``0``/``[]`` is a
+        # wrong type, NOT an omission, and must be rejected.
+        # Only the tiers FilecoinAdapter.store_content actually persists are
+        # exposed. The cloud_hot / cloud_cold StorageTier members exist in
+        # the enum but the sovereignty export adapter has no storage path for
+        # them — passing them through silently produced a receipt + wallet
+        # charge for a blob that was never written. They are kept OUT of this
+        # map (and out of the endpoint allowlist) until an implementation
+        # lands. The old ``.get(..., IPFS)`` collapsed cloud_hot/cloud_cold to
+        # IPFS silently; rejecting is the honest behavior.
         tier_map = {
             "local": StorageTier.LOCAL_ONLY,
             "ipfs": StorageTier.IPFS,
             "filecoin": StorageTier.FILECOIN,
         }
-        tier_enum = tier_map.get(storage_tier.lower(), StorageTier.IPFS)
+        if storage_tier is None or (isinstance(storage_tier, str) and not storage_tier.strip()):
+            tier_key = "ipfs"
+        elif isinstance(storage_tier, str):
+            tier_key = storage_tier.strip().lower()
+        else:
+            tier_key = None  # wrong type → fall into the rejection below
+        if tier_key not in tier_map:
+            return ToolResult.failed(
+                error=(
+                    f"storage_tier must be one of {', '.join(tier_map)}; "
+                    f"got {storage_tier!r}. The tier was NOT silently "
+                    "defaulted to ipfs — re-run with a valid tier."
+                )
+            )
+        tier_enum = tier_map[tier_key]
 
         # Don't encrypt for local storage (no point, and complicates retrieval)
         encrypt = encrypt and tier_enum != StorageTier.LOCAL_ONLY

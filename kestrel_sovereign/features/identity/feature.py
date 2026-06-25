@@ -68,7 +68,9 @@ class IdentityFeature(Feature):
         name="export_identity",
         description="Export the agent's complete identity to a portable, signed package. "
                     "This creates a JSON package containing DID, constitution, memories, "
-                    "personality, relationships, and skills that can be imported to another substrate.",
+                    "personality, relationships, and skills that can be imported to another substrate. "
+                    "storage_tier must be one of 'local' (default), 'ipfs', or 'filecoin'; an "
+                    "unrecognized value is rejected (it is NOT silently downgraded to local).",
         category=ToolCategory.SYSTEM,
         command_prefix="!identity export"
     )
@@ -86,6 +88,29 @@ class IdentityFeature(Feature):
             sign: Whether to sign the package with DID key
             include_wallet: Whether to include wallet transaction history
         """
+        # Validate storage_tier explicitly. The old code resolved this via
+        # ``tier_map.get(storage_tier.lower(), StorageTier.LOCAL_ONLY)``, so a
+        # typo'd / unknown tier SILENTLY fell through to local-only — the
+        # agent would believe it exported to ipfs/filecoin while the package
+        # never left the host. Reject unknown / wrong-type tiers loudly. Only
+        # an explicitly omitted value (None or an empty/whitespace string)
+        # keeps the documented default ('local'); a falsy non-string such as
+        # ``false``/``0``/``[]`` is a wrong type, NOT an omission, and must
+        # be rejected rather than coerced to the default.
+        valid_tiers = ("local", "ipfs", "filecoin")
+        if storage_tier is None or (isinstance(storage_tier, str) and not storage_tier.strip()):
+            tier_key = "local"
+        elif isinstance(storage_tier, str):
+            tier_key = storage_tier.strip().lower()
+        else:
+            tier_key = None  # wrong type → fall into the rejection below
+        if tier_key not in valid_tiers:
+            return ToolResult.failed(
+                f"storage_tier must be one of {', '.join(valid_tiers)}; "
+                f"got {storage_tier!r}. The tier was NOT silently defaulted "
+                "to local — re-run with a valid tier."
+            )
+
         if not isinstance(sign, bool):
             return ToolResult.failed(
                 f"sign must be a boolean, got {type(sign).__name__}={sign!r}"
@@ -136,7 +161,8 @@ class IdentityFeature(Feature):
                 "ipfs": StorageTier.IPFS,
                 "filecoin": StorageTier.FILECOIN,
             }
-            tier_enum = tier_map.get(storage_tier.lower(), StorageTier.LOCAL_ONLY)
+            # tier_key was validated against tier_map's keys above.
+            tier_enum = tier_map[tier_key]
 
             if tier_enum != StorageTier.LOCAL_ONLY:
                 # Upload to IPFS/Filecoin
