@@ -414,5 +414,82 @@ class TestTrashIntegration:
         assert "Trash" in body or "empty" in body.lower()
 
 
+class TestToolEnumSelfDocumentation:
+    """Tool-schema self-documentation + case normalization (#1925, friction #1923).
+
+    The agent only sees the @tool ``description`` string, not the Python
+    docstring. These tests assert the constrained enum values are advertised in
+    that description AND that case-variant inputs normalize instead of erroring.
+    """
+
+    def test_write_script_description_advertises_languages(self):
+        desc = ComputeFeature.write_script._tool_schema["description"]
+        assert "bash" in desc
+        assert "python" in desc
+
+    def test_run_script_description_advertises_executors(self):
+        desc = ComputeFeature.run_script._tool_schema["description"]
+        for executor in ("uv", "docker", "local"):
+            assert executor in desc
+        # Discovery hint + availability caveat.
+        assert "get_compute_capabilities" in desc
+        assert "KESTREL_ALLOW_LOCAL_COMPUTE" in desc
+
+    def test_list_scripts_description_advertises_all_states(self):
+        desc = ComputeFeature.list_scripts._tool_schema["description"]
+        for state in ScriptState:
+            assert state.value in desc, f"description missing state '{state.value}'"
+
+    def test_script_state_documented_set_matches_enum(self):
+        # The exact, complete ScriptState set. If models.py adds/removes a
+        # member, this fails so the docs stay honest.
+        documented = {
+            "draft", "signed", "pending_review", "approved", "rejected",
+            "queued", "running", "completed", "failed",
+        }
+        assert {s.value for s in ScriptState} == documented
+
+
+class TestToolEnumCaseNormalization:
+    """Case-variant inputs normalize instead of erroring (#1925, friction #1923)."""
+
+    @pytest.mark.asyncio
+    async def test_write_script_language_case_insensitive(self, compute_feature):
+        result = await compute_feature.write_script(
+            name="case_test",
+            language="Python",
+            content='print("hi")',
+            purpose="case normalization",
+        )
+        assert result.data.get("language") == "python"
+        assert "Unsupported language" not in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_run_script_executor_case_insensitive(self, compute_feature):
+        """'UV' must normalize so it resolves to the real executor."""
+        write = await compute_feature.write_script(
+            name="exec_case",
+            language="python",
+            content='print("ok")',
+            purpose="executor case normalization",
+        )
+        script_id = write.data["script_id"]
+        result = await compute_feature.run_script(script_id=script_id, executor="UV")
+        # The case-variant must NOT trip the "Executor 'UV' not available" path.
+        assert "not available" not in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_list_scripts_state_case_insensitive(self, compute_feature):
+        """'Approved' must normalize and not raise an invalid-state error."""
+        result = await compute_feature.list_scripts(state="Approved")
+        assert "Invalid state" not in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_list_scripts_accepts_queued_state(self, compute_feature):
+        """'queued' is a real ScriptState and must be accepted."""
+        result = await compute_feature.list_scripts(state="queued")
+        assert "Invalid state" not in (result.error or "")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

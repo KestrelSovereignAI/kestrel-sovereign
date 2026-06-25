@@ -221,7 +221,11 @@ class ComputeFeature(Feature):
     
     @tool(
         name="write_script",
-        description="Write a new script for later execution. The script is NOT executed immediately - it will be signed, reviewed, and requires user approval.",
+        description=(
+            "Write a new script for later execution. The script is NOT executed "
+            "immediately - it will be signed, reviewed, and requires user "
+            "approval. language is one of: 'bash', 'python' (case-insensitive)."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!compute-write",
     )
@@ -251,6 +255,8 @@ class ComputeFeature(Feature):
         """
         await self._ensure_initialized()
 
+        # Normalize so case/whitespace variants ("Python", " BASH ") resolve.
+        language = language.strip().lower()
         if language not in ("bash", "python"):
             return ToolResult.failed(
                 f"Error: Unsupported language '{language}'. Use 'bash' or 'python'.",
@@ -360,7 +366,14 @@ class ComputeFeature(Feature):
     
     @tool(
         name="run_script",
-        description="Submit a script for execution (requires security review and user approval)",
+        description=(
+            "Submit a script for execution (requires security review and user "
+            "approval). executor is one of: 'uv', 'docker', 'local' "
+            "(case-insensitive). 'docker' requires a running Docker daemon and "
+            "'local' requires KESTREL_ALLOW_LOCAL_COMPUTE — either may be "
+            "unavailable on this host. Call get_compute_capabilities to discover "
+            "the live set of available executors."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!compute-run",
     )
@@ -372,23 +385,30 @@ class ComputeFeature(Feature):
     ) -> ToolResult:
         """
         Submit a script for execution.
-        
+
         This triggers the security review and approval flow:
         1. Security hook analyzes the script
         2. If risky patterns found, auto-reject or require approval
         3. User is notified via approval queue
         4. On approval, script executes in sandbox
-        
+
         Args:
             script_id: ID of the script to run (full or prefix)
-            executor: Execution environment ("uv", "docker", or "local")
+            executor: Execution environment ("uv", "docker", or "local",
+                case-insensitive). 'docker'/'local' may be unavailable depending
+                on the host (Docker daemon / KESTREL_ALLOW_LOCAL_COMPUTE). Call
+                get_compute_capabilities to discover the live set.
             timeout: Maximum execution time in seconds
-            
+
         Returns:
             Execution result or status message
         """
         # Ensure async initialization is complete
         await self._ensure_initialized()
+
+        # Normalize executor so case/whitespace variants ("UV", " Docker ")
+        # resolve to the canonical executor key.
+        executor = executor.strip().lower()
         
         # Find script
         script = await self.script_store.find_by_id_prefix(script_id)
@@ -637,7 +657,12 @@ class ComputeFeature(Feature):
     
     @tool(
         name="list_scripts",
-        description="List all scripts or filter by state",
+        description=(
+            "List all scripts or filter by state. state is one of: 'draft', "
+            "'signed', 'pending_review', 'approved', 'rejected', 'queued', "
+            "'running', 'completed', 'failed' (case-insensitive), or empty for "
+            "all scripts."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!compute-list",
     )
@@ -650,12 +675,14 @@ class ComputeFeature(Feature):
         List scripts in the store.
 
         Args:
-            state: Filter by state (draft, signed, pending_review, approved, rejected, running, completed, failed)
+            state: Filter by state (draft, signed, pending_review, approved,
+                rejected, queued, running, completed, failed). Case-insensitive;
+                empty lists all scripts.
             limit: Maximum number of results
         """
         if state:
             try:
-                script_state = ScriptState(state)
+                script_state = ScriptState(state.strip().lower())
                 scripts = await self.script_store.list_by_state(script_state, limit)
             except ValueError:
                 return ToolResult.failed(
