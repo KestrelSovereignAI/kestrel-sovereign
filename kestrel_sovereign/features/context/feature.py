@@ -301,7 +301,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="summarize_section",
-        description="Summarize a specific section of conversation history to save context space. Use this to compact verbose exchanges while preserving key information.",
+        description="Summarize a specific section of conversation history to save context space. Use this to compact verbose exchanges while preserving key information. mode must be one of: time_range, topic, messages, last_n.",
         category=ToolCategory.MEMORY,
         command_prefix="!context summarize"
     )
@@ -315,10 +315,20 @@ class ContextFeature(Feature):
         Summarize a section of conversation.
 
         Args:
-            mode: Selection mode - "time_range", "topic", "messages", or "last_n"
-            criteria: Selection criteria based on mode
+            mode: Selection mode - one of "time_range", "topic", "messages", "last_n".
+            criteria: Selection criteria, interpreted per mode - messages: comma-separated message IDs e.g. "1,2,3"; last_n: an integer count e.g. "10"; topic: a free-text search query; time_range: "before_today" | "last_<n>_hours"/"last_<n>_days"/"last_<n>_minutes" e.g. "last_2_hours" | an ISO date range "YYYY-MM-DD..YYYY-MM-DD".
             preserve_key_facts: Keep explicit facts, decisions, commitments (default True)
         """
+        valid_modes = ("time_range", "topic", "messages", "last_n")
+        normalized_mode = mode.strip().lower() if isinstance(mode, str) else mode
+        if normalized_mode not in valid_modes:
+            return ToolResult.failed(
+                f"Invalid mode {mode!r}. Must be one of: "
+                f"{', '.join(valid_modes)}.",
+                data={"mode_requested": mode, "valid_modes": list(valid_modes)},
+            )
+        mode = normalized_mode
+
         if not isinstance(preserve_key_facts, bool):
             return ToolResult.failed(
                 "preserve_key_facts must be a boolean, got "
