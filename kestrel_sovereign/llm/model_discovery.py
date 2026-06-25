@@ -120,6 +120,12 @@ class ModelDiscoveryMixin:
         from kestrel_sovereign.agent.token_counter import register_discovered_limits
         register_discovered_limits(all_models)
 
+        # Build per-route catalogs for routes whose adapter exposes its OWN
+        # serveable set (e.g. openai:plan via codex's models_cache.json),
+        # distinct from the vendor's shared discovery. Must precede
+        # auto-resolution so those routes resolve against their own catalog.
+        await self._build_route_catalogs()
+
         # Auto-resolve providers with model="auto" to the first discovered chat model
         self._resolve_auto_providers(all_models)
 
@@ -151,22 +157,43 @@ class ModelDiscoveryMixin:
     def _resolve_auto_providers(self, models: list) -> None:
         """Resolve routes whose configured model is ``"auto"`` using discovered models.
 
-        Each route inherits the model catalog of its vendor. Selection is driven
-        by the route's ``selection_hints`` (config), then by rank heuristics.
+        Most routes inherit the model catalog of their *vendor*; selection is
+        driven by the route's ``selection_hints`` (config), then rank heuristics.
+
+        A route whose adapter exposes its OWN serveable catalog (e.g.
+        ``openai:plan`` via codex's ``models_cache.json``) resolves against
+        THAT catalog instead — its serveable set differs from the vendor's
+        full discovery (``openai:api``'s full OpenAI catalog), so resolving
+        against the shared catalog picks models codex rejects.
         """
         if not hasattr(self, 'providers') or not isinstance(self.providers, list):
             return
+        # On the sync cache-hit paths (``_load_from_disk_cache``) route catalogs
+        # haven't been built by the async discovery phase yet — build them now
+        # so route-scoped routes still resolve correctly. No-op if already built.
+        self._ensure_route_catalogs_sync()
+        route_catalogs = getattr(self, "_route_catalogs", None) or {}
         for provider in self.providers:
             if provider.get("model") != "auto":
                 continue
             vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
             route_key = provider.get("name")
-            candidates = [
-                m for m in models
-                if m.provider == vendor
-                and m.category == ModelCategory.CHAT
-                and not m.is_hidden
-            ]
+            if route_key in route_catalogs:
+                # Route-scoped (e.g. codex/openai:plan): resolve ONLY against the
+                # route's own serveable catalog — never the vendor catalog. An
+                # empty catalog yields no candidate, leaving ``auto`` unresolved
+                # so the adapter sends no model and codex uses its own default.
+                candidates = [
+                    m for m in route_catalogs[route_key]
+                    if m.category == ModelCategory.CHAT and not m.is_hidden
+                ]
+            else:
+                candidates = [
+                    m for m in models
+                    if m.provider == vendor
+                    and m.category == ModelCategory.CHAT
+                    and not m.is_hidden
+                ]
             hints = list(provider.get("selection_hints") or [])
             selected = self._select_auto_model_for_route(candidates, hints)
             if selected:
@@ -174,6 +201,88 @@ class ModelDiscoveryMixin:
                 logger.info(f"Auto-resolved model for {route_key}: {provider['model']}")
             else:
                 logger.warning(f"No chat models discovered for {route_key} (vendor={vendor}) — 'auto' unresolved")
+
+    def _route_specific_catalog_adapters(self):
+        """Yield ``(route_key, adapter)`` for routes that expose their OWN catalog.
+
+        A route is "route-specific" when its adapter overrides ``list_models``
+        away from the base subscription contract (which raises
+        ``NotImplementedError``). Today only ``CodexAdapter`` (openai:plan)
+        qualifies; ``ClaudeMaxAdapter`` (anthropic:plan) still raises, so it
+        is correctly skipped and keeps inheriting the vendor catalog.
+        """
+        if not hasattr(self, 'providers') or not isinstance(self.providers, list):
+            return
+        try:
+            from .codex_adapter import CodexAdapter
+        except Exception:  # pragma: no cover - import-safety
+            return
+        for provider in self.providers:
+            adapter = provider.get("adapter")
+            route_key = provider.get("name")
+            if route_key and isinstance(adapter, CodexAdapter):
+                yield route_key, adapter
+
+    async def _build_route_catalogs(self) -> None:
+        """Populate ``self._route_catalogs`` from route-specific adapters.
+
+        Keyed by route name (e.g. ``"openai:plan"``). A route-specific route is
+        ALWAYS entered (even with an empty catalog) so it never falls back to
+        the vendor's shared discovery — that fallback would *resolve* the route
+        to an API-only model codex rejects (e.g. ``gpt-5.5-pro``). An empty
+        catalog instead leaves ``auto`` unresolved, so the adapter sends no
+        model and codex uses its own serveable subscription default (e.g. on a
+        fresh install before ``models_cache.json`` exists).
+        """
+        catalogs: dict[str, list] = {}
+        for route_key, adapter in self._route_specific_catalog_adapters():
+            try:
+                models = await adapter.list_models()
+            except NotImplementedError:
+                continue
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("route %s: catalog build failed: %s", route_key, e)
+                models = []
+            # Register even when empty: membership marks the route as
+            # route-scoped so it never inherits the vendor catalog.
+            catalogs[route_key] = models or []
+            logger.debug("route %s: %d route-specific models", route_key, len(models or []))
+        self._route_catalogs = catalogs
+
+    def _ensure_route_catalogs_sync(self) -> None:
+        """Synchronously ensure ``self._route_catalogs`` is populated.
+
+        Used by the sync disk-cache resolution path (``_load_from_disk_cache``
+        runs in ``LLMService.__init__``, outside any event loop). Route-specific
+        adapters (codex) read a local JSON cache, so driving their async
+        ``list_models`` via ``asyncio.run`` is cheap and side-effect-free.
+        No-op if catalogs were already built by the async discovery phase.
+        """
+        import asyncio
+
+        if getattr(self, "_route_catalogs", None) is not None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — safe to drive the async builder synchronously.
+            try:
+                asyncio.run(self._build_route_catalogs())
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("sync route-catalog build skipped: %s", e)
+                self._route_catalogs = {}
+        else:
+            # A loop is already running (rare on this path); we can't await
+            # the adapter's list_models. Still register every route-specific
+            # route as an EMPTY catalog (this enumeration is sync) so the plan
+            # route is marked route-scoped and never inherits the vendor's API
+            # catalog (e.g. gpt-5.5-pro). Empty leaves ``auto`` unresolved →
+            # codex uses its own serveable default. The async discovery phase
+            # (_build_route_catalogs) later overwrites with the real catalog.
+            self._route_catalogs = {
+                route_key: []
+                for route_key, _ in self._route_specific_catalog_adapters()
+            }
 
     def _select_auto_model_for_route(
         self,

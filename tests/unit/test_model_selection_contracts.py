@@ -1,11 +1,53 @@
 """Contracts for shared config-driven model selection helpers."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from kestrel_sovereign.llm.model_selection import (
     _numeric_rank,
     _rank_cached_candidates,
     resolve_provider_default,
 )
+from kestrel_sovereign.llm.service import LLMService
+
+
+def test_resolve_concrete_model_route_scoped_never_uses_vendor_cache():
+    """A route-scoped route (codex/openai:plan) that's still 'auto' must return
+    'auto' (→ adapter sends no model → codex default), NEVER resolve_provider_
+    default's vendor cache (which can hold gpt-5.5-pro). Closes the last path
+    where openai:plan could 400 (codex review)."""
+    # Fresh cache-less startup: _route_catalogs not built yet; the fallback
+    # must lazily register route-specific routes (even empty) and return "auto"
+    # WITHOUT ever consulting the vendor cache (codex review round 4/5).
+    stub = SimpleNamespace(_route_catalogs=None)
+
+    def _ensure():
+        if stub._route_catalogs is None:
+            stub._route_catalogs = {"openai:plan": []}  # route-scoped, empty
+    stub._ensure_route_catalogs_sync = _ensure
+
+    provider = {"name": "openai:plan", "vendor": "openai", "route": "plan",
+                "model": "auto"}
+    # If the guard fails, resolve_provider_default would be hit and could
+    # return gpt-5.5-pro; assert it is NOT called and we get "auto".
+    with patch("kestrel_sovereign.llm.model_selection.resolve_provider_default",
+               side_effect=AssertionError("vendor cache must not be consulted")):
+        result = LLMService._resolve_concrete_model(stub, None, provider)
+    assert result == "auto"
+
+
+def test_resolve_concrete_model_non_route_scoped_still_resolves_default():
+    """Non-route-scoped routes keep the existing behavior: lazy-resolve from
+    the vendor default when still 'auto'."""
+    stub = SimpleNamespace(_route_catalogs={})
+    provider = {"name": "openai:api", "vendor": "openai", "route": "api",
+                "model": "auto"}
+    with patch("kestrel_sovereign.llm.model_selection.resolve_provider_default",
+               return_value="gpt-5.5") as m:
+        result = LLMService._resolve_concrete_model(stub, None, provider)
+    assert result == "gpt-5.5"
+    m.assert_called_once()
 
 
 def test_resolve_provider_default_prefers_explicit_model():
