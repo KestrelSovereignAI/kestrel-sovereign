@@ -570,6 +570,12 @@ class MemoryFeature(Feature):
         if limit_val < 1:
             return ToolResult.failed("limit must be >= 1")
 
+        if not isinstance(mood, str):
+            return ToolResult.failed(
+                f"mood must be a string (positive, negative, or neutral), "
+                f"got {type(mood).__name__}={mood!r}"
+            )
+
         if not self.memory_retriever:
             # Fallback path: surface as PARTIAL so the LLM cannot claim
             # the emotionally-weighted recall ran when the retriever was
@@ -598,18 +604,26 @@ class MemoryFeature(Feature):
                 },
             )
 
+        # Mood is mapped to a valence weighting. An unknown, non-empty mood
+        # is treated as neutral but surfaced as PARTIAL so the agent is not
+        # silently misled into thinking its mood was honored.
+        valence_map = {
+            "positive": 0.6,
+            "negative": -0.6,
+            "neutral": 0.0,
+        }
+        normalized_mood = mood.lower().strip()
+        mood_recognized = normalized_mood in valence_map
+        mood_unrecognized = bool(normalized_mood) and not mood_recognized
+
         try:
             from kestrel_sovereign.storage.memory_models import MemoryMetadata
 
-            mood_valence = {
-                "positive": 0.6,
-                "negative": -0.6,
-                "neutral": 0.0,
-            }.get(mood.lower(), 0.0)
+            mood_valence = valence_map.get(normalized_mood, 0.0)
 
             emotional_context = MemoryMetadata(
                 emotional_valence=mood_valence,
-                emotional_intensity=0.5 if mood != "neutral" else 0.0,
+                emotional_intensity=0.5 if mood_valence != 0.0 else 0.0,
             )
 
             memories = await self.memory_retriever.retrieve(
@@ -641,18 +655,35 @@ class MemoryFeature(Feature):
                 "timestamp": mem.get("timestamp", ""),
             })
 
+        data = {
+            "memories": formatted,
+            "count": len(formatted),
+            "query": query,
+            "mood_context": mood,
+            "mood_requested": mood,
+            "limit_requested": limit_val,
+        }
+
+        if mood_unrecognized:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Retrieved {len(formatted)} memory(ies) with human-like "
+                    f"weighting (limit requested: {limit_val})"
+                ),
+                error=(
+                    f"mood={mood!r} is not a recognized value (expected "
+                    f"positive, negative, or neutral); treated as neutral "
+                    f"(no emotional weighting applied)"
+                ),
+                data=data,
+            )
+
         return ToolResult.ok(
             confirmation=(
                 f"Retrieved {len(formatted)} memory(ies) with human-like "
                 f"weighting (mood={mood}, limit requested: {limit_val})"
             ),
-            data={
-                "memories": formatted,
-                "count": len(formatted),
-                "query": query,
-                "mood_context": mood,
-                "limit_requested": limit_val,
-            },
+            data=data,
         )
 
     @tool(
