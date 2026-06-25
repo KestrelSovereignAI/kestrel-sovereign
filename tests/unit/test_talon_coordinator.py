@@ -342,7 +342,10 @@ class TestTalonToolDocumentation:
         }
         # default_model must keep the codex/opencode tail (was cut at "When").
         assert "opencode" in params["default_model"]
-        assert "provider model id" in params["default_model"]
+        # codex/opencode model is OPTIONAL (omit for provider default), NOT
+        # required — the schema must not overstate it (codex round-2 P2).
+        assert "provider default" in params["default_model"].lower()
+        assert "optional" in params["default_model"].lower()
         # default_auth_lane must keep the full cross-field rule tail.
         assert "allow_api_billing" in params["default_auth_lane"]
 

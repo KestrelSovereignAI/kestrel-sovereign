@@ -993,8 +993,9 @@ class TalonCoordinatorFeature(Feature):
             "changed by this tool). Writes the same defaults that talon_claim "
             "consumes per-dispatch. Allowed values: "
             "default_backend ∈ {claude, codex, opencode}; "
-            "default_model — when backend=claude one of {opus, sonnet, haiku}, "
-            "when backend=codex/opencode a non-blank provider model id; "
+            "default_model — when backend=claude one of {opus, sonnet, haiku} "
+            "(required), when backend=codex/opencode optional (omit to use the "
+            "provider default; an explicitly blank value is rejected); "
             "default_auth_lane ∈ {oauth, api_key, provider_config}. "
             "Cross-field rules: codex ⇒ auth_lane=oauth; "
             "opencode ⇒ auth_lane=provider_config; "
@@ -1024,7 +1025,7 @@ class TalonCoordinatorFeature(Feature):
 
         Args:
             default_backend: Talon runtime backend — one of ``claude``, ``codex``, or ``opencode``. Separate from Kestrel chat LLM routing.
-            default_model: Backend-specific model. When backend is ``claude``, one of ``opus``, ``sonnet``, or ``haiku``; when backend is ``codex`` or ``opencode``, a non-blank provider model id (blank is rejected).
+            default_model: Backend-specific model. When backend is ``claude``, one of ``opus``, ``sonnet``, or ``haiku`` (required). When backend is ``codex`` or ``opencode``, OPTIONAL — omit/leave unset to use the provider default; if you do pass a value it must be non-blank (an explicitly empty value is rejected).
             default_auth_lane: One of ``oauth``, ``api_key``, or ``provider_config``. Cross-field rules enforced downstream: ``codex`` requires ``oauth``; ``opencode`` requires ``provider_config``; ``claude`` accepts ``oauth`` or ``api_key`` (``api_key`` also requires policy ``allow_api_billing``).
             max_iterations: Default max LLM implementation iterations — a positive integer count (>= 1).
             max_turns: Default max agent turns per Talon iteration — a positive integer count (>= 1).
