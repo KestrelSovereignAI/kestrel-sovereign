@@ -1396,6 +1396,104 @@ class TestSecurityFeature:
         assert "ago)" in result.confirmation
 
 
+class TestSetPermissionUnknownTarget:
+    """set_permission must not silently write a dead permission row for a
+    typo'd / nonexistent feature_name or tool_name (#1946)."""
+
+    @pytest.fixture
+    async def feature(self, tmp_path):
+        agent = MagicMock()
+        agent.features = {}
+        feat = SecurityFeature(agent)
+        feat.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feat.permission_store.initialize()
+        # Seed a real registered feature/tool, mirroring _register_all_tools.
+        await feat.permission_store.register_tool(
+            "WalletAgent", "get_balance", PermissionLevel.ASK
+        )
+        await feat.permission_store.register_tool(
+            "WalletAgent", "send_tokens", PermissionLevel.ASK
+        )
+        return feat
+
+    @pytest.mark.asyncio
+    async def test_unknown_feature_is_partial_and_persists_nothing(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        result = await feature.set_permission("NoSuchFeature", level="deny")
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "NoSuchFeature" in result.error
+        assert "list_permissions" in result.error
+        assert result.data["persisted"] is False
+        # No dead row was written.
+        tree = await feature.permission_store.get_permission_tree()
+        assert all(f.feature_name != "NoSuchFeature" for f in tree)
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_on_real_feature_is_partial(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        result = await feature.set_permission(
+            "WalletAgent", tool_name="typo_tool", level="deny"
+        )
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "typo_tool" in result.error
+        assert "list_permissions" in result.error
+        assert result.data["persisted"] is False
+        # The bogus tool name was not persisted under the real feature: it
+        # does not appear in the registered tree.
+        tree = await feature.permission_store.get_permission_tree()
+        wallet = next(f for f in tree if f.feature_name == "WalletAgent")
+        assert all(t.tool_name != "typo_tool" for t in wallet.tools)
+
+    @pytest.mark.asyncio
+    async def test_known_feature_tool_still_succeeds(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        result = await feature.set_permission(
+            "WalletAgent", tool_name="get_balance", level="deny"
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["scope"] == "tool"
+        assert (
+            await feature.permission_store.get_permission(
+                "WalletAgent", "get_balance"
+            )
+        ) == PermissionLevel.DENY
+
+    @pytest.mark.asyncio
+    async def test_known_feature_bulk_still_succeeds(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        result = await feature.set_permission("WalletAgent", level="allow")
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["scope"] == "feature"
+        assert (
+            await feature.permission_store.get_permission(
+                "WalletAgent", "send_tokens"
+            )
+        ) == PermissionLevel.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_tree_read_failure_fails_open(self, feature):
+        """If the registry can't be read, name validation is skipped rather
+        than blocking a legitimate change (the store path surfaces real
+        errors)."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        feature.permission_store.get_permission_tree = AsyncMock(
+            side_effect=RuntimeError("db unavailable")
+        )
+        feature.permission_store.set_feature_permission = AsyncMock()
+
+        result = await feature.set_permission("WalletAgent", level="allow")
+        assert result.status is ToolResultStatus.OK
+
+
 # === Run tests ===
 
 if __name__ == "__main__":
