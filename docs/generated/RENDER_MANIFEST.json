@@ -240,13 +240,6 @@
           "reason": "touched_referenced_file",
           "sha": "1830dde0ffd6",
           "title": "Scheduler accepts unknown task names and PR activity cannot wake agents (#1618) (#1621)"
-        },
-        {
-          "merged_at": "2026-06-01T15:33:03-05:00",
-          "number": 1485,
-          "reason": "touched_referenced_file",
-          "sha": "382504177fec",
-          "title": "docs(workflows): convention for synthesis-vs-state in multi-agent scripts (#1484) (#1485)"
         }
       ],
       "render": "public",
@@ -1971,13 +1964,6 @@
           "reason": "touched_referenced_file",
           "sha": "1830dde0ffd6",
           "title": "Scheduler accepts unknown task names and PR activity cannot wake agents (#1618) (#1621)"
-        },
-        {
-          "merged_at": "2026-06-01T15:33:03-05:00",
-          "number": 1485,
-          "reason": "touched_referenced_file",
-          "sha": "382504177fec",
-          "title": "docs(workflows): convention for synthesis-vs-state in multi-agent scripts (#1484) (#1485)"
         }
       ],
       "render": "internal",
@@ -11868,13 +11854,6 @@
           "reason": "touched_referenced_file",
           "sha": "1830dde0ffd6",
           "title": "Scheduler accepts unknown task names and PR activity cannot wake agents (#1618) (#1621)"
-        },
-        {
-          "merged_at": "2026-06-01T15:33:03-05:00",
-          "number": 1485,
-          "reason": "touched_referenced_file",
-          "sha": "382504177fec",
-          "title": "docs(workflows): convention for synthesis-vs-state in multi-agent scripts (#1484) (#1485)"
         }
       ],
       "render": "internal",
@@ -11894,15 +11873,7 @@
       ],
       "path": "docs/development/README.md",
       "privacy": "internal",
-      "recent_prs": [
-        {
-          "merged_at": "2026-06-01T15:33:03-05:00",
-          "number": 1485,
-          "reason": "changed_doc",
-          "sha": "382504177fec",
-          "title": "docs(workflows): convention for synthesis-vs-state in multi-agent scripts (#1484) (#1485)"
-        }
-      ],
+      "recent_prs": [],
       "render": "internal",
       "status": "needs-revalidation",
       "title": "Development Documentation",
@@ -11963,13 +11934,6 @@
           "reason": "touched_referenced_file",
           "sha": "1830dde0ffd6",
           "title": "Scheduler accepts unknown task names and PR activity cannot wake agents (#1618) (#1621)"
-        },
-        {
-          "merged_at": "2026-06-01T15:33:03-05:00",
-          "number": 1485,
-          "reason": "touched_referenced_file",
-          "sha": "382504177fec",
-          "title": "docs(workflows): convention for synthesis-vs-state in multi-agent scripts (#1484) (#1485)"
         }
       ],
       "render": "internal",
@@ -11984,15 +11948,7 @@
       "missing_links": [],
       "path": "docs/development/WORKFLOW_AUTHORING.md",
       "privacy": "internal",
-      "recent_prs": [
-        {
-          "merged_at": "2026-06-01T15:33:03-05:00",
-          "number": 1485,
-          "reason": "changed_doc",
-          "sha": "382504177fec",
-          "title": "docs(workflows): convention for synthesis-vs-state in multi-agent scripts (#1484) (#1485)"
-        }
-      ],
+      "recent_prs": [],
       "render": "internal",
       "status": "needs-revalidation",
       "title": "Authoring multi-agent Workflow scripts",
