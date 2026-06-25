@@ -823,6 +823,33 @@ class TestWebhooksRegister:
         )
         assert envelope.status is ToolResultStatus.OK
 
+    def test_docstring_documents_per_auth_type_config_keys(self):
+        """The agent-facing docstring must spell out the auth_config_json keys
+        required by each auth_type, not just the bearer example (#1923/#1925).
+        """
+        doc = WebhookFeature.webhooks_register.__doc__ or ""
+        # bearer_token
+        assert "bearer_token" in doc
+        assert "token" in doc
+        # hmac_sha256 -- required key + optional defaults
+        assert "secret" in doc
+        assert "sha256=" in doc
+        # ip_allowlist -- required list key
+        assert "allowed_ips" in doc
+
+    @pytest.mark.asyncio
+    async def test_register_hmac_missing_secret_error_names_auth_type(self, feature):
+        """The auth-config ValueError must reference the agent-supplied
+        auth_type, not the internal handler class name.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
+            name="hmac-hook", auth_type="hmac_sha256", auth_config_json="{}"
+        )
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "hmac_sha256" in envelope.error
+        assert "HMACSignatureAuth" not in envelope.error
+
 
 class TestWebhooksRemove:
     @pytest_asyncio.fixture
