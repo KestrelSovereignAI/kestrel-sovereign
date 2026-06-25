@@ -71,6 +71,26 @@ async def _wait_for_close_result(result: Any) -> None:
         await asyncio.wait_for(asyncio.shield(result), timeout=CLIENT_CLOSE_TIMEOUT)
 
 
+def _client_timeout_seconds(timeout: Any) -> Optional[float]:
+    """Normalize an OpenAI/httpx client timeout to a number of seconds (#1966).
+
+    Accepts a plain float (what we set for local routes), an ``httpx.Timeout``
+    (the SDK default, which carries per-phase ``read``/``connect``/… values), or
+    None. For a long generation the ``read`` phase is what matters, so we take
+    the largest finite phase value. Returns None when nothing numeric is found.
+    """
+    if timeout is None:
+        return None
+    if isinstance(timeout, (int, float)):
+        return float(timeout)
+    candidates = [
+        getattr(timeout, attr, None)
+        for attr in ("read", "timeout", "pool", "write", "connect")
+    ]
+    nums = [float(c) for c in candidates if isinstance(c, (int, float))]
+    return max(nums) if nums else None
+
+
 def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
     """Resolve canonical current-selection metadata for any LLM-service-like object.
 
@@ -753,6 +773,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         determines the active route. A model-only mandate remains model-only.
         """
         return resolve_active_model_selection(self)
+
+    def effective_request_timeout(self) -> Optional[float]:
+        """Largest LOCAL provider request timeout (seconds), or None.
+
+        Coordinates the timeout layers (#1966): the orchestrator's per-call
+        watchdog uses ``max(its default, this)`` so it never fires before a
+        slow local model's LLM client would. Only ``is_local`` providers count
+        — cloud routes keep the orchestrator's default behavior unchanged; a
+        local route's configured ``timeout`` (#1957) becomes the single knob.
+        """
+        best: Optional[float] = None
+        for provider in (self.providers or []):
+            if not provider.get("is_local"):
+                continue
+            secs = _client_timeout_seconds(getattr(provider.get("client"), "timeout", None))
+            if secs is not None and (best is None or secs > best):
+                best = secs
+        return best
 
     def get_model_preference(self) -> Dict[str, Optional[str]]:
         """Get the current model preference.
