@@ -989,9 +989,17 @@ class TalonCoordinatorFeature(Feature):
     @tool(
         name="talon_set_config",
         description=(
-            "Update mutable Talon preferences only: default backend/model, "
-            "auth lane, iterations, turns, clarification, and self-review. "
-            "Operator policy is not changed by this tool."
+            "Update mutable Talon preferences only (operator policy is not "
+            "changed by this tool). Writes the same defaults that talon_claim "
+            "consumes per-dispatch. Allowed values: "
+            "default_backend ∈ {claude, codex, opencode}; "
+            "default_model — when backend=claude one of {opus, sonnet, haiku}, "
+            "when backend=codex/opencode a non-blank provider model id; "
+            "default_auth_lane ∈ {oauth, api_key, provider_config}. "
+            "Cross-field rules: codex ⇒ auth_lane=oauth; "
+            "opencode ⇒ auth_lane=provider_config; "
+            "claude ⇒ auth_lane oauth or api_key. "
+            "max_iterations / max_turns are positive integer counts."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!talon set-config",
@@ -1006,7 +1014,41 @@ class TalonCoordinatorFeature(Feature):
         skip_clarification: Optional[bool] = None,
         self_review: Optional[bool] = None,
     ) -> ToolResult:
-        """Persist Talon preference updates under ``[talon.preference]``."""
+        """Persist Talon preference updates under ``[talon.preference]``.
+
+        Only the fields you pass are changed; ``None`` leaves the existing
+        value untouched. These are the same controls talon_claim accepts
+        per-dispatch — set them here to change the defaults. Operator policy
+        (allowed_backends, billing, worktree requirements) is NOT writable
+        here.
+
+        Args:
+            default_backend: Talon runtime backend — one of ``claude``,
+                ``codex``, or ``opencode``. This is separate from Kestrel
+                chat LLM routing.
+            default_model: Backend-specific model. When backend is
+                ``claude``, one of ``opus``, ``sonnet``, or ``haiku``. When
+                backend is ``codex`` or ``opencode``, a non-blank provider
+                model id (blank is rejected).
+            default_auth_lane: One of ``oauth``, ``api_key``, or
+                ``provider_config``. Cross-field rules enforced downstream:
+                ``codex`` requires ``oauth``; ``opencode`` requires
+                ``provider_config``; ``claude`` accepts ``oauth`` or
+                ``api_key`` (``api_key`` also requires policy
+                ``allow_api_billing``).
+            max_iterations: Default max LLM implementation iterations — a
+                positive integer count (>= 1).
+            max_turns: Default max agent turns per Talon iteration — a
+                positive integer count (>= 1).
+            skip_clarification: Default for skipping the
+                analysis/clarification phase.
+            self_review: Default for running Talon's self-review pass.
+
+        Returns:
+            ``{"success": True, ...}`` with the persisted preference on
+            success; ``{"success": False, "error": ...}`` on a validation
+            or write failure.
+        """
         updates = {
             "default_backend": default_backend,
             "default_model": default_model,
@@ -1906,7 +1948,18 @@ class TalonCoordinatorFeature(Feature):
 
     @tool(
         name="talon_batch",
-        description="Dispatch a batch of issues to Talon (by label or PRD).",
+        description=(
+            "Dispatch a batch of issues to Talon. Provide EXACTLY ONE of "
+            "``label`` or ``prd`` — if both are given, ``prd`` wins and "
+            "``label``/``repo`` are ignored; if neither is given the call "
+            "fails with 'Provide either label or prd'. ``label`` mode "
+            "claims all issues in ``repo`` carrying that GitHub label. "
+            "``prd`` is a path to a PRD JSON file resolved against the "
+            "Talon subprocess working directory ($KESTREL_TALON_CWD, else "
+            "the sibling-checkout project parent) — NOT repo- or "
+            "workspace-relative; pass an absolute path to be unambiguous. "
+            "Returns immediately with a job_id; poll talon_status."
+        ),
         category=ToolCategory.UTILITY,
         command_prefix="!talon batch",
     )
@@ -1918,10 +1971,30 @@ class TalonCoordinatorFeature(Feature):
     ) -> ToolResult:
         """Dispatch batch processing to Talon.
 
+        Provide EXACTLY ONE of ``label`` or ``prd``. If both are set,
+        ``prd`` takes precedence and ``label``/``repo`` are ignored. If
+        neither is set, the call fails with ``"Provide either label or
+        prd"``. Like talon_claim, this launches in the background and
+        returns immediately.
+
         Args:
-            repo: GitHub repo in owner/name format.
-            label: Filter issues by this label.
-            prd: Path to a PRD JSON file for batch mode.
+            repo: GitHub repo in owner/name format (or ``self``). Used in
+                ``label`` mode to scope the issue search; ignored in
+                ``prd`` mode.
+            label: Claim every issue in ``repo`` carrying this GitHub
+                label. Required when ``prd`` is not given.
+            prd: Path to a PRD JSON file for batch mode. Resolved against
+                the Talon subprocess working directory (``$KESTREL_TALON_CWD``
+                if set, otherwise the sibling-checkout project parent) — it
+                is NOT repo-relative or workspace-relative, so pass an
+                absolute path when in doubt. Takes precedence over ``label``
+                when both are provided.
+
+        Returns:
+            ``{"dispatched": True, "job_id": ..., ...}`` on success — poll
+            the returned ``job_id`` via ``talon_status`` (or
+            ``talon_job_log``) to follow progress. Failure returns
+            ``{"dispatched": False, "error": ...}``.
         """
         if prd:
             cli_result = await self._dispatch_via_cli_background(

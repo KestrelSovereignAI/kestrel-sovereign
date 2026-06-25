@@ -279,6 +279,72 @@ class TestTalonBatch:
         assert "error" in result.data
 
 
+class TestTalonToolDocumentation:
+    """Agent-facing tool self-documentation regressions (#1925 / #1923).
+
+    ``talon_set_config`` and ``talon_batch`` must spell out their
+    constrained vocabulary and contracts in the schema the agent sees,
+    matching the ``talon_claim`` reference standard.
+    """
+
+    @staticmethod
+    def _schema(method):
+        # The @tool decorator parses ``description=`` + the Args: docstring
+        # into ``_tool_schema`` — this is the agent-facing surface.
+        return method._tool_schema
+
+    @staticmethod
+    def _full_doc(method):
+        schema = method._tool_schema
+        parts = [schema["description"]]
+        parts.extend(p.description or "" for p in schema["parameters"])
+        return "\n".join(parts)
+
+    def test_set_config_documents_allowed_backends(self):
+        doc = self._full_doc(TalonCoordinatorFeature.talon_set_config)
+        for backend in ("claude", "codex", "opencode"):
+            assert backend in doc
+
+    def test_set_config_documents_model_vocabulary(self):
+        doc = self._full_doc(TalonCoordinatorFeature.talon_set_config)
+        for alias in ("opus", "sonnet", "haiku"):
+            assert alias in doc
+
+    def test_set_config_documents_auth_lanes_and_cross_field_rules(self):
+        doc = self._full_doc(TalonCoordinatorFeature.talon_set_config)
+        for lane in ("oauth", "api_key", "provider_config"):
+            assert lane in doc
+        # Cross-field rules from runtime.resolve_runtime.
+        assert "codex" in doc and "provider_config" in doc
+        assert "iteration" in doc.lower()
+        assert "turn" in doc.lower()
+
+    def test_set_config_has_args_block(self):
+        # The decorator only populates per-parameter descriptions from an
+        # Args: block, so a populated description proves the block exists.
+        params = {
+            p.name: p.description
+            for p in self._schema(TalonCoordinatorFeature.talon_set_config)["parameters"]
+        }
+        assert params["default_backend"]
+        assert params["default_model"]
+        assert params["default_auth_lane"]
+
+    def test_batch_documents_one_of_label_or_prd(self):
+        doc = self._full_doc(TalonCoordinatorFeature.talon_batch)
+        # Exactly-one-of contract surfaced in description.
+        desc = self._schema(TalonCoordinatorFeature.talon_batch)["description"]
+        assert "label" in desc and "prd" in desc
+        assert "either label or prd" in desc.lower() or "one of" in desc.lower()
+        # prd-wins precedence and the resolve base path are documented.
+        assert "precedence" in doc.lower() or "wins" in doc.lower()
+
+    def test_batch_documents_job_id_polling(self):
+        doc = self._full_doc(TalonCoordinatorFeature.talon_batch)
+        assert "job_id" in doc
+        assert "talon_status" in doc
+
+
 class TestTalonStatus:
     @pytest.mark.asyncio
     async def test_status_empty(self):
