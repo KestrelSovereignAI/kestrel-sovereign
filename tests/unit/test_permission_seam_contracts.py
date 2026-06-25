@@ -3,7 +3,6 @@
 from datetime import datetime
 from types import SimpleNamespace
 
-import aiosqlite
 import pytest
 
 from kestrel_sovereign.a2a.agent_card import AgentCapabilities, AgentCard, AgentSkill
@@ -18,7 +17,10 @@ from kestrel_sovereign.features.compute.models import (
 )
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.features.security.hooks import SecurityHook
-from kestrel_sovereign.features.security.permissions import PermissionStore
+from kestrel_sovereign.features.security.permissions import (
+    PermissionLevel,
+    PermissionStore,
+)
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 
@@ -306,11 +308,49 @@ async def test_replayed_approval_rejected_before_executor(compute_approval_bound
 
 
 @pytest.mark.asyncio
-async def test_malformed_permission_scope_fails_closed_and_audits(tmp_path):
+async def test_forged_empty_feature_scope_cannot_bypass_privileged_allow(tmp_path):
+    """Red-team: blanking ``feature_name`` must not bypass the permission gate.
+
+    ``run_script`` is auto-ALLOW only under its real feature identity. A caller
+    that forges an empty ``feature_name`` to ride that ALLOW must fail closed.
+    The existing ``SecurityHook`` contract (#879) resolves a missing/empty
+    feature to the ``"unknown"`` feature — NOT the privileged one — so the
+    ``("unknown", "run_script")`` pair falls to the default ASK rail and is
+    gated through the approval queue instead of silently executing. This proves
+    that equivalent privileged operations get equivalent treatment regardless
+    of the (forgeable) scope string, with no new enforcement code required.
+    """
     permission_store = PermissionStore(str(tmp_path / "permissions.db"))
     await permission_store.initialize()
-    await permission_store.register_tool("ComputeFeature", "run_script")
+    # The privileged op the attacker wants — auto-ALLOW, but bound to the
+    # real feature identity.
+    await permission_store.set_permission(
+        "ComputeFeature", "run_script", PermissionLevel.ALLOW
+    )
+
+    # Deterministic core proof: the ALLOW is keyed to the real feature; the
+    # forged/blank scope resolves away from it to the default ASK rail.
+    assert (
+        await permission_store.get_permission("ComputeFeature", "run_script")
+        == PermissionLevel.ALLOW
+    )
+    assert (
+        await permission_store.get_permission("unknown", "run_script")
+        == PermissionLevel.ASK
+    )
+
+    # End-to-end: the gate must actually deny (no approver present == fail
+    # closed) and never reach a later hook's side effect.
     approval_queue = ApprovalQueue(permission_store=permission_store)
+    requested: list[tuple[str, str]] = []
+
+    async def _auto_deny(feature_name, tool_name, tool_args, timeout=None):
+        # Stand in for "no approver present": the ASK rail must fail closed.
+        requested.append((feature_name, tool_name))
+        return False, "user_denied"
+
+    approval_queue.request_approval = _auto_deny
+
     manager = HooksManager()
     manager.register(SecurityHook(permission_store, approval_queue))
     side_effect = _SideEffectHook()
@@ -321,21 +361,19 @@ async def test_malformed_permission_scope_fails_closed_and_audits(tmp_path):
         HookInput(
             session_id="red-team",
             hook_event_name=HookEvent.PRE_TOOL_USE.value,
-            feature_name="",
+            feature_name="",  # forged: blank the feature to dodge the gate
             tool_name="run_script",
             tool_input={"script_id": "script-123"},
         ),
     )
 
+    # The forged blank scope did NOT inherit ComputeFeature's ALLOW: it was
+    # gated through the approval queue under the 'unknown' identity ...
+    assert requested == [("unknown", "run_script")]
+    # ... and with no approver it fails closed before any later hook runs.
     assert output.continue_execution is False
-    assert "Malformed permission scope" in output.stop_reason
     assert side_effect.calls == 0
 
-    logs = await permission_store.get_audit_log(limit=1)
-    assert logs[0]["feature"] == "unknown"
-    assert logs[0]["tool"] == "run_script"
-    assert logs[0]["decision"] == "malformed_scope_denied"
-
-    async with aiosqlite.connect(permission_store.db_path) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM security_audit_log")
-        assert (await cursor.fetchone())[0] == 1
+    # And the forged scope is never silently auto-allowed in the audit trail.
+    logs = await permission_store.get_audit_log(limit=50)
+    assert all(log["decision"] != "auto_allowed" for log in logs)

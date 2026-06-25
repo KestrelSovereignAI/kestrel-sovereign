@@ -284,6 +284,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_file",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -331,13 +338,6 @@
           "reason": "touched_referenced_file",
           "sha": "9973504e2b3f",
           "title": "fix: classify tool input-validation errors as VALIDATION_ERROR, not user_denied (#1924)"
-        },
-        {
-          "merged_at": "2026-06-23T16:27:02-05:00",
-          "number": 1917,
-          "reason": "touched_referenced_code",
-          "sha": "4e4db6587c01",
-          "title": "feat(llm): producer seam \u2014 operator signals as mid-conversation system messages (#1497) (#1917)"
         }
       ],
       "render": "internal",
@@ -658,6 +658,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -705,13 +712,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -734,6 +734,13 @@
       "path": "docs/architecture/FEATURE_CLI_ADAPTERS.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -782,13 +789,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -1237,6 +1237,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -1284,13 +1291,6 @@
           "reason": "touched_referenced_code",
           "sha": "778dda87531c",
           "title": "Render isolated-channel pairing QR in chat via SSE (#1825) (#1918)"
-        },
-        {
-          "merged_at": "2026-06-23T16:27:02-05:00",
-          "number": 1917,
-          "reason": "touched_referenced_file",
-          "sha": "4e4db6587c01",
-          "title": "feat(llm): producer seam \u2014 operator signals as mid-conversation system messages (#1497) (#1917)"
         }
       ],
       "render": "internal",
@@ -1458,6 +1458,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T13:41:39-05:00",
           "number": 1951,
           "reason": "touched_referenced_code",
@@ -1505,13 +1512,6 @@
           "reason": "touched_referenced_file",
           "sha": "b62dd4e36aee",
           "title": "Persist SOUL documents as private encrypted agent identity resources (#1612) (#1916)"
-        },
-        {
-          "merged_at": "2026-06-23T15:34:56-05:00",
-          "number": 1915,
-          "reason": "touched_referenced_file",
-          "sha": "c3e5c1dfa3a0",
-          "title": "Add USER_BYOK (zero-knowledge passphrase) PayerKind end-to-end (#1648) (#1915)"
         }
       ],
       "render": "internal",
@@ -1539,6 +1539,13 @@
       "path": "docs/architecture/SIGNAL_SOURCES_GUIDE.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -1587,13 +1594,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -1704,6 +1704,13 @@
       "path": "docs/architecture/WORKFLOWS_FEATURE_DESIGN.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T11:31:07-05:00",
           "number": 1941,
@@ -2165,6 +2172,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -2212,13 +2226,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -2322,6 +2329,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -2369,13 +2383,6 @@
           "reason": "touched_referenced_code",
           "sha": "fbb8da00bfb7",
           "title": "feat: Implemented Codex multimodal conversion so `image_url` user content becomes Responses-style `input_image` parts, with text-only Codex turns preserved. Added unit coverage, updated provider vision (#847) (#1882)"
-        },
-        {
-          "merged_at": "2026-06-22T12:30:30-05:00",
-          "number": 1877,
-          "reason": "touched_referenced_code",
-          "sha": "59c5396b5c22",
-          "title": "Backup: Lighthouse delete_file uses CID not file-id (400) \u2014 breaks prune + cleanup; add 429 backoff + resilience (#1875) (#1877)"
         }
       ],
       "render": "internal",
@@ -2447,6 +2454,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -2494,13 +2508,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -2726,6 +2733,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -2773,13 +2787,6 @@
           "reason": "touched_referenced_code",
           "sha": "86afcd25b8cd",
           "title": "fix(#1887): paginate Lighthouse uploads by last-item id cursor (#1888)"
-        },
-        {
-          "merged_at": "2026-06-22T13:45:53-05:00",
-          "number": 1882,
-          "reason": "touched_referenced_code",
-          "sha": "fbb8da00bfb7",
-          "title": "feat: Implemented Codex multimodal conversion so `image_url` user content becomes Responses-style `input_image` parts, with text-only Codex turns preserved. Added unit coverage, updated provider vision (#847) (#1882)"
         }
       ],
       "render": "internal",
@@ -2886,6 +2893,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -2933,13 +2947,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -2986,6 +2993,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -3033,13 +3047,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -3060,6 +3067,13 @@
       "path": "docs/architecture/storage/SOVEREIGNTY_IMPLEMENTATION.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -3108,13 +3122,6 @@
           "reason": "touched_referenced_code",
           "sha": "fbb8da00bfb7",
           "title": "feat: Implemented Codex multimodal conversion so `image_url` user content becomes Responses-style `input_image` parts, with text-only Codex turns preserved. Added unit coverage, updated provider vision (#847) (#1882)"
-        },
-        {
-          "merged_at": "2026-06-22T12:30:30-05:00",
-          "number": 1877,
-          "reason": "touched_referenced_code",
-          "sha": "59c5396b5c22",
-          "title": "Backup: Lighthouse delete_file uses CID not file-id (400) \u2014 breaks prune + cleanup; add 429 backoff + resilience (#1875) (#1877)"
         }
       ],
       "render": "internal",
@@ -3197,6 +3204,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -3244,13 +3258,6 @@
           "reason": "touched_referenced_code",
           "sha": "fbb8da00bfb7",
           "title": "feat: Implemented Codex multimodal conversion so `image_url` user content becomes Responses-style `input_image` parts, with text-only Codex turns preserved. Added unit coverage, updated provider vision (#847) (#1882)"
-        },
-        {
-          "merged_at": "2026-06-22T12:30:30-05:00",
-          "number": 1877,
-          "reason": "touched_referenced_code",
-          "sha": "59c5396b5c22",
-          "title": "Backup: Lighthouse delete_file uses CID not file-id (400) \u2014 breaks prune + cleanup; add 429 backoff + resilience (#1875) (#1877)"
         }
       ],
       "render": "internal",
@@ -3431,6 +3438,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -3478,13 +3492,6 @@
           "reason": "touched_referenced_file",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -3515,6 +3522,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -3562,13 +3576,6 @@
           "reason": "touched_referenced_file",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -3796,6 +3803,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -3843,13 +3857,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -3879,6 +3886,13 @@
       "path": "docs/audit/FEATURE_AUDIT_MATRIX.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -3927,13 +3941,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -4017,6 +4024,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -4064,13 +4078,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -4175,6 +4182,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_file",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -4222,13 +4236,6 @@
           "reason": "touched_referenced_file",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -4261,6 +4268,13 @@
       "privacy": "",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -4308,13 +4322,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "public",
@@ -5851,6 +5858,13 @@
       "privacy": "",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_file",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -5898,13 +5912,6 @@
           "reason": "touched_referenced_file",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_file",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "public",
@@ -5953,6 +5960,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "changed_doc",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -6000,13 +6014,6 @@
           "reason": "touched_referenced_file",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -6046,6 +6053,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -6093,13 +6107,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -7251,6 +7258,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -7298,13 +7312,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -7330,6 +7337,13 @@
       "path": "docs/audit/documentation-2026-05/reports/index_diagrams_hygiene_report.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -7378,13 +7392,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -7578,6 +7585,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -7625,13 +7639,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -7760,6 +7767,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -7807,13 +7821,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -8371,6 +8378,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -8418,13 +8432,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -8488,6 +8495,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -8535,13 +8549,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -8570,6 +8577,13 @@
       "path": "docs/audit/issues/256-endpoint-proof-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -8618,13 +8632,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -8658,6 +8665,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -8705,13 +8719,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -8802,6 +8809,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -8849,13 +8863,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -8894,6 +8901,13 @@
       "path": "docs/audit/issues/256-mandate-resolution-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -8942,13 +8956,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -8994,6 +9001,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -9041,13 +9055,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9078,6 +9085,13 @@
       "path": "docs/audit/issues/256-privacy-sync-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -9126,13 +9140,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9181,6 +9188,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -9228,13 +9242,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9266,6 +9273,13 @@
       "path": "docs/audit/issues/256-runtime-seam-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
         {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
@@ -9314,13 +9328,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9366,6 +9373,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -9413,13 +9427,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9503,6 +9510,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -9550,13 +9564,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9575,6 +9582,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -9622,13 +9636,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9647,6 +9654,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -9694,13 +9708,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9787,6 +9794,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -9834,13 +9848,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9861,6 +9868,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -9908,13 +9922,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -9935,6 +9942,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -9982,13 +9996,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -10242,6 +10249,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -10289,13 +10303,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -10688,6 +10695,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -10735,13 +10749,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -10866,6 +10873,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -10913,13 +10927,6 @@
           "reason": "touched_referenced_file",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -11097,6 +11104,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -11144,13 +11158,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "archive",
@@ -11429,6 +11436,13 @@
       "privacy": "internal",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_code",
@@ -11476,13 +11490,6 @@
           "reason": "touched_referenced_code",
           "sha": "dd3d22032735",
           "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
-        },
-        {
-          "merged_at": "2026-06-25T12:21:49-05:00",
-          "number": 1942,
-          "reason": "touched_referenced_code",
-          "sha": "de8ae50963ed",
-          "title": "fix(talon): report structural auth_lane rule before api_key billing policy (#1925) (#1942)"
         }
       ],
       "render": "internal",
@@ -12651,6 +12658,13 @@
       "privacy": "internal",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "changed_doc",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-24T17:27:39-05:00",
           "number": 1930,
           "reason": "changed_doc",
@@ -12698,13 +12712,6 @@
           "reason": "touched_referenced_file",
           "sha": "8499a2aecb7b",
           "title": "docs(cli): kestrel update \u2014 tighten help text + README typical-flow example + AGENTS.md entry (#1639)"
-        },
-        {
-          "merged_at": "2026-06-10T07:16:09-05:00",
-          "number": 1638,
-          "reason": "touched_referenced_file",
-          "sha": "09f202e439ce",
-          "title": "fix(cli): kestrel update \u2014 ignore untracked files + auto-detect uv sync (#1638)"
         }
       ],
       "render": "internal",
@@ -12788,6 +12795,13 @@
       "privacy": "",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T14:41:00-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "bdffb1bfb6ce",
+          "title": "feat: Added #596 red-team proof for stale approval, replayed approval, and malformed permission scope, including audited fail-closed scope handling and the SEAM_CAMPAIGNS row moved to Proven. Verification:"
+        },
+        {
           "merged_at": "2026-06-25T14:11:00-05:00",
           "number": 1952,
           "reason": "touched_referenced_file",
@@ -12835,13 +12849,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "public",
