@@ -253,8 +253,16 @@ class TestConsentLog:
         assert result.data["records"][0]["id"] == "id1"
         assert result.data["records"][0]["action_type"] == "privacy_mode_change"
         assert result.data["records"][0]["agent_sentiment"] == "positive"
+        # action_details is stored as a JSON string but returned as a dict
+        # (#1946) so chaining agents receive structured data.
+        assert result.data["records"][0]["action_details"] == {
+            "from": "normal", "to": "ephemeral"
+        }
         assert result.data["records"][1]["id"] == "id2"
         assert result.data["records"][1]["agent_sentiment"] == "concerned"
+        assert result.data["records"][1]["action_details"] == {
+            "from": "gpt-4", "to": "llama3"
+        }
 
     @pytest.mark.asyncio
     async def test_consent_log_empty(self):
