@@ -906,8 +906,14 @@ class SecurityFeature(Feature):
             )
             return None
 
+        # Match against every casing/alias variant the store itself resolves
+        # at read/write time (snake/Pascal + registered cross-form aliases),
+        # so a legitimate legacy-alias write (e.g. ``computer_use`` for
+        # ``ComputerUseFeature``) is accepted rather than rejected as unknown
+        # (codex review #1946 P2).
+        variants = self.permission_store.feature_name_variants(feature_name)
         feature = next(
-            (f for f in tree if f.feature_name == feature_name), None
+            (f for f in tree if f.feature_name in variants), None
         )
         if feature is None:
             return ToolResult.partial(

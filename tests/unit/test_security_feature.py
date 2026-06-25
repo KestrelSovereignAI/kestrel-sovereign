@@ -1479,6 +1479,43 @@ class TestSetPermissionUnknownTarget:
         ) == PermissionLevel.ALLOW
 
     @pytest.mark.asyncio
+    async def test_legacy_snake_case_alias_is_accepted(self, feature):
+        """A feature registered under its PascalCase name must still accept a
+        write addressed by its snake_case form — the store resolves both
+        (codex review #1946 P2). It must not be rejected as unknown."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        # ``WalletAgent`` is registered; ``wallet_agent`` is the snake variant
+        # the store resolves at read time.
+        result = await feature.set_permission(
+            "wallet_agent", tool_name="get_balance", level="allow"
+        )
+        assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_registered_cross_form_alias_is_accepted(self, feature):
+        """A non-derived registered alias (e.g. ``computer_use`` ↔
+        ``ComputerUseFeature``) must be accepted, matching the store's own
+        alias resolution."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        await feature.permission_store.register_tool(
+            "ComputerUseFeature", "fs_read", PermissionLevel.ASK
+        )
+        # Register the cross-form alias the store consults.
+        feature.permission_store._feature_alias_to_class["computer_use"] = (
+            "ComputerUseFeature"
+        )
+        feature.permission_store._feature_class_to_alias[
+            "ComputerUseFeature"
+        ] = "computer_use"
+
+        result = await feature.set_permission(
+            "computer_use", tool_name="fs_read", level="allow"
+        )
+        assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
     async def test_tree_read_failure_fails_open(self, feature):
         """If the registry can't be read, name validation is skipped rather
         than blocking a legitimate change (the store path surfaces real

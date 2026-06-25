@@ -476,16 +476,10 @@ class PermissionStore:
         (and vice versa) so non-derived pairs like ``computer_use`` ↔
         ``ComputerUseFeature`` resolve symmetrically (codex review #1427 P2).
         """
-        names = _name_variants(feature_name)
-        # Add registered cross-form alias (covers non-derived pairs that
-        # _name_variants can't reproduce, e.g. ``computer_use`` ↔
-        # ``ComputerUseFeature``).
-        canonical = self._feature_alias_to_class.get(feature_name)
-        if canonical:
-            names.add(canonical)
-        alias = self._feature_class_to_alias.get(feature_name)
-        if alias:
-            names.add(alias)
+        # Snake/Pascal casing plus registered cross-form aliases (covers
+        # non-derived pairs that _name_variants can't reproduce, e.g.
+        # ``computer_use`` ↔ ``ComputerUseFeature``).
+        names = self.feature_name_variants(feature_name)
         placeholders = ",".join(["?"] * len(names))
         query = (
             f"SELECT level FROM security_permissions "
@@ -502,6 +496,26 @@ class PermissionStore:
                 # Stale level value from a removed enum variant — ignore.
                 continue
         return levels
+
+    def feature_name_variants(self, feature_name: str) -> set[str]:
+        """Return every feature_name casing/alias variant that resolves to the
+        same logical feature as ``feature_name``.
+
+        This is the same resolution ``_lookup_rows`` applies at read time —
+        snake/Pascal casing plus registered cross-form aliases (e.g.
+        ``computer_use`` <-> ``ComputerUseFeature``). Exposed so callers that
+        need to validate a feature_name against the registered permission tree
+        (e.g. ``SecurityFeature.set_permission``) accept the same names the
+        store itself honors, rather than only the exact canonical spelling.
+        """
+        names = _name_variants(feature_name)
+        canonical = self._feature_alias_to_class.get(feature_name)
+        if canonical:
+            names.add(canonical)
+        alias = self._feature_class_to_alias.get(feature_name)
+        if alias:
+            names.add(alias)
+        return names
 
     async def set_permission(
         self,
