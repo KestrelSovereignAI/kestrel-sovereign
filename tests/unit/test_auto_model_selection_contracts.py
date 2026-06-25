@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from kestrel_sovereign.llm.model_discovery import ModelDiscoveryMixin
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
@@ -220,6 +222,42 @@ def test_openai_plan_empty_codex_cache_stays_auto_never_inherits_api_catalog():
 
     # Stays "auto" (codex picks its own default) — never inherits gpt-5.5-pro.
     assert harness.providers[0]["model"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_openai_plan_inside_running_loop_never_inherits_api_catalog():
+    """Sync cache-hit resolution under an ALREADY-RUNNING loop must still mark
+    openai:plan route-scoped (can't await list_models, so register empty) — it
+    must never fall back to the OpenAI API catalog and pin gpt-5.5-pro.
+    (codex review P2.)
+    """
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+    codex_adapter = CodexAdapter()
+    codex_adapter.list_models = AsyncMock(return_value=[
+        ModelInfo(id="gpt-5.5", provider="openai", display_name="GPT-5.5",
+                  category=ModelCategory.CHAT, supports_tools=True, is_featured=True),
+    ])
+    harness = _DiscoveryHarness(
+        config={},
+        providers=[
+            {"name": "openai:plan", "vendor": "openai", "route": "plan",
+             "model": "auto", "selection_hints": ["gpt-5"], "adapter": codex_adapter},
+        ],
+    )
+    models = [
+        ModelInfo(id="gpt-5.5-pro", provider="openai", display_name="GPT-5.5 Pro",
+                  category=ModelCategory.CHAT, supports_tools=True, is_featured=True),
+    ]
+
+    # We are inside a running event loop here (async test).
+    harness._resolve_auto_providers(models)
+
+    # Marked route-scoped with an empty catalog → stays "auto", NOT gpt-5.5-pro.
+    assert harness.providers[0]["model"] == "auto"
+    assert "openai:plan" in harness._route_catalogs
 
 
 def test_shipped_llm_config_uses_auto_models_for_primary_routes():

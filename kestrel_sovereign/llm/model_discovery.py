@@ -272,10 +272,17 @@ class ModelDiscoveryMixin:
                 logger.debug("sync route-catalog build skipped: %s", e)
                 self._route_catalogs = {}
         else:
-            # A loop is already running (rare on this path); avoid nesting.
-            # Leave catalogs unbuilt — the async discovery phase will populate
-            # them and re-resolve. Initialize to empty so this is a no-op next time.
-            self._route_catalogs = {}
+            # A loop is already running (rare on this path); we can't await
+            # the adapter's list_models. Still register every route-specific
+            # route as an EMPTY catalog (this enumeration is sync) so the plan
+            # route is marked route-scoped and never inherits the vendor's API
+            # catalog (e.g. gpt-5.5-pro). Empty leaves ``auto`` unresolved →
+            # codex uses its own serveable default. The async discovery phase
+            # (_build_route_catalogs) later overwrites with the real catalog.
+            self._route_catalogs = {
+                route_key: []
+                for route_key, _ in self._route_specific_catalog_adapters()
+            }
 
     def _select_auto_model_for_route(
         self,
