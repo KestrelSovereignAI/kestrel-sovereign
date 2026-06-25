@@ -222,6 +222,101 @@ async def test_request_restart_rejects_empty_reason(tmp_path):
     assert "reason" in result.error
 
 
+# ---------------------------------------------------------------------------
+# Self-documentation: advertised + normalized constrained enums (#1923/#1925)
+# ---------------------------------------------------------------------------
+
+
+def _tool_desc(method):
+    """The @tool decorator stashes its description on the function."""
+    return method._tool_schema["description"]
+
+
+def test_request_restart_description_advertises_allowed_values():
+    desc = _tool_desc(RestartCoordinatorFeature.request_restart)
+    # urgency set + default + a synonym hint.
+    for token in ("low", "normal", "high", "critical", "medium", "urgent"):
+        assert token in desc
+    # policy set + per-value meaning.
+    for token in (
+        "idle_agents_only",
+        "allow_busy_after_timeout",
+        "manual_only",
+    ):
+        assert token in desc
+    # Returns shape so the agent can chain on data.request.id.
+    assert "data.request.id" in desc
+    assert "created" in desc
+
+
+def test_list_restart_requests_description_includes_updating_and_returns():
+    desc = _tool_desc(RestartCoordinatorFeature.list_restart_requests)
+    for token in (
+        "pending",
+        "approved",
+        "updating",
+        "executing",
+        "completed",
+        "rejected",
+        "canceled",
+    ):
+        assert token in desc
+    assert "count" in desc and "requests" in desc
+
+
+def test_cancel_restart_request_description_documents_returns():
+    desc = _tool_desc(RestartCoordinatorFeature.cancel_restart_request)
+    assert "canceled" in desc
+    assert "request_id" in desc
+
+
+@pytest.mark.asyncio
+async def test_request_restart_normalizes_urgency_synonyms(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    # 'medium' is the universal taxonomy LLMs reach for → normal.
+    result = await feat.request_restart(reason="r", urgency="medium")
+    assert result.status is ToolResultStatus.OK
+    assert result.data["request"]["urgency"] == "normal"
+    # 'urgent' → high, 'emergency' → critical (case-insensitive).
+    r2 = await feat.request_restart(reason="r", urgency="Urgent")
+    assert r2.data["request"]["urgency"] == "high"
+    r3 = await feat.request_restart(reason="r", urgency="EMERGENCY")
+    assert r3.data["request"]["urgency"] == "critical"
+
+
+@pytest.mark.asyncio
+async def test_request_restart_normalizes_policy_synonyms(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    result = await feat.request_restart(reason="r", policy="manual")
+    assert result.status is ToolResultStatus.OK
+    assert result.data["request"]["policy"] == "manual_only"
+
+
+@pytest.mark.asyncio
+async def test_list_restart_requests_accepts_updating_status(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="r")
+    req_id = created.data["request"]["id"]
+    await update_status(
+        backend, req_id, status="updating",
+        expected_current_status="pending",
+    )
+    r = await feat.list_restart_requests(status="updating")
+    assert r.status is ToolResultStatus.OK
+    assert r.data["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_restart_requests_rejects_unknown_status(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    r = await feat.list_restart_requests(status="bogus")
+    assert r.error is not None
+    assert "status" in r.error
+    # The error names the valid values so the agent can recover.
+    for token in ("pending", "updating", "completed", "canceled"):
+        assert token in r.error
+
+
 @pytest.mark.asyncio
 async def test_list_restart_requests_returns_all_then_filtered(tmp_path):
     feat, backend = await _make_feature(tmp_path)

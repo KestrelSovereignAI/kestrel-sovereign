@@ -43,6 +43,7 @@ from .events import EVENT_NAME, build_restart_status_event
 from .store import (
     KNOWN_OPERATIONS,
     KNOWN_POLICIES,
+    KNOWN_STATUSES,
     KNOWN_URGENCIES,
     PENDING_STATES,
     TERMINAL_STATES,
@@ -86,6 +87,60 @@ STALE_ACTIVE_REQUEST_SECONDS = 900
 _PROCESS_BOOT_ID = uuid.uuid4().hex
 
 logger = logging.getLogger(__name__)
+
+
+# Synonyms LLMs reliably reach for that map cleanly onto the canonical
+# enum sets. The middle urgency is ``normal``, but every model defaults to
+# the universal low/medium/high taxonomy — accept ``medium`` rather than
+# hard-failing the call. ``urgent``/``emergency`` likewise map to the
+# nearest canonical rung. Normalization is case-insensitive.
+_URGENCY_ALIASES = {
+    "medium": "normal",
+    "med": "normal",
+    "moderate": "normal",
+    "default": "normal",
+    "urgent": "high",
+    "important": "high",
+    "emergency": "critical",
+    "highest": "critical",
+    "p0": "critical",
+    "p1": "high",
+    "p2": "normal",
+    "p3": "low",
+}
+# Policy synonyms: the canonical values are verbose, so map the obvious
+# shorthands onto them.
+_POLICY_ALIASES = {
+    "idle_only": "idle_agents_only",
+    "idle": "idle_agents_only",
+    "when_idle": "idle_agents_only",
+    "timeout": "allow_busy_after_timeout",
+    "after_timeout": "allow_busy_after_timeout",
+    "busy_after_timeout": "allow_busy_after_timeout",
+    "manual": "manual_only",
+    "explicit": "manual_only",
+}
+# Status synonyms for the ``list_restart_requests`` filter.
+_STATUS_ALIASES = {
+    "cancelled": "canceled",
+    "complete": "completed",
+    "done": "completed",
+    "running": "executing",
+    "in_progress": "executing",
+    "in-progress": "executing",
+    "denied": "rejected",
+}
+
+
+def _normalize_choice(value, aliases):
+    """Lower-case + map a known synonym onto its canonical enum value.
+    Unknown values pass through (lower-cased) so the validator still
+    rejects genuine typos with a helpful message. Non-strings (None)
+    pass through untouched."""
+    if not isinstance(value, str):
+        return value
+    key = value.strip().lower()
+    return aliases.get(key, key)
 
 
 def _tail(raw: Any) -> str:
@@ -235,9 +290,19 @@ class RestartCoordinatorFeature(Feature):
         name="request_restart",
         description=(
             "File a durable restart request. The host coordinator "
-            "evaluates safety and executes when conditions are met. "
-            "Returns a request_id you can pass to list_restart_requests "
-            "or cancel_restart_request.\n\n"
+            "evaluates safety and executes when conditions are met.\n\n"
+            "urgency: one of low|normal|high|critical (default 'normal'); "
+            "common synonyms are accepted ('medium'→normal, 'urgent'→high, "
+            "'emergency'→critical). Higher urgency is executed first.\n"
+            "policy: one of idle_agents_only|allow_busy_after_timeout|"
+            "manual_only (default 'idle_agents_only'):\n"
+            "  - idle_agents_only: execute only while this agent is idle "
+            "(no in-flight cognition turns or real background work).\n"
+            "  - allow_busy_after_timeout: prefer idle, but execute anyway "
+            "once the request has aged past the busy timeout even if the "
+            "agent is still busy.\n"
+            "  - manual_only: never auto-execute; the row waits for an "
+            "explicit dispatch.\n\n"
             "operation='restart_only' (default) restarts the current code "
             "and NEVER updates it. operation='update_then_restart' first "
             "runs an explicit, allowlisted update profile (e.g. "
@@ -246,7 +311,11 @@ class RestartCoordinatorFeature(Feature):
             "code. Update mode requires update_profile and target_ref; "
             "repo_path defaults to the local Sovereign checkout. "
             "Updating/installing is always explicit and audited — it is "
-            "never an implicit side effect of a plain restart."
+            "never an implicit side effect of a plain restart.\n\n"
+            "Returns: data={created: bool, request: <public dict>}. The "
+            "filed request's id is at data.request.id (NOT a top-level "
+            "request_id) — pass it to list_restart_requests or "
+            "cancel_restart_request."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!restart request",
@@ -268,12 +337,14 @@ class RestartCoordinatorFeature(Feature):
                 "reason is required",
                 data={"created": False},
             )
+        urgency = _normalize_choice(urgency, _URGENCY_ALIASES)
         if urgency not in KNOWN_URGENCIES:
             return ToolResult.failed(
                 f"urgency must be one of {sorted(KNOWN_URGENCIES)}; "
                 f"got {urgency!r}",
                 data={"created": False},
             )
+        policy = _normalize_choice(policy, _POLICY_ALIASES)
         if policy not in KNOWN_POLICIES:
             return ToolResult.failed(
                 f"policy must be one of {sorted(KNOWN_POLICIES)}; "
@@ -382,8 +453,12 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="list_restart_requests",
         description=(
-            "List restart requests, optionally filtered by status "
-            "(pending|approved|executing|completed|rejected|canceled)."
+            "List restart requests, optionally filtered by status. Valid "
+            "statuses: pending|approved|updating|executing|completed|"
+            "rejected|canceled (omit status for all). An unknown status is "
+            "rejected with the valid set rather than silently returning no "
+            "rows.\n\n"
+            "Returns: data={count: int, requests: [<public dict>, ...]}."
         ),
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!restart list",
@@ -396,8 +471,17 @@ class RestartCoordinatorFeature(Feature):
                 "Restart coordinator storage unavailable",
                 data={"requests": []},
             )
+        status_filter = status.strip()
+        if status_filter:
+            status_filter = _normalize_choice(status_filter, _STATUS_ALIASES)
+            if status_filter not in KNOWN_STATUSES:
+                return ToolResult.failed(
+                    f"status must be one of {sorted(KNOWN_STATUSES)}; "
+                    f"got {status!r}",
+                    data={"count": 0, "requests": []},
+                )
         rows = await list_requests(
-            self._db, status=(status.strip() or None),
+            self._db, status=(status_filter or None),
         )
         return ToolResult.ok(
             confirmation=f"{len(rows)} restart request(s)",
@@ -447,8 +531,13 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="cancel_restart_request",
         description=(
-            "Cancel a still-pending restart request. Rows already "
-            "executing/completed/rejected cannot be canceled."
+            "Cancel a still-pending restart request (status pending or "
+            "approved). Rows already updating/executing/completed/rejected/"
+            "canceled cannot be canceled. Pass request_id from "
+            "data.request.id of request_restart (or data.requests[].id of "
+            "list_restart_requests).\n\n"
+            "Returns: data={canceled: bool, request_id: str} (plus "
+            "current_status when the cancel is refused)."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!restart cancel",
