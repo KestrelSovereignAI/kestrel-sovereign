@@ -1701,6 +1701,16 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         route_model = provider.get("model")
         if route_model and route_model != "auto":
             return route_model
+        # Route-scoped routes (e.g. codex/openai:plan) own their serveable
+        # catalog and must NEVER fall back to the vendor discovery cache —
+        # that cache can hold API-only models the route can't serve (e.g.
+        # gpt-5.5-pro). When such a route is still "auto" (its own catalog
+        # didn't resolve a concrete model, e.g. before codex's models_cache
+        # exists), pass "auto" through so the adapter sends no model and the
+        # substrate uses its own serveable default, rather than a vendor model.
+        route_catalogs = getattr(self, "_route_catalogs", None) or {}
+        if provider.get("name") in route_catalogs:
+            return "auto"
         from .model_selection import resolve_provider_default
         try:
             return resolve_provider_default(provider["name"])
