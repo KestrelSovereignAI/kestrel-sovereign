@@ -253,11 +253,18 @@ class ConsentFeature(Feature):
 
         records = []
         for row in rows:
+            # action_details is stored as a JSON string (json.dumps in
+            # _store_record). Deserialize it back to a dict so chaining
+            # agents receive structured data, not an opaque string.
+            try:
+                action_details = json.loads(row[3]) if row[3] is not None else None
+            except (TypeError, ValueError):
+                action_details = row[3]
             records.append({
                 "id": row[0],
                 "agent_id": row[1],
                 "action_type": row[2],
-                "action_details": row[3],
+                "action_details": action_details,
                 "agent_view": row[4],
                 "agent_sentiment": row[5],
                 "sovereign_proceeded": bool(row[6]),
@@ -284,7 +291,14 @@ class ConsentFeature(Feature):
     async def consent_stats(self) -> ToolResult:
         """
         Count consent records by action_type and by sentiment, plus
-        latency and timeout/error metrics.
+        latency and timeout (reliability) metrics.
+
+        Note: timeouts are the only failure mode recorded in consent_log.
+        The generic-error path in request_consent fails open without
+        persisting a row, and the only system-generated agent_view marker
+        ("[TIMEOUT]") always carries timed_out=1. There is therefore no
+        distinct "error" population beyond timeouts, so timeout_count /
+        timeout_rate are the authoritative reliability metrics.
         """
         try:
             db = resolve_feature_database(self.agent)
@@ -338,14 +352,6 @@ class ConsentFeature(Feature):
             timeout_count = timeout_row[0] if timeout_row else 0
             timeout_rate = round(timeout_count / total, 4) if total > 0 else 0.0
 
-            # Error count (sentiment = 'timeout' covers timeouts; agent_view
-            # starting with '[' covers system-generated entries)
-            error_row = await db.fetchone(
-                "SELECT COUNT(*) FROM consent_log WHERE timed_out = 1"
-            )
-            error_count = error_row[0] if error_row else 0
-            error_rate = round(error_count / total, 4) if total > 0 else 0.0
-
             data = {
                 "success": True,
                 "total": total,
@@ -355,8 +361,6 @@ class ConsentFeature(Feature):
                 "p95_duration_ms": p95_duration_ms,
                 "timeout_count": timeout_count,
                 "timeout_rate": timeout_rate,
-                "error_count": error_count,
-                "error_rate": error_rate,
             }
         except Exception as e:
             logger.error(f"consent_stats query failed: {e}")
