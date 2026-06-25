@@ -202,6 +202,49 @@ async def test_signal_dispatch_fallback_success_returns_ok():
     assert result.data["fallback"] is True
 
 
+@pytest.mark.asyncio
+async def test_signal_dispatch_invalid_mode_rejected_not_dispatched():
+    """A typo'd/unknown mode must error, NOT fall through to live dispatch
+    (#1925). dispatch_to_talon is patched to blow up if it's ever reached."""
+    feat = _make_feature({})
+    boom = AsyncMock(side_effect=AssertionError("must not dispatch on bad mode"))
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.dispatch_to_talon",
+        new=boom,
+    ):
+        for bad in ("suggst", "dry-run", "plan", ""):
+            result = await feat.signal_dispatch(mode=bad)
+            assert result.status is ToolResultStatus.ERROR, bad
+            assert "Must be one of: execute, suggest" in result.error
+    boom.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_suggest_is_case_insensitive():
+    feat = _make_feature({})
+    result = await feat.signal_dispatch(mode="SUGGEST")
+    assert result.status is ToolResultStatus.OK
+    assert result.data["mode"] == "suggest"
+
+
+@pytest.mark.asyncio
+async def test_strategy_add_blocker_invalid_severity_rejected():
+    feat = _make_feature({})
+    result = await feat.strategy_add_blocker(issue="42", title="x", severity="sev1")
+    assert result.status is ToolResultStatus.ERROR
+    assert "Must be one of: low, medium, high, critical" in result.error
+    # Nothing persisted on rejection.
+    assert not feat._data.get("blockers")
+
+
+@pytest.mark.asyncio
+async def test_strategy_add_blocker_severity_normalized():
+    feat = _make_feature({})
+    result = await feat.strategy_add_blocker(issue="42", title="x", severity="HIGH")
+    assert result.status is ToolResultStatus.OK
+    assert feat._data["blockers"][-1]["severity"] == "high"
+
+
 # ---------------------------------------------------------------------------
 # Contract: every @tool annotated -> ToolResult
 # ---------------------------------------------------------------------------
