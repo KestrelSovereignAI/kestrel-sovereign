@@ -619,24 +619,34 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return  # No discovery yet — don't block.
 
         # If EVERY matched route is route-scoped, the vendor catalog doesn't
-        # apply — the model already failed every route's own catalog above.
+        # apply — the model already failed every route's own (populated)
+        # catalog above (an empty route catalog returned early as "unknown").
         all_route_scoped = bool(matching) and all(
             p.get("name") in route_catalogs for p in matching
         )
         if not all_route_scoped:
-            for m in catalog:
-                if m.provider == vendor and m.id == model:
-                    return
+            vendor_models = sorted({
+                m.id for m in catalog if m.provider == vendor and m.id
+            })
+            if not vendor_models:
+                # Discovery has no catalog for THIS vendor yet → unknown for
+                # this vendor, permit (cold-start; resolve-time still defends).
+                # Only a *populated* vendor catalog can prove a model invalid.
+                return
+            if model in vendor_models:
+                return
+            raise ValueError(
+                f"Cannot set model '{model}' on '{selector}': it is not served "
+                f"by that vendor/route. Available for {vendor}: {vendor_models}. "
+                f"Use list_models to discover valid vendor/route/model values."
+            )
 
-        nearby = sorted({
-            m.id for m in catalog
-            if m.provider == vendor and m.id
-        })
+        # All matched routes are route-scoped and the model was absent from
+        # every populated route catalog checked above.
         raise ValueError(
-            f"Cannot set model '{model}' on '{selector}': it is not served "
-            f"by that vendor/route. Available for {vendor}: "
-            f"{nearby or '(none discovered)'}. Use list_models to discover "
-            f"valid vendor/route/model values."
+            f"Cannot set model '{model}' on '{selector}': it is not served by "
+            f"that route's catalog. Use list_models to discover valid "
+            f"vendor/route/model values."
         )
 
     def _resolve_vendor_for_model(self, model: str) -> Optional[Any]:
