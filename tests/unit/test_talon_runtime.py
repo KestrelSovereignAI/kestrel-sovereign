@@ -101,6 +101,28 @@ def test_api_key_lane_rejected_by_default_policy():
         )
 
 
+def test_codex_with_api_key_reports_structural_rule_not_billing():
+    # codex+api_key is structurally invalid regardless of billing policy, so the
+    # error must name the true reason (codex requires oauth), not the misleading
+    # "API-key billing not allowed" that fired first before the reorder (#1925
+    # dogfooding finding). Default policy has allow_api_billing=False.
+    with pytest.raises(TalonRuntimeError, match="Codex Talon backend requires"):
+        build_talon_invocation(
+            TalonRuntimeRequest(backend="codex", model="gpt-5.4-mini", auth_lane="api_key"),
+            _execution(),
+            base_env=_env(),
+        )
+
+
+def test_opencode_with_api_key_reports_structural_rule_not_billing():
+    with pytest.raises(TalonRuntimeError, match="OpenCode Talon backend requires"):
+        build_talon_invocation(
+            TalonRuntimeRequest(backend="opencode", model="some/model", auth_lane="api_key"),
+            _execution(),
+            base_env=_env(),
+        )
+
+
 def test_opencode_invocation_maps_model_to_opencode_model_flag():
     invocation = build_talon_invocation(
         TalonRuntimeRequest(
