@@ -178,10 +178,13 @@ class ModelDiscoveryMixin:
                 continue
             vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
             route_key = provider.get("name")
-            route_catalog = route_catalogs.get(route_key)
-            if route_catalog:
+            if route_key in route_catalogs:
+                # Route-scoped (e.g. codex/openai:plan): resolve ONLY against the
+                # route's own serveable catalog — never the vendor catalog. An
+                # empty catalog yields no candidate, leaving ``auto`` unresolved
+                # so the adapter sends no model and codex uses its own default.
                 candidates = [
-                    m for m in route_catalog
+                    m for m in route_catalogs[route_key]
                     if m.category == ModelCategory.CHAT and not m.is_hidden
                 ]
             else:
@@ -223,10 +226,13 @@ class ModelDiscoveryMixin:
     async def _build_route_catalogs(self) -> None:
         """Populate ``self._route_catalogs`` from route-specific adapters.
 
-        Keyed by route name (e.g. ``"openai:plan"``). A route is only entered
-        when its adapter returns a non-empty catalog; an empty/missing catalog
-        leaves the route to fall back to the vendor's shared discovery (and,
-        for an unresolved ``auto``, codex's own serveable default).
+        Keyed by route name (e.g. ``"openai:plan"``). A route-specific route is
+        ALWAYS entered (even with an empty catalog) so it never falls back to
+        the vendor's shared discovery — that fallback would *resolve* the route
+        to an API-only model codex rejects (e.g. ``gpt-5.5-pro``). An empty
+        catalog instead leaves ``auto`` unresolved, so the adapter sends no
+        model and codex uses its own serveable subscription default (e.g. on a
+        fresh install before ``models_cache.json`` exists).
         """
         catalogs: dict[str, list] = {}
         for route_key, adapter in self._route_specific_catalog_adapters():
@@ -236,10 +242,11 @@ class ModelDiscoveryMixin:
                 continue
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("route %s: catalog build failed: %s", route_key, e)
-                continue
-            if models:
-                catalogs[route_key] = models
-                logger.debug("route %s: %d route-specific models", route_key, len(models))
+                models = []
+            # Register even when empty: membership marks the route as
+            # route-scoped so it never inherits the vendor catalog.
+            catalogs[route_key] = models or []
+            logger.debug("route %s: %d route-specific models", route_key, len(models or []))
         self._route_catalogs = catalogs
 
     def _ensure_route_catalogs_sync(self) -> None:

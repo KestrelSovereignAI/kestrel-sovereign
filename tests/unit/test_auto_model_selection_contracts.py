@@ -189,6 +189,39 @@ def test_openai_plan_resolves_against_codex_catalog_not_openai_api():
     assert by_name["openai:api"] == "gpt-5.5-pro"
 
 
+def test_openai_plan_empty_codex_cache_stays_auto_never_inherits_api_catalog():
+    """Fresh install (no models_cache.json yet): codex's catalog is empty.
+
+    openai:plan must NOT fall back to openai:api's catalog (which would pin it
+    to ``gpt-5.5-pro``). With an empty route catalog the route stays ``auto``,
+    so the adapter sends no model and codex uses its own serveable default.
+    (codex review P2 on the route-catalog PR.)
+    """
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+    codex_adapter = CodexAdapter()
+    codex_adapter.list_models = AsyncMock(return_value=[])  # cache missing/empty
+
+    harness = _DiscoveryHarness(
+        config={},
+        providers=[
+            {"name": "openai:plan", "vendor": "openai", "route": "plan",
+             "model": "auto", "selection_hints": ["gpt-5"], "adapter": codex_adapter},
+        ],
+    )
+    models = [
+        ModelInfo(id="gpt-5.5-pro", provider="openai", display_name="GPT-5.5 Pro",
+                  category=ModelCategory.CHAT, supports_tools=True, is_featured=True),
+    ]
+
+    harness._resolve_auto_providers(models)
+
+    # Stays "auto" (codex picks its own default) — never inherits gpt-5.5-pro.
+    assert harness.providers[0]["model"] == "auto"
+
+
 def test_shipped_llm_config_uses_auto_models_for_primary_routes():
     """Every shipped route in kestrel.toml [llm] has ``model = "auto"``.
 
