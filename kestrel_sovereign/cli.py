@@ -253,6 +253,36 @@ def _detect_running_agent_server(
     return None
 
 
+# Default read timeout (seconds) for talking to a running agent. An agentic
+# turn can fan out into several provider round-trips + tool executions (a
+# Codex/openai:plan turn alone carries a ~300s server-side watchdog), so the
+# old hardcoded 600s flat timeout would abort a legitimately-long turn. The
+# read timeout is configurable via ``KESTREL_ASK_TIMEOUT_SECONDS``; connect /
+# write / pool stay short so a dead server still fails fast.
+_DEFAULT_ASK_READ_TIMEOUT = 1800.0
+
+
+def _agent_http_timeout(read_override: Optional[float] = None):
+    """``httpx.Timeout`` for agent calls: fast connect, long (configurable) read.
+
+    Precedence for the read timeout: explicit ``read_override`` (e.g. the
+    ``--timeout`` flag) > ``KESTREL_ASK_TIMEOUT_SECONDS`` env > default. A
+    value <= 0 disables the read timeout (wait indefinitely) for very long
+    batch turns.
+    """
+    import httpx
+
+    read = read_override
+    if read is None:
+        env = os.environ.get("KESTREL_ASK_TIMEOUT_SECONDS", "").strip()
+        try:
+            read = float(env) if env else _DEFAULT_ASK_READ_TIMEOUT
+        except ValueError:
+            read = _DEFAULT_ASK_READ_TIMEOUT
+    read_timeout = None if read is not None and read <= 0 else read
+    return httpx.Timeout(read_timeout, connect=10.0, write=30.0, pool=10.0)
+
+
 def _run_http_shell(
     agent_name: str,
     base_url: str,
@@ -271,7 +301,8 @@ def _run_http_shell(
     print(f"   {_SHELL_EXIT_HINT}")
 
     headers = {"X-API-Key": api_key} if api_key else {}
-    with httpx.Client(base_url=base_url, headers=headers, timeout=600.0) as client:
+    with httpx.Client(base_url=base_url, headers=headers,
+                      timeout=_agent_http_timeout()) as client:
         while True:
             try:
                 user_input = input("\n> ")
@@ -343,6 +374,7 @@ def _run_http_ask(
     message: str,
     session_id: Optional[str],
     as_json: bool,
+    timeout_seconds: Optional[float] = None,
 ) -> int:
     """One-shot POST to a running agent's HTTP API; print the reply.
 
@@ -359,7 +391,8 @@ def _run_http_ask(
         payload["session_id"] = session_id
     headers = {"X-API-Key": api_key} if api_key else {}
     try:
-        with httpx.Client(base_url=base_url, headers=headers, timeout=600.0) as client:
+        with httpx.Client(base_url=base_url, headers=headers,
+                          timeout=_agent_http_timeout(timeout_seconds)) as client:
             resp = client.post("/api/agent/invoke", json=payload)
     except httpx.RequestError as e:
         print(f"Connection error talking to '{agent_name}' at {base_url}: {e}",
@@ -419,6 +452,7 @@ def cmd_ask(args) -> int:
         args.message,
         getattr(args, "session", None),
         bool(getattr(args, "json", False)),
+        getattr(args, "timeout", None),
     )
 
 
@@ -1462,6 +1496,12 @@ def build_parser() -> argparse.ArgumentParser:
     ask_p.add_argument(
         "--json", action="store_true",
         help="Emit the full {response, session_id} envelope as JSON",
+    )
+    ask_p.add_argument(
+        "--timeout", type=float, default=None, metavar="SECONDS",
+        help="Read timeout for the agent's reply (default 1800, or "
+             "KESTREL_ASK_TIMEOUT_SECONDS); <=0 waits indefinitely. "
+             "Connect stays fast so a dead server fails immediately.",
     )
 
     # kestrel health (deprecated alias for doctor)
