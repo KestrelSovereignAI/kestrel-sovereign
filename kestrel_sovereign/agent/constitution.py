@@ -8,7 +8,17 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 from datetime import datetime, timezone
 
-from kestrel_sovereign.storage import GraphNode
+# Import the concrete submodule, not the ``storage`` package aggregator.
+# constitution.py is pulled into the LLMService import chain (via
+# ``agent/__init__`` -> token_counter), and the storage package itself
+# reaches back into LLMService at import time when sizing the
+# conversation-history embedding column. Importing from the package
+# top-level forces ``storage/__init__`` to finish binding ``GraphNode``
+# first, which it cannot while it is the thing mid-initialization —
+# yielding a "partially initialized module" ImportError that silently
+# disables provider embeddings. Importing the submodule directly breaks
+# that cycle (see #1792).
+from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 
 class ConstitutionMixin:
