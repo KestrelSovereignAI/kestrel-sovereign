@@ -284,6 +284,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_file",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_file",
@@ -331,13 +338,6 @@
           "reason": "touched_referenced_code",
           "sha": "5ad9a1166537",
           "title": "fix(llm): refuse silent cross-vendor LLM route fallback (no-blind-fallback) (#1931)"
-        },
-        {
-          "merged_at": "2026-06-24T13:09:12-05:00",
-          "number": 1924,
-          "reason": "touched_referenced_file",
-          "sha": "9973504e2b3f",
-          "title": "fix: classify tool input-validation errors as VALIDATION_ERROR, not user_denied (#1924)"
         }
       ],
       "render": "internal",
@@ -658,6 +658,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -705,13 +712,6 @@
           "reason": "touched_referenced_file",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -734,6 +734,13 @@
       "path": "docs/architecture/FEATURE_CLI_ADAPTERS.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -782,13 +789,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -1458,6 +1458,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -1505,13 +1512,6 @@
           "reason": "touched_referenced_file",
           "sha": "4e4db6587c01",
           "title": "feat(llm): producer seam \u2014 operator signals as mid-conversation system messages (#1497) (#1917)"
-        },
-        {
-          "merged_at": "2026-06-23T16:23:27-05:00",
-          "number": 1916,
-          "reason": "touched_referenced_file",
-          "sha": "b62dd4e36aee",
-          "title": "Persist SOUL documents as private encrypted agent identity resources (#1612) (#1916)"
         }
       ],
       "render": "internal",
@@ -1539,6 +1539,13 @@
       "path": "docs/architecture/SIGNAL_SOURCES_GUIDE.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -1587,13 +1594,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -1704,6 +1704,13 @@
       "path": "docs/architecture/WORKFLOWS_FEATURE_DESIGN.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -2172,6 +2179,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -2219,13 +2233,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_code",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "internal",
@@ -2454,6 +2461,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -2501,13 +2515,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_code",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "internal",
@@ -2893,6 +2900,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -2940,13 +2954,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -2993,6 +3000,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -3040,13 +3054,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -3438,6 +3445,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -3485,13 +3499,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_file",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "internal",
@@ -3522,6 +3529,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -3569,13 +3583,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_file",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "internal",
@@ -3803,6 +3810,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -3850,13 +3864,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -3886,6 +3893,13 @@
       "path": "docs/audit/FEATURE_AUDIT_MATRIX.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -3934,13 +3948,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_code",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "internal",
@@ -4024,6 +4031,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -4071,13 +4085,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -4182,6 +4189,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_file",
@@ -4229,13 +4243,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_file",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -4268,6 +4275,13 @@
       "privacy": "",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -4315,13 +4329,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "public",
@@ -5858,6 +5865,13 @@
       "privacy": "",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_file",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_file",
@@ -5905,13 +5919,6 @@
           "reason": "touched_referenced_file",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_file",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "public",
@@ -5960,6 +5967,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "changed_doc",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "changed_doc",
@@ -6007,13 +6021,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_file",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -6052,6 +6059,13 @@
       "path": "docs/audit/SYNC_ASYNC_AUDIT.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -6100,13 +6114,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -7258,6 +7265,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -7305,13 +7319,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_code",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "archive",
@@ -7337,6 +7344,13 @@
       "path": "docs/audit/documentation-2026-05/reports/index_diagrams_hygiene_report.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -7385,13 +7399,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -7585,6 +7592,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -7632,13 +7646,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -7767,6 +7774,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -7814,13 +7828,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -8378,6 +8385,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -8425,13 +8439,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -8495,6 +8502,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -8542,13 +8556,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -8577,6 +8584,13 @@
       "path": "docs/audit/issues/256-endpoint-proof-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -8625,13 +8639,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -8665,6 +8672,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -8712,13 +8726,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -8809,6 +8816,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -8856,13 +8870,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -8901,6 +8908,13 @@
       "path": "docs/audit/issues/256-mandate-resolution-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -8949,13 +8963,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9001,6 +9008,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9048,13 +9062,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9085,6 +9092,13 @@
       "path": "docs/audit/issues/256-privacy-sync-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -9133,13 +9147,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9188,6 +9195,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9235,13 +9249,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9273,6 +9280,13 @@
       "path": "docs/audit/issues/256-runtime-seam-update.md",
       "privacy": "public",
       "recent_prs": [
+        {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
         {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
@@ -9321,13 +9335,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9373,6 +9380,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9420,13 +9434,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9510,6 +9517,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9557,13 +9571,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9582,6 +9589,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9629,13 +9643,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9654,6 +9661,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9701,13 +9715,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9794,6 +9801,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9841,13 +9855,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9868,6 +9875,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9915,13 +9929,6 @@
           "reason": "touched_referenced_file",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -9942,6 +9949,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -9989,13 +10003,6 @@
           "reason": "touched_referenced_file",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -10249,6 +10256,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -10296,13 +10310,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -10695,6 +10702,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -10742,13 +10756,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -10873,6 +10880,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -10920,13 +10934,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_file",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "archive",
@@ -11104,6 +11111,13 @@
       "privacy": "public",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -11151,13 +11165,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "archive",
@@ -11436,6 +11443,13 @@
       "privacy": "internal",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -11483,13 +11497,6 @@
           "reason": "touched_referenced_code",
           "sha": "17587864586c",
           "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
-        },
-        {
-          "merged_at": "2026-06-25T12:30:08-05:00",
-          "number": 1943,
-          "reason": "touched_referenced_code",
-          "sha": "dd3d22032735",
-          "title": "fix(webhooks): single-line auth_config_json doc so ip_allowlist reaches the agent schema (#1925) (#1943)"
         }
       ],
       "render": "internal",
@@ -12658,6 +12665,13 @@
       "privacy": "internal",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "changed_doc",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "changed_doc",
@@ -12705,13 +12719,6 @@
           "reason": "touched_referenced_file",
           "sha": "6d4e2578f3c8",
           "title": "feat(memory): decay-aware episode forgetting in the consolidation pass (#1674) (#1717)"
-        },
-        {
-          "merged_at": "2026-06-10T08:36:32-05:00",
-          "number": 1639,
-          "reason": "touched_referenced_file",
-          "sha": "8499a2aecb7b",
-          "title": "docs(cli): kestrel update \u2014 tighten help text + README typical-flow example + AGENTS.md entry (#1639)"
         }
       ],
       "render": "internal",
@@ -12795,6 +12802,13 @@
       "privacy": "",
       "recent_prs": [
         {
+          "merged_at": "2026-06-25T15:27:53-05:00",
+          "number": 596,
+          "reason": "touched_referenced_code",
+          "sha": "8e679c61bebc",
+          "title": "fix(#596): prove red-team permission bypass via existing fail-closed rails"
+        },
+        {
           "merged_at": "2026-06-25T14:41:00-05:00",
           "number": 596,
           "reason": "touched_referenced_code",
@@ -12842,13 +12856,6 @@
           "reason": "touched_referenced_code",
           "sha": "222ec2cedc7e",
           "title": "fix(strategic-memory): validate signal_dispatch mode + blocker severity (#1925) (#1945)"
-        },
-        {
-          "merged_at": "2026-06-25T12:48:00-05:00",
-          "number": 1944,
-          "reason": "touched_referenced_code",
-          "sha": "17587864586c",
-          "title": "fix(tools): stop docstring param parser truncating wrapped descriptions (#1925) (#1944)"
         }
       ],
       "render": "public",
