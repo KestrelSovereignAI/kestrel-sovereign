@@ -68,6 +68,65 @@ def test_strip_helper_leaves_metadata_untouched():
     assert out[0]["metadata"] == {"sent_form": True, "session_id": "s1"}
 
 
+@pytest.mark.asyncio
+async def test_recall_emotional_unknown_mood_is_partial():
+    """An unrecognized mood (e.g. 'anxious') must not silently degrade to
+    neutral weighting — it surfaces as PARTIAL with the requested mood
+    echoed so the agent knows its mood was not honored."""
+    feature = MemoryFeature.__new__(MemoryFeature)
+    feature.agent_id = "test-agent"
+
+    retriever = MagicMock()
+    retriever.retrieve = AsyncMock(return_value=[
+        {"role": "assistant", "content": "remembered thing", "metadata": {}},
+    ])
+    memory_system = MagicMock()
+    memory_system.retriever = retriever
+    feature._memory_system = memory_system
+
+    out = await feature.recall_emotional(query="anything", mood="anxious")
+
+    assert out.status is ToolResultStatus.PARTIAL
+    assert "anxious" in out.error
+    assert out.data["mood_requested"] == "anxious"
+    # Still returned results — proceeds, just flagged.
+    assert out.data["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recall_emotional_known_mood_is_ok():
+    """A recognized mood weights normally and returns OK."""
+    feature = MemoryFeature.__new__(MemoryFeature)
+    feature.agent_id = "test-agent"
+
+    retriever = MagicMock()
+    retriever.retrieve = AsyncMock(return_value=[
+        {"role": "assistant", "content": "remembered thing", "metadata": {}},
+    ])
+    memory_system = MagicMock()
+    memory_system.retriever = retriever
+    feature._memory_system = memory_system
+
+    out = await feature.recall_emotional(query="anything", mood="positive")
+
+    assert out.status is ToolResultStatus.OK
+    assert out.data["mood_context"] == "positive"
+
+
+@pytest.mark.asyncio
+async def test_recall_emotional_non_string_mood_fails_cleanly():
+    """A malformed (non-string, possibly unhashable) mood must return a
+    structured failure, not raise TypeError on the membership check."""
+    feature = MemoryFeature.__new__(MemoryFeature)
+    feature.agent_id = "test-agent"
+    feature._memory_system = None  # not reached; guard fires first
+
+    out = await feature.recall_emotional(query="anything", mood=["anxious"])
+
+    assert out.status is ToolResultStatus.ERROR
+    assert "mood must be a string" in out.error
+
+
 def test_strip_helper_does_not_mutate_input():
     rows = [{"role": "user", "content": SENT_FORM}]
     original_content = rows[0]["content"]
