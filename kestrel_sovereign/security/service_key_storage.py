@@ -273,9 +273,10 @@ class ServiceKeyStorage:
             provider_id: Service provider
 
         Returns:
-            True if key was deactivated
+            True if a row was actually deactivated, False if no key existed
+            for this agent+provider (nothing was affected).
         """
-        await self._db.execute(
+        affected = await self._db.execute(
             """
             UPDATE agent_service_keys
             SET is_active = 0
@@ -284,8 +285,11 @@ class ServiceKeyStorage:
             (self._agent_did, provider_id)
         )
 
-        logger.info(f"Deactivated key for agent={self._agent_did[:30]}..., provider={provider_id}")
-        return True
+        logger.info(
+            f"Deactivated key for agent={self._agent_did[:30]}..., "
+            f"provider={provider_id} (rows affected={affected})"
+        )
+        return bool(affected)
 
     async def delete_key(self, provider_id: str) -> bool:
         """
@@ -295,9 +299,10 @@ class ServiceKeyStorage:
             provider_id: Service provider
 
         Returns:
-            True if key was deleted
+            True if a row was actually deleted, False if no key existed for
+            this agent+provider (nothing was affected).
         """
-        await self._db.execute(
+        affected = await self._db.execute(
             """
             DELETE FROM agent_service_keys
             WHERE agent_did = ? AND provider_id = ?
@@ -305,8 +310,11 @@ class ServiceKeyStorage:
             (self._agent_did, provider_id)
         )
 
-        logger.info(f"Deleted key for agent={self._agent_did[:30]}..., provider={provider_id}")
-        return True
+        logger.info(
+            f"Deleted key for agent={self._agent_did[:30]}..., "
+            f"provider={provider_id} (rows affected={affected})"
+        )
+        return bool(affected)
 
     async def record_usage(
         self,

@@ -238,6 +238,29 @@ class TestServiceKeyStorage:
         assert len(keys) == 0
 
     @pytest.mark.asyncio
+    async def test_deactivate_key_row_affected(self, key_storage):
+        """deactivate_key reports whether a row was actually affected."""
+        # No key yet -> False (nothing affected)
+        assert await key_storage.deactivate_key(provider_id="github") is False
+
+        await key_storage.store_key(provider_id="github", api_key="ghp_test")
+
+        # Now a row exists -> True
+        assert await key_storage.deactivate_key(provider_id="github") is True
+
+    @pytest.mark.asyncio
+    async def test_delete_key_row_affected(self, key_storage):
+        """delete_key reports whether a row was actually affected."""
+        # No key yet -> False (nothing affected)
+        assert await key_storage.delete_key(provider_id="github") is False
+
+        await key_storage.store_key(provider_id="github", api_key="ghp_test")
+
+        # Now a row exists -> True, and a second delete affects nothing
+        assert await key_storage.delete_key(provider_id="github") is True
+        assert await key_storage.delete_key(provider_id="github") is False
+
+    @pytest.mark.asyncio
     async def test_get_usage_history(self, key_storage):
         """Test retrieving usage history."""
         await key_storage.store_key(
@@ -426,6 +449,123 @@ class TestKeyManagementFeature:
 
             assert result.status is ToolResultStatus.OK
             assert "deactivated" in result.confirmation.lower()
+
+    @pytest.mark.asyncio
+    async def test_get_key_usage_unknown_provider_fails(self, mock_agent, data_key):
+        """Unknown provider must fail loudly, not silently return empty usage."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            result = await feature.get_key_usage(provider="opemai")  # typo
+
+            assert result.status is ToolResultStatus.ERROR
+            assert "Unknown provider" in result.error
+            assert result.data["provider"] == "opemai"
+
+    @pytest.mark.asyncio
+    async def test_remove_unknown_provider_fails(self, mock_agent, data_key):
+        """Destructive remove on a typo'd provider must fail, not 'succeed'."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            result = await feature.remove_service_key(provider="githubb")
+
+            assert result.status is ToolResultStatus.ERROR
+            assert "Unknown provider" in result.error
+
+    @pytest.mark.asyncio
+    async def test_delete_unknown_provider_fails(self, mock_agent, data_key):
+        """Destructive delete on a typo'd provider must fail, not 'succeed'."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            result = await feature.delete_service_key(provider="vasti")
+
+            assert result.status is ToolResultStatus.ERROR
+            assert "Unknown provider" in result.error
+
+    @pytest.mark.asyncio
+    async def test_rotate_unknown_provider_fails(self, mock_agent, data_key):
+        """Rotate on a typo'd provider must fail before touching storage."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            result = await feature.rotate_service_key(
+                provider="anthropicc", new_api_key="sk-new"
+            )
+
+            assert result.status is ToolResultStatus.ERROR
+            assert "Unknown provider" in result.error
+
+    @pytest.mark.asyncio
+    async def test_remove_never_configured_known_provider_fails(self, mock_agent, data_key):
+        """A KNOWN provider with no configured key must NOT report false success."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            result = await feature.remove_service_key(provider="runpod")
+
+            assert result.status is ToolResultStatus.ERROR
+            assert "No key configured" in result.error
+
+    @pytest.mark.asyncio
+    async def test_delete_never_configured_known_provider_fails(self, mock_agent, data_key):
+        """A KNOWN provider with no configured key must NOT report false success."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            result = await feature.delete_service_key(provider="runpod")
+
+            assert result.status is ToolResultStatus.ERROR
+            assert "No key configured" in result.error
+
+    @pytest.mark.asyncio
+    async def test_remove_configured_key_succeeds(self, mock_agent, data_key):
+        """A real configured key still deactivates successfully."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            await feature.add_service_key(provider="github", api_key="ghp-real")
+            result = await feature.remove_service_key(provider="github")
+
+            assert result.status is ToolResultStatus.OK
+            assert "deactivated" in result.confirmation.lower()
+
+    @pytest.mark.asyncio
+    async def test_delete_configured_key_succeeds(self, mock_agent, data_key):
+        """A real configured key still hard-deletes successfully."""
+        from kestrel_sovereign.features.keys import KeyManagementFeature
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            feature = KeyManagementFeature(mock_agent)
+            await feature.initialize()
+
+            await feature.add_service_key(provider="github", api_key="ghp-real")
+            result = await feature.delete_service_key(provider="github")
+
+            assert result.status is ToolResultStatus.OK
+            assert "deleted" in result.confirmation.lower()
 
     @pytest.mark.asyncio
     async def test_get_key_internal_api(self, mock_agent, data_key):
