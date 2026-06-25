@@ -264,6 +264,12 @@ class ProviderRegistry:
         # surfaces it as ``embedding_sibling`` on the dict shape that
         # routing code consumes.
         info._kestrel_embedding_sibling = normalized_sibling  # type: ignore[attr-defined]
+        # Sovereign-only knob (#1954): per-route reasoning effort for local
+        # reasoning models (e.g. GLM-5.2 via llama_cpp, which otherwise runs at
+        # its chat-template default of Max). Stashed like the embedding sibling
+        # above; surfaced as ``reasoning_effort`` on the dict shape by
+        # ``LLMService`` and gated to llama.cpp in ``provider_cache_body``.
+        info._kestrel_reasoning_effort = route_cfg.get("reasoning_effort")  # type: ignore[attr-defined]
         return info
 
     def _build_client_and_adapter(
@@ -417,7 +423,7 @@ class ProviderRegistry:
             # use the SDK default (no base_url override).
             base_url = route_cfg.get("base_url")
             api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key")
-            is_local = bool(route_cfg.get("local", False))
+            is_local = bool(route_cfg.get("local", False)) or not vendor_cfg.get("is_cloud", True)
             if not api_key:
                 api_key = os.environ.get(f"{vendor.upper()}_API_KEY")
             if not api_key and is_local:
@@ -432,6 +438,13 @@ class ProviderRegistry:
             kwargs = {"api_key": api_key, "max_retries": 0}
             if base_url:
                 kwargs["base_url"] = base_url
+            if is_local:
+                # Local models can legitimately generate for many minutes (large
+                # reasoning models at low tok/s). The OpenAI SDK default 600s
+                # total timeout cancels these mid-flight; use a generous,
+                # route-configurable timeout so long local generations complete
+                # instead of being cancelled. See #1954.
+                kwargs["timeout"] = float(route_cfg.get("timeout", 1800.0))
             client = openai.AsyncOpenAI(**kwargs)
             embedding_model = route_cfg.get("embedding_model")
             embedding_dim = route_cfg.get("embedding_dim")
@@ -607,14 +620,25 @@ _CACHE_PROMPT_VENDORS = frozenset({"llama_cpp"})
 
 
 def provider_cache_body(provider: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return extra_body kwargs for providers that accept explicit prompt-
-    cache signaling on the request body.  Today only llama.cpp (llama-server)
-    qualifies; Anthropic uses `cache_control` markers instead (see #705) and
-    Gemini uses a separate CachedContent API.
+    """Return llama.cpp-specific ``extra_body`` kwargs for a request.
 
-    Returns None when the provider has no such extension — the adapter's
-    extra_body passthrough then does nothing.
+    Two llama-server body extensions, both gated to the ``llama_cpp`` vendor so
+    strict OpenAI-compatible proxies never see unknown fields:
+
+    - ``cache_prompt`` (#704): aggressive prefix-KV retention for the slot.
+    - ``reasoning_effort`` (#1954): when the route configures one, control the
+      reasoning budget of local reasoning models (e.g. GLM-5.2, which otherwise
+      defaults to ``Max`` from its chat template with no way to override). Only
+      sent when set, so the model's own default is preserved when unconfigured.
+
+    Anthropic uses `cache_control` markers instead (#705) and Gemini a separate
+    CachedContent API, so they get None. Returns None when there is nothing to
+    send — the adapter's extra_body passthrough then does nothing.
     """
-    if provider.get("vendor") in _CACHE_PROMPT_VENDORS:
-        return {"cache_prompt": True}
-    return None
+    if provider.get("vendor") not in _CACHE_PROMPT_VENDORS:
+        return None
+    body: Dict[str, Any] = {"cache_prompt": True}
+    effort = provider.get("reasoning_effort")
+    if effort:
+        body["reasoning_effort"] = effort
+    return body

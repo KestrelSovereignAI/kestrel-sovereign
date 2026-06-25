@@ -131,7 +131,7 @@ class CliFeature(Feature):
 
     @tool(
         name="git_status",
-        description="Read local repository status via `git status --short --branch`.",
+        description="Read local repository status via `git status --short --branch`. repo_path: within allowed repo roots (default cwd).",
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!git-status",
     )
@@ -147,7 +147,7 @@ class CliFeature(Feature):
 
     @tool(
         name="git_diff",
-        description="Read local repository diff via `git diff`.",
+        description="Read local repository diff via `git diff`. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd).",
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!git-diff",
     )
@@ -172,7 +172,7 @@ class CliFeature(Feature):
 
     @tool(
         name="git_log",
-        description="Read recent local repository commits via `git log`.",
+        description="Read recent local repository commits via `git log`. max_count is capped at 100; repo_path: within allowed repo roots (default cwd).",
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!git-log",
     )
@@ -191,7 +191,7 @@ class CliFeature(Feature):
 
     @tool(
         name="git_show_file",
-        description="Read a local repository file from a git ref via `git show`.",
+        description="Read a local repository file from a git ref via `git show`. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd).",
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!git-show-file",
     )
@@ -216,7 +216,7 @@ class CliFeature(Feature):
 
     @tool(
         name="git_merge_base",
-        description="Read the merge-base for two local git refs.",
+        description="Read the merge-base for two local git refs. left_ref/right_ref: single git refs, no ranges/`..`; repo_path: within allowed repo roots (default cwd).",
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!git-merge-base",
     )

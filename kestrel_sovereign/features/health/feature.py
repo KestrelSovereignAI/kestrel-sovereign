@@ -285,7 +285,7 @@ class HealthFeature(Feature):
 
     @tool(
         name="heartbeat_check",
-        description="[deprecated] alias for !health",
+        description="[deprecated] alias for !health — use health instead",
         category=ToolCategory.SYSTEM,
         command_prefix="!heartbeat",
     )
@@ -296,7 +296,7 @@ class HealthFeature(Feature):
 
     @tool(
         name="heartbeat_status",
-        description="[deprecated] alias for !health-history",
+        description="[deprecated] alias for !health-history — use health_history instead",
         category=ToolCategory.SYSTEM,
         command_prefix="!heartbeat-status",
     )
@@ -307,7 +307,7 @@ class HealthFeature(Feature):
 
     @tool(
         name="heartbeat_interval",
-        description="[deprecated] alias for !health-interval",
+        description="[deprecated] alias for !health-interval — use health_interval instead",
         category=ToolCategory.SYSTEM,
         command_prefix="!heartbeat-interval",
     )

@@ -419,6 +419,68 @@ class TestDeployFeature:
             assert ref == "gcr.io/test-project/kestrel:v1.2.3"
 
 
+class TestDeployAgentDocs:
+    """Doc-visibility assertions on the deploy_agent @tool schema (#1946).
+
+    The Cloud-Run "latest is rejected" rule, the action synonym set,
+    the per-action profile requirement, and the per-action return shape
+    were only documented in internal helper docstrings invisible to the
+    agent. These tests pin the agent-facing schema so the guidance can't
+    silently regress back out of the tool description / param docs.
+    """
+
+    @property
+    def _schema(self):
+        return DeployFeature.deploy_agent._tool_schema
+
+    def _param(self, name):
+        return next(p for p in self._schema["parameters"] if p.name == name)
+
+    def test_description_surfaces_cloudrun_tag_rule(self):
+        desc = self._schema["description"].lower()
+        assert "latest" in desc
+        assert "cloud run" in desc
+        assert "reject" in desc
+        # Concrete-tag guidance must be present so the agent knows what to pass.
+        assert "v0.15.1" in self._schema["description"]
+
+    def test_description_lists_action_synonyms(self):
+        desc = self._schema["description"].lower()
+        for canonical in ("status", "deploy", "teardown", "logs", "list", "health"):
+            assert canonical in desc
+        for synonym in ("start", "stop", "delete", "log", "ls", "check"):
+            assert synonym in desc
+
+    def test_description_documents_profile_requirement(self):
+        desc = self._schema["description"].lower()
+        assert "profile" in desc
+        assert "required" in desc
+
+    def test_tag_param_doc_carries_cloudrun_rule(self):
+        tag_desc = self._param("tag").description.lower()
+        assert "concrete" in tag_desc
+        assert "reject" in tag_desc
+        assert "cloud run" in tag_desc
+
+    def test_profile_param_doc_lists_required_actions(self):
+        profile_desc = self._param("profile").description.lower()
+        assert "required" in profile_desc
+        for action in ("deploy", "teardown", "logs", "health"):
+            assert action in profile_desc
+
+    def test_action_param_doc_lists_synonyms(self):
+        action_desc = self._param("action").description.lower()
+        for synonym in ("start", "stop", "delete", "ls", "check"):
+            assert synonym in action_desc
+
+    def test_docstring_documents_per_action_returns(self):
+        doc = DeployFeature.deploy_agent.__doc__
+        assert "Returns" in doc
+        assert "active_deployments" in doc
+        assert "count" in doc
+        assert "health.healthy" in doc
+
+
 class TestDeployManager:
     """Test DeployManager composition layer."""
 

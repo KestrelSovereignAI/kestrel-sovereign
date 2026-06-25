@@ -105,6 +105,26 @@ class KeyManagementFeature(Feature):
             data={"privacy_mode_blocks_persistent_storage": True},
         )
 
+    @staticmethod
+    def _validate_provider(provider: str) -> Optional[ToolResult]:
+        """Validate ``provider`` against ``KNOWN_PROVIDERS``.
+
+        Returns ``None`` if the (lower-cased) provider is known, otherwise a
+        ``ToolResult.failed`` naming the valid providers. Callers must lower-case
+        the provider themselves before passing it here. Validating membership up
+        front prevents two silent failure modes: a typo'd provider returning an
+        empty usage report (looks like "no usage" rather than "wrong name"), and
+        a destructive op (remove/delete) reporting success for a provider that
+        was never configured.
+        """
+        if provider not in KNOWN_PROVIDERS:
+            valid_providers = ", ".join(KNOWN_PROVIDERS.keys())
+            return ToolResult.failed(
+                f"Unknown provider '{provider}'. Valid providers: {valid_providers}",
+                data={"provider": provider},
+            )
+        return None
+
     # =========================================================================
     # Key Management Tools
     # =========================================================================
@@ -223,7 +243,11 @@ class KeyManagementFeature(Feature):
 
     @tool(
         name="get_key_usage",
-        description="Get usage statistics for a service key",
+        description=(
+            "Get usage statistics for a service key. Valid providers: "
+            "openrouter, openai, anthropic, lighthouse, github, runpod, vastai "
+            "(use list_providers for the authoritative set)."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!key-usage"
     )
@@ -250,6 +274,9 @@ class KeyManagementFeature(Feature):
             )
 
         provider = provider.lower()
+        invalid = self._validate_provider(provider)
+        if invalid is not None:
+            return invalid
 
         try:
             usage_records = await self._storage.get_usage(
@@ -298,7 +325,11 @@ class KeyManagementFeature(Feature):
 
     @tool(
         name="remove_service_key",
-        description="Remove/deactivate a service key",
+        description=(
+            "Remove/deactivate a service key. Valid providers: "
+            "openrouter, openai, anthropic, lighthouse, github, runpod, vastai "
+            "(use list_providers for the authoritative set)."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!remove-key"
     )
@@ -323,14 +354,22 @@ class KeyManagementFeature(Feature):
             )
 
         provider = provider.lower()
+        invalid = self._validate_provider(provider)
+        if invalid is not None:
+            return invalid
 
         try:
-            await self._storage.deactivate_key(provider_id=provider)
+            removed = await self._storage.deactivate_key(provider_id=provider)
         except Exception as e:
             logger.error(f"Failed to remove service key: {e}")
             return ToolResult.failed(str(e))
 
         provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
+        if not removed:
+            return ToolResult.failed(
+                f"No key configured for {provider_info['name']} - nothing to deactivate",
+                data={"provider": provider, "provider_name": provider_info["name"]},
+            )
         return ToolResult.ok(
             confirmation=f"API key for {provider_info['name']} has been deactivated",
             data={
@@ -343,7 +382,11 @@ class KeyManagementFeature(Feature):
 
     @tool(
         name="delete_service_key",
-        description="Permanently delete a service key",
+        description=(
+            "Permanently delete a service key. Valid providers: "
+            "openrouter, openai, anthropic, lighthouse, github, runpod, vastai "
+            "(use list_providers for the authoritative set)."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!delete-key"
     )
@@ -368,14 +411,22 @@ class KeyManagementFeature(Feature):
             )
 
         provider = provider.lower()
+        invalid = self._validate_provider(provider)
+        if invalid is not None:
+            return invalid
 
         try:
-            await self._storage.delete_key(provider_id=provider)
+            deleted = await self._storage.delete_key(provider_id=provider)
         except Exception as e:
             logger.error(f"Failed to delete service key: {e}")
             return ToolResult.failed(str(e))
 
         provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
+        if not deleted:
+            return ToolResult.failed(
+                f"No key configured for {provider_info['name']} - nothing to delete",
+                data={"provider": provider, "provider_name": provider_info["name"]},
+            )
         return ToolResult.ok(
             confirmation=f"API key for {provider_info['name']} has been permanently deleted",
             data={
@@ -388,7 +439,11 @@ class KeyManagementFeature(Feature):
 
     @tool(
         name="rotate_service_key",
-        description="Rotate an API key (requires constitutional approval)",
+        description=(
+            "Rotate an API key (requires constitutional approval). Valid "
+            "providers: openrouter, openai, anthropic, lighthouse, github, "
+            "runpod, vastai (use list_providers for the authoritative set)."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!rotate-key"
     )
@@ -403,6 +458,15 @@ class KeyManagementFeature(Feature):
         This requires constitutional approval for security.
         The old key is replaced with the new key.
 
+        Approval semantics:
+        - If the constitutional approval queue denies the request, rotation is
+          refused (``ToolResult.failed``).
+        - If the approval queue itself raises, rotation fails closed by default.
+          Operators may opt into the legacy "proceed without review" behavior by
+          setting ``KESTREL_KEYS_ROTATE_WITHOUT_APPROVAL=1``; in that case the
+          rotation proceeds but is reported as ``ToolResult.partial`` so the
+          bypass is spoken rather than silently swallowed.
+
         Args:
             provider: Service provider
             new_api_key: The new API key
@@ -416,6 +480,9 @@ class KeyManagementFeature(Feature):
             )
 
         provider = provider.lower()
+        invalid = self._validate_provider(provider)
+        if invalid is not None:
+            return invalid
 
         # Get security feature for approval
         security = None

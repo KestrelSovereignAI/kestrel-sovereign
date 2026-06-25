@@ -304,7 +304,6 @@ class TestConsentStatsIncludesMetrics:
         # 3. COUNT where duration_ms IS NOT NULL (for p95 calc)
         # 4. P95 duration row
         # 5. Timeout count
-        # 6. Error count (same query as timeout in current impl)
         agent.storage.db.fetchone = AsyncMock(
             side_effect=[
                 (5,),        # total
@@ -312,7 +311,6 @@ class TestConsentStatsIncludesMetrics:
                 (4,),        # count with duration
                 (250.0,),    # p95 duration
                 (1,),        # timeout count
-                (1,),        # error count
             ]
         )
 
@@ -330,8 +328,10 @@ class TestConsentStatsIncludesMetrics:
         assert result.data["p95_duration_ms"] == 250.0
         assert result.data["timeout_count"] == 1
         assert result.data["timeout_rate"] == 0.2  # 1/5
-        assert result.data["error_count"] == 1
-        assert result.data["error_rate"] == 0.2
+        # error_count / error_rate were duplicates of the timeout metrics
+        # (identical SQL) and have been removed (#1946).
+        assert "error_count" not in result.data
+        assert "error_rate" not in result.data
         assert result.data["by_action"]["privacy_mode_change"] == 3
         assert result.data["by_sentiment"]["timeout"] == 1
 
@@ -348,7 +348,6 @@ class TestConsentStatsIncludesMetrics:
                 (0,),     # count with duration
                 # p95 query skipped since duration_count=0
                 (0,),     # timeout count
-                (0,),     # error count
             ]
         )
 
@@ -364,8 +363,8 @@ class TestConsentStatsIncludesMetrics:
         assert result.data["p95_duration_ms"] is None
         assert result.data["timeout_count"] == 0
         assert result.data["timeout_rate"] == 0.0
-        assert result.data["error_count"] == 0
-        assert result.data["error_rate"] == 0.0
+        assert "error_count" not in result.data
+        assert "error_rate" not in result.data
 
 
 # =========================================================================

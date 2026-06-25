@@ -267,6 +267,13 @@ class WellnessFeature(Feature):
             ToolResult.failed when the database is unavailable or the
             query fails.
         """
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(error=f"limit must be an integer, got {limit!r}")
+        if limit_val < 1:
+            return ToolResult.failed(error="limit must be >= 1")
+
         if not self._db:
             return ToolResult.failed(error="Database not available")
 
@@ -286,7 +293,7 @@ class WellnessFeature(Feature):
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (self._agent_id, limit),
+                (self._agent_id, limit_val),
             )
 
             checkpoints = []

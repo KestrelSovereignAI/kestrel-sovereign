@@ -1007,3 +1007,42 @@ class TestBootstrapLoaderCustomOrder:
         # Should return a copy, not the internal list
         order.append("EXTRA.md")
         assert "EXTRA.md" not in loader.file_order
+
+
+# ---------------------------------------------------------------------------
+# bootstrap_status — structured (chainable) data (#1946)
+# ---------------------------------------------------------------------------
+
+class TestBootstrapStatusStructuredData:
+    """bootstrap_status must return structured fields, not a stringified blob."""
+
+    @pytest.mark.asyncio
+    async def test_returns_structured_fields(self, mock_agent, tmp_agent_dir):
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sovereign.bootstrap.service import BootstrapState
+
+        mock_agent.bootstrap_service.agent_data_path = tmp_agent_dir
+        (tmp_agent_dir / "SOUL.md").write_text("# Soul")
+        mock_agent.bootstrap_service.get_bootstrap_status = AsyncMock(
+            return_value="**Bootstrap State:** complete"
+        )
+        mock_agent.bootstrap_service.get_bootstrap_state = AsyncMock(
+            return_value=BootstrapState.COMPLETE
+        )
+        mock_agent.bootstrap_service.get_discovery_history = AsyncMock(
+            return_value=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "more"},
+            ]
+        )
+
+        feature = BootstrapFeature(mock_agent)
+        envelope = await feature.bootstrap_status()
+
+        assert envelope.data["state"] == "complete"
+        assert envelope.data["exchange_count"] == 2
+        assert envelope.data["soul_exists"] is True
+        # No stringified structured object masquerading as the payload.
+        assert isinstance(envelope.data["state"], str)
+        assert isinstance(envelope.data["exchange_count"], int)
