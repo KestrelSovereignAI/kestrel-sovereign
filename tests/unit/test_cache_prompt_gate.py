@@ -82,6 +82,37 @@ def test_provider_cache_body_is_fresh_dict_per_call():
 
 
 # ---------------------------------------------------------------------------
+# reasoning_effort plumbing (issue #1954)
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_effort_included_for_llama_cpp_when_configured():
+    """When the route configures reasoning_effort, it rides along with
+    cache_prompt in the llama.cpp extra_body."""
+    provider = {"vendor": "llama_cpp", "route": "local", "reasoning_effort": "medium"}
+    assert provider_cache_body(provider) == {
+        "cache_prompt": True,
+        "reasoning_effort": "medium",
+    }
+
+
+def test_reasoning_effort_omitted_for_llama_cpp_when_unset():
+    """Unset/None reasoning_effort must NOT be sent — the model's own default
+    (e.g. GLM's template Max) is preserved when the operator hasn't chosen."""
+    assert provider_cache_body({"vendor": "llama_cpp"}) == {"cache_prompt": True}
+    assert provider_cache_body(
+        {"vendor": "llama_cpp", "reasoning_effort": None}
+    ) == {"cache_prompt": True}
+
+
+def test_reasoning_effort_never_sent_to_non_llama_cpp_vendors():
+    """Even if a reasoning_effort leaks onto a cloud provider dict, the gate
+    must drop the whole body (strict endpoints reject unknown fields)."""
+    provider = {"vendor": "openai", "route": "api", "reasoning_effort": "low"}
+    assert provider_cache_body(provider) is None
+
+
+# ---------------------------------------------------------------------------
 # OpenAIAdapter extra_body passthrough
 # ---------------------------------------------------------------------------
 

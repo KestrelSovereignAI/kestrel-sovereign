@@ -1264,6 +1264,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "is_cloud": getattr(provider, "is_cloud", True),
                 "is_local": getattr(provider, "is_local", False),
                 "base_url": getattr(provider, "base_url", None),
+                # #1954 per-route reasoning effort (llama.cpp local models),
+                # stashed as a private attr in ``ProviderRegistry._build_route``.
+                "reasoning_effort": getattr(provider, "_kestrel_reasoning_effort", None),
                 "selection_hints": hints,
                 "capabilities": capabilities,
                 # #1494 sibling string carried over the SDK boundary
