@@ -39,6 +39,20 @@ class MockAgent:
             await listener(event_type, data)
 
 
+class CountingExecutor:
+    """Executor spy for approval-boundary tests."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_language(self, language):
+        return True
+
+    async def execute(self, script):
+        self.calls += 1
+        raise AssertionError("executor must not run before approval boundary passes")
+
+
 @pytest.fixture
 def temp_db():
     """Create temporary database file."""
@@ -263,6 +277,40 @@ class TestScriptLifecycle:
             f"run_script must reject state=SIGNED with empty signature, got: {result!r}"
         )
 
+        refreshed = await compute_feature.script_store.find_by_id_prefix(script.id)
+        assert refreshed.state == ScriptState.REJECTED
+
+    @pytest.mark.asyncio
+    async def test_run_script_rejects_mutated_approved_script_before_executor(
+        self, compute_feature
+    ):
+        """A stale approval cannot survive post-approval content mutation.
+
+        This exercises the real ECDSA signer.verify() path: write_script signs
+        the original content, the test marks that signed script as approved,
+        then mutates content before run_script. The approval boundary must
+        reject before any executor side effect.
+        """
+        await compute_feature.write_script(
+            name="mutated_after_approval",
+            language="python",
+            content="print('approved content')",
+            purpose="stale approval regression",
+        )
+        scripts = await compute_feature.script_store.list_recent(1)
+        script = scripts[0]
+        assert script.state == ScriptState.SIGNED
+
+        executor = CountingExecutor()
+        compute_feature.executors["uv"] = executor
+        script.state = ScriptState.APPROVED
+        script.content = "print('mutated after approval')"
+        await compute_feature.script_store.update(script)
+
+        result = await compute_feature.run_script(script.id, executor="uv")
+
+        assert "invalid signature" in (result.error or "").lower()
+        assert executor.calls == 0
         refreshed = await compute_feature.script_store.find_by_id_prefix(script.id)
         assert refreshed.state == ScriptState.REJECTED
 
