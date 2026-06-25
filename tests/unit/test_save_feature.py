@@ -445,6 +445,8 @@ async def test_recall_invalid_type_filter_errors_clearly():
 
     assert result.status is ToolResultStatus.ERROR
     assert "recipe" in result.error
+    # Guides the agent to drop the filter so legacy items still surface.
+    assert "Drop the item_type filter" in result.error
     # Errors instead of returning a silently-empty result.
     store.search.assert_not_called()
 

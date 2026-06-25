@@ -111,13 +111,23 @@ class SaveFeature(Feature):
         return (raw or "").strip().lower()
 
     @classmethod
-    def _item_type_error(cls, normalized: str) -> ToolResult:
+    def _item_type_error(cls, normalized: str, *, context: str = "save") -> ToolResult:
         valid = ", ".join(cls._VALID_ITEM_TYPES)
+        if context == "filter":
+            guidance = (
+                "Drop the item_type filter to search across all types (legacy "
+                "items mis-filed under a custom type still surface in an "
+                "unfiltered recall, with their real type shown in results)."
+            )
+        else:
+            guidance = (
+                "Use schema_id (e.g. 'recipe', 'user_story') for finer typing "
+                "of a 'structured' item — item_type itself must be one of the "
+                "values above or the saved item becomes unfindable via recall."
+            )
         return ToolResult.failed(
             f"Unknown item_type {normalized!r}. Valid types are: {valid}. "
-            "Use schema_id (e.g. 'recipe', 'user_story') for finer typing of "
-            "a 'structured' item — item_type itself must be one of the values "
-            "above or the saved item becomes unfindable via recall.",
+            + guidance,
             data={
                 "item_type": normalized,
                 "valid_item_types": list(cls._VALID_ITEM_TYPES),
@@ -511,7 +521,7 @@ class SaveFeature(Feature):
         if item_type:
             filter_type = self._normalize_item_type(item_type)
             if filter_type not in self._VALID_ITEM_TYPES:
-                return self._item_type_error(filter_type)
+                return self._item_type_error(filter_type, context="filter")
 
         try:
             results = await store.search(
@@ -583,7 +593,7 @@ class SaveFeature(Feature):
         if item_type:
             filter_type = self._normalize_item_type(item_type)
             if filter_type not in self._VALID_ITEM_TYPES:
-                return self._item_type_error(filter_type)
+                return self._item_type_error(filter_type, context="filter")
 
         try:
             items = await store.list_items(
