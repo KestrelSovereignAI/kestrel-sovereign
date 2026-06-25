@@ -70,10 +70,20 @@ def test_effective_timeout_ignores_cloud_providers():
     assert _svc(providers) is None
 
 
-def test_effective_timeout_local_wins_over_cloud_in_mixed_deploy():
+def test_effective_timeout_none_for_mixed_set_to_protect_cloud_hang_detection():
+    # A mixed candidate set (cloud-primary + local-fallback) must NOT lift the
+    # watchdog — the cloud route may be the one tried (#1966 review round 2).
     providers = [
         {"is_local": False, "client": SimpleNamespace(timeout=httpx.Timeout(600.0))},
         {"is_local": True, "client": SimpleNamespace(timeout=1800.0)},
+    ]
+    assert _svc(providers) is None
+
+
+def test_effective_timeout_lifts_only_when_all_candidates_local():
+    providers = [
+        {"is_local": True, "client": SimpleNamespace(timeout=1800.0)},
+        {"is_local": True, "client": SimpleNamespace(timeout=900.0)},
     ]
     assert _svc(providers) == 1800.0
 

@@ -785,15 +785,18 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         — a local route's configured ``timeout`` (#1957) becomes the single knob.
 
         ``providers`` should be the **candidate routes for the specific call**
-        (from :meth:`resolve_provider_routing`), so an explicit cloud selection
-        in a mixed local/cloud deployment is NOT lengthened by an unrelated
-        local route. Falls back to all providers when omitted.
+        (from :meth:`resolve_provider_routing`). The watchdog is lifted ONLY when
+        EVERY candidate is local: in a mixed set the call may try a cloud route
+        first (cloud-primary, local-fallback), and we must not delay
+        hang-detection of that cloud call to an unrelated local route's timeout.
+        Returns None (no lift, keep the default) for empty or mixed sets.
+        Falls back to all providers when omitted.
         """
         src = providers if providers is not None else (self.providers or [])
+        if not src or any(not p.get("is_local") for p in src):
+            return None
         best: Optional[float] = None
         for provider in src:
-            if not provider.get("is_local"):
-                continue
             secs = _client_timeout_seconds(getattr(provider.get("client"), "timeout", None))
             if secs is not None and (best is None or secs > best):
                 best = secs
