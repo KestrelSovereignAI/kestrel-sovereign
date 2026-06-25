@@ -27,9 +27,47 @@ from kestrel_sovereign.cli import (
     cmd_health,
     cmd_storage,
     cmd_config,
+    _agent_http_timeout,
+    _DEFAULT_ASK_READ_TIMEOUT,
     _get_project_dir,
     _host_pid_file,
 )
+
+
+class TestAgentHttpTimeout:
+    """Read timeout for talking to a running agent is configurable; connect
+    stays fast so a dead server fails immediately (replaces the old hardcoded
+    flat 600s that aborted long agentic/Codex turns)."""
+
+    def test_default_read_timeout(self, monkeypatch):
+        monkeypatch.delenv("KESTREL_ASK_TIMEOUT_SECONDS", raising=False)
+        t = _agent_http_timeout()
+        assert t.read == _DEFAULT_ASK_READ_TIMEOUT
+        assert t.connect == 10.0  # fast-fail on a dead server
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("KESTREL_ASK_TIMEOUT_SECONDS", "120")
+        assert _agent_http_timeout().read == 120.0
+
+    def test_explicit_override_beats_env(self, monkeypatch):
+        monkeypatch.setenv("KESTREL_ASK_TIMEOUT_SECONDS", "120")
+        assert _agent_http_timeout(45.0).read == 45.0
+
+    def test_non_positive_disables_read_timeout(self, monkeypatch):
+        monkeypatch.delenv("KESTREL_ASK_TIMEOUT_SECONDS", raising=False)
+        assert _agent_http_timeout(0).read is None
+
+    def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("KESTREL_ASK_TIMEOUT_SECONDS", "not-a-number")
+        assert _agent_http_timeout().read == _DEFAULT_ASK_READ_TIMEOUT
+
+    def test_ask_timeout_flag_parses(self):
+        args = build_parser().parse_args(["ask", "kite", "hi", "--timeout", "90"])
+        assert args.timeout == 90.0
+
+    def test_ask_timeout_flag_defaults_none(self):
+        args = build_parser().parse_args(["ask", "kite", "hi"])
+        assert args.timeout is None
 from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
