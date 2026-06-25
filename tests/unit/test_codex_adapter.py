@@ -7,6 +7,8 @@ their tests are gone too; these exercise the new app-server projection,
 the per-turn tool-executor bridge, and binary-resolution registry
 wiring.
 """
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import patch
@@ -43,11 +45,55 @@ class TestOpenAIPlanAdapterClass:
         assert a.cost_per_1m_tokens() == {"input": 0.0, "output": 0.0}
 
 
+_CODEX_MODELS_CACHE = {
+    "fetched_at": "2026-06-24T00:00:00Z",
+    "etag": "abc123",
+    "models": [
+        {"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list",
+         "supported_in_api": True, "priority": 9},
+        {"slug": "gpt-5.4", "display_name": "GPT-5.4", "visibility": "list", "priority": 16},
+        {"slug": "gpt-5.4-mini", "display_name": "GPT-5.4 mini", "visibility": "list",
+         "priority": 23},
+        {"slug": "gpt-5.3-codex-spark", "visibility": "list",
+         "supported_in_api": False, "priority": 26},
+        {"slug": "codex-auto-review", "visibility": "hide", "priority": 43},
+    ],
+}
+
+
 class TestOpenAIPlanListModels:
     @pytest.mark.asyncio
-    async def test_list_models_is_not_supported_directly(self):
-        with pytest.raises(NotImplementedError, match="canonical openai provider"):
-            await CodexAdapter().list_models()
+    async def test_list_models_reads_codex_cache(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / ".kestrel" / "codex-home"
+        codex_home.mkdir(parents=True)
+        (codex_home / "models_cache.json").write_text(
+            json.dumps(_CODEX_MODELS_CACHE), encoding="utf-8"
+        )
+        # Managed home resolves to ``Path.home()/.kestrel/codex-home``.
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+
+        models = await CodexAdapter().list_models()
+        ids = [m.id for m in models]
+        # list-visible only; "hide" excluded.
+        assert ids == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]
+        assert "codex-auto-review" not in ids
+        # priority<=10 is featured.
+        by_id = {m.id: m for m in models}
+        assert by_id["gpt-5.5"].is_featured is True
+        assert by_id["gpt-5.4"].is_featured is False
+        assert by_id["gpt-5.5"].display_name == "GPT-5.5"
+        # slug used as display_name when none provided.
+        assert by_id["gpt-5.3-codex-spark"].display_name == "gpt-5.3-codex-spark"
+        assert all(m.provider == "openai" for m in models)
+        assert all(m.supports_tools and m.supports_streaming for m in models)
+
+    @pytest.mark.asyncio
+    async def test_list_models_missing_cache_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+        models = await CodexAdapter().list_models()
+        assert models == []
 
 
 class TestMessageHelpers:

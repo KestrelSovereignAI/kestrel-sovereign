@@ -137,6 +137,58 @@ def test_auto_resolution_for_subscription_route_shares_vendor_catalog():
     assert harness.providers[0]["model"] == "claude-sonnet-4-6"
 
 
+def test_openai_plan_resolves_against_codex_catalog_not_openai_api():
+    """openai:plan must resolve ``auto`` against codex's serveable subset.
+
+    The two openai routes have DIFFERENT serveable sets: ``openai:api`` sees
+    the full OpenAI catalog (incl. ``gpt-5.5-pro``, which codex/ChatGPT
+    rejects); ``openai:plan`` (CodexAdapter) sees only what codex serves. With
+    hint ``"gpt-5"`` the plan route must pick ``gpt-5.5`` (top list-visible
+    codex model), NEVER ``gpt-5.5-pro`` — while ``openai:api`` still resolves
+    against its full catalog.
+    """
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+    codex_catalog = [
+        ModelInfo(id="gpt-5.5", provider="openai", display_name="GPT-5.5",
+                  category=ModelCategory.CHAT, supports_tools=True, is_featured=True),
+        ModelInfo(id="gpt-5.4", provider="openai", display_name="GPT-5.4",
+                  category=ModelCategory.CHAT, supports_tools=True),
+        ModelInfo(id="gpt-5.4-mini", provider="openai", display_name="GPT-5.4 mini",
+                  category=ModelCategory.CHAT, supports_tools=True),
+    ]
+    codex_adapter = CodexAdapter()
+    # Stub the route-specific catalog read (would hit models_cache.json).
+    codex_adapter.list_models = AsyncMock(return_value=codex_catalog)
+
+    harness = _DiscoveryHarness(
+        config={},
+        providers=[
+            {"name": "openai:api", "vendor": "openai", "route": "api",
+             "model": "auto", "selection_hints": ["gpt-5"], "adapter": object()},
+            {"name": "openai:plan", "vendor": "openai", "route": "plan",
+             "model": "auto", "selection_hints": ["gpt-5"], "adapter": codex_adapter},
+        ],
+    )
+    # Shared vendor discovery (openai:api's full catalog) includes gpt-5.5-pro.
+    models = [
+        ModelInfo(id="gpt-5.5-pro", provider="openai", display_name="GPT-5.5 Pro",
+                  category=ModelCategory.CHAT, supports_tools=True, is_featured=True),
+        ModelInfo(id="gpt-5.1", provider="openai", display_name="GPT-5.1",
+                  category=ModelCategory.CHAT, supports_tools=True, is_featured=True),
+    ]
+
+    harness._resolve_auto_providers(models)
+
+    by_name = {p["name"]: p["model"] for p in harness.providers}
+    # plan resolves against codex's subset -> gpt-5.5 (NOT gpt-5.5-pro).
+    assert by_name["openai:plan"] == "gpt-5.5"
+    # api still resolves against the full OpenAI catalog.
+    assert by_name["openai:api"] == "gpt-5.5-pro"
+
+
 def test_shipped_llm_config_uses_auto_models_for_primary_routes():
     """Every shipped route in kestrel.toml [llm] has ``model = "auto"``.
 

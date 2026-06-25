@@ -7,6 +7,7 @@ carry ``{vendor, model, route?}`` rather than the old flat ``{model, provider}``
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -459,12 +460,36 @@ class TestCodexAdapterContract:
                     messages=[{"role": "user", "content": "hi"}],
                 ))
 
-    def test_codex_adapter_does_not_list_models(self):
+    def test_codex_adapter_lists_its_own_catalog(self, tmp_path, monkeypatch):
+        """CodexAdapter now reports codex's serveable subset from the managed cache.
+
+        The plan route used to defer to ``openai:api``, which surfaced models
+        codex/ChatGPT rejects (e.g. ``gpt-5.5-pro``). It now reads
+        ``<managed CODEX_HOME>/models_cache.json``; a missing cache yields ``[]``
+        (route stays ``auto`` → codex's own default), never raising.
+        """
+        from pathlib import Path
+
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
-        adapter = CodexAdapter()
-        with pytest.raises(NotImplementedError, match="canonical openai"):
-            asyncio.run(adapter.list_models())
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+
+        # No cache present -> empty, no raise.
+        assert asyncio.run(CodexAdapter().list_models()) == []
+
+        codex_home = tmp_path / ".kestrel" / "codex-home"
+        codex_home.mkdir(parents=True)
+        (codex_home / "models_cache.json").write_text(
+            json.dumps({"models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5",
+                 "visibility": "list", "priority": 9},
+                {"slug": "codex-auto-review", "visibility": "hide", "priority": 43},
+            ]}),
+            encoding="utf-8",
+        )
+        models = asyncio.run(CodexAdapter().list_models())
+        assert [m.id for m in models] == ["gpt-5.5"]
 
 
 class TestOpenAIPlanProviderRegistry:

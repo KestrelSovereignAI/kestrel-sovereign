@@ -2863,14 +2863,71 @@ class CodexAdapter(LLMAdapter):
                 yield resp
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
-        """Model discovery is the canonical openai provider's job.
+        """Discover the codex (ChatGPT app-server) serveable model catalog.
 
-        Kept as ``NotImplementedError`` (unchanged contract): the plan
-        route deliberately defers its catalog to ``openai:api``.
+        Codex fetches the account's serveable models from chatgpt.com and
+        caches them at ``<CODEX_HOME>/models_cache.json`` where the
+        kestrel-managed ``CODEX_HOME = ~/.kestrel/codex-home`` (mirrors
+        ``codex_app_server._spawn``). That file is the source of truth for
+        what a ChatGPT-account Codex session can actually run — a *subset*
+        of the full OpenAI API catalog. The plan route MUST resolve
+        ``auto`` against this subset, not ``openai:api``'s full catalog,
+        or it picks models codex rejects (e.g. ``gpt-5.5-pro``).
+
+        Returns one :class:`ModelInfo` per ``visibility == "list"`` model
+        (user-selectable); ``"hide"`` models are codex-internal and skipped.
+        No model ids are hardcoded — everything comes from the cache. If the
+        cache is missing/unreadable/empty we return ``[]`` (callers tolerate
+        empty; the route then stays ``auto`` and codex uses its own default,
+        which is still serveable).
         """
-        raise NotImplementedError(
-            "OpenAI plan model discovery is provided by the canonical openai provider."
-        )
+        from .model_metadata import ModelCategory
+
+        env_home = os.environ.get("CODEX_HOME", "").strip()
+        managed_home = Path.home() / ".kestrel" / "codex-home"
+        # Prefer the env override only when it points at the managed dir
+        # (mirrors how ``codex_app_server._spawn`` resolves CODEX_HOME);
+        # otherwise the managed home is authoritative for the plan route.
+        if env_home and Path(env_home) == managed_home:
+            codex_home = Path(env_home)
+        else:
+            codex_home = managed_home
+
+        cache_path = codex_home / "models_cache.json"
+        try:
+            raw = cache_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except FileNotFoundError:
+            logger.debug("codex: models_cache.json not found at %s", cache_path)
+            return []
+        except (OSError, ValueError) as e:
+            logger.info("codex: could not read models_cache.json (%s): %s", cache_path, e)
+            return []
+
+        models_raw = (data or {}).get("models") or []
+        out: List[ModelInfo] = []
+        for entry in models_raw:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("visibility") != "list":
+                continue
+            slug = entry.get("slug")
+            if not slug:
+                continue
+            priority = entry.get("priority")
+            is_featured = isinstance(priority, (int, float)) and priority <= 10
+            out.append(ModelInfo(
+                id=slug,
+                provider="openai",
+                display_name=entry.get("display_name") or slug,
+                category=ModelCategory.CHAT,
+                is_featured=is_featured,
+                is_hidden=False,
+                supports_tools=True,
+                supports_streaming=True,
+            ))
+        logger.debug("codex: discovered %d list-visible models from %s", len(out), cache_path)
+        return out
 
     def contribute_system_prompt(
         self, model_id: str, base: Optional[str]
