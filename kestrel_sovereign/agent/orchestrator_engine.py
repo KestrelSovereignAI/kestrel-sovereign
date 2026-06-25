@@ -2454,10 +2454,16 @@ class OrchestratorEngineMixin:
             # itself would. A slow local route (e.g. GLM via llama_cpp with a
             # large timeout) lifts this automatically, so the route ``timeout``
             # is the single knob — no separate KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS
-            # needed. Cloud-only deploys are unchanged (no local providers).
+            # needed. Scoped to THIS call's candidate routes (same resolution the
+            # dispatch will use), so an explicit cloud selection in a mixed
+            # deployment keeps the default watchdog.
             _call_timeout = ORCHESTRATOR_TURN_TIMEOUT_SECS
             try:
-                _route_timeout = self.llm_service.effective_request_timeout()
+                _candidates, _ = self.llm_service.resolve_provider_routing(
+                    model_override=effective_model,
+                    force_local_only=force_local_only,
+                )
+                _route_timeout = self.llm_service.effective_request_timeout(_candidates)
                 if _route_timeout and _route_timeout > _call_timeout:
                     _call_timeout = _route_timeout
             except Exception:

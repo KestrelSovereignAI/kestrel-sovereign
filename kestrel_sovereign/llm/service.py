@@ -774,17 +774,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """
         return resolve_active_model_selection(self)
 
-    def effective_request_timeout(self) -> Optional[float]:
+    def effective_request_timeout(
+        self, providers: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[float]:
         """Largest LOCAL provider request timeout (seconds), or None.
 
         Coordinates the timeout layers (#1966): the orchestrator's per-call
         watchdog uses ``max(its default, this)`` so it never fires before a
         slow local model's LLM client would. Only ``is_local`` providers count
-        — cloud routes keep the orchestrator's default behavior unchanged; a
-        local route's configured ``timeout`` (#1957) becomes the single knob.
+        — a local route's configured ``timeout`` (#1957) becomes the single knob.
+
+        ``providers`` should be the **candidate routes for the specific call**
+        (from :meth:`resolve_provider_routing`), so an explicit cloud selection
+        in a mixed local/cloud deployment is NOT lengthened by an unrelated
+        local route. Falls back to all providers when omitted.
         """
+        src = providers if providers is not None else (self.providers or [])
         best: Optional[float] = None
-        for provider in (self.providers or []):
+        for provider in src:
             if not provider.get("is_local"):
                 continue
             secs = _client_timeout_seconds(getattr(provider.get("client"), "timeout", None))

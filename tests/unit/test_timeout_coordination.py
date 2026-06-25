@@ -37,9 +37,27 @@ def test_timeout_seconds_none():
 # --------------------------------------------------------------------------- #
 # effective_request_timeout (local-only)
 # --------------------------------------------------------------------------- #
-def _svc(providers):
-    """Exercise the method without building the heavyweight LLMService."""
-    return LLMService.effective_request_timeout(SimpleNamespace(providers=providers))
+def _svc(providers, candidates=None):
+    """Exercise the method without building the heavyweight LLMService.
+
+    ``providers`` seeds ``self.providers``; ``candidates`` (when given) is the
+    scoped per-call list passed as the argument.
+    """
+    svc = SimpleNamespace(providers=providers)
+    if candidates is None:
+        return LLMService.effective_request_timeout(svc)
+    return LLMService.effective_request_timeout(svc, candidates)
+
+
+def test_effective_timeout_scoped_to_candidates_ignores_unrelated_local():
+    """The P2 case: a cloud-only candidate set must NOT be lengthened by an
+    unrelated local route that exists in the deployment (#1966 review)."""
+    local = {"is_local": True, "client": SimpleNamespace(timeout=1800.0)}
+    cloud = {"is_local": False, "client": SimpleNamespace(timeout=httpx.Timeout(600.0))}
+    # Deployment has a local route, but THIS call resolved to cloud only.
+    assert _svc([local, cloud], candidates=[cloud]) is None
+    # ...and a call that resolved to the local route still gets it.
+    assert _svc([local, cloud], candidates=[local]) == 1800.0
 
 
 def test_effective_timeout_picks_local_route():
