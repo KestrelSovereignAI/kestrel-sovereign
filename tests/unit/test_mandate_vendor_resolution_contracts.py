@@ -278,6 +278,49 @@ class TestExplicitMandateValidation:
             svc.set_model_preference("gpt-5-anything", vendor="openai", route="plan")
         assert svc.get_model_preference()["model"] == "gpt-5-anything"
 
+    def test_route_catalogs_built_when_unset(self):
+        """Regression: a route-scoped route must be recognized even when
+        ``_route_catalogs`` is unset at validate time.
+
+        This instance may have been created before the shared vendor cache was
+        populated (by another instance), so ``_route_catalogs`` is still unset
+        while the vendor catalog is non-empty. The validator must build route
+        catalogs first (via ``_ensure_route_catalogs_sync``) so a route-scoped
+        route (codex/openai:plan) is held to its OWN catalog rather than
+        falling through to the broader vendor catalog and accepting an
+        api-only model. (codex finding on #1946.)
+        """
+        from unittest.mock import AsyncMock
+
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+        svc = _make_service()
+        # _route_catalogs intentionally NOT set on the instance.
+        assert not hasattr(svc, "_route_catalogs")
+
+        codex_adapter = CodexAdapter.__new__(CodexAdapter)
+        # Route-scoped catalog serves only gpt-5-codex; the broader vendor
+        # catalog (below) additionally has gpt-5-pro, which must be rejected.
+        codex_adapter.list_models = AsyncMock(
+            return_value=[_mk_model("gpt-5-codex", "openai")]
+        )
+        svc.providers = [{
+            "name": "openai:plan", "vendor": "openai", "route": "plan",
+            "model": "auto", "adapter": codex_adapter,
+        }]
+        cache = _cached([
+            _mk_model("gpt-5-codex", "openai"),
+            _mk_model("gpt-5-pro", "openai"),
+        ])
+        with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache):
+            # In the route-scoped catalog → accepted.
+            svc.set_model_preference("gpt-5-codex", vendor="openai", route="plan")
+            assert svc.get_model_preference()["model"] == "gpt-5-codex"
+            # Vendor-catalog-only (api-only) model → rejected on the plan route,
+            # proving route catalogs were built despite starting unset.
+            with pytest.raises(ValueError):
+                svc.set_model_preference("gpt-5-pro", vendor="openai", route="plan")
+
     def test_empty_discovery_permits_known_route(self):
         """Known route + empty catalog (pre-discovery) → permit, don't block."""
         svc = _make_service()

@@ -587,6 +587,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         from .model_cache import get_shared_model_cache
         catalog = get_shared_model_cache().get_any()
 
+        # Ensure route-scoped catalogs are built before reading them. This
+        # instance may have been created before the shared vendor cache was
+        # populated (by another instance), so ``_route_catalogs`` can still be
+        # unset even though ``get_any()`` now returns a vendor catalog. Without
+        # this, a route-scoped route (e.g. codex/openai:plan) would be treated
+        # as non-scoped and fall through to the broader vendor catalog —
+        # accepting an api-only model on the plan route. Mirrors the routing
+        # and default-resolution paths.
+        self._ensure_route_catalogs_sync()
         route_catalogs = getattr(self, "_route_catalogs", None) or {}
 
         for provider in matching:
