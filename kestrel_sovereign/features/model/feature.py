@@ -115,11 +115,23 @@ class ModelAgent(Feature):
 
     @tool(
         name="cleanup_models",
-        description="Clean up unused models to free space.",
+        description=(
+            "Clean up unused models to free space. DESTRUCTIVE: deletes model "
+            "files from disk. Defaults to dry_run=True, which only PREVIEWS what "
+            "would be deleted without removing anything — re-run with dry_run=False "
+            "to actually delete. Only models unused for threshold_days (default 30) "
+            "are eligible, and deletion is gated so at least min_free_space_pct (10%) "
+            "free disk is preserved."
+        ),
         category=ToolCategory.MODEL_MANAGEMENT
     )
-    async def cleanup_models(self, threshold_days: int = 30, dry_run: bool = False) -> ToolResult:
-        """Clean up unused models."""
+    async def cleanup_models(self, threshold_days: int = 30, dry_run: bool = True) -> ToolResult:
+        """Clean up unused models.
+
+        Args:
+            threshold_days: Only models unused for at least this many days are eligible for deletion (default: 30).
+            dry_run: If True (the default), only preview what would be deleted; nothing is removed. Set False to actually delete.
+        """
         try:
             result = await self.llm_service.cleanup_unused_models(
                 threshold_days=threshold_days,
