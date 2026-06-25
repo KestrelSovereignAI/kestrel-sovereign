@@ -245,8 +245,11 @@ class TestServiceKeyStorage:
 
         await key_storage.store_key(provider_id="github", api_key="ghp_test")
 
-        # Now a row exists -> True
+        # Now an active row exists -> True
         assert await key_storage.deactivate_key(provider_id="github") is True
+
+        # Re-deactivating an already-inactive key is a no-op -> False
+        assert await key_storage.deactivate_key(provider_id="github") is False
 
     @pytest.mark.asyncio
     async def test_delete_key_row_affected(self, key_storage):

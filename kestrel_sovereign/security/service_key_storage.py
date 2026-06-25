@@ -273,14 +273,16 @@ class ServiceKeyStorage:
             provider_id: Service provider
 
         Returns:
-            True if a row was actually deactivated, False if no key existed
-            for this agent+provider (nothing was affected).
+            True if an ACTIVE row was actually deactivated, False if no active
+            key existed for this agent+provider (nothing was transitioned). The
+            ``is_active = 1`` predicate ensures a repeated remove of an
+            already-inactive key reports no-op rather than false success.
         """
         affected = await self._db.execute(
             """
             UPDATE agent_service_keys
             SET is_active = 0
-            WHERE agent_did = ? AND provider_id = ?
+            WHERE agent_did = ? AND provider_id = ? AND is_active = 1
             """,
             (self._agent_did, provider_id)
         )
