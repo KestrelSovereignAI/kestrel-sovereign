@@ -321,6 +321,45 @@ class TestExplicitMandateValidation:
             with pytest.raises(ValueError):
                 svc.set_model_preference("gpt-5-pro", vendor="openai", route="plan")
 
+    def test_route_catalogs_built_inside_running_loop(self):
+        """Regression (codex P1): validating inside a running event loop must
+        build the REAL route-scoped catalog, not an empty placeholder.
+
+        The ``set_model`` tool is async, so ``set_model_preference`` runs inside
+        a loop. ``_ensure_route_catalogs_sync`` previously registered an empty
+        placeholder there, and "empty route catalog → permit" let an api-only
+        model land on the plan route. The sync helper now drives the (loop-
+        independent) builder on a worker thread, so the plan route is held to
+        codex's actual serveable subset.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+        async def _run():
+            svc = _make_service()
+            assert not hasattr(svc, "_route_catalogs")
+            codex_adapter = CodexAdapter.__new__(CodexAdapter)
+            codex_adapter.list_models = AsyncMock(
+                return_value=[_mk_model("gpt-5-codex", "openai")]
+            )
+            svc.providers = [{
+                "name": "openai:plan", "vendor": "openai", "route": "plan",
+                "model": "auto", "adapter": codex_adapter,
+            }]
+            cache = _cached([
+                _mk_model("gpt-5-codex", "openai"),
+                _mk_model("gpt-5-pro", "openai"),  # api-only, NOT in codex cache
+            ])
+            with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache):
+                svc.set_model_preference("gpt-5-codex", vendor="openai", route="plan")
+                assert svc.get_model_preference()["model"] == "gpt-5-codex"
+                with pytest.raises(ValueError):
+                    svc.set_model_preference("gpt-5-pro", vendor="openai", route="plan")
+
+        asyncio.run(_run())
+
     def test_empty_discovery_permits_known_route(self):
         """Known route + empty catalog (pre-discovery) → permit, don't block."""
         svc = _make_service()

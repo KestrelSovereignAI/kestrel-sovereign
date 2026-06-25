@@ -226,10 +226,15 @@ def test_openai_plan_empty_codex_cache_stays_auto_never_inherits_api_catalog():
 
 @pytest.mark.asyncio
 async def test_openai_plan_inside_running_loop_never_inherits_api_catalog():
-    """Sync cache-hit resolution under an ALREADY-RUNNING loop must still mark
-    openai:plan route-scoped (can't await list_models, so register empty) — it
-    must never fall back to the OpenAI API catalog and pin gpt-5.5-pro.
-    (codex review P2.)
+    """Sync cache-hit resolution under an ALREADY-RUNNING loop must mark
+    openai:plan route-scoped and resolve ONLY against codex's own serveable
+    subset — never the OpenAI API catalog (which would pin gpt-5.5-pro).
+
+    The route-scoped builder reads a local JSON cache with no loop-dependent
+    awaits, so it is now driven to completion on a worker thread even inside a
+    running loop (#1946) — the route resolves to its real serveable model
+    (gpt-5.5) instead of being left as an empty placeholder. (Originally codex
+    review P2 on the auto-resolution path.)
     """
     from unittest.mock import AsyncMock
 
@@ -255,8 +260,9 @@ async def test_openai_plan_inside_running_loop_never_inherits_api_catalog():
     # We are inside a running event loop here (async test).
     harness._resolve_auto_providers(models)
 
-    # Marked route-scoped with an empty catalog → stays "auto", NOT gpt-5.5-pro.
-    assert harness.providers[0]["model"] == "auto"
+    # Route-scoped catalog built on a worker thread → resolves to codex's own
+    # serveable model (gpt-5.5), NEVER the api-only gpt-5.5-pro.
+    assert harness.providers[0]["model"] == "gpt-5.5"
     assert "openai:plan" in harness._route_catalogs
 
 
