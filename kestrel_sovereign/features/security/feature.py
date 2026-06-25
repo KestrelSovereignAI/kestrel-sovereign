@@ -545,7 +545,13 @@ class SecurityFeature(Feature):
 
     @tool(
         name="set_permission",
-        description="Set permission level for a tool or all tools in a feature",
+        description=(
+            "Set permission level for a tool or all tools in a feature. "
+            "level is one of: allow, auto, always_ask, deny, ask, session. "
+            "Call list_permissions to enumerate valid feature_name/tool_name "
+            "values — setting a permission on an unregistered name does not "
+            "take effect."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!security-set",
     )
@@ -559,8 +565,11 @@ class SecurityFeature(Feature):
         Set permission level for a tool or all tools in a feature.
 
         Args:
-            feature_name: Name of the feature (e.g., "WalletAgent")
-            tool_name: Name of the tool (optional, sets all if omitted)
+            feature_name: Name of the feature (e.g., "WalletAgent"). Must be a
+                registered feature — call ``list_permissions`` to enumerate
+                valid names.
+            tool_name: Name of the tool (optional, sets all if omitted). When
+                provided, must be a registered tool of ``feature_name``.
             level: Permission level - "allow", "auto", "always_ask", "deny", "ask", or "session"
         """
         try:
@@ -569,6 +578,20 @@ class SecurityFeature(Feature):
             return ToolResult.failed(
                 f"Invalid level '{level}'. Use: allow, auto, always_ask, deny, ask, session"
             )
+
+        # Validate the target against the registered permission tree before
+        # writing anything. Every real feature/tool is seeded into the store at
+        # startup (``_register_all_tools`` -> ``register_tool``), so the tree is
+        # the authoritative registry of valid names. Writing a permission row
+        # for a typo'd / nonexistent name silently succeeds but never matches a
+        # real tool — a dead row that gives the agent a false "permission set"
+        # with no effect (#1946). Surface it as PARTIAL and persist nothing,
+        # pointing the agent at ``list_permissions`` for discovery. There is no
+        # legitimate forward-grant pattern: future features get their rows from
+        # startup registration, never from a pre-emptive set_permission.
+        unknown = await self._unknown_target(feature_name, tool_name)
+        if unknown is not None:
+            return unknown
 
         try:
             if tool_name:
@@ -854,6 +877,85 @@ class SecurityFeature(Feature):
                 "entries": safe_entries,
             },
         )
+
+    async def _unknown_target(
+        self,
+        feature_name: str,
+        tool_name: Optional[str],
+    ) -> Optional[ToolResult]:
+        """Validate a set_permission target against the registered tree.
+
+        Returns ``None`` when ``feature_name`` (and ``tool_name`` if given) is a
+        registered feature/tool, meaning the caller may proceed to persist.
+        Otherwise returns a PARTIAL ToolResult that persists nothing and points
+        the agent at ``list_permissions`` for the valid names — so a typo'd or
+        nonexistent name surfaces a clear non-OK result instead of writing a
+        dead permission row (#1946).
+
+        If the tree cannot be read, returns ``None`` (fail open): an unreadable
+        registry must not block legitimate permission changes, and the
+        downstream ``set_permission`` path will surface any real store error.
+        """
+        try:
+            tree = await self.permission_store.get_permission_tree()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "set_permission could not validate target against permission "
+                "tree (%s); proceeding without name validation",
+                exc,
+            )
+            return None
+
+        # Match against every casing/alias variant the store itself resolves
+        # at read/write time (snake/Pascal + registered cross-form aliases),
+        # so a legitimate legacy-alias write (e.g. ``computer_use`` for
+        # ``ComputerUseFeature``) is accepted rather than rejected as unknown
+        # (codex review #1946 P2).
+        variants = self.permission_store.feature_name_variants(feature_name)
+        feature = next(
+            (f for f in tree if f.feature_name in variants), None
+        )
+        if feature is None:
+            return ToolResult.partial(
+                confirmation=(
+                    f"No permission was changed: feature '{feature_name}' is "
+                    "not a registered feature."
+                ),
+                error=(
+                    f"Unknown feature_name '{feature_name}'. Call "
+                    "list_permissions to see valid feature/tool names. Nothing "
+                    "was persisted."
+                ),
+                data={
+                    "feature_name": feature_name,
+                    "tool_name": tool_name,
+                    "persisted": False,
+                    "reason": "unknown_feature",
+                },
+            )
+
+        if tool_name and not any(
+            t.tool_name == tool_name for t in feature.tools
+        ):
+            return ToolResult.partial(
+                confirmation=(
+                    f"No permission was changed: '{tool_name}' is not a "
+                    f"registered tool of feature '{feature_name}'."
+                ),
+                error=(
+                    f"Unknown tool_name '{tool_name}' for feature "
+                    f"'{feature_name}'. Call list_permissions to see valid "
+                    "tool names. Nothing was persisted."
+                ),
+                data={
+                    "feature_name": feature_name,
+                    "tool_name": tool_name,
+                    "persisted": False,
+                    "reason": "unknown_tool",
+                },
+            )
+
+        return None
 
     def _format_permission_confirmation(
         self,
