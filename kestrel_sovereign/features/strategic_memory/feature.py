@@ -261,10 +261,18 @@ class StrategicMemoryFeature(Feature):
         Args:
             issue: Issue number or identifier
             title: Short description of the blocker
-            severity: How severe -- low, medium, high, critical
+            severity: How severe -- one of low, medium, high, critical (default medium)
             owner: Who owns resolving this blocker
             notes: Additional context
         """
+        # Normalize + validate so an unrecognized severity isn't persisted
+        # verbatim (later sort/format code only understands the four levels).
+        severity = (severity or "").strip().lower()
+        if severity not in ("low", "medium", "high", "critical"):
+            return ToolResult.failed(
+                f"Invalid severity '{severity}'. Must be one of: low, medium, high, critical.",
+                data={"severity": severity},
+            )
         if "blockers" not in self._data:
             self._data["blockers"] = []
 
@@ -368,8 +376,19 @@ class StrategicMemoryFeature(Feature):
         """Pick top issue from strategic memory and dispatch to Talon.
 
         Args:
-            mode: 'execute' to dispatch immediately, 'suggest' to show suggestion only.
+            mode: One of 'execute' (dispatch the top issue to Talon immediately)
+                or 'suggest' (preview the top issue only, dispatch nothing).
+                Defaults to 'execute'.
         """
+        # Validate up-front. An unrecognized mode must NOT silently fall through
+        # to the live execute/dispatch path — a typo like "suggst" or casing
+        # like "Suggest" would otherwise ship a real issue to Talon (#1925).
+        mode = (mode or "").strip().lower()
+        if mode not in ("execute", "suggest"):
+            return ToolResult.failed(
+                f"Invalid mode '{mode}'. Must be one of: execute, suggest.",
+                data={"mode": mode},
+            )
         if mode == "suggest":
             issue = await pick_top_issue(self._data)
             if not issue:
