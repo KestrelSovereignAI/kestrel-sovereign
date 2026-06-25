@@ -490,6 +490,39 @@ class TestToolEnumCaseNormalization:
         result = await compute_feature.list_scripts(state="queued")
         assert "Invalid state" not in (result.error or "")
 
+    # --- Non-string inputs stay on the controlled error path (codex P2/P3) --- #
+    # Normalization must not raise AttributeError on null/non-string tool args;
+    # malformed input should return a ToolResult.failed, not blow up the wrapper.
+    @pytest.mark.asyncio
+    async def test_write_script_non_string_language_is_tool_error(self, compute_feature):
+        result = await compute_feature.write_script(
+            name="bad_lang",
+            language=None,  # type: ignore[arg-type]
+            content='print("hi")',
+            purpose="malformed language",
+        )
+        assert result.status == "error"
+        assert "Unsupported language" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_run_script_non_string_executor_is_tool_error(self, compute_feature):
+        write = await compute_feature.write_script(
+            name="bad_exec",
+            language="python",
+            content='print("ok")',
+            purpose="malformed executor",
+        )
+        script_id = write.data["script_id"]
+        result = await compute_feature.run_script(script_id=script_id, executor=None)  # type: ignore[arg-type]
+        # Must come back as a controlled failure, never an unhandled exception.
+        assert result.status == "error"
+
+    @pytest.mark.asyncio
+    async def test_list_scripts_non_string_state_is_tool_error(self, compute_feature):
+        result = await compute_feature.list_scripts(state=123)  # type: ignore[arg-type]
+        assert result.status == "error"
+        assert "Invalid state" in (result.error or "")
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

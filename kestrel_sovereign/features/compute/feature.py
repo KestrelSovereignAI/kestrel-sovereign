@@ -256,7 +256,11 @@ class ComputeFeature(Feature):
         await self._ensure_initialized()
 
         # Normalize so case/whitespace variants ("Python", " BASH ") resolve.
-        language = language.strip().lower()
+        # Guard non-string input (e.g. null) so malformed tool args fall
+        # through to the controlled unsupported-language error below instead
+        # of raising AttributeError on .strip() (codex P2).
+        if isinstance(language, str):
+            language = language.strip().lower()
         if language not in ("bash", "python"):
             return ToolResult.failed(
                 f"Error: Unsupported language '{language}'. Use 'bash' or 'python'.",
@@ -407,9 +411,12 @@ class ComputeFeature(Feature):
         await self._ensure_initialized()
 
         # Normalize executor so case/whitespace variants ("UV", " Docker ")
-        # resolve to the canonical executor key.
-        executor = executor.strip().lower()
-        
+        # resolve to the canonical executor key. Guard non-string input so a
+        # malformed value falls through to the "not available" error path
+        # instead of raising AttributeError on .strip() (codex P2).
+        if isinstance(executor, str):
+            executor = executor.strip().lower()
+
         # Find script
         script = await self.script_store.find_by_id_prefix(script_id)
         if not script:
@@ -682,9 +689,13 @@ class ComputeFeature(Feature):
         """
         if state:
             try:
-                script_state = ScriptState(state.strip().lower())
+                # Normalize only strings; a non-string filter falls through to
+                # the controlled invalid-state error rather than raising
+                # AttributeError on .strip() (codex P3).
+                normalized = state.strip().lower() if isinstance(state, str) else state
+                script_state = ScriptState(normalized)
                 scripts = await self.script_store.list_by_state(script_state, limit)
-            except ValueError:
+            except (ValueError, TypeError):
                 return ToolResult.failed(
                     f"Error: Invalid state '{state}'. Valid states: {[s.value for s in ScriptState]}",
                     data={"state": state},
