@@ -362,6 +362,121 @@ async def test_recall_delete_succeeds():
 
 
 # ---------------------------------------------------------------------------
+# item_type validation against SavedItemType (#1946)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_save_item_invalid_type_fails_without_persisting():
+    """A free-form item_type must error, not silently persist a mis-filed item."""
+    store = AsyncMock()
+    store.save_item = AsyncMock(
+        return_value=_fake_item(item_id="i-bad", embedding=[0.1])
+    )
+    feat = _make_feature(store)
+
+    result = await feat.save_item(
+        name="grandma's sauce", content="...", item_type="recipe"
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "recipe" in result.error
+    # All valid types are listed for the agent to self-correct.
+    for valid in ("stash", "file", "excerpt", "structured"):
+        assert valid in result.error
+    assert result.data["valid_item_types"] == [
+        "stash", "file", "excerpt", "structured"
+    ]
+    # Nothing was written.
+    store.save_item.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_save_item_normalizes_type_case_and_whitespace():
+    store = AsyncMock()
+    store.save_item = AsyncMock(
+        return_value=_fake_item(item_id="i-ok", item_type="structured", embedding=[0.1])
+    )
+    feat = _make_feature(store)
+
+    result = await feat.save_item(
+        name="n", content="c", item_type="  Structured "
+    )
+
+    assert result.status is ToolResultStatus.OK
+    # The store receives the normalized value, keeping it recall-able.
+    assert store.save_item.await_args.kwargs["item_type"] == "structured"
+
+
+@pytest.mark.asyncio
+async def test_save_item_valid_type_persists_and_is_recallable():
+    store = AsyncMock()
+    store.save_item = AsyncMock(
+        return_value=_fake_item(item_id="i-rc", item_type="excerpt", embedding=[0.1])
+    )
+    store.search = AsyncMock(return_value=[
+        {
+            "score": 0.9,
+            "item": {
+                "id": "i-rc", "name": "n", "item_type": "excerpt",
+                "summary": "s", "tags": [], "created_at": None,
+            },
+        }
+    ])
+    feat = _make_feature(store)
+
+    saved = await feat.save_item(name="n", content="c", item_type="excerpt")
+    assert saved.status is ToolResultStatus.OK
+    assert store.save_item.await_args.kwargs["item_type"] == "excerpt"
+
+    found = await feat.recall(query="n", item_type="excerpt")
+    assert found.status is ToolResultStatus.OK
+    assert found.data["result_count"] == 1
+    # The store was queried with the validated, recall-able type.
+    assert store.search.await_args.kwargs["item_type"] == "excerpt"
+
+
+@pytest.mark.asyncio
+async def test_recall_invalid_type_filter_errors_clearly():
+    store = AsyncMock()
+    store.search = AsyncMock(return_value=[])
+    feat = _make_feature(store)
+
+    result = await feat.recall(query="anything", item_type="recipe")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "recipe" in result.error
+    # Guides the agent to drop the filter so legacy items still surface.
+    assert "Drop the item_type filter" in result.error
+    # Errors instead of returning a silently-empty result.
+    store.search.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recall_list_invalid_type_filter_errors_clearly():
+    store = AsyncMock()
+    store.list_items = AsyncMock(return_value=[])
+    feat = _make_feature(store)
+
+    result = await feat.recall_list(item_type="bogus")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "bogus" in result.error
+    store.list_items.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recall_list_normalizes_type_filter():
+    store = AsyncMock()
+    store.list_items = AsyncMock(return_value=[])
+    feat = _make_feature(store)
+
+    result = await feat.recall_list(item_type="  FILE ")
+
+    assert result.status is ToolResultStatus.OK
+    assert store.list_items.await_args.kwargs["item_type"] == "file"
+
+
+# ---------------------------------------------------------------------------
 # Storage-not-available paths
 # ---------------------------------------------------------------------------
 
