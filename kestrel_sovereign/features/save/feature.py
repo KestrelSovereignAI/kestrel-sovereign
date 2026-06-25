@@ -99,6 +99,31 @@ class SaveFeature(Feature):
             "Saved items are unavailable in the current privacy mode"
         )
 
+    # Valid item_type values, derived from the SavedItemType enum so the
+    # set never drifts from the storage layer (#1946). Free-form item_type
+    # was silently persisted and then unfindable via recall/recall_list,
+    # which only ever query these known types.
+    _VALID_ITEM_TYPES = tuple(t.value for t in SavedItemType)
+
+    @classmethod
+    def _normalize_item_type(cls, raw: str) -> str:
+        """Normalize an item_type string (strip + lowercase) for comparison."""
+        return (raw or "").strip().lower()
+
+    @classmethod
+    def _item_type_error(cls, normalized: str) -> ToolResult:
+        valid = ", ".join(cls._VALID_ITEM_TYPES)
+        return ToolResult.failed(
+            f"Unknown item_type {normalized!r}. Valid types are: {valid}. "
+            "Use schema_id (e.g. 'recipe', 'user_story') for finer typing of "
+            "a 'structured' item — item_type itself must be one of the values "
+            "above or the saved item becomes unfindable via recall.",
+            data={
+                "item_type": normalized,
+                "valid_item_types": list(cls._VALID_ITEM_TYPES),
+            },
+        )
+
     @staticmethod
     def _parse_tags(raw: str) -> List[str]:
         return [t.strip() for t in raw.split(",") if t.strip()] if raw else []
@@ -237,7 +262,12 @@ class SaveFeature(Feature):
 
     @tool(
         name="save_excerpt",
-        description="Save conversation messages for later retrieval. Use this to preserve important discussions, decisions, or information.",
+        description=(
+            "Save conversation messages for later retrieval. Use this to "
+            "preserve important discussions, decisions, or information. The "
+            "target selects which messages: 'last_N' (e.g. last_10) for the "
+            "most recent N messages, or 'ids:1,2,3' for specific message ids."
+        ),
         category=ToolCategory.MEMORY,
         command_prefix="!save excerpt"
     )
@@ -375,7 +405,14 @@ class SaveFeature(Feature):
 
     @tool(
         name="save_item",
-        description="Save arbitrary content (text, JSON) for later retrieval. Use for recipes, notes, decisions, or any structured content.",
+        description=(
+            "Save arbitrary content (text, JSON) for later retrieval. Good for "
+            "recipes, notes, decisions, and other content you want to recall. "
+            "item_type must be one of: stash, file, excerpt, structured "
+            "(default: structured) — do NOT invent your own type or the item "
+            "becomes unfindable via recall. To finely type a 'structured' item "
+            "(recipe, user_story, etc.) pass schema_id, not a custom item_type."
+        ),
         category=ToolCategory.MEMORY,
         command_prefix="!save item"
     )
@@ -394,7 +431,9 @@ class SaveFeature(Feature):
         Args:
             name: Name for the item
             content: The content to save (text or JSON)
-            item_type: Type of item (default: structured)
+            item_type: One of stash | file | excerpt | structured
+                (default: structured). Must match a SavedItemType value or the
+                item is unrecoverable via recall. Use schema_id for finer typing.
             summary: Optional summary for search
             tags: Comma-separated tags
             schema_id: Optional schema identifier (e.g., "recipe", "user_story")
@@ -405,11 +444,15 @@ class SaveFeature(Feature):
                 return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
+        normalized_type = self._normalize_item_type(item_type)
+        if normalized_type not in self._VALID_ITEM_TYPES:
+            return self._item_type_error(normalized_type)
+
         try:
             tag_list = self._parse_tags(tags)
 
             item = await store.save_item(
-                item_type=item_type,
+                item_type=normalized_type,
                 name=name,
                 content=content,
                 summary=summary or content[:500],
@@ -436,7 +479,11 @@ class SaveFeature(Feature):
 
     @tool(
         name="recall",
-        description="Search saved items using semantic search. Find previously saved stashes, excerpts, files, and items by meaning.",
+        description=(
+            "Search saved items using semantic search. Find previously saved "
+            "stashes, excerpts, files, and items by meaning. Optional item_type "
+            "filter must be one of: stash, file, excerpt, structured."
+        ),
         category=ToolCategory.MEMORY,
         command_prefix="!recall"
     )
@@ -451,7 +498,7 @@ class SaveFeature(Feature):
 
         Args:
             query: Search query (searches by meaning, not just keywords)
-            item_type: Filter by type (stash, file, excerpt, structured)
+            item_type: Filter by type — one of stash | file | excerpt | structured
             limit: Maximum results to return
         """
         store = self._get_store()
@@ -460,10 +507,16 @@ class SaveFeature(Feature):
                 return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
+        filter_type: Optional[str] = None
+        if item_type:
+            filter_type = self._normalize_item_type(item_type)
+            if filter_type not in self._VALID_ITEM_TYPES:
+                return self._item_type_error(filter_type)
+
         try:
             results = await store.search(
                 query=query,
-                item_type=item_type if item_type else None,
+                item_type=filter_type,
                 limit=limit
             )
         except Exception as e:
@@ -501,7 +554,10 @@ class SaveFeature(Feature):
 
     @tool(
         name="recall_list",
-        description="List all saved items, optionally filtered by type.",
+        description=(
+            "List all saved items, optionally filtered by type. Optional "
+            "item_type filter must be one of: stash, file, excerpt, structured."
+        ),
         category=ToolCategory.MEMORY,
         command_prefix="!recall list"
     )
@@ -514,7 +570,7 @@ class SaveFeature(Feature):
         List saved items.
 
         Args:
-            item_type: Filter by type (stash, file, excerpt, structured)
+            item_type: Filter by type — one of stash | file | excerpt | structured
             limit: Maximum items to return
         """
         store = self._get_store()
@@ -523,9 +579,15 @@ class SaveFeature(Feature):
                 return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
+        filter_type: Optional[str] = None
+        if item_type:
+            filter_type = self._normalize_item_type(item_type)
+            if filter_type not in self._VALID_ITEM_TYPES:
+                return self._item_type_error(filter_type)
+
         try:
             items = await store.list_items(
-                item_type=item_type if item_type else None,
+                item_type=filter_type,
                 limit=limit
             )
         except Exception as e:
@@ -550,7 +612,7 @@ class SaveFeature(Feature):
         }
         return ToolResult.ok(
             confirmation=f"Listed {len(formatted)} saved item(s)"
-            + (f" (type={item_type})" if item_type else ""),
+            + (f" (type={filter_type})" if filter_type else ""),
             data=data,
         )
 
