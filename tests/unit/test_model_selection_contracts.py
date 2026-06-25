@@ -17,8 +17,16 @@ def test_resolve_concrete_model_route_scoped_never_uses_vendor_cache():
     'auto' (→ adapter sends no model → codex default), NEVER resolve_provider_
     default's vendor cache (which can hold gpt-5.5-pro). Closes the last path
     where openai:plan could 400 (codex review)."""
-    # openai:plan is registered route-scoped (even empty catalog).
-    stub = SimpleNamespace(_route_catalogs={"openai:plan": []})
+    # Fresh cache-less startup: _route_catalogs not built yet; the fallback
+    # must lazily register route-specific routes (even empty) and return "auto"
+    # WITHOUT ever consulting the vendor cache (codex review round 4/5).
+    stub = SimpleNamespace(_route_catalogs=None)
+
+    def _ensure():
+        if stub._route_catalogs is None:
+            stub._route_catalogs = {"openai:plan": []}  # route-scoped, empty
+    stub._ensure_route_catalogs_sync = _ensure
+
     provider = {"name": "openai:plan", "vendor": "openai", "route": "plan",
                 "model": "auto"}
     # If the guard fails, resolve_provider_default would be hit and could

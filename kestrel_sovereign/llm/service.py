@@ -1708,6 +1708,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # didn't resolve a concrete model, e.g. before codex's models_cache
         # exists), pass "auto" through so the adapter sends no model and the
         # substrate uses its own serveable default, rather than a vendor model.
+        # Ensure route catalogs exist first — on a fresh cache-less startup
+        # discovery may not have populated them yet, and this fallback can run
+        # before discovery. _ensure_route_catalogs_sync registers route-specific
+        # routes (even empty) without consulting the vendor cache.
+        if hasattr(self, "_ensure_route_catalogs_sync"):
+            try:
+                self._ensure_route_catalogs_sync()
+            except Exception:  # pragma: no cover - never block resolution
+                pass
         route_catalogs = getattr(self, "_route_catalogs", None) or {}
         if provider.get("name") in route_catalogs:
             return "auto"
