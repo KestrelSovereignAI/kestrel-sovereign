@@ -121,7 +121,19 @@ def parse_docstring_params(docstring: Optional[str]) -> Dict[str, str]:
         args_section = args_section_match.group(1)
         # Parse individual parameters from Args section
         # Match: "    param_name: description" or "    param_name (type): description"
-        param_pattern = r'^\s+(\w+)\s*(?:\([^)]+\))?\s*:\s*(.+?)(?=\n\s+\w+|\Z)'
+        #
+        # Terminate a param's description only at the start of the NEXT param
+        # ("name:" / "name (type):") or end-of-section — NOT at any wrapped
+        # continuation line that merely begins with a word. The old
+        # ``(?=\n\s+\w+|\Z)`` lookahead truncated wrapped multi-line
+        # descriptions (e.g. a line continuing with "backend is ..." or
+        # "the defaults)") before they reached the agent-facing tool schema,
+        # silently dropping documented constraints (#1925; hit in talon #1939
+        # and webhooks #1937 before this root fix).
+        param_pattern = (
+            r'^\s+(\w+)\s*(?:\([^)]+\))?\s*:\s*'
+            r'(.+?)(?=\n\s+\w+\s*(?:\([^)]+\))?\s*:|\Z)'
+        )
         for match in re.finditer(param_pattern, args_section, re.MULTILINE | re.DOTALL):
             param_name = match.group(1).strip()
             description = match.group(2).strip()
