@@ -261,10 +261,28 @@ class TestResolveProviderRouting:
 class TestUnavailableProviderFails:
     """Contract: requesting a provider that is not initialized raises clearly."""
 
-    def test_mandate_preference_for_missing_route_raises(self, service_with_providers):
+    def test_set_model_preference_refuses_missing_route(self, service_with_providers):
+        """#1946: set_model_preference rejects an uninitialized route at SET time.
+
+        openai:plan isn't initialized in this fixture, so the explicit triple
+        must be refused before it can land a broken mandate (the old behavior
+        let it persist and only fail at the next resolve — see the
+        defense-in-depth test below for the routing-layer guard).
+        """
         svc = service_with_providers
-        # openai:plan isn't initialized in this fixture.
-        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
+        with pytest.raises(ValueError) as exc_info:
+            svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
+        assert "openai:plan" in str(exc_info.value)
+        # No broken mandate landed.
+        assert svc.get_model_preference() == {"vendor": None, "model": None, "route": None}
+
+    def test_stale_mandate_for_missing_route_raises_at_routing(self, service_with_providers):
+        """Defense-in-depth: a mandate that goes stale (route removed/disabled
+        after being set) must still surface clearly at resolve time."""
+        svc = service_with_providers
+        # Seed the mandate directly to simulate a route that existed at set
+        # time but is no longer initialized (bypasses the set-time guard).
+        svc._mandate_preference = {"vendor": "openai", "model": "gpt-5.4", "route": "plan"}
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
@@ -281,7 +299,10 @@ class TestUnavailableProviderFails:
 
     def test_unavailable_with_fallbacks_degrades_gracefully(self, service_with_providers):
         svc = service_with_providers
-        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
+        # Seed a stale mandate (openai:plan route no longer initialized) so the
+        # graceful-degradation path is exercised; set_model_preference would
+        # now refuse this triple up front (#1946), which is its own test above.
+        svc._mandate_preference = {"vendor": "openai", "model": "gpt-5.4", "route": "plan"}
         svc.add_fallback_model("gpt-5-mini", provider="openai")
 
         providers, target = svc.resolve_provider_routing()

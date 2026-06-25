@@ -472,7 +472,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         Raises:
             ValueError: if vendor is omitted and the discovery catalog has
-                zero matches (unknown model) or multiple matches (ambiguous).
+                zero matches (unknown model) or multiple matches (ambiguous);
+                or if an explicit ``{vendor, route, model}`` triple names a
+                route that is not configured, or a model not serveable on it.
         """
         if model == "auto":
             logger.debug("Ignoring model preference 'auto' — using default routing")
@@ -502,6 +504,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "Auto-resolved vendor '%s' for model '%s' from discovery catalog",
                 vendor, model,
             )
+        else:
+            # Explicit-vendor path. The vendor-less branch above validates the
+            # model against discovery before persisting; an explicit triple
+            # must be held to the same bar, else a hallucinated/stale
+            # ``{vendor, route, model}`` lands a broken mandate that only
+            # surfaces on the NEXT request (the #1927 route-fidelity skew).
+            self._validate_explicit_mandate(model, vendor, route)
 
         self._mandate_preference = {"vendor": vendor, "model": model, "route": route}
         if route:
@@ -511,6 +520,115 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         if self._preference_persistence_callback:
             self._schedule_preference_persistence(model, vendor, route)
+
+    def _validate_explicit_mandate(
+        self,
+        model: str,
+        vendor: str,
+        route: Optional[str],
+    ) -> None:
+        """Validate an explicit ``{vendor, route, model}`` triple before persisting.
+
+        The vendor-less path in :meth:`set_model_preference` resolves+validates
+        the model against discovery. This is the symmetric guard for the
+        explicit-vendor path: an unknown vendor/route or a model that no
+        configured route can serve must be refused at *set* time, not silently
+        persisted to break the next request (the #1927 route-fidelity skew, hit
+        by the #1925 dogfooding sweep — tracked in #1946).
+
+        Validation is deliberately permissive about UNKNOWN state, only gating
+        against *known* mismatches (mirrors ``_model_available_for_route``):
+
+        - If no routes are configured yet (``self.providers`` empty/unset), we
+          can't validate the route — trust the caller.
+        - Routes ARE checked against ``self.providers`` (the same exact-match
+          semantics as ``_filter_providers_by_selector``: ``vendor:route``
+          matches a route ``name``; a bare ``vendor`` matches any route for
+          that vendor). A miss is a hard error — the route doesn't exist.
+        - The model is checked only once discovery has populated a catalog. A
+          route's own configured default always counts. Route-scoped catalogs
+          (e.g. ``openai:plan`` via codex) are honored: when a matched route
+          carries its own catalog, the model must be in THAT catalog, not the
+          vendor's broader one. An empty/absent catalog is treated as
+          "unknown" → permitted (cold-start safety).
+
+        Raises:
+            ValueError: on an unconfigured route or a model that no matched
+                route can serve once discovery is populated.
+        """
+        if not model:
+            return
+
+        selector = f"{vendor}:{route}" if route else vendor
+        providers = getattr(self, "providers", None) or []
+
+        # --- Route existence -------------------------------------------------
+        # Only enforce when routes are actually configured; an empty provider
+        # list means we're pre-init / in a bare harness and can't validate.
+        if providers:
+            matching = self._filter_providers_by_selector(providers, selector)
+            if not matching:
+                known = sorted({
+                    p.get("name") for p in providers if p.get("name")
+                })
+                raise ValueError(
+                    f"Cannot set model: no configured route matches "
+                    f"'{selector}'. Known routes: {known or '(none)'}. "
+                    f"Use list_models to discover valid vendor/route/model "
+                    f"values."
+                )
+        else:
+            matching = []
+
+        # --- Model serveability ---------------------------------------------
+        # Gate only against known mismatches. If discovery hasn't populated a
+        # catalog yet, permit (cold-start) — same contract as
+        # ``_model_available_for_route``.
+        from .model_cache import get_shared_model_cache
+        catalog = get_shared_model_cache().get_any()
+
+        route_catalogs = getattr(self, "_route_catalogs", None) or {}
+
+        for provider in matching:
+            # The route's own configured default is always serveable.
+            if provider.get("model") == model:
+                return
+            route_key = provider.get("name")
+            if route_key in route_catalogs:
+                # Route-scoped catalog: the model must live in THIS route's
+                # own serveable set, never the vendor's broader catalog.
+                scoped = route_catalogs[route_key]
+                if not scoped:
+                    # Empty/unbuilt route catalog → unknown, permit.
+                    return
+                if any(getattr(m, "id", None) == model for m in scoped):
+                    return
+
+        # No route-scoped match (or no configured routes). Fall back to the
+        # vendor catalog from shared discovery.
+        if not catalog:
+            return  # No discovery yet — don't block.
+
+        # If EVERY matched route is route-scoped, the vendor catalog doesn't
+        # apply — the model already failed every route's own catalog above.
+        all_route_scoped = bool(matching) and all(
+            p.get("name") in route_catalogs for p in matching
+        )
+        if not all_route_scoped:
+            for m in catalog:
+                if m.provider == vendor and m.id == model:
+                    return
+
+        nearby = sorted({
+            m.id for m in catalog
+            if m.provider == vendor and m.id
+        })
+        raise ValueError(
+            f"Cannot set model '{model}' on '{selector}': it is not served "
+            f"by that vendor/route. Available for {vendor}: "
+            f"{nearby or '(none discovered)'}. Use list_models to discover "
+            f"valid vendor/route/model values."
+        )
 
     def _resolve_vendor_for_model(self, model: str) -> Optional[Any]:
         """Resolve which vendor serves a given model id from discovery.

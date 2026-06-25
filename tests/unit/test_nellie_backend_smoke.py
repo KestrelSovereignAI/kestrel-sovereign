@@ -224,9 +224,19 @@ class TestNellieFailureModes:
             "openai:api": "gpt-5-mini",
         })
 
-    def test_openai_plan_missing_raises_with_route_name(self, nellie_without_plan_routes):
+    def test_openai_plan_missing_refused_at_set_time(self, nellie_without_plan_routes):
+        """#1946: an uninitialized route is refused at set time, not deferred."""
         svc = nellie_without_plan_routes
-        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
+        with pytest.raises(ValueError) as exc_info:
+            svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
+        assert "openai:plan" in str(exc_info.value)
+        assert svc.get_model_preference() == {"vendor": None, "model": None, "route": None}
+
+    def test_openai_plan_missing_raises_with_route_name(self, nellie_without_plan_routes):
+        """Defense-in-depth: a stale mandate still raises clearly at routing."""
+        svc = nellie_without_plan_routes
+        # Seed directly to simulate a route that was removed after being set.
+        svc._mandate_preference = {"vendor": "openai", "model": "gpt-5.4", "route": "plan"}
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
@@ -236,7 +246,9 @@ class TestNellieFailureModes:
 
     def test_anthropic_plan_missing_raises_with_route_name(self, nellie_without_plan_routes):
         svc = nellie_without_plan_routes
-        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
+        svc._mandate_preference = {
+            "vendor": "anthropic", "model": "claude-sonnet-4-6", "route": "plan",
+        }
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()
@@ -246,7 +258,7 @@ class TestNellieFailureModes:
 
     def test_error_message_lists_available_routes(self, nellie_without_plan_routes):
         svc = nellie_without_plan_routes
-        svc.set_model_preference("gpt-5.4", vendor="openai", route="plan")
+        svc._mandate_preference = {"vendor": "openai", "model": "gpt-5.4", "route": "plan"}
 
         with pytest.raises(LLMProviderUnavailableError) as exc_info:
             svc.resolve_provider_routing()

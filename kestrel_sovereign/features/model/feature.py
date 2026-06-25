@@ -239,7 +239,15 @@ class ModelAgent(Feature):
 
     @tool(
         name="set_model",
-        description="Set the active AI model for conversations.",
+        description=(
+            "Set the active AI model for conversations. Accepts a vendor and "
+            "model, e.g. set_model('openai', 'gpt-5-mini'), or the "
+            "'vendor:route/model' micro-syntax in a single arg, e.g. "
+            "set_model('anthropic:plan/claude-opus-4-7'). The vendor, route, "
+            "and model must be real — an unknown triple is rejected, not "
+            "silently applied. Call list_models first to discover valid "
+            "vendor/route/model values."
+        ),
         category=ToolCategory.MODEL_MANAGEMENT,
         command_prefix="!model-set"
     )

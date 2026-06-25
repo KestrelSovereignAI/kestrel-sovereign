@@ -50,7 +50,17 @@ class TestModelMandateMethods:
         assert mandate["preference"] is not None
 
     def test_set_model_preference(self, llm_service):
-        """set_model_preference() changes preference under {vendor, model, route}."""
+        """set_model_preference() changes preference under {vendor, model, route}.
+
+        The explicit triple is validated against configured routes (#1946), so
+        register the route under test before setting it (the real on-disk
+        provider set is host-dependent). The catalog is empty in this harness,
+        so model serveability is permitted (cold-start) — this exercises the
+        schema-write path on a genuinely-configured route.
+        """
+        llm_service.providers.append(
+            {"name": "test-vendor:api", "vendor": "test-vendor", "route": "api", "model": "auto"}
+        )
         llm_service.set_model_preference(
             "test-model-123", vendor="test-vendor", route="api"
         )
@@ -93,7 +103,13 @@ class TestModelMandateMethods:
 
     def test_clear_mandate_resets_preference(self, llm_service):
         """clear_mandate() resets to TOML defaults."""
-        # Set custom preference with explicit vendor (required by the new schema).
+        # Set custom preference with explicit vendor (required by the new
+        # schema). Register the route first — explicit triples are validated
+        # against configured routes (#1946); the empty catalog permits the
+        # model (cold-start).
+        llm_service.providers.append(
+            {"name": "custom-vendor:api", "vendor": "custom-vendor", "route": "api", "model": "auto"}
+        )
         llm_service.set_model_preference("custom-model", vendor="custom-vendor")
         llm_service.add_fallback_model("custom-fallback")
 
@@ -364,7 +380,21 @@ class TestModelSetEndpoint:
 
         mock_agent = MagicMock()
         mock_agent.agent_id = "did:test:model_set"
-        mock_agent.llm_service = LLMService()
+        svc = LLMService()
+        # Explicit-vendor set_model now validates the triple against configured
+        # routes (#1946). The real on-disk provider set is host-dependent, so
+        # register the routes these endpoint tests exercise. The catalog is
+        # empty in this harness → model serveability is permitted (cold-start).
+        for name, vendor, route in (
+            ("openai:api", "openai", "api"),
+            ("anthropic:api", "anthropic", "api"),
+            ("anthropic:plan", "anthropic", "plan"),
+        ):
+            if not any(p.get("name") == name for p in svc.providers):
+                svc.providers.append(
+                    {"name": name, "vendor": vendor, "route": route, "model": "auto"}
+                )
+        mock_agent.llm_service = svc
         mock_agent.storage = None
 
         original_lifespan = app.router.lifespan_context
