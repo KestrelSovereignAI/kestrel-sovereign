@@ -158,7 +158,7 @@ class ConstitutionFeature(Feature):
 
     @tool(
         name="constitution",
-        description="Get the full text of the Kestrel Constitution, specific books, amendments, or articles.",
+        description="Get the full text of the Kestrel Constitution, specific books, amendments, or articles. Two-slot grammar: 'article' is the subcommand keyword {book, amendment, article, search, summary} and 'search' is the identifier/term — e.g. article='book' search='I', article='amendment' search='VIII', article='search' search='honesty'. Omit both for full text; article='summary' for the executive summary.",
         category=ToolCategory.SYSTEM,
         command_prefix="!constitution"
     )

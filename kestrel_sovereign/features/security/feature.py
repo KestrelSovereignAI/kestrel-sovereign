@@ -649,7 +649,7 @@ class SecurityFeature(Feature):
 
     @tool(
         name="approve",
-        description="Approve a pending request",
+        description="Approve a pending request. scope: 'once', 'session', or 'always'.",
         category=ToolCategory.SYSTEM,
         command_prefix="!security-approve",
     )
