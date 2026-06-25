@@ -234,6 +234,15 @@ class ModelDiscoveryMixin:
         model and codex uses its own serveable subscription default (e.g. on a
         fresh install before ``models_cache.json`` exists).
         """
+        self._route_catalogs = await self._collect_route_catalogs()
+
+    async def _collect_route_catalogs(self) -> dict:
+        """Build and RETURN the route-scoped catalog map (no self mutation).
+
+        Split out from :meth:`_build_route_catalogs` so the sync helper can
+        drive it on a worker thread and assign the result on the owning thread
+        (avoids cross-thread mutation of ``self._route_catalogs``).
+        """
         catalogs: dict[str, list] = {}
         for route_key, adapter in self._route_specific_catalog_adapters():
             try:
@@ -247,16 +256,19 @@ class ModelDiscoveryMixin:
             # route-scoped so it never inherits the vendor catalog.
             catalogs[route_key] = models or []
             logger.debug("route %s: %d route-specific models", route_key, len(models or []))
-        self._route_catalogs = catalogs
+        return catalogs
 
     def _ensure_route_catalogs_sync(self) -> None:
         """Synchronously ensure ``self._route_catalogs`` is populated.
 
         Used by the sync disk-cache resolution path (``_load_from_disk_cache``
-        runs in ``LLMService.__init__``, outside any event loop). Route-specific
-        adapters (codex) read a local JSON cache, so driving their async
-        ``list_models`` via ``asyncio.run`` is cheap and side-effect-free.
-        No-op if catalogs were already built by the async discovery phase.
+        runs in ``LLMService.__init__``, outside any event loop) AND by the
+        sync ``set_model_preference`` validator, which may run *inside* a
+        running loop (the ``set_model`` tool is async). Route-specific adapters
+        (codex) build their catalog from a local JSON cache with no awaits, so
+        the async builder is loop-independent and safe to drive to completion
+        on a worker thread when a loop is already running. No-op if catalogs
+        were already built by the async discovery phase.
         """
         import asyncio
 
@@ -272,17 +284,31 @@ class ModelDiscoveryMixin:
                 logger.debug("sync route-catalog build skipped: %s", e)
                 self._route_catalogs = {}
         else:
-            # A loop is already running (rare on this path); we can't await
-            # the adapter's list_models. Still register every route-specific
-            # route as an EMPTY catalog (this enumeration is sync) so the plan
-            # route is marked route-scoped and never inherits the vendor's API
-            # catalog (e.g. gpt-5.5-pro). Empty leaves ``auto`` unresolved →
-            # codex uses its own serveable default. The async discovery phase
-            # (_build_route_catalogs) later overwrites with the real catalog.
-            self._route_catalogs = {
-                route_key: []
-                for route_key, _ in self._route_specific_catalog_adapters()
-            }
+            # A loop is already running. We can't ``asyncio.run`` here, but the
+            # route-specific builder only reads a local JSON cache (no awaits
+            # that depend on THIS loop), so drive it to completion on a worker
+            # thread with its own loop. This yields the REAL catalog rather
+            # than an empty placeholder, so the validator can distinguish a
+            # model that codex can't serve from "catalog not built yet" — the
+            # placeholder otherwise let an api-only model land on the plan
+            # route (gpt-5.5-pro). On any failure, fall back to registering
+            # every route-specific route as EMPTY so it stays route-scoped
+            # (never inherits the vendor catalog); the async discovery phase
+            # later overwrites with the real catalog.
+            import concurrent.futures
+
+            def _build_in_thread() -> dict:
+                return asyncio.run(self._collect_route_catalogs())
+
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    self._route_catalogs = pool.submit(_build_in_thread).result()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("threaded route-catalog build skipped: %s", e)
+                self._route_catalogs = {
+                    route_key: []
+                    for route_key, _ in self._route_specific_catalog_adapters()
+                }
 
     def _select_auto_model_for_route(
         self,

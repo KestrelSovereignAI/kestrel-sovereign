@@ -213,8 +213,29 @@ class TestModelPreference:
 
     @pytest.mark.asyncio
     async def test_set_model_preference_with_vendor_and_route(self, llm_service):
-        """Route narrows routing to the exact <vendor>:<route> entry."""
-        llm_service.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
+        """Route narrows routing to the exact <vendor>:<route> entry.
+
+        The triple must be a configured route serving the model — an explicit
+        ``{vendor, route, model}`` is now validated against discovery (#1946),
+        so this test wires a real ``anthropic:plan`` route + catalog entry
+        rather than relying on the old silent-accept loophole.
+        """
+        from unittest.mock import MagicMock, patch
+        from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
+
+        llm_service.providers.append(
+            {"name": "anthropic:plan", "vendor": "anthropic", "route": "plan", "model": "auto"}
+        )
+        cache = MagicMock()
+        cache.get_any = MagicMock(return_value=[
+            ModelInfo(
+                id="claude-sonnet-4-6", provider="anthropic",
+                display_name="claude-sonnet-4-6", category=ModelCategory.CHAT,
+                supports_tools=True,
+            ),
+        ])
+        with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=cache):
+            llm_service.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
 
         pref = llm_service.get_model_preference()
         assert pref["vendor"] == "anthropic"
