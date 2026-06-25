@@ -96,6 +96,49 @@ class TestOpenAIPlanListModels:
         assert models == []
 
 
+class TestEffectiveModelParam:
+    """Choke-point: whatever upstream resolution picks, codex never receives a
+    model the account can't serve — it's dropped to None (codex default) so the
+    app-server can't 400. Makes every upstream resolution-path edge moot."""
+
+    def _adapter(self, serveable_slugs):
+        a = CodexAdapter()
+        rows = [{"slug": s} for s in serveable_slugs]
+        return a, patch.object(CodexAdapter, "_read_codex_models_cache", return_value=rows)
+
+    def test_auto_and_default_become_none(self):
+        a, p = self._adapter(["gpt-5.5"])
+        with p:
+            assert a._effective_model_param("auto") is None
+            assert a._effective_model_param("default") is None
+            assert a._effective_model_param(None) is None
+
+    def test_serveable_model_passes_through(self):
+        a, p = self._adapter(["gpt-5.5", "gpt-5.4"])
+        with p:
+            assert a._effective_model_param("gpt-5.5") == "gpt-5.5"
+
+    def test_unserveable_model_dropped_to_codex_default(self):
+        # gpt-5.5-pro is absent from the account's serveable set → None.
+        a, p = self._adapter(["gpt-5.5", "gpt-5.4"])
+        with p:
+            assert a._effective_model_param("gpt-5.5-pro-2026-04-23") is None
+
+    def test_hidden_internal_models_are_serveable(self):
+        # serveability = membership in the cache (any visibility), e.g. an
+        # internal slug codex can still run.
+        a, p = self._adapter(["gpt-5.5", "codex-auto-review"])
+        with p:
+            assert a._effective_model_param("codex-auto-review") == "codex-auto-review"
+
+    def test_empty_cache_passes_through_for_loud_surfacing(self):
+        # Can't validate (cache unavailable) → pass through; an unserveable
+        # pick then 400s loudly rather than being silently swapped.
+        a, p = self._adapter([])
+        with p:
+            assert a._effective_model_param("gpt-5.5-pro") == "gpt-5.5-pro"
+
+
 class TestMessageHelpers:
     def test_extract_system_prompt(self):
         instructions, inputs = _extract_instructions_and_input([

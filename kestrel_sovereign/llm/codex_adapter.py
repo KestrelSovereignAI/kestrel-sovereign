@@ -1036,7 +1036,7 @@ class CodexAdapter(LLMAdapter):
         unavoidable given the protocol; mirrors OpenClaw's fingerprint
         reset behaviour.
         """
-        m = self._model_param(model)
+        m = self._effective_model_param(model)
         # #1734 codex review: cwd + sandbox + approval_policy are
         # thread-scoped settings codex only consumes at thread/start,
         # so they MUST be in the fingerprint. Without that, a session
@@ -2332,7 +2332,7 @@ class CodexAdapter(LLMAdapter):
             # that the previous unconditional pass would break
             # ``openai:plan`` agents whose route was configured with
             # ``model = "auto"``.
-            m_for_turn = self._model_param(model)
+            m_for_turn = self._effective_model_param(model)
             if m_for_turn:
                 turn_params["model"] = m_for_turn
             await app.request("turn/start", turn_params, timeout=60)
@@ -2883,30 +2883,8 @@ class CodexAdapter(LLMAdapter):
         """
         from .model_metadata import ModelCategory
 
-        env_home = os.environ.get("CODEX_HOME", "").strip()
-        managed_home = Path.home() / ".kestrel" / "codex-home"
-        # Prefer the env override only when it points at the managed dir
-        # (mirrors how ``codex_app_server._spawn`` resolves CODEX_HOME);
-        # otherwise the managed home is authoritative for the plan route.
-        if env_home and Path(env_home) == managed_home:
-            codex_home = Path(env_home)
-        else:
-            codex_home = managed_home
-
-        cache_path = codex_home / "models_cache.json"
-        try:
-            raw = cache_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-        except FileNotFoundError:
-            logger.debug("codex: models_cache.json not found at %s", cache_path)
-            return []
-        except (OSError, ValueError) as e:
-            logger.info("codex: could not read models_cache.json (%s): %s", cache_path, e)
-            return []
-
-        models_raw = (data or {}).get("models") or []
         out: List[ModelInfo] = []
-        for entry in models_raw:
+        for entry in self._read_codex_models_cache():
             if not isinstance(entry, dict):
                 continue
             if entry.get("visibility") != "list":
@@ -2926,8 +2904,79 @@ class CodexAdapter(LLMAdapter):
                 supports_tools=True,
                 supports_streaming=True,
             ))
-        logger.debug("codex: discovered %d list-visible models from %s", len(out), cache_path)
+        logger.debug("codex: discovered %d list-visible models from cache", len(out))
         return out
+
+    @staticmethod
+    def _codex_home() -> Path:
+        """Resolve the kestrel-managed CODEX_HOME (mirrors ``_spawn``)."""
+        env_home = os.environ.get("CODEX_HOME", "").strip()
+        managed_home = Path.home() / ".kestrel" / "codex-home"
+        # Prefer the env override only when it points at the managed dir;
+        # otherwise the managed home is authoritative for the plan route.
+        if env_home and Path(env_home) == managed_home:
+            return Path(env_home)
+        return managed_home
+
+    def _read_codex_models_cache(self) -> List[Dict[str, Any]]:
+        """Raw ``models`` list from ``<CODEX_HOME>/models_cache.json``.
+
+        Codex fetches the account's serveable models from chatgpt.com and
+        caches them here. Returns ``[]`` on any missing/unreadable cache —
+        callers treat empty as "can't validate / use codex default". No model
+        ids are hardcoded; everything is account-sourced.
+        """
+        cache_path = self._codex_home() / "models_cache.json"
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            logger.debug("codex: models_cache.json not found at %s", cache_path)
+            return []
+        except (OSError, ValueError) as e:
+            logger.info("codex: could not read models_cache.json (%s): %s", cache_path, e)
+            return []
+        models = (data or {}).get("models") or []
+        return models if isinstance(models, list) else []
+
+    def _codex_serveable_slugs(self) -> set:
+        """Every model slug the account's codex can run (any visibility).
+
+        The 400 "model is not supported" rejection fires for slugs ABSENT from
+        this set (e.g. ``gpt-5.5-pro``), so serveability is membership here —
+        including ``visibility=="hide"`` codex-internal models. Empty set when
+        the cache is unavailable (cannot validate).
+        """
+        return {
+            e["slug"]
+            for e in self._read_codex_models_cache()
+            if isinstance(e, dict) and e.get("slug")
+        }
+
+    def _effective_model_param(self, model: Optional[str]) -> Optional[str]:
+        """Final guard before a model reaches codex (the choke-point).
+
+        Drops ``auto``/``default`` (``_model_param``) AND any model the
+        account's codex cannot serve to ``None`` so the app-server uses its own
+        serveable subscription default instead of 400-ing. Whatever upstream
+        discovery/mandate resolution picked, codex never receives an
+        unserveable model. Logs loudly when it overrides (no silent vendor
+        swap — the operator sees why their pin was dropped). If the cache is
+        unavailable (empty set) we cannot validate, so we pass the model
+        through and let the app-server's error surface.
+        """
+        m = self._model_param(model)
+        if m is None:
+            return None
+        serveable = self._codex_serveable_slugs()
+        if serveable and m not in serveable:
+            logger.warning(
+                "codex: model %r is not in this account's serveable set %s; "
+                "sending no model so codex uses its subscription default. Pin a "
+                "listed model under [llm.vendors.openai.routes.plan] to override.",
+                m, sorted(serveable),
+            )
+            return None
+        return m
 
     def contribute_system_prompt(
         self, model_id: str, base: Optional[str]
