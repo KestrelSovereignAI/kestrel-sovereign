@@ -101,6 +101,26 @@ from kestrel_sdk.tools.result import ToolResult
 logger = logging.getLogger(__name__)
 
 
+# Environment variables that opt a *test instance* into non-interactive
+# approval (#1936). Any one set to a truthy value is sufficient. This is the
+# explicit second gate on top of ``is_test_instance`` — a tagged test agent
+# does NOT auto-approve unless the operator who launched it asked for it, so a
+# test instance used interactively (e.g. a recorded demo) still prompts.
+_TEST_AUTO_APPROVE_ENV_VARS = (
+    "KESTREL_TEST_AUTO_APPROVE",
+    "KESTREL_TEST_INSTANCE_AUTO_APPROVE",
+)
+
+
+def _test_auto_approve_opt_in() -> bool:
+    """True when the operator has opted test instances into non-interactive
+    approval via the environment. Never consulted for non-test agents."""
+    for _var in _TEST_AUTO_APPROVE_ENV_VARS:
+        if os.environ.get(_var, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
 class SecurityFeature(Feature):
     """
     Security Agent for managing permissions and approval queue.
@@ -196,7 +216,65 @@ class SecurityFeature(Feature):
         # Complete async initialization directly (no longer need to schedule as task)
         await self._async_init()
 
+        # #1936 — enable non-interactive approval for tagged test instances.
+        await self._maybe_enable_test_instance_auto_approve()
+
         logger.info("SecurityFeature initialized (async setup pending)")
+
+    async def _maybe_enable_test_instance_auto_approve(self) -> bool:
+        """Enable non-interactive approval for a tagged test instance (#1936).
+
+        A headless test agent (driven via ``kestrel ask``) has no human to
+        answer the interactive approval queue, so every ASK-level tool falls
+        into the ~20-minute approval timeout (#406) and is recorded as a user
+        denial — exactly how the dogfooding loop's compute drive saw a clean
+        script rejected ("User denied execution (scope: timeout)").
+
+        Rather than invent a parallel approval path, reuse the framework's
+        existing, audited global auto-mode: with it enabled, ``get_permission``
+        promotes ASK/SESSION/default to AUTO while DENY and ALWAYS_ASK remain
+        hard policy rails, and the tool flows through the established AUTO path
+        in both the SecurityHook and the ApprovalQueue. Every other PreToolUse
+        hook (constitutional / honesty / security) still runs and can block —
+        this only resolves the *human-confirmation* gate, and each
+        auto-approval is audited (``decision="auto_mode_allowed"``).
+
+        Strictly scoped: requires BOTH ``is_test_instance`` AND an explicit
+        operator opt-in (``KESTREL_TEST_AUTO_APPROVE``). A sovereign/production
+        agent (``is_test_instance is False``) can never reach this; a test
+        instance launched without the env opt-in stays fully interactive.
+
+        Returns True iff auto-mode was enabled (for callers/tests).
+        """
+        if self.permission_store is None:
+            return False
+        if not bool(getattr(self.agent, "is_test_instance", False)):
+            return False
+        if not _test_auto_approve_opt_in():
+            return False
+
+        self.permission_store.set_global_auto_mode(True)
+        agent_name = getattr(self.agent, "_agent_name", None) or getattr(
+            self.agent, "did", "test-instance"
+        )
+        try:
+            await self.permission_store.log_decision(
+                feature_name="SecurityFeature",
+                tool_name="non_interactive_approval",
+                action="auto_mode_config",
+                decision="auto_mode_allowed",
+                user_choice="is_test_instance_opt_in",
+            )
+        except Exception:  # noqa: BLE001 - auditing is best-effort, never fatal
+            logger.debug("Failed to audit test-instance auto-approve", exc_info=True)
+        logger.warning(
+            "SecurityFeature: NON-INTERACTIVE approval ENABLED for test "
+            "instance %s (#1936) — ASK-level tools auto-approve after hooks; "
+            "DENY/ALWAYS_ASK still hard-stop. This MUST never be a "
+            "sovereign/production agent.",
+            agent_name,
+        )
+        return True
 
     async def _ensure_initialized(self):
         """Ensure async initialization is complete before operations."""
