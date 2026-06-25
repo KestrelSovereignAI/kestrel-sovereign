@@ -2,17 +2,15 @@
 """Project the OKF docs corpus into a published documentation site.
 
 This is a *projection*, not a migration: ``docs/`` stays the source of truth and
-this command emits a renderable site (Mintlify today, other emitters later) from
-OKF frontmatter. Publication is default-deny:
+this command emits a renderable static site (Starlight; Mintlify for preview)
+from OKF frontmatter.
 
-1. ``privacy: public`` only (never ``internal`` / ``private`` /
-   ``review-before-public``).
-2. ``type`` must be in :data:`PUBLISHABLE_TYPES` (curated, not "every public
-   doc"). The bulk migration marked ~238 files ``public``; most of those are
-   issue bodies, audit ledgers, and review records that do not belong on a
-   public site.
-3. ``status`` must not be in :data:`STALE_STATUSES` unless ``--include-stale``
-   is passed, in which case the doc renders with a staleness banner.
+Publication routing is owned by ``scripts/docs_verify.render_channel``, which
+buckets every doc into ``public`` / ``internal`` / ``archive`` / ``exclude``
+from its frontmatter. This builder publishes the ``public`` channel by default
+(``--channels`` to opt archive docs in, rendered with a snapshot banner). It
+does not re-derive its own type/privacy/status gate — there is one routing
+policy, shared with the verification ledger.
 
 Run ``--check`` in CI to fail if the published tree drifts from the corpus.
 """
@@ -21,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import filecmp
+import hashlib
 import json
 import re
 import shutil
@@ -28,7 +27,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Reuse the OKF parser so the site can never disagree with the validator.
+# Reuse the OKF parser and the docs_verify render router so the site can never
+# disagree with the validator or with the shipped publication-routing policy.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from docs_okf import (  # noqa: E402
     DEFAULT_DOCS_ROOT,
@@ -38,34 +38,19 @@ from docs_okf import (  # noqa: E402
     markdown_files,
     read_okf_document,
 )
+from docs_verify import render_channel  # noqa: E402
 
 DEFAULT_SITE_ROOT = PROJECT_ROOT / "site"
 
-# Curated allow-list of document types that belong on a public docs site.
-# Everything else (Issue Body, Audit Ledger, Review Record, Audit Report,
-# Review Lane, Test Report, Migration Plan, ...) is internal by nature.
-PUBLISHABLE_TYPES = {
-    "Documentation Index",
-    "User Guide",
-    "Guide",
-    "Runbook",
-    "Use Case",
-    "Principle Document",
-    "Vision Document",
-    "Design Note",
-    "Architecture Spec",
-    "Generated Reference",
-}
+# Publication routing is owned by scripts/docs_verify.py's render_channel():
+# every doc routes to public / internal / archive / exclude from its OKF
+# frontmatter. The site builder consumes that single classifier rather than
+# re-deriving a parallel type/privacy/status gate. ``public`` is the default
+# channel; ``archive`` can be opted in (rendered with a snapshot banner).
+PUBLISHABLE_CHANNELS = {"public"}
 
-# Statuses that should not be published without an explicit opt-in + banner.
-STALE_STATUSES = {"needs-revalidation", "snapshot", "historical", "aspirational"}
-
+# Status-driven banners for docs pulled in from non-default channels (archive).
 STATUS_BANNER = {
-    "needs-revalidation": (
-        "warning",
-        "This page has not been re-verified against the current codebase and may "
-        "be out of date.",
-    ),
     "snapshot": (
         "info",
         "This page is a point-in-time snapshot and is not maintained as living "
@@ -76,10 +61,10 @@ STATUS_BANNER = {
         "This page is preserved for historical context and does not describe the "
         "current system.",
     ),
-    "aspirational": (
+    "needs-revalidation": (
         "warning",
-        "This page describes intended/future behavior that may not be implemented "
-        "yet.",
+        "This page has not been re-verified against the current codebase and may "
+        "be out of date.",
     ),
 }
 
@@ -104,12 +89,14 @@ GROUP_ORDER = [
 def select_pages(
     docs_root: Path,
     *,
-    include_stale: bool,
+    channels: set[str] = PUBLISHABLE_CHANNELS,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
-    """Return ``(pages, skipped)`` where each page carries its OKF metadata.
+    """Return ``(pages, skipped)`` for docs whose render channel is requested.
 
-    ``skipped`` is a list of ``(path, reason)`` so the build is never a silent
-    truncation — callers log it.
+    Routing is delegated to ``docs_verify.render_channel`` — the same classifier
+    the verification ledger uses — so the site and the ledger can never disagree
+    about what is public. ``skipped`` carries the channel each excluded doc
+    routed to, so the build is never a silent truncation.
     """
     pages: list[dict[str, Any]] = []
     skipped: list[tuple[str, str]] = []
@@ -124,27 +111,19 @@ def select_pages(
             skipped.append((rel, "no OKF frontmatter"))
             continue
 
+        channel = render_channel(doc)
+        if channel not in channels:
+            skipped.append((rel, f"render={channel}"))
+            continue
+
         fm = doc.frontmatter
-        privacy = str(fm.get("privacy", "")).strip().lower()
-        doc_type = str(fm.get("type", "")).strip()
-        status = str(fm.get("status", "")).strip().lower()
-
-        if privacy != "public":
-            skipped.append((rel, f"privacy={privacy or 'unset'}"))
-            continue
-        if doc_type not in PUBLISHABLE_TYPES:
-            skipped.append((rel, f"type not publishable: {doc_type or 'unset'}"))
-            continue
-        if status in STALE_STATUSES and not include_stale:
-            skipped.append((rel, f"status={status} (use --include-stale)"))
-            continue
-
         pages.append(
             {
                 "src": path,
                 "rel": rel,
-                "type": doc_type,
-                "status": status,
+                "type": str(fm.get("type", "")).strip(),
+                "status": str(fm.get("status", "")).strip().lower(),
+                "channel": channel,
                 "title": fm.get("title") or first_h1(doc.body) or path.stem,
                 "description": fm.get("description", ""),
                 "body": doc.body,
@@ -204,6 +183,42 @@ def _strip_leading_h1(body: str) -> str:
     return "\n".join(lines).rstrip()
 
 
+_IMAGE_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
+
+
+def rewrite_local_images(
+    body: str, src_dir: Path, url_prefix: str
+) -> tuple[str, dict[str, Path], list[str]]:
+    """Resolve relative image embeds against the source doc.
+
+    Local images live outside the docs tree (e.g. demo screenshots under
+    ``demos/``), so their relative paths do not survive the projection. Copy
+    each one that exists into the site under a content-hashed name and rewrite
+    the link to ``url_prefix/<name>``; drop the rest with a note (never a silent
+    deletion). Returns ``(new_body, {asset_name: source_path}, dropped)``.
+    """
+    assets: dict[str, Path] = {}
+    dropped: list[str] = []
+
+    def repl(match: re.Match[str]) -> str:
+        pre, url, post = match.groups()
+        raw = url.strip()
+        if raw.startswith(("http://", "https://", "/")):
+            return match.group(0)
+        target = raw.split()[0].split("#")[0]
+        asset_src = (src_dir / target).resolve()
+        if asset_src.is_file():
+            digest = hashlib.sha1(str(asset_src).encode()).hexdigest()[:8]
+            safe = re.sub(r"[^A-Za-z0-9._-]", "-", asset_src.name)
+            name = f"{digest}-{safe}"
+            assets[name] = asset_src
+            return f"{pre}{url_prefix}/{name}{post}"
+        dropped.append(target)
+        return "*(image unavailable in published docs)*"
+
+    return _IMAGE_RE.sub(repl, body), assets, dropped
+
+
 def _grouped(pages: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
     by_group: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
@@ -226,7 +241,7 @@ class StarlightEmitter:
     def __init__(self, base: str = DEFAULT_PAGES_BASE) -> None:
         self.base = base.rstrip("/")
 
-    def render_page(self, page: dict[str, Any]) -> str:
+    def render_page(self, page: dict[str, Any], body: str | None = None) -> str:
         lines = ["---", f"title: {_yaml_quote(page['title'])}"]
         if page["description"]:
             lines += [f"description: {_yaml_quote(page['description'])}"]
@@ -238,13 +253,20 @@ class StarlightEmitter:
             directive = {"warning": "caution", "info": "note"}.get(kind, "note")
             lines += [f":::{directive}", text, ":::", ""]
 
-        lines += [_strip_leading_h1(page["body"]), ""]
+        lines += [_strip_leading_h1(page["body"] if body is None else body), ""]
         return "\n".join(lines)
 
-    def tree(self, pages: list[dict[str, Any]]) -> dict[str, str]:
-        files: dict[str, str] = {}
+    def tree(self, pages: list[dict[str, Any]]) -> dict[str, str | Path]:
+        files: dict[str, str | Path] = {}
         for page in pages:
-            files[f"src/content/docs/{_site_slug(page['rel'])}.md"] = self.render_page(page)
+            body, assets, dropped = rewrite_local_images(
+                page["body"], Path(page["src"]).parent, f"{self.base}/_assets"
+            )
+            files[f"src/content/docs/{_site_slug(page['rel'])}.md"] = self.render_page(page, body)
+            for name, src in assets.items():
+                files[f"public/_assets/{name}"] = src
+            for target in dropped:
+                print(f"  WARN {page['rel']}: dropped missing image {target}", file=sys.stderr)
         files["src/content/docs/index.md"] = self._landing(pages)
         files["astro.config.mjs"] = self._astro_config(pages)
         files["src/content.config.ts"] = _STARLIGHT_CONTENT_CONFIG
@@ -297,7 +319,7 @@ class MintlifyEmitter:
 
     name = "mintlify"
 
-    def render_page(self, page: dict[str, Any]) -> str:
+    def render_page(self, page: dict[str, Any], body: str | None = None) -> str:
         lines = ["---", f"title: {_yaml_quote(page['title'])}"]
         if page["description"]:
             lines += [f"description: {_yaml_quote(page['description'])}"]
@@ -307,11 +329,18 @@ class MintlifyEmitter:
             kind, text = banner
             tag = {"warning": "Warning", "info": "Info"}.get(kind, "Note")
             lines += [f"<{tag}>{text}</{tag}>", ""]
-        lines += [_strip_leading_h1(page["body"]), ""]
+        lines += [_strip_leading_h1(page["body"] if body is None else body), ""]
         return "\n".join(lines)
 
-    def tree(self, pages: list[dict[str, Any]]) -> dict[str, str]:
-        files = {f"{_site_slug(p['rel'])}.mdx": self.render_page(p) for p in pages}
+    def tree(self, pages: list[dict[str, Any]]) -> dict[str, str | Path]:
+        files: dict[str, str | Path] = {}
+        for page in pages:
+            body, assets, _ = rewrite_local_images(
+                page["body"], Path(page["src"]).parent, "/_assets"
+            )
+            files[f"{_site_slug(page['rel'])}.mdx"] = self.render_page(page, body)
+            for name, src in assets.items():
+                files[f"_assets/{name}"] = src
         nav = [
             {"group": group, "pages": [_site_slug(p["rel"]) for p in group_pages]}
             for group, group_pages in _grouped(pages)
@@ -391,12 +420,12 @@ def build_site(
     site_root: Path,
     emitter: str,
     base: str,
-    include_stale: bool,
+    channels: set[str],
     check: bool,
 ) -> int:
     emitter_cls = EMITTERS[emitter]
     renderer = emitter_cls(base) if emitter == "starlight" else emitter_cls()
-    pages, skipped = select_pages(docs_root, include_stale=include_stale)
+    pages, skipped = select_pages(docs_root, channels=channels)
 
     if not pages:
         print("ERROR: no publishable pages selected", file=sys.stderr)
@@ -411,7 +440,10 @@ def build_site(
     for rel_path, contents in renderer.tree(pages).items():
         out = staging / rel_path
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(contents, encoding="utf-8")
+        if isinstance(contents, Path):
+            shutil.copyfile(contents, out)  # binary asset (e.g. screenshot)
+        else:
+            out.write_text(contents, encoding="utf-8")
 
     print(f"Selected {len(pages)} pages for the {emitter} site; skipped {len(skipped)}.")
     for rel, reason in skipped[:15]:
@@ -471,18 +503,21 @@ def main() -> int:
         help='GitHub Pages base path (starlight). Use "" for a custom domain.',
     )
     parser.add_argument(
-        "--include-stale",
-        action="store_true",
-        help="publish needs-revalidation/snapshot docs with a staleness banner",
+        "--channels",
+        default="public",
+        help="comma-separated docs_verify render channels to publish "
+        "(public, archive, internal). Default: public.",
     )
     args = parser.parse_args()
+
+    channels = {c.strip() for c in args.channels.split(",") if c.strip()}
 
     return build_site(
         docs_root=args.docs_root.resolve(),
         site_root=args.site_root.resolve(),
         emitter=args.emitter,
         base=args.base,
-        include_stale=args.include_stale,
+        channels=channels,
         check=args.command == "check",
     )
 

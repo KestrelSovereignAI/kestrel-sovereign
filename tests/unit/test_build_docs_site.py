@@ -32,52 +32,57 @@ def _write(root: Path, rel: str, frontmatter: dict, body: str = "# Title\n\nBody
 def docs(tmp_path: Path) -> Path:
     root = tmp_path / "docs"
     root.mkdir()
+    # render_channel routing (from docs_verify): public / internal / archive.
     _write(root, "guide.md", {"type": "User Guide", "privacy": "public", "status": "active"})
     _write(root, "secret.md", {"type": "User Guide", "privacy": "internal", "status": "active"})
     _write(root, "issue.md", {"type": "Issue Body", "privacy": "public", "status": "active"})
-    _write(root, "stale.md", {"type": "Guide", "privacy": "public", "status": "needs-revalidation"})
+    _write(root, "unrev.md", {"type": "Guide", "privacy": "public", "status": "needs-revalidation"})
+    _write(root, "snap.md", {"type": "Guide", "privacy": "public", "status": "snapshot"})
     return root
 
 
-def test_public_curated_active_doc_is_published(docs: Path):
-    pages, _ = build_docs_site.select_pages(docs, include_stale=False)
+def test_public_channel_doc_is_published(docs: Path):
+    pages, _ = build_docs_site.select_pages(docs)
     rels = {p["rel"].rsplit("/", 1)[-1] for p in pages}
     assert "guide.md" in rels
 
 
-def test_internal_privacy_is_blocked(docs: Path):
-    pages, skipped = build_docs_site.select_pages(docs, include_stale=False)
+def test_internal_privacy_routes_off_public(docs: Path):
+    pages, skipped = build_docs_site.select_pages(docs)
     rels = {p["rel"].rsplit("/", 1)[-1] for p in pages}
     assert "secret.md" not in rels
-    assert any("secret.md" in s[0] and "privacy=internal" in s[1] for s in skipped)
+    assert any("secret.md" in s[0] and "render=internal" in s[1] for s in skipped)
 
 
-def test_non_publishable_type_is_blocked(docs: Path):
-    pages, skipped = build_docs_site.select_pages(docs, include_stale=False)
+def test_internal_type_routes_off_public(docs: Path):
+    pages, skipped = build_docs_site.select_pages(docs)
     rels = {p["rel"].rsplit("/", 1)[-1] for p in pages}
     assert "issue.md" not in rels
-    assert any("issue.md" in s[0] and "type not publishable" in s[1] for s in skipped)
+    assert any("issue.md" in s[0] and "render=internal" in s[1] for s in skipped)
 
 
-def test_stale_status_blocked_by_default_but_allowed_with_flag(docs: Path):
-    default_pages, _ = build_docs_site.select_pages(docs, include_stale=False)
-    assert all("stale.md" not in p["rel"] for p in default_pages)
-
-    stale_pages, _ = build_docs_site.select_pages(docs, include_stale=True)
-    assert any("stale.md" in p["rel"] for p in stale_pages)
+def test_needs_revalidation_routes_internal_not_public(docs: Path):
+    pages, skipped = build_docs_site.select_pages(docs)
+    assert all("unrev.md" not in p["rel"] for p in pages)
+    assert any("unrev.md" in s[0] and "render=internal" in s[1] for s in skipped)
 
 
-def test_stale_page_renders_a_banner(docs: Path):
-    stale_pages, _ = build_docs_site.select_pages(docs, include_stale=True)
-    page = next(p for p in stale_pages if "stale.md" in p["rel"])
+def test_archive_channel_is_opt_in_with_banner(docs: Path):
+    # snapshot status routes to the archive channel, withheld by default.
+    default_pages, _ = build_docs_site.select_pages(docs)
+    assert all("snap.md" not in p["rel"] for p in default_pages)
+
+    archive_pages, _ = build_docs_site.select_pages(docs, channels={"public", "archive"})
+    page = next(p for p in archive_pages if "snap.md" in p["rel"])
+    assert page["channel"] == "archive"
     rendered = build_docs_site.StarlightEmitter().render_page(page)
-    assert ":::caution" in rendered
+    assert ":::note" in rendered  # snapshot banner
 
 
 def test_starlight_tree_has_config_and_grouped_sidebar(docs: Path):
     import json
 
-    pages, _ = build_docs_site.select_pages(docs, include_stale=True)
+    pages, _ = build_docs_site.select_pages(docs)
     tree = build_docs_site.StarlightEmitter().tree(pages)
     assert "package.json" in tree
     assert "src/content.config.ts" in tree
@@ -92,7 +97,7 @@ def test_starlight_tree_has_config_and_grouped_sidebar(docs: Path):
 def test_mintlify_emitter_groups_by_type(docs: Path):
     import json
 
-    pages, _ = build_docs_site.select_pages(docs, include_stale=True)
+    pages, _ = build_docs_site.select_pages(docs)
     tree = build_docs_site.MintlifyEmitter().tree(pages)
     nav = json.loads(tree["mint.json"])["navigation"]
     groups = {g["group"] for g in nav}
