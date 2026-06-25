@@ -77,11 +77,45 @@ class TestParseDocstringParams:
         '''
         
         result = parse_docstring_params(docstring)
-        
+
         # Multi-line should be collapsed to single line
         assert 'configuration dictionary' in result['config']
+        # The WHOLE wrapped description must survive — including continuation
+        # lines that begin with a word ("all ...", "including ...").
+        assert 'including nested options' in result['config']
         assert result['name'] == 'Simple name param'
-    
+
+    def test_wrapped_description_not_truncated_at_word_continuation(self):
+        """Regression (#1925): a param description wrapped across lines whose
+        continuations BEGIN WITH A WORD must not be truncated. The old
+        ``(?=\\n\\s+\\w+|\\Z)`` terminator cut the description at the first such
+        line, silently dropping documented constraints from the tool schema
+        (hit in talon #1939 and webhooks #1937).
+        """
+        docstring = '''
+        Configure the backend.
+
+        Args:
+            model: When backend is claude, one of opus, sonnet, or
+                haiku. When backend is codex or opencode, a non-blank
+                provider model id (blank is rejected).
+            auth_config: Required keys depend on auth_type. For
+                ip_allowlist pass allowed_ips as a list of CIDRs.
+            flag: A trailing one-liner.
+
+        Returns:
+            The result.
+        '''
+        result = parse_docstring_params(docstring)
+        # Tail content past the first word-continuation must be present.
+        assert 'opencode' in result['model']
+        assert 'blank is rejected' in result['model']
+        assert 'allowed_ips' in result['auth_config']
+        # Boundaries between params stay correct.
+        assert result['flag'] == 'A trailing one-liner.'
+        assert 'allowed_ips' not in result['flag']
+        assert 'haiku' not in result['auth_config']
+
     def test_empty_docstring(self):
         """Test handling of empty docstring."""
         assert parse_docstring_params(None) == {}
