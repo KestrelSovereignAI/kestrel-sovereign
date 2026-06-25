@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -75,3 +75,125 @@ async def test_export_sovereignty_reports_upload_progress():
     ]
     assert progress_events
     assert progress_events[-1]["percent"] == 100
+
+
+from kestrel_sdk.tools.result import ToolResultStatus
+
+
+@pytest.mark.asyncio
+async def test_export_sovereignty_unknown_tier_is_failed():
+    """An unknown/typo'd storage_tier must FAIL loudly, not silently
+    fall through to IPFS (#1946). Pre-fix, ``tier_map.get(..., IPFS)``
+    meant a bogus tier attempted a network publish without the agent
+    knowing, while its identity twin defaulted silently to local-only."""
+    agent = _FakeAgent()
+    feature = SovereigntyFeature(agent)
+
+    result = await feature.export_sovereignty(storage_tier="ipsf", encrypt=False)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "local" in result.error and "ipfs" in result.error and "filecoin" in result.error
+    assert "ipsf" in result.error
+    # Validation fired BEFORE any backup blob / network attempt.
+    assert not hasattr(agent.storage, "receipt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_tier", [False, 0, [], {}])
+async def test_export_sovereignty_falsy_nonstring_tier_is_failed(bad_tier):
+    """A falsy NON-STRING tier (false/0/[]/{}) is a wrong type, not an
+    omission — it must be rejected, not coerced to the 'ipfs' default."""
+    agent = _FakeAgent()
+    feature = SovereigntyFeature(agent)
+    result = await feature.export_sovereignty(storage_tier=bad_tier, encrypt=False)
+    assert result.status is ToolResultStatus.ERROR
+    assert "local" in result.error and "ipfs" in result.error
+    assert not hasattr(agent.storage, "receipt")
+
+
+@pytest.mark.asyncio
+async def test_export_sovereignty_valid_local_tier_resolves():
+    """A valid tier ('local') passes validation and completes."""
+    agent = _FakeAgent()
+    feature = SovereigntyFeature(agent)
+
+    def fake_store_content(*args, **kwargs):
+        return StorageResult(
+            content_hash="hashlocal",
+            cid=None,
+            tier=StorageTier.LOCAL_ONLY,
+            provider="local",
+            encrypted=False,
+            size_bytes=1024,
+        )
+
+    with patch(
+        "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter.store_content",
+        side_effect=fake_store_content,
+    ):
+        result = await feature.export_sovereignty(storage_tier="local", encrypt=False)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["tier"] == "local_only"
+    assert result.data["tier_requested"] == "local_only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cloud_tier", ["cloud_hot", "cloud_cold"])
+async def test_export_sovereignty_cloud_tier_is_rejected(cloud_tier):
+    """cloud_hot/cloud_cold have StorageTier enum members but no
+    FilecoinAdapter export path, so they must be REJECTED (not charged +
+    receipted for an unstored blob, and not silently mapped to IPFS as the
+    old ``.get(..., IPFS)`` did) (#1946). The endpoint allowlist excludes
+    them in lockstep — see test_endpoint_allowlist_matches_feature."""
+    agent = _FakeAgent()
+    feature = SovereigntyFeature(agent)
+    result = await feature.export_sovereignty(storage_tier=cloud_tier, encrypt=False)
+    assert result.status is ToolResultStatus.ERROR
+    assert cloud_tier in result.error
+    # No store / receipt / wallet charge happened.
+    assert not hasattr(agent.storage, "receipt")
+
+
+def test_endpoint_allowlist_matches_feature_tier_map():
+    """The endpoint ALLOWED_TIERS must be a subset of the feature's
+    supported tiers, or the endpoint accepts tiers the feature 500s on."""
+    from kestrel_sovereign.endpoints.sovereignty import ALLOWED_TIERS
+
+    supported = {"local", "ipfs", "filecoin"}
+    assert ALLOWED_TIERS == supported
+
+
+@pytest.mark.asyncio
+async def test_export_sovereignty_omitted_tier_keeps_ipfs_default():
+    """Omitting storage_tier keeps the documented 'ipfs' default."""
+    agent = _FakeAgent()
+    # The 'ipfs' default is a paid tier, so a wallet is required to reach
+    # the store path; without it the export refuses before resolving tier.
+    wallet = MagicMock()
+    wallet.can_afford.return_value = True
+    wallet.transfer = AsyncMock()
+    agent.wallet = wallet
+    feature = SovereigntyFeature(agent)
+
+    captured = {}
+
+    def fake_store_content(*args, **kwargs):
+        captured["tier"] = kwargs.get("storage_tier")
+        return StorageResult(
+            content_hash="abc",
+            cid="QmDefault",
+            tier=StorageTier.IPFS,
+            provider="ipfs",
+            encrypted=False,
+            size_bytes=1024,
+        )
+
+    with patch(
+        "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter.store_content",
+        side_effect=fake_store_content,
+    ):
+        result = await feature.export_sovereignty(encrypt=False)
+
+    assert captured["tier"] == StorageTier.IPFS
+    assert result.data["tier_requested"] == "ipfs"

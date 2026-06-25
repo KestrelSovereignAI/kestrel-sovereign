@@ -29,10 +29,15 @@ STORAGE_CACHE_DIR = Path(
     os.environ.get("KESTREL_CACHE_DIR") or "storage_cache"
 ).resolve()
 
-# Allowlist of valid storage tiers for sovereignty export.
-# Legacy names (ipfs, filecoin) map to CLOUD_HOT / CLOUD_COLD via SovereigntyFeature.
-# "cloud_hot" / "cloud_cold" are the modern preferred values.
-ALLOWED_TIERS = {"local", "ipfs", "filecoin", "cloud_hot", "cloud_cold"}
+# Allowlist of valid storage tiers for sovereignty export. Each value here
+# MUST be a recognized key in SovereigntyFeature.export_sovereignty's
+# tier_map, or the endpoint would accept a tier the feature then rejects with
+# HTTP 500. cloud_hot / cloud_cold are intentionally excluded: the
+# FilecoinAdapter export path has no storage implementation for them, so
+# accepting them produced a receipt + wallet charge for data that was never
+# persisted (#1946). Re-add here AND in the feature tier_map together once a
+# cloud storage path lands.
+ALLOWED_TIERS = {"local", "ipfs", "filecoin"}
 
 # CID format: alphanumeric characters only (covers CIDv0 Qm... and CIDv1 bafy...)
 CID_PATTERN = re.compile(r'^[a-zA-Z0-9]+$')

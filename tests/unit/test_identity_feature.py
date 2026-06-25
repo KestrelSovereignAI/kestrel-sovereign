@@ -260,6 +260,87 @@ async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
     assert "ipfs" in result.error.lower()
 
 
+# ---------------------------------------------------------------------------
+# export_identity: storage_tier validation (#1946)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_export_identity_unknown_tier_is_failed():
+    """An unknown/typo'd storage_tier must FAIL loudly, not silently
+    fall through to LOCAL_ONLY. Pre-fix, ``tier_map.get(..., LOCAL_ONLY)``
+    meant 'ipfsss' produced a local-only export while the agent believed
+    it went to IPFS."""
+    feat = _make_feature(db=MagicMock())
+    result = await feat.export_identity(storage_tier="ipfsss", sign=False)
+
+    assert result.status is ToolResultStatus.ERROR
+    # Lists the valid tiers and does NOT claim a local export happened.
+    assert "local" in result.error and "ipfs" in result.error and "filecoin" in result.error
+    assert "ipfsss" in result.error
+    # No data implying an export occurred.
+    assert not (result.data or {}).get("file_path")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_tier", [False, 0, [], {}])
+async def test_export_identity_falsy_nonstring_tier_is_failed(bad_tier):
+    """A falsy NON-STRING tier (false/0/[]/{}) is a wrong type, not an
+    omission — it must be rejected, not coerced to the 'local' default."""
+    feat = _make_feature(db=MagicMock())
+    result = await feat.export_identity(storage_tier=bad_tier, sign=False)
+    assert result.status is ToolResultStatus.ERROR
+    assert "local" in result.error and "ipfs" in result.error
+
+
+def _mock_local_export(monkeypatch, tmp_path):
+    """Wire up IdentityExporter + sign so a local export reaches disk."""
+    fake_pkg = MagicMock()
+    fake_pkg.did = "did:test:export-agent"
+    fake_pkg.to_json.return_value = '{"fake": "json"}'
+    fake_pkg.get_summary.return_value = {
+        "did": "did:test:export-agent",
+        "agent_name": "Test Agent",
+        "created_at": "2026-05-08T00:00:00",
+        "episodes_count": 1,
+        "saved_items_count": 0,
+        "relationships_count": 0,
+        "skills_count": 0,
+        "is_signed": False,
+    }
+    monkeypatch.setattr(
+        "kestrel_sovereign.identity.IdentityExporter",
+        lambda **kwargs: MagicMock(export=AsyncMock(return_value=fake_pkg)),
+    )
+    monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path))
+    return fake_pkg
+
+
+@pytest.mark.asyncio
+async def test_export_identity_valid_tier_resolves(monkeypatch, tmp_path):
+    """A valid tier ('local') passes validation and produces an export."""
+    feat = _make_feature(db=MagicMock())
+    feat.agent.agent_id = "did:test:export-agent"
+    _mock_local_export(monkeypatch, tmp_path)
+
+    result = await feat.export_identity(storage_tier="local", sign=False)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["storage_tier"] == "local"
+    assert Path(result.data["file_path"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_export_identity_omitted_tier_keeps_local_default(monkeypatch, tmp_path):
+    """Omitting storage_tier keeps the documented 'local' default."""
+    feat = _make_feature(db=MagicMock())
+    feat.agent.agent_id = "did:test:export-agent"
+    _mock_local_export(monkeypatch, tmp_path)
+
+    result = await feat.export_identity(sign=False)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["storage_tier"] == "local"
+
+
 @pytest.mark.asyncio
 async def test_assess_substrate_anthropic_is_ok(monkeypatch):
     """Known substrate → OK, no PARTIAL caveat."""
