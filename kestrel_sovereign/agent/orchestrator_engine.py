@@ -2450,8 +2450,26 @@ class OrchestratorEngineMixin:
             #      ``\n---\n`` into "response", not "toolActivity" — a
             #      timeout marker rendered as response prose loses its
             #      tool-card error styling).
+            # #1966: never fire the per-call watchdog before the LLM client
+            # itself would. A slow local route (e.g. GLM via llama_cpp with a
+            # large timeout) lifts this automatically, so the route ``timeout``
+            # is the single knob — no separate KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS
+            # needed. Scoped to THIS call's candidate routes (same resolution the
+            # dispatch will use), so an explicit cloud selection in a mixed
+            # deployment keeps the default watchdog.
+            _call_timeout = ORCHESTRATOR_TURN_TIMEOUT_SECS
             try:
-                async with asyncio.timeout(ORCHESTRATOR_TURN_TIMEOUT_SECS):
+                _candidates, _ = self.llm_service.resolve_provider_routing(
+                    model_override=effective_model,
+                    force_local_only=force_local_only,
+                )
+                _route_timeout = self.llm_service.effective_request_timeout(_candidates)
+                if _route_timeout and _route_timeout > _call_timeout:
+                    _call_timeout = _route_timeout
+            except Exception:
+                pass
+            try:
+                async with asyncio.timeout(_call_timeout):
                     async for item in self.llm_service.stream_with_tool_detection(
                         messages=messages,
                         tools=all_tools or None,
@@ -2522,10 +2540,10 @@ class OrchestratorEngineMixin:
                 # that the old segmenter grouped as tool activity.
                 logging.warning(
                     "[ORCHESTRATOR-STREAM] follow-up LLM call timed out after %ss",
-                    ORCHESTRATOR_TURN_TIMEOUT_SECS,
+                    _call_timeout,
                 )
                 _timeout_detail = (
-                    f"timeout after {int(ORCHESTRATOR_TURN_TIMEOUT_SECS)}s"
+                    f"timeout after {int(_call_timeout)}s"
                 )
                 if tool_events is not None:
                     tool_events.append({
