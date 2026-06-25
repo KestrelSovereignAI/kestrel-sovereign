@@ -46,6 +46,16 @@ _STATUS_ALIASES = {
     "canceled": "cancelled", "cancel": "cancelled", "abandoned": "cancelled",
 }
 _SCOPE_ALIASES: dict = {}
+# ``todo_complete`` outcomes are done|cancelled|superseded. Models reach for
+# American spelling (``canceled``), bare verbs (``cancel``/``supersede``), and
+# completion synonyms; map them onto the canonical values instead of failing.
+_OUTCOME_ALIASES = {
+    "complete": "done", "completed": "done", "finished": "done", "resolved": "done",
+    "canceled": "cancelled", "cancel": "cancelled", "abandoned": "cancelled",
+    "dropped": "cancelled", "wontfix": "cancelled", "won't do": "cancelled",
+    "supersede": "superseded", "replaced": "superseded", "obsolete": "superseded",
+    "obsoleted": "superseded", "duplicate": "superseded",
+}
 
 
 def _normalize_choice(value, aliases):
@@ -609,7 +619,14 @@ class TodoFeature(Feature):
         terminal_condition_satisfied: bool = False,
         superseded_by: Optional[str] = None,
     ) -> ToolResult:
-        """Complete, cancel, or supersede a todo."""
+        """Complete, cancel, or supersede a todo.
+
+        outcome: one of done, cancelled, superseded (default done). Common
+        synonyms are accepted and normalized (e.g. completed→done,
+        canceled/cancel→cancelled, supersede/duplicate→superseded). ``done``
+        requires terminal_condition_satisfied=True; cancelled/superseded do not.
+        """
+        outcome = _normalize_choice(outcome, _OUTCOME_ALIASES)
         if outcome not in {"done", "cancelled", "superseded"}:
             return ToolResult.failed(
                 f"outcome must be one of cancelled, done, superseded, got {outcome!r}"

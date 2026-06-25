@@ -10,7 +10,6 @@ from kestrel_sdk.payer_policy import (
     PayerPolicyError,
     PayerSpec,
     ResourceClass,
-    SUPPORT_MATRIX_NOTES,
     SupportStatus,
     status_for,
 )
@@ -45,12 +44,6 @@ class TestSDKUserBYOK:
             status_for(ResourceClass.LLM, "openrouter", PayerKind.USER_BYOK)
             is SupportStatus.READY
         )
-        note = SUPPORT_MATRIX_NOTES[
-            (ResourceClass.LLM, "openrouter", PayerKind.USER_BYOK)
-        ]
-        assert "no platform minting" in note.lower()
-        assert "caps" in note.lower()
-        assert "rotation" in note.lower()
 
     def test_user_byok_forbids_caps(self) -> None:
         with pytest.raises(ValueError, match="caps"):

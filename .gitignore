@@ -16,6 +16,7 @@ credentials/
 *.json
 !package.json
 !package-lock.json
+!docs/generated/RENDER_MANIFEST.json
 !docs/audit/issues/*-prd.json
 *.pem
 *.key

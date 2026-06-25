@@ -49,7 +49,7 @@ from .adapter import LLMResponse, messages_for
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
-from .streaming import StreamingMixin
+from .streaming import StreamingMixin, RoutingResolution
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
 from kestrel_sovereign.kestrel_config.constants import (
@@ -665,10 +665,18 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         *,
         model_override: Optional[str] = None,
         force_local_only: bool = False,
-    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+    ) -> RoutingResolution:
         """Resolve which routes and model to use for the next LLM call.
 
         Single source of truth for routing. All call paths funnel through here.
+
+        Returns a :class:`RoutingResolution` that unpacks as the historic
+        ``(providers, target_model)`` 2-tuple AND carries ``.meta`` — the
+        no-silent-fallback authorization (``explicit_selection`` +
+        ``authorized_vendors``) computed in this SAME pass by
+        :meth:`StreamingMixin._compute_route_authorization`. The dispatch loops
+        consume ``.meta`` instead of re-deriving it, so the two can no longer
+        drift (the root cause of the prior edge-bug rounds).
 
         Resolution order:
             1. ``model_override`` — caller-supplied ``vendor/model`` or
@@ -833,7 +841,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "OPENAI_API_KEY)."
             )
 
-        return providers_to_use, target_model
+        meta = self._compute_route_authorization(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
+        return RoutingResolution(providers_to_use, target_model, meta)
 
     @staticmethod
     def _provider_supports_embeddings(provider: Dict[str, Any]) -> bool:
@@ -1984,16 +1996,32 @@ No other text or formatting.
         # Use mandate-aware model from prompt if no explicit override
         effective_override = model_override if model_override else self._get_model_for_prompt(user_prompt)
 
-        available_providers, target_model = self.resolve_provider_routing(
+        resolution = self.resolve_provider_routing(
             model_override=effective_override,
             force_local_only=force_local_only,
         )
+        available_providers, target_model = resolution
+        explicit_selection, configured_vendors = resolution.meta
 
         # Strip tools if the target model can't handle them
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
         errors = {}
-        for provider in available_providers:
+        for provider_index, provider in enumerate(available_providers):
+            if not explicit_selection and self._skip_unconfigured_route(
+                provider, configured_vendors
+            ):
+                logger.warning(
+                    "Skipping unconfigured-vendor route %s (vendor %s not "
+                    "authorized) in get_response; refusing blind "
+                    "cross-vendor fallback.",
+                    provider.get("name"), provider.get("vendor"),
+                )
+                errors[provider["name"]] = LLMServiceError(
+                    f"Route {provider['name']} skipped: vendor "
+                    f"{provider.get('vendor')} not in authorized vendor set"
+                )
+                continue
             try:
                 provider_name = provider['name']
                 logger.info(f"Attempting provider: {provider_name}")
@@ -2051,6 +2079,27 @@ No other text or formatting.
                     user_prompt=user_prompt,
                     error_message=str(e),
                 )
+
+                if self._configured_routes_exhausted(
+                    available_providers, provider_index, configured_vendors
+                ):
+                    # Operator's preferred-vendor routes are exhausted; every
+                    # remaining candidate is an unconfigured vendor (which the
+                    # top-of-loop guard skips). Surface the failure loudly
+                    # instead of silently answering from an unconfigured vendor
+                    # (feedback_no_blind_fallbacks).
+                    logger.error(
+                        "Configured routes exhausted in get_response: preferred "
+                        "vendor %s route %s failed and every remaining route is "
+                        "an unconfigured vendor. Error: %s",
+                        available_providers[0].get("vendor"), provider["name"], e,
+                    )
+                    raise LLMServiceError(
+                        f"Preferred route {provider['name']} failed and the "
+                        f"only remaining routes are unconfigured vendors; "
+                        f"refusing to silently swap vendors. "
+                        f"Underlying error: {e}"
+                    ) from e
 
         provider_type = "local" if force_local_only else "all"
         raise LLMAllProvidersFailedError(errors)
@@ -2422,6 +2471,13 @@ No other text or formatting.
                 else:
                     target_selector = pref_model
 
+        # Narrow ``providers``/``target_model`` to the pinned selector. This
+        # path resolves routing inline (it does NOT call
+        # resolve_provider_routing), but the no-silent-fallback signals
+        # (``explicit_selection`` + ``authorized_vendors``) are computed once
+        # below by the SAME shared helper resolve_provider_routing uses, so
+        # there is exactly one implementation of "what's authorized + is it
+        # explicit" across both paths.
         target_model = None
         if target_selector:
             resolved = self._resolve_model_selector(target_selector, providers=providers)
@@ -2460,15 +2516,36 @@ No other text or formatting.
                         f"Available: {[p['name'] for p in providers]}"
                     )
 
-        # Same no-silent-fallback rule as the streaming paths: if routing
-        # was narrowed to one provider (by mandate, route, or override),
-        # failure raises with the *specific* provider+error. No cascade to
-        # an unrelated backend. Never hand the caller a response from a
-        # model they didn't ask for.
-        mandate_restricted = len(providers) == 1
+        # Same no-silent-fallback rule as the streaming paths: if the caller
+        # explicitly pinned a single route (by mandate, route, or override),
+        # failure raises with the *specific* provider+error. No cascade to an
+        # unrelated backend. Both ``explicit_selection`` and
+        # ``configured_vendors`` come from the SAME shared helper
+        # resolve_provider_routing uses, so there's one implementation of the
+        # branching logic. ``explicit_selection`` is the real pinned-route
+        # signal — NOT ``len(providers) == 1``, which would also fire for an
+        # incidental singleton and wrongly bypass the unconfigured-route skip.
+        # The helper mirrors resolve_provider_routing's branch conditions:
+        # override precedence (a bare override does NOT authorize a stale
+        # mandate's vendor, P2a) and mandate fallbacks engaged ONLY when an
+        # active mandate is unmatched (no stale-fallback authorization, P2b).
+        explicit_selection, configured_vendors = self._compute_route_authorization(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
         last_error = None
         last_provider_name = None
-        for provider in providers:
+        for provider_index, provider in enumerate(providers):
+            if not explicit_selection and self._skip_unconfigured_route(
+                provider, configured_vendors
+            ):
+                logger.warning(
+                    "Skipping unconfigured-vendor route %s (vendor %s not "
+                    "authorized) in generate_with_messages; refusing blind "
+                    "cross-vendor fallback.",
+                    provider.get("name"), provider.get("vendor"),
+                )
+                continue
             last_provider_name = provider["name"]
             try:
                 model = target_model or provider["model"]
@@ -2508,9 +2585,29 @@ No other text or formatting.
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)
                 last_error = e
-                if mandate_restricted:
+                if explicit_selection:
                     raise LLMServiceError(
                         f"Selected route {provider['name']} failed: {e}"
+                    ) from e
+                if self._configured_routes_exhausted(
+                    providers, provider_index, configured_vendors
+                ):
+                    # The operator's preferred-vendor routes are exhausted and
+                    # every remaining candidate is an unconfigured vendor (which
+                    # the top-of-loop guard skips). Don't silently answer from
+                    # an unconfigured vendor — surface the failure loudly
+                    # (feedback_no_blind_fallbacks).
+                    logger.error(
+                        "Configured routes exhausted in generate_with_messages: "
+                        "preferred vendor %s route %s failed and every remaining "
+                        "route is an unconfigured vendor. Error: %s",
+                        providers[0].get("vendor"), provider["name"], e,
+                    )
+                    raise LLMServiceError(
+                        f"Preferred route {provider['name']} failed and the "
+                        f"only remaining routes are unconfigured vendors; "
+                        f"refusing to silently swap vendors. "
+                        f"Underlying error: {e}"
                     ) from e
                 logger.warning(
                     "Falling through from %s in generate_with_messages: %s",

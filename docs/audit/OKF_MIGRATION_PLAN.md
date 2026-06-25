@@ -34,15 +34,19 @@ Snapshot from 2026-06-18:
 - Initial baseline before this migration: `docs/` contained 319 markdown files,
   0 markdown files had YAML frontmatter at the top of the file, and 273
   markdown files had an H1 heading.
-- Current corpus after rebasing onto the June 20 `main`: `docs/` contains 261
+- Current corpus after rebasing onto the June 24 `main`: `docs/` contains 264
   markdown files.
-- 255 non-reserved Markdown files have OKF frontmatter and validate with
+- 258 non-reserved Markdown files have OKF frontmatter and validate with
   `uv run python scripts/docs_okf.py validate --all docs`.
 - 6 generated OKF views are intentionally reserved and skipped:
   `docs/audit/index.md`, `docs/audit/log.md`, `docs/generated/index.md`,
   `docs/generated/log.md`, `docs/architecture/index.md`, and
   `docs/architecture/log.md`.
 - 0 non-reserved Markdown files are missing OKF frontmatter.
+- `docs/generated/DOC_VERIFICATION.md` and
+  `docs/generated/RENDER_MANIFEST.json` are now generated verification
+  surfaces. They do not claim every document is fresh; they show the remaining
+  local-link, code-reference, render-routing, and recent-PR review queue.
 - Only about 14 files mention status conventions or status-like metadata.
 - Existing navigation and inventory surfaces are already strong:
   - `docs/README.md`
@@ -486,23 +490,33 @@ Implemented in branch `codex/okf-docs-demo`:
 - Added `scripts/docs_okf.py index` and `scripts/docs_okf.py log`, generated
   `index.md` and `log.md` for `docs/audit`, `docs/generated`, and
   `docs/architecture`, and wired `--check` commands into CI/Talon gates.
+- Added `scripts/docs_verify.py`, generated
+  `docs/generated/DOC_VERIFICATION.md` and
+  `docs/generated/RENDER_MANIFEST.json`, and wired `audit --check` plus
+  `manifest --check` into GitHub Actions and `.kestreltalon/quality.yaml`.
+  This is the content-verification layer on top of OKF metadata: it checks
+  local links, repo/code references, public/internal/archive render routing,
+  and merged PR relevance from the configured recent window.
 - Linked user-facing workflow docs and demo docs to the generated demo evidence
   index plus the matching `kestrel-flight` demo scripts and `kestrel-eye`
   configs.
 - Added focused tests:
   - `tests/unit/test_docs_okf.py`
+  - `tests/unit/test_docs_verify.py`
   - `tests/unit/test_generate_feature_docs.py`
   - `tests/unit/test_demo_evidence_docs.py`
 
 Verified locally:
 
 ```bash
-uv run pytest tests/unit/test_docs_okf.py tests/unit/test_generate_feature_docs.py tests/unit/test_demo_evidence_docs.py tests/unit/test_feature_doc_canonicality.py -q
+uv run pytest tests/unit/test_docs_okf.py tests/unit/test_docs_verify.py tests/unit/test_generate_feature_docs.py tests/unit/test_demo_evidence_docs.py tests/unit/test_feature_doc_canonicality.py -q
 uv run python scripts/docs_okf.py validate --all docs
 uv run python scripts/docs_okf.py validate
 uv run python scripts/generate_feature_docs.py --check
 uv run python scripts/generate_demo_evidence_docs.py --check
 uv run python scripts/docs_okf.py index --check
 uv run python scripts/docs_okf.py log --check
+uv run python scripts/docs_verify.py audit --check
+uv run python scripts/docs_verify.py manifest --check
 uv run python scripts/generate_feature_docs.py --all --dry-run
 ```

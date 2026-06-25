@@ -159,12 +159,22 @@ def mock_provider_registry(mock_openai_client, mock_adapter):
 async def llm_service(mock_config, mock_mandate_config, mock_provider_registry):
     """Create LLMService with mocked dependencies."""
     with patch("kestrel_sovereign.llm.service.load_config") as mock_load_config, \
+         patch("kestrel_sovereign.llm.service.load_section") as mock_load_section, \
          patch("kestrel_sovereign.llm.service.ProviderRegistry") as mock_registry_class:
 
         # Setup config mocking
         mock_load_config.side_effect = lambda path: (
             mock_config if "llm_config" in path else mock_mandate_config
         )
+        # ``service.config`` comes from ``load_section("llm")`` — pin it to the
+        # fixture's two-vendor setup instead of leaking the real on-disk
+        # kestrel.toml. The fixture wires an openai+anthropic provider chain,
+        # so both vendors must appear in ``route_priority`` for cross-vendor
+        # fallback in those tests to be a legitimate *configured* fallback
+        # (not the blind cross-vendor swap blocked by #no-blind-fallbacks).
+        mock_load_section.return_value = {
+            "route_priority": ["openai:api", "anthropic:api"],
+        }
 
         # Setup registry mocking
         mock_registry_class.return_value = mock_provider_registry
