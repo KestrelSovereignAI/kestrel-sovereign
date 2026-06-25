@@ -824,18 +824,24 @@ class TestWebhooksRegister:
         assert envelope.status is ToolResultStatus.OK
 
     def test_docstring_documents_per_auth_type_config_keys(self):
-        """The agent-facing docstring must spell out the auth_config_json keys
-        required by each auth_type, not just the bearer example (#1923/#1925).
+        """The agent-facing SCHEMA (not just the raw __doc__) must spell out the
+        auth_config_json keys required by each auth_type (#1923/#1925).
+
+        Regression: the keys lived in a WRAPPED docstring that
+        ``parse_docstring_params`` truncated at the first continuation line
+        starting with a word char, so ``ip_allowlist``/``allowed_ips`` never
+        reached the agent — a live drive's first ip_allowlist register failed.
+        Assert against the PARSED ``_tool_schema`` param description, which is
+        what the agent actually sees.
         """
-        doc = WebhookFeature.webhooks_register.__doc__ or ""
-        # bearer_token
-        assert "bearer_token" in doc
-        assert "token" in doc
-        # hmac_sha256 -- required key + optional defaults
-        assert "secret" in doc
-        assert "sha256=" in doc
-        # ip_allowlist -- required list key
-        assert "allowed_ips" in doc
+        schema = WebhookFeature.webhooks_register._tool_schema
+        params = {p.name: (p.description or "") for p in schema["parameters"]}
+        cfg = params["auth_config_json"]
+        # All four auth_types' key contracts must survive into the schema —
+        # the truncation specifically dropped everything after hmac_sha256.
+        assert "bearer_token" in cfg and "token" in cfg
+        assert "secret" in cfg and "sha256=" in cfg
+        assert "ip_allowlist" in cfg and "allowed_ips" in cfg
 
     @pytest.mark.asyncio
     async def test_register_hmac_missing_secret_error_names_auth_type(self, feature):

@@ -354,17 +354,7 @@ class WebhookFeature(Feature):
             name: Unique webhook name (used in the URL path /webhooks/{name})
             auth_type: Authentication method (none, bearer_token, hmac_sha256, ip_allowlist)
             event_type: Optional event type label for categorisation
-            auth_config_json: JSON config for auth. The required keys depend on
-                ``auth_type``:
-
-                - ``none`` -> ``{}`` (any config is ignored)
-                - ``bearer_token`` -> ``{"token": "<non-empty-secret>"}``
-                - ``hmac_sha256`` -> ``{"secret": "<non-empty-secret>",
-                  "header"?: "x-hub-signature-256", "prefix"?: "sha256="}``
-                  (``header`` and ``prefix`` are optional; the shown values are
-                  the defaults)
-                - ``ip_allowlist`` -> ``{"allowed_ips": ["192.168.1.0/24",
-                  "10.0.0.5"]}`` (non-empty list of IPs and/or CIDR ranges)
+            auth_config_json: JSON config for auth; required keys depend on ``auth_type`` — ``none``: ``{}`` (any config ignored); ``bearer_token``: ``{"token": "<non-empty-secret>"}``; ``hmac_sha256``: ``{"secret": "<non-empty-secret>", "header"?: "x-hub-signature-256", "prefix"?: "sha256="}`` (header/prefix optional, shown values are the defaults); ``ip_allowlist``: ``{"allowed_ips": ["192.168.1.0/24", "10.0.0.5"]}`` (non-empty list of IPs and/or CIDR ranges).
             rate_limit: Maximum requests per minute (default: 60, 0 = unlimited)
             allow_unauthenticated: Acknowledge an intentionally open
                 (``auth_type="none"``) endpoint. The host bypasses its
