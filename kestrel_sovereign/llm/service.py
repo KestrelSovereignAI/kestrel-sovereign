@@ -584,69 +584,58 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Gate only against known mismatches. If discovery hasn't populated a
         # catalog yet, permit (cold-start) — same contract as
         # ``_model_available_for_route``.
-        from .model_cache import get_shared_model_cache
-        catalog = get_shared_model_cache().get_any()
-
-        # Ensure route-scoped catalogs are built before reading them. This
-        # instance may have been created before the shared vendor cache was
-        # populated (by another instance), so ``_route_catalogs`` can still be
-        # unset even though ``get_any()`` now returns a vendor catalog. Without
-        # this, a route-scoped route (e.g. codex/openai:plan) would be treated
-        # as non-scoped and fall through to the broader vendor catalog —
-        # accepting an api-only model on the plan route. Mirrors the routing
-        # and default-resolution paths.
+        #
+        # Ordering matters: a POPULATED route-scoped catalog (e.g. codex's
+        # models_cache for ``openai:plan``) that proves the model unservable
+        # must reject BEFORE the vendor-catalog fallback — otherwise an empty
+        # shared vendor cache would permit e.g. ``gpt-5.5-pro`` on the plan
+        # route (the #1933 skew). So we resolve the route-scoped verdict first.
         self._ensure_route_catalogs_sync()
         route_catalogs = getattr(self, "_route_catalogs", None) or {}
 
+        # First pass: route's own default, and route-scoped catalogs.
+        scoped_missed = 0  # matched routes that are scoped, populated, and missed
         for provider in matching:
-            # The route's own configured default is always serveable.
             if provider.get("model") == model:
-                return
+                return  # the route's own configured default is always serveable
             route_key = provider.get("name")
             if route_key in route_catalogs:
-                # Route-scoped catalog: the model must live in THIS route's
-                # own serveable set, never the vendor's broader catalog.
                 scoped = route_catalogs[route_key]
                 if not scoped:
-                    # Empty/unbuilt route catalog → unknown, permit.
-                    return
+                    return  # empty/unbuilt route catalog → unknown, permit
                 if any(getattr(m, "id", None) == model for m in scoped):
-                    return
+                    return  # served by this route's own scoped catalog
+                scoped_missed += 1
 
-        # No route-scoped match (or no configured routes). Fall back to the
-        # vendor catalog from shared discovery.
-        if not catalog:
-            return  # No discovery yet — don't block.
-
-        # If EVERY matched route is route-scoped, the vendor catalog doesn't
-        # apply — the model already failed every route's own (populated)
-        # catalog above (an empty route catalog returned early as "unknown").
-        all_route_scoped = bool(matching) and all(
-            p.get("name") in route_catalogs for p in matching
-        )
-        if not all_route_scoped:
-            vendor_models = sorted({
-                m.id for m in catalog if m.provider == vendor and m.id
-            })
-            if not vendor_models:
-                # Discovery has no catalog for THIS vendor yet → unknown for
-                # this vendor, permit (cold-start; resolve-time still defends).
-                # Only a *populated* vendor catalog can prove a model invalid.
-                return
-            if model in vendor_models:
-                return
+        # If EVERY matched route is route-scoped with a populated catalog and
+        # none served the model, the route itself has proven the mandate
+        # invalid — reject regardless of the (possibly empty) vendor cache.
+        if matching and scoped_missed == len(matching):
             raise ValueError(
                 f"Cannot set model '{model}' on '{selector}': it is not served "
-                f"by that vendor/route. Available for {vendor}: {vendor_models}. "
-                f"Use list_models to discover valid vendor/route/model values."
+                f"by that route's catalog. Use list_models to discover valid "
+                f"vendor/route/model values."
             )
 
-        # All matched routes are route-scoped and the model was absent from
-        # every populated route catalog checked above.
+        # Fall back to the shared vendor catalog for non-route-scoped routes.
+        from .model_cache import get_shared_model_cache
+        catalog = get_shared_model_cache().get_any()
+        if not catalog:
+            return  # no vendor discovery yet → permit (cold-start)
+        vendor_models = sorted({
+            m.id for m in catalog if m.provider == vendor and m.id
+        })
+        if not vendor_models:
+            # Discovery has no catalog for THIS vendor yet → unknown for this
+            # vendor, permit (resolve-time still defends). Only a *populated*
+            # vendor catalog can prove a model invalid.
+            return
+        if model in vendor_models:
+            return
         raise ValueError(
-            f"Cannot set model '{model}' on '{selector}': it is not served by "
-            f"that route's catalog. Use list_models to discover valid "
-            f"vendor/route/model values."
+            f"Cannot set model '{model}' on '{selector}': it is not served "
+            f"by that vendor/route. Available for {vendor}: {vendor_models}. "
+            f"Use list_models to discover valid vendor/route/model values."
         )
 
     def _resolve_vendor_for_model(self, model: str) -> Optional[Any]:

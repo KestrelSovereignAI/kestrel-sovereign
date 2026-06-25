@@ -278,6 +278,23 @@ class TestExplicitMandateValidation:
             svc.set_model_preference("gpt-5-anything", vendor="openai", route="plan")
         assert svc.get_model_preference()["model"] == "gpt-5-anything"
 
+    def test_populated_route_catalog_rejects_even_when_vendor_cache_empty(self):
+        """Regression (codex P2): a POPULATED route-scoped catalog that proves
+        the model unservable must reject BEFORE the vendor-cache fallback —
+        otherwise an empty shared vendor cache on cold start would permit e.g.
+        gpt-5-pro on openai:plan (the #1933 skew)."""
+        svc = _make_service()
+        svc.providers = [_route("openai:plan", "openai", "plan")]
+        svc._route_catalogs = {"openai:plan": [_mk_model("gpt-5-codex", "openai")]}
+        empty_cache = _cached([])  # shared vendor discovery not yet populated
+        with patch("kestrel_sovereign.llm.model_cache.get_shared_model_cache", return_value=empty_cache):
+            # Served by the route's own catalog → ok even with empty vendor cache.
+            svc.set_model_preference("gpt-5-codex", vendor="openai", route="plan")
+            assert svc.get_model_preference()["model"] == "gpt-5-codex"
+            # Not in the route catalog → rejected despite the empty vendor cache.
+            with pytest.raises(ValueError):
+                svc.set_model_preference("gpt-5-pro", vendor="openai", route="plan")
+
     def test_route_catalogs_built_when_unset(self):
         """Regression: a route-scoped route must be recognized even when
         ``_route_catalogs`` is unset at validate time.
