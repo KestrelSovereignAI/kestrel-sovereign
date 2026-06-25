@@ -94,6 +94,40 @@ def test_starlight_tree_has_config_and_grouped_sidebar(docs: Path):
     assert "/kestrel-sovereign" in config
 
 
+def test_rewrite_links_published_repo_and_external(tmp_path: Path):
+    repo = tmp_path
+    (repo / "docs" / "guides").mkdir(parents=True)
+    (repo / "server.py").write_text("x", encoding="utf-8")
+    src_dir = repo / "docs"
+    published = {"docs/guides/building-features.md": "guides/building-features"}
+
+    body = (
+        "See [guide](guides/building-features.md#vocab), "
+        "[source](../server.py), "
+        "[missing](../nope.md), "
+        "[site](https://example.com)."
+    )
+    out = build_docs_site.rewrite_local_links(
+        body, src_dir, base="/kestrel-sovereign", published=published, repo_root=repo
+    )
+    # published doc -> site slug (with anchor preserved)
+    assert "(/kestrel-sovereign/guides/building-features/#vocab)" in out
+    # real repo file -> GitHub blob URL
+    assert f"({build_docs_site.GITHUB_REPO_URL}/blob/main/server.py)" in out
+    # unresolvable + external are untouched
+    assert "(../nope.md)" in out
+    assert "(https://example.com)" in out
+
+
+def test_rewrite_links_ignores_images(tmp_path: Path):
+    # an image embed (leading !) must not be treated as a doc link
+    body = "![alt](../img.png)"
+    out = build_docs_site.rewrite_local_links(
+        body, tmp_path, base="", published={}, repo_root=tmp_path
+    )
+    assert out == body
+
+
 def test_mintlify_emitter_groups_by_type(docs: Path):
     import json
 

@@ -147,6 +147,8 @@ def select_pages(
 # --------------------------------------------------------------------------- #
 SITE_TITLE = "Kestrel Sovereign"
 GITHUB_ORG_URL = "https://github.com/KestrelSovereignAI"
+GITHUB_REPO_URL = "https://github.com/KestrelSovereignAI/kestrel-sovereign"
+DEFAULT_BRANCH = "main"
 # Project-pages default. For a custom domain (CNAME) override to "" via --base.
 DEFAULT_PAGES_BASE = "/kestrel-sovereign"
 
@@ -219,6 +221,64 @@ def rewrite_local_images(
     return _IMAGE_RE.sub(repl, body), assets, dropped
 
 
+_LINK_RE = re.compile(r"(?<!!)(\[[^\]]+\]\()([^)]+)(\))")
+
+
+def rewrite_local_links(
+    body: str,
+    src_dir: Path,
+    *,
+    base: str,
+    published: dict[str, str],
+    repo_root: Path,
+) -> str:
+    """Repoint relative Markdown links so the published site has no dead links.
+
+    A projected page still carries the corpus's relative links. Three cases:
+
+    * target is a *published* doc -> rewrite to its site slug (``base/slug/``);
+    * target is any other real repo file/dir (an internal doc, or source like
+      ``server.py``) -> rewrite to its GitHub URL so the link still resolves;
+    * external / anchor-only / unresolvable -> left untouched.
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        pre, url, post = match.groups()
+        raw = url.strip()
+        if not raw or raw[0] in "#/" or raw.startswith(
+            ("http://", "https://", "mailto:", "tel:", "//")
+        ):
+            return match.group(0)
+
+        # Split an optional ` "title"` suffix and a `#anchor`.
+        head, _, title = raw.partition(" ")
+        title = f" {title}" if title else ""
+        target, _, frag = head.partition("#")
+        anchor = f"#{frag}" if frag else ""
+        if not target:
+            return match.group(0)
+
+        abs_path = (src_dir / target).resolve()
+        try:
+            rel = abs_path.relative_to(repo_root).as_posix()
+        except ValueError:
+            return match.group(0)
+
+        if rel in published:
+            return f"{pre}{base}/{published[rel]}/{anchor}{title}{post}"
+        if abs_path.exists():
+            kind = "tree" if abs_path.is_dir() else "blob"
+            return f"{pre}{GITHUB_REPO_URL}/{kind}/{DEFAULT_BRANCH}/{rel}{anchor}{title}{post}"
+        return match.group(0)
+
+    return _LINK_RE.sub(repl, body)
+
+
+def _published_map(pages: list[dict[str, Any]]) -> dict[str, str]:
+    """Map each published doc's repo-relative path to its site slug."""
+    return {page["rel"]: _site_slug(page["rel"]) for page in pages}
+
+
 def _grouped(pages: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
     by_group: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
@@ -258,9 +318,14 @@ class StarlightEmitter:
 
     def tree(self, pages: list[dict[str, Any]]) -> dict[str, str | Path]:
         files: dict[str, str | Path] = {}
+        published = _published_map(pages)
         for page in pages:
+            src_dir = Path(page["src"]).parent
             body, assets, dropped = rewrite_local_images(
-                page["body"], Path(page["src"]).parent, f"{self.base}/_assets"
+                page["body"], src_dir, f"{self.base}/_assets"
+            )
+            body = rewrite_local_links(
+                body, src_dir, base=self.base, published=published, repo_root=PROJECT_ROOT
             )
             files[f"src/content/docs/{_site_slug(page['rel'])}.md"] = self.render_page(page, body)
             for name, src in assets.items():
@@ -334,9 +399,12 @@ class MintlifyEmitter:
 
     def tree(self, pages: list[dict[str, Any]]) -> dict[str, str | Path]:
         files: dict[str, str | Path] = {}
+        published = _published_map(pages)
         for page in pages:
-            body, assets, _ = rewrite_local_images(
-                page["body"], Path(page["src"]).parent, "/_assets"
+            src_dir = Path(page["src"]).parent
+            body, assets, _ = rewrite_local_images(page["body"], src_dir, "/_assets")
+            body = rewrite_local_links(
+                body, src_dir, base="", published=published, repo_root=PROJECT_ROOT
             )
             files[f"{_site_slug(page['rel'])}.mdx"] = self.render_page(page, body)
             for name, src in assets.items():
