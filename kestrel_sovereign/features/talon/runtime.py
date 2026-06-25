@@ -173,15 +173,21 @@ def resolve_runtime(
         or preference.default_auth_lane
         or DEFAULT_AUTH_LANES[backend]
     )
-    if auth_lane == "api_key" and not policy.allow_api_billing:
-        raise TalonRuntimeError("Talon API-key billing is not allowed by policy")
-
+    # Structural backend<->auth_lane validity is checked BEFORE the api_key
+    # billing policy. For codex/opencode an ``api_key`` lane is invalid no
+    # matter what the billing policy says, so surfacing "API-key billing is not
+    # allowed" there is misleading (it implies the call would work if billing
+    # were enabled). Report the true structural reason first; the billing
+    # policy only gates the lanes that ARE structurally valid (claude+api_key).
     if backend == "claude" and auth_lane not in ("oauth", "api_key"):
         raise TalonRuntimeError("Claude Talon backend supports oauth or api_key auth_lane")
     if backend == "codex" and auth_lane != "oauth":
         raise TalonRuntimeError("Codex Talon backend requires auth_lane='oauth'")
     if backend == "opencode" and auth_lane != "provider_config":
         raise TalonRuntimeError("OpenCode Talon backend requires auth_lane='provider_config'")
+
+    if auth_lane == "api_key" and not policy.allow_api_billing:
+        raise TalonRuntimeError("Talon API-key billing is not allowed by policy")
 
     model = request.model
     if model is None:
