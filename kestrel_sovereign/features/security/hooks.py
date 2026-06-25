@@ -75,8 +75,33 @@ class SecurityHook(Hook):
         Returns:
             HookOutput with permission decision
         """
-        feature_name = input.feature_name or "unknown"
-        tool_name = input.tool_name or "unknown"
+        raw_feature_name = input.feature_name
+        raw_tool_name = input.tool_name
+        feature_name = raw_feature_name or "unknown"
+        tool_name = raw_tool_name or "unknown"
+        args_summary = self._summarize_args(input.tool_input)
+
+        if not raw_feature_name or not str(raw_feature_name).strip():
+            await self.permission_store.log_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                action="tool_execution",
+                decision="malformed_scope_denied",
+                args_summary=args_summary,
+            )
+            logger.warning("Denied tool execution with malformed feature scope")
+            return HookOutput.deny("Malformed permission scope: missing feature_name")
+
+        if not raw_tool_name or not str(raw_tool_name).strip():
+            await self.permission_store.log_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                action="tool_execution",
+                decision="malformed_scope_denied",
+                args_summary=args_summary,
+            )
+            logger.warning("Denied tool execution with malformed tool scope")
+            return HookOutput.deny("Malformed permission scope: missing tool_name")
 
         logger.debug(f"Security check: {feature_name}.{tool_name}")
 
@@ -84,7 +109,6 @@ class SecurityHook(Hook):
         level = await self.permission_store.get_permission(feature_name, tool_name)
 
         # Prepare args summary for audit log (truncate for privacy)
-        args_summary = self._summarize_args(input.tool_input)
 
         if level == PermissionLevel.ALLOW:
             await self.permission_store.log_decision(
