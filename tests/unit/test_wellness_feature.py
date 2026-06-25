@@ -566,6 +566,26 @@ class TestWellnessFeature:
         assert envelope.data["trend"] == "stable"
 
     @pytest.mark.asyncio
+    async def test_wellness_history_rejects_non_integer_limit(self, feature):
+        """A non-integer limit fails fast before touching SQL (mirrors health_history)."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        envelope = await feature.wellness_history(limit="abc")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "integer" in (envelope.error or "")
+        feature._db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_wellness_history_rejects_non_positive_limit(self, feature):
+        """A limit < 1 fails fast before touching SQL."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        envelope = await feature.wellness_history(limit=0)
+        assert envelope.status is ToolResultStatus.ERROR
+        assert ">= 1" in (envelope.error or "")
+        feature._db.fetchall.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_wellness_export(self, feature):
         """Verify export returns all checkpoints in ascending order."""
         feature._db.fetchall = AsyncMock(

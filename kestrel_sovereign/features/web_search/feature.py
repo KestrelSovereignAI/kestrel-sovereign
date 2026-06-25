@@ -29,13 +29,20 @@ class WebSearchFeature(Feature):
 
     @tool(
         name="web_search",
-        description="Search the web for information.",
+        description="Search the web for information. max_results is typically 1-10 (default 5). A 'disabled' error means no search provider is configured — set a provider API key (e.g. TAVILY_API_KEY).",
         category=ToolCategory.WEB_SEARCH,
         command_prefix="!web-search"
     )
     async def search(self, query: str, max_results: int = 5) -> ToolResult:
         """
         Perform a web search.
+
+        Args:
+            query: The search query.
+            max_results: Maximum results to return (typically 1-10, default 5).
+
+        Returns ToolResult.failed when web search is disabled (no provider
+        configured — e.g. set TAVILY_API_KEY) or the provider call fails.
         """
         if not self.tool.enabled:
             return ToolResult.failed(

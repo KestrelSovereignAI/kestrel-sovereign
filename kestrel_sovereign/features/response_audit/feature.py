@@ -56,7 +56,7 @@ class ResponseAuditFeature(Feature):
             self.agent.hooks_manager.register(self._hook)
             logger.info(f"ResponseAuditHook dynamically registered: mode={mode}")
 
-    @tool("audit_enable", "Enable per-response audit", category=ToolCategory.SYSTEM, command_prefix="!audit-on")
+    @tool("audit_enable", "Enable per-response audit. mode: 'warn' (annotate risky responses) or 'strict' (block risky responses).", category=ToolCategory.SYSTEM, command_prefix="!audit-on")
     async def enable_audit(self, mode: str = "warn") -> ToolResult:
         """Enable response auditing.
 

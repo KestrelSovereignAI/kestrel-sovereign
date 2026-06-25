@@ -298,7 +298,7 @@ class BootstrapFeature(Feature):
 
     @tool(
         name="bootstrap_list",
-        description="Show all loaded bootstrap files and their paths, sizes, and status.",
+        description="Show all loaded bootstrap files and their paths, sizes, and per-file status (one of: loaded, partial, not found, skipped (budget)).",
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap list"
     )
@@ -486,7 +486,7 @@ class BootstrapFeature(Feature):
 
     @tool(
         name="bootstrap_add",
-        description="Add a new bootstrap file to be loaded at startup.",
+        description="Add a new bootstrap file to be loaded at startup. file_path resolves relative to the agent data dir when not absolute; the file is registered by BASENAME, so a basename collision loads the search-root copy instead.",
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap add"
     )
@@ -666,7 +666,7 @@ class BootstrapFeature(Feature):
 
     @tool(
         name="bootstrap_remove",
-        description="Remove a bootstrap file from the loading convention.",
+        description="Remove a bootstrap file from the loading convention. name is the basename as shown by bootstrap_list (the file is not deleted from disk).",
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap remove"
     )
@@ -1048,20 +1048,45 @@ class BootstrapFeature(Feature):
         if not hasattr(self.agent, 'bootstrap_service') or not self.agent.bootstrap_service:
             return ToolResult.failed("Bootstrap service not available.")
 
+        service = self.agent.bootstrap_service
         try:
-            status = await self.agent.bootstrap_service.get_bootstrap_status()
+            status = await service.get_bootstrap_status()
         except Exception as e:
             logger.error(f"bootstrap_status failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
+        # Surface the structured fields the human-readable status string
+        # summarizes so the result is chainable (not a stringified blob):
+        # state, discovery exchange count, soul-exists bool. These are a
+        # best-effort enrichment — a sub-query failure must not sink the
+        # OK envelope, which already carries the authoritative summary.
+        state_value: Optional[str] = None
+        exchange_count: Optional[int] = None
+        soul_exists: Optional[bool] = None
+        try:
+            state = await service.get_bootstrap_state()
+            state_value = state.value if hasattr(state, "value") else str(state)
+            history = await service.get_discovery_history()
+            exchange_count = sum(1 for m in history if m.get("role") == "user")
+            agent_data_path = getattr(service, "agent_data_path", None)
+            if agent_data_path:
+                soul_exists = (Path(agent_data_path) / "SOUL.md").exists()
+        except Exception as e:
+            logger.warning(f"bootstrap_status structured fields unavailable: {e}")
+
         return ToolResult.ok(
             confirmation=str(status) if status else "Bootstrap status retrieved",
-            data={"status": str(status)},
+            data={
+                "state": state_value,
+                "exchange_count": exchange_count,
+                "soul_exists": soul_exists,
+                "status": str(status),
+            },
         )
 
     @tool(
         name="rename_agent",
-        description="Rename this agent.",
+        description="Rename this agent. new_name must be 1-64 characters.",
         category=ToolCategory.SYSTEM,
         command_prefix="!rename"
     )
