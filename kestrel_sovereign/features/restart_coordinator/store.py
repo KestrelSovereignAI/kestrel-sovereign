@@ -36,6 +36,23 @@ TERMINAL_STATES = frozenset({"completed", "rejected", "canceled"})
 # post-restart sweep to mark).
 PENDING_STATES = frozenset({"pending", "approved"})
 
+# Every status a row can carry through its life. ``pending`` → ``approved``
+# → (``updating`` for update_then_restart rows) → ``executing`` →
+# ``completed``; or the terminal ``rejected`` / ``canceled``. Used to
+# validate the ``list_restart_requests`` status filter so an unknown value
+# is rejected with a clear message rather than silently returning 0 rows.
+KNOWN_STATUSES = frozenset(
+    {
+        "pending",
+        "approved",
+        "updating",
+        "executing",
+        "completed",
+        "rejected",
+        "canceled",
+    }
+)
+
 # All policies the coordinator understands. Anything else is rejected
 # at request time so the table never carries an unknown value.
 KNOWN_POLICIES = frozenset(
