@@ -60,7 +60,14 @@ class DeployFeature(Feature):
 
     @tool(
         name="deploy_agent",
-        description="Deploy or manage Kestrel agent on cloud platforms (usage: !deploy <action> [...]).",
+        description=(
+            "Deploy or manage Kestrel agent on cloud platforms (usage: !deploy <action> [...]). "
+            "Actions: status, deploy, teardown, logs, list, health "
+            "(synonyms accepted: start=deploy; stop/delete=teardown; log=logs; ls=list; check=health). "
+            "profile= is REQUIRED for the deploy, teardown, logs and health actions. "
+            "tag= must be a CONCRETE image tag (e.g. v0.15.1) for Cloud Run — the 'latest' "
+            "default is REJECTED by Cloud Run, so always pass an explicit tag when deploying."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!deploy",
     )
@@ -73,18 +80,24 @@ class DeployFeature(Feature):
         """
         Main entry point for agent deployment management.
 
-        Actions:
+        Actions (canonical name, then accepted synonyms):
             - status: Show current deployment status
-            - deploy: Deploy agent to cloud platform
-            - teardown: Delete deployed service
-            - logs: View deployment logs
-            - list: List all deployments
-            - health: Check health of deployed service
+            - deploy (start): Deploy agent to cloud platform
+            - teardown (stop, delete): Delete deployed service
+            - logs (log): View deployment logs
+            - list (ls): List all deployments
+            - health (check): Check health of deployed service
 
         Args:
-            action: Action to perform (status, deploy, teardown, logs, list, health)
-            profile: Deployment profile name (required for deploy action)
-            tag: Image tag to deploy (default: latest)
+            action: Action to perform — status, deploy (start), teardown (stop, delete), logs (log), list (ls), or health (check).
+            profile: Deployment profile name; REQUIRED for deploy, teardown, logs and health actions (ignored for status and list).
+            tag: Image tag to deploy — must be a CONCRETE tag (e.g. v0.15.1) for Cloud Run; the 'latest' default is REJECTED by Cloud Run, so pass an explicit tag.
+
+        Returns (per action, under ToolResult.data):
+            - status: active_deployments (int), sessions (list).
+            - list: count (int), deployments (list).
+            - health: health.healthy (bool) for deployed services, or top-level healthy (bool).
+            - deploy/teardown/logs: manager payload with success and message.
 
         Examples:
             !deploy status
