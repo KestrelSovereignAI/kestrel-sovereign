@@ -330,6 +330,33 @@ class TestTalonToolDocumentation:
         assert params["default_model"]
         assert params["default_auth_lane"]
 
+    def test_set_config_param_descriptions_not_truncated(self):
+        # Regression: ``parse_docstring_params`` terminates a param description
+        # at the next indented line starting with a word char, so a WRAPPED
+        # Args entry silently drops its tail in the agent-facing schema (codex
+        # P2). Assert the per-PARAM descriptions carry their full vocabulary,
+        # not just the concatenated tool-level description.
+        params = {
+            p.name: (p.description or "")
+            for p in self._schema(TalonCoordinatorFeature.talon_set_config)["parameters"]
+        }
+        # default_model must keep the codex/opencode tail (was cut at "When").
+        assert "opencode" in params["default_model"]
+        assert "provider model id" in params["default_model"]
+        # default_auth_lane must keep the full cross-field rule tail.
+        assert "allow_api_billing" in params["default_auth_lane"]
+
+    def test_batch_param_descriptions_not_truncated(self):
+        params = {
+            p.name: (p.description or "")
+            for p in self._schema(TalonCoordinatorFeature.talon_batch)["parameters"]
+        }
+        # label kept its "required when prd not given" tail.
+        assert "Required when" in params["label"]
+        # prd kept its precedence + path-resolution tail.
+        assert "precedence" in params["prd"].lower()
+        assert "KESTREL_TALON_CWD" in params["prd"]
+
     def test_batch_documents_one_of_label_or_prd(self):
         doc = self._full_doc(TalonCoordinatorFeature.talon_batch)
         # Exactly-one-of contract surfaced in description.

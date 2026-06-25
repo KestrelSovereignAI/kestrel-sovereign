@@ -1023,25 +1023,12 @@ class TalonCoordinatorFeature(Feature):
         here.
 
         Args:
-            default_backend: Talon runtime backend — one of ``claude``,
-                ``codex``, or ``opencode``. This is separate from Kestrel
-                chat LLM routing.
-            default_model: Backend-specific model. When backend is
-                ``claude``, one of ``opus``, ``sonnet``, or ``haiku``. When
-                backend is ``codex`` or ``opencode``, a non-blank provider
-                model id (blank is rejected).
-            default_auth_lane: One of ``oauth``, ``api_key``, or
-                ``provider_config``. Cross-field rules enforced downstream:
-                ``codex`` requires ``oauth``; ``opencode`` requires
-                ``provider_config``; ``claude`` accepts ``oauth`` or
-                ``api_key`` (``api_key`` also requires policy
-                ``allow_api_billing``).
-            max_iterations: Default max LLM implementation iterations — a
-                positive integer count (>= 1).
-            max_turns: Default max agent turns per Talon iteration — a
-                positive integer count (>= 1).
-            skip_clarification: Default for skipping the
-                analysis/clarification phase.
+            default_backend: Talon runtime backend — one of ``claude``, ``codex``, or ``opencode``. Separate from Kestrel chat LLM routing.
+            default_model: Backend-specific model. When backend is ``claude``, one of ``opus``, ``sonnet``, or ``haiku``; when backend is ``codex`` or ``opencode``, a non-blank provider model id (blank is rejected).
+            default_auth_lane: One of ``oauth``, ``api_key``, or ``provider_config``. Cross-field rules enforced downstream: ``codex`` requires ``oauth``; ``opencode`` requires ``provider_config``; ``claude`` accepts ``oauth`` or ``api_key`` (``api_key`` also requires policy ``allow_api_billing``).
+            max_iterations: Default max LLM implementation iterations — a positive integer count (>= 1).
+            max_turns: Default max agent turns per Talon iteration — a positive integer count (>= 1).
+            skip_clarification: Default for skipping the analysis/clarification phase.
             self_review: Default for running Talon's self-review pass.
 
         Returns:
@@ -1978,17 +1965,9 @@ class TalonCoordinatorFeature(Feature):
         returns immediately.
 
         Args:
-            repo: GitHub repo in owner/name format (or ``self``). Used in
-                ``label`` mode to scope the issue search; ignored in
-                ``prd`` mode.
-            label: Claim every issue in ``repo`` carrying this GitHub
-                label. Required when ``prd`` is not given.
-            prd: Path to a PRD JSON file for batch mode. Resolved against
-                the Talon subprocess working directory (``$KESTREL_TALON_CWD``
-                if set, otherwise the sibling-checkout project parent) — it
-                is NOT repo-relative or workspace-relative, so pass an
-                absolute path when in doubt. Takes precedence over ``label``
-                when both are provided.
+            repo: GitHub repo in owner/name format (or ``self``). Used in ``label`` mode to scope the issue search; ignored in ``prd`` mode.
+            label: Claim every issue in ``repo`` carrying this GitHub label. Required when ``prd`` is not given.
+            prd: Path to a PRD JSON file for batch mode. Resolved against the Talon subprocess working directory (``$KESTREL_TALON_CWD`` if set, otherwise the sibling-checkout project parent) — NOT repo-relative or workspace-relative, so pass an absolute path when in doubt. Takes precedence over ``label`` when both are provided.
 
         Returns:
             ``{"dispatched": True, "job_id": ..., ...}`` on success — poll
