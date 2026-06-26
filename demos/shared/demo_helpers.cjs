@@ -254,6 +254,7 @@ const {
   isDemoServerEnv,
   requireDemoSandbox,
   resetDemoAgentDatabases,
+  assertOnlyDemoAgents,
 } = require('./demo_safety.cjs');
 
 /**
@@ -281,21 +282,22 @@ async function assertIsolatedDemoTarget(request, baseUrl, apiKey = null) {
       + 'isolated demo run launched via `kestrel demo run`, not a raw Playwright run.',
     );
   }
-  let agents;
+  // Fetch the agent roster and hand it to the fail-closed decision (which lives
+  // in demo_safety.cjs so the security logic is unit-tested). Any response we
+  // can't positively read as "only demo agents" is a refusal.
+  let resp;
   try {
-    const resp = await request.get(`${baseUrl}/api/agents`, { headers: authHeaders(apiKey) });
-    const data = await resp.json();
-    agents = Array.isArray(data) ? data : (data.agents || []);
+    resp = await request.get(`${baseUrl}/api/agents`, { headers: authHeaders(apiKey) });
   } catch (e) {
-    throw new Error(`Refusing to run the demo: could not verify agents via /api/agents (${e.message}).`);
+    throw new Error(`Refusing to run the demo: could not reach /api/agents (${e.message}).`);
   }
-  const live = agents.filter((a) => a.is_demo !== true).map((a) => a.name || a.id || '<unnamed>');
-  if (live.length) {
-    throw new Error(
-      `Refusing to run the demo: server reports non-demo agent(s): ${live.join(', ')}. `
-      + 'A demo must only run against an isolated instance with demo agents (issue #1973).',
-    );
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    data = null; // non-JSON body → assertOnlyDemoAgents refuses (no agents array)
   }
+  assertOnlyDemoAgents({ ok: resp.ok(), status: resp.status(), data });
 }
 
 /**

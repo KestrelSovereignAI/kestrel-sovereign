@@ -13,7 +13,9 @@ import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 // Import the dependency-free safety module directly (no @kestrel/flight needed).
-const { resetDemoAgentDatabases, requireDemoSandbox, isDemoServerEnv } = require('../../demos/shared/demo_safety.cjs');
+const {
+  resetDemoAgentDatabases, requireDemoSandbox, isDemoServerEnv, assertOnlyDemoAgents,
+} = require('../../demos/shared/demo_safety.cjs');
 
 const NOOP_NARRATOR = { narrate() {}, act() {} };
 
@@ -88,4 +90,27 @@ test('reset refuses entirely when not a demo run', () => {
     assert.throws(() => resetDemoAgentDatabases(NOOP_NARRATOR, root), /KESTREL_DEMO_SERVER is not set/);
   });
   assert.equal(fs.existsSync(db), true);
+});
+
+// assertOnlyDemoAgents must FAIL CLOSED — every non-isolated/ambiguous response
+// is a refusal, never a silent pass (the codex P2).
+test('assertOnlyDemoAgents passes only for a non-empty all-demo roster', () => {
+  assert.doesNotThrow(() => assertOnlyDemoAgents({ ok: true, status: 200, data: { agents: [{ name: 'demo', is_demo: true }] } }));
+  assert.doesNotThrow(() => assertOnlyDemoAgents({ ok: true, status: 200, data: [{ name: 'demo', is_demo: true }] }));
+});
+
+test('assertOnlyDemoAgents refuses non-OK / error-shaped / empty / live responses', () => {
+  // non-OK
+  assert.throws(() => assertOnlyDemoAgents({ ok: false, status: 500, data: { detail: 'boom' } }), /HTTP 500/);
+  // OK but error-shaped JSON with no agents array — must NOT pass as "no live agents"
+  assert.throws(() => assertOnlyDemoAgents({ ok: true, status: 200, data: { detail: 'unauthorized' } }), /no agents array/);
+  // null body (e.g. non-JSON)
+  assert.throws(() => assertOnlyDemoAgents({ ok: true, status: 200, data: null }), /no agents array/);
+  // zero agents
+  assert.throws(() => assertOnlyDemoAgents({ ok: true, status: 200, data: { agents: [] } }), /zero agents/);
+  // a live (non-demo) agent present
+  assert.throws(
+    () => assertOnlyDemoAgents({ ok: true, status: 200, data: { agents: [{ name: 'meridian', is_demo: false }] } }),
+    /non-demo agent/,
+  );
 });

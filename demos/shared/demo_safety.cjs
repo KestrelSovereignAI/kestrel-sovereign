@@ -103,9 +103,47 @@ function resetDemoAgentDatabases(narrator, dataDir) {
   }
 }
 
+/**
+ * Decide, fail-CLOSED, whether an /api/agents response proves an isolated demo
+ * instance. Throws unless: the response was OK, the body is an agents array (or
+ * `{agents: [...]}`), it is non-empty, and every agent has `is_demo === true`.
+ *
+ * An error-shaped body (e.g. a 401/500 `{detail: ...}`), a missing agents array,
+ * or zero agents are all refusals — never "no live agents present" (issue #1973).
+ *
+ * @param {{ ok: boolean, status: number, data: any }} response
+ */
+function assertOnlyDemoAgents({ ok, status, data }) {
+  if (!ok) {
+    throw new Error(
+      `Refusing to run the demo: /api/agents returned HTTP ${status}; cannot verify isolation.`,
+    );
+  }
+  const agents = Array.isArray(data) ? data : (data && data.agents);
+  if (!Array.isArray(agents)) {
+    throw new Error(
+      'Refusing to run the demo: /api/agents response had no agents array; cannot verify isolation.',
+    );
+  }
+  if (agents.length === 0) {
+    throw new Error(
+      'Refusing to run the demo: server reports zero agents, so it cannot be proven to be an '
+      + 'isolated demo instance (issue #1973).',
+    );
+  }
+  const live = agents.filter((a) => a.is_demo !== true).map((a) => a.name || a.id || '<unnamed>');
+  if (live.length) {
+    throw new Error(
+      `Refusing to run the demo: server reports non-demo agent(s): ${live.join(', ')}. `
+      + 'A demo must only run against an isolated instance with demo agents (issue #1973).',
+    );
+  }
+}
+
 module.exports = {
   isDemoServerEnv,
   requireDemoSandbox,
   isInsideSandbox,
   resetDemoAgentDatabases,
+  assertOnlyDemoAgents,
 };
