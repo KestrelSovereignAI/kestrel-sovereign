@@ -829,7 +829,25 @@ async def get_context_status(
         ),
     ),
 ):
+    """Thin HTTP wrapper over :func:`compute_context_status`.
+
+    Shared with the agent ``context`` tool so the chat-footer pill and the
+    agent's own self-report cannot drift (#1969).
+    """
+    return await compute_context_status(get_agent(request), session_id, full=full)
+
+
+async def compute_context_status(
+    agent,
+    session_id: Optional[str] = None,
+    full: bool = False,
+) -> Dict[str, Any]:
     """Honest whole-window context status + per-section breakdown.
+
+    Single source of truth for BOTH the chat-footer pill (via the HTTP route
+    above) AND the agent ``context_status`` tool (#1969). Before this, the tool
+    used a separate cross-session, raw-content token count and drifted from this
+    session-scoped, canonical ``measure_context_breakdown`` measurement.
 
     The pill in the chat footer (chat.js) reads ``utilization_percent``
     and renders the ● N msgs · X% indicator. The popup (#1310) reads
@@ -850,8 +868,6 @@ async def get_context_status(
       retrieved live; the popup labels it as ``estimated``.
     """
     try:
-        agent = get_agent(request)
-
         from kestrel_sovereign.agent.token_counter import get_token_counter
         from kestrel_sovereign.agent.token_budget import RESPONSE_RESERVE
         from kestrel_sovereign.kestrel_config.constants import MAX_CONVERSATION_HISTORY_LIMIT

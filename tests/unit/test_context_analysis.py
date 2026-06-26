@@ -349,6 +349,7 @@ class TestContextFeatureLateBoundContextManager:
         agent attaches one later, and the tool then succeeds — the
         registration-vs-init race that #1382 surfaced."""
         from types import SimpleNamespace
+        from unittest.mock import patch
 
         from kestrel_sovereign.features.context.feature import ContextFeature
         from kestrel_sdk.tools.result import ToolResultStatus
@@ -360,15 +361,18 @@ class TestContextFeatureLateBoundContextManager:
 
         # Agent attaches its real ContextManager — same ordering the
         # production init has in kestrel_agent.py:1034.
-        cm = AsyncMock()
-        cm.get_status = AsyncMock(return_value={
+        agent.context_manager = AsyncMock()
+        agent.context_stats = None
+        agent._active_session_id = "sess-late"
+
+        # #1969: the tool now reports via the shared, session-scoped
+        # compute_context_status (same source of truth as the chat pill).
+        shared = AsyncMock(return_value={
             "utilization_percent": 12,
             "message_count": 4,
         })
-        agent.context_manager = cm
-        agent.context_stats = None
-
-        result = await feature.context_status()
+        with patch("kestrel_sovereign.endpoints.agent.compute_context_status", new=shared):
+            result = await feature.context_status()
         assert result.status is ToolResultStatus.OK
         assert result.data["utilization_percent"] == 12
 
