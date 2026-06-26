@@ -219,10 +219,14 @@ def test_build_playwright_env_strips_api_key_preserves_provider_keys(tmp_path):
         "OLLAMA_HOST": "http://localhost:11434",
         "PATH": "/usr/bin",
     }
-    env = cli_demo._build_playwright_env(parent, "http://127.0.0.1:8900", tmp_path)
+    demo_db = tmp_path / "agent_data" / "demo"
+    env = cli_demo._build_playwright_env(parent, "http://127.0.0.1:8900", tmp_path, demo_db)
     assert "KESTREL_API_KEY" not in env
     assert env["KESTREL_URL"] == "http://127.0.0.1:8900"
     assert env["KESTREL_DEMO_SERVER"] == "1"
+    # The demo must know its isolated sandbox so resetDemoAgentDatabases can
+    # prove which dir is safe to reset (issue #1973).
+    assert env["KESTREL_DB_PATH"] == str(demo_db)
     # All provider keys survive.
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-prod"
     assert env["OPENROUTER_API_KEY"] == "sk-or-prod"

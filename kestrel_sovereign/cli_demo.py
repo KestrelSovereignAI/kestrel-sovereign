@@ -199,15 +199,18 @@ def _build_demo_env(parent_env: dict, demo_db: Path, repo: Path) -> dict:
     return env
 
 
-def _build_playwright_env(parent_env: dict, demo_url: str, repo: Path) -> dict:
+def _build_playwright_env(parent_env: dict, demo_url: str, repo: Path, demo_db: Path) -> dict:
     """Build the env for ``npx playwright test``.
 
     Strips ``KESTREL_API_KEY`` (the demo fetches its own key via
     ``/api/auth/key``); sets ``KESTREL_URL`` to the isolated demo
     server; sets ``KESTREL_DEMO_SERVER=1`` (some demo helpers branch
-    on this — same flag the server reads). Provider keys come from
-    ``<repo>/.env`` (loaded under parent_env so shell exports win on
-    collision), preserving the bash predecessor's behaviour.
+    on this — same flag the server reads); and sets ``KESTREL_DB_PATH``
+    to the isolated demo sandbox so the demo can prove which directory
+    is safe to reset (issue #1973 — ``resetDemoAgentDatabases`` refuses
+    any path outside it). Provider keys come from ``<repo>/.env`` (loaded
+    under parent_env so shell exports win on collision), preserving the
+    bash predecessor's behaviour.
     """
     env: dict = {}
     env.update(_load_dotenv_for_demo(repo))
@@ -222,6 +225,7 @@ def _build_playwright_env(parent_env: dict, demo_url: str, repo: Path) -> dict:
             env[key] = parent_env[key]
     env["KESTREL_URL"] = demo_url
     env["KESTREL_DEMO_SERVER"] = "1"
+    env["KESTREL_DB_PATH"] = str(demo_db)
     return env
 
 
@@ -375,7 +379,7 @@ def _cmd_demo_run(args) -> int:
 
         # 5. Run the demo via npx.
         print(f"[demo-runner] Running demos/{name} ...")
-        playwright_env = _build_playwright_env(os.environ.copy(), demo_url, repo)
+        playwright_env = _build_playwright_env(os.environ.copy(), demo_url, repo, demo_db)
         rc = run_streaming(
             ["npx", "playwright", "test", "--config=config.cjs"],
             cwd=demo_dir,
