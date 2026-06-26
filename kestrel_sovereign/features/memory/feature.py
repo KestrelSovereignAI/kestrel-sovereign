@@ -20,6 +20,10 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import (
+    STATUS_DONE_CANCELLED_ALIASES,
+    normalize_choice,
+)
 from kestrel_sovereign.features.storage_access import (
     resolve_feature_conversation_store,
     resolve_feature_database,
@@ -889,10 +893,12 @@ class MemoryFeature(Feature):
         if err:
             return ToolResult.failed(err)
 
-        if status is not None and status not in ("pending", "done", "cancelled"):
-            return ToolResult.failed(
-                f"status must be pending/done/cancelled, got {status!r}"
-            )
+        if status is not None:
+            status = normalize_choice(status, STATUS_DONE_CANCELLED_ALIASES)
+            if status not in ("pending", "done", "cancelled"):
+                return ToolResult.failed(
+                    f"status must be one of: pending, done, cancelled (got {status!r})"
+                )
 
         since: Optional[str] = None
         if days is not None:
@@ -978,10 +984,12 @@ class MemoryFeature(Feature):
         if storage is None or not hasattr(storage, "graph"):
             return ToolResult.failed("Graph store not available")
 
-        if status is not None and status not in ("pending", "done", "cancelled"):
-            return ToolResult.failed(
-                f"status must be pending/done/cancelled, got {status!r}"
-            )
+        if status is not None:
+            status = normalize_choice(status, STATUS_DONE_CANCELLED_ALIASES)
+            if status not in ("pending", "done", "cancelled"):
+                return ToolResult.failed(
+                    f"status must be one of: pending, done, cancelled (got {status!r})"
+                )
 
         if due_date is not None:
             from datetime import datetime as _dt

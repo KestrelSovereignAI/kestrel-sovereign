@@ -22,11 +22,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
+
+# Synonyms LLMs reach for on import_identity's merge_mode.
+_MERGE_MODE_ALIASES = {
+    "overwrite": "replace", "replace_all": "replace", "reset": "replace",
+    "combine": "merge", "union": "merge", "update": "merge",
+    "skip": "skip_existing", "skip-existing": "skip_existing",
+    "keep": "skip_existing", "keep_existing": "skip_existing",
+}
 
 
 def _unique_export_filename() -> str:
@@ -351,7 +360,8 @@ class IdentityFeature(Feature):
         name="import_identity",
         description="Import agent identity from a portable package. "
                     "This restores memories, personality, relationships, and skills "
-                    "from a previously exported identity package.",
+                    "from a previously exported identity package. "
+                    "merge_mode must be one of: replace, merge (default), skip_existing.",
         category=ToolCategory.SYSTEM,
         command_prefix="!identity import"
     )
@@ -374,10 +384,11 @@ class IdentityFeature(Feature):
                 "verify_signature must be a boolean, got "
                 f"{type(verify_signature).__name__}={verify_signature!r}"
             )
+        merge_mode = _normalize_choice(merge_mode, _MERGE_MODE_ALIASES)
         if merge_mode not in ("replace", "merge", "skip_existing"):
             return ToolResult.failed(
-                f"merge_mode must be 'replace', 'merge', or 'skip_existing'; "
-                f"got {merge_mode!r}"
+                f"merge_mode must be one of: replace, merge, skip_existing "
+                f"(got {merge_mode!r})"
             )
 
         try:

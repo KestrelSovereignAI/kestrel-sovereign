@@ -3,6 +3,7 @@ import logging
 import os
 from typing import List
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -68,6 +69,10 @@ class ResponseAuditFeature(Feature):
             ToolResult.failed when ``mode`` is not one of the
             supported values.
         """
+        mode = _normalize_choice(mode, {
+            "warning": "warn", "soft": "warn", "lenient": "warn",
+            "hard": "strict", "enforce": "strict", "strict_mode": "strict",
+        })
         if mode not in ("warn", "strict"):
             return ToolResult.failed(
                 error=f"Mode must be 'warn' or 'strict' (got {mode!r})"

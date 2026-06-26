@@ -25,6 +25,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -415,10 +416,15 @@ class ContextFeature(Feature):
         if not self.context_manager:
             return ToolResult.failed("Context manager not available")
 
+        action = _normalize_choice(action, {
+            "keep": "protect", "pin": "protect", "preserve": "protect",
+            "drop": "droppable", "unprotect": "droppable",
+            "reset": "clear", "unmark": "clear", "remove": "clear",
+        })
         if action not in ("protect", "droppable", "clear"):
             return ToolResult.failed(
-                f"action must be 'protect', 'droppable', or 'clear', "
-                f"got {action!r}"
+                f"action must be one of: protect, droppable, clear "
+                f"(got {action!r})"
             )
 
         messages, err = await self._resolve_target_messages(target)

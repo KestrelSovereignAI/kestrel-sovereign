@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 
 
@@ -688,6 +689,10 @@ class SecurityFeature(Feature):
             request_id: ID of the pending request (first 8 chars OK)
             scope: Approval scope - "once", "session", or "always"
         """
+        scope = _normalize_choice(scope, {
+            "single": "once", "one": "once", "this_session": "session",
+            "forever": "always", "permanent": "always", "permanently": "always",
+        })
         if scope not in ("once", "session", "always"):
             return ToolResult.failed(
                 f"Invalid scope '{scope}'. Use: once, session, always"

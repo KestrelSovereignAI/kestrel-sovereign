@@ -16,6 +16,7 @@ from uuid import uuid4
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 logger = logging.getLogger(__name__)
@@ -56,16 +57,6 @@ _OUTCOME_ALIASES = {
     "supersede": "superseded", "replaced": "superseded", "obsolete": "superseded",
     "obsoleted": "superseded", "duplicate": "superseded",
 }
-
-
-def _normalize_choice(value, aliases):
-    """Lower-case + map a known synonym onto its canonical enum value. Unknown
-    values pass through (lower-cased) so the validator still rejects genuine
-    typos with a helpful message. Non-strings (None) pass through untouched."""
-    if not isinstance(value, str):
-        return value
-    key = value.strip().lower()
-    return aliases.get(key, key)
 
 
 def _utc_now_iso() -> str:

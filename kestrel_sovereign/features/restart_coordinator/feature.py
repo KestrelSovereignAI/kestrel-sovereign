@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 
 from .event_store import (
@@ -130,17 +131,6 @@ _STATUS_ALIASES = {
     "in-progress": "executing",
     "denied": "rejected",
 }
-
-
-def _normalize_choice(value, aliases):
-    """Lower-case + map a known synonym onto its canonical enum value.
-    Unknown values pass through (lower-cased) so the validator still
-    rejects genuine typos with a helpful message. Non-strings (None)
-    pass through untouched."""
-    if not isinstance(value, str):
-        return value
-    key = value.strip().lower()
-    return aliases.get(key, key)
 
 
 def _tail(raw: Any) -> str:
