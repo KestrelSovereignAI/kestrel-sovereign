@@ -59,7 +59,7 @@ The runner:
 3. Runs the Playwright demo against the isolated server
 4. Stops the isolated server on exit (even on failure)
 
-**Never point Playwright at your live server directly.** The raw command `cd demos/<name> && npx playwright test --config=config.cjs` will hit whatever `KESTREL_URL` resolves to — if that's your working instance, Act 3's `clearConversationHistory` and Act 6's permission toggles will mutate real data.
+**Always use `kestrel demo run` — it is the only sanctioned entry point.** The demo mutates databases and permissions, so it is now *enforced*, not merely discouraged: each demo calls `assertIsolatedDemoTarget` (refuses port 8888, requires `KESTREL_DEMO_SERVER=1`, and verifies every loaded agent is `is_demo=true`) before any mutation, and `resetDemoAgentDatabases` refuses any path outside the isolated `KESTREL_DB_PATH` sandbox. A raw `npx playwright test` against a live instance is therefore rejected rather than allowed to corrupt real data (issue #1973).
 
 Outputs land in `demos/<name>/demo-output/` — screenshots, `narration.md`, and (via Playwright) per-test video under `demo-output/playwright/`.
 

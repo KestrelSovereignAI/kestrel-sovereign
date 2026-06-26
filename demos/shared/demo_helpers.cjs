@@ -248,37 +248,53 @@ async function selectDemoProvider(page, opts = {}) {
 // Session management
 // ---------------------------------------------------------------------------
 
+// Safety-critical, dependency-free primitives live in demo_safety.cjs so they
+// can be unit-tested without @kestrel/flight. Re-exported below for callers.
+const {
+  isDemoServerEnv,
+  requireDemoSandbox,
+  resetDemoAgentDatabases,
+} = require('./demo_safety.cjs');
+
 /**
- * Clear old conversation history so the demo starts with a clean context window.
- * Walks the agent data dir with Node (cross-platform — Unix `find` and the
- * `sqlite3` CLI aren't present on Windows) and unlinks each kestrel_prime.db
- * it finds. The agent re-creates the DB on the next startFreshSession().
- * @param {import('@kestrel/flight').NarrationEngine} narrator
- * @param {string} agentDataDir - absolute path to agent_data/
+ * Fail-fast guard for the demo entry point: prove the target is an isolated demo
+ * server before any mutation (DB reset, permission toggles, model changes).
+ *
+ * Defends against a raw `npx playwright test` pointed at a live host. Refuses the
+ * live port (8888), requires KESTREL_DEMO_SERVER, and verifies every loaded agent
+ * reports `is_demo=true` via /api/agents (mirrors cli_demo._verify_only_demo_agents).
+ *
+ * @param {import('@playwright/test').APIRequestContext} request
+ * @param {string} baseUrl
+ * @param {string|null} [apiKey]
  */
-function clearConversationHistory(narrator, agentDataDir) {
-  const dbs = [];
-  function walk(dir, depth) {
-    if (depth > 3) return;
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch { return; }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full, depth + 1);
-      else if (entry.name === 'kestrel_prime.db') dbs.push(full);
-    }
+async function assertIsolatedDemoTarget(request, baseUrl, apiKey = null) {
+  if (/:8888(\b|\/|$)/.test(baseUrl)) {
+    throw new Error(
+      `Refusing to run the demo against ${baseUrl}: port 8888 is the live server. `
+      + 'Launch via `kestrel demo run`, which starts an isolated server on its own port.',
+    );
   }
+  if (!isDemoServerEnv()) {
+    throw new Error(
+      'Refusing to run the demo: KESTREL_DEMO_SERVER is not set. This must be an '
+      + 'isolated demo run launched via `kestrel demo run`, not a raw Playwright run.',
+    );
+  }
+  let agents;
   try {
-    walk(agentDataDir, 0);
-    let unlinked = 0;
-    for (const db of dbs) {
-      try { fs.unlinkSync(db); unlinked++; } catch { /* locked or already gone */ }
-    }
-    narrator.narrate(`Cleared ${unlinked}/${dbs.length} agent database(s); fresh session will recreate`);
+    const resp = await request.get(`${baseUrl}/api/agents`, { headers: authHeaders(apiKey) });
+    const data = await resp.json();
+    agents = Array.isArray(data) ? data : (data.agents || []);
   } catch (e) {
-    narrator.narrate(`Could not clear history: ${e.message}`);
+    throw new Error(`Refusing to run the demo: could not verify agents via /api/agents (${e.message}).`);
+  }
+  const live = agents.filter((a) => a.is_demo !== true).map((a) => a.name || a.id || '<unnamed>');
+  if (live.length) {
+    throw new Error(
+      `Refusing to run the demo: server reports non-demo agent(s): ${live.join(', ')}. `
+      + 'A demo must only run against an isolated instance with demo agents (issue #1973).',
+    );
   }
 }
 
@@ -464,7 +480,10 @@ module.exports = {
   dismissContextWarning,
   scrollChatToTop,
   scrollChatToBottom,
-  clearConversationHistory,
+  resetDemoAgentDatabases,
+  assertIsolatedDemoTarget,
+  isDemoServerEnv,
+  requireDemoSandbox,
   startFreshSession,
   // Provider selection
   selectDemoProvider,
