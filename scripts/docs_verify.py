@@ -343,8 +343,20 @@ def verify_docs(
         doc, error = docs_okf.read_okf_document(path)
         if error or doc is None:
             continue
-        existing_refs, missing_refs = classify_code_refs(doc)
-        missing_links = missing_markdown_links(doc)
+        # Generated docs (REPO_MAP.md, FEATURES_*.md, …) are machine output with
+        # a "do not edit by hand" body. Their link/code-ref sets are a volatile
+        # function of repo size — REPO_MAP alone embeds ~1400 code refs that grow
+        # every time the tree grows — and they are regenerated out-of-band (e.g.
+        # the nightly repo-map job). Embedding those sets in the committed
+        # ledger/manifest restales the artifacts on every regen and reds out
+        # ``test_docs_verify`` on main (#1971). Verifying their links is also
+        # meaningless: you cannot fix a generated file by editing it. So we keep
+        # the doc in render routing but emit empty, stable link/ref sets.
+        if bool(doc.frontmatter.get("generated")):
+            existing_refs, missing_refs, missing_links = (), (), ()
+        else:
+            existing_refs, missing_refs = classify_code_refs(doc)
+            missing_links = missing_markdown_links(doc)
         related_prs = relevant_prs(doc, existing_refs, prs)
         render = render_channel(doc)
         status = str(doc.frontmatter.get("status") or "")
