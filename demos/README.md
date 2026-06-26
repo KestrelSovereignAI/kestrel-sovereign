@@ -59,7 +59,12 @@ The runner:
 3. Runs the Playwright demo against the isolated server
 4. Stops the isolated server on exit (even on failure)
 
-**Always use `kestrel demo run` — it is the only sanctioned entry point.** The demo mutates databases and permissions, so it is now *enforced*, not merely discouraged: each demo calls `assertIsolatedDemoTarget` (refuses port 8888, requires `KESTREL_DEMO_SERVER=1`, and verifies every loaded agent is `is_demo=true`) before any mutation, and `resetDemoAgentDatabases` refuses any path outside the isolated `KESTREL_DB_PATH` sandbox. A raw `npx playwright test` against a live instance is therefore rejected rather than allowed to corrupt real data (issue #1973).
+**Always use `kestrel demo run` — it is the only sanctioned entry point.** Demos mutate databases and permissions, so the most destructive operation is now *enforced*, not merely discouraged:
+
+- `resetDemoAgentDatabases` (the DB wipe, called by the technical demo) refuses any path outside the isolated `KESTREL_DB_PATH` sandbox and refuses to run at all unless `KESTREL_DEMO_SERVER=1`. **No demo can wipe live agent data**, regardless of how it is launched (issue #1973).
+- The technical demo additionally calls `assertIsolatedDemoTarget` before any mutation — refuses port 8888, requires `KESTREL_DEMO_SERVER=1`, and (fail-closed) verifies every loaded agent reports `is_demo=true`.
+
+Other demos that mutate state (e.g. `privacy-modes`, `spawn`) do **not yet** call `assertIsolatedDemoTarget`, so a raw `npx playwright test` against a live instance could still toggle privacy modes or create conversations there. Extending the upfront guard to every mutating demo is tracked in #1974. Until then: launch demos only via `kestrel demo run`.
 
 Outputs land in `demos/<name>/demo-output/` — screenshots, `narration.md`, and (via Playwright) per-test video under `demo-output/playwright/`.
 
