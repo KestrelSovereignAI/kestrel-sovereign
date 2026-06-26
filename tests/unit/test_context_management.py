@@ -1544,22 +1544,37 @@ class TestContextFeature:
 
     @pytest.mark.asyncio
     async def test_context_status_tool(self, mock_agent):
-        """Test context_status tool returns status."""
+        """Tool reports the canonical, session-scoped measurement (#1969).
+
+        It must call the shared ``compute_context_status`` with the agent's
+        ACTIVE session id (the window the LLM sees), not the old cross-session
+        ``context_manager.get_status`` aggregate.
+        """
+        from unittest.mock import patch
         from kestrel_sovereign.features.context import ContextFeature
 
-        mock_agent.context_manager.get_status = AsyncMock(return_value={
+        mock_agent._active_session_id = "sess-1"
+        fake_status = {
             "success": True,
-            "total_budget": 8000,
-            "utilization_percent": 45.5
-        })
+            "message_count": 6,
+            "total_budget": 130048,
+            "total_tokens": 5239,
+            "utilization_percent": 4.0,
+        }
+        shared = AsyncMock(return_value=fake_status)
 
         feature = ContextFeature(mock_agent)
         await feature.initialize()
-        result = await feature.context_status()
+        with patch("kestrel_sovereign.endpoints.agent.compute_context_status", new=shared):
+            result = await feature.context_status()
 
         from kestrel_sdk.tools.result import ToolResultStatus
         assert result.status is ToolResultStatus.OK
-        assert "total_budget" in result.data
+        assert result.data["message_count"] == 6
+        assert result.data["utilization_percent"] == 4.0
+        # The fix: scoped to the active session, via the shared SoT.
+        shared.assert_awaited_once()
+        assert shared.await_args.args[1] == "sess-1"
 
     @pytest.mark.asyncio
     async def test_recursive_query_tool(self, mock_agent):
