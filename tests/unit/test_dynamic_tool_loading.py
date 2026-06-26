@@ -689,3 +689,61 @@ class TestAllToolsReachCodexHandler:
         assert registered_tool_call == [], (
             "text-only turn must not register an item/tool/call handler"
         )
+
+
+# =============================================================================
+# Public dynamic-tool API (#1979 PR2): register/unregister for arbitrary owners
+# (feature exploration AND out-of-band sources like MCP servers).
+# =============================================================================
+
+class TestRegisterDynamicToolsPublicAPI:
+
+    def test_register_non_feature_owner(self, agent):
+        """An MCP-style owner mounts tools just like an explored feature."""
+        n = agent.register_dynamic_tools(
+            "mcp:fetch", [_make_mock_tool("fetch"), _make_mock_tool("fetch_raw")]
+        )
+        assert n == 2
+        assert "fetch" in agent._direct_tools
+        assert "fetch_raw" in agent._direct_tools
+        assert agent._tool_to_feature["fetch"] == "mcp:fetch"
+        assert agent._explored_features.get("mcp:fetch") is True
+        names = {d["function"]["name"] for d in agent._direct_tool_defs}
+        assert {"fetch", "fetch_raw"} <= names
+
+    def test_unregister_removes_only_that_owner(self, agent):
+        agent.register_dynamic_tools("mcp:fetch", [_make_mock_tool("fetch")])
+        agent.register_dynamic_tools("mcp:time", [_make_mock_tool("get_time")])
+        removed = agent.unregister_dynamic_tools("mcp:fetch")
+        assert removed == 1
+        assert "fetch" not in agent._direct_tools
+        assert "mcp:fetch" not in agent._explored_features
+        # The other owner is untouched.
+        assert "get_time" in agent._direct_tools
+        assert agent._tool_to_feature["get_time"] == "mcp:time"
+        names = {d["function"]["name"] for d in agent._direct_tool_defs}
+        assert "fetch" not in names and "get_time" in names
+
+    def test_name_collision_prefixes_sanitised_owner(self, agent):
+        # An existing direct tool named "fetch" forces the colliding one to be
+        # prefixed with the schema-safe owner ("mcp:fetch" -> "mcp_fetch").
+        agent.register_dynamic_tools("native", [_make_mock_tool("fetch")])
+        agent.register_dynamic_tools("mcp:fetch", [_make_mock_tool("fetch")])
+        assert "fetch" in agent._direct_tools  # the first (native) one
+        assert "mcp_fetch__fetch" in agent._direct_tools  # disambiguated
+        assert agent._tool_to_feature["mcp_fetch__fetch"] == "mcp:fetch"
+
+    def test_pin_exempts_owner_from_eviction(self, agent):
+        agent.MAX_DIRECT_TOOLS = 2
+        agent.register_dynamic_tools("mcp:pinned", [_make_mock_tool("keep_me")], pin=True)
+        # Flood with unpinned owners to force eviction.
+        for i in range(5):
+            agent.register_dynamic_tools(f"mcp:tmp{i}", [_make_mock_tool(f"t{i}")])
+        assert "keep_me" in agent._direct_tools  # pinned survived
+        assert "mcp:pinned" in agent._pinned_features
+
+    def test_unregister_discards_pin(self, agent):
+        agent.register_dynamic_tools("mcp:pinned", [_make_mock_tool("keep_me")], pin=True)
+        agent.unregister_dynamic_tools("mcp:pinned")
+        assert "mcp:pinned" not in agent._pinned_features
+        assert "keep_me" not in agent._direct_tools
