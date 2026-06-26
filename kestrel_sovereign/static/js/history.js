@@ -717,7 +717,7 @@ function attachAssistantControls(node, messageId, modelMetadata) {
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'msg-delete-btn';
         deleteBtn.title = 'Move to trash';
-        deleteBtn.textContent = '✕';
+        deleteBtn.innerHTML = (typeof kicon === 'function') ? kicon('x-mark') : '✕';
         deleteBtn.onclick = (e) => {
             e.stopPropagation();
             window.deleteMessage(messageId, node);

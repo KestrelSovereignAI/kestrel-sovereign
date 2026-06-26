@@ -676,9 +676,9 @@ function renderDemoModeBanner({ serverDemoMode, agents, isStandalone }) {
             : 'background: linear-gradient(90deg, #14532d, #16a34a); color: white;'}
     `;
     banner.innerHTML = isMisconfig
-        ? `<span>⛔ DEMO MODE MISCONFIG</span>
+        ? `<span>${window.kicon('ban')} DEMO MODE MISCONFIG</span>
            <span style="opacity:.85; font-weight: 400;">— this server is in demo mode but mounted live agents: ${liveAgents.map(escapeHtml).join(', ')}.  Refusing to auto-select.</span>`
-        : `<span>🧪 DEMO MODE</span>
+        : `<span>${window.kicon('beaker')} DEMO MODE</span>
            <span style="opacity:.85; font-weight: 400;">— targeting <code>${escapeHtml(targetName)}</code> (is_demo=true).  Production data is not at risk.</span>`;
 
     document.body.insertBefore(banner, document.body.firstChild);

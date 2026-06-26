@@ -570,7 +570,7 @@ async function refreshPlatformAccess() {
                             ${provider.pricing_hint ? `<div>${provider.pricing_hint}</div>` : ''}
                             <div style="display: flex; gap: 1rem; margin-top: 0.25rem;">
                                 ${marginText ? `<span>${kicon('credit-card')} ${marginText}</span>` : ''}
-                                ${provider.rate_limit_per_companion ? `<span>⏱️ ${provider.rate_limit_per_companion} req/min</span>` : ''}
+                                ${provider.rate_limit_per_companion ? `<span>${kicon('clock')} ${provider.rate_limit_per_companion} req/min</span>` : ''}
                             </div>
                         </div>
                     </div>

@@ -81,7 +81,7 @@
         <aside id="agents-pane" class="pane-sidebar">
             <div class="pane-header">
                 <h3 data-label-key="sidebar_agents">Agents</h3>
-                <button id="collapse-agents-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse">‹</button>
+                <button id="collapse-agents-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse"><span class="ki ki-chevron-left"></span></button>
             </div>
             <div id="agents-list" class="pane-content">
                 <div class="loading" data-label-key="loading_agents">Loading agents...</div>
@@ -93,9 +93,9 @@
         <aside id="conversations-pane" class="pane-sidebar" style="display: none;">
             <div class="pane-header">
                 <h3 id="conversations-pane-title">Conversations</h3>
-                <button id="new-conversation-sidebar-btn" class="btn-icon" data-label-attr-title="btn_new_conversation" title="New Conversation">+</button>
-                <button id="trash-toggle-btn" class="btn-icon" title="Show Trash" data-mode="conversations">🗑</button>
-                <button id="collapse-conversations-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse">‹</button>
+                <button id="new-conversation-sidebar-btn" class="btn-icon" data-label-attr-title="btn_new_conversation" title="New Conversation"><span class="ki ki-plus"></span></button>
+                <button id="trash-toggle-btn" class="btn-icon" title="Show Trash" data-mode="conversations"><span class="ki ki-trash"></span></button>
+                <button id="collapse-conversations-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse"><span class="ki ki-chevron-left"></span></button>
             </div>
             <div id="conversations-list" class="pane-content">
                 <p class="empty-state" data-label-key="empty_conversations">Select an agent to view conversations</p>
@@ -583,7 +583,7 @@
                             color: var(--text-primary);
                             cursor: pointer;
                             font-size: 0.85rem;
-                        ">↻ Refresh</button>
+                        "><span class="ki ki-refresh"></span> Refresh</button>
                     </div>
                 </div>
 
@@ -769,7 +769,7 @@
                     <button onclick="FeatureStore.reload()" class="btn btn-secondary" style="
                         padding: 0.25rem 0.75rem;
                         font-size: 0.8rem;
-                    ">↻ Refresh</button>
+                    "><span class="ki ki-refresh"></span> Refresh</button>
                 </div>
                 <p class="text-muted mb-3 text-md" data-label-key="features_description">
                     Browse, install, and manage feature packages for your agent.
@@ -895,7 +895,7 @@
                         <button onclick="Security.loadPermissionTree()" class="btn btn-secondary" style="
                             padding: 0.25rem 0.75rem;
                             font-size: 0.8rem;
-                        ">↻ Refresh</button>
+                        "><span class="ki ki-refresh"></span> Refresh</button>
                     </div>
                     <div id="permission-tree">
                         <p class="empty-state text-muted" data-label-key="security_load_tree_prompt">
@@ -936,7 +936,7 @@
                         <button onclick="Security.loadAuditLog()" class="btn btn-secondary" style="
                             padding: 0.25rem 0.75rem;
                             font-size: 0.8rem;
-                        ">↻ Refresh</button>
+                        "><span class="ki ki-refresh"></span> Refresh</button>
                     </div>
                     <div id="security-audit-log">
                         <p class="empty-state text-muted" data-label-key="security_load_audit_prompt">
