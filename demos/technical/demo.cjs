@@ -9,7 +9,11 @@
  *   Act 5: Sovereignty Export
  *   Act 6: Permission Enforcement
  *
- * Run: cd demos/technical && npx playwright test --config=config.cjs
+ * Run: `kestrel demo run technical` — the only sanctioned entry point. It
+ * launches an isolated demo server (own port + KESTREL_DB_PATH sandbox) and
+ * verifies only demo agents are loaded. This script refuses to run otherwise
+ * (assertIsolatedDemoTarget) because it mutates databases and permissions —
+ * pointing it at a live instance would corrupt real data (issue #1973).
  *
  * Output (in demo-output/):
  *   - narration.md   — timestamped transcript with screenshot references
@@ -42,12 +46,14 @@ const {
     navigateToPanel,
     dismissContextWarning,
     scrollChatToTop,
-    clearConversationHistory,
+    resetDemoAgentDatabases,
+    assertIsolatedDemoTarget,
+    requireDemoSandbox,
     startFreshSession,
     selectDemoProvider,
 } = require('../shared/demo_helpers.cjs');
 
-const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
+const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8900';
 const OUTPUT_DIR = path.join(__dirname, 'demo-output');
 
 // ============================================================================
@@ -77,9 +83,14 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         apiKey = await getApiKey(request, BASE_URL);
         narrator.narrate(apiKey ? 'API key acquired' : 'No API key (public mode)');
 
-        // Clear old conversation history and start a fresh session
-        const agentDataDir = path.resolve(__dirname, '../../agent_data');
-        clearConversationHistory(narrator, agentDataDir);
+        // Fail-fast: prove this is an isolated demo server BEFORE any mutation.
+        // Guards against a raw `npx playwright test` pointed at the live host
+        // (issue #1973). Throwing here aborts the demo before it touches data.
+        await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
+
+        // Reset ONLY the isolated demo sandbox (KESTREL_DB_PATH), never the live
+        // agent_data/ tree, then start a fresh session.
+        resetDemoAgentDatabases(narrator, requireDemoSandbox());
         await startFreshSession(request, BASE_URL, apiKey, narrator);
 
         // Set model to llama3.2 via Ollama (cloud keys not configured on this machine)
