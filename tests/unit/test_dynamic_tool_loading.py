@@ -689,3 +689,104 @@ class TestAllToolsReachCodexHandler:
         assert registered_tool_call == [], (
             "text-only turn must not register an item/tool/call handler"
         )
+
+
+# =============================================================================
+# Public dynamic-tool API (#1979 PR2): register/unregister for arbitrary owners
+# (feature exploration AND out-of-band sources like MCP servers).
+# =============================================================================
+
+class TestRegisterDynamicToolsPublicAPI:
+
+    def test_register_non_feature_owner(self, agent):
+        """An MCP-style owner mounts tools just like an explored feature."""
+        n = agent.register_dynamic_tools(
+            "mcp:fetch", [_make_mock_tool("fetch"), _make_mock_tool("fetch_raw")]
+        )
+        assert n == 2
+        assert "fetch" in agent._direct_tools
+        assert "fetch_raw" in agent._direct_tools
+        assert agent._tool_to_feature["fetch"] == "mcp:fetch"
+        assert agent._explored_features.get("mcp:fetch") is True
+        names = {d["function"]["name"] for d in agent._direct_tool_defs}
+        assert {"fetch", "fetch_raw"} <= names
+
+    def test_unregister_removes_only_that_owner(self, agent):
+        agent.register_dynamic_tools("mcp:fetch", [_make_mock_tool("fetch")])
+        agent.register_dynamic_tools("mcp:time", [_make_mock_tool("get_time")])
+        removed = agent.unregister_dynamic_tools("mcp:fetch")
+        assert removed == 1
+        assert "fetch" not in agent._direct_tools
+        assert "mcp:fetch" not in agent._explored_features
+        # The other owner is untouched.
+        assert "get_time" in agent._direct_tools
+        assert agent._tool_to_feature["get_time"] == "mcp:time"
+        names = {d["function"]["name"] for d in agent._direct_tool_defs}
+        assert "fetch" not in names and "get_time" in names
+
+    def test_name_collision_prefixes_sanitised_owner(self, agent):
+        # An existing direct tool named "fetch" forces the colliding one to be
+        # prefixed with the schema-safe owner ("mcp:fetch" -> "mcp_fetch").
+        agent.register_dynamic_tools("native", [_make_mock_tool("fetch")])
+        agent.register_dynamic_tools("mcp:fetch", [_make_mock_tool("fetch")])
+        assert "fetch" in agent._direct_tools  # the first (native) one
+        assert "mcp_fetch__fetch" in agent._direct_tools  # disambiguated
+        assert agent._tool_to_feature["mcp_fetch__fetch"] == "mcp:fetch"
+
+    def test_pin_exempts_owner_from_eviction(self, agent):
+        agent.MAX_DIRECT_TOOLS = 2
+        agent.register_dynamic_tools("mcp:pinned", [_make_mock_tool("keep_me")], pin=True)
+        # Flood with unpinned owners to force eviction.
+        for i in range(5):
+            agent.register_dynamic_tools(f"mcp:tmp{i}", [_make_mock_tool(f"t{i}")])
+        assert "keep_me" in agent._direct_tools  # pinned survived
+        assert "mcp:pinned" in agent._pinned_features
+
+    def test_unregister_discards_pin(self, agent):
+        agent.register_dynamic_tools("mcp:pinned", [_make_mock_tool("keep_me")], pin=True)
+        agent.unregister_dynamic_tools("mcp:pinned")
+        assert "mcp:pinned" not in agent._pinned_features
+        assert "keep_me" not in agent._direct_tools
+
+    def test_double_collision_stays_unique(self, agent):
+        """Owners that sanitise to the same prefix + same tool name don't clobber."""
+        agent.register_dynamic_tools("native", [_make_mock_tool("search")])
+        agent.register_dynamic_tools("mcp:foo-bar", [_make_mock_tool("search")])
+        agent.register_dynamic_tools("mcp:foo_bar", [_make_mock_tool("search")])
+        # All three distinct registrations survive with unique names.
+        assert len([n for n in agent._direct_tools if n.endswith("search") or "search" in n]) >= 3
+        defs = [d["function"]["name"] for d in agent._direct_tool_defs]
+        assert len(defs) == len(set(defs)), f"duplicate schema names: {defs}"
+        # Each owner still owns exactly one tool.
+        for owner in ("native", "mcp:foo-bar", "mcp:foo_bar"):
+            owned = [n for n, o in agent._tool_to_feature.items() if o == owner]
+            assert len(owned) == 1, (owner, owned)
+
+    def test_long_owner_name_is_bounded_to_provider_cap(self, agent):
+        """A long owner + colliding tool name must not exceed the 64-char cap."""
+        long_owner = "mcp:" + "a" * 80  # e.g. a package-name/URL-shaped id
+        agent.register_dynamic_tools("native", [_make_mock_tool("search")])
+        agent.register_dynamic_tools(long_owner, [_make_mock_tool("search")])
+        for d in agent._direct_tool_defs:
+            assert len(d["function"]["name"]) <= agent.MAX_TOOL_NAME_LEN
+        # The long owner still registered exactly one (reachable, unique) tool.
+        owned = [n for n, o in agent._tool_to_feature.items() if o == long_owner]
+        assert len(owned) == 1
+        assert owned[0] in agent._direct_tools
+
+    def test_invalid_char_tool_names_are_sanitised(self, agent):
+        """MCP-style names with . / : become provider-valid (and unique)."""
+        import re as _re
+        agent.register_dynamic_tools(
+            "mcp:srv",
+            [_make_mock_tool("server.tool"), _make_mock_tool("fetch/raw"),
+             _make_mock_tool("pkg:search")],
+        )
+        names = [d["function"]["name"] for d in agent._direct_tool_defs]
+        assert len(names) == 3
+        for n in names:
+            assert _re.fullmatch(r"[a-zA-Z0-9_-]+", n), n
+        assert len(set(names)) == 3  # still unique
+        # All three reachable and owned.
+        owned = [n for n, o in agent._tool_to_feature.items() if o == "mcp:srv"]
+        assert len(owned) == 3 and all(n in agent._direct_tools for n in owned)

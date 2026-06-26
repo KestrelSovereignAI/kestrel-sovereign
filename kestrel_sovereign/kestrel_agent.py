@@ -2007,18 +2007,13 @@ class KestrelAgent(
                 )
 
         self.features.pop(feature_key, None)
-        self._explored_features.pop(feature_tool_name, None)
+        # Capture the owned tool names before unregister mutates the maps;
+        # _tool_context_hidden_tools is reconciled against them below.
         to_remove = [
             name for name, owner in self._tool_to_feature.items()
             if owner == feature_tool_name
         ]
-        for name in to_remove:
-            self._direct_tools.pop(name, None)
-            self._tool_to_feature.pop(name, None)
-        self._direct_tool_defs = [
-            tool_def for tool_def in self._direct_tool_defs
-            if tool_def.get("function", {}).get("name") not in to_remove
-        ]
+        self.unregister_dynamic_tools(feature_tool_name)
         if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
             self._tool_context_hidden_features.discard(feature_tool_name)
             self._tool_context_hidden_features.discard(feature_key)

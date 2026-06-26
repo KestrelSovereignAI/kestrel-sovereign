@@ -6,7 +6,9 @@ orchestrator LLM, including feature dispatcher tools and directly-promoted
 individual tools with LRU eviction.
 """
 
+import hashlib
 import logging
+import re
 from typing import Any, Dict, List
 
 from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
@@ -20,6 +22,43 @@ class ToolRegistryMixin:
     # headroom for the common model_agent + memory_feature exploration
     # path without immediately evicting the first explored feature.
     MAX_DIRECT_TOOLS = 80
+
+    # OpenAI (and most providers) cap function names at 64 chars matching
+    # ``^[a-zA-Z0-9_-]+$``. A single over-length name rejects the entire tool
+    # list request, so every dynamically-generated name is bounded here.
+    MAX_TOOL_NAME_LEN = 64
+
+    def _bounded_unique_tool_name(self, candidate: str) -> str:
+        """Return a provider-safe (<=64 char), registry-unique tool name.
+
+        Provider function names must match ``^[a-zA-Z0-9_-]+$``; MCP tool names
+        routinely contain ``.``/``/``/``:`` (e.g. ``server.tool``,
+        ``fetch/raw``), so any invalid char is replaced first — otherwise a
+        single bad name rejects the whole tool-list request. The schema name is
+        purely the LLM-facing handle; the tool's own ``.execute`` knows the real
+        downstream name, so renaming here is safe.
+
+        Over-length candidates (common for MCP owners that are package names
+        or URLs once prefixed) are then truncated and suffixed with a short
+        stable hash of the full candidate. Any residual collision (including
+        ones created by sanitisation, e.g. ``fetch.raw`` and ``fetch/raw``) gets
+        a numeric suffix. Uniqueness is checked against ``_direct_tools`` so two
+        owners can never end up writing the same schema name.
+        """
+        candidate = re.sub(r"[^a-zA-Z0-9_-]", "_", str(candidate))
+        limit = self.MAX_TOOL_NAME_LEN
+        if len(candidate) > limit:
+            digest = hashlib.sha1(candidate.encode()).hexdigest()[:8]
+            candidate = f"{candidate[: limit - 9]}_{digest}"
+        if candidate not in self._direct_tools:
+            return candidate
+        base = candidate[: limit - 4]
+        suffix = 2
+        name = f"{base}_{suffix}"
+        while name in self._direct_tools:
+            suffix += 1
+            name = f"{base}_{suffix}"
+        return name
 
     def _build_feature_tools(self) -> List[Dict[str, Any]]:
         """
@@ -130,12 +169,93 @@ class ToolRegistryMixin:
             if isinstance(tool_def.get("function", {}).get("name"), str)
         }
 
+    def register_dynamic_tools(self, owner: str, tools, *, pin: bool = False) -> int:
+        """Mount runtime tools owned by ``owner`` into the direct-tool registry.
+
+        This is the single primitive for adding first-class, LLM-callable tools
+        at runtime. Both feature exploration (``owner`` = ``feature.tool_name``)
+        and out-of-band tool sources such as MCP servers (``owner`` =
+        ``"mcp:<server>"``) go through here, so every dynamically-mounted tool
+        gets the same progressive-disclosure schema slot, LRU eviction, and —
+        because execution flows through ``_dispatch_direct_tool`` —
+        ``ToolResult`` envelope, ``a2a_tool_dispatches`` row, hook, and
+        permission treatment.
+
+        ``tools`` is any iterable of tool handles exposing ``.name`` and
+        ``.schema.to_openai_format()`` plus an awaitable ``.execute(**kwargs)``
+        (the SDK ``AgentTool`` protocol). Names that collide with an existing
+        direct tool are disambiguated as ``<owner>__<tool.name>`` (the owner is
+        sanitised to a schema-safe token first). Returns the number registered.
+
+        ``owner`` is recorded in ``_explored_features`` so eviction and
+        :meth:`unregister_dynamic_tools` treat feature- and non-feature owners
+        uniformly. ``pin=True`` exempts the owner from LRU eviction.
+
+        Permissions: a tool not present in the security permission store
+        resolves to ``PermissionLevel.ASK`` (the safe default — never a silent
+        ALLOW), so dynamically-mounted tools are always gated. Letting an
+        operator *preconfigure* ALLOW/DENY for non-feature owners (the security
+        feature only enumerates ``self.agent.features`` today) is handled in
+        #1979 PR5; it is a convenience, not a safety gap.
+        """
+        safe_owner = re.sub(r"\W+", "_", str(owner))
+        self._explored_features[owner] = True
+        if pin:
+            self._pinned_features.add(owner)
+        registered = 0
+        for tool in tools:
+            name = tool.name
+            if name in self._direct_tools:
+                name = f"{safe_owner}__{tool.name}"
+            # Bound to the provider name cap AND guarantee uniqueness — covers
+            # long MCP owner/tool identifiers and the case where two owners
+            # sanitise to the same prefix and expose a colliding tool name.
+            name = self._bounded_unique_tool_name(name)
+            self._direct_tools[name] = tool
+            tool_def = tool.schema.to_openai_format()
+            tool_def["function"]["name"] = name
+            self._direct_tool_defs.append(tool_def)
+            self._tool_to_feature[name] = owner
+            registered += 1
+        self._maybe_evict_direct_tools()
+        logging.info(
+            f"[DYNAMIC-TOOLS] Registered {registered} direct tools for "
+            f"'{owner}'. Total: {len(self._direct_tools)}"
+        )
+        return registered
+
+    def unregister_dynamic_tools(self, owner: str) -> int:
+        """Remove all direct tools owned by ``owner`` (inverse of
+        :meth:`register_dynamic_tools`).
+
+        Used when a feature is disabled or an MCP server is removed. Returns the
+        number of tools removed.
+        """
+        to_remove = [
+            name for name, tool_owner in self._tool_to_feature.items()
+            if tool_owner == owner
+        ]
+        for name in to_remove:
+            self._direct_tools.pop(name, None)
+            self._tool_to_feature.pop(name, None)
+        if to_remove:
+            removed = set(to_remove)
+            self._direct_tool_defs = [
+                tool_def for tool_def in self._direct_tool_defs
+                if tool_def.get("function", {}).get("name") not in removed
+            ]
+        self._explored_features.pop(owner, None)
+        self._pinned_features.discard(owner)
+        return len(to_remove)
+
     def _register_explored_feature_tools(self, feature) -> None:
         """Register a feature's individual tools for direct calling.
 
         After a successful subagent dispatch, the feature's @tool methods
         become available for the orchestrator to call directly without
-        a subagent LLM hop.
+        a subagent LLM hop. Thin wrapper over :meth:`register_dynamic_tools`
+        that adds the feature-specific idempotency guard and ToolResult
+        contract enforcement.
         """
         if feature.tool_name in self._explored_features:
             return
@@ -146,25 +266,7 @@ class ToolRegistryMixin:
         # registration failure rather than letting it propagate would
         # silently ship an honesty-violating tool, so we let it surface.
         enforce_tool_result_contract(feature)
-        self._explored_features[feature.tool_name] = True
-        registered = 0
-        for tool in feature.get_tools():
-            if tool.name in self._direct_tools:
-                name = f"{feature.tool_name}__{tool.name}"
-            else:
-                name = tool.name
-            self._direct_tools[name] = tool
-            tool_def = tool.schema.to_openai_format()
-            tool_def["function"]["name"] = name
-            self._direct_tool_defs.append(tool_def)
-            self._tool_to_feature[name] = feature.tool_name
-            registered += 1
-        self._maybe_evict_direct_tools()
-        logging.info(
-            f"[DYNAMIC-TOOLS] Explored {feature.tool_name}, "
-            f"registered {registered} direct tools. "
-            f"Total: {len(self._direct_tools)}"
-        )
+        self.register_dynamic_tools(feature.tool_name, feature.get_tools())
 
     def _maybe_evict_direct_tools(self) -> None:
         """Evict least-recently-explored feature's tools if over limit.
