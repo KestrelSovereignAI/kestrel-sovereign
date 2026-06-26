@@ -747,3 +747,17 @@ class TestRegisterDynamicToolsPublicAPI:
         agent.unregister_dynamic_tools("mcp:pinned")
         assert "mcp:pinned" not in agent._pinned_features
         assert "keep_me" not in agent._direct_tools
+
+    def test_double_collision_stays_unique(self, agent):
+        """Owners that sanitise to the same prefix + same tool name don't clobber."""
+        agent.register_dynamic_tools("native", [_make_mock_tool("search")])
+        agent.register_dynamic_tools("mcp:foo-bar", [_make_mock_tool("search")])
+        agent.register_dynamic_tools("mcp:foo_bar", [_make_mock_tool("search")])
+        # All three distinct registrations survive with unique names.
+        assert len([n for n in agent._direct_tools if n.endswith("search") or "search" in n]) >= 3
+        defs = [d["function"]["name"] for d in agent._direct_tool_defs]
+        assert len(defs) == len(set(defs)), f"duplicate schema names: {defs}"
+        # Each owner still owns exactly one tool.
+        for owner in ("native", "mcp:foo-bar", "mcp:foo_bar"):
+            owned = [n for n, o in agent._tool_to_feature.items() if o == owner]
+            assert len(owned) == 1, (owner, owned)

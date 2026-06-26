@@ -159,10 +159,19 @@ class ToolRegistryMixin:
             self._pinned_features.add(owner)
         registered = 0
         for tool in tools:
-            if tool.name in self._direct_tools:
+            name = tool.name
+            if name in self._direct_tools:
                 name = f"{safe_owner}__{tool.name}"
-            else:
-                name = tool.name
+            # Guarantee the final name is unique even when the prefixed name
+            # also collides (e.g. two owners that sanitise to the same token,
+            # 'mcp:foo-bar' and 'mcp:foo_bar', each exposing 'search'). Without
+            # this, the second registration would overwrite the first and leave
+            # duplicate schema/owner bookkeeping.
+            if name in self._direct_tools:
+                base, suffix = name, 2
+                while name in self._direct_tools:
+                    name = f"{base}_{suffix}"
+                    suffix += 1
             self._direct_tools[name] = tool
             tool_def = tool.schema.to_openai_format()
             tool_def["function"]["name"] = name
