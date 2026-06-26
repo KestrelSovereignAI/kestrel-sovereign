@@ -31,6 +31,9 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoEnv,
+  assertIsolatedDemoTarget,
+  demoIsolationVerified,
   authHeaders,
   demoGoto,
   demoSendMessage,
@@ -57,7 +60,13 @@ async function setPrivacyModeViaApi(request, mode) {
 test.describe.serial('EPHEMERAL Purge Vignette', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    // Local isolation checks BEFORE any credentialed call (issue #1974).
+    assertIsolatedDemoEnv(BASE_URL);
+
     apiKey = await getApiKey(request, BASE_URL);
+
+    // Refuse to run against a live instance before any mutation (issue #1974).
+    await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
     narrator.act(0, 'Setup');
     narrator.narrate(apiKey ? 'API key acquired' : 'No API key (public mode)');
     // Ensure we start in NORMAL — prior runs might have left a different mode.
@@ -65,8 +74,12 @@ test.describe.serial('EPHEMERAL Purge Vignette', () => {
   });
 
   test.afterAll(async ({ request }) => {
+    // afterAll runs even when beforeAll aborts, so only mutate if isolation was
+    // verified — never touch a live instance on teardown (issue #1974).
     // Restore NORMAL on the way out so the demo agent isn't left in EPHEMERAL.
-    try { await setPrivacyModeViaApi(request, 'normal'); } catch { /* best-effort */ }
+    if (demoIsolationVerified()) {
+      try { await setPrivacyModeViaApi(request, 'normal'); } catch { /* best-effort */ }
+    }
     const narrationPath = path.join(OUTPUT_DIR, 'narration.md');
     fs.writeFileSync(narrationPath, narrator.toMarkdown(), 'utf-8');
     console.log(`[DEMO] Narration written to ${narrationPath}`);

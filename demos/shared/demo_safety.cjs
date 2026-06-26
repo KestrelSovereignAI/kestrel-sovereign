@@ -103,6 +103,30 @@ function resetDemoAgentDatabases(narrator, dataDir) {
   }
 }
 
+const LIVE_PORT_RE = /:8888(\b|\/|$)/;
+
+/**
+ * Local, credential-free isolation checks: the target is not the live port and
+ * this is a `kestrel demo run` (KESTREL_DEMO_SERVER=1). Call this BEFORE any
+ * network/credential side effect (e.g. getApiKey hits /api/auth/key, which can
+ * generate and persist a key on a live host) so a raw run aborts first.
+ * @param {string} baseUrl
+ */
+function assertIsolatedDemoEnv(baseUrl) {
+  if (LIVE_PORT_RE.test(baseUrl)) {
+    throw new Error(
+      `Refusing to run the demo against ${baseUrl}: port 8888 is the live server. `
+      + 'Launch via `kestrel demo run`, which starts an isolated server on its own port.',
+    );
+  }
+  if (!isDemoServerEnv()) {
+    throw new Error(
+      'Refusing to run the demo: KESTREL_DEMO_SERVER is not set. This must be an '
+      + 'isolated demo run launched via `kestrel demo run`, not a raw Playwright run.',
+    );
+  }
+}
+
 /**
  * Decide, fail-CLOSED, whether an /api/agents response proves an isolated demo
  * instance. Throws unless: the response was OK, the body is an agents array (or
@@ -140,10 +164,20 @@ function assertOnlyDemoAgents({ ok, status, data }) {
   }
 }
 
+// Latched true only once assertIsolatedDemoTarget has fully verified isolation.
+// Teardown (`afterAll`) runs even when `beforeAll` throws, so teardown mutations
+// must gate on this — otherwise an aborted live-target run still mutates on exit.
+let _isolationVerified = false;
+function markDemoIsolationVerified() { _isolationVerified = true; }
+function demoIsolationVerified() { return _isolationVerified; }
+
 module.exports = {
   isDemoServerEnv,
   requireDemoSandbox,
   isInsideSandbox,
   resetDemoAgentDatabases,
+  assertIsolatedDemoEnv,
   assertOnlyDemoAgents,
+  markDemoIsolationVerified,
+  demoIsolationVerified,
 };

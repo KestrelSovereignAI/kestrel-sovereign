@@ -33,6 +33,9 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoEnv,
+  assertIsolatedDemoTarget,
+  demoIsolationVerified,
   authHeaders,
   demoGoto,
   navigateToPanel,
@@ -66,14 +69,24 @@ async function setMode(request, mode) {
 test.describe.serial('Privacy Modes Vignette', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    // Local isolation checks BEFORE any credentialed call (issue #1974).
+    assertIsolatedDemoEnv(BASE_URL);
+
     apiKey = await getApiKey(request, BASE_URL);
+
+    // Refuse to run against a live instance before any mutation (issue #1974).
+    await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
     narrator.act(0, 'Setup');
     narrator.narrate(apiKey ? 'API key acquired' : 'No API key (public mode)');
     try { await setMode(request, 'normal'); } catch { /* best-effort */ }
   });
 
   test.afterAll(async ({ request }) => {
-    try { await setMode(request, 'normal'); } catch { /* best-effort */ }
+    // afterAll runs even when beforeAll aborts, so only mutate if isolation was
+    // verified — never touch a live instance on teardown (issue #1974).
+    if (demoIsolationVerified()) {
+      try { await setMode(request, 'normal'); } catch { /* best-effort */ }
+    }
     const narrationPath = path.join(OUTPUT_DIR, 'narration.md');
     fs.writeFileSync(narrationPath, narrator.toMarkdown(), 'utf-8');
     console.log(`[DEMO] Narration written to ${narrationPath}`);

@@ -28,6 +28,8 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoEnv,
+  assertIsolatedDemoTarget,
   demoGoto,
   demoSendMessage,
   navigateToPanel,
@@ -43,7 +45,13 @@ let apiKey = null;
 test.describe.serial('Kestrel Metrics Dashboard Demo', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    // Local isolation checks BEFORE any credentialed call (issue #1974).
+    assertIsolatedDemoEnv(BASE_URL);
+
     apiKey = await getApiKey(request, BASE_URL);
+
+    // Refuse to run against a live instance before any mutation (issue #1974).
+    await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
     // Approval modal is suppressed server-side via KESTREL_DEMO_SERVER=1
     // (set by kestrel demo run). See SecurityFeature._register_all_tools.
   });

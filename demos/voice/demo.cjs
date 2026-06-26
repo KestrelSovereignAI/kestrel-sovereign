@@ -37,13 +37,15 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoEnv,
+  assertIsolatedDemoTarget,
   authHeaders,
   demoGoto,
   navigateToPanel,
   dismissContextWarning,
 } = require('../shared/demo_helpers.cjs');
 
-const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
+const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8900';
 const OUTPUT_DIR = path.join(__dirname, 'demo-output');
 
 const narrator = new NarrationEngine({ title: 'Kestrel Sovereign — Voice Demo Transcript' });
@@ -60,7 +62,13 @@ test.describe.serial('Kestrel Voice Demo', () => {
     } catch (e) {
       narrator.narrate(`Server health check failed: ${e.message} — demo may not work`);
     }
+    // Local isolation checks BEFORE any credentialed call (issue #1974).
+    assertIsolatedDemoEnv(BASE_URL);
+
     apiKey = await getApiKey(request, BASE_URL);
+
+    // Refuse to run against a live instance before any mutation (issue #1974).
+    await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
     narrator.narrate(apiKey ? 'API key acquired' : 'No API key (public mode)');
   });
 
