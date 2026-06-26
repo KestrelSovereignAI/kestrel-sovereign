@@ -45,7 +45,7 @@ class ToolRegistryMixin:
         a numeric suffix. Uniqueness is checked against ``_direct_tools`` so two
         owners can never end up writing the same schema name.
         """
-        candidate = re.sub(r"[^a-zA-Z0-9_-]", "_", candidate)
+        candidate = re.sub(r"[^a-zA-Z0-9_-]", "_", str(candidate))
         limit = self.MAX_TOOL_NAME_LEN
         if len(candidate) > limit:
             digest = hashlib.sha1(candidate.encode()).hexdigest()[:8]
@@ -198,7 +198,7 @@ class ToolRegistryMixin:
         feature only enumerates ``self.agent.features`` today) is handled in
         #1979 PR5; it is a convenience, not a safety gap.
         """
-        safe_owner = re.sub(r"\W+", "_", owner)
+        safe_owner = re.sub(r"\W+", "_", str(owner))
         self._explored_features[owner] = True
         if pin:
             self._pinned_features.add(owner)
