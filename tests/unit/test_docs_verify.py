@@ -54,6 +54,27 @@ def test_committed_outputs_carry_no_head_relative_activity_data():
         assert all(f not in docs_verify.ACTIVITY_FINDINGS for f in route["findings"])
 
 
+def test_generated_docs_have_no_volatile_link_or_code_refs():
+    # #1971: REPO_MAP.md (and other generated docs) embedded a repo-size-
+    # dependent code-ref set (~1400 entries) that grew on every nightly regen
+    # and restaled the committed ledger/manifest, redding out main and blocking
+    # all merges. Generated docs must stay in render routing but carry empty,
+    # stable link/ref sets so out-of-band regeneration never desyncs the
+    # committed artifacts.
+    items = docs_verify.verify_docs(
+        since=docs_verify.DEFAULT_SINCE,
+        ignored_prs=docs_verify.DEFAULT_IGNORED_PRS,
+    )
+    repo_map = next((i for i in items if i.path == "docs/audit/REPO_MAP.md"), None)
+    assert repo_map is not None, "REPO_MAP.md should still be verified and routed"
+    assert repo_map.render == "public", "generated docs must keep their render routing"
+    assert repo_map.existing_code_refs == (), "generated docs must not embed a volatile code-ref set"
+    assert repo_map.missing_code_refs == ()
+    assert repo_map.missing_links == ()
+    assert "missing_code_refs" not in repo_map.findings
+    assert "missing_local_links" not in repo_map.findings
+
+
 def test_activity_view_is_live_and_separate():
     # The recent-PR review queue is still available, computed live, not committed.
     items = docs_verify.verify_docs(
