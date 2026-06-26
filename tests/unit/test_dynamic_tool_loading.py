@@ -761,3 +761,15 @@ class TestRegisterDynamicToolsPublicAPI:
         for owner in ("native", "mcp:foo-bar", "mcp:foo_bar"):
             owned = [n for n, o in agent._tool_to_feature.items() if o == owner]
             assert len(owned) == 1, (owner, owned)
+
+    def test_long_owner_name_is_bounded_to_provider_cap(self, agent):
+        """A long owner + colliding tool name must not exceed the 64-char cap."""
+        long_owner = "mcp:" + "a" * 80  # e.g. a package-name/URL-shaped id
+        agent.register_dynamic_tools("native", [_make_mock_tool("search")])
+        agent.register_dynamic_tools(long_owner, [_make_mock_tool("search")])
+        for d in agent._direct_tool_defs:
+            assert len(d["function"]["name"]) <= agent.MAX_TOOL_NAME_LEN
+        # The long owner still registered exactly one (reachable, unique) tool.
+        owned = [n for n, o in agent._tool_to_feature.items() if o == long_owner]
+        assert len(owned) == 1
+        assert owned[0] in agent._direct_tools

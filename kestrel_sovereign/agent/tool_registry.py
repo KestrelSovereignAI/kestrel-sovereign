@@ -6,6 +6,7 @@ orchestrator LLM, including feature dispatcher tools and directly-promoted
 individual tools with LRU eviction.
 """
 
+import hashlib
 import logging
 import re
 from typing import Any, Dict, List
@@ -21,6 +22,34 @@ class ToolRegistryMixin:
     # headroom for the common model_agent + memory_feature exploration
     # path without immediately evicting the first explored feature.
     MAX_DIRECT_TOOLS = 80
+
+    # OpenAI (and most providers) cap function names at 64 chars matching
+    # ``^[a-zA-Z0-9_-]+$``. A single over-length name rejects the entire tool
+    # list request, so every dynamically-generated name is bounded here.
+    MAX_TOOL_NAME_LEN = 64
+
+    def _bounded_unique_tool_name(self, candidate: str) -> str:
+        """Return a provider-safe (<=64 char), registry-unique tool name.
+
+        Over-length candidates (common for MCP owners that are package names
+        or URLs once prefixed) are truncated and suffixed with a short stable
+        hash of the full candidate. Any residual collision gets a numeric
+        suffix. Uniqueness is checked against ``_direct_tools`` so two owners
+        can never end up writing the same schema name.
+        """
+        limit = self.MAX_TOOL_NAME_LEN
+        if len(candidate) > limit:
+            digest = hashlib.sha1(candidate.encode()).hexdigest()[:8]
+            candidate = f"{candidate[: limit - 9]}_{digest}"
+        if candidate not in self._direct_tools:
+            return candidate
+        base = candidate[: limit - 4]
+        suffix = 2
+        name = f"{base}_{suffix}"
+        while name in self._direct_tools:
+            suffix += 1
+            name = f"{base}_{suffix}"
+        return name
 
     def _build_feature_tools(self) -> List[Dict[str, Any]]:
         """
@@ -152,6 +181,13 @@ class ToolRegistryMixin:
         ``owner`` is recorded in ``_explored_features`` so eviction and
         :meth:`unregister_dynamic_tools` treat feature- and non-feature owners
         uniformly. ``pin=True`` exempts the owner from LRU eviction.
+
+        Permissions: a tool not present in the security permission store
+        resolves to ``PermissionLevel.ASK`` (the safe default — never a silent
+        ALLOW), so dynamically-mounted tools are always gated. Letting an
+        operator *preconfigure* ALLOW/DENY for non-feature owners (the security
+        feature only enumerates ``self.agent.features`` today) is handled in
+        #1979 PR5; it is a convenience, not a safety gap.
         """
         safe_owner = re.sub(r"\W+", "_", owner)
         self._explored_features[owner] = True
@@ -162,16 +198,10 @@ class ToolRegistryMixin:
             name = tool.name
             if name in self._direct_tools:
                 name = f"{safe_owner}__{tool.name}"
-            # Guarantee the final name is unique even when the prefixed name
-            # also collides (e.g. two owners that sanitise to the same token,
-            # 'mcp:foo-bar' and 'mcp:foo_bar', each exposing 'search'). Without
-            # this, the second registration would overwrite the first and leave
-            # duplicate schema/owner bookkeeping.
-            if name in self._direct_tools:
-                base, suffix = name, 2
-                while name in self._direct_tools:
-                    name = f"{base}_{suffix}"
-                    suffix += 1
+            # Bound to the provider name cap AND guarantee uniqueness — covers
+            # long MCP owner/tool identifiers and the case where two owners
+            # sanitise to the same prefix and expose a colliding tool name.
+            name = self._bounded_unique_tool_name(name)
             self._direct_tools[name] = tool
             tool_def = tool.schema.to_openai_format()
             tool_def["function"]["name"] = name
