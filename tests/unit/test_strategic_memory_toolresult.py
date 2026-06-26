@@ -212,10 +212,30 @@ async def test_signal_dispatch_invalid_mode_rejected_not_dispatched():
         "kestrel_sovereign.features.strategic_memory.feature.dispatch_to_talon",
         new=boom,
     ):
-        for bad in ("suggst", "dry-run", "plan", ""):
+        # Genuine typos / ambiguous words must error (and list valid values).
+        # "run"/"apply"/"go" are deliberately NOT aliased to execute — a live
+        # dispatch requires the literal canonical value (#1923 asymmetry).
+        for bad in ("suggst", "run", "apply", "go", ""):
             result = await feat.signal_dispatch(mode=bad)
             assert result.status is ToolResultStatus.ERROR, bad
             assert "Must be one of: execute, suggest" in result.error
+    boom.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_dryrun_synonyms_map_to_suggest_no_dispatch():
+    """Safe preview synonyms (dry-run, plan, preview) normalize to 'suggest'
+    and never reach live dispatch (#1923)."""
+    boom = AsyncMock(side_effect=AssertionError("suggest must not dispatch"))
+    for syn in ("dry-run", "dry_run", "plan", "preview", "PLAN"):
+        feat = _make_feature({})
+        with patch(
+            "kestrel_sovereign.features.strategic_memory.feature.dispatch_to_talon",
+            new=boom,
+        ):
+            result = await feat.signal_dispatch(mode=syn)
+        assert result.status is ToolResultStatus.OK, syn
+        assert result.data["mode"] == "suggest", syn
     boom.assert_not_called()
 
 

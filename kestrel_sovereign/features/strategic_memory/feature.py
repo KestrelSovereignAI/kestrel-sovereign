@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 
 from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
 from .morning_signal import generate_morning_signal
@@ -25,6 +26,29 @@ from .session_log import collect_session_log
 from .talon_handoff import dispatch_to_talon, pick_top_issue
 
 logger = logging.getLogger(__name__)
+
+
+# Synonyms LLMs reach for on the strategic-memory enums. severity's canonical
+# middle value is ``medium`` here (unlike todo priority's ``normal``), so the
+# alias map is local. mode aliases steer dry-run phrasings onto ``suggest`` so a
+# preview request never accidentally dispatches a real issue to Talon.
+_SEVERITY_ALIASES = {
+    "moderate": "medium", "med": "medium", "normal": "medium",
+    "crit": "critical", "urgent": "critical", "blocker": "critical",
+    # NOTE: deliberately no "sevN" aliases — Sev1 means "most critical" in some
+    # incident taxonomies and "high" in others; too ambiguous to guess, so they
+    # fall through to a value-listing error.
+}
+# Asymmetric on purpose: ``signal_dispatch`` can ship a real issue to Talon, so
+# we only normalize synonyms onto the SAFE ``suggest`` (preview) side. We never
+# add aliases that resolve to ``execute`` — a live dispatch requires the literal
+# canonical value, so an ambiguous word ("run", "apply") errors (and lists the
+# valid values) rather than silently triggering an action (#1925).
+_DISPATCH_MODE_ALIASES = {
+    "dry-run": "suggest", "dryrun": "suggest", "dry_run": "suggest",
+    "preview": "suggest", "plan": "suggest", "simulate": "suggest",
+    "suggestion": "suggest", "propose": "suggest",
+}
 
 
 # Prefixes that the github-backed sub-modules (backlog_hygiene,
@@ -267,7 +291,7 @@ class StrategicMemoryFeature(Feature):
         """
         # Normalize + validate so an unrecognized severity isn't persisted
         # verbatim (later sort/format code only understands the four levels).
-        severity = (severity or "").strip().lower()
+        severity = _normalize_choice(severity or "", _SEVERITY_ALIASES)
         if severity not in ("low", "medium", "high", "critical"):
             return ToolResult.failed(
                 f"Invalid severity '{severity}'. Must be one of: low, medium, high, critical.",
@@ -383,7 +407,7 @@ class StrategicMemoryFeature(Feature):
         # Validate up-front. An unrecognized mode must NOT silently fall through
         # to the live execute/dispatch path — a typo like "suggst" or casing
         # like "Suggest" would otherwise ship a real issue to Talon (#1925).
-        mode = (mode or "").strip().lower()
+        mode = _normalize_choice(mode or "", _DISPATCH_MODE_ALIASES)
         if mode not in ("execute", "suggest"):
             return ToolResult.failed(
                 f"Invalid mode '{mode}'. Must be one of: execute, suggest.",

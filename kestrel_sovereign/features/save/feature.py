@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
@@ -105,10 +106,24 @@ class SaveFeature(Feature):
     # which only ever query these known types.
     _VALID_ITEM_TYPES = tuple(t.value for t in SavedItemType)
 
+    # Synonyms/plurals LLMs reach for that map onto the canonical item types
+    # (stash, file, excerpt, structured). Normalized before validation so a
+    # natural phrasing succeeds instead of being mis-filed under a custom type.
+    _ITEM_TYPE_ALIASES = {
+        "stashes": "stash",
+        "files": "file", "document": "file", "documents": "file", "doc": "file",
+        "excerpts": "excerpt", "snippet": "excerpt", "snippets": "excerpt",
+        "quote": "excerpt",
+        "structures": "structured", "record": "structured", "records": "structured",
+        "data": "structured", "json": "structured", "object": "structured",
+    }
+
     @classmethod
     def _normalize_item_type(cls, raw: str) -> str:
-        """Normalize an item_type string (strip + lowercase) for comparison."""
-        return (raw or "").strip().lower()
+        """Normalize an item_type string for comparison: strip + lowercase, then
+        map a known synonym/plural onto its canonical type. Unknown values pass
+        through (lower-cased) so genuine typos still hit the validator."""
+        return _normalize_choice(raw or "", cls._ITEM_TYPE_ALIASES)
 
     @classmethod
     def _item_type_error(cls, normalized: str, *, context: str = "save") -> ToolResult:
