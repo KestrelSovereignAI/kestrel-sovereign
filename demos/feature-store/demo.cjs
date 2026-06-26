@@ -28,6 +28,7 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoTarget,
   demoGoto,
   navigateToPanel,
   dismissContextWarning,
@@ -43,6 +44,9 @@ test.describe.serial('Kestrel Feature Store Demo', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     apiKey = await getApiKey(request, BASE_URL);
+
+    // Refuse to run against a live instance before any mutation (issue #1974).
+    await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
   });
 
   test.afterAll(() => {

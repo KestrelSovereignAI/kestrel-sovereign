@@ -35,6 +35,7 @@ const {
     highlightElement,
     clearHighlights,
     getApiKey,
+    assertIsolatedDemoTarget,
     authHeaders,
     demoSendMessage,
     demoGoto,
@@ -46,7 +47,7 @@ const {
     waitForSpawnCompletion,
 } = require('../shared/demo_helpers.cjs');
 
-const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
+const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8900';
 const OUTPUT_DIR = path.join(__dirname, 'demo-output');
 
 // ============================================================================
@@ -74,6 +75,9 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
         }
 
         apiKey = await getApiKey(request, BASE_URL);
+
+        // Refuse to run against a live instance before any mutation (issue #1974).
+        await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
         narrator.narrate(apiKey ? 'API key acquired' : 'No API key (public mode)');
 
         // Start a fresh session

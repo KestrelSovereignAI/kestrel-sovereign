@@ -33,6 +33,7 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoTarget,
   authHeaders,
   demoGoto,
   navigateToPanel,
@@ -67,6 +68,9 @@ test.describe.serial('Privacy Modes Vignette', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     apiKey = await getApiKey(request, BASE_URL);
+
+    // Refuse to run against a live instance before any mutation (issue #1974).
+    await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
     narrator.act(0, 'Setup');
     narrator.narrate(apiKey ? 'API key acquired' : 'No API key (public mode)');
     try { await setMode(request, 'normal'); } catch { /* best-effort */ }
