@@ -143,7 +143,7 @@ class TestRecallActionItems:
     async def test_rejects_invalid_status(self, feature):
         result = await feature.recall_action_items(status="nonsense")
         assert result.status is ToolResultStatus.ERROR
-        assert "pending/done/cancelled" in result.error
+        assert "pending, done, cancelled" in result.error
 
     @pytest.mark.asyncio
     async def test_rejects_invalid_days(self, feature):
