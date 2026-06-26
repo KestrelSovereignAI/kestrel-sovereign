@@ -33,6 +33,7 @@ const {
   getApiKey,
   assertIsolatedDemoEnv,
   assertIsolatedDemoTarget,
+  demoIsolationVerified,
   authHeaders,
   demoGoto,
   demoSendMessage,
@@ -73,8 +74,12 @@ test.describe.serial('EPHEMERAL Purge Vignette', () => {
   });
 
   test.afterAll(async ({ request }) => {
+    // afterAll runs even when beforeAll aborts, so only mutate if isolation was
+    // verified — never touch a live instance on teardown (issue #1974).
     // Restore NORMAL on the way out so the demo agent isn't left in EPHEMERAL.
-    try { await setPrivacyModeViaApi(request, 'normal'); } catch { /* best-effort */ }
+    if (demoIsolationVerified()) {
+      try { await setPrivacyModeViaApi(request, 'normal'); } catch { /* best-effort */ }
+    }
     const narrationPath = path.join(OUTPUT_DIR, 'narration.md');
     fs.writeFileSync(narrationPath, narrator.toMarkdown(), 'utf-8');
     console.log(`[DEMO] Narration written to ${narrationPath}`);

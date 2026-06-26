@@ -164,6 +164,13 @@ function assertOnlyDemoAgents({ ok, status, data }) {
   }
 }
 
+// Latched true only once assertIsolatedDemoTarget has fully verified isolation.
+// Teardown (`afterAll`) runs even when `beforeAll` throws, so teardown mutations
+// must gate on this — otherwise an aborted live-target run still mutates on exit.
+let _isolationVerified = false;
+function markDemoIsolationVerified() { _isolationVerified = true; }
+function demoIsolationVerified() { return _isolationVerified; }
+
 module.exports = {
   isDemoServerEnv,
   requireDemoSandbox,
@@ -171,4 +178,6 @@ module.exports = {
   resetDemoAgentDatabases,
   assertIsolatedDemoEnv,
   assertOnlyDemoAgents,
+  markDemoIsolationVerified,
+  demoIsolationVerified,
 };

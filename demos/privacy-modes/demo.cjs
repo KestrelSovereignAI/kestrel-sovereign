@@ -35,6 +35,7 @@ const {
   getApiKey,
   assertIsolatedDemoEnv,
   assertIsolatedDemoTarget,
+  demoIsolationVerified,
   authHeaders,
   demoGoto,
   navigateToPanel,
@@ -81,7 +82,11 @@ test.describe.serial('Privacy Modes Vignette', () => {
   });
 
   test.afterAll(async ({ request }) => {
-    try { await setMode(request, 'normal'); } catch { /* best-effort */ }
+    // afterAll runs even when beforeAll aborts, so only mutate if isolation was
+    // verified — never touch a live instance on teardown (issue #1974).
+    if (demoIsolationVerified()) {
+      try { await setMode(request, 'normal'); } catch { /* best-effort */ }
+    }
     const narrationPath = path.join(OUTPUT_DIR, 'narration.md');
     fs.writeFileSync(narrationPath, narrator.toMarkdown(), 'utf-8');
     console.log(`[DEMO] Narration written to ${narrationPath}`);

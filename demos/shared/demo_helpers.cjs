@@ -256,6 +256,8 @@ const {
   resetDemoAgentDatabases,
   assertIsolatedDemoEnv,
   assertOnlyDemoAgents,
+  markDemoIsolationVerified,
+  demoIsolationVerified,
 } = require('./demo_safety.cjs');
 
 /**
@@ -290,6 +292,8 @@ async function assertIsolatedDemoTarget(request, baseUrl, apiKey = null) {
     data = null; // non-JSON body → assertOnlyDemoAgents refuses (no agents array)
   }
   assertOnlyDemoAgents({ ok: resp.ok(), status: resp.status(), data });
+  // Isolation fully proven — teardown mutations may now run (gated on this).
+  markDemoIsolationVerified();
 }
 
 /**
@@ -477,6 +481,7 @@ module.exports = {
   resetDemoAgentDatabases,
   assertIsolatedDemoEnv,
   assertIsolatedDemoTarget,
+  demoIsolationVerified,
   isDemoServerEnv,
   requireDemoSandbox,
   startFreshSession,
