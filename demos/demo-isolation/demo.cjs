@@ -34,6 +34,7 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoEnv,
   assertIsolatedDemoTarget,
   demoGoto,
   demoSendMessage,
@@ -86,6 +87,9 @@ async function renderBanner(page, opts) {
 test.describe.serial('Demo Isolation Vignette', () => {
   test.beforeAll(async ({ request }) => {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    // Local isolation checks BEFORE any credentialed call (issue #1974).
+    assertIsolatedDemoEnv(BASE_URL);
+
     apiKey = await getApiKey(request, BASE_URL);
 
     // Refuse to run against a live instance before any mutation (issue #1974).

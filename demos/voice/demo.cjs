@@ -37,6 +37,7 @@ const {
   highlightElement,
   clearHighlights,
   getApiKey,
+  assertIsolatedDemoEnv,
   assertIsolatedDemoTarget,
   authHeaders,
   demoGoto,
@@ -61,6 +62,9 @@ test.describe.serial('Kestrel Voice Demo', () => {
     } catch (e) {
       narrator.narrate(`Server health check failed: ${e.message} — demo may not work`);
     }
+    // Local isolation checks BEFORE any credentialed call (issue #1974).
+    assertIsolatedDemoEnv(BASE_URL);
+
     apiKey = await getApiKey(request, BASE_URL);
 
     // Refuse to run against a live instance before any mutation (issue #1974).

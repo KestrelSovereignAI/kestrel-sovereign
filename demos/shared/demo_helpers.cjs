@@ -254,34 +254,26 @@ const {
   isDemoServerEnv,
   requireDemoSandbox,
   resetDemoAgentDatabases,
+  assertIsolatedDemoEnv,
   assertOnlyDemoAgents,
 } = require('./demo_safety.cjs');
 
 /**
- * Fail-fast guard for the demo entry point: prove the target is an isolated demo
- * server before any mutation (DB reset, permission toggles, model changes).
+ * Authenticated isolation guard: prove the target is an isolated demo server
+ * before any *network* mutation (DB reset, permission toggles, model changes).
  *
- * Defends against a raw `npx playwright test` pointed at a live host. Refuses the
- * live port (8888), requires KESTREL_DEMO_SERVER, and verifies every loaded agent
+ * Re-runs the local env checks (idempotent) then verifies every loaded agent
  * reports `is_demo=true` via /api/agents (mirrors cli_demo._verify_only_demo_agents).
+ *
+ * NOTE: call `assertIsolatedDemoEnv(baseUrl)` *before* fetching credentials —
+ * getApiKey hits /api/auth/key, which can generate/persist a key on a live host.
  *
  * @param {import('@playwright/test').APIRequestContext} request
  * @param {string} baseUrl
  * @param {string|null} [apiKey]
  */
 async function assertIsolatedDemoTarget(request, baseUrl, apiKey = null) {
-  if (/:8888(\b|\/|$)/.test(baseUrl)) {
-    throw new Error(
-      `Refusing to run the demo against ${baseUrl}: port 8888 is the live server. `
-      + 'Launch via `kestrel demo run`, which starts an isolated server on its own port.',
-    );
-  }
-  if (!isDemoServerEnv()) {
-    throw new Error(
-      'Refusing to run the demo: KESTREL_DEMO_SERVER is not set. This must be an '
-      + 'isolated demo run launched via `kestrel demo run`, not a raw Playwright run.',
-    );
-  }
+  assertIsolatedDemoEnv(baseUrl);
   // Fetch the agent roster and hand it to the fail-closed decision (which lives
   // in demo_safety.cjs so the security logic is unit-tested). Any response we
   // can't positively read as "only demo agents" is a refusal.
@@ -483,6 +475,7 @@ module.exports = {
   scrollChatToTop,
   scrollChatToBottom,
   resetDemoAgentDatabases,
+  assertIsolatedDemoEnv,
   assertIsolatedDemoTarget,
   isDemoServerEnv,
   requireDemoSandbox,

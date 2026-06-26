@@ -15,6 +15,7 @@ const require = createRequire(import.meta.url);
 // Import the dependency-free safety module directly (no @kestrel/flight needed).
 const {
   resetDemoAgentDatabases, requireDemoSandbox, isDemoServerEnv, assertOnlyDemoAgents,
+  assertIsolatedDemoEnv,
 } = require('../../demos/shared/demo_safety.cjs');
 
 const NOOP_NARRATOR = { narrate() {}, act() {} };
@@ -90,6 +91,21 @@ test('reset refuses entirely when not a demo run', () => {
     assert.throws(() => resetDemoAgentDatabases(NOOP_NARRATOR, root), /KESTREL_DEMO_SERVER is not set/);
   });
   assert.equal(fs.existsSync(db), true);
+});
+
+// assertIsolatedDemoEnv is the credential-free gate that must run BEFORE
+// getApiKey (which can mint/persist a key on a live host).
+test('assertIsolatedDemoEnv refuses the live port and missing demo flag', () => {
+  withEnv({ KESTREL_DEMO_SERVER: '1' }, () => {
+    assert.throws(() => assertIsolatedDemoEnv('http://localhost:8888'), /port 8888 is the live server/);
+    assert.throws(() => assertIsolatedDemoEnv('http://host:8888/'), /port 8888 is the live server/);
+  });
+  withEnv({ KESTREL_DEMO_SERVER: undefined }, () => {
+    assert.throws(() => assertIsolatedDemoEnv('http://localhost:8900'), /KESTREL_DEMO_SERVER is not set/);
+  });
+  withEnv({ KESTREL_DEMO_SERVER: '1' }, () => {
+    assert.doesNotThrow(() => assertIsolatedDemoEnv('http://localhost:8900'));
+  });
 });
 
 // assertOnlyDemoAgents must FAIL CLOSED — every non-isolated/ambiguous response

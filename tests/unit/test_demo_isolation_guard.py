@@ -30,6 +30,21 @@ def test_demo_calls_isolation_guard(demo: Path):
 
 
 @pytest.mark.parametrize("demo", DEMO_SCRIPTS, ids=lambda p: p.parent.name)
+def test_demo_env_guard_runs_before_credentials(demo: Path):
+    # getApiKey hits /api/auth/key (can mint/persist a key on a live host), so the
+    # credential-free env check must run first (issue #1974).
+    source = demo.read_text(encoding="utf-8")
+    env_at = source.find("assertIsolatedDemoEnv(BASE_URL)")
+    key_at = source.find("getApiKey(request, BASE_URL)")
+    assert env_at != -1, f"{demo.parent.name}/demo.cjs must call assertIsolatedDemoEnv(BASE_URL)."
+    assert key_at != -1, f"{demo.parent.name}/demo.cjs must fetch its API key via getApiKey."
+    assert env_at < key_at, (
+        f"{demo.parent.name}/demo.cjs must call assertIsolatedDemoEnv(BASE_URL) BEFORE getApiKey "
+        "so a live-instance run aborts before any credentialed side effect (issue #1974)."
+    )
+
+
+@pytest.mark.parametrize("demo", DEMO_SCRIPTS, ids=lambda p: p.parent.name)
 def test_demo_does_not_default_to_live_port(demo: Path):
     source = demo.read_text(encoding="utf-8")
     assert "localhost:8888" not in source, (

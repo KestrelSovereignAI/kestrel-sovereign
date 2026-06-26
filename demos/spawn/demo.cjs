@@ -35,6 +35,7 @@ const {
     highlightElement,
     clearHighlights,
     getApiKey,
+    assertIsolatedDemoEnv,
     assertIsolatedDemoTarget,
     authHeaders,
     demoSendMessage,
@@ -73,6 +74,9 @@ test.describe.serial('Kestrel Spawn Agent Demo', () => {
         } catch (e) {
             narrator.narrate(`Server health check failed: ${e.message} — demo may not work`);
         }
+
+        // Local isolation checks BEFORE any credentialed call (issue #1974).
+        assertIsolatedDemoEnv(BASE_URL);
 
         apiKey = await getApiKey(request, BASE_URL);
 
