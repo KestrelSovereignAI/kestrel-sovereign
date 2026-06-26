@@ -172,7 +172,7 @@ function renderFeatureCard(feature) {
             color: var(--text-secondary);
             margin-top: 0.25rem;
         ">
-            <span title="Skills provided">⚡</span>
+            <span title="Skills provided">${window.kicon('lightning')}</span>
             <span>${skills.length} skill${skills.length !== 1 ? 's' : ''}</span>
         </div>`
         : '';
@@ -492,7 +492,7 @@ function renderDetailModal(detail) {
     if (gitUrl) {
         linksHtml.push(`<a href="${escapeHtml(gitUrl)}" target="_blank" rel="noopener" style="
             color: var(--accent-color); font-size: 0.825rem; text-decoration: none;
-        ">View on GitHub ↗</a>`);
+        ">View on GitHub ${window.kicon('arrow-up-right')}</a>`);
     }
     if (installInstructions) {
         linksHtml.push(`<code style="
