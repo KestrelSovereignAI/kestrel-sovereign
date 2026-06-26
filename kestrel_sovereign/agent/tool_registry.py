@@ -31,12 +31,21 @@ class ToolRegistryMixin:
     def _bounded_unique_tool_name(self, candidate: str) -> str:
         """Return a provider-safe (<=64 char), registry-unique tool name.
 
+        Provider function names must match ``^[a-zA-Z0-9_-]+$``; MCP tool names
+        routinely contain ``.``/``/``/``:`` (e.g. ``server.tool``,
+        ``fetch/raw``), so any invalid char is replaced first — otherwise a
+        single bad name rejects the whole tool-list request. The schema name is
+        purely the LLM-facing handle; the tool's own ``.execute`` knows the real
+        downstream name, so renaming here is safe.
+
         Over-length candidates (common for MCP owners that are package names
-        or URLs once prefixed) are truncated and suffixed with a short stable
-        hash of the full candidate. Any residual collision gets a numeric
-        suffix. Uniqueness is checked against ``_direct_tools`` so two owners
-        can never end up writing the same schema name.
+        or URLs once prefixed) are then truncated and suffixed with a short
+        stable hash of the full candidate. Any residual collision (including
+        ones created by sanitisation, e.g. ``fetch.raw`` and ``fetch/raw``) gets
+        a numeric suffix. Uniqueness is checked against ``_direct_tools`` so two
+        owners can never end up writing the same schema name.
         """
+        candidate = re.sub(r"[^a-zA-Z0-9_-]", "_", candidate)
         limit = self.MAX_TOOL_NAME_LEN
         if len(candidate) > limit:
             digest = hashlib.sha1(candidate.encode()).hexdigest()[:8]

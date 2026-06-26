@@ -773,3 +773,20 @@ class TestRegisterDynamicToolsPublicAPI:
         owned = [n for n, o in agent._tool_to_feature.items() if o == long_owner]
         assert len(owned) == 1
         assert owned[0] in agent._direct_tools
+
+    def test_invalid_char_tool_names_are_sanitised(self, agent):
+        """MCP-style names with . / : become provider-valid (and unique)."""
+        import re as _re
+        agent.register_dynamic_tools(
+            "mcp:srv",
+            [_make_mock_tool("server.tool"), _make_mock_tool("fetch/raw"),
+             _make_mock_tool("pkg:search")],
+        )
+        names = [d["function"]["name"] for d in agent._direct_tool_defs]
+        assert len(names) == 3
+        for n in names:
+            assert _re.fullmatch(r"[a-zA-Z0-9_-]+", n), n
+        assert len(set(names)) == 3  # still unique
+        # All three reachable and owned.
+        owned = [n for n, o in agent._tool_to_feature.items() if o == "mcp:srv"]
+        assert len(owned) == 3 and all(n in agent._direct_tools for n in owned)
