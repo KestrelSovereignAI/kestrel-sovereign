@@ -259,6 +259,25 @@ async def test_batch_submit_and_results_are_keyed_by_custom_id():
 
 
 @pytest.mark.asyncio
+async def test_batch_submit_falls_back_to_stable_custom_ids():
+    # Default BatchRequest.custom_id is "" — OpenAI Batch rejects empty/duplicate
+    # ids, so the adapter must emit a stable non-empty id per line.
+    adapter = OpenAIAdapter()
+    client = _client()
+    requests = [
+        BatchRequest(model="gpt-5-mini", messages=[{"role": "user", "content": "a"}]),
+        BatchRequest(model="gpt-5-mini", messages=[{"role": "user", "content": "b"}]),
+    ]
+
+    await adapter.batch_submit(client, requests)
+
+    uploaded = client.files.create.await_args.kwargs["file"][1].decode("utf-8")
+    ids = [json.loads(line)["custom_id"] for line in uploaded.strip().splitlines()]
+    assert ids == ["request-0", "request-1"]
+    assert all(cid for cid in ids)
+
+
+@pytest.mark.asyncio
 async def test_raw_request_dispatches_provider_unique_operations():
     client = _client()
     result = await OpenAIAdapter().raw_request(

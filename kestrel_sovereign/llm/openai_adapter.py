@@ -874,12 +874,16 @@ class OpenAIAdapter(LLMAdapter):
         **kwargs: Any,
     ) -> Any:
         lines = []
-        for request in requests:
+        for index, request in enumerate(requests):
             body = self._batch_request_body(request)
+            # OpenAI Batch requires a unique, non-empty custom_id per line.
+            # BatchRequest.custom_id defaults to "" in the SDK, so fall back to a
+            # stable per-index id rather than emit empty ids that get rejected.
+            custom_id = getattr(request, "custom_id", "") or f"request-{index}"
             lines.append(
                 json.dumps(
                     {
-                        "custom_id": getattr(request, "custom_id", ""),
+                        "custom_id": custom_id,
                         "method": "POST",
                         "url": "/v1/chat/completions",
                         "body": body,
