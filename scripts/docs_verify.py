@@ -34,6 +34,7 @@ GENERATED_TIMESTAMP = "2026-06-24T00:00:00Z"
 INTERNAL_TYPES = {
     "Audit Ledger",
     "Audit Report",
+    "Demo Script",
     "Issue Body",
     "Review Lane",
     "Review Record",
