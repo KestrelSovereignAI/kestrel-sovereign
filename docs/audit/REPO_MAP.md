@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-26
-**Scope:** 1828 tracked files (1197 `.py`, 317 `.md`, 314 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-27
+**Scope:** 1835 tracked files (1202 `.py`, 317 `.md`, 316 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -410,6 +410,8 @@ Repo entry points and standard project files.
   - `class CloudRunProvider`
 - **kestrel_sovereign/features/deploy/secrets.py** — GCP Secret Manager sync — port of ``scripts/cloudrun/setup_secrets.sh``.
   - `class SecretSyncResult`; `def derive_secret_mapping(deploy_config, profile)`; `def load_env_file(path)`; `def sync_secret(client, project_id, secret_name, value)`; `def sync_all_secrets(deploy_config, env_path, project_id)`
+- **kestrel_sovereign/features/enum_coerce.py** — Shared helpers for agent-facing ``@tool`` parameters validated against a fixed set of values (priorities, statuses, modes, scopes, tiers, …).
+  - `def normalize_choice(value, aliases)`; `def coerce_enum(value, valid)`
 - **kestrel_sovereign/features/health/__init__.py** — Health Feature - periodic liveness probes for the agent.
 - **kestrel_sovereign/features/health/checks.py** — Individual health check functions for the Heartbeat Feature.
   - `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_context_budget(agent)`; `async def check_bootstrap_state(agent, threshold_seconds)`
@@ -1672,6 +1674,7 @@ Repo entry points and standard project files.
 - **tests/frontend/console_mount_cutover.test.mjs** — (mjs asset)
 - **tests/frontend/context_status_model_identity.test.mjs** — (mjs asset)
 - **tests/frontend/conversation_agent_switch.test.mjs** — (mjs asset)
+- **tests/frontend/demo_reset_guard.test.mjs** — (mjs asset)
 - **tests/frontend/dynamic_thinking_status.test.mjs** — (mjs asset)
 - **tests/frontend/effective_session_id.test.mjs** — (mjs asset)
 - **tests/frontend/history_rename.test.mjs** — (mjs asset)
@@ -2209,6 +2212,8 @@ Repo entry points and standard project files.
   - `def test_discovers_existing_demo_evidence()`; `def test_render_demo_evidence_index_has_okf_metadata()`; `def test_checked_in_demo_evidence_index_is_current()`; `def test_user_docs_link_to_demo_evidence()`
 - **tests/unit/test_demo_isolation.py** — Unit tests for the server-side demo-mode isolation rail (#766).
   - `def test_empty_multi_agent_is_live_mode()`; `def test_all_demo_agents_classifies_as_demo()`; `def test_one_live_agent_keeps_server_live()`; `def test_truthy_non_bool_is_demo_does_not_flip_classification()`; `async def test_live_server_live_target_no_header_is_refused_with_audit()`; `async def test_live_server_live_target_with_header_is_allowed_and_audited()`; `async def test_live_server_demo_target_passes_silently()`; `async def test_demo_server_demo_target_passes_silently()`; `…`
+- **tests/unit/test_demo_isolation_guard.py** — Every demo must guard against running on a live instance (issue #1974).
+  - `def test_demo_scripts_exist()`; `def test_demo_calls_isolation_guard(demo)`; `def test_demo_env_guard_runs_before_credentials(demo)`; `def test_demo_does_not_default_to_live_port(demo)`
 - **tests/unit/test_demo_server_multi_agent_guard.py** — Unit tests for the demo-server multi_agent auto-mount guard (#868-1).
   - `def test_demo_marker_with_existing_multi_agent_disables_auto_mount(tmp_path, monkeypatch)`; `def test_explicit_multi_agent_config_honored_even_in_demo_mode(tmp_path)`; `def test_no_demo_marker_uses_multi_agent_normally(tmp_path, monkeypatch)`; `def test_demo_marker_without_multi_agent_file_no_op(tmp_path, monkeypatch)`; `def test_demo_marker_truthy_variants(tmp_path, monkeypatch)`; `def test_lifespan_actually_calls_resolve_multi_agent_path()`
 - **tests/unit/test_denied_tools_dispatch.py** — Tests for security DENY enforcement at orchestrator dispatch level.
@@ -2244,7 +2249,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_docs_okf.py** — Tests for OKF documentation metadata tooling.
   - `def test_split_frontmatter_parses_yaml_mapping()`; `def test_validate_opt_in_okf_file(tmp_path)`; `def test_validate_all_requires_frontmatter(tmp_path)`; `def test_inventory_includes_okf_metadata(tmp_path)`; `def test_resolve_input_paths_expands_directories(tmp_path)`; `def test_render_index_lists_okf_and_pending_docs(tmp_path)`; `def test_render_log_lists_timestamped_okf_docs(tmp_path)`; `def test_write_or_check_generated_indexes(tmp_path)`; `…`
 - **tests/unit/test_docs_verify.py** — Tests for documentation verification and render routing.
-  - `def test_report_links_wrap_space_containing_targets()`; `def test_doc_relative_markdown_links_are_not_missing_code_refs()`; `def test_verification_outputs_are_current()`; `def test_committed_outputs_carry_no_head_relative_activity_data()`; `def test_activity_view_is_live_and_separate()`
+  - `def test_report_links_wrap_space_containing_targets()`; `def test_doc_relative_markdown_links_are_not_missing_code_refs()`; `def test_verification_outputs_are_current()`; `def test_committed_outputs_carry_no_head_relative_activity_data()`; `def test_generated_docs_have_no_volatile_link_or_code_refs()`; `def test_activity_view_is_live_and_separate()`
 - **tests/unit/test_docstring_parser.py** — Unit tests for docstring parameter parsing in features/base.py.
   - `class TestParseDocstringParams`; `class TestToolDecorator`; `class TestToolDecoratorIntegration`
 - **tests/unit/test_doctor.py** — Unit tests for kestrel_sovereign.doctor.
@@ -2285,6 +2290,10 @@ Repo entry points and standard project files.
   - `def test_database_tables_endpoint_returns_shape_from_storage()`; `def test_files_head_uses_existence_check_contract()`; `def test_observability_events_endpoint_returns_serialized_events()`; `def test_saved_items_structured_endpoint_uses_store_contract()`; `def test_openai_compatible_endpoints_return_minimal_contracts()`; `def test_v1_models_reports_mandated_model_not_provider_default()`; `def test_chat_completions_reports_active_model_not_request_echo()`; `def test_chat_completions_preserves_503_when_no_agent_bound()`; `…`
 - **tests/unit/test_endpoint_contracts.py** — —
   - `class TestCommandsEndpoint`; `class TestObservabilityEndpoints`; `class TestFilesEndpoint`; `class TestDatabaseExplorerHelpers`
+- **tests/unit/test_enum_coerce.py** — Unit tests for the shared enum-parameter coercion helpers (#1923).
+  - `class TestNormalizeChoice`; `class TestCoerceEnum`
+- **tests/unit/test_enum_param_normalization.py** — End-to-end regression tests for #1923: agent-facing @tool params validated against a fixed set now normalize the synonyms LLMs reach for, while genuine typos still fail with a value-listing error.
+  - `class TestSaveItemType`; `class TestStrategicSeverity`; `class TestMemoryActionItemStatus`; `class TestPerDomainAliasesDoNotCollide`
 - **tests/unit/test_ephemeral_purge_transition.py** — Unit tests for the EPHEMERAL hard-purge transition wiring (#767).
   - `async def test_clean_ephemeral_exit_calls_purge_and_skips_audit()`; `async def test_leaked_ephemeral_exit_writes_audit_with_breakdown()`; `async def test_normal_to_ephemeral_does_not_purge()`; `async def test_normal_to_isolated_does_not_purge()`; `async def test_ephemeral_to_ephemeral_does_not_purge()`; `async def test_audit_failure_does_not_block_purge_or_transition()`; `async def test_purge_failure_does_not_block_transition()`; `async def test_audit_skipped_when_security_feature_missing()`
 - **tests/unit/test_epistemic_status.py** — Tests for the epistemic status layer (#680).
@@ -2809,6 +2818,8 @@ Repo entry points and standard project files.
   - `async def test_invalid_mode_returns_error_not_no_messages_found()`; `async def test_invalid_mode_echoes_request_in_data()`; `async def test_valid_mode_is_normalized_and_runs()`
 - **tests/unit/test_system_prompt_assembler.py** — Unit tests for the priority-ordered system-prompt assembler.
   - `def test_section_name_strips_md_and_uppercases()`; `def test_assemble_minimal_has_constitution_only()`; `def test_assemble_full_combination_clause_order()`; `def test_assemble_skips_heartbeat_md()`; `def test_assemble_skips_agents_when_anchored_supplies_it()`; `def test_assemble_includes_agents_from_bootstrap_when_no_anchor()`; `def test_soul_fence_uses_your_identity_label()`; `def test_other_bootstrap_fence_uses_uppercase_basename()`; `…`
+- **tests/unit/test_system_prompt_truthful_reporting.py** — Regression: the base system prompt must carry a GENERAL truthful-tool- reporting rule, not one quarantined to cryptographic data (#1925).
+  - `def test_base_prompt_has_general_truthful_tool_reporting_rule()`; `def test_fabrication_rule_is_not_crypto_scoped_only()`
 - **tests/unit/test_talon_coordinator.py** — Tests for TalonCoordinatorFeature.
   - `class TestTalonCoordinatorInit`; `class TestTalonClaim`; `class TestTalonBatch`; `class TestTalonToolDocumentation`; `class TestTalonStatus`; `class TestTalonPauseResume`; `class TestA2ADispatch`; `class TestCLIDispatch`; `…`
 - **tests/unit/test_talon_daemon_runtime.py** — Daemon command contracts for backend-aware Talon runtime.
@@ -2922,6 +2933,7 @@ Repo entry points and standard project files.
 - **demos/privacy-modes/eye.toml** — (configuration)
 - **demos/privacy-modes/narration.md** — Privacy Modes Vignette — Narration — ## Why this feature exists
 - **demos/shared/demo_helpers.cjs** — —
+- **demos/shared/demo_safety.cjs** — —
 - **demos/spawn/config.cjs** — —
 - **demos/spawn/demo.cjs** — —
 - **demos/spawn/eye.toml** — (configuration)
