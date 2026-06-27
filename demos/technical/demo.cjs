@@ -67,8 +67,12 @@ let apiKey = null;
 test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
     test.beforeAll(async ({ request }) => {
-        // Create output directory
+        // Create output directory, and clear stale screenshots from prior runs so
+        // the output only ever contains THIS run's shots (no mixing old + new).
         fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+        for (const f of fs.readdirSync(OUTPUT_DIR)) {
+            if (f.endsWith('.png')) fs.unlinkSync(path.join(OUTPUT_DIR, f));
+        }
 
         narrator.act(0, 'Setup');
 
@@ -116,7 +120,12 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await demoGoto(page, BASE_URL, apiKey);
         await demoPause(page, 2000);
 
-        // Identity panel should be the default view
+        // Navigate to the Identity panel explicitly — the console now loads on
+        // Chat by default, so we can't assume Identity is the active view.
+        await navigateToPanel(page, 'identity');
+        await dismissContextWarning(page);
+        await demoPause(page, 1000);
+
         try {
             await page.waitForSelector('.identity-did-text', { timeout: 15000 });
             const didText = await page.locator('.identity-did-text').textContent();
