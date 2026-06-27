@@ -400,6 +400,34 @@ class TestAnthropicPlanVsApi:
         assert len(providers) == 1
         assert providers[0]["name"] == "anthropic:api"
 
+    def test_available_mandate_is_not_overridden_by_configured_fallback(
+        self, service_with_providers
+    ):
+        """#592 invariant: fallback must NOT override an explicit preference whose
+        route is available.
+
+        Even with a fallback to a *different, available* vendor configured, an
+        available mandated route is used verbatim and the fallback chain is never
+        consulted. Fallback may only kick in when the mandated route is
+        UNAVAILABLE — that complementary case is proven by
+        ``test_unavailable_with_fallbacks_degrades_gracefully`` (degrades to the
+        fallback) and ``test_stale_mandate_for_missing_route_raises_at_routing``
+        (no fallback configured -> raises rather than silently swapping vendors).
+        Together these pin the full "...unless the selected provider is
+        unavailable" clause.
+        """
+        svc = service_with_providers
+        svc.set_model_preference("claude-sonnet-4-6", vendor="anthropic", route="plan")
+        # A fallback to a different, available vendor/route is configured...
+        svc.add_fallback_model("gpt-5-mini", provider="openai")
+
+        providers, target = svc.resolve_provider_routing()
+
+        # ...but it is never consulted: the available mandated route wins verbatim.
+        assert [p["name"] for p in providers] == ["anthropic:plan"]
+        assert all(p["name"] != "openai:api" for p in providers)
+        assert target == "claude-sonnet-4-6"
+
 
 class TestOpenAIPlanRouting:
     """Contract: openai:plan is routable when registered."""
