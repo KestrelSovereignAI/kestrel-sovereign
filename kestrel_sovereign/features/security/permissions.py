@@ -486,8 +486,26 @@ class PermissionStore:
             f"WHERE feature_name IN ({placeholders}) AND tool_name = ?"
         )
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(query, (*names, tool_name))
-            rows = await cursor.fetchall()
+            try:
+                cursor = await db.execute(query, (*names, tool_name))
+                rows = await cursor.fetchall()
+            except aiosqlite.OperationalError as e:
+                # The security_permissions table may not exist at lookup time:
+                # the store hasn't finished initialize(), or a demo DB reset
+                # recreated the file out from under an already-initialized
+                # store (_initialized stays True, so the table is never
+                # re-created). Treat a missing table as "no grants recorded"
+                # and return [] so get_permission falls through to its default
+                # policy (demo server -> ALLOW, production -> ASK) instead of
+                # raising and hard-denying every tool with a confusing error
+                # the agent then misreports as a security policy block.
+                if "no such table" in str(e).lower():
+                    logger.warning(
+                        "security_permissions lookup hit a missing table "
+                        "(%s); falling back to default policy", e,
+                    )
+                    return []
+                raise
         levels: List[PermissionLevel] = []
         for row in rows:
             try:

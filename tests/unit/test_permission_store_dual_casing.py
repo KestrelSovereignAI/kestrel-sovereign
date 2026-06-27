@@ -250,3 +250,37 @@ async def test_get_permission_returns_ask_default_when_neither_row_present(tmp_p
         await store.get_permission("TaskFeature", "respond_to_a2a_task")
         == PermissionLevel.ASK
     )
+
+
+@pytest.mark.asyncio
+async def test_get_permission_missing_table_falls_back_to_default(tmp_path):
+    """A lookup against a DB whose ``security_permissions`` table doesn't exist
+    must NOT raise — it falls through to the default policy. This happens when
+    a demo DB reset recreates the file out from under an already-initialized
+    store, or before ``initialize()`` runs. Previously this raised
+    ``OperationalError: no such table`` and hard-denied every tool, which the
+    agent then misreported as a security-policy block (feature-store demo 04).
+    """
+    db_path = str(tmp_path / "uninitialized.db")
+    # Deliberately do NOT call initialize() — the table is absent.
+    store = PermissionStore(db_path)
+    # Production default is ASK (safe — prompts the user, never silently grants).
+    assert (
+        await store.get_permission("MemoryAgencyFeature", "memory_agency_feature")
+        == PermissionLevel.ASK
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_permission_missing_table_allows_on_demo_server(
+    tmp_path, monkeypatch
+):
+    """On a demo server the missing-table fallback resolves to ALLOW so the
+    Playwright demos (which can't click an approval modal) aren't blocked."""
+    monkeypatch.setenv("KESTREL_DEMO_SERVER", "1")
+    db_path = str(tmp_path / "uninitialized.db")
+    store = PermissionStore(db_path)
+    assert (
+        await store.get_permission("MemoryAgencyFeature", "memory_agency_feature")
+        == PermissionLevel.ALLOW
+    )
