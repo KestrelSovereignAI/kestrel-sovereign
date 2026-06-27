@@ -151,8 +151,6 @@ class OpenAIAdapter(LLMAdapter):
             supports_files=True,
             supports_prompt_cache=True,
             supports_reasoning_control=True,
-            supports_web_search=True,
-            supports_code_execution=True,
             supports_raw_passthrough=True,
             structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
             tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
@@ -168,9 +166,6 @@ class OpenAIAdapter(LLMAdapter):
             batch_mode=_enum_value(BatchMode, "FILE_BASED", "file_based"),
             files_mode=_enum_value(FilesMode, "UPLOAD", "upload"),
             token_count_mode=_enum_value(TokenCountMode, "ESTIMATE", "estimate"),
-            server_tool_mode=_enum_value(
-                ServerToolMode, "REQUEST_OPTION", "request_option"
-            ),
             reasoning_effort_levels=("minimal", "low", "medium", "high"),
             raw_operations=(
                 "chat.completions.create",
@@ -185,7 +180,7 @@ class OpenAIAdapter(LLMAdapter):
                 "batches.retrieve",
                 "batches.cancel",
             ),
-            model_dependent=("vision", "web_search", "code_execution"),
+            model_dependent=("vision",),
             notes=(
                 "Structured output uses response_format=json_schema for Pydantic models.",
                 "OpenAI prompt caching is implicit for stable prefixes.",
@@ -201,7 +196,6 @@ class OpenAIAdapter(LLMAdapter):
                 "files",
                 "prompt_cache",
                 "reasoning_control",
-                "server_tools",
                 "raw_passthrough",
             }
         )
@@ -987,9 +981,10 @@ class OpenAIAdapter(LLMAdapter):
         model: str,
     ) -> Dict[str, Any]:
         out = request_kwargs
+        # OpenAI chat-completions accepts ``reasoning_effort`` directly; there
+        # is no top-level ``reasoning`` argument (that is a Responses-API field).
         if getattr(options, "reasoning_effort", None):
             out["reasoning_effort"] = options.reasoning_effort
-            out["reasoning"] = {"effort": options.reasoning_effort}
 
         if getattr(options, "cache_markers", None):
             extra_body = dict(out.get("extra_body") or {})
@@ -1001,29 +996,12 @@ class OpenAIAdapter(LLMAdapter):
             ]
             out["extra_body"] = extra_body
 
-        web_search = getattr(options, "web_search", None)
-        if web_search is not None and getattr(web_search, "enabled", True):
-            tool = {"type": "web_search_preview"}
-            if getattr(web_search, "search_context_size", None):
-                tool["search_context_size"] = web_search.search_context_size
-            if getattr(web_search, "user_location", None):
-                tool["user_location"] = web_search.user_location
-            self._append_server_tool(out, tool)
-            if getattr(web_search, "max_results", None) is not None:
-                out.setdefault("web_search_options", {})["max_results"] = (
-                    web_search.max_results
-                )
-
-        code_execution = getattr(options, "code_execution", None)
-        if code_execution is not None and getattr(code_execution, "enabled", True):
-            tool = {"type": "code_interpreter"}
-            if getattr(code_execution, "container", None):
-                tool["container"] = code_execution.container
-            self._append_server_tool(out, tool)
-            if getattr(code_execution, "timeout_seconds", None) is not None:
-                out.setdefault("extra_body", {})["code_execution"] = {
-                    "timeout_seconds": code_execution.timeout_seconds
-                }
+        # NOTE: web_search / code_execution are intentionally NOT translated
+        # here. They are Responses/Assistants-API server tools — the chat
+        # completions endpoint rejects ``web_search_preview`` / ``code_interpreter``
+        # tool entries. This adapter therefore does not advertise those
+        # capabilities (see provider_capabilities). They can be added once this
+        # adapter routes through the Responses API.
 
         raw = getattr(options, "raw", None)
         if isinstance(raw, dict):
@@ -1130,12 +1108,6 @@ class OpenAIAdapter(LLMAdapter):
         except Exception as e:
             logger.error(f"Failed to list OpenAI models: {e}", exc_info=True)
             return []
-
-    @staticmethod
-    def _append_server_tool(request_kwargs: Dict[str, Any], tool: Dict[str, Any]) -> None:
-        tools = list(request_kwargs.get("tools") or [])
-        tools.append(tool)
-        request_kwargs["tools"] = tools
 
     @staticmethod
     def _cache_key_for_options(model: str, markers: List[Any]) -> str:

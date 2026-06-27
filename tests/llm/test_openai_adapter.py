@@ -107,9 +107,11 @@ def test_openai_v5_capability_flags_and_round_trip():
     assert caps.supports_files is True
     assert caps.supports_prompt_cache is True
     assert caps.supports_reasoning_control is True
-    assert caps.supports_web_search is True
-    assert caps.supports_code_execution is True
     assert caps.supports_raw_passthrough is True
+    # web_search / code_execution are Responses/Assistants-API server tools, not
+    # chat.completions features — this adapter does not advertise them.
+    assert caps.supports_web_search is False
+    assert caps.supports_code_execution is False
     assert caps.reasoning_control_mode.value == "effort"
     assert caps.batch_mode.value == "file_based"
     assert caps.files_mode.value == "upload"
@@ -126,9 +128,9 @@ def test_openai_contract_features_match_advertised_optional_methods():
         "files",
         "prompt_cache",
         "reasoning_control",
-        "server_tools",
         "raw_passthrough",
     }.issubset(features)
+    assert "server_tools" not in features
 
 
 def test_apply_request_options_mutates_outbound_kwargs():
@@ -145,15 +147,18 @@ def test_apply_request_options_mutates_outbound_kwargs():
     out = adapter.apply_request_options(kwargs, options, model="gpt-5")
 
     assert out is kwargs
+    # reasoning_effort is forwarded directly; no top-level `reasoning` kwarg
+    # (chat.completions rejects it).
     assert out["reasoning_effort"] == "high"
-    assert out["reasoning"] == {"effort": "high"}
+    assert "reasoning" not in out
     assert out["extra_body"]["cache_markers"][0]["label"] == "system"
     assert out["extra_body"]["prompt_cache_key"].startswith("kestrel:gpt-5:")
-    assert out["extra_body"]["code_execution"]["timeout_seconds"] == 30
     assert out["extra_body"]["custom"] is True
-    assert {"type": "web_search_preview", "search_context_size": "low"} in out["tools"]
-    assert {"type": "code_interpreter", "container": "auto"} in out["tools"]
-    assert out["web_search_options"]["max_results"] == 3
+    # web_search / code_execution options are ignored — not chat.completions
+    # features. The only tools present are the caller's own function tools.
+    assert out["tools"] == [{"type": "function", "function": {"name": "x"}}]
+    assert "web_search_options" not in out
+    assert "code_execution" not in out["extra_body"]
 
 
 @pytest.mark.asyncio
@@ -170,7 +175,7 @@ async def test_get_response_applies_request_options_to_chat_completion():
 
     kwargs = client.chat.completions.create.await_args.kwargs
     assert kwargs["reasoning_effort"] == "low"
-    assert kwargs["reasoning"] == {"effort": "low"}
+    assert "reasoning" not in kwargs
 
 
 @pytest.mark.asyncio
@@ -244,8 +249,8 @@ async def test_raw_request_dispatches_provider_unique_operations():
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not os.environ.get("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY required for OpenAI live smoke",
+    not os.environ.get("KESTREL_LIVE_TESTS") or not os.environ.get("OPENAI_API_KEY"),
+    reason="live smoke requires explicit opt-in: set KESTREL_LIVE_TESTS=1 and OPENAI_API_KEY",
 )
 @pytest.mark.asyncio
 async def test_live_openai_smoke_count_tokens_batch_and_files():
