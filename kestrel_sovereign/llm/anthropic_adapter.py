@@ -384,7 +384,16 @@ class AnthropicAdapter(LLMAdapter):
         """
         out = request_kwargs
         budget = getattr(options, "thinking_budget_tokens", None)
-        if budget:
+        # Anthropic rejects extended thinking combined with a forced tool choice.
+        # Structured output (response_format) forces a synthetic tool before this
+        # runs, so skip thinking when a tool is forced rather than build an
+        # invalid request — structured output takes precedence.
+        tool_choice = out.get("tool_choice")
+        forces_tool = (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") in ("tool", "any")
+        )
+        if budget and not forces_tool:
             budget = int(budget)
             out["thinking"] = {"type": "enabled", "budget_tokens": budget}
             # Anthropic requires budget_tokens < max_tokens. The request builders

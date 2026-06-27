@@ -98,6 +98,19 @@ def test_apply_request_options_maps_thinking_budget_and_ignores_effort():
     assert "output_config" not in out
 
 
+def test_thinking_skipped_when_tool_choice_forced():
+    # Structured output forces a tool; Anthropic rejects thinking + forced tool,
+    # so apply_request_options must not add thinking in that case.
+    adapter = AnthropicAdapter()
+    out = adapter.apply_request_options(
+        {"max_tokens": 4096, "tool_choice": {"type": "tool", "name": "output_X"}},
+        RequestOptions(thinking_budget_tokens=8000),
+        model="claude-opus-4-8",
+    )
+    assert "thinking" not in out
+    assert out["max_tokens"] == 4096  # untouched
+
+
 def test_apply_request_options_default_no_op():
     adapter = AnthropicAdapter()
     kwargs = {"max_tokens": 1024}
