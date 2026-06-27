@@ -778,14 +778,42 @@ class TestPersistAgentDescription:
         assert storage.node.properties["description"] == "Self-authored bio"
 
     @pytest.mark.asyncio
-    async def test_returns_false_when_no_store_succeeds(self):
-        """Contract the PATCH endpoint relies on: a total write failure
-        reports False so the operator-facing API can surface a 500."""
+    async def test_metadata_write_failure_propagates(self):
+        """A failed metadata write must propagate so PATCH can 500 instead
+        of reporting a false success."""
         from kestrel_sovereign.bootstrap.service import persist_agent_description
 
         class _FailingDB:
             async def execute(self, *a, **k):
                 raise RuntimeError("db down")
+
+        with pytest.raises(RuntimeError):
+            await persist_agent_description(_FailingDB(), None, "agent-1", "bio")
+
+    @pytest.mark.asyncio
+    async def test_existing_node_write_failure_propagates(self):
+        """The graph node is read first, so a swallowed node-write failure
+        would leave a stale description behind a success. It must propagate."""
+        from kestrel_sovereign.bootstrap.service import persist_agent_description
+
+        db = MockDB()
+
+        class _FailingNodeStorage:
+            async def get_node(self, _id):
+                return _GraphNode(node_id="agent-1", properties={"description": "old"})
+
+            async def add_node(self, _node):
+                raise RuntimeError("graph write failed")
+
+        with pytest.raises(RuntimeError):
+            await persist_agent_description(db, _FailingNodeStorage(), "agent-1", "new")
+
+    @pytest.mark.asyncio
+    async def test_node_absent_writes_metadata_only(self):
+        """No graph node (abnormal) — metadata-only write still reports True."""
+        from kestrel_sovereign.bootstrap.service import persist_agent_description
+
+        db = MockDB()
 
         class _NoNodeStorage:
             async def get_node(self, _id):
@@ -794,10 +822,9 @@ class TestPersistAgentDescription:
             async def add_node(self, _node):  # pragma: no cover - never reached
                 raise AssertionError("should not be called")
 
-        wrote = await persist_agent_description(
-            _FailingDB(), _NoNodeStorage(), "agent-1", "bio"
-        )
-        assert wrote is False
+        wrote = await persist_agent_description(db, _NoNodeStorage(), "agent-1", "bio")
+        assert wrote is True
+        assert db.data[("agent-1", "description")] == "bio"
 
     @pytest.mark.asyncio
     async def test_none_description_is_noop(self):

@@ -129,37 +129,37 @@ async def persist_agent_description(db, storage, agent_id: str, description: str
     This is the single write path shared by PATCH /api/identity and the
     SOUL-driven self-description in :meth:`BootstrapService.save_soul_md`.
 
+    Write failures are **not** swallowed: a failed metadata write, or a
+    failed update of an existing graph node, propagates to the caller.
+    Because the graph node is read first, swallowing a node-write failure
+    would let a stale description survive behind a "success" — so the
+    operator-facing PATCH path lets the exception become a 500, while the
+    SOUL path wraps this call to stay best-effort (a self-description must
+    never block saving the SOUL itself).
+
     ``description`` of ``None`` is a no-op; an empty string is allowed so an
-    operator can deliberately clear the field via PATCH.
+    operator can deliberately clear the field via PATCH. Returns True once a
+    write has been performed.
     """
     if description is None:
         return False
 
     now = datetime.now(timezone.utc)
-    wrote = False
-    try:
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (agent_id, "description", description, now),
-        )
-        wrote = True
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning("Failed to persist description to agent_metadata: %s", e)
+    await db.execute(
+        """
+        INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (agent_id, "description", description, now),
+    )
 
     if storage is not None:
-        try:
-            node = await storage.get_node(agent_id)
-            if node:
-                node.properties["description"] = description
-                await storage.add_node(node)
-                wrote = True
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Failed to persist description to agent node: %s", e)
+        node = await storage.get_node(agent_id)
+        if node:
+            node.properties["description"] = description
+            await storage.add_node(node)
 
-    return wrote
+    return True
 
 
 class BootstrapState(Enum):
