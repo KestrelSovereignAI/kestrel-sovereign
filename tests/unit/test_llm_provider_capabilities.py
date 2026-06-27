@@ -58,7 +58,13 @@ def test_provider_capabilities_to_dict_uses_wire_values():
         notes=("example",),
     )
 
-    assert capabilities.to_dict() == {
+    data = capabilities.to_dict()
+
+    # Enum fields serialize to their wire string values; scalars/tuples pass
+    # through. Asserted field-by-field (not as an exact dict) so the additive
+    # v5+ ProviderCapabilities surface doesn't make this brittle — the SDK's
+    # own contract test owns the exhaustive field-set guard.
+    expected_wire = {
         "supports_tools": True,
         "supports_streaming": False,
         "supports_vision": False,
@@ -73,6 +79,15 @@ def test_provider_capabilities_to_dict_uses_wire_values():
         "model_dependent": ["vision"],
         "notes": ["example"],
     }
+    for key, value in expected_wire.items():
+        assert data[key] == value, key
+
+    # v5 additive fields are present at their conservative defaults.
+    assert data["supports_batch"] is False
+    assert data["batch_mode"] == "none"
+
+    # to_dict() round-trips losslessly through from_mapping().
+    assert ProviderCapabilities.from_mapping(data) == capabilities
 
 
 def test_adapter_capabilities_normalizes_plugin_dicts():

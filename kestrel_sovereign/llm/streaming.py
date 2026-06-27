@@ -39,7 +39,7 @@ from typing import (
 
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sdk.llm import ProviderCapabilities, StructuredOutputMode, ToolCallStarted
 
 from .adapter import LLMResponse, ThinkingDelta, messages_for
 from .cancellation import CancelToken
@@ -48,6 +48,95 @@ from .error_handling import LLMError
 from .provider_registry import provider_cache_body
 
 logger = logging.getLogger(__name__)
+
+# v5 typed negotiation (#1983). Routing gates read the adapter's typed
+# ``ProviderCapabilities`` plus its ``contract_features()`` opt-in set instead
+# of matching on bare vendor names — composite route names (``"openai:api"``)
+# never matched the old ``provider_name in [...]`` literals, so those gates
+# were dead. The contract-feature opt-in keeps every in-tree adapter's
+# behavior unchanged until it explicitly advertises the feature.
+_FEATURE_STREAMING_STRUCTURED_OUTPUT = "streaming_structured_output"
+_FEATURE_TOOL_STREAM_SYSTEM_PROMPT = "tool_stream_system_prompt"
+
+# Structured-output modes that can be produced while streaming. ``TOOL_FORCED``
+# (Anthropic) cannot — it assembles the object from a buffered tool call — and
+# ``NONE``/``UNKNOWN`` carry no streamable guarantee.
+_STREAMABLE_STRUCTURED_MODES = frozenset(
+    {
+        StructuredOutputMode.JSON_OBJECT,
+        StructuredOutputMode.JSON_SCHEMA,
+        StructuredOutputMode.SCHEMA_FORMAT,
+        StructuredOutputMode.PROVIDER_NATIVE,
+    }
+)
+
+
+def _route_capabilities(provider: Any) -> Tuple[ProviderCapabilities, frozenset]:
+    """Return a route's typed capabilities and the adapter's opt-in feature set.
+
+    Prefers the **route-scoped** capabilities carried on the provider dict — an
+    entry-point factory may set these precisely on ``ProviderInfo`` and they can
+    differ from the adapter's own ``provider_capabilities()`` (e.g. an
+    OpenAI-compatible adapter reused across vendors). Falls back to the adapter
+    when the route didn't carry them. ``contract_features()`` always comes from
+    the adapter. Returns empty defaults when nothing can answer, so callers can
+    use plain attribute access.
+    """
+    adapter = provider.get("adapter") if isinstance(provider, dict) else provider
+    raw = provider.get("capabilities") if isinstance(provider, dict) else None
+    caps: Optional[ProviderCapabilities] = None
+    if isinstance(raw, ProviderCapabilities):
+        caps = raw
+    elif isinstance(raw, dict) and raw:
+        try:
+            caps = ProviderCapabilities.from_mapping(raw)
+        except Exception:
+            caps = None
+    if caps is None and adapter is not None:
+        try:
+            caps = adapter.provider_capabilities()
+        except Exception:
+            caps = None
+    if not isinstance(caps, ProviderCapabilities):
+        caps = ProviderCapabilities()
+    features: frozenset = frozenset()
+    if adapter is not None:
+        try:
+            features = frozenset(adapter.contract_features() or ())
+        except Exception:
+            features = frozenset()
+    return caps, features
+
+
+def _route_supports_streaming_structured(provider: Any) -> bool:
+    """Whether this route can stream while honoring a ``response_format``.
+
+    Typed replacement for the dead ``provider_name in ["openai", "vertex_ai"]``
+    literal. Reads route-scoped capabilities (honoring factory-set values on
+    entry-point routes) and evaluates False for every in-tree adapter until one
+    opts in via ``contract_features()`` — i.e. no behavior change yet (#1983).
+    """
+    caps, features = _route_capabilities(provider)
+    if _FEATURE_STREAMING_STRUCTURED_OUTPUT not in features:
+        return False
+    if not caps.supports_streaming:
+        return False
+    return caps.structured_output_mode in _STREAMABLE_STRUCTURED_MODES
+
+
+def _route_wants_tool_stream_system_prompt(provider: Any) -> bool:
+    """Whether to forward ``system_prompt`` separately into tool streaming.
+
+    Typed replacement for the dead ``provider_name == "anthropic"`` literal.
+    Anthropic-family routes carry the system prompt as a top-level field rather
+    than an inline message; the typed signal is ``supports_inline_system``.
+    Reads route-scoped capabilities and is gated behind ``contract_features()``
+    so no in-tree adapter changes behavior until it opts in (#1983).
+    """
+    caps, features = _route_capabilities(provider)
+    if _FEATURE_TOOL_STREAM_SYSTEM_PROMPT not in features:
+        return False
+    return caps.supports_inline_system
 
 
 class RoutingMeta(NamedTuple):
@@ -627,10 +716,12 @@ class StreamingMixin:
 
                 adapter = provider["adapter"]
 
-                # For structured output, only some providers support streaming
-                # OpenAI and Vertex support streaming with response_format
-                # Anthropic does NOT support streaming with structured output (uses tool_use pattern)
-                supports_streaming_structured = provider_name in ["openai", "vertex_ai"]
+                # For structured output, only routes whose typed capabilities
+                # advertise a streamable structured-output mode (and opt in via
+                # contract_features) can stream a response_format. Anthropic's
+                # TOOL_FORCED mode buffers a tool call, so it stays on the
+                # non-streaming fallback below.
+                supports_streaming_structured = _route_supports_streaming_structured(provider)
 
                 # Use streaming if supported (or no structured output requested)
                 if hasattr(adapter, "get_streaming_response"):
@@ -1189,7 +1280,7 @@ class StreamingMixin:
                 if hasattr(adapter, "get_streaming_response_with_tools"):
                     # Build kwargs for provider-specific parameters
                     kwargs = {}
-                    if provider_name == "anthropic" and system_prompt:
+                    if system_prompt and _route_wants_tool_stream_system_prompt(provider):
                         kwargs["system_prompt"] = system_prompt
                     cache_body = provider_cache_body(provider)
                     if cache_body:

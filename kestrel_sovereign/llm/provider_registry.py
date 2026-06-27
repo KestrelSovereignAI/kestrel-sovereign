@@ -90,6 +90,71 @@ def _normalize_capabilities(raw: Any) -> ProviderCapabilities:
     return ProviderCapabilities()
 
 
+# Registration-time capability validator (#1983). Each entry pairs a v5
+# ``ProviderCapabilities`` flag with the optional ``LLMAdapter`` method that
+# implements it and the ``contract_features()`` key an adapter uses to opt in.
+# If a route advertises the flag but still inherits the SDK's default method
+# *and* hasn't declared the feature, the capability silently won't work — we
+# warn (non-fatal) so the drift surfaces at startup instead of at call time.
+_V5_CAPABILITY_PROBES: tuple[tuple[str, str, str], ...] = (
+    ("supports_token_counting", "count_tokens", "token_counting"),
+    ("supports_batch", "batch_submit", "batch"),
+    ("supports_files", "file_upload", "files"),
+    ("supports_raw_passthrough", "raw_request", "raw_passthrough"),
+)
+
+
+def _adapter_contract_features(adapter: Any) -> frozenset:
+    """Best-effort read of an adapter's ``contract_features()`` opt-in set.
+
+    Returns an empty set when the adapter predates v5 or the probe raises, so
+    callers can treat "didn't declare it" uniformly.
+    """
+    fn = getattr(adapter, "contract_features", None)
+    if fn is None:
+        return frozenset()
+    try:
+        return frozenset(fn() or ())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "contract_features() probe failed for %s: %s",
+            type(adapter).__name__,
+            exc,
+        )
+        return frozenset()
+
+
+def _warn_unimplemented_capabilities(info: ProviderInfo) -> None:
+    """Warn when a route advertises a v5 capability it can't actually serve.
+
+    Non-fatal: a misconfigured plugin should still load for its working
+    features. Compares each advertised flag against the SDK base method so an
+    adapter that overrides the method (or declares the feature) passes clean.
+    """
+    adapter = getattr(info, "adapter", None)
+    caps = getattr(info, "capabilities", None)
+    if adapter is None or not isinstance(caps, ProviderCapabilities):
+        return
+    declared = _adapter_contract_features(adapter)
+    cls = type(adapter)
+    for flag, probe, feature in _V5_CAPABILITY_PROBES:
+        if not getattr(caps, flag, False) or feature in declared:
+            continue
+        impl = getattr(cls, probe, None)
+        base = getattr(_SDKLLMAdapter, probe, None)
+        if impl is not None and impl is base:
+            logger.warning(
+                "Route '%s' advertises %s but %s still uses LLMAdapter's "
+                "default %s() and does not declare '%s' in contract_features(); "
+                "that capability will not work until the method is implemented.",
+                info.name,
+                flag,
+                cls.__name__,
+                probe,
+                feature,
+            )
+
+
 class ProviderInitializationError(Exception):
     """Raised when provider initialization fails."""
     pass
@@ -178,6 +243,11 @@ class ProviderRegistry:
                 "Claude OAuth/plan route, OPENAI_API_KEY) and "
                 "kestrel.toml [llm]."
             )
+
+        # v5 capability contract check (#1983): surface advertised-but-missing
+        # capabilities once, after every route (built-in + entry_point) is in.
+        for info in initialized:
+            _warn_unimplemented_capabilities(info)
 
         self.providers = initialized
         self._initialized = True
