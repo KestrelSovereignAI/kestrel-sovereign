@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, MagicMock
 from kestrel_sdk.llm import (
     PromptCacheMode,
     ProviderCapabilities,
-    ReasoningControlMode,
     RequestOptions,
     TokenCountMode,
 )
@@ -25,11 +24,11 @@ def test_anthropic_v5_capabilities_and_round_trip():
 
     assert caps.supports_token_counting is True
     assert caps.supports_prompt_cache is True
-    assert caps.supports_reasoning_control is True
     assert caps.supports_raw_passthrough is True
+    # Reasoning control is intentionally not advertised (model-version-specific).
+    assert caps.supports_reasoning_control is False
     assert caps.token_count_mode == TokenCountMode.PROVIDER_NATIVE
     assert caps.prompt_cache_mode == PromptCacheMode.EXPLICIT_BREAKPOINTS
-    assert caps.reasoning_control_mode == ReasoningControlMode.THINKING_BUDGET
     assert caps.max_cache_breakpoints == 4
     assert "messages.count_tokens" in caps.raw_operations
     assert ProviderCapabilities.from_mapping(caps.to_dict()) == caps
@@ -40,17 +39,16 @@ def test_anthropic_contract_features():
     assert {
         "token_counting",
         "prompt_cache",
-        "reasoning_control",
         "raw_passthrough",
     }.issubset(features)
+    assert "reasoning_control" not in features
 
 
 def test_claude_max_plan_gates_off_platform_apis():
     caps = ClaudeMaxAdapter().provider_capabilities()
 
-    # Request-level features still advertised on the plan route.
+    # Request-level prompt caching still advertised on the plan route.
     assert caps.supports_prompt_cache is True
-    assert caps.supports_reasoning_control is True
     # API-key-only data-plane features are NOT advertised.
     assert caps.supports_token_counting is False
     assert caps.supports_raw_passthrough is False
@@ -58,7 +56,7 @@ def test_claude_max_plan_gates_off_platform_apis():
     assert caps.raw_operations == ()
 
     features = ClaudeMaxAdapter().contract_features()
-    assert "prompt_cache" in features and "reasoning_control" in features
+    assert "prompt_cache" in features
     assert "token_counting" not in features
     assert "raw_passthrough" not in features
 
@@ -81,36 +79,6 @@ async def test_count_tokens_uses_real_endpoint():
     assert sent["messages"]
 
 
-def test_apply_request_options_maps_thinking_budget_and_ignores_effort():
-    adapter = AnthropicAdapter()
-    out = adapter.apply_request_options(
-        {"max_tokens": 1024},
-        RequestOptions(thinking_budget_tokens=8000, reasoning_effort="high"),
-        model="claude-opus-4-8",
-    )
-
-    # Thinking budget maps to the Anthropic thinking config.
-    assert out["thinking"] == {"type": "enabled", "budget_tokens": 8000}
-    # max_tokens is raised above the budget (Anthropic requires budget < max).
-    assert out["max_tokens"] == 8000 + 1024
-    # Effort has no Messages API equivalent — intentionally ignored (not sent as
-    # an unsupported output_config that would be rejected).
-    assert "output_config" not in out
-
-
-def test_thinking_skipped_when_tool_choice_forced():
-    # Structured output forces a tool; Anthropic rejects thinking + forced tool,
-    # so apply_request_options must not add thinking in that case.
-    adapter = AnthropicAdapter()
-    out = adapter.apply_request_options(
-        {"max_tokens": 4096, "tool_choice": {"type": "tool", "name": "output_X"}},
-        RequestOptions(thinking_budget_tokens=8000),
-        model="claude-opus-4-8",
-    )
-    assert "thinking" not in out
-    assert out["max_tokens"] == 4096  # untouched
-
-
 def test_apply_request_options_default_no_op():
     adapter = AnthropicAdapter()
     kwargs = {"max_tokens": 1024}
@@ -118,21 +86,27 @@ def test_apply_request_options_default_no_op():
     assert out == {"max_tokens": 1024}
 
 
-def test_request_options_are_wired_into_request_paths():
-    # The request builders call _maybe_apply_request_options, so a caller's
-    # request_options actually reach api_params (rather than being advertised
-    # but silently dropped).
+def test_apply_request_options_merges_raw_escape_hatch():
     adapter = AnthropicAdapter()
-    api_params = {"model": "claude-opus-4-8", "messages": []}
+    out = adapter.apply_request_options(
+        {"max_tokens": 1024},
+        RequestOptions(raw={"metadata": {"user_id": "u1"}}),
+        model="claude-opus-4-8",
+    )
+    assert out["metadata"] == {"user_id": "u1"}
+
+
+def test_request_options_wiring_applies_raw_and_no_ops_without_options():
+    # The request builders call _maybe_apply_request_options, so a caller's
+    # request_options reach api_params; absence leaves them untouched.
+    adapter = AnthropicAdapter()
     out = adapter._maybe_apply_request_options(
-        api_params,
-        {"request_options": RequestOptions(thinking_budget_tokens=4096)},
+        {"model": "claude-opus-4-8"},
+        {"request_options": RequestOptions(raw={"metadata": {"k": "v"}})},
         "claude-opus-4-8",
     )
-    assert out["thinking"] == {"type": "enabled", "budget_tokens": 4096}
-    assert out["max_tokens"] == 4096 + 1024  # bumped above the budget
+    assert out["metadata"] == {"k": "v"}
 
-    # No request_options → untouched.
     untouched = adapter._maybe_apply_request_options(
         {"model": "x"}, {}, "claude-opus-4-8"
     )

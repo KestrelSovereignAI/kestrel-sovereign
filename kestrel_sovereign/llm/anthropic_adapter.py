@@ -29,7 +29,6 @@ from kestrel_sdk.llm import (
     PromptCacheMode,
     ProviderCapabilities,
     RawResponse,
-    ReasoningControlMode,
     StructuredOutputMode,
     TokenCount,
     TokenCountMode,
@@ -288,10 +287,12 @@ class AnthropicAdapter(LLMAdapter):
         # Data-plane features that hit api.anthropic.com directly — the
         # count_tokens endpoint and raw passthrough — need API-key access. The
         # OAuth/plan route (ClaudeMaxAdapter) overrides _has_platform_api_access()
-        # to False, so it advertises only the request-level features
-        # (prompt caching, reasoning) that work on both routes. Prompt caching is
-        # genuinely applied here via cache_control breakpoints; reasoning maps a
-        # thinking budget / effort through apply_request_options.
+        # to False, so it advertises only request-level prompt caching (which
+        # works on both routes, genuinely applied via cache_control breakpoints).
+        # Reasoning control is intentionally NOT advertised: Anthropic's thinking
+        # surface is model-version-specific (budget_tokens is removed on Opus
+        # 4.7/4.8 and deprecated on 4.6 in favor of adaptive thinking), so a
+        # route-wide capability would over-claim — deferred to a follow-up.
         platform = self._has_platform_api_access()
         kwargs = {
             "supports_tools": True,
@@ -299,7 +300,6 @@ class AnthropicAdapter(LLMAdapter):
             "supports_vision": True,
             "supports_structured_output": True,
             "supports_prompt_cache": True,
-            "supports_reasoning_control": True,
             "supports_token_counting": platform,
             "supports_raw_passthrough": platform,
             "structured_output_mode": StructuredOutputMode.TOOL_FORCED,
@@ -307,7 +307,6 @@ class AnthropicAdapter(LLMAdapter):
             "vision_input_mode": VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
             "prompt_cache_mode": PromptCacheMode.EXPLICIT_BREAKPOINTS,
             "max_cache_breakpoints": 4,
-            "reasoning_control_mode": ReasoningControlMode.THINKING_BUDGET,
             "token_count_mode": (
                 TokenCountMode.PROVIDER_NATIVE if platform else TokenCountMode.NONE
             ),
@@ -333,7 +332,7 @@ class AnthropicAdapter(LLMAdapter):
         return True
 
     def contract_features(self) -> frozenset:
-        features = {"prompt_cache", "reasoning_control"}
+        features = {"prompt_cache"}
         if self._has_platform_api_access():
             features |= {"token_counting", "raw_passthrough"}
         return frozenset(features)
@@ -373,34 +372,13 @@ class AnthropicAdapter(LLMAdapter):
     ) -> Dict[str, Any]:
         """Translate neutral request options into Anthropic request kwargs.
 
-        Reasoning control on this route is a thinking *budget* (the advertised
-        reasoning_control_mode is THINKING_BUDGET): ``thinking_budget_tokens``
-        maps to ``thinking={"type":"enabled","budget_tokens": N}``. A neutral
-        ``reasoning_effort`` is intentionally ignored — the Anthropic Messages
-        API has no equivalent request parameter, so forwarding it would be
-        rejected (effort-mode is for other providers). Prompt-cache markers are
-        already applied automatically by _apply_cache_control, so cache_markers
-        here are a no-op (the capability is advertised as automatic).
+        Prompt-cache markers are already applied automatically by
+        _apply_cache_control (so cache_markers here are a no-op), and reasoning
+        control is not advertised on this route (see provider_capabilities). The
+        only thing honored is an explicit ``raw`` dict escape hatch, merged into
+        the outbound request.
         """
         out = request_kwargs
-        budget = getattr(options, "thinking_budget_tokens", None)
-        # Anthropic rejects extended thinking combined with a forced tool choice.
-        # Structured output (response_format) forces a synthetic tool before this
-        # runs, so skip thinking when a tool is forced rather than build an
-        # invalid request — structured output takes precedence.
-        tool_choice = out.get("tool_choice")
-        forces_tool = (
-            isinstance(tool_choice, dict)
-            and tool_choice.get("type") in ("tool", "any")
-        )
-        if budget and not forces_tool:
-            budget = int(budget)
-            out["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            # Anthropic requires budget_tokens < max_tokens. The request builders
-            # default max_tokens to 4096, which would tie/exceed a 4096 budget,
-            # so raise the ceiling to leave output headroom above the budget.
-            if (out.get("max_tokens") or 0) <= budget:
-                out["max_tokens"] = budget + 1024
         raw = getattr(options, "raw", None)
         if isinstance(raw, dict):
             for key, value in raw.items():
