@@ -714,3 +714,138 @@ class TestCompleteBootstrap:
 
         result = await bootstrap_service.complete_bootstrap(avatar_description="a friendly owl")
         assert "avatar" in result.lower()
+
+
+class TestDeriveDescriptionFromSoul:
+    """Tests for deriving a UI description from SOUL.md content."""
+
+    def test_prefers_explicit_tagline(self):
+        from kestrel_sovereign.bootstrap.service import derive_description_from_soul
+
+        soul = (
+            "# SOUL.md - You Are Atlas\n\n"
+            "## Tagline\n> *A patient eldercare companion who remembers your stories.*\n\n"
+            "## Who You Are\nYou are Atlas, born today.\n"
+        )
+        assert (
+            derive_description_from_soul(soul)
+            == "A patient eldercare companion who remembers your stories."
+        )
+
+    def test_falls_back_to_first_sentence_of_who_you_are(self):
+        from kestrel_sovereign.bootstrap.service import derive_description_from_soul
+
+        soul = (
+            "# SOUL.md - You Are Bee\n\n"
+            "## Who You Are\nI help with code and I am direct. Second sentence.\n"
+        )
+        assert derive_description_from_soul(soul) == "I help with code and I am direct."
+
+    def test_returns_none_when_no_usable_section(self):
+        from kestrel_sovereign.bootstrap.service import derive_description_from_soul
+
+        assert derive_description_from_soul("") is None
+        assert derive_description_from_soul("# SOUL.md - You Are X\n") is None
+
+    def test_clips_overlong_tagline(self):
+        from kestrel_sovereign.bootstrap.service import (
+            derive_description_from_soul,
+            DESCRIPTION_MAX_LEN,
+        )
+
+        long_line = "x" * 800
+        soul = f"## Tagline\n{long_line}\n"
+        result = derive_description_from_soul(soul)
+        assert len(result) <= DESCRIPTION_MAX_LEN
+        assert result.endswith("…")
+
+
+class TestPersistAgentDescription:
+    """Tests for the shared description write path."""
+
+    @pytest.mark.asyncio
+    async def test_writes_both_metadata_and_node(self):
+        from kestrel_sovereign.bootstrap.service import persist_agent_description
+
+        node = _GraphNode(node_id="agent-1")
+        storage = _Storage(node)
+        db = MockDB()
+
+        wrote = await persist_agent_description(db, storage, "agent-1", "Self-authored bio")
+
+        assert wrote is True
+        assert db.data[("agent-1", "description")] == "Self-authored bio"
+        assert storage.node.properties["description"] == "Self-authored bio"
+
+    @pytest.mark.asyncio
+    async def test_none_description_is_noop(self):
+        from kestrel_sovereign.bootstrap.service import persist_agent_description
+
+        node = _GraphNode(node_id="agent-1")
+        storage = _Storage(node)
+        db = MockDB()
+
+        wrote = await persist_agent_description(db, storage, "agent-1", None)
+
+        assert wrote is False
+        assert ("agent-1", "description") not in db.data
+        assert "description" not in node.properties
+
+
+class TestSaveSoulSetsDescription:
+    """save_soul_md should set the agent description from the SOUL content."""
+
+    @pytest.mark.asyncio
+    async def test_save_soul_md_persists_description(self, mock_db, mock_llm, temp_agent_dir):
+        node = _GraphNode(node_id="did:pkh:eip155:1:0x123")
+        storage = _Storage(node)
+        service = BootstrapService(
+            db=mock_db,
+            agent_id="did:pkh:eip155:1:0x123",
+            agent_name="TestAgent",
+            llm_service=mock_llm,
+            agent_data_path=temp_agent_dir,
+            storage=storage,
+        )
+
+        soul = "# SOUL.md - You Are TestAgent\n\n## Tagline\nA sharp coding companion.\n"
+        ok = await service.save_soul_md(soul)
+
+        assert ok is True
+        assert node.properties["description"] == "A sharp coding companion."
+        assert mock_db.data[("did:pkh:eip155:1:0x123", "description")] == "A sharp coding companion."
+
+
+class TestInitialAgentDescription:
+    """Tests for the deterministic birth-time description template."""
+
+    def test_generic_name_omitted(self):
+        from kestrel_sovereign.inception_service import _initial_agent_description
+
+        desc = _initial_agent_description("Steve")
+        assert desc.startswith("A sovereign Kestrel agent")
+        assert "Steve" not in desc
+
+    def test_descriptive_name_folded_in(self):
+        from kestrel_sovereign.inception_service import _initial_agent_description
+
+        desc = _initial_agent_description("Eldercare Companion")
+        assert desc.startswith("Eldercare Companion — ")
+
+    def test_default_and_test_names_omitted(self):
+        from kestrel_sovereign.inception_service import _initial_agent_description
+
+        assert "Kestrel Agent" not in _initial_agent_description("Kestrel Agent")
+        assert "Test" not in _initial_agent_description("Kestrel-Test-1234")
+
+    def test_child_and_emancipation_flavor(self):
+        from kestrel_sovereign.inception_service import _initial_agent_description
+
+        assert "spawned by a parent" in _initial_agent_description("Steve", is_child=True)
+        assert "Amendment VIII active" in _initial_agent_description("Steve", emancipated=True)
+
+    def test_never_the_old_hardcoded_label(self):
+        from kestrel_sovereign.inception_service import _initial_agent_description
+
+        for name in ["Steve", "Kestrel Agent", "Eldercare Companion"]:
+            assert _initial_agent_description(name) != "Constitutional AI Agent with sovereign memory"
