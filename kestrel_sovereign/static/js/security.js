@@ -10,6 +10,10 @@ export const Security = {
     pendingApprovals: new Map(),
     permissionTree: [],
     globalAutoMode: false,
+    // Effective global Auto tier: 'off' | 'session' | 'always'. 'always' is the
+    // persistent tier — it survives refresh and server restart (red); 'session'
+    // is in-memory (orange). globalAutoMode mirrors (scope !== 'off').
+    globalAutoScope: 'off',
     _initialized: false,
     // Modal is a singleton — if two approval_request events arrive in quick
     // succession, showing both concurrently would stack overlays in the DOM
@@ -271,28 +275,40 @@ export const Security = {
                         }
                     },
                     {
-                        label: `${kicon('shield')} Enable Auto Mode`,
+                        // Global Auto, session tier (orange). Distinct from the
+                        // per-tool "Always" above: this skips approval for ALL
+                        // non-denied tools, not just this one.
+                        label: `${kicon('shield')} Auto: Session`,
                         type: 'primary',
-                        onClick: async () => {
-                            try {
-                                const response = await this.setGlobalAutoMode(true);
-                                Modal.hide();
-                                Toast.warning(response.warning);
-                                wrappedResolve({
-                                    approved: true,
-                                    scope: 'once',
-                                    suppressToast: true
-                                });
-                            } catch (error) {
-                                console.error('Failed to enable Auto mode from approval modal:', error);
-                                Toast.error('Failed to enable Auto mode');
-                            }
-                        }
+                        onClick: () => this._enableGlobalAutoFromModal('session', wrappedResolve)
+                    },
+                    {
+                        // Global Auto, persistent tier (red): survives refresh
+                        // and server restart until explicitly turned off.
+                        label: `${kicon('shield')} Auto: Always`,
+                        type: 'danger',
+                        onClick: () => this._enableGlobalAutoFromModal('always', wrappedResolve)
                     }
                 ],
                 onClose: () => wrappedResolve({ approved: false, scope: 'once' })
             });
         });
+    },
+
+    // Enable global Auto at the chosen tier from the approval modal, then
+    // approve the in-flight request once (global Auto will auto-handle the
+    // rest). Red toast for the persistent 'always' tier, orange for session.
+    async _enableGlobalAutoFromModal(scope, wrappedResolve) {
+        try {
+            const response = await this.setGlobalAutoScope(scope);
+            Modal.hide();
+            Toast[this.globalAutoScope === 'always' ? 'danger' : 'warning'](response.warning);
+            await this.loadPermissionTree();
+            wrappedResolve({ approved: true, scope: 'once', suppressToast: true });
+        } catch (error) {
+            console.error('Failed to enable Auto mode from approval modal:', error);
+            Toast.error('Failed to enable Auto mode');
+        }
     },
 
     async submitApproval(approvalId, approved, scope, options = {}) {
@@ -764,72 +780,111 @@ export const Security = {
         if (!API.hasCapability('permissions')) return;
         try {
             const response = await API.request('/api/security/auto-mode');
-            this.globalAutoMode = Boolean(response.enabled);
-            this.renderAutoModeButton();
+            this._applyAutoModeResponse(response);
         } catch (error) {
             console.error('Failed to load Auto mode:', error);
         }
     },
 
-    async setGlobalAutoMode(enabled) {
+    _applyAutoModeResponse(response) {
+        this.globalAutoScope = response.scope || (response.enabled ? 'session' : 'off');
+        this.globalAutoMode = this.globalAutoScope !== 'off';
+        this.renderAutoModeButton();
+    },
+
+    async setGlobalAutoScope(scope) {
         const response = await API.request('/api/security/auto-mode', {
             method: 'POST',
-            body: JSON.stringify({ enabled })
+            body: JSON.stringify({ scope })
         });
-        this.globalAutoMode = Boolean(response.enabled);
-        this.renderAutoModeButton();
+        this._applyAutoModeResponse(response);
         return response;
     },
 
     renderAutoModeButton() {
+        // Three visual states driven by the effective tier:
+        //   off     → neutral secondary button
+        //   session → primary (orange-adjacent) "On (session)"
+        //   always  → danger (red) "Always" — the persistent tier
+        const scope = this.globalAutoScope;
         document.querySelectorAll('.security-auto-mode-toggle').forEach((button) => {
-            button.classList.toggle('btn-primary', this.globalAutoMode);
-            button.classList.toggle('btn-secondary', !this.globalAutoMode);
-            button.innerHTML = this.globalAutoMode
-                ? `${kicon('shield')} Auto Mode: On`
-                : `${kicon('shield')} Auto Mode: Off`;
-            button.title = this.globalAutoMode
-                ? 'Global Auto is on for this session. Explicit Deny still blocks.'
-                : 'Turn on session-scoped global Auto for non-denied tools.';
+            button.classList.toggle('btn-secondary', scope === 'off');
+            button.classList.toggle('btn-primary', scope === 'session');
+            button.classList.toggle('btn-danger', scope === 'always');
+            if (scope === 'always') {
+                button.innerHTML = `${kicon('shield')} Auto Mode: Always`;
+                button.title = 'Global Auto is ON PERSISTENTLY (survives refresh and restart). '
+                    + 'Explicit Deny still blocks. Click to turn off.';
+            } else if (scope === 'session') {
+                button.innerHTML = `${kicon('shield')} Auto Mode: Session`;
+                button.title = 'Global Auto is on for this session. Explicit Deny still blocks. '
+                    + 'Click to turn off.';
+            } else {
+                button.innerHTML = `${kicon('shield')} Auto Mode: Off`;
+                button.title = 'Turn on global Auto for non-denied tools (session or always).';
+            }
         });
     },
 
+    // Toolbar entry point. When off, prompt for which tier to enable; when on
+    // (either tier), a click turns it off. confirmEnable:false skips the
+    // chooser only for the legacy quick-toggle — it still defaults to session.
     async toggleGlobalAutoMode(options = {}) {
         try {
-            const nextEnabled = !this.globalAutoMode;
-            const confirmEnable = options.confirmEnable !== false;
-            if (nextEnabled && confirmEnable) {
-                const confirmed = await new Promise((resolve) => {
-                    Modal.show({
-                        title: 'Enable Global Auto Mode',
-                        content: `
-                            <p style="margin: 0 0 0.75rem 0; color: var(--text-secondary);">
-                                Auto Mode skips approval popups for every non-denied tool while this session is active.
-                            </p>
-                            <p style="margin: 0; color: var(--warning); font-size: 0.875rem;">
-                                Constitutional, honesty, and security hooks still get the first chance to flag or block.
-                                This is not a guarantee that every risk has been detected.
-                            </p>
-                        `,
-                        buttons: [
-                            { label: 'Cancel', type: 'secondary', onClick: () => { Modal.hide(); resolve(false); } },
-                            { label: `${kicon('shield')} Enable Auto`, type: 'primary', onClick: () => { Modal.hide(); resolve(true); } }
-                        ],
-                        onClose: () => resolve(false)
-                    });
-                });
-                if (!confirmed) return;
+            if (this.globalAutoMode) {
+                const response = await this.setGlobalAutoScope('off');
+                Toast.success('Global Auto mode disabled');
+                await this.loadPermissionTree();
+                return response;
             }
 
-            const response = await this.setGlobalAutoMode(nextEnabled);
-            Toast[this.globalAutoMode ? 'warning' : 'success'](
-                this.globalAutoMode ? response.warning : 'Global Auto mode disabled'
-            );
-            await this.loadPermissionTree();
+            let scope = 'session';
+            if (options.confirmEnable !== false) {
+                scope = await this._chooseAutoScope();
+                if (!scope) return;
+            }
+            return await this._enableAutoScope(scope);
         } catch (error) {
             console.error('Failed to toggle Auto mode:', error);
             Toast.error('Failed to toggle Auto mode');
         }
+    },
+
+    // Shared scope chooser used by the toolbar. Resolves to 'session',
+    // 'always', or null (cancelled).
+    _chooseAutoScope() {
+        return new Promise((resolve) => {
+            Modal.show({
+                title: 'Enable Global Auto Mode',
+                content: `
+                    <p style="margin: 0 0 0.75rem 0; color: var(--text-secondary);">
+                        Auto Mode skips approval popups for every non-denied tool.
+                        Constitutional, honesty, and security hooks still get the
+                        first chance to flag or block — this is not a guarantee
+                        that every risk has been detected.
+                    </p>
+                    <p style="margin: 0; color: var(--danger, #dc2626); font-size: 0.875rem;">
+                        <strong>Always</strong> keeps Auto on across page refresh and
+                        server restart until you explicitly turn it off.
+                    </p>
+                `,
+                buttons: [
+                    { label: 'Cancel', type: 'secondary', onClick: () => { Modal.hide(); resolve(null); } },
+                    { label: `${kicon('shield')} This Session`, type: 'primary', onClick: () => { Modal.hide(); resolve('session'); } },
+                    { label: `${kicon('shield')} Always`, type: 'danger', onClick: () => { Modal.hide(); resolve('always'); } }
+                ],
+                onClose: () => resolve(null)
+            });
+        });
+    },
+
+    // Apply an enable choice and surface the tier-appropriate toast: red
+    // (danger) for the persistent 'always' tier, orange (warning) for session.
+    async _enableAutoScope(scope) {
+        const response = await this.setGlobalAutoScope(scope);
+        Toast[this.globalAutoScope === 'always' ? 'danger' : 'warning'](response.warning);
+        await this.loadPermissionTree();
+        return response;
     },
 
     async resetSession() {
@@ -854,8 +909,9 @@ export const Security = {
             if (!confirmed) return;
 
             await API.request('/api/security/reset-session', { method: 'POST' });
-            this.globalAutoMode = false;
-            this.renderAutoModeButton();
+            // The persistent ("always") Auto tier survives a session reset, so
+            // re-fetch the effective tier rather than assuming it is now off.
+            await this.loadAutoMode();
             Toast.success('Session permissions cleared');
             await this.loadPermissionTree();
         } catch (error) {

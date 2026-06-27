@@ -43,7 +43,7 @@ class _LLM:
 async def test_auto_mode_uses_inline_system_when_route_and_model_support_it():
     agent = SimpleNamespace(did="agent-1")
     producer = OperatorSignalProducer(agent)
-    producer.enqueue_auto_mode(True)
+    producer.enqueue_auto_mode("session")
     llm = _LLM(
         {
             "name": "anthropic:api",
@@ -73,7 +73,7 @@ async def test_auto_mode_uses_inline_system_when_route_and_model_support_it():
 async def test_auto_mode_falls_back_to_visible_user_notice_on_unsupported_route():
     agent = SimpleNamespace(did="agent-1")
     producer = OperatorSignalProducer(agent)
-    producer.enqueue_auto_mode(False)
+    producer.enqueue_auto_mode("off")
     llm = _LLM(
         {
             "name": "openai:api",

@@ -68,7 +68,9 @@ def _make_security_feature():
     permission_store.set_permission = AsyncMock()
     permission_store.set_feature_permission = AsyncMock()
     permission_store.get_global_auto_mode = MagicMock(return_value=False)
+    permission_store.get_global_auto_mode_scope = MagicMock(return_value="off")
     permission_store.set_global_auto_mode = MagicMock()
+    permission_store.set_global_auto_mode_scope = AsyncMock()
     permission_store.log_decision = AsyncMock()
     permission_store.clear_session_overrides = MagicMock()
     approval_queue = MagicMock(
@@ -218,9 +220,15 @@ def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()
         _restore_app(app, original)
 
 
-def test_security_global_auto_mode_endpoints_are_session_scoped():
+def test_security_global_auto_mode_endpoints_support_scopes():
     security_feature = _make_security_feature()
+    # GET reflects current scope (off); POST(always) flips effective state on.
     security_feature.permission_store.get_global_auto_mode.side_effect = [False, True]
+    security_feature.permission_store.get_global_auto_mode_scope.side_effect = [
+        "off",       # GET
+        "always",    # POST: log_decision read
+        "always",    # POST: response read
+    ]
     agent = MagicMock(features={"SecurityFeature": security_feature})
 
     app, original = _prepare_app(agent)
@@ -234,15 +242,36 @@ def test_security_global_auto_mode_endpoints_are_session_scoped():
                 enable_response = client.post(
                     "/api/security/auto-mode",
                     headers=_api_headers(),
-                    json={"enabled": True},
+                    json={"scope": "always"},
                 )
         assert status_response.status_code == 200
         assert status_response.json()["enabled"] is False
+        assert status_response.json()["scope"] == "off"
         assert enable_response.status_code == 200
         assert enable_response.json()["enabled"] is True
-        assert "not DENY or ALWAYS_ASK" in enable_response.json()["warning"]
-        security_feature.permission_store.set_global_auto_mode.assert_called_once_with(True)
+        assert enable_response.json()["scope"] == "always"
+        assert "survives page refresh and server restart" in enable_response.json()["warning"]
+        security_feature.permission_store.set_global_auto_mode_scope.assert_awaited_once_with("always")
         security_feature.permission_store.log_decision.assert_awaited_once()
+    finally:
+        _restore_app(app, original)
+
+
+def test_security_global_auto_mode_rejects_invalid_scope():
+    security_feature = _make_security_feature()
+    agent = MagicMock(features={"SecurityFeature": security_feature})
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/api/security/auto-mode",
+                    headers=_api_headers(),
+                    json={"scope": "forever"},
+                )
+        assert resp.status_code == 400
+        security_feature.permission_store.set_global_auto_mode_scope.assert_not_awaited()
     finally:
         _restore_app(app, original)
 

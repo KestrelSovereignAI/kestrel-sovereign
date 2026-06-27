@@ -188,7 +188,15 @@ class PermissionStore:
         """
         self.db_path = db_path
         self._session_overrides: Dict[str, PermissionLevel] = {}
-        self._global_auto_mode = False
+        # Global Auto has two tiers backing one effective state:
+        #   - _global_auto_session: in-memory, cleared on session reset.
+        #   - _global_auto_always:  persisted in security_global_settings,
+        #     rehydrated on initialize(), and survives session resets and
+        #     server restarts until the operator explicitly turns it off.
+        # ``_global_auto_mode`` (the property below) is the effective OR of the
+        # two, so all existing read sites keep working unchanged.
+        self._global_auto_session = False
+        self._global_auto_always = False
         self._initialized = False
         # Bidirectional alias map populated by ``migrate_legacy_feature_aliases``.
         # Used by ``_lookup_rows`` to translate between the snake-case alias an
@@ -198,6 +206,11 @@ class PermissionStore:
         # #1427 P2).
         self._feature_alias_to_class: Dict[str, str] = {}
         self._feature_class_to_alias: Dict[str, str] = {}
+
+    @property
+    def _global_auto_mode(self) -> bool:
+        """Effective global Auto: enabled if either tier is active."""
+        return self._global_auto_session or self._global_auto_always
 
     async def initialize(self) -> None:
         """Create database tables if they don't exist."""
@@ -215,6 +228,14 @@ class PermissionStore:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(feature_name, tool_name)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS security_global_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -288,6 +309,8 @@ class PermissionStore:
             """)
 
             await db.commit()
+
+        await self._load_global_auto_always()
 
         self._initialized = True
         logger.info("PermissionStore initialized")
@@ -837,23 +860,106 @@ class PermissionStore:
         return [dict(r) for r in rows]
 
     def clear_session_overrides(self) -> None:
-        """Clear all session-scoped permission overrides and global Auto."""
+        """Clear session-scoped overrides and the session tier of global Auto.
+
+        The persistent ("always") tier deliberately survives a session reset —
+        that is the whole point of Always Auto. After this call the effective
+        global Auto state falls back to whatever was persisted.
+        """
         count = len(self._session_overrides)
         self._session_overrides.clear()
-        self._global_auto_mode = False
-        logger.info(f"Cleared {count} session overrides and disabled global Auto")
-
-    def set_global_auto_mode(self, enabled: bool) -> None:
-        """Enable or disable session-scoped global Auto mode."""
-        self._global_auto_mode = bool(enabled)
-        logger.warning(
-            "Global security Auto mode %s",
-            "enabled" if self._global_auto_mode else "disabled",
+        self._global_auto_session = False
+        logger.info(
+            "Cleared %d session overrides; session-tier global Auto disabled "
+            "(persistent Auto=%s)",
+            count,
+            self._global_auto_always,
         )
 
+    def set_global_auto_mode(self, enabled: bool) -> None:
+        """Enable or disable the *session* tier of global Auto mode.
+
+        In-memory only; cleared on session reset. For the persistent tier use
+        :meth:`set_global_auto_mode_scope`.
+        """
+        self._global_auto_session = bool(enabled)
+        logger.warning(
+            "Session-tier global security Auto mode %s",
+            "enabled" if self._global_auto_session else "disabled",
+        )
+
+    async def set_global_auto_mode_scope(self, scope: str) -> None:
+        """Set the effective global Auto tier.
+
+        ``off``     — disable both tiers and clear the persisted flag.
+        ``session`` — enable the in-memory tier; clear any persisted flag
+                      (an explicit choice of "this session" downgrades Always).
+        ``always``  — persist the flag so it survives session resets and
+                      server restarts until explicitly turned off.
+        """
+        if scope not in ("off", "session", "always"):
+            raise ValueError(
+                f"Invalid global Auto scope '{scope}'. Use: off, session, always"
+            )
+
+        if scope == "off":
+            self._global_auto_session = False
+            self._global_auto_always = False
+            await self._delete_global_auto_always()
+        elif scope == "session":
+            self._global_auto_session = True
+            self._global_auto_always = False
+            await self._delete_global_auto_always()
+        else:  # always
+            self._global_auto_always = True
+            await self._persist_global_auto_always()
+
+        logger.warning("Global security Auto mode set to scope=%s", scope)
+
     def get_global_auto_mode(self) -> bool:
-        """Return whether session-scoped global Auto mode is enabled."""
+        """Return whether global Auto mode is effectively enabled (either tier)."""
         return self._global_auto_mode
+
+    def get_global_auto_mode_scope(self) -> str:
+        """Return the effective global Auto tier: 'always', 'session', or 'off'."""
+        if self._global_auto_always:
+            return "always"
+        if self._global_auto_session:
+            return "session"
+        return "off"
+
+    async def _load_global_auto_always(self) -> None:
+        """Rehydrate the persistent global Auto tier from storage."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT value FROM security_global_settings WHERE key = ?",
+                ("global_auto_always",),
+            )
+            row = await cursor.fetchone()
+        self._global_auto_always = bool(row) and row[0] == "1"
+        if self._global_auto_always:
+            logger.warning("Persistent global security Auto mode rehydrated (always)")
+
+    async def _persist_global_auto_always(self) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO security_global_settings (key, value, updated_at)
+                VALUES (?, '1', CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET value = '1',
+                                               updated_at = CURRENT_TIMESTAMP
+                """,
+                ("global_auto_always",),
+            )
+            await db.commit()
+
+    async def _delete_global_auto_always(self) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM security_global_settings WHERE key = ?",
+                ("global_auto_always",),
+            )
+            await db.commit()
 
     def __repr__(self) -> str:
         return (

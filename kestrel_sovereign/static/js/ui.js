@@ -292,7 +292,11 @@ export const Toast = {
     success(message, duration) { this.show(message, 'success', duration); },
     error(message, duration) { this.show(message, 'error', duration); },
     warning(message, duration) { this.show(message, 'warning', duration); },
-    info(message, duration) { this.show(message, 'info', duration); }
+    info(message, duration) { this.show(message, 'info', duration); },
+    // Red toast for high-consequence persistent state (e.g. Always Auto). Same
+    // color as 'error' but semantically a deliberate danger acknowledgement,
+    // not a failure.
+    danger(message, duration) { this.show(message, 'error', duration); }
 };
 
 // ============================================================================

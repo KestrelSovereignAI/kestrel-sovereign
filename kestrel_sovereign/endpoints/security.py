@@ -44,8 +44,14 @@ class ApprovalDecisionRequest(BaseModel):
 
 
 class AutoModeRequest(BaseModel):
-    """Request to enable or disable global Auto mode."""
-    enabled: bool
+    """Request to set the global Auto mode tier.
+
+    ``scope``:
+      - "off":     disable global Auto entirely.
+      - "session": in-memory, cleared on session reset (orange / warning).
+      - "always":  persisted, survives refresh and server restart (red / danger).
+    """
+    scope: str
 
 
 class ToolPermissionResponse(BaseModel):
@@ -105,6 +111,7 @@ class AuditLogResponse(BaseModel):
 class AutoModeResponse(BaseModel):
     """Global Auto mode status."""
     enabled: bool
+    scope: str
     warning: str
 
 
@@ -328,25 +335,41 @@ async def get_pending_approvals(request: Request):
     )
 
 
+def _auto_mode_warning(scope: str) -> str:
+    """Scope-aware warning copy for the global Auto status."""
+    base = (
+        "Global Auto skips human approval for tools that are not DENY or "
+        "ALWAYS_ASK when earlier constitutional, honesty, and security hooks "
+        "do not flag the call. It is not a guarantee that every risk has been "
+        "detected."
+    )
+    if scope == "always":
+        return (
+            base
+            + " This is the persistent tier: it survives page refresh and "
+            "server restart, and stays on until you explicitly turn it off."
+        )
+    if scope == "session":
+        return base + " It is session-scoped and clears on session reset."
+    return base
+
+
 @router.get("/auto-mode", response_model=AutoModeResponse)
 async def get_auto_mode(request: Request):
     """
     Get global Auto mode status.
 
-    Global Auto is session-scoped. While enabled, tool permissions other
-    than DENY and ALWAYS_ASK behave as AUTO, so human approval is skipped
-    after earlier constitutional, honesty, and security hooks do not flag.
+    Global Auto has two tiers: "session" (in-memory) and "always" (persisted,
+    survives refresh and restart). While enabled, tool permissions other than
+    DENY and ALWAYS_ASK behave as AUTO, so human approval is skipped after
+    earlier constitutional, honesty, and security hooks do not flag.
     """
     security = get_security_feature(request)
-    enabled = security.permission_store.get_global_auto_mode()
+    scope = security.permission_store.get_global_auto_mode_scope()
     return AutoModeResponse(
-        enabled=enabled,
-        warning=(
-            "Global Auto skips human approval for tools that are not DENY or "
-            "ALWAYS_ASK when earlier constitutional, honesty, and security "
-            "hooks do not flag the call. It is session-scoped and is not a "
-            "guarantee that every risk has been detected."
-        ),
+        enabled=security.permission_store.get_global_auto_mode(),
+        scope=scope,
+        warning=_auto_mode_warning(scope),
     )
 
 
@@ -354,33 +377,36 @@ async def get_auto_mode(request: Request):
 @limiter.limit("30/minute")
 async def set_auto_mode(request: Request, data: AutoModeRequest):
     """
-    Enable or disable global Auto mode for this server session.
+    Set the global Auto mode tier (off / session / always).
 
     Explicit DENY and ALWAYS_ASK permissions remain DENY/ALWAYS_ASK. All
-    other configured or unregistered tools resolve as AUTO while this switch
-    is enabled.
+    other configured or unregistered tools resolve as AUTO while Auto is
+    enabled. The "always" tier persists across refresh and server restart.
     """
+    if data.scope not in ("off", "session", "always"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid scope '{data.scope}'. Use: off, session, always",
+        )
+
     security = get_security_feature(request)
-    security.permission_store.set_global_auto_mode(data.enabled)
+    await security.permission_store.set_global_auto_mode_scope(data.scope)
+    scope = security.permission_store.get_global_auto_mode_scope()
     await security.permission_store.log_decision(
         feature_name="SecurityFeature",
         tool_name="global_auto_mode",
         action="mode_change",
-        decision="global_auto_enabled" if data.enabled else "global_auto_disabled",
-        user_choice="session",
+        decision=f"global_auto_{scope}",
+        user_choice=scope,
     )
     agent = get_agent(request)
     producer = getattr(agent, "operator_signal_producer", None)
     if producer is not None and hasattr(producer, "enqueue_auto_mode"):
-        producer.enqueue_auto_mode(data.enabled)
+        producer.enqueue_auto_mode(scope)
     return AutoModeResponse(
         enabled=security.permission_store.get_global_auto_mode(),
-        warning=(
-            "Global Auto skips human approval for tools that are not DENY or "
-            "ALWAYS_ASK when earlier constitutional, honesty, and security "
-            "hooks do not flag the call. It is session-scoped and is not a "
-            "guarantee that every risk has been detected."
-        ),
+        scope=scope,
+        warning=_auto_mode_warning(scope),
     )
 
 
