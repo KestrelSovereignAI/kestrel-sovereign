@@ -520,12 +520,14 @@ class ProviderRegistry:
             embedding_dim = route_cfg.get("embedding_dim")
             if embedding_dim is not None:
                 embedding_dim = int(embedding_dim)
+            # Computed unconditionally — both the embedding default below and
+            # the native_openai signal passed to the adapter depend on it.
+            official_openai_base = (
+                not base_url
+                or str(base_url).rstrip("/") == "https://api.openai.com/v1"
+            )
             supports_embeddings = route_cfg.get("supports_embeddings")
             if supports_embeddings is None:
-                official_openai_base = (
-                    not base_url
-                    or str(base_url).rstrip("/") == "https://api.openai.com/v1"
-                )
                 supports_embeddings = (
                     vendor == "openai"
                     and official_openai_base
@@ -542,6 +544,11 @@ class ProviderRegistry:
                 supports_embeddings=bool(supports_embeddings),
                 embedding_model=embedding_model,
                 embedding_dim=embedding_dim,
+                # Only the real OpenAI vendor on the official base exposes the
+                # /batches, /files, /responses surface; OpenAI-compatible routes
+                # (custom base_url) do not. Pass through as a typed signal so the
+                # adapter advertises those capabilities only when truly native.
+                native_openai=(vendor == "openai" and official_openai_base),
             )
 
         # --- Fallback: try plain instantiation; let adapter fail at call time ---
