@@ -293,6 +293,25 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [
+        "kestrel_sovereign/features/scheduler/feature.py",
+        "kestrel_sovereign/storage/car_builder.py",
+        "kestrel_sovereign/storage/sync/lighthouse_target.py",
+        "kestrel_sovereign/storage/sync/retention.py",
+        "kestrel_sovereign/storage/sync/service.py",
+        "kestrel_sovereign/storage/sync/targets.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/INCREMENTAL_BACKUP.md",
+      "privacy": "public",
+      "render": "internal",
+      "status": "needs-revalidation",
+      "title": "Incremental Backup \u2014 Page-Aligned Content-Addressed Deltas for Active Agents",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [],
       "findings": [],
       "missing_code_refs": [],
