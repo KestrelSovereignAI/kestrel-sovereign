@@ -3377,7 +3377,7 @@
       "missing_links": [],
       "path": "docs/demos/DEMO_SCRIPT.md",
       "privacy": "public",
-      "render": "public",
+      "render": "internal",
       "status": "active",
       "title": "Kestrel Sovereign Technical Demo Script",
       "type": "Demo Script"
