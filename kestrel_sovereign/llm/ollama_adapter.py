@@ -25,6 +25,7 @@ from .adapter import (
 )
 from kestrel_sdk.llm import (
     ProviderCapabilities,
+    RawResponse,
     StructuredOutputMode,
     ToolStreamingMode,
     VisionInputMode,
@@ -93,17 +94,76 @@ class OllamaAdapter(LLMAdapter):
             supports_vision=True,
             supports_structured_output=True,
             supports_embeddings=True,
+            supports_raw_passthrough=True,
             structured_output_mode=StructuredOutputMode.SCHEMA_FORMAT,
             tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
             vision_input_mode=VisionInputMode.OLLAMA_IMAGES,
             embedding_model="nomic-embed-text",
             embedding_dim=768,
+            raw_operations=("chat", "generate", "embed", "show", "list", "ps", "pull"),
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
                 "Tool and vision support are model-dependent in Ollama.",
                 "Structured output passes a JSON schema via Ollama's format option.",
+                "Ollama is a local runtime: no batch/files/prompt-cache/token-count "
+                "platform APIs. Ollama-specific options (keep_alive, num_ctx, "
+                "options, think) flow via RequestOptions.raw; raw_request reaches "
+                "ollama client methods (pull/show/ps/...).",
             ),
         )
+
+    def contract_features(self) -> frozenset:
+        return frozenset({"raw_passthrough"})
+
+    def apply_request_options(
+        self,
+        request_kwargs: Dict[str, Any],
+        options: Any,
+        *,
+        model: str,
+    ) -> Dict[str, Any]:
+        """Translate neutral request options into Ollama request kwargs.
+
+        Ollama exposes no effort/thinking-budget/prompt-cache/server-tool
+        request parameters, so the structured neutral fields don't map. The
+        ``raw`` escape hatch is honored — merged into the outbound request — so
+        callers can pass Ollama-native options (``keep_alive``, ``num_ctx``,
+        ``options``, ``think``, ...).
+        """
+        out = request_kwargs
+        raw = getattr(options, "raw", None)
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                out[key] = value
+        return out
+
+    async def raw_request(
+        self,
+        client: Any,
+        operation: str,
+        payload: Optional[Any] = None,
+        *,
+        http_method: Optional[str] = None,
+        path: Optional[str] = None,
+        **kwargs: Any,
+    ) -> RawResponse:
+        """Escape hatch for Ollama client methods the typed surface doesn't cover
+        (e.g. ``pull``, ``show``, ``ps``). Routes a named ``operation`` through
+        the initialized Ollama client so host/transport are reused. Path-based
+        passthrough is unsupported (the typed client owns the endpoint mapping)."""
+        if not operation:
+            raise ValueError(
+                "raw_request requires a named Ollama client operation "
+                "(e.g. 'show', 'pull', 'ps')"
+            )
+        target: Any = client
+        for part in operation.split("."):
+            target = getattr(target, part)
+        if isinstance(payload, dict) or payload is None:
+            result = await target(**{**(payload or {}), **kwargs})
+        else:
+            result = await target(payload, **kwargs)
+        return RawResponse(operation=operation, data=result, raw=result)
 
     async def probe_reachable(
         self,
