@@ -315,12 +315,18 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
 
         if body.description is not None:
             from kestrel_sovereign.bootstrap.service import persist_agent_description
-            await persist_agent_description(
+            # The helper is best-effort by design (it must never block the
+            # SOUL save path). For this operator-facing endpoint we require a
+            # durable write — surface a 500 if nothing persisted, matching the
+            # prior inline behaviour rather than reporting a false success.
+            wrote = await persist_agent_description(
                 agent._raw_storage.db,
                 agent.storage,
                 agent.agent_id,
                 body.description,
             )
+            if not wrote:
+                raise HTTPException(status_code=500, detail="Error updating identity description.")
             updated_fields.append("description")
 
         # Return updated identity

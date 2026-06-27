@@ -778,6 +778,28 @@ class TestPersistAgentDescription:
         assert storage.node.properties["description"] == "Self-authored bio"
 
     @pytest.mark.asyncio
+    async def test_returns_false_when_no_store_succeeds(self):
+        """Contract the PATCH endpoint relies on: a total write failure
+        reports False so the operator-facing API can surface a 500."""
+        from kestrel_sovereign.bootstrap.service import persist_agent_description
+
+        class _FailingDB:
+            async def execute(self, *a, **k):
+                raise RuntimeError("db down")
+
+        class _NoNodeStorage:
+            async def get_node(self, _id):
+                return None
+
+            async def add_node(self, _node):  # pragma: no cover - never reached
+                raise AssertionError("should not be called")
+
+        wrote = await persist_agent_description(
+            _FailingDB(), _NoNodeStorage(), "agent-1", "bio"
+        )
+        assert wrote is False
+
+    @pytest.mark.asyncio
     async def test_none_description_is_noop(self):
         from kestrel_sovereign.bootstrap.service import persist_agent_description
 
