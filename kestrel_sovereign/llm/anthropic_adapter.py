@@ -385,7 +385,13 @@ class AnthropicAdapter(LLMAdapter):
         out = request_kwargs
         budget = getattr(options, "thinking_budget_tokens", None)
         if budget:
-            out["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
+            budget = int(budget)
+            out["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            # Anthropic requires budget_tokens < max_tokens. The request builders
+            # default max_tokens to 4096, which would tie/exceed a 4096 budget,
+            # so raise the ceiling to leave output headroom above the budget.
+            if (out.get("max_tokens") or 0) <= budget:
+                out["max_tokens"] = budget + 1024
         raw = getattr(options, "raw", None)
         if isinstance(raw, dict):
             for key, value in raw.items():
@@ -416,13 +422,15 @@ class AnthropicAdapter(LLMAdapter):
                 "(e.g. 'messages.count_tokens'); raw path passthrough is "
                 "unsupported because it would bypass SDK authentication"
             )
-        payload = payload or {}
         target: Any = client
         for part in operation.split("."):
             target = getattr(target, part)
-        result = (
-            await target(**payload) if isinstance(payload, dict) else await target(payload)
-        )
+        # Support both the dict-payload form and the SDK-style keyword form
+        # (raw_request(client, "messages.count_tokens", model=..., messages=...)).
+        if isinstance(payload, dict) or payload is None:
+            result = await target(**{**(payload or {}), **kwargs})
+        else:
+            result = await target(payload, **kwargs)
         return RawResponse(operation=operation, data=result, raw=result)
 
     def _maybe_apply_request_options(

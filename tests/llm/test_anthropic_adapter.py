@@ -91,6 +91,8 @@ def test_apply_request_options_maps_thinking_budget_and_ignores_effort():
 
     # Thinking budget maps to the Anthropic thinking config.
     assert out["thinking"] == {"type": "enabled", "budget_tokens": 8000}
+    # max_tokens is raised above the budget (Anthropic requires budget < max).
+    assert out["max_tokens"] == 8000 + 1024
     # Effort has no Messages API equivalent — intentionally ignored (not sent as
     # an unsupported output_config that would be rejected).
     assert "output_config" not in out
@@ -115,6 +117,7 @@ def test_request_options_are_wired_into_request_paths():
         "claude-opus-4-8",
     )
     assert out["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    assert out["max_tokens"] == 4096 + 1024  # bumped above the budget
 
     # No request_options → untouched.
     untouched = adapter._maybe_apply_request_options(
@@ -135,6 +138,24 @@ async def test_raw_request_routes_named_operation_through_client():
 
     assert result.operation == "messages.count_tokens"
     assert result.data == {"input_tokens": 7}
+    client.messages.count_tokens.assert_awaited_once_with(
+        model="claude-opus-4-8", messages=[]
+    )
+
+
+@pytest.mark.asyncio
+async def test_raw_request_supports_keyword_payload_form():
+    # SDK-style: raw_request(client, "op", model=..., messages=...) — kwargs must
+    # reach the target call, not be dropped.
+    adapter = AnthropicAdapter()
+    client = MagicMock()
+    client.messages.count_tokens = AsyncMock(return_value={"input_tokens": 3})
+
+    result = await adapter.raw_request(
+        client, "messages.count_tokens", model="claude-opus-4-8", messages=[]
+    )
+
+    assert result.data == {"input_tokens": 3}
     client.messages.count_tokens.assert_awaited_once_with(
         model="claude-opus-4-8", messages=[]
     )
