@@ -11,6 +11,7 @@ import json
 import os
 import openai
 import logging
+from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
 
 import httpx
@@ -32,6 +33,30 @@ from kestrel_sdk.llm import (
     ToolStreamingMode,
     VisionInputMode,
 )
+try:  # SDK v5 optional surface.
+    from kestrel_sdk.llm import (
+        BatchHandle,
+        BatchMode,
+        BatchRequest,
+        BatchResult,
+        BatchStatus,
+        CodeExecOptions,
+        FileRef,
+        FilesMode,
+        PromptCacheMode,
+        RawResponse,
+        ReasoningControlMode,
+        RequestOptions,
+        ServerToolMode,
+        TokenCount,
+        TokenCountMode,
+        WebSearchOptions,
+    )
+except ImportError:  # pragma: no cover - compatibility with SDK v4 checkouts.
+    BatchHandle = BatchMode = BatchRequest = BatchResult = BatchStatus = None
+    CodeExecOptions = FileRef = FilesMode = PromptCacheMode = None
+    RawResponse = ReasoningControlMode = RequestOptions = ServerToolMode = None
+    TokenCount = TokenCountMode = WebSearchOptions = None
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
@@ -40,6 +65,46 @@ logger = logging.getLogger(__name__)
 
 _split_thinking_from_content = split_thinking_from_content
 _ThinkingContentSplitter = ThinkingContentSplitter
+
+
+def _capability_kwargs(**kwargs: Any) -> Dict[str, Any]:
+    fields = getattr(ProviderCapabilities, "__dataclass_fields__", {})
+    if not fields:
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in fields}
+
+
+def _enum_value(enum_type: Any, name: str, fallback: str) -> Any:
+    if enum_type is None:
+        return fallback
+    return getattr(enum_type, name)
+
+
+def _object_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if is_dataclass(obj):
+        return {k: v for k, v in asdict(obj).items() if v is not None}
+    data: Dict[str, Any] = {}
+    for key in dir(obj):
+        if key.startswith("_"):
+            continue
+        try:
+            value = getattr(obj, key)
+        except Exception:
+            continue
+        if callable(value) or value is None:
+            continue
+        data[key] = value
+    return data
+
+
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -75,21 +140,70 @@ class OpenAIAdapter(LLMAdapter):
         self._embedding_dim = embedding_dim
 
     def provider_capabilities(self) -> ProviderCapabilities:
-        return ProviderCapabilities(
+        return ProviderCapabilities(**_capability_kwargs(
             supports_tools=True,
             supports_streaming=True,
             supports_vision=True,
             supports_structured_output=True,
             supports_embeddings=self._supports_embeddings,
+            supports_token_counting=True,
+            supports_batch=True,
+            supports_files=True,
+            supports_prompt_cache=True,
+            supports_reasoning_control=True,
+            supports_web_search=True,
+            supports_code_execution=True,
+            supports_raw_passthrough=True,
             structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
             tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
             embedding_model=self._embedding_model,
             embedding_dim=self._embedding_dim,
-            model_dependent=("vision",),
+            reasoning_control_mode=_enum_value(
+                ReasoningControlMode, "EFFORT", "effort"
+            ),
+            prompt_cache_mode=_enum_value(
+                PromptCacheMode, "AUTOMATIC", "automatic"
+            ),
+            batch_mode=_enum_value(BatchMode, "FILE_BASED", "file_based"),
+            files_mode=_enum_value(FilesMode, "UPLOAD", "upload"),
+            token_count_mode=_enum_value(TokenCountMode, "ESTIMATE", "estimate"),
+            server_tool_mode=_enum_value(
+                ServerToolMode, "REQUEST_OPTION", "request_option"
+            ),
+            reasoning_effort_levels=("minimal", "low", "medium", "high"),
+            raw_operations=(
+                "chat.completions.create",
+                "responses.create",
+                "responses.retrieve",
+                "files.create",
+                "files.list",
+                "files.retrieve",
+                "files.delete",
+                "files.content",
+                "batches.create",
+                "batches.retrieve",
+                "batches.cancel",
+            ),
+            model_dependent=("vision", "web_search", "code_execution"),
             notes=(
                 "Structured output uses response_format=json_schema for Pydantic models.",
+                "OpenAI prompt caching is implicit for stable prefixes.",
+                "Token counting is estimated locally with tiktoken.",
             ),
+        ))
+
+    def contract_features(self) -> frozenset[str]:
+        return frozenset(
+            {
+                "token_counting",
+                "batch",
+                "files",
+                "prompt_cache",
+                "reasoning_control",
+                "server_tools",
+                "raw_passthrough",
+            }
         )
 
     async def probe_reachable(
@@ -240,6 +354,14 @@ class OpenAIAdapter(LLMAdapter):
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
 
+            request_options = kwargs.get("request_options")
+            if request_options is not None:
+                extra_kwargs = self.apply_request_options(
+                    extra_kwargs,
+                    request_options,
+                    model=model,
+                )
+
             response = await with_retry(
                 client.chat.completions.create,
                 model=model,
@@ -369,6 +491,14 @@ class OpenAIAdapter(LLMAdapter):
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
 
+            request_options = kwargs.get("request_options")
+            if request_options is not None:
+                extra_kwargs = self.apply_request_options(
+                    extra_kwargs,
+                    request_options,
+                    model=model,
+                )
+
             logger.info(f"Starting OpenAI stream for model: {model}")
             stream = await with_retry(
                 client.chat.completions.create,
@@ -485,6 +615,14 @@ class OpenAIAdapter(LLMAdapter):
             # Provider-specific body extensions (issue #704).  See get_response().
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
+
+            request_options = kwargs.get("request_options")
+            if request_options is not None:
+                extra_kwargs = self.apply_request_options(
+                    extra_kwargs,
+                    request_options,
+                    model=model,
+                )
 
             # Request streaming with usage stats
             extra_kwargs["stream_options"] = {"include_usage": True}
@@ -701,6 +839,224 @@ class OpenAIAdapter(LLMAdapter):
             tools=tools
         )
 
+    async def count_tokens(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        **kwargs: Any,
+    ) -> Any:
+        total = self._estimate_message_tokens(model, messages)
+        return TokenCount(input_tokens=total, total_tokens=total) if TokenCount else {
+            "input_tokens": total,
+            "total_tokens": total,
+        }
+
+    async def batch_submit(
+        self,
+        client: Any,
+        requests: List[Any],
+        **kwargs: Any,
+    ) -> Any:
+        lines = []
+        for request in requests:
+            body = self._batch_request_body(request)
+            lines.append(
+                json.dumps(
+                    {
+                        "custom_id": getattr(request, "custom_id", ""),
+                        "method": "POST",
+                        "url": "/v1/chat/completions",
+                        "body": body,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        filename = kwargs.get("filename", "kestrel-openai-batch.jsonl")
+        payload = ("\n".join(lines) + "\n").encode("utf-8")
+        uploaded = await self.file_upload(
+            client,
+            (filename, payload),
+            purpose="batch",
+        )
+        batch_kwargs = {
+            "input_file_id": uploaded.id,
+            "endpoint": "/v1/chat/completions",
+            "completion_window": kwargs.get("completion_window", "24h"),
+        }
+        if kwargs.get("metadata") is not None:
+            batch_kwargs["metadata"] = kwargs["metadata"]
+        batch = await with_retry(client.batches.create, **batch_kwargs)
+        return self._batch_handle(batch)
+
+    async def batch_poll(self, client: Any, handle: Any, **kwargs: Any) -> Any:
+        batch = await with_retry(client.batches.retrieve, getattr(handle, "id", handle))
+        return self._batch_handle(batch)
+
+    async def batch_results(self, client: Any, handle: Any, **kwargs: Any) -> List[Any]:
+        raw_handle = getattr(handle, "raw", None) or handle
+        output_file_id = (
+            getattr(raw_handle, "output_file_id", None)
+            or getattr(handle, "output_file_id", None)
+            or kwargs.get("output_file_id")
+        )
+        if not output_file_id:
+            refreshed = await self.batch_poll(client, handle)
+            raw_handle = getattr(refreshed, "raw", None) or refreshed
+            output_file_id = getattr(raw_handle, "output_file_id", None)
+        if not output_file_id:
+            return []
+        content_response = await with_retry(client.files.content, output_file_id)
+        content = await self._read_file_content(content_response)
+        results = []
+        for line in content.decode("utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            custom_id = item.get("custom_id", "")
+            error = item.get("error")
+            response_body = ((item.get("response") or {}).get("body") or None)
+            response = (
+                self._llm_response_from_chat_completion(response_body)
+                if response_body
+                else None
+            )
+            error_text = json.dumps(error) if error is not None else None
+            if BatchResult:
+                results.append(
+                    BatchResult(
+                        custom_id=custom_id,
+                        response=response,
+                        error=error_text,
+                        raw=item,
+                    )
+                )
+            else:
+                results.append(
+                    {
+                        "custom_id": custom_id,
+                        "response": response,
+                        "error": error_text,
+                        "raw": item,
+                    }
+                )
+        return results
+
+    async def batch_cancel(self, client: Any, handle: Any, **kwargs: Any) -> Any:
+        batch = await with_retry(client.batches.cancel, getattr(handle, "id", handle))
+        return self._batch_handle(batch)
+
+    async def file_upload(
+        self,
+        client: Any,
+        file: Any,
+        *,
+        purpose: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        uploaded = await with_retry(
+            client.files.create,
+            file=file,
+            purpose=purpose or kwargs.get("purpose") or "assistants",
+        )
+        return self._file_ref(uploaded)
+
+    async def file_list(self, client: Any, **kwargs: Any) -> List[Any]:
+        response = await with_retry(client.files.list, **kwargs)
+        return [self._file_ref(item) for item in getattr(response, "data", [])]
+
+    async def file_get(self, client: Any, file_id: str, **kwargs: Any) -> Any:
+        response = await with_retry(client.files.retrieve, file_id)
+        return self._file_ref(response)
+
+    async def file_delete(self, client: Any, file_id: str, **kwargs: Any) -> bool:
+        response = await with_retry(client.files.delete, file_id)
+        return bool(getattr(response, "deleted", False) or getattr(response, "id", None))
+
+    def file_reference(self, file_ref: Any) -> Dict[str, Any]:
+        file_id = getattr(file_ref, "id", None)
+        if not file_id:
+            raise ValueError("file_ref.id is required")
+        return {"file_id": file_id}
+
+    def apply_request_options(
+        self,
+        request_kwargs: Dict[str, Any],
+        options: Any,
+        *,
+        model: str,
+    ) -> Dict[str, Any]:
+        out = request_kwargs
+        if getattr(options, "reasoning_effort", None):
+            out["reasoning_effort"] = options.reasoning_effort
+            out["reasoning"] = {"effort": options.reasoning_effort}
+
+        if getattr(options, "cache_markers", None):
+            extra_body = dict(out.get("extra_body") or {})
+            extra_body["prompt_cache_key"] = self._cache_key_for_options(
+                model, options.cache_markers
+            )
+            extra_body["cache_markers"] = [
+                _object_to_dict(marker) for marker in options.cache_markers
+            ]
+            out["extra_body"] = extra_body
+
+        web_search = getattr(options, "web_search", None)
+        if web_search is not None and getattr(web_search, "enabled", True):
+            tool = {"type": "web_search_preview"}
+            if getattr(web_search, "search_context_size", None):
+                tool["search_context_size"] = web_search.search_context_size
+            if getattr(web_search, "user_location", None):
+                tool["user_location"] = web_search.user_location
+            self._append_server_tool(out, tool)
+            if getattr(web_search, "max_results", None) is not None:
+                out.setdefault("web_search_options", {})["max_results"] = (
+                    web_search.max_results
+                )
+
+        code_execution = getattr(options, "code_execution", None)
+        if code_execution is not None and getattr(code_execution, "enabled", True):
+            tool = {"type": "code_interpreter"}
+            if getattr(code_execution, "container", None):
+                tool["container"] = code_execution.container
+            self._append_server_tool(out, tool)
+            if getattr(code_execution, "timeout_seconds", None) is not None:
+                out.setdefault("extra_body", {})["code_execution"] = {
+                    "timeout_seconds": code_execution.timeout_seconds
+                }
+
+        raw = getattr(options, "raw", None)
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if key == "extra_body" and isinstance(value, dict):
+                    out.setdefault("extra_body", {}).update(value)
+                else:
+                    out[key] = value
+        return out
+
+    async def raw_request(
+        self,
+        client: Any,
+        operation: str,
+        payload: Optional[Any] = None,
+        *,
+        http_method: Optional[str] = None,
+        path: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        target: Any = client
+        for part in operation.split("."):
+            target = getattr(target, part)
+        call_kwargs = dict(payload or {}) if isinstance(payload, dict) else {}
+        call_kwargs.update(kwargs)
+        if payload is not None and not isinstance(payload, dict):
+            data = await _maybe_await(target(payload, **kwargs))
+        else:
+            data = await _maybe_await(target(**call_kwargs))
+        if RawResponse:
+            return RawResponse(operation=operation, data=data, raw=data)
+        return {"operation": operation, "data": data, "raw": data}
+
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """List available models from OpenAI API (or any OpenAI-compatible
         endpoint the route was initialized against).
@@ -774,6 +1130,166 @@ class OpenAIAdapter(LLMAdapter):
         except Exception as e:
             logger.error(f"Failed to list OpenAI models: {e}", exc_info=True)
             return []
+
+    @staticmethod
+    def _append_server_tool(request_kwargs: Dict[str, Any], tool: Dict[str, Any]) -> None:
+        tools = list(request_kwargs.get("tools") or [])
+        tools.append(tool)
+        request_kwargs["tools"] = tools
+
+    @staticmethod
+    def _cache_key_for_options(model: str, markers: List[Any]) -> str:
+        payload = json.dumps(
+            [getattr(marker, "label", None) or getattr(marker, "index", None) for marker in markers],
+            sort_keys=True,
+            default=str,
+        )
+        return f"kestrel:{model}:{payload}"
+
+    @staticmethod
+    def _estimate_message_tokens(model: str, messages: List[Dict[str, Any]]) -> int:
+        try:
+            import tiktoken
+
+            try:
+                encoding = tiktoken.encoding_for_model(model)
+            except KeyError:
+                encoding = tiktoken.get_encoding("o200k_base")
+            total = 0
+            for message in messages:
+                total += 3
+                for key, value in message.items():
+                    total += len(encoding.encode(OpenAIAdapter._token_text(value)))
+                    if key == "name":
+                        total += 1
+            return total + 3
+        except Exception:
+            text = "\n".join(OpenAIAdapter._token_text(message) for message in messages)
+            return max(1, len(text) // 4)
+
+    @staticmethod
+    def _token_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(OpenAIAdapter._token_text(item) for item in value)
+        if isinstance(value, dict):
+            if isinstance(value.get("text"), str):
+                return value["text"]
+            return json.dumps(value, sort_keys=True, default=str)
+        return str(value)
+
+    def _batch_request_body(self, request: Any) -> Dict[str, Any]:
+        body = {
+            "model": getattr(request, "model", None) or "gpt-5-mini",
+            "messages": self._normalize_messages(getattr(request, "messages", []) or []),
+        }
+        if getattr(request, "tools", None):
+            body["tools"] = getattr(request, "tools")
+            body["tool_choice"] = "auto"
+        if getattr(request, "format", None) == "json":
+            body["response_format"] = {"type": "json_object"}
+        body.update(getattr(request, "kwargs", None) or {})
+        request_options = getattr(request, "request_options", None)
+        if request_options is not None:
+            body = self.apply_request_options(
+                body,
+                request_options,
+                model=body["model"],
+            )
+        return body
+
+    @staticmethod
+    def _batch_handle(batch: Any) -> Any:
+        status_map = {
+            "validating": "running",
+            "in_progress": "running",
+            "finalizing": "running",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "cancelling": "cancelled",
+            "expired": "expired",
+        }
+        status_value = status_map.get(str(getattr(batch, "status", "") or ""), "unknown")
+        status = (
+            getattr(BatchStatus, status_value.upper(), status_value)
+            if BatchStatus is not None
+            else status_value
+        )
+        if BatchHandle:
+            return BatchHandle(
+                id=getattr(batch, "id", ""),
+                status=status,
+                created_at=getattr(batch, "created_at", None),
+                expires_at=getattr(batch, "expires_at", None),
+                raw=batch,
+            )
+        return {"id": getattr(batch, "id", ""), "status": status, "raw": batch}
+
+    @staticmethod
+    def _file_ref(file_obj: Any) -> Any:
+        if FileRef:
+            return FileRef(
+                id=getattr(file_obj, "id", ""),
+                filename=getattr(file_obj, "filename", None),
+                purpose=getattr(file_obj, "purpose", None),
+                size_bytes=getattr(file_obj, "bytes", None),
+                created_at=getattr(file_obj, "created_at", None),
+                raw=file_obj,
+            )
+        return {
+            "id": getattr(file_obj, "id", ""),
+            "filename": getattr(file_obj, "filename", None),
+            "purpose": getattr(file_obj, "purpose", None),
+            "raw": file_obj,
+        }
+
+    @staticmethod
+    async def _read_file_content(content_response: Any) -> bytes:
+        if isinstance(content_response, bytes):
+            return content_response
+        if isinstance(content_response, str):
+            return content_response.encode("utf-8")
+        if hasattr(content_response, "read"):
+            return await _maybe_await(content_response.read())
+        if hasattr(content_response, "content"):
+            content = content_response.content
+            return content if isinstance(content, bytes) else str(content).encode("utf-8")
+        return str(content_response).encode("utf-8")
+
+    def _llm_response_from_chat_completion(self, response_body: Any) -> LLMResponse:
+        body = response_body if isinstance(response_body, dict) else _object_to_dict(response_body)
+        choices = body.get("choices") or []
+        message = (choices[0].get("message") if choices else {}) or {}
+        tool_calls = None
+        if message.get("tool_calls"):
+            tool_calls = []
+            for tc in message["tool_calls"]:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments") or "{}"
+                try:
+                    parsed = json.loads(args) if isinstance(args, str) else args
+                except json.JSONDecodeError:
+                    parsed = {"_raw": args}
+                tool_calls.append(
+                    ToolCall(
+                        id=tc.get("id", ""),
+                        name=fn.get("name", ""),
+                        arguments=parsed,
+                    )
+                )
+        usage = body.get("usage") or {}
+        return LLMResponse(
+            content=message.get("content"),
+            tool_calls=tool_calls,
+            raw=response_body,
+            input_tokens=usage.get("prompt_tokens"),
+            output_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+        )
 
     def _normalize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
