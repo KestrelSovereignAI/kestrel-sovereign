@@ -43,6 +43,22 @@ def test_apply_request_options_merges_ollama_native_raw():
     assert out["options"] == {"num_ctx": 8192}
 
 
+def test_raw_options_merge_preserves_existing_options():
+    # A raw `options` dict must compose with (not clobber) options already built
+    # from neutral kwargs like temperature/max_tokens.
+    adapter = OllamaAdapter()
+    out = adapter.apply_request_options(
+        {"options": {"temperature": 0.2, "num_predict": 100}},
+        RequestOptions(raw={"options": {"num_ctx": 8192, "temperature": 0.9}}),
+        model="qwen3",
+    )
+    assert out["options"] == {
+        "temperature": 0.9,  # raw wins per-key
+        "num_predict": 100,  # preserved
+        "num_ctx": 8192,  # added
+    }
+
+
 def test_apply_request_options_default_no_op():
     adapter = OllamaAdapter()
     out = adapter.apply_request_options({"model": "x"}, RequestOptions(), model="x")

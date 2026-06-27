@@ -134,7 +134,20 @@ class OllamaAdapter(LLMAdapter):
         raw = getattr(options, "raw", None)
         if isinstance(raw, dict):
             for key, value in raw.items():
-                out[key] = value
+                # Deep-merge the nested ``options`` dict so a raw escape hatch
+                # composes with the sampling/token options already built from
+                # neutral kwargs (temperature, max_tokens) instead of replacing
+                # them wholesale; per-key, raw wins.
+                if (
+                    key == "options"
+                    and isinstance(value, dict)
+                    and isinstance(out.get("options"), dict)
+                ):
+                    merged = dict(out["options"])
+                    merged.update(value)
+                    out["options"] = merged
+                else:
+                    out[key] = value
         return out
 
     def _maybe_apply_request_options(
