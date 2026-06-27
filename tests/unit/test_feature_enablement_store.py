@@ -133,3 +133,48 @@ async def test_disabled_skip_never_includes_mandatory():
     mandatory = next(iter(MANDATORY_FEATURES))
     agent = _UnionAgent(None, [{"name": mandatory, "state": "disabled"}])
     assert mandatory not in await agent._disabled_feature_names()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end primitive: host API writes a delta -> startup union reads it back
+# (proves persist_feature_enablement -> get_enablement_deltas ->
+# _effective_allowed_features round-trips through a real store, i.e. a change
+# survives a "restart". The production callers — feature_add/remove + MCP — wire
+# into persist_feature_enablement in the follow-up PRs.)
+# ---------------------------------------------------------------------------
+class _StoreBackedAgent:
+    from kestrel_sovereign.kestrel_agent import KestrelAgent as _KA
+    persist_feature_enablement = _KA.persist_feature_enablement
+    get_enablement_deltas = _KA.get_enablement_deltas
+    clear_feature_enablement = _KA.clear_feature_enablement
+    _effective_allowed_features = _KA._effective_allowed_features
+
+    def __init__(self, did, store, allowed):
+        self.did = did
+        self._feature_enablement_store = store
+        self._allowed_features = allowed
+
+
+@pytest.mark.asyncio
+async def test_persist_then_union_reflects_change_across_restart(tmp_path):
+    backend = SQLiteBackend(str(tmp_path / "e2e.db"))
+    await backend.connect()
+    store = FeatureEnablementStore(backend)
+    await store.initialize()
+    try:
+        # "Session 1": agent enables a non-bootstrap feature, disables a bootstrap one.
+        a1 = _StoreBackedAgent("did:test:e2e", store, {"VoiceFeature"})
+        await a1.persist_feature_enablement("feature", "WebSearchFeature", "enabled", actor="agent")
+        await a1.persist_feature_enablement("feature", "VoiceFeature", "disabled", actor="agent")
+
+        # "Session 2": a fresh agent object over the SAME db reflects the deltas.
+        a2 = _StoreBackedAgent("did:test:e2e", store, {"VoiceFeature"})
+        eff = await a2._effective_allowed_features()
+        assert eff == {"WebSearchFeature"}  # voice disabled, websearch enabled — persisted
+
+        # clearing reverts to the bootstrap default
+        await a2.clear_feature_enablement("feature", "VoiceFeature")
+        await a2.clear_feature_enablement("feature", "WebSearchFeature")
+        assert await a2._effective_allowed_features() == {"VoiceFeature"}
+    finally:
+        await backend.close()

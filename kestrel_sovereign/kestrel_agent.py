@@ -1333,7 +1333,11 @@ class KestrelAgent(
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
             # Per-agent feature profiles filter via allowed_features — the
             # config bootstrap set unioned with agent-driven enablement deltas
-            # from the DB (so a runtime feature_add survives restart).
+            # from the DB. This is the READ side of the primitive; the production
+            # writers (FeatureFeaturesFeature.feature_add/remove + MCPAgent
+            # enable/disable, which call persist_feature_enablement) land in the
+            # follow-up PRs. With no deltas the effective set == the bootstrap
+            # allowlist, so behavior is unchanged today.
             effective_features = await self._effective_allowed_features()
             # Disabled deltas must be honored even when there is no bootstrap
             # allowlist (effective is None → discover_features loads all), so a
