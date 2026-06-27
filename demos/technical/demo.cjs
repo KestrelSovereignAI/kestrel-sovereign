@@ -46,10 +46,8 @@ const {
     navigateToPanel,
     dismissContextWarning,
     scrollChatToTop,
-    resetDemoAgentDatabases,
     assertIsolatedDemoEnv,
     assertIsolatedDemoTarget,
-    requireDemoSandbox,
     startFreshSession,
     selectDemoProvider,
 } = require('../shared/demo_helpers.cjs');
@@ -67,8 +65,12 @@ let apiKey = null;
 test.describe.serial('Kestrel Sovereign Technical Demo', () => {
 
     test.beforeAll(async ({ request }) => {
-        // Create output directory
+        // Create output directory, and clear stale screenshots from prior runs so
+        // the output only ever contains THIS run's shots (no mixing old + new).
         fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+        for (const f of fs.readdirSync(OUTPUT_DIR)) {
+            if (f.endsWith('.png')) fs.unlinkSync(path.join(OUTPUT_DIR, f));
+        }
 
         narrator.act(0, 'Setup');
 
@@ -92,26 +94,23 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         // (issue #1973). Throwing here aborts the demo before it touches data.
         await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
 
-        // Reset ONLY the isolated demo sandbox (KESTREL_DB_PATH), never the live
-        // agent_data/ tree, then start a fresh session.
-        resetDemoAgentDatabases(narrator, requireDemoSandbox());
+        // Start a fresh conversation via the API. We deliberately do NOT delete
+        // the DB file here: `kestrel demo run` already provisions a brand-new
+        // demo agent each run (setup_demo_agent.py rmtree+recreate), and the
+        // server has it open + initialized. Deleting kestrel_prime.db out from
+        // under the running server drops the security_permissions table for new
+        // connections, so every permission check fail-closes to DENY and tools
+        // like memory_save silently fail. A clean context comes from the fresh
+        // per-run DB + startFreshSession, not a mid-run file wipe.
         await startFreshSession(request, BASE_URL, apiKey, narrator);
 
-        // Set model to llama3.2 via Ollama (cloud keys not configured on this machine)
-        try {
-            const headers = { 'Content-Type': 'application/json', ...authHeaders(apiKey) };
-            const resp = await request.post(`${BASE_URL}/api/model/set`, {
-                headers,
-                data: { model: 'llama3.2:1b', provider: 'ollama' }
-            });
-            if (resp.ok()) {
-                narrator.narrate('Model set to llama3.2:1b (ollama)');
-            } else {
-                narrator.narrate(`Model set returned ${resp.status()} — using default`);
-            }
-        } catch (e) {
-            narrator.narrate(`Could not set model: ${e.message} — using default`);
-        }
+        // Leave the agent on its configured default route — a real CLOUD model
+        // (anthropic:api, route_priority[0] in the demo agent's kestrel.toml).
+        // We deliberately do NOT pin a local model here: NORMAL/cloud modes must
+        // use an actual cloud model, and only EPHEMERAL switches to local-only
+        // (Ollama) later in the privacy act. Misrepresenting a local model as the
+        // cloud model would undermine the whole privacy story.
+        narrator.narrate('NORMAL mode uses the agent\'s configured cloud model; EPHEMERAL switches to local-only');
     });
 
     // ========================================================================
@@ -124,7 +123,12 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await demoGoto(page, BASE_URL, apiKey);
         await demoPause(page, 2000);
 
-        // Identity panel should be the default view
+        // Navigate to the Identity panel explicitly — the console now loads on
+        // Chat by default, so we can't assume Identity is the active view.
+        await navigateToPanel(page, 'identity');
+        await dismissContextWarning(page);
+        await demoPause(page, 1000);
+
         try {
             await page.waitForSelector('.identity-did-text', { timeout: 15000 });
             const didText = await page.locator('.identity-did-text').textContent();
@@ -172,8 +176,13 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        // Select a working provider from the dropdown (prefer local Ollama — cloud keys not configured)
-        await selectDemoProvider(page, { narrator, narrateFallback: true });
+        // NORMAL mode: prefer a real CLOUD provider (anthropic/openai), falling
+        // back to local only if no cloud route is available (issue: demo fidelity).
+        await selectDemoProvider(page, {
+            narrator,
+            narrateFallback: true,
+            preferred: ['anthropic', 'openai', 'openrouter', 'ollama'],
+        });
 
         // Send a message that elicits constitutional awareness
         narrator.narrate('Sending a message — every response is processed through the Constitution');
@@ -225,8 +234,11 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        // Select a working provider (prefer local Ollama — cloud keys not configured)
-        await selectDemoProvider(page, { narrator });
+        // NORMAL mode: prefer a real CLOUD provider (anthropic/openai).
+        await selectDemoProvider(page, {
+            narrator,
+            preferred: ['anthropic', 'openai', 'openrouter', 'ollama'],
+        });
 
         // Beat 1: Send a memorable fact
         narrator.narrate('Sending a unique fact for the agent to remember...');

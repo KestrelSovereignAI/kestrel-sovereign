@@ -229,6 +229,16 @@ def _build_playwright_env(parent_env: dict, demo_url: str, repo: Path, demo_db: 
     return env
 
 
+def _fetch_demo_api_key(demo_url: str) -> Optional[str]:
+    """Mint/return the demo server's API key via the public ``/api/auth/key``
+    endpoint (in ``server.py``'s ``public_paths``). ``/api/agents`` requires it."""
+    try:
+        with urllib.request.urlopen(f"{demo_url}/api/auth/key", timeout=5) as resp:
+            return json.loads(resp.read()).get("key")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return None
+
+
 def _verify_only_demo_agents(demo_url: str) -> Optional[str]:
     """Sanity-check ``/api/agents``: every loaded agent must report
     ``is_demo=true``. Returns None on success, else a string with
@@ -238,10 +248,17 @@ def _verify_only_demo_agents(demo_url: str) -> Optional[str]:
     defences (``KESTREL_MULTI_AGENT_CONFIG`` override + the demo flag)
     should make this unreachable in practice, but the cost of a false
     negative is wiping a live agent — re-check at the boundary.
+
+    ``/api/agents`` is authenticated, so mint the demo key first
+    (``X-API-Key``); without it the server returns 401 and the runner
+    can never pass the check.
     """
-    url = f"{demo_url}/api/agents"
+    api_key = _fetch_demo_api_key(demo_url)
+    request = urllib.request.Request(f"{demo_url}/api/agents")
+    if api_key:
+        request.add_header("X-API-Key", api_key)
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with urllib.request.urlopen(request, timeout=5) as resp:
             body = resp.read()
     except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
         return f"!!fetch-error: {e}"
