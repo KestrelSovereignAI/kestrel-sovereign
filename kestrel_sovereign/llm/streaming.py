@@ -39,7 +39,7 @@ from typing import (
 
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sdk.llm import ProviderCapabilities, StructuredOutputMode, ToolCallStarted
 
 from .adapter import LLMResponse, ThinkingDelta, messages_for
 from .cancellation import CancelToken
@@ -48,6 +48,76 @@ from .error_handling import LLMError
 from .provider_registry import provider_cache_body
 
 logger = logging.getLogger(__name__)
+
+# v5 typed negotiation (#1983). Routing gates read the adapter's typed
+# ``ProviderCapabilities`` plus its ``contract_features()`` opt-in set instead
+# of matching on bare vendor names — composite route names (``"openai:api"``)
+# never matched the old ``provider_name in [...]`` literals, so those gates
+# were dead. The contract-feature opt-in keeps every in-tree adapter's
+# behavior unchanged until it explicitly advertises the feature.
+_FEATURE_STREAMING_STRUCTURED_OUTPUT = "streaming_structured_output"
+_FEATURE_TOOL_STREAM_SYSTEM_PROMPT = "tool_stream_system_prompt"
+
+# Structured-output modes that can be produced while streaming. ``TOOL_FORCED``
+# (Anthropic) cannot — it assembles the object from a buffered tool call — and
+# ``NONE``/``UNKNOWN`` carry no streamable guarantee.
+_STREAMABLE_STRUCTURED_MODES = frozenset(
+    {
+        StructuredOutputMode.JSON_OBJECT,
+        StructuredOutputMode.JSON_SCHEMA,
+        StructuredOutputMode.SCHEMA_FORMAT,
+        StructuredOutputMode.PROVIDER_NATIVE,
+    }
+)
+
+
+def _route_capabilities(adapter: Any) -> Tuple[ProviderCapabilities, frozenset]:
+    """Return the adapter's typed capabilities and contract-feature opt-ins.
+
+    Falls back to an empty :class:`ProviderCapabilities` / ``frozenset`` when
+    the adapter can't answer, so callers can use plain attribute access.
+    """
+    try:
+        caps = adapter.provider_capabilities()
+    except Exception:
+        caps = ProviderCapabilities()
+    if not isinstance(caps, ProviderCapabilities):
+        caps = ProviderCapabilities()
+    try:
+        features = adapter.contract_features()
+    except Exception:
+        features = frozenset()
+    return caps, frozenset(features or ())
+
+
+def _route_supports_streaming_structured(adapter: Any) -> bool:
+    """Whether this route can stream while honoring a ``response_format``.
+
+    Typed replacement for the dead ``provider_name in ["openai", "vertex_ai"]``
+    literal. Evaluates False for every in-tree adapter until one opts in via
+    ``contract_features()`` — i.e. no behavior change yet (#1983).
+    """
+    caps, features = _route_capabilities(adapter)
+    if _FEATURE_STREAMING_STRUCTURED_OUTPUT not in features:
+        return False
+    if not caps.supports_streaming:
+        return False
+    return caps.structured_output_mode in _STREAMABLE_STRUCTURED_MODES
+
+
+def _route_wants_tool_stream_system_prompt(adapter: Any) -> bool:
+    """Whether to forward ``system_prompt`` separately into tool streaming.
+
+    Typed replacement for the dead ``provider_name == "anthropic"`` literal.
+    Anthropic-family routes carry the system prompt as a top-level field rather
+    than an inline message; the typed signal is ``supports_inline_system``.
+    Gated behind ``contract_features()`` so no in-tree adapter changes behavior
+    until it opts in (#1983).
+    """
+    caps, features = _route_capabilities(adapter)
+    if _FEATURE_TOOL_STREAM_SYSTEM_PROMPT not in features:
+        return False
+    return caps.supports_inline_system
 
 
 class RoutingMeta(NamedTuple):
@@ -627,10 +697,12 @@ class StreamingMixin:
 
                 adapter = provider["adapter"]
 
-                # For structured output, only some providers support streaming
-                # OpenAI and Vertex support streaming with response_format
-                # Anthropic does NOT support streaming with structured output (uses tool_use pattern)
-                supports_streaming_structured = provider_name in ["openai", "vertex_ai"]
+                # For structured output, only routes whose typed capabilities
+                # advertise a streamable structured-output mode (and opt in via
+                # contract_features) can stream a response_format. Anthropic's
+                # TOOL_FORCED mode buffers a tool call, so it stays on the
+                # non-streaming fallback below.
+                supports_streaming_structured = _route_supports_streaming_structured(adapter)
 
                 # Use streaming if supported (or no structured output requested)
                 if hasattr(adapter, "get_streaming_response"):
@@ -1189,7 +1261,7 @@ class StreamingMixin:
                 if hasattr(adapter, "get_streaming_response_with_tools"):
                     # Build kwargs for provider-specific parameters
                     kwargs = {}
-                    if provider_name == "anthropic" and system_prompt:
+                    if system_prompt and _route_wants_tool_stream_system_prompt(adapter):
                         kwargs["system_prompt"] = system_prompt
                     cache_body = provider_cache_body(provider)
                     if cache_body:
