@@ -119,6 +119,30 @@ def test_openai_v5_capability_flags_and_round_trip():
     assert ProviderCapabilities.from_mapping(caps.to_dict()) == caps
 
 
+def test_openai_compatible_route_does_not_advertise_native_only_caps():
+    # A compatible route (Kimi/DeepSeek/OpenRouter via custom base_url) is
+    # constructed with supports_embeddings=False; it must NOT advertise the
+    # OpenAI-only /batches, /files, /responses surface (would 404).
+    compat = OpenAIAdapter(name="openrouter", supports_embeddings=False)
+    caps = compat.provider_capabilities()
+
+    assert caps.supports_batch is False
+    assert caps.supports_files is False
+    assert caps.supports_prompt_cache is False
+    assert caps.supports_raw_passthrough is False
+    assert caps.batch_mode.value == "none"
+    assert caps.files_mode.value == "none"
+    assert caps.raw_operations == ()
+    # Endpoint-agnostic capabilities remain.
+    assert caps.supports_token_counting is True
+    assert caps.supports_reasoning_control is True
+
+    features = compat.contract_features()
+    assert "batch" not in features and "files" not in features
+    assert "raw_passthrough" not in features
+    assert "token_counting" in features
+
+
 def test_openai_contract_features_match_advertised_optional_methods():
     features = OpenAIAdapter().contract_features()
 
@@ -151,7 +175,8 @@ def test_apply_request_options_mutates_outbound_kwargs():
     # (chat.completions rejects it).
     assert out["reasoning_effort"] == "high"
     assert "reasoning" not in out
-    assert out["extra_body"]["cache_markers"][0]["label"] == "system"
+    # Only prompt_cache_key is sent (chat.completions has no cache_markers field).
+    assert "cache_markers" not in out["extra_body"]
     assert out["extra_body"]["prompt_cache_key"].startswith("kestrel:gpt-5:")
     assert out["extra_body"]["custom"] is True
     # web_search / code_execution options are ignored — not chat.completions

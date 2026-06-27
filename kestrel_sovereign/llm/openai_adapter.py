@@ -140,6 +140,15 @@ class OpenAIAdapter(LLMAdapter):
         self._embedding_dim = embedding_dim
 
     def provider_capabilities(self) -> ProviderCapabilities:
+        # OpenAI-native endpoints — /batches, /files, /responses and the
+        # prompt_cache_key param — are exposed only by canonical OpenAI, not by
+        # the OpenAI-*compatible* routes this adapter also serves via a custom
+        # base_url (Kimi, DeepSeek, OpenRouter, …). Gate those on the same
+        # native-OpenAI signal used for embeddings so the framework never routes
+        # batch/file/raw operations to a compatible endpoint that would 404.
+        # Token counting (local tiktoken estimate) and reasoning effort (a
+        # request param) are endpoint-agnostic and stay ungated.
+        native = bool(self._supports_embeddings)
         return ProviderCapabilities(**_capability_kwargs(
             supports_tools=True,
             supports_streaming=True,
@@ -147,11 +156,11 @@ class OpenAIAdapter(LLMAdapter):
             supports_structured_output=True,
             supports_embeddings=self._supports_embeddings,
             supports_token_counting=True,
-            supports_batch=True,
-            supports_files=True,
-            supports_prompt_cache=True,
             supports_reasoning_control=True,
-            supports_raw_passthrough=True,
+            supports_batch=native,
+            supports_files=native,
+            supports_prompt_cache=native,
+            supports_raw_passthrough=native,
             structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
             tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
@@ -161,24 +170,35 @@ class OpenAIAdapter(LLMAdapter):
                 ReasoningControlMode, "EFFORT", "effort"
             ),
             prompt_cache_mode=_enum_value(
-                PromptCacheMode, "AUTOMATIC", "automatic"
+                PromptCacheMode, "AUTOMATIC" if native else "NONE",
+                "automatic" if native else "none",
             ),
-            batch_mode=_enum_value(BatchMode, "FILE_BASED", "file_based"),
-            files_mode=_enum_value(FilesMode, "UPLOAD", "upload"),
+            batch_mode=_enum_value(
+                BatchMode, "FILE_BASED" if native else "NONE",
+                "file_based" if native else "none",
+            ),
+            files_mode=_enum_value(
+                FilesMode, "UPLOAD" if native else "NONE",
+                "upload" if native else "none",
+            ),
             token_count_mode=_enum_value(TokenCountMode, "ESTIMATE", "estimate"),
             reasoning_effort_levels=("minimal", "low", "medium", "high"),
             raw_operations=(
-                "chat.completions.create",
-                "responses.create",
-                "responses.retrieve",
-                "files.create",
-                "files.list",
-                "files.retrieve",
-                "files.delete",
-                "files.content",
-                "batches.create",
-                "batches.retrieve",
-                "batches.cancel",
+                (
+                    "chat.completions.create",
+                    "responses.create",
+                    "responses.retrieve",
+                    "files.create",
+                    "files.list",
+                    "files.retrieve",
+                    "files.delete",
+                    "files.content",
+                    "batches.create",
+                    "batches.retrieve",
+                    "batches.cancel",
+                )
+                if native
+                else ()
             ),
             model_dependent=("vision",),
             notes=(
@@ -189,16 +209,10 @@ class OpenAIAdapter(LLMAdapter):
         ))
 
     def contract_features(self) -> frozenset[str]:
-        return frozenset(
-            {
-                "token_counting",
-                "batch",
-                "files",
-                "prompt_cache",
-                "reasoning_control",
-                "raw_passthrough",
-            }
-        )
+        features = {"token_counting", "reasoning_control"}
+        if self._supports_embeddings:
+            features |= {"batch", "files", "prompt_cache", "raw_passthrough"}
+        return frozenset(features)
 
     async def probe_reachable(
         self,
@@ -987,13 +1001,13 @@ class OpenAIAdapter(LLMAdapter):
             out["reasoning_effort"] = options.reasoning_effort
 
         if getattr(options, "cache_markers", None):
+            # chat.completions supports prompt_cache_key (a stable string that
+            # pins the cache prefix); it has no `cache_markers` field, so derive
+            # the key from the markers and send only that.
             extra_body = dict(out.get("extra_body") or {})
             extra_body["prompt_cache_key"] = self._cache_key_for_options(
                 model, options.cache_markers
             )
-            extra_body["cache_markers"] = [
-                _object_to_dict(marker) for marker in options.cache_markers
-            ]
             out["extra_body"] = extra_body
 
         # NOTE: web_search / code_execution are intentionally NOT translated
@@ -1154,9 +1168,16 @@ class OpenAIAdapter(LLMAdapter):
         return str(value)
 
     def _batch_request_body(self, request: Any) -> Dict[str, Any]:
+        model = getattr(request, "model", None) or "gpt-5-mini"
+        # Mirror get_response: apply the model's system-prompt contribution
+        # (e.g. the GPT-5 behavior overlay) before normalizing, so batched
+        # calls don't silently lose it.
+        messages = self._apply_system_prompt_contribution(
+            getattr(request, "messages", []) or [], model
+        )
         body = {
-            "model": getattr(request, "model", None) or "gpt-5-mini",
-            "messages": self._normalize_messages(getattr(request, "messages", []) or []),
+            "model": model,
+            "messages": self._normalize_messages(messages),
         }
         if getattr(request, "tools", None):
             body["tools"] = getattr(request, "tools")
