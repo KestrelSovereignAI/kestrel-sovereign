@@ -26,8 +26,12 @@ from .cancellation import (
     raise_if_cancelled,
 )
 from kestrel_sdk.llm import (
+    PromptCacheMode,
     ProviderCapabilities,
+    RawResponse,
     StructuredOutputMode,
+    TokenCount,
+    TokenCountMode,
     ToolStreamingMode,
     VisionInputMode,
 )
@@ -280,24 +284,153 @@ class AnthropicAdapter(LLMAdapter):
     supports_partial_usage_flush: bool = True
 
     def provider_capabilities(self) -> ProviderCapabilities:
+        # Data-plane features that hit api.anthropic.com directly — the
+        # count_tokens endpoint and raw passthrough — need API-key access. The
+        # OAuth/plan route (ClaudeMaxAdapter) overrides _has_platform_api_access()
+        # to False, so it advertises only request-level prompt caching (which
+        # works on both routes, genuinely applied via cache_control breakpoints).
+        # Reasoning control is intentionally NOT advertised: Anthropic's thinking
+        # surface is model-version-specific (budget_tokens is removed on Opus
+        # 4.7/4.8 and deprecated on 4.6 in favor of adaptive thinking), so a
+        # route-wide capability would over-claim — deferred to a follow-up.
+        platform = self._has_platform_api_access()
         kwargs = {
             "supports_tools": True,
             "supports_streaming": True,
             "supports_vision": True,
             "supports_structured_output": True,
+            "supports_prompt_cache": True,
+            "supports_token_counting": platform,
+            "supports_raw_passthrough": platform,
             "structured_output_mode": StructuredOutputMode.TOOL_FORCED,
             "tool_streaming_mode": ToolStreamingMode.NATIVE_DELTA,
             "vision_input_mode": VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
+            "prompt_cache_mode": PromptCacheMode.EXPLICIT_BREAKPOINTS,
+            "max_cache_breakpoints": 4,
+            "token_count_mode": (
+                TokenCountMode.PROVIDER_NATIVE if platform else TokenCountMode.NONE
+            ),
+            "raw_operations": (
+                ("messages.count_tokens", "messages.create") if platform else ()
+            ),
             "model_dependent": ("supports_inline_system",),
             "notes": (
                 "Structured output is implemented by forcing a synthetic Anthropic tool.",
                 "Streaming with response_format falls back to non-streaming structured generation.",
                 "Mid-conversation system messages are route- and model-gated to Opus 4.8+.",
+                "Prompt caching uses cache_control breakpoints (max 4), applied automatically.",
             ),
         }
         if "supports_inline_system" in ProviderCapabilities.__dataclass_fields__:
             kwargs["supports_inline_system"] = True
         return ProviderCapabilities(**kwargs)
+
+    def _has_platform_api_access(self) -> bool:
+        """Whether this route can reach api.anthropic.com platform endpoints
+        (count_tokens, and — when added — batches/files). True for API-key
+        routes; the OAuth/plan route overrides to False."""
+        return True
+
+    def contract_features(self) -> frozenset:
+        features = {"prompt_cache"}
+        if self._has_platform_api_access():
+            features |= {"token_counting", "raw_passthrough"}
+        return frozenset(features)
+
+    async def count_tokens(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> Optional[TokenCount]:
+        """Count input tokens via Anthropic's real count_tokens endpoint
+        (/v1/messages/count_tokens) — exact, not an estimate."""
+        system_prompt = kwargs.get("system_prompt")
+        filtered_messages, combined_system = self._convert_messages_to_anthropic(
+            messages, system_prompt, keep_trailing_system=False, model=model,
+        )
+        params: Dict[str, Any] = {
+            "model": self._resolve_wire_model_id(model),
+            "messages": filtered_messages,
+        }
+        if combined_system:
+            params["system"] = combined_system
+        if tools:
+            params["tools"] = self._convert_tools_to_anthropic_format(tools)
+        result = await client.messages.count_tokens(**params)
+        input_tokens = getattr(result, "input_tokens", None)
+        return TokenCount(input_tokens=input_tokens, raw=result)
+
+    def apply_request_options(
+        self,
+        request_kwargs: Dict[str, Any],
+        options: Any,
+        *,
+        model: str,
+    ) -> Dict[str, Any]:
+        """Translate neutral request options into Anthropic request kwargs.
+
+        Prompt-cache markers are already applied automatically by
+        _apply_cache_control (so cache_markers here are a no-op), and reasoning
+        control is not advertised on this route (see provider_capabilities). The
+        only thing honored is an explicit ``raw`` dict escape hatch, merged into
+        the outbound request.
+        """
+        out = request_kwargs
+        raw = getattr(options, "raw", None)
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                out[key] = value
+        return out
+
+    async def raw_request(
+        self,
+        client: Any,
+        operation: str,
+        payload: Optional[Any] = None,
+        *,
+        http_method: Optional[str] = None,
+        path: Optional[str] = None,
+        **kwargs: Any,
+    ) -> RawResponse:
+        """Escape hatch for Anthropic endpoints the typed surface doesn't cover.
+
+        Routes a dotted ``operation`` (e.g. "messages.count_tokens") through the
+        pre-initialized SDK client, so auth headers (x-api-key / version),
+        base_url and retries are all reused. Path-based passthrough is NOT
+        supported — hitting the raw httpx transport directly would bypass the
+        SDK's auth headers and reach Anthropic unauthenticated.
+        """
+        if not operation:
+            raise ValueError(
+                "raw_request requires a named SDK operation "
+                "(e.g. 'messages.count_tokens'); raw path passthrough is "
+                "unsupported because it would bypass SDK authentication"
+            )
+        target: Any = client
+        for part in operation.split("."):
+            target = getattr(target, part)
+        # Support both the dict-payload form and the SDK-style keyword form
+        # (raw_request(client, "messages.count_tokens", model=..., messages=...)).
+        if isinstance(payload, dict) or payload is None:
+            result = await target(**{**(payload or {}), **kwargs})
+        else:
+            result = await target(payload, **kwargs)
+        return RawResponse(operation=operation, data=result, raw=result)
+
+    def _maybe_apply_request_options(
+        self, api_params: Dict[str, Any], call_kwargs: Dict[str, Any], model: str
+    ) -> Dict[str, Any]:
+        """Apply RequestOptions (thinking budget / effort) into api_params when
+        the caller passed ``request_options``. Invoked from every Anthropic
+        request path so the advertised supports_reasoning_control capability
+        actually takes effect rather than being silently dropped."""
+        options = call_kwargs.get("request_options")
+        if options is not None:
+            api_params = self.apply_request_options(api_params, options, model=model)
+        return api_params
 
     @staticmethod
     def _resolve_wire_model_id(model: str) -> str:
@@ -805,6 +938,7 @@ class AnthropicAdapter(LLMAdapter):
             # helper docstrings in this module.  Anthropic silently no-ops
             # below the per-model minimum cache size, so we don't gate.
             api_params = self._apply_cache_control(api_params)
+            api_params = self._maybe_apply_request_options(api_params, kwargs, model)
 
             # CACHE_CONTROL_EPHEMERAL carries `ttl: "1h"` (issue #797), which
             # Anthropic only honors when this beta header is present. Without
@@ -933,6 +1067,7 @@ class AnthropicAdapter(LLMAdapter):
 
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
+            api_params = self._maybe_apply_request_options(api_params, kwargs, model)
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
             # OAuth/plan route only: shape the request like Claude Code and
             # refresh the access token if it is near expiry. No-ops on the
@@ -1058,6 +1193,7 @@ class AnthropicAdapter(LLMAdapter):
 
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
+            api_params = self._maybe_apply_request_options(api_params, kwargs, model)
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
             # OAuth/plan route only: shape the request like Claude Code and
             # refresh the access token if it is near expiry. No-ops on the
