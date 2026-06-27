@@ -430,6 +430,18 @@ class AnthropicAdapter(LLMAdapter):
             )
         raise ValueError("raw_request requires either an operation or a path")
 
+    def _maybe_apply_request_options(
+        self, api_params: Dict[str, Any], call_kwargs: Dict[str, Any], model: str
+    ) -> Dict[str, Any]:
+        """Apply RequestOptions (thinking budget / effort) into api_params when
+        the caller passed ``request_options``. Invoked from every Anthropic
+        request path so the advertised supports_reasoning_control capability
+        actually takes effect rather than being silently dropped."""
+        options = call_kwargs.get("request_options")
+        if options is not None:
+            api_params = self.apply_request_options(api_params, options, model=model)
+        return api_params
+
     @staticmethod
     def _resolve_wire_model_id(model: str) -> str:
         """Strip a leading ``anthropic/`` prefix from a stored model id
@@ -936,6 +948,7 @@ class AnthropicAdapter(LLMAdapter):
             # helper docstrings in this module.  Anthropic silently no-ops
             # below the per-model minimum cache size, so we don't gate.
             api_params = self._apply_cache_control(api_params)
+            api_params = self._maybe_apply_request_options(api_params, kwargs, model)
 
             # CACHE_CONTROL_EPHEMERAL carries `ttl: "1h"` (issue #797), which
             # Anthropic only honors when this beta header is present. Without
@@ -1064,6 +1077,7 @@ class AnthropicAdapter(LLMAdapter):
 
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
+            api_params = self._maybe_apply_request_options(api_params, kwargs, model)
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
             # OAuth/plan route only: shape the request like Claude Code and
             # refresh the access token if it is near expiry. No-ops on the
@@ -1189,6 +1203,7 @@ class AnthropicAdapter(LLMAdapter):
 
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
+            api_params = self._maybe_apply_request_options(api_params, kwargs, model)
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
             # OAuth/plan route only: shape the request like Claude Code and
             # refresh the access token if it is near expiry. No-ops on the

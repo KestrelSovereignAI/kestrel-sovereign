@@ -100,6 +100,26 @@ def test_apply_request_options_default_no_op():
     assert out == {"max_tokens": 1024}
 
 
+def test_request_options_are_wired_into_request_paths():
+    # The request builders call _maybe_apply_request_options, so a caller's
+    # request_options actually reach api_params (rather than being advertised
+    # but silently dropped).
+    adapter = AnthropicAdapter()
+    api_params = {"model": "claude-opus-4-8", "messages": []}
+    out = adapter._maybe_apply_request_options(
+        api_params,
+        {"request_options": RequestOptions(thinking_budget_tokens=4096)},
+        "claude-opus-4-8",
+    )
+    assert out["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+
+    # No request_options → untouched.
+    untouched = adapter._maybe_apply_request_options(
+        {"model": "x"}, {}, "claude-opus-4-8"
+    )
+    assert untouched == {"model": "x"}
+
+
 @pytest.mark.asyncio
 async def test_raw_request_routes_named_operation_through_client():
     adapter = AnthropicAdapter()
