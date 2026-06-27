@@ -46,10 +46,8 @@ const {
     navigateToPanel,
     dismissContextWarning,
     scrollChatToTop,
-    resetDemoAgentDatabases,
     assertIsolatedDemoEnv,
     assertIsolatedDemoTarget,
-    requireDemoSandbox,
     startFreshSession,
     selectDemoProvider,
 } = require('../shared/demo_helpers.cjs');
@@ -96,9 +94,14 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         // (issue #1973). Throwing here aborts the demo before it touches data.
         await assertIsolatedDemoTarget(request, BASE_URL, apiKey);
 
-        // Reset ONLY the isolated demo sandbox (KESTREL_DB_PATH), never the live
-        // agent_data/ tree, then start a fresh session.
-        resetDemoAgentDatabases(narrator, requireDemoSandbox());
+        // Start a fresh conversation via the API. We deliberately do NOT delete
+        // the DB file here: `kestrel demo run` already provisions a brand-new
+        // demo agent each run (setup_demo_agent.py rmtree+recreate), and the
+        // server has it open + initialized. Deleting kestrel_prime.db out from
+        // under the running server drops the security_permissions table for new
+        // connections, so every permission check fail-closes to DENY and tools
+        // like memory_save silently fail. A clean context comes from the fresh
+        // per-run DB + startFreshSession, not a mid-run file wipe.
         await startFreshSession(request, BASE_URL, apiKey, narrator);
 
         // Leave the agent on its configured default route — a real CLOUD model
