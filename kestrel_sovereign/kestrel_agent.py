@@ -977,6 +977,28 @@ class KestrelAgent(
             # Expose observability store for orchestrator instrumentation
             self.observability_store = observability_store
 
+            # Per-agent enablement deltas (agent-driven feature/MCP-server
+            # add/remove that must survive restart). Reuses the observability
+            # backend so it lands in the agent's own DB. Initialized BEFORE
+            # feature discovery so the reconcile-union below can read it.
+            # Degrades to None (deltas disabled) rather than blocking init.
+            self._feature_enablement_store = None
+            try:
+                from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import (
+                    FeatureEnablementStore,
+                )
+                backend = observability_store.backend
+                await backend.connect()  # idempotent — no-op if already connected
+                store = FeatureEnablementStore(backend)
+                await store.initialize()
+                self._feature_enablement_store = store
+            except Exception as e:  # noqa: BLE001 - never block init on this
+                logging.warning(
+                    "FeatureEnablementStore unavailable; enablement deltas "
+                    "disabled (features still load from the bootstrap allowlist): %s",
+                    e,
+                )
+
             # Initialize SignalDispatcher with the agent's existing
             # OrderedLockManager (shared with the turn lifecycle so
             # disjoint resource locks parallelize correctly) and a
@@ -1309,8 +1331,11 @@ class KestrelAgent(
 
             # Auto-discover and register features from features/ directory
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
-            # Per-agent feature profiles filter via allowed_features
-            for feature in discover_features(self, allowed_features=self._allowed_features):
+            # Per-agent feature profiles filter via allowed_features — the
+            # config bootstrap set unioned with agent-driven enablement deltas
+            # from the DB (so a runtime feature_add survives restart).
+            effective_features = await self._effective_allowed_features()
+            for feature in discover_features(self, allowed_features=effective_features):
                 await self._register_feature(feature)
 
             # Notify all features that discovery is complete (cross-feature wiring)
@@ -1922,6 +1947,68 @@ class KestrelAgent(
                 e, breakdown, reason,
             )
 
+
+    async def _effective_allowed_features(self) -> Optional[set]:
+        """Bootstrap allowlist unioned with agent-driven enablement deltas.
+
+        ``self._allowed_features`` is the operator's bootstrap set from
+        ``multi_agent.toml`` (``None`` = no filter, load all discovered). Agent-
+        driven ``feature_add``/``feature_remove`` persist deltas in the DB; this
+        applies them so a runtime change survives restart. Mandatory features can
+        never be disabled by a delta. With no deltas the result equals the
+        bootstrap set, so behavior is unchanged for agents that don't self-manage.
+        """
+        bootstrap = self._allowed_features
+        if bootstrap is None:
+            # No allowlist filter in effect; enablement deltas need an explicit
+            # bootstrap set to layer onto, so they are a no-op here.
+            return None
+        try:
+            deltas = await self.get_enablement_deltas("feature")
+        except Exception as e:  # noqa: BLE001 - never block init on this
+            logging.warning("Could not read feature enablement deltas: %s", e)
+            return set(bootstrap)
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+        mandatory = set(MANDATORY_FEATURES)
+        effective = set(bootstrap)
+        for d in deltas:
+            if d["state"] == "enabled":
+                effective.add(d["name"])
+            elif d["state"] == "disabled" and d["name"] not in mandatory:
+                effective.discard(d["name"])
+        return effective
+
+    async def persist_feature_enablement(
+        self, kind: str, name: str, state: str, *, actor: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Record an agent-driven enablement delta so it survives restart.
+
+        ``kind`` is ``"feature"`` or ``"mcp_server"``; ``state`` is ``"enabled"``
+        or ``"disabled"``. No-op if the store isn't initialized (e.g. a bare
+        test agent).
+        """
+        store = getattr(self, "_feature_enablement_store", None)
+        if store is None:
+            return
+        await store.set_state(
+            agent_did=self.did, kind=kind, name=name, state=state,
+            actor=actor, metadata=metadata,
+        )
+
+    async def get_enablement_deltas(self, kind: Optional[str] = None) -> list:
+        """Return this agent's enablement deltas (optionally filtered by kind)."""
+        store = getattr(self, "_feature_enablement_store", None)
+        if store is None:
+            return []
+        return await store.get_deltas(self.did, kind)
+
+    async def clear_feature_enablement(self, kind: str, name: str) -> None:
+        """Drop a delta, reverting to the bootstrap default for it."""
+        store = getattr(self, "_feature_enablement_store", None)
+        if store is None:
+            return
+        await store.clear(self.did, kind, name)
 
     async def _register_feature(self, feature: Feature):
         """Register a feature with A2A TaskManager for unified command routing."""
