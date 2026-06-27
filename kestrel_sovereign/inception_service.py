@@ -296,6 +296,45 @@ def cleanup_artifacts(paths):
                 logging.error(f"Error securely deleting {path}: {e}")
 
 
+def _initial_agent_description(
+    agent_name: Optional[str],
+    *,
+    is_child: bool = False,
+    emancipated: bool = False,
+) -> str:
+    """Build a deterministic birth-time description for a new agent.
+
+    Features aren't known at inception (they're loaded at agent runtime),
+    so this template draws on what *is* known: the agent's constitutional,
+    sovereign identity, whether it was spawned by a parent, and whether
+    Amendment VIII is active. It's overwritten by the agent's self-authored
+    SOUL.md tagline once wake-up discovery completes.
+
+    The chosen name is folded in only when it carries meaning beyond a
+    personal label (e.g. "Eldercare Companion"), never for a bare given
+    name like "Steve" or the framework defaults.
+    """
+    if is_child:
+        base = (
+            "A sovereign Kestrel agent, spawned by a parent agent, with "
+            "cryptographic identity, persistent memory, and constitutional protections"
+        )
+    else:
+        base = (
+            "A sovereign Kestrel agent with cryptographic identity, "
+            "persistent memory, and constitutional protections"
+        )
+    if emancipated:
+        base += " (Amendment VIII active)"
+    base += "."
+
+    name = (agent_name or "").strip()
+    descriptive = bool(name) and " " in name and not name.startswith("Kestrel")
+    if descriptive:
+        return f"{name} — {base[0].lower() + base[1:]}"
+    return base
+
+
 async def create_kestrel_identity_async(
     output_dir: Optional[str] = None,
     constitution_path: Optional[str] = None,
@@ -477,6 +516,13 @@ async def create_kestrel_identity_async(
         "constitution_hash": constitution_hash,
         "initialBalance": "1000.0",
         "name": agent_name,
+        "description": _initial_agent_description(
+            agent_name,
+            is_child=bool(parent_did),
+            emancipated=bool(
+                emancipation_contract is not None and emancipation_contract.enabled
+            ),
+        ),
         "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
     }
 

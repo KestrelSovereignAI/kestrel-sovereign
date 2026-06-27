@@ -314,20 +314,17 @@ async def update_identity(request: Request, response: Response, body: UpdateIden
                 updated_fields.append("name_partial")
 
         if body.description is not None:
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc)
-            await agent._raw_storage.db.execute(
-                """
-                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (agent.agent_id, "description", body.description, now),
+            from kestrel_sovereign.bootstrap.service import persist_agent_description
+            # persist_agent_description does not swallow write failures, so a
+            # failed metadata write or a failed update of an existing graph
+            # node propagates here and becomes a 500 (handled below) — the
+            # operator never sees a false success with stale data behind it.
+            await persist_agent_description(
+                agent._raw_storage.db,
+                agent.storage,
+                agent.agent_id,
+                body.description,
             )
-            # Also update node properties
-            agent_node = await agent.storage.get_node(agent.agent_id)
-            if agent_node:
-                agent_node.properties["description"] = body.description
-                await agent.storage.add_node(agent_node)
             updated_fields.append("description")
 
         # Return updated identity

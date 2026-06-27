@@ -1583,6 +1583,7 @@ class KestrelAgent(
                 llm_service=self.llm_service,
                 agent_data_path=agent_data_dir,
                 storage=self.storage,
+                capabilities=sorted(self.features.keys()) if getattr(self, "features", None) else None,
             )
             logging.info("BootstrapService initialized")
             from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending

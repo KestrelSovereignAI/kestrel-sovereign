@@ -9,6 +9,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -43,6 +44,122 @@ DISCOVERY_PROMPT_FILE = PROMPTS_DIR / "discovery_prompt.md"
 SOUL_GENERATION_PROMPT_FILE = PROMPTS_DIR / "soul_generation_prompt.md"
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 DEFAULT_SOUL_FILE = TEMPLATES_DIR / "default_soul.md"
+
+#: Hard cap on a persisted agent description. Mirrors the
+#: ``UpdateIdentityRequest.description`` validator on PATCH /api/identity
+#: so a self-authored tagline can never exceed what an operator could set.
+DESCRIPTION_MAX_LEN = 500
+
+
+def _clip_description(text: str) -> Optional[str]:
+    """Trim/normalize a candidate description; return None if it's empty."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if len(text) > DESCRIPTION_MAX_LEN:
+        text = text[: DESCRIPTION_MAX_LEN - 1].rstrip() + "…"
+    return text
+
+
+def _soul_section(content: str, header: str) -> str:
+    """Return the body text under a ``## <header>`` section of a SOUL.md.
+
+    Capture stops at the next ``## `` heading (or end of file). Returns an
+    empty string when the section is absent.
+    """
+    capturing = False
+    out: List[str] = []
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            if capturing:
+                break
+            capturing = stripped[3:].strip().lower() == header.lower()
+            continue
+        if capturing:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def derive_description_from_soul(content: str) -> Optional[str]:
+    """Derive a one-line agent description from SOUL.md content.
+
+    The agent authors its own SOUL.md during wake-up discovery, so this is
+    the agent's self-description rather than a framework-imposed label.
+    Preference order:
+
+    1. The explicit ``## Tagline`` section (the line the agent wrote for
+       exactly this purpose).
+    2. The first sentence of ``## Who You Are`` as a fallback for SOUL docs
+       authored before the Tagline section existed.
+
+    Returns None when neither yields usable text (caller keeps the prior
+    description rather than blanking it).
+    """
+    if not content:
+        return None
+
+    tagline = _soul_section(content, "Tagline")
+    if tagline:
+        for line in tagline.splitlines():
+            line = line.strip().lstrip(">").strip().strip("*_`").strip()
+            if line:
+                return _clip_description(line)
+
+    who = _soul_section(content, "Who You Are")
+    if who:
+        first_para = next(
+            (p.strip().lstrip(">").strip() for p in who.splitlines() if p.strip()),
+            "",
+        )
+        if first_para:
+            # First sentence only — keep it tagline-length.
+            sentence = re.split(r"(?<=[.!?])\s", first_para, maxsplit=1)[0].strip()
+            return _clip_description(sentence)
+
+    return None
+
+
+async def persist_agent_description(db, storage, agent_id: str, description: str) -> bool:
+    """Persist an agent description to both stores the read paths consult.
+
+    The authoritative read order (``get_agent_card`` / ``GET /api/identity``)
+    is the agent graph node first, then the ``agent_metadata`` row as a
+    fallback — so we write both, matching the prior inline PATCH behaviour.
+    This is the single write path shared by PATCH /api/identity and the
+    SOUL-driven self-description in :meth:`BootstrapService.save_soul_md`.
+
+    Write failures are **not** swallowed: a failed metadata write, or a
+    failed update of an existing graph node, propagates to the caller.
+    Because the graph node is read first, swallowing a node-write failure
+    would let a stale description survive behind a "success" — so the
+    operator-facing PATCH path lets the exception become a 500, while the
+    SOUL path wraps this call to stay best-effort (a self-description must
+    never block saving the SOUL itself).
+
+    ``description`` of ``None`` is a no-op; an empty string is allowed so an
+    operator can deliberately clear the field via PATCH. Returns True once a
+    write has been performed.
+    """
+    if description is None:
+        return False
+
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        """
+        INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (agent_id, "description", description, now),
+    )
+
+    if storage is not None:
+        node = await storage.get_node(agent_id)
+        if node:
+            node.properties["description"] = description
+            await storage.add_node(node)
+
+    return True
 
 
 class BootstrapState(Enum):
@@ -124,6 +241,7 @@ class BootstrapService:
         llm_service,
         agent_data_path: Path,
         storage=None,
+        capabilities: Optional[List[str]] = None,
     ):
         """
         Initialize the bootstrap service.
@@ -135,6 +253,9 @@ class BootstrapService:
             llm_service: LLM service for generating responses
             agent_data_path: Path to agent's data directory (for SOUL.md)
             storage: Storage facade for accessing agent resources
+            capabilities: Names of the agent's currently enabled features.
+                Fed into SOUL.md generation so the agent's self-authored
+                tagline can reflect what it can actually do.
         """
         self.db = db
         self.agent_id = agent_id
@@ -142,6 +263,7 @@ class BootstrapService:
         self.llm_service = llm_service
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
         self.storage = storage
+        self.capabilities = list(capabilities) if capabilities else []
 
         # Load prompts
         self._discovery_prompt = self._load_prompt(DISCOVERY_PROMPT_FILE)
@@ -780,11 +902,21 @@ Describe how you imagine me and I'll generate an avatar. Something like "a frien
             for msg in history
         ])
 
+        capabilities_note = ""
+        if self.capabilities:
+            capabilities_note = (
+                "\n\n--- AVAILABLE CAPABILITIES ---\n"
+                f"This agent currently has these features enabled: {', '.join(self.capabilities)}.\n"
+                "Let the Tagline and 'Who You Are' reflect what this agent can actually do, "
+                "but write naturally — do not list features mechanically.\n"
+                "--- END CAPABILITIES ---"
+            )
+
         generation_prompt = f"""Based on this discovery conversation, generate a SOUL.md file:
 
 --- DISCOVERY CONVERSATION ---
 {discovery_summary}
---- END CONVERSATION ---
+--- END CONVERSATION ---{capabilities_note}
 
 Generate the SOUL.md now, following the template format."""
 
@@ -895,6 +1027,22 @@ Your preferences matter - tell me what works and what doesn't.
             soul_path.write_text(content, encoding="utf-8")
             logger.info(f"Saved SOUL.md to {soul_path}")
             await self._promote_soul_resource(content, source=str(soul_path))
+
+            # Derive the agent's public description from its own SOUL.md.
+            # This replaces the hardcoded "Constitutional AI Agent..."
+            # fallback with a self-authored tagline once the agent has
+            # woken up. Best-effort: a derivation/persist failure must
+            # never block saving the SOUL itself.
+            try:
+                description = derive_description_from_soul(content)
+                if description:
+                    await persist_agent_description(
+                        self.db, self.storage, self.agent_id, description
+                    )
+                    logger.info("Set agent description from SOUL.md: %r", description)
+            except Exception as exc:
+                logger.warning("Could not derive description from SOUL.md: %s", exc)
+
             return True
         except Exception as e:
             logger.error(f"Failed to save SOUL.md: {e}")
