@@ -542,6 +542,11 @@ class ProviderRegistry:
                 supports_embeddings=bool(supports_embeddings),
                 embedding_model=embedding_model,
                 embedding_dim=embedding_dim,
+                # Only the real OpenAI vendor on the official base exposes the
+                # /batches, /files, /responses surface; OpenAI-compatible routes
+                # (custom base_url) do not. Pass through as a typed signal so the
+                # adapter advertises those capabilities only when truly native.
+                native_openai=(vendor == "openai" and official_openai_base),
             )
 
         # --- Fallback: try plain instantiation; let adapter fail at call time ---

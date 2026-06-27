@@ -100,7 +100,7 @@ def _client():
 
 
 def test_openai_v5_capability_flags_and_round_trip():
-    caps = OpenAIAdapter().provider_capabilities()
+    caps = OpenAIAdapter(native_openai=True).provider_capabilities()
 
     assert caps.supports_token_counting is True
     assert caps.supports_batch is True
@@ -144,7 +144,7 @@ def test_openai_compatible_route_does_not_advertise_native_only_caps():
 
 
 def test_openai_contract_features_match_advertised_optional_methods():
-    features = OpenAIAdapter().contract_features()
+    features = OpenAIAdapter(native_openai=True).contract_features()
 
     assert {
         "token_counting",

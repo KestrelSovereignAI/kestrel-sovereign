@@ -127,6 +127,7 @@ class OpenAIAdapter(LLMAdapter):
         supports_embeddings: Optional[bool] = None,
         embedding_model: Optional[str] = None,
         embedding_dim: Optional[int] = None,
+        native_openai: bool = False,
     ):
         self.name = name
         if supports_embeddings is None:
@@ -138,6 +139,12 @@ class OpenAIAdapter(LLMAdapter):
         self._supports_embeddings = supports_embeddings
         self._embedding_model = embedding_model
         self._embedding_dim = embedding_dim
+        # Canonical OpenAI (real openai vendor on the official base_url) is the
+        # only deployment that exposes /batches, /files, /responses. This is set
+        # explicitly by the registry — NOT inferred from embedding support,
+        # since an OpenAI-compatible route can enable embeddings too. Defaults
+        # False so any other construction path is treated as compatible-only.
+        self._native_openai = bool(native_openai)
 
     def provider_capabilities(self) -> ProviderCapabilities:
         # OpenAI-native endpoints — /batches, /files, /responses and the
@@ -148,7 +155,7 @@ class OpenAIAdapter(LLMAdapter):
         # batch/file/raw operations to a compatible endpoint that would 404.
         # Token counting (local tiktoken estimate) and reasoning effort (a
         # request param) are endpoint-agnostic and stay ungated.
-        native = bool(self._supports_embeddings)
+        native = self._native_openai
         return ProviderCapabilities(**_capability_kwargs(
             supports_tools=True,
             supports_streaming=True,
@@ -210,7 +217,7 @@ class OpenAIAdapter(LLMAdapter):
 
     def contract_features(self) -> frozenset[str]:
         features = {"token_counting", "reasoning_control"}
-        if self._supports_embeddings:
+        if self._native_openai:
             features |= {"batch", "files", "prompt_cache", "raw_passthrough"}
         return frozenset(features)
 
