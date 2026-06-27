@@ -520,12 +520,14 @@ class ProviderRegistry:
             embedding_dim = route_cfg.get("embedding_dim")
             if embedding_dim is not None:
                 embedding_dim = int(embedding_dim)
+            # Computed unconditionally — both the embedding default below and
+            # the native_openai signal passed to the adapter depend on it.
+            official_openai_base = (
+                not base_url
+                or str(base_url).rstrip("/") == "https://api.openai.com/v1"
+            )
             supports_embeddings = route_cfg.get("supports_embeddings")
             if supports_embeddings is None:
-                official_openai_base = (
-                    not base_url
-                    or str(base_url).rstrip("/") == "https://api.openai.com/v1"
-                )
                 supports_embeddings = (
                     vendor == "openai"
                     and official_openai_base
