@@ -1335,7 +1335,14 @@ class KestrelAgent(
             # config bootstrap set unioned with agent-driven enablement deltas
             # from the DB (so a runtime feature_add survives restart).
             effective_features = await self._effective_allowed_features()
+            # Disabled deltas must be honored even when there is no bootstrap
+            # allowlist (effective is None → discover_features loads all), so a
+            # runtime feature_remove survives restart for bootstrap-less agents
+            # too. Mandatory features are never in this set.
+            disabled_features = await self._disabled_feature_names()
             for feature in discover_features(self, allowed_features=effective_features):
+                if feature.name in disabled_features:
+                    continue
                 await self._register_feature(feature)
 
             # Notify all features that discovery is complete (cross-feature wiring)
@@ -1977,6 +1984,26 @@ class KestrelAgent(
             elif d["state"] == "disabled" and d["name"] not in mandatory:
                 effective.discard(d["name"])
         return effective
+
+    async def _disabled_feature_names(self) -> set:
+        """Feature names an agent has persisted as ``disabled`` (mandatory excluded).
+
+        Applied as a load-loop skip so a runtime ``feature_remove`` survives
+        restart even for agents with no bootstrap allowlist (where
+        ``_effective_allowed_features`` returns ``None`` and ``discover_features``
+        would otherwise reload everything).
+        """
+        try:
+            deltas = await self.get_enablement_deltas("feature")
+        except Exception as e:  # noqa: BLE001 - never block init on this
+            logging.warning("Could not read disabled feature deltas: %s", e)
+            return set()
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+        mandatory = set(MANDATORY_FEATURES)
+        return {
+            d["name"] for d in deltas
+            if d["state"] == "disabled" and d["name"] not in mandatory
+        }
 
     async def persist_feature_enablement(
         self, kind: str, name: str, state: str, *, actor: Optional[str] = None,

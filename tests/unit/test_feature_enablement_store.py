@@ -63,10 +63,11 @@ async def test_store_upsert_get_clear(tmp_path):
 # Reconcile-union (_effective_allowed_features)
 # ---------------------------------------------------------------------------
 class _UnionAgent:
-    """Minimal stand-in exposing only what _effective_allowed_features needs."""
+    """Minimal stand-in exposing only what the union helpers need."""
 
     from kestrel_sovereign.kestrel_agent import KestrelAgent as _KA
     _effective_allowed_features = _KA._effective_allowed_features
+    _disabled_feature_names = _KA._disabled_feature_names
 
     def __init__(self, allowed, deltas):
         self._allowed_features = allowed
@@ -112,3 +113,23 @@ async def test_union_mandatory_cannot_be_disabled():
 async def test_union_none_bootstrap_passthrough():
     agent = _UnionAgent(None, [{"name": "X", "state": "enabled"}])
     assert await agent._effective_allowed_features() is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_skip_applies_without_allowlist():
+    # Bootstrap-less agent (None) must still honor a persisted disabled delta —
+    # discover_features loads all, so the load loop skips these names.
+    agent = _UnionAgent(None, [
+        {"name": "WebSearchFeature", "state": "disabled"},
+        {"name": "VoiceFeature", "state": "enabled"},
+    ])
+    disabled = await agent._disabled_feature_names()
+    assert disabled == {"WebSearchFeature"}
+
+
+@pytest.mark.asyncio
+async def test_disabled_skip_never_includes_mandatory():
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+    mandatory = next(iter(MANDATORY_FEATURES))
+    agent = _UnionAgent(None, [{"name": mandatory, "state": "disabled"}])
+    assert mandatory not in await agent._disabled_feature_names()
