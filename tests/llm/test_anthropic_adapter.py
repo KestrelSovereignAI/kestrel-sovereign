@@ -81,7 +81,7 @@ async def test_count_tokens_uses_real_endpoint():
     assert sent["messages"]
 
 
-def test_apply_request_options_maps_thinking_and_effort():
+def test_apply_request_options_maps_thinking_budget_and_ignores_effort():
     adapter = AnthropicAdapter()
     out = adapter.apply_request_options(
         {"max_tokens": 1024},
@@ -89,8 +89,11 @@ def test_apply_request_options_maps_thinking_and_effort():
         model="claude-opus-4-8",
     )
 
+    # Thinking budget maps to the Anthropic thinking config.
     assert out["thinking"] == {"type": "enabled", "budget_tokens": 8000}
-    assert out["output_config"]["effort"] == "high"
+    # Effort has no Messages API equivalent — intentionally ignored (not sent as
+    # an unsupported output_config that would be rejected).
+    assert "output_config" not in out
 
 
 def test_apply_request_options_default_no_op():

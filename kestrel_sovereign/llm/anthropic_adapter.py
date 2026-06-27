@@ -373,21 +373,19 @@ class AnthropicAdapter(LLMAdapter):
     ) -> Dict[str, Any]:
         """Translate neutral request options into Anthropic request kwargs.
 
-        Reasoning: a thinking budget maps to ``thinking={"type":"enabled",
-        "budget_tokens": N}``; an effort string maps to
-        ``output_config={"effort": ...}``. Prompt-cache markers are already
-        applied automatically by _apply_cache_control, so cache_markers here are
-        a no-op (the capability is advertised as automatic).
+        Reasoning control on this route is a thinking *budget* (the advertised
+        reasoning_control_mode is THINKING_BUDGET): ``thinking_budget_tokens``
+        maps to ``thinking={"type":"enabled","budget_tokens": N}``. A neutral
+        ``reasoning_effort`` is intentionally ignored — the Anthropic Messages
+        API has no equivalent request parameter, so forwarding it would be
+        rejected (effort-mode is for other providers). Prompt-cache markers are
+        already applied automatically by _apply_cache_control, so cache_markers
+        here are a no-op (the capability is advertised as automatic).
         """
         out = request_kwargs
         budget = getattr(options, "thinking_budget_tokens", None)
         if budget:
             out["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
-        effort = getattr(options, "reasoning_effort", None)
-        if effort:
-            output_config = dict(out.get("output_config") or {})
-            output_config["effort"] = effort
-            out["output_config"] = output_config
         raw = getattr(options, "raw", None)
         if isinstance(raw, dict):
             for key, value in raw.items():
@@ -407,28 +405,25 @@ class AnthropicAdapter(LLMAdapter):
         """Escape hatch for Anthropic endpoints the typed surface doesn't cover.
 
         Routes a dotted ``operation`` (e.g. "messages.count_tokens") through the
-        pre-initialized client so auth/base_url/retries are reused; falls back to
-        the client's underlying transport for an explicit ``path``.
+        pre-initialized SDK client, so auth headers (x-api-key / version),
+        base_url and retries are all reused. Path-based passthrough is NOT
+        supported — hitting the raw httpx transport directly would bypass the
+        SDK's auth headers and reach Anthropic unauthenticated.
         """
-        payload = payload or {}
-        if operation:
-            target: Any = client
-            for part in operation.split("."):
-                target = getattr(target, part)
-            result = await target(**payload) if isinstance(payload, dict) else await target(payload)
-            return RawResponse(operation=operation, data=result, raw=result)
-        if path:
-            method = (http_method or "POST").lower()
-            transport = getattr(client, "_client", None) or client
-            resp = await getattr(transport, method)(path, json=payload)
-            data = resp.json() if hasattr(resp, "json") else None
-            return RawResponse(
-                operation=path,
-                data=data,
-                status_code=getattr(resp, "status_code", None),
-                raw=resp,
+        if not operation:
+            raise ValueError(
+                "raw_request requires a named SDK operation "
+                "(e.g. 'messages.count_tokens'); raw path passthrough is "
+                "unsupported because it would bypass SDK authentication"
             )
-        raise ValueError("raw_request requires either an operation or a path")
+        payload = payload or {}
+        target: Any = client
+        for part in operation.split("."):
+            target = getattr(target, part)
+        result = (
+            await target(**payload) if isinstance(payload, dict) else await target(payload)
+        )
+        return RawResponse(operation=operation, data=result, raw=result)
 
     def _maybe_apply_request_options(
         self, api_params: Dict[str, Any], call_kwargs: Dict[str, Any], model: str
