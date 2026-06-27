@@ -49,6 +49,22 @@ def test_apply_request_options_default_no_op():
     assert out == {"model": "x"}
 
 
+def test_request_options_wiring_reaches_chat_kwargs():
+    # The chat request paths call _maybe_apply_request_options, so a caller's
+    # request_options reach the outbound kwargs (not silently dropped).
+    adapter = OllamaAdapter()
+    out = adapter._maybe_apply_request_options(
+        {"format": "json"},
+        {"request_options": RequestOptions(raw={"keep_alive": "10m"})},
+        "qwen3",
+    )
+    assert out["keep_alive"] == "10m"
+    assert out["format"] == "json"
+
+    untouched = adapter._maybe_apply_request_options({"a": 1}, {}, "qwen3")
+    assert untouched == {"a": 1}
+
+
 @pytest.mark.asyncio
 async def test_raw_request_routes_named_operation():
     adapter = OllamaAdapter()

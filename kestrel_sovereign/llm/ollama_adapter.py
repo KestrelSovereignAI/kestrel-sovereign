@@ -137,6 +137,18 @@ class OllamaAdapter(LLMAdapter):
                 out[key] = value
         return out
 
+    def _maybe_apply_request_options(
+        self, extra_kwargs: Dict[str, Any], call_kwargs: Dict[str, Any], model: str
+    ) -> Dict[str, Any]:
+        """Apply RequestOptions into the outbound chat kwargs when the caller
+        passed ``request_options`` — invoked from the chat request paths so the
+        advertised supports_raw_passthrough capability actually takes effect
+        rather than being silently dropped."""
+        options = call_kwargs.get("request_options")
+        if options is not None:
+            extra_kwargs = self.apply_request_options(extra_kwargs, options, model=model)
+        return extra_kwargs
+
     async def raw_request(
         self,
         client: Any,
@@ -305,6 +317,8 @@ class OllamaAdapter(LLMAdapter):
             if options:
                 extra_kwargs["options"] = options
 
+            extra_kwargs = self._maybe_apply_request_options(extra_kwargs, kwargs, model)
+
             response = await with_retry(
                 client.chat,
                 model=model,
@@ -449,6 +463,8 @@ class OllamaAdapter(LLMAdapter):
                 options["num_predict"] = kwargs["max_tokens"]
             if options:
                 extra_kwargs["options"] = options
+
+            extra_kwargs = self._maybe_apply_request_options(extra_kwargs, kwargs, model)
 
             stream = await with_retry(
                 client.chat,
