@@ -97,21 +97,13 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         resetDemoAgentDatabases(narrator, requireDemoSandbox());
         await startFreshSession(request, BASE_URL, apiKey, narrator);
 
-        // Set model to llama3.2 via Ollama (cloud keys not configured on this machine)
-        try {
-            const headers = { 'Content-Type': 'application/json', ...authHeaders(apiKey) };
-            const resp = await request.post(`${BASE_URL}/api/model/set`, {
-                headers,
-                data: { model: 'llama3.2:1b', provider: 'ollama' }
-            });
-            if (resp.ok()) {
-                narrator.narrate('Model set to llama3.2:1b (ollama)');
-            } else {
-                narrator.narrate(`Model set returned ${resp.status()} — using default`);
-            }
-        } catch (e) {
-            narrator.narrate(`Could not set model: ${e.message} — using default`);
-        }
+        // Leave the agent on its configured default route — a real CLOUD model
+        // (anthropic:api, route_priority[0] in the demo agent's kestrel.toml).
+        // We deliberately do NOT pin a local model here: NORMAL/cloud modes must
+        // use an actual cloud model, and only EPHEMERAL switches to local-only
+        // (Ollama) later in the privacy act. Misrepresenting a local model as the
+        // cloud model would undermine the whole privacy story.
+        narrator.narrate('NORMAL mode uses the agent\'s configured cloud model; EPHEMERAL switches to local-only');
     });
 
     // ========================================================================
@@ -172,8 +164,13 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        // Select a working provider from the dropdown (prefer local Ollama — cloud keys not configured)
-        await selectDemoProvider(page, { narrator, narrateFallback: true });
+        // NORMAL mode: prefer a real CLOUD provider (anthropic/openai), falling
+        // back to local only if no cloud route is available (issue: demo fidelity).
+        await selectDemoProvider(page, {
+            narrator,
+            narrateFallback: true,
+            preferred: ['anthropic', 'openai', 'openrouter', 'ollama'],
+        });
 
         // Send a message that elicits constitutional awareness
         narrator.narrate('Sending a message — every response is processed through the Constitution');
@@ -225,8 +222,11 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
 
-        // Select a working provider (prefer local Ollama — cloud keys not configured)
-        await selectDemoProvider(page, { narrator });
+        // NORMAL mode: prefer a real CLOUD provider (anthropic/openai).
+        await selectDemoProvider(page, {
+            narrator,
+            preferred: ['anthropic', 'openai', 'openrouter', 'ollama'],
+        });
 
         // Beat 1: Send a memorable fact
         narrator.narrate('Sending a unique fact for the agent to remember...');

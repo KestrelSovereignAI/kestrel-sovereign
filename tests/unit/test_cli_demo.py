@@ -524,3 +524,40 @@ def test_run_streaming_does_not_capture(monkeypatch):
     assert rc == 0
     assert "capture_output" not in captured_kwargs
     assert captured_kwargs.get("check") is False
+
+
+# ---------------------------------------------------------------------------
+# Demo-agent verification must authenticate (issue: runner-auth)
+# ---------------------------------------------------------------------------
+
+def test_verify_only_demo_agents_authenticates_with_minted_key(monkeypatch):
+    """/api/agents is authenticated. The verifier must mint the demo key via
+    the public /api/auth/key and send it as X-API-Key, else it always 401s and
+    `kestrel demo run` can never pass the guard."""
+    seen_headers = {}
+
+    def fake_urlopen(req, timeout=5):
+        url = req if isinstance(req, str) else req.full_url
+        if url.endswith("/api/auth/key"):
+            return BytesIO(json.dumps({"key": "demo-key-xyz"}).encode())
+        # /api/agents — capture headers the verifier attached
+        if not isinstance(req, str):
+            seen_headers.update(req.headers)
+        return BytesIO(json.dumps({"agents": [{"name": "demo", "is_demo": True}]}).encode())
+
+    monkeypatch.setattr(cli_demo.urllib.request, "urlopen", fake_urlopen)
+    result = cli_demo._verify_only_demo_agents("http://127.0.0.1:8900")
+    assert result is None  # all agents is_demo=true → OK
+    # header key is title-cased by urllib (X-api-key)
+    assert any(k.lower() == "x-api-key" and v == "demo-key-xyz" for k, v in seen_headers.items())
+
+
+def test_verify_only_demo_agents_flags_live_agent(monkeypatch):
+    def fake_urlopen(req, timeout=5):
+        url = req if isinstance(req, str) else req.full_url
+        if url.endswith("/api/auth/key"):
+            return BytesIO(json.dumps({"key": "k"}).encode())
+        return BytesIO(json.dumps({"agents": [{"name": "Meridian", "is_demo": False}]}).encode())
+
+    monkeypatch.setattr(cli_demo.urllib.request, "urlopen", fake_urlopen)
+    assert cli_demo._verify_only_demo_agents("http://127.0.0.1:8900") == "Meridian"
