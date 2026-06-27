@@ -42,6 +42,14 @@ class ClaudeMaxAdapter(AnthropicAdapter):
         See ``AnthropicAdapter._apply_oauth_request_shaping``."""
         return True
 
+    def _has_platform_api_access(self) -> bool:
+        """The OAuth/plan route authenticates with a consumer subscription
+        token, which cannot reach api.anthropic.com platform/data-plane
+        endpoints (count_tokens, batches, files). So this route advertises only
+        the request-level v5 features (prompt caching, reasoning) inherited from
+        AnthropicAdapter — not token counting or raw passthrough."""
+        return False
+
     async def list_models(self, client=None):
         """Claude plan uses Anthropic discovery; this execution wrapper has no catalog.
 

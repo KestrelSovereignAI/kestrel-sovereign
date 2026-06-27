@@ -26,8 +26,13 @@ from .cancellation import (
     raise_if_cancelled,
 )
 from kestrel_sdk.llm import (
+    PromptCacheMode,
     ProviderCapabilities,
+    RawResponse,
+    ReasoningControlMode,
     StructuredOutputMode,
+    TokenCount,
+    TokenCountMode,
     ToolStreamingMode,
     VisionInputMode,
 )
@@ -280,24 +285,150 @@ class AnthropicAdapter(LLMAdapter):
     supports_partial_usage_flush: bool = True
 
     def provider_capabilities(self) -> ProviderCapabilities:
+        # Data-plane features that hit api.anthropic.com directly — the
+        # count_tokens endpoint and raw passthrough — need API-key access. The
+        # OAuth/plan route (ClaudeMaxAdapter) overrides _has_platform_api_access()
+        # to False, so it advertises only the request-level features
+        # (prompt caching, reasoning) that work on both routes. Prompt caching is
+        # genuinely applied here via cache_control breakpoints; reasoning maps a
+        # thinking budget / effort through apply_request_options.
+        platform = self._has_platform_api_access()
         kwargs = {
             "supports_tools": True,
             "supports_streaming": True,
             "supports_vision": True,
             "supports_structured_output": True,
+            "supports_prompt_cache": True,
+            "supports_reasoning_control": True,
+            "supports_token_counting": platform,
+            "supports_raw_passthrough": platform,
             "structured_output_mode": StructuredOutputMode.TOOL_FORCED,
             "tool_streaming_mode": ToolStreamingMode.NATIVE_DELTA,
             "vision_input_mode": VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
+            "prompt_cache_mode": PromptCacheMode.EXPLICIT_BREAKPOINTS,
+            "max_cache_breakpoints": 4,
+            "reasoning_control_mode": ReasoningControlMode.THINKING_BUDGET,
+            "token_count_mode": (
+                TokenCountMode.PROVIDER_NATIVE if platform else TokenCountMode.NONE
+            ),
+            "raw_operations": (
+                ("messages.count_tokens", "messages.create") if platform else ()
+            ),
             "model_dependent": ("supports_inline_system",),
             "notes": (
                 "Structured output is implemented by forcing a synthetic Anthropic tool.",
                 "Streaming with response_format falls back to non-streaming structured generation.",
                 "Mid-conversation system messages are route- and model-gated to Opus 4.8+.",
+                "Prompt caching uses cache_control breakpoints (max 4), applied automatically.",
             ),
         }
         if "supports_inline_system" in ProviderCapabilities.__dataclass_fields__:
             kwargs["supports_inline_system"] = True
         return ProviderCapabilities(**kwargs)
+
+    def _has_platform_api_access(self) -> bool:
+        """Whether this route can reach api.anthropic.com platform endpoints
+        (count_tokens, and — when added — batches/files). True for API-key
+        routes; the OAuth/plan route overrides to False."""
+        return True
+
+    def contract_features(self) -> frozenset:
+        features = {"prompt_cache", "reasoning_control"}
+        if self._has_platform_api_access():
+            features |= {"token_counting", "raw_passthrough"}
+        return frozenset(features)
+
+    async def count_tokens(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> Optional[TokenCount]:
+        """Count input tokens via Anthropic's real count_tokens endpoint
+        (/v1/messages/count_tokens) — exact, not an estimate."""
+        system_prompt = kwargs.get("system_prompt")
+        filtered_messages, combined_system = self._convert_messages_to_anthropic(
+            messages, system_prompt, keep_trailing_system=False, model=model,
+        )
+        params: Dict[str, Any] = {
+            "model": self._resolve_wire_model_id(model),
+            "messages": filtered_messages,
+        }
+        if combined_system:
+            params["system"] = combined_system
+        if tools:
+            params["tools"] = self._convert_tools_to_anthropic_format(tools)
+        result = await client.messages.count_tokens(**params)
+        input_tokens = getattr(result, "input_tokens", None)
+        return TokenCount(input_tokens=input_tokens, raw=result)
+
+    def apply_request_options(
+        self,
+        request_kwargs: Dict[str, Any],
+        options: Any,
+        *,
+        model: str,
+    ) -> Dict[str, Any]:
+        """Translate neutral request options into Anthropic request kwargs.
+
+        Reasoning: a thinking budget maps to ``thinking={"type":"enabled",
+        "budget_tokens": N}``; an effort string maps to
+        ``output_config={"effort": ...}``. Prompt-cache markers are already
+        applied automatically by _apply_cache_control, so cache_markers here are
+        a no-op (the capability is advertised as automatic).
+        """
+        out = request_kwargs
+        budget = getattr(options, "thinking_budget_tokens", None)
+        if budget:
+            out["thinking"] = {"type": "enabled", "budget_tokens": int(budget)}
+        effort = getattr(options, "reasoning_effort", None)
+        if effort:
+            output_config = dict(out.get("output_config") or {})
+            output_config["effort"] = effort
+            out["output_config"] = output_config
+        raw = getattr(options, "raw", None)
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                out[key] = value
+        return out
+
+    async def raw_request(
+        self,
+        client: Any,
+        operation: str,
+        payload: Optional[Any] = None,
+        *,
+        http_method: Optional[str] = None,
+        path: Optional[str] = None,
+        **kwargs: Any,
+    ) -> RawResponse:
+        """Escape hatch for Anthropic endpoints the typed surface doesn't cover.
+
+        Routes a dotted ``operation`` (e.g. "messages.count_tokens") through the
+        pre-initialized client so auth/base_url/retries are reused; falls back to
+        the client's underlying transport for an explicit ``path``.
+        """
+        payload = payload or {}
+        if operation:
+            target: Any = client
+            for part in operation.split("."):
+                target = getattr(target, part)
+            result = await target(**payload) if isinstance(payload, dict) else await target(payload)
+            return RawResponse(operation=operation, data=result, raw=result)
+        if path:
+            method = (http_method or "POST").lower()
+            transport = getattr(client, "_client", None) or client
+            resp = await getattr(transport, method)(path, json=payload)
+            data = resp.json() if hasattr(resp, "json") else None
+            return RawResponse(
+                operation=path,
+                data=data,
+                status_code=getattr(resp, "status_code", None),
+                raw=resp,
+            )
+        raise ValueError("raw_request requires either an operation or a path")
 
     @staticmethod
     def _resolve_wire_model_id(model: str) -> str:
