@@ -41,7 +41,7 @@ For a busy agent whose DB changes every cycle, this is the dominant ongoing cost
 | Content-addressed targets | Lighthouse wraps whole DB in a one-block CAR → one CID; IPFS `add` → one CID | `lighthouse_target.py:263-268`, `car_builder.py:121` |
 | Manifest | Per-backup, per-target: whole-file `content_hash`, CID/blob name, size, ts | `manifest_manager.py`, `gcs_target.py:124-131`, `lighthouse_target.py:134-145` |
 | Retention | GFS per data class (WORKING_MEMORY: 14d all + weekly forever) | `storage/sync/retention.py:75-85` |
-| WAL | **Enabled** (`PRAGMA journal_mode=WAL`), but `wal_checkpoint(TRUNCATE)` runs before backup, so the `-wal` is drained at snapshot time | `storage/db/sqlite.py:82`, `async_storage.py:761` |
+| WAL | **Enabled** (`PRAGMA journal_mode=WAL`). The scheduled sync snapshots via `sqlite3.backup()` **with an active WAL** — it materializes a consistent full-DB copy but does **not** truncate the live `-wal`. `wal_checkpoint(TRUNCATE)` runs only in the *separate* `AsyncStorage.create_backup_blob` export path, not the scheduled cron. | `storage/db/sqlite.py:82`, `storage/sync/targets.py:57-87`, `async_storage.py:761` |
 | `sync_wal()` | No-op on every target ("new CID on every write, not recoverable without the matching DB") | `lighthouse_target.py:439-445`, `targets.py:140-151` |
 
 **Key structural fact:** Lighthouse/IPFS addressing is whole-file `sha256 → CID` (`car_builder.py:121`). Any single changed byte yields an entirely new CID, so there is **zero block-level reuse** across snapshots today — even though the underlying stores (IPFS/Lighthouse) are block-addressed and *would* dedup identical blocks if we gave them block-aligned content.
@@ -61,7 +61,7 @@ For a busy agent whose DB changes every cycle, this is the dominant ongoing cost
 Ship `-wal` frames between checkpoints; periodically compact to a full base.
 
 **Verdict: rejected as the primary mechanism.**
-- The backup path checkpoints `TRUNCATE` before snapshotting (`async_storage.py:761`), so the WAL is *empty* at backup time — there are no frames to ship without restructuring the checkpoint discipline.
+- The scheduled path snapshots via `sqlite3.backup()` "while the database is in use with an active WAL" (`storage/sync/targets.py:57-87`): it materializes a fully-consistent full-DB copy (WAL folded in) and does **not** expose the live `-wal` frames as a shippable artifact — every `sync_wal()` is a deliberate no-op. (`wal_checkpoint(TRUNCATE)` runs only in the separate `create_backup_blob` export, `async_storage.py:761`.) Adopting WAL-shipping would mean restructuring the snapshot discipline to capture, ship, and truncate frames every cycle — new machinery, not a tweak.
 - WAL frames are only replayable against the *exact* matching base page-set and are sensitive to SQLite version/format; a broken or reordered frame chain corrupts restore. That is a poor fit for long-lived, multi-tier archival.
 - It does not fit content-addressed targets at all — the existing `sync_wal()` no-op comment already documents why ("new CID on every write, not recoverable without the matching DB"). Keeping a WAL-shipping path *and* a snapshot path doubles target complexity (violates requirement 1).
 - Possible niche later: a high-frequency, path-keyed-only EXPEDIENT sub-tier. Out of scope here.
