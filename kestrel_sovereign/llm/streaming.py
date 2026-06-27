@@ -71,33 +71,52 @@ _STREAMABLE_STRUCTURED_MODES = frozenset(
 )
 
 
-def _route_capabilities(adapter: Any) -> Tuple[ProviderCapabilities, frozenset]:
-    """Return the adapter's typed capabilities and contract-feature opt-ins.
+def _route_capabilities(provider: Any) -> Tuple[ProviderCapabilities, frozenset]:
+    """Return a route's typed capabilities and the adapter's opt-in feature set.
 
-    Falls back to an empty :class:`ProviderCapabilities` / ``frozenset`` when
-    the adapter can't answer, so callers can use plain attribute access.
+    Prefers the **route-scoped** capabilities carried on the provider dict — an
+    entry-point factory may set these precisely on ``ProviderInfo`` and they can
+    differ from the adapter's own ``provider_capabilities()`` (e.g. an
+    OpenAI-compatible adapter reused across vendors). Falls back to the adapter
+    when the route didn't carry them. ``contract_features()`` always comes from
+    the adapter. Returns empty defaults when nothing can answer, so callers can
+    use plain attribute access.
     """
-    try:
-        caps = adapter.provider_capabilities()
-    except Exception:
-        caps = ProviderCapabilities()
+    adapter = provider.get("adapter") if isinstance(provider, dict) else provider
+    raw = provider.get("capabilities") if isinstance(provider, dict) else None
+    caps: Optional[ProviderCapabilities] = None
+    if isinstance(raw, ProviderCapabilities):
+        caps = raw
+    elif isinstance(raw, dict) and raw:
+        try:
+            caps = ProviderCapabilities.from_mapping(raw)
+        except Exception:
+            caps = None
+    if caps is None and adapter is not None:
+        try:
+            caps = adapter.provider_capabilities()
+        except Exception:
+            caps = None
     if not isinstance(caps, ProviderCapabilities):
         caps = ProviderCapabilities()
-    try:
-        features = adapter.contract_features()
-    except Exception:
-        features = frozenset()
-    return caps, frozenset(features or ())
+    features: frozenset = frozenset()
+    if adapter is not None:
+        try:
+            features = frozenset(adapter.contract_features() or ())
+        except Exception:
+            features = frozenset()
+    return caps, features
 
 
-def _route_supports_streaming_structured(adapter: Any) -> bool:
+def _route_supports_streaming_structured(provider: Any) -> bool:
     """Whether this route can stream while honoring a ``response_format``.
 
     Typed replacement for the dead ``provider_name in ["openai", "vertex_ai"]``
-    literal. Evaluates False for every in-tree adapter until one opts in via
-    ``contract_features()`` — i.e. no behavior change yet (#1983).
+    literal. Reads route-scoped capabilities (honoring factory-set values on
+    entry-point routes) and evaluates False for every in-tree adapter until one
+    opts in via ``contract_features()`` — i.e. no behavior change yet (#1983).
     """
-    caps, features = _route_capabilities(adapter)
+    caps, features = _route_capabilities(provider)
     if _FEATURE_STREAMING_STRUCTURED_OUTPUT not in features:
         return False
     if not caps.supports_streaming:
@@ -105,16 +124,16 @@ def _route_supports_streaming_structured(adapter: Any) -> bool:
     return caps.structured_output_mode in _STREAMABLE_STRUCTURED_MODES
 
 
-def _route_wants_tool_stream_system_prompt(adapter: Any) -> bool:
+def _route_wants_tool_stream_system_prompt(provider: Any) -> bool:
     """Whether to forward ``system_prompt`` separately into tool streaming.
 
     Typed replacement for the dead ``provider_name == "anthropic"`` literal.
     Anthropic-family routes carry the system prompt as a top-level field rather
     than an inline message; the typed signal is ``supports_inline_system``.
-    Gated behind ``contract_features()`` so no in-tree adapter changes behavior
-    until it opts in (#1983).
+    Reads route-scoped capabilities and is gated behind ``contract_features()``
+    so no in-tree adapter changes behavior until it opts in (#1983).
     """
-    caps, features = _route_capabilities(adapter)
+    caps, features = _route_capabilities(provider)
     if _FEATURE_TOOL_STREAM_SYSTEM_PROMPT not in features:
         return False
     return caps.supports_inline_system
@@ -702,7 +721,7 @@ class StreamingMixin:
                 # contract_features) can stream a response_format. Anthropic's
                 # TOOL_FORCED mode buffers a tool call, so it stays on the
                 # non-streaming fallback below.
-                supports_streaming_structured = _route_supports_streaming_structured(adapter)
+                supports_streaming_structured = _route_supports_streaming_structured(provider)
 
                 # Use streaming if supported (or no structured output requested)
                 if hasattr(adapter, "get_streaming_response"):
@@ -1261,7 +1280,7 @@ class StreamingMixin:
                 if hasattr(adapter, "get_streaming_response_with_tools"):
                     # Build kwargs for provider-specific parameters
                     kwargs = {}
-                    if system_prompt and _route_wants_tool_stream_system_prompt(adapter):
+                    if system_prompt and _route_wants_tool_stream_system_prompt(provider):
                         kwargs["system_prompt"] = system_prompt
                     cache_body = provider_cache_body(provider)
                     if cache_body:

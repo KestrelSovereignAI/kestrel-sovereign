@@ -80,25 +80,61 @@ def test_validator_silent_when_method_overridden(caplog):
 
 # --------------------------------------------------------------------------- #
 # Typed streaming routing gates (no behavior change until opt-in)
+#
+# The gates take the routing ``provider`` dict (``{"adapter": ...,
+# "capabilities": <wire dict>}``) so they honor route-scoped capabilities an
+# entry-point factory set on ProviderInfo, not just the adapter's own.
 # --------------------------------------------------------------------------- #
 
 
+def _provider(adapter, capabilities=None):
+    prov = {"adapter": adapter}
+    if capabilities is not None:
+        prov["capabilities"] = capabilities
+    return prov
+
+
+class _StreamStructuredOptIn(_MinimalAdapter):
+    def provider_capabilities(self):
+        return ProviderCapabilities(
+            supports_streaming=True,
+            structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
+        )
+
+    def contract_features(self):
+        return frozenset({streaming_mod._FEATURE_STREAMING_STRUCTURED_OUTPUT})
+
+
 def test_streaming_structured_gate_default_false():
-    assert streaming_mod._route_supports_streaming_structured(_MinimalAdapter()) is False
+    assert (
+        streaming_mod._route_supports_streaming_structured(_provider(_MinimalAdapter()))
+        is False
+    )
 
 
-def test_streaming_structured_gate_true_on_optin():
-    class _OptIn(_MinimalAdapter):
-        def provider_capabilities(self):
-            return ProviderCapabilities(
-                supports_streaming=True,
-                structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
-            )
+def test_streaming_structured_gate_true_on_adapter_optin():
+    assert (
+        streaming_mod._route_supports_streaming_structured(
+            _provider(_StreamStructuredOptIn())
+        )
+        is True
+    )
 
+
+def test_streaming_structured_gate_honors_route_scoped_caps():
+    """codex P2: a factory-set route capability is honored even when the
+    adapter's own provider_capabilities() returns defaults."""
+
+    class _DeclaresFeatureOnly(_MinimalAdapter):
         def contract_features(self):
             return frozenset({streaming_mod._FEATURE_STREAMING_STRUCTURED_OUTPUT})
 
-    assert streaming_mod._route_supports_streaming_structured(_OptIn()) is True
+    route_caps = ProviderCapabilities(
+        supports_streaming=True,
+        structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
+    ).to_dict()
+    prov = _provider(_DeclaresFeatureOnly(), capabilities=route_caps)
+    assert streaming_mod._route_supports_streaming_structured(prov) is True
 
 
 def test_streaming_structured_gate_false_when_mode_not_streamable():
@@ -112,12 +148,16 @@ def test_streaming_structured_gate_false_when_mode_not_streamable():
         def contract_features(self):
             return frozenset({streaming_mod._FEATURE_STREAMING_STRUCTURED_OUTPUT})
 
-    assert streaming_mod._route_supports_streaming_structured(_ToolForced()) is False
+    assert (
+        streaming_mod._route_supports_streaming_structured(_provider(_ToolForced()))
+        is False
+    )
 
 
 def test_tool_stream_system_prompt_gate_default_false():
     assert (
-        streaming_mod._route_wants_tool_stream_system_prompt(_MinimalAdapter()) is False
+        streaming_mod._route_wants_tool_stream_system_prompt(_provider(_MinimalAdapter()))
+        is False
     )
 
 
@@ -129,4 +169,6 @@ def test_tool_stream_system_prompt_gate_true_on_optin():
         def contract_features(self):
             return frozenset({streaming_mod._FEATURE_TOOL_STREAM_SYSTEM_PROMPT})
 
-    assert streaming_mod._route_wants_tool_stream_system_prompt(_OptIn()) is True
+    assert (
+        streaming_mod._route_wants_tool_stream_system_prompt(_provider(_OptIn())) is True
+    )
