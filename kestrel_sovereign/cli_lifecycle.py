@@ -1092,16 +1092,66 @@ def cmd_update(args) -> int:
     else:
         print("• install: skipped (--no-install)")
 
-    # Step 2.5: reconcile the host venv against union(agent allowlists).
+    # Step 2.5: kestrel feature sync — restore the host's out-of-tree feature
+    # packages that `uv sync` just pruned (anything not in sovereign's lock).
+    #
+    # This MUST run before reconcile: a feature package describes itself via its
+    # ``kestrel_sovereign.features`` entry points, and reconcile resolves
+    # allowlist classes from that LIVE discovery (the static catalog is only a
+    # fallback for not-yet-installed packages — see feature_reconcile.
+    # resolve_packages). If reconcile ran first, it would discover against the
+    # just-pruned venv, fail to resolve any editable feature not also hand-listed
+    # in the static catalog, and abort. Restoring first means the features are
+    # present to self-declare, so reconcile validates against reality.
+    # (Reordered from the original #1788 placement, which checked before the
+    # restore and made the static catalog load-bearing.)
+    if features:
+        manifest_path = cli._host_manifest_path(
+            argparse.Namespace(manifest=getattr(args, "manifest", None))
+        )
+        if not manifest_path.exists():
+            # No host manifest: nothing recorded to restore. Skip the restore
+            # (cmd_feature_sync errors on a missing manifest) but DON'T abort —
+            # reconcile still runs so registry-backed allowlist features get
+            # provisioned, and it hard-fails on any NAMED allowlist class that
+            # is now unresolvable. Warn because `uv sync` may have pruned
+            # out-of-tree packages a load-all agent relied on (which reconcile
+            # can't enumerate); capturing a manifest makes them survive updates.
+            print(
+                f"• features: no host manifest at {manifest_path} — skipping "
+                "restore. If this host has out-of-tree feature packages, "
+                "capture one with `kestrel feature sync --capture` so they "
+                "survive `uv sync`. Continuing to reconcile.",
+                file=sys.stderr,
+            )
+        elif dry_run:
+            print("• features: would run `kestrel feature sync`")
+        else:
+            print("• features: kestrel feature sync")
+            sync_args = argparse.Namespace(
+                manifest=getattr(args, "manifest", None),
+                capture=False,
+                dry_run=False,
+            )
+            rc = cli.cmd_feature_sync(sync_args)
+            if rc != 0 and not continue_on_error:
+                print(
+                    "• features: FAILED — aborting before reconcile/restart. "
+                    "Re-run with --continue-on-error to proceed anyway.",
+                    file=sys.stderr,
+                )
+                return rc
+    else:
+        print("• features: skipped (--no-features)")
+
+    # Step 2.6: reconcile the host venv against union(agent allowlists).
     #
     # The per-agent `features` allowlist is a FILTER, not an INSTALLER: a class
     # named in an allowlist but missing from the venv silently never loads.
-    # Reconcile installs the missing union members and updates the present ones
-    # (git pull editable checkouts; pip --upgrade PyPI packages) so the venv
-    # holds exactly what the agents need. Gated by the same `features` flag as
-    # the sync below — together they are the feature-provisioning half of the
-    # update. Runs BEFORE sync so newly-required packages are linked before
-    # sync refreshes entry-points (issue #1788).
+    # Reconcile validates union(allowlists) ⊆ host venv and installs any union
+    # member still missing (e.g. catalogued-but-not-yet-installed packages),
+    # resolving class→package from live entry-point discovery of the features
+    # restored by the sync above. Gated by the same `features` flag.
     if features:
         if dry_run:
             print("• reconcile: union(agent allowlists) → host venv [preview]")
@@ -1117,35 +1167,13 @@ def cmd_update(args) -> int:
         )
         if rc != 0 and not continue_on_error:
             print(
-                "• reconcile: FAILED — aborting before sync/restart. "
+                "• reconcile: FAILED — aborting before restart. "
                 "Re-run with --continue-on-error to proceed anyway.",
                 file=sys.stderr,
             )
             return rc
     else:
         print("• reconcile: skipped (--no-features)")
-
-    # Step 3: kestrel feature sync.
-    if features:
-        if dry_run:
-            print("• features: would run `kestrel feature sync`")
-        else:
-            print("• features: kestrel feature sync")
-            sync_args = argparse.Namespace(
-                manifest=getattr(args, "manifest", None),
-                capture=False,
-                dry_run=False,
-            )
-            rc = cli.cmd_feature_sync(sync_args)
-            if rc != 0 and not continue_on_error:
-                print(
-                    "• features: FAILED — aborting before restart. "
-                    "Re-run with --continue-on-error to restart anyway.",
-                    file=sys.stderr,
-                )
-                return rc
-    else:
-        print("• features: skipped (--no-features)")
 
     # Step 4: kestrel restart.
     if restart:

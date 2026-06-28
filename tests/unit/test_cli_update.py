@@ -77,10 +77,14 @@ def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir):
         calls.append(("restart", args.name, args.force))
         return 0
 
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text("")
+
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", fake_dirty), \
          patch.object(cli, "_run_git_pull", fake_pull), \
          patch.object(cli, "_run_uv_pip_install_editable", fake_install), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
          patch.object(cli, "cmd_feature_sync", fake_sync), \
          patch.object(cli, "cmd_restart", fake_restart):
         rc = cli.cmd_update(_ns())
@@ -93,6 +97,72 @@ def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir):
         "sync",
         ("restart", None, False),
     ]
+
+
+def test_update_runs_feature_sync_before_reconcile(stub_project_dir):
+    """feature sync MUST run before reconcile.
+
+    `uv sync` prunes out-of-tree feature packages; feature sync restores them so
+    they self-declare via their entry points. Reconcile resolves allowlist
+    classes from that LIVE discovery (the static catalog is only a fallback). If
+    reconcile ran first it would discover against the just-pruned venv and abort
+    on any editable feature not also hand-listed in the catalog — the ordering
+    bug this reorder fixes.
+    """
+    from kestrel_sovereign import cli_lifecycle
+
+    calls = []
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text("")
+
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "ok\n")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: (0, "ok\n")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda args: calls.append("sync") or 0), \
+         patch.object(cli_lifecycle, "_run_feature_reconcile",
+                      lambda *a, **kw: calls.append("reconcile") or 0), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: calls.append("restart") or 0):
+        rc = cli.cmd_update(_ns())
+
+    assert rc == 0
+    assert calls == ["sync", "reconcile", "restart"]
+
+
+def test_update_no_host_manifest_skips_sync_but_still_reconciles(
+    stub_project_dir, capsys
+):
+    """A host with no .kestrel-host-features.toml has no out-of-tree packages to
+    restore — skip the sync (it would error on the missing manifest) but STILL
+    run reconcile, so registry-backed allowlist features get provisioned. (Guards
+    the regression from moving sync before reconcile.)"""
+    from kestrel_sovereign import cli_lifecycle
+
+    calls = []
+    missing = stub_project_dir / "does-not-exist.toml"
+
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "ok\n")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: (0, "ok\n")), \
+         patch.object(cli, "_host_manifest_path", lambda args: missing), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda args: calls.append("sync") or 1), \
+         patch.object(cli_lifecycle, "_run_feature_reconcile",
+                      lambda *a, **kw: calls.append("reconcile") or 0), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: calls.append("restart") or 0):
+        rc = cli.cmd_update(_ns())
+
+    assert rc == 0
+    # sync was NOT called (manifest missing); reconcile + restart still ran.
+    assert calls == ["reconcile", "restart"]
+    assert "no host manifest" in capsys.readouterr().err
 
 
 def test_update_short_circuits_when_pull_fails(stub_project_dir):
@@ -212,10 +282,13 @@ def test_continue_on_error_runs_restart_after_sync_failure(stub_project_dir):
     abort the restart — useful when a single optional feature package
     is temporarily unreachable."""
     called = []
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text("")
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
          patch.object(cli, "cmd_feature_sync",
                       lambda args: called.append("sync") or 1), \
          patch.object(cli, "cmd_restart",
@@ -269,10 +342,13 @@ def test_pypi_install_skips_pull_and_install_silently(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: None)
     called = []
+    manifest = tmp_path / ".kestrel-host-features.toml"
+    manifest.write_text("")
     with patch.object(cli, "_run_git_pull",
                       lambda _: called.append("pull") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: called.append("install") or (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
          patch.object(cli, "cmd_feature_sync",
                       lambda args: called.append("sync") or 0), \
          patch.object(cli, "cmd_restart",
@@ -645,12 +721,15 @@ def test_update_recovers_from_detached_head_and_retries_pull(stub_project_dir):
             else (0, "Updated.\n")
 
     later = []
+    manifest = stub_project_dir / ".kestrel-host-features.toml"
+    manifest.write_text("")
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull", fake_pull), \
          patch.object(cli, "_git_reattach_if_safely_detached", lambda _: "main"), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: later.append("install") or (0, "")), \
+         patch.object(cli, "_host_manifest_path", lambda args: manifest), \
          patch.object(cli, "cmd_feature_sync",
                       lambda args: later.append("sync") or 0), \
          patch.object(cli, "cmd_restart",
