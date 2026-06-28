@@ -89,14 +89,17 @@ test.describe('#748 security approval popup', () => {
         await expect(page.locator('.modal-btn:has-text("This Time")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("This Session")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("Always")')).toBeVisible();
-        await expect(page.locator('.modal-btn:has-text("Enable Auto Mode")')).toBeVisible();
+        // Global Auto now offers both tiers: session (orange) and always (red).
+        await expect(page.locator('.modal-btn:has-text("Auto: Session")')).toBeVisible();
+        await expect(page.locator('.modal-btn:has-text("Auto: Always")')).toBeVisible();
         await expect(modalBody).toContainText('Auto Mode approves this request');
         expect((await page.locator('.modal-btn').allTextContents()).map((text) => text.trim())).toEqual([
             'Deny',
             'This Time',
             'This Session',
             'Always',
-            'Enable Auto Mode',
+            'Auto: Session',
+            'Auto: Always',
         ]);
 
         // Click "This Session" and verify the decision is posted.
@@ -153,18 +156,21 @@ test.describe('#748 security approval popup', () => {
                     contentType: 'application/json',
                     body: JSON.stringify({
                         enabled: false,
+                        scope: 'off',
                         warning: 'Auto Mode is off.',
                     }),
                 });
                 return;
             }
 
-            autoModeCalls.push(JSON.parse(request.postData() || '{}'));
+            const body = JSON.parse(request.postData() || '{}');
+            autoModeCalls.push(body);
             await route.fulfill({
                 status: 200,
                 contentType: 'application/json',
                 body: JSON.stringify({
-                    enabled: true,
+                    enabled: body.scope !== 'off',
+                    scope: body.scope,
                     warning: 'Auto Mode enabled for this session. Constitutional and honesty checks still run first.',
                 }),
             });
@@ -174,11 +180,11 @@ test.describe('#748 security approval popup', () => {
 
         await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Off');
         await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 10000 });
-        await page.click('.modal-btn:has-text("Enable Auto Mode")');
+        await page.click('.modal-btn:has-text("Auto: Session")');
 
         await expect.poll(() => autoModeCalls.length, { timeout: 5000 }).toBe(1);
-        expect(autoModeCalls[0]).toMatchObject({ enabled: true });
-        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
+        expect(autoModeCalls[0]).toMatchObject({ scope: 'session' });
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Session');
 
         await expect.poll(() => approveCalls.length, { timeout: 5000 }).toBe(1);
         expect(approveCalls[0]).toMatchObject({
@@ -224,11 +230,14 @@ test.describe('#748 security approval popup', () => {
         });
 
         await page.route('**/api/security/auto-mode', async (route, request) => {
+            const body = request.method() === 'POST' ? JSON.parse(request.postData() || '{}') : {};
+            const scope = request.method() === 'POST' ? body.scope : 'off';
             await route.fulfill({
                 status: 200,
                 contentType: 'application/json',
                 body: JSON.stringify({
-                    enabled: request.method() === 'POST',
+                    enabled: scope !== 'off',
+                    scope,
                     warning: 'Auto Mode enabled for this session. Constitutional and honesty checks still run first.',
                 }),
             });
@@ -237,9 +246,9 @@ test.describe('#748 security approval popup', () => {
         await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
 
         await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 10000 });
-        await page.click('.modal-btn:has-text("Enable Auto Mode")');
+        await page.click('.modal-btn:has-text("Auto: Session")');
 
-        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Session');
         await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
         await expect(page.locator('.toast-item').filter({ hasText: 'Auto Mode enabled' })).toBeVisible();
         await expect(page.locator('.toast-item').filter({ hasText: 'Failed to submit decision' })).toHaveCount(0);
@@ -269,18 +278,19 @@ test.describe('#748 security approval popup', () => {
             });
         });
 
-        let autoEnabled = false;
+        let autoScope = 'off';
         await page.route('**/api/security/auto-mode', async (route, request) => {
             if (request.method() === 'POST') {
-                autoEnabled = Boolean(JSON.parse(request.postData() || '{}').enabled);
+                autoScope = JSON.parse(request.postData() || '{}').scope || 'off';
             }
 
             await route.fulfill({
                 status: 200,
                 contentType: 'application/json',
                 body: JSON.stringify({
-                    enabled: autoEnabled,
-                    warning: autoEnabled
+                    enabled: autoScope !== 'off',
+                    scope: autoScope,
+                    warning: autoScope !== 'off'
                         ? 'Auto Mode enabled for this session. Constitutional and honesty checks still run first.'
                         : 'Auto Mode is off.',
                 }),
@@ -289,8 +299,10 @@ test.describe('#748 security approval popup', () => {
 
         await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
         await page.getByRole('button', { name: 'Chat' }).click();
+        // Toolbar Auto opens the tier chooser; pick the session tier.
         await page.click('#chat-auto-mode-btn');
-        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
+        await page.click('.modal-btn:has-text("This Session")');
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Session');
 
         await page.evaluate((payload) => {
             window.Security.handleApprovalRequest(payload);
@@ -308,7 +320,7 @@ test.describe('#748 security approval popup', () => {
         await expect(page.locator('.toast-item').filter({ hasText: 'Failed to submit decision' })).toHaveCount(0);
     });
 
-    test('chat header Auto toggle enables mode without a second confirmation popup', async ({ page }) => {
+    test('chat header Auto toggle opens the tier chooser; Always enables the persistent tier', async ({ page }) => {
         await page.route('**/agent/notifications/sse**', async (route) => {
             await route.fulfill({
                 status: 200,
@@ -322,22 +334,25 @@ test.describe('#748 security approval popup', () => {
         });
 
         const autoModeCalls = [];
-        let autoEnabled = false;
+        let autoScope = 'off';
         await page.route('**/api/security/auto-mode', async (route, request) => {
             if (request.method() === 'POST') {
                 const body = JSON.parse(request.postData() || '{}');
                 autoModeCalls.push(body);
-                autoEnabled = Boolean(body.enabled);
+                autoScope = body.scope || 'off';
             }
 
             await route.fulfill({
                 status: 200,
                 contentType: 'application/json',
                 body: JSON.stringify({
-                    enabled: autoEnabled,
-                    warning: autoEnabled
-                        ? 'Auto Mode enabled for this session. Constitutional and honesty checks still run first.'
-                        : 'Auto Mode is off.',
+                    enabled: autoScope !== 'off',
+                    scope: autoScope,
+                    warning: autoScope === 'always'
+                        ? 'Auto Mode is on persistently and survives page refresh and server restart until you turn it off.'
+                        : autoScope === 'session'
+                            ? 'Auto Mode enabled for this session.'
+                            : 'Auto Mode is off.',
                 }),
             });
         });
@@ -346,11 +361,19 @@ test.describe('#748 security approval popup', () => {
         await page.getByRole('button', { name: 'Chat' }).click();
 
         await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Off');
+        // Clicking the toolbar opens the tier chooser rather than toggling blindly.
         await page.click('#chat-auto-mode-btn');
+        await expect(page.locator('.modal-btn:has-text("This Session")')).toBeVisible();
+        await expect(page.locator('.modal-btn:has-text("Always")')).toBeVisible();
+
+        // Choose the persistent tier.
+        await page.click('.modal-btn:has-text("Always")');
 
         await expect.poll(() => autoModeCalls.length, { timeout: 5000 }).toBe(1);
-        expect(autoModeCalls[0]).toMatchObject({ enabled: true });
-        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
+        expect(autoModeCalls[0]).toMatchObject({ scope: 'always' });
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Always');
+        // Persistent tier raises a red (danger/error) toast.
+        await expect(page.locator('.toast-item').filter({ hasText: 'survives page refresh' })).toBeVisible();
         await expect(page.locator('#modal-overlay')).not.toBeVisible();
     });
 
