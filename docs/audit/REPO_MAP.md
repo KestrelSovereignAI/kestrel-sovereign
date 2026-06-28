@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-27
-**Scope:** 1835 tracked files (1202 `.py`, 317 `.md`, 316 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-28
+**Scope:** 1842 tracked files (1208 `.py`, 318 `.md`, 316 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -108,6 +108,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/stores/unified/__init__.py** — Unified A2A Stores - Backend-Agnostic Implementations
 - **kestrel_sovereign/a2a/stores/unified/base.py** — Base class for unified stores.
   - `class UnifiedStoreBase`
+- **kestrel_sovereign/a2a/stores/unified/feature_enablement_store.py** — Per-agent feature / MCP-server **enablement** deltas, persisted in the DB.
+  - `class FeatureEnablementStore`
 - **kestrel_sovereign/a2a/stores/unified/feedback_store.py** — Unified FeedbackStore - Backend-Agnostic Agent Feedback.
   - `class FeedbackCategory`; `class FeedbackSeverity`; `class FeedbackStatus`; `class FeedbackSource`; `class FeedbackEntry`; `class FeedbackStore`
 - **kestrel_sovereign/a2a/stores/unified/memory_service.py** — Unified MemoryService — Task Completion Archive.
@@ -180,7 +182,7 @@ Repo entry points and standard project files.
   - `class AuthMethod`; `class CallerRole`; `class CallerContext`
 - **kestrel_sovereign/bootstrap/__init__.py** — Bootstrap module for Kestrel agent wake-up and personality discovery.
 - **kestrel_sovereign/bootstrap/service.py** — Bootstrap Service for Kestrel agent wake-up and personality discovery.
-  - `class BootstrapState`; `class RestartDiscoveryResult`; `class BootstrapStaleness`; `class BootstrapService`
+  - `def derive_description_from_soul(content)`; `async def persist_agent_description(db, storage, agent_id, description)`; `class BootstrapState`; `class RestartDiscoveryResult`; `class BootstrapStaleness`; `class BootstrapService`
 - **kestrel_sovereign/cli.py** — Unified Kestrel CLI for host and agent management.
   - `def cmd_list(args)`; `def cmd_create(args)`; `def cmd_shell(args)`; `def cmd_ask(args)`; `def cmd_health(args)`; `def cmd_doctor(args)`; `def cmd_storage(args)`; `def cmd_auth(args)`; `…`
 - **kestrel_sovereign/cli_agent_docker.py** — ``kestrel agent docker {create,chat,retire}`` CLI command — sub-PR 3.2 of epic #1050 (bash-to-Python port of ``scripts/sovereign-agent.sh``).
@@ -1320,6 +1322,7 @@ Repo entry points and standard project files.
 - **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
 - **docs/architecture/FILECOIN_WALLET.md** — Filecoin Wallet Integration — > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.
 - **docs/architecture/GITHUB_FEATURE_DESIGN.md** — GitHub Feature Design — > **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-poin…
+- **docs/architecture/INCREMENTAL_BACKUP.md** — Incremental Backup — Page-Aligned Content-Addressed Deltas for Active Agents — **Status (2026-06-27): Design spike for [#1842](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1842).** No implementation yet.
 - **docs/architecture/LLM_PROVIDER_CAPABILITIES.md** — LLM Provider Capabilities — Kestrel tracks adapter-level capabilities separately from per-model `ModelInfo`.
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
 - **docs/architecture/MEMORY_OWNERSHIP.md** — Memory System Ownership Map — > Created for Issue #501.
@@ -1889,14 +1892,22 @@ Repo entry points and standard project files.
 - **tests/llm/__init__.py** — —
 - **tests/llm/test_adapter.py** — Tests for LLM Adapter base class.
   - `class SimpleModel`; `class DetailedModel`; `class MockAdapter`; `class TestMessageCreation`; `class TestImageHandling`; `class TestMessageStructure`; `class TestBackwardCompatibility`
+- **tests/llm/test_anthropic_adapter.py** — v5 capability parity for the Anthropic adapters (#1984).
+  - `def test_anthropic_v5_capabilities_and_round_trip()`; `def test_anthropic_contract_features()`; `def test_claude_max_plan_gates_off_platform_apis()`; `async def test_count_tokens_uses_real_endpoint()`; `def test_apply_request_options_default_no_op()`; `def test_apply_request_options_merges_raw_escape_hatch()`; `def test_request_options_wiring_applies_raw_and_no_ops_without_options()`; `async def test_raw_request_routes_named_operation_through_client()`; `…`
 - **tests/llm/test_image_resizing.py** — Tests for image resizing functionality in llm/image_utils.py
   - `def create_test_image(width, height, color)`; `def get_image_size(image_bytes)`; `class TestImageResizing`; `class TestProcessImageWithResize`; `class TestProcessImagesWithResize`; `class TestProviderDimensions`; `class TestGetBase64OnlyWithResize`
+- **tests/llm/test_ollama_adapter.py** — v5 capability parity for the Ollama adapter (#1987).
+  - `def test_ollama_v5_capabilities_and_round_trip()`; `def test_ollama_contract_features()`; `def test_apply_request_options_merges_ollama_native_raw()`; `def test_raw_options_merge_preserves_existing_options()`; `def test_apply_request_options_default_no_op()`; `def test_request_options_wiring_reaches_chat_kwargs()`; `async def test_raw_request_routes_named_operation()`; `async def test_raw_request_requires_operation()`
+- **tests/llm/test_openai_adapter.py** — —
+  - `def test_openai_v5_capability_flags_and_round_trip()`; `def test_openai_compatible_route_does_not_advertise_native_only_caps()`; `def test_openai_contract_features_match_advertised_optional_methods()`; `def test_apply_request_options_mutates_outbound_kwargs()`; `async def test_get_response_applies_request_options_to_chat_completion()`; `async def test_count_tokens_returns_estimated_token_count()`; `async def test_files_api_wrappers_use_openai_client()`; `async def test_batch_submit_and_results_are_keyed_by_custom_id()`; `…`
 - **tests/llm/test_streaming_tool_detection.py** — Streaming Tool Detection Tests
   - `class TestOpenAIStreamingToolDetectionUnit`; `class TestAnthropicStreamingToolDetectionUnit`; `class TestOllamaStreamingToolDetectionUnit`; `class TestVertexStreamingToolDetectionUnit`; `class TestOpenAIStreamingToolDetectionIntegration`; `class TestAnthropicStreamingToolDetectionIntegration`; `class TestOllamaStreamingToolDetectionIntegration`; `class TestLLMServiceStreamWithToolDetection`; `…`
 - **tests/llm/test_structured_output.py** — Comprehensive Structured Output Test Suite
   - `class SimpleResponse`; `class ListResponse`; `class MathResponse`; `class AnalysisResponse`; `def provider_available(provider_name)`; `def llm_service()`; `class TestStructuredOutputBasic`; `class TestStructuredOutputComplex`; `…`
 - **tests/llm/test_token_tracking.py** — Token Tracking Tests
   - `class TestOpenAITokenExtraction`; `class TestAnthropicTokenExtraction`; `class TestOllamaTokenExtraction`; `class TestRealOpenAITokenTracking`; `class TestRealAnthropicTokenTracking`; `class TestRealOllamaTokenTracking`; `class TestLLMServiceTokenTracking`; `class TestUsageTrackingIntegration`
+- **tests/llm/test_v5_capability_negotiation.py** — v5 capability negotiation (#1983).
+  - `def test_validator_warns_when_flag_on_but_method_unimplemented(caplog)`; `def test_validator_silent_when_no_flags_advertised(caplog)`; `def test_validator_silent_when_feature_declared(caplog)`; `def test_validator_silent_when_method_overridden(caplog)`; `def test_streaming_structured_gate_default_false()`; `def test_streaming_structured_gate_true_on_adapter_optin()`; `def test_streaming_structured_gate_honors_route_scoped_caps()`; `def test_streaming_structured_gate_false_when_mode_not_streamable()`; `…`
 - **tests/llm/test_vertex_adapter.py** — Tests for Vertex AI Adapter.
   - `def has_gcp_credentials()`; `def adapter()`; `def sample_png_path(tmp_path)`; `class TestVertexAIAdapterInit`; `class TestMessageCreation`; `class TestToolConversion`; `class TestModelDiscovery`; `class TestGeneration`; `…`
 - **tests/load/__init__.py** — Load tests for Kestrel framework.
@@ -2314,6 +2325,8 @@ Repo entry points and standard project files.
   - `class TestGetDisabledFeatures`; `class TestDiscoverFeatureModules`; `class TestDiscoverFeatures`; `class TestGetFeatureByName`; `class TestFindFeatureClass`; `class TestFeatureProfiles`; `class TestEntryPointDiscovery`; `class TestEntrypointClassName`
 - **tests/unit/test_feature_doc_canonicality.py** — Guardrails for canonical feature-document structure.
   - `def test_canonical_feature_doc_declares_source_of_truth()`; `def test_canonical_feature_doc_distinguishes_core_and_package_features()`; `def test_canonical_feature_doc_lists_core_only_inventory()`; `def test_legacy_archive_is_marked_historical()`; `def test_generator_prompt_does_not_hardcode_stale_metrics()`; `def test_progress_review_script_uses_discovered_inventory_language()`; `def test_investor_generated_doc_does_not_invent_unverified_metrics()`
+- **tests/unit/test_feature_enablement_store.py** — Tests for the per-agent feature/MCP-server enablement delta store + the startup reconcile-union (bootstrap config ∪ DB deltas).
+  - `async def test_store_upsert_get_clear(tmp_path)`; `async def test_union_no_deltas_equals_bootstrap()`; `async def test_union_enabled_adds_disabled_removes()`; `async def test_union_mandatory_cannot_be_disabled()`; `async def test_union_none_bootstrap_passthrough()`; `async def test_disabled_skip_applies_without_allowlist()`; `async def test_disabled_skip_never_includes_mandatory()`; `async def test_persist_then_union_reflects_change_across_restart(tmp_path)`
 - **tests/unit/test_feature_inventory_contracts.py** — Contract tests for the discoverable feature inventory.
   - `def test_every_discoverable_feature_module_exports_a_feature_class()`; `def test_discover_features_matches_unique_class_inventory()`; `def test_disabled_feature_env_filters_exact_class_names()`; `def test_get_feature_by_name_resolves_discovered_features_by_name_and_class()`; `def test_entrypoint_features_included_in_combined_inventory()`; `def test_combined_inventory_has_no_duplicates()`; `def test_combined_inventory_respects_disabled_env()`; `def test_core_only_inventory_stable_without_entrypoints()`; `…`
 - **tests/unit/test_feature_lifecycle.py** — Unit Tests for Feature Lifecycle Hooks.
