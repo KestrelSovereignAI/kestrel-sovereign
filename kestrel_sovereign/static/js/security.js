@@ -236,8 +236,11 @@ export const Security = {
                             Choose how to handle this permission:
                         </p>
                         <p style="margin: 0.5rem 0 0; color: var(--warning); font-size: 0.8125rem;">
-                            Auto Mode approves this request and future non-denied requests while this session is active.
-                            Constitutional, honesty, and security hooks can still flag or block.
+                            Auto Mode approves this request and future non-denied requests.
+                            <strong>Auto: Session</strong> lasts until the session is reset;
+                            <strong>Auto: Always</strong> persists across page refresh and server
+                            restart until you turn it off. Constitutional, honesty, and security
+                            hooks can still flag or block.
                         </p>
                     </div>
                 `,
