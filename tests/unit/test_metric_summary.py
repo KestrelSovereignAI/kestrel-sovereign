@@ -111,6 +111,39 @@ async def test_metric_summary_empty_when_metric_never_emitted(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_metric_summary_finds_rare_metric_amid_high_volume_other(tmp_path):
+    # Regression: a rare forensic metric must be found even when a high-volume
+    # metric is emitted more recently and exceeds the fetch limit. The metric
+    # name is filtered in SQL, so the limit bounds THIS metric's rows, not all.
+    store = await _store(tmp_path, "metric-summary-rare.db")
+
+    # One rare persist failure FIRST (oldest)...
+    await store.log_metric(
+        agent_name="did:test:emma",
+        metric_name="assistant_turn_persist_failed",
+        metric_value=1.0,
+        metadata={"session_id": "rare", "error_type": "TimeoutError"},
+    )
+    # ...then a flood of a different, high-volume metric (all newer).
+    for i in range(50):
+        await store.log_metric(
+            agent_name="did:test:emma",
+            metric_name="feature_tools_built_streaming",
+            metric_value=float(i),
+            metadata={},
+        )
+
+    # Even with a tiny limit, the SQL name-filter still surfaces the rare one.
+    summary = await store.get_metric_summary(
+        "assistant_turn_persist_failed", limit=3
+    )
+    assert summary["count"] == 1
+    assert summary["truncated"] is False
+    assert summary["last_seen"] is not None
+    assert summary["samples"][0]["metadata"].get("error_type") == "TimeoutError"
+
+
+@pytest.mark.asyncio
 async def test_metric_summary_truncated_flag_when_window_exceeds_limit(tmp_path):
     store = await _store(tmp_path, "metric-summary-trunc.db")
     for i in range(5):

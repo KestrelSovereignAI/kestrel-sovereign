@@ -520,8 +520,18 @@ class ObservabilityStore(UnifiedStoreBase):
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         limit: int = 100,
+        metadata_like: Optional[str] = None,
     ) -> list[ObservabilityEvent]:
-        """Query observability events with filters."""
+        """Query observability events with filters.
+
+        ``metadata_like`` applies a ``LIKE ? ESCAPE '\\'`` predicate against the
+        serialized JSON ``metadata`` column. It lets callers push a coarse
+        metadata filter (e.g. a specific ``metric_name``) into SQL so the
+        ``limit`` applies to the rows they care about rather than to all rows
+        of the ``event_type`` — without backend-specific JSON SQL (portable
+        across SQLite and Postgres). Callers must still verify the parsed
+        metadata, as ``LIKE`` is a substring match, not a structural one.
+        """
         conditions = []
         params: list[Any] = []
 
@@ -534,6 +544,9 @@ class ObservabilityStore(UnifiedStoreBase):
         if session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
+        if metadata_like:
+            conditions.append("metadata LIKE ? ESCAPE '\\'")
+            params.append(metadata_like)
         if since:
             conditions.append("timestamp >= ?")
             params.append(self.to_timestamp_param(since))
@@ -580,12 +593,23 @@ class ObservabilityStore(UnifiedStoreBase):
         and ``truncated`` (True if the window held more than ``limit`` metric
         events, so ``count`` is a lower bound).
         """
+        # Push the metric-name filter into SQL so ``limit`` bounds THIS metric's
+        # rows, not all metric events. Without this, a rare forensic metric
+        # (e.g. assistant_turn_persist_failed) would be missed entirely when a
+        # high-volume metric (feature_tools_built_streaming) fills the newest
+        # ``limit`` rows. Escape LIKE wildcards so the pattern is literal; the
+        # parsed-metadata check below remains authoritative (#969).
+        escaped = (
+            metric_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f'%"metric_name": "{escaped}"%'
         events = await self.query_events(
             agent_name=agent_name,
             event_type="metric",
             since=since,
             until=until,
             limit=limit + 1,
+            metadata_like=pattern,
         )
         truncated = len(events) > limit
         if truncated:
