@@ -520,17 +520,18 @@ class ObservabilityStore(UnifiedStoreBase):
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         limit: int = 100,
-        metadata_like: Optional[str] = None,
+        metadata_equals: Optional[tuple[str, str]] = None,
     ) -> list[ObservabilityEvent]:
         """Query observability events with filters.
 
-        ``metadata_like`` applies a ``LIKE ? ESCAPE '\\'`` predicate against the
-        serialized JSON ``metadata`` column. It lets callers push a coarse
-        metadata filter (e.g. a specific ``metric_name``) into SQL so the
-        ``limit`` applies to the rows they care about rather than to all rows
-        of the ``event_type`` — without backend-specific JSON SQL (portable
-        across SQLite and Postgres). Callers must still verify the parsed
-        metadata, as ``LIKE`` is a substring match, not a structural one.
+        ``metadata_equals`` is a ``(json_key, value)`` pair that matches a
+        top-level string field inside the JSON ``metadata`` column (e.g.
+        ``("metric_name", "assistant_turn_persist_failed")``). It pushes the
+        filter into SQL so ``limit`` applies to the matching rows rather than
+        to every row of the ``event_type``. The predicate uses each backend's
+        native JSON accessor — ``metadata ->> ?`` on PostgreSQL (JSONB),
+        ``json_extract(metadata, ?)`` on SQLite — so it is an exact, portable
+        structural match (not a substring ``LIKE``) on both backends.
         """
         conditions = []
         params: list[Any] = []
@@ -544,9 +545,15 @@ class ObservabilityStore(UnifiedStoreBase):
         if session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
-        if metadata_like:
-            conditions.append("metadata LIKE ? ESCAPE '\\'")
-            params.append(metadata_like)
+        if metadata_equals:
+            json_key, json_value = metadata_equals
+            if self.is_postgres:
+                conditions.append("metadata ->> ? = ?")
+                params.append(json_key)
+            else:
+                conditions.append("json_extract(metadata, ?) = ?")
+                params.append(f"$.{json_key}")
+            params.append(json_value)
         if since:
             conditions.append("timestamp >= ?")
             params.append(self.to_timestamp_param(since))
@@ -597,19 +604,14 @@ class ObservabilityStore(UnifiedStoreBase):
         # rows, not all metric events. Without this, a rare forensic metric
         # (e.g. assistant_turn_persist_failed) would be missed entirely when a
         # high-volume metric (feature_tools_built_streaming) fills the newest
-        # ``limit`` rows. Escape LIKE wildcards so the pattern is literal; the
-        # parsed-metadata check below remains authoritative (#969).
-        escaped = (
-            metric_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
-        pattern = f'%"metric_name": "{escaped}"%'
+        # ``limit`` rows. The parsed-metadata check below stays authoritative (#969).
         events = await self.query_events(
             agent_name=agent_name,
             event_type="metric",
             since=since,
             until=until,
             limit=limit + 1,
-            metadata_like=pattern,
+            metadata_equals=("metric_name", metric_name),
         )
         truncated = len(events) > limit
         if truncated:

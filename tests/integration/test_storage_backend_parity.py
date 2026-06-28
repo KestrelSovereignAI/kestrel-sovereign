@@ -13,7 +13,7 @@ from kestrel_sovereign.endpoints.database import (
     list_database_tables,
     query_database_table,
 )
-from kestrel_sovereign.a2a.stores.unified import TaskStore
+from kestrel_sovereign.a2a.stores.unified import ObservabilityStore, TaskStore
 from kestrel_sovereign.a2a.types import (
     Artifact,
     Message,
@@ -414,3 +414,41 @@ async def test_db_explorer_scopes_graph_edges_via_node_membership(db_backend):
         request, "graph_edges", limit=50, offset=0, search="internal"
     )
     assert {r["label"] for r in searched["rows"]} == {"mine_internal"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_metric_summary_is_backend_neutral(db_backend):
+    """#969: get_metric_summary filters metric_name via each backend's native
+    JSON accessor (json_extract on SQLite, ->> on Postgres-JSONB). This proves
+    the predicate is valid on both — a LIKE on JSONB would 500 on Postgres."""
+    store = ObservabilityStore(db_backend)
+    await store.initialize()
+
+    await store.log_metric(
+        agent_name="did:test:emma",
+        metric_name="assistant_turn_persist_failed",
+        metric_value=1.0,
+        metadata={"session_id": "s-1", "error_type": "TimeoutError"},
+    )
+    # A newer, higher-volume different metric must not crowd out the rare one.
+    for i in range(5):
+        await store.log_metric(
+            agent_name="did:test:emma",
+            metric_name="feature_tools_built_streaming",
+            metric_value=float(i),
+            metadata={},
+        )
+
+    rare = await store.get_metric_summary("assistant_turn_persist_failed", limit=3)
+    assert rare["count"] == 1
+    assert rare["by_agent"] == {"did:test:emma": 1}
+    assert rare["last_seen"] is not None
+    assert rare["samples"][0]["metadata"].get("error_type") == "TimeoutError"
+
+    other = await store.get_metric_summary("feature_tools_built_streaming")
+    assert other["count"] == 5
+
+    missing = await store.get_metric_summary("never_emitted")
+    assert missing["count"] == 0
+    assert missing["samples"] == []
