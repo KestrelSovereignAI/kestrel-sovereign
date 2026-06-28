@@ -29,12 +29,16 @@ class OperatorSignalProducer:
 
     def __init__(self, agent: Any):
         self._agent = agent
-        self._pending_auto_mode: List[bool] = []
+        self._pending_auto_mode: List[str] = []
         self._last_budget_low_by_session: Dict[str, bool] = {}
         self._last_governance_fingerprint_by_session: Dict[str, str] = {}
 
-    def enqueue_auto_mode(self, enabled: bool) -> None:
-        self._pending_auto_mode.append(bool(enabled))
+    def enqueue_auto_mode(self, scope: str) -> None:
+        """Queue a global Auto change for the next turn.
+
+        ``scope`` is one of "off", "session", or "always".
+        """
+        self._pending_auto_mode.append(str(scope))
 
     async def collect_for_turn(
         self,
@@ -54,12 +58,12 @@ class OperatorSignalProducer:
         delivery_role = "system" if use_inline else "user"
 
         events: List[OperatorSignalEvent] = []
-        for enabled in self._pending_auto_mode:
+        for scope in self._pending_auto_mode:
             events.append(
                 OperatorSignalEvent(
                     source=SOURCE_AUTO_MODE,
-                    content=_auto_mode_notice(enabled),
-                    payload={"enabled": enabled},
+                    content=_auto_mode_notice(scope),
+                    payload={"scope": scope, "enabled": scope != "off"},
                 )
             )
         self._pending_auto_mode.clear()
@@ -297,8 +301,18 @@ def state_of_mind_snapshot(state: Any) -> Dict[str, Any]:
     return raw
 
 
-def _auto_mode_notice(enabled: bool) -> str:
-    if enabled:
+def _auto_mode_notice(scope: str) -> str:
+    if scope == "always":
+        return (
+            "Operator context: auto-mode is now enabled persistently (the "
+            "'always' tier). The operator has given standing consent for "
+            "multi-agent workflows and non-denied tool calls to proceed "
+            "without additional approval prompts when earlier constitutional, "
+            "honesty, and security checks do not flag the action. This consent "
+            "survives session resets and server restarts until explicitly "
+            "revoked."
+        )
+    if scope == "session":
         return (
             "Operator context: auto-mode is now enabled for this server "
             "session. The operator has given standing consent for "
@@ -307,9 +321,9 @@ def _auto_mode_notice(enabled: bool) -> str:
             "honesty, and security checks do not flag the action."
         )
     return (
-        "Operator context: auto-mode is now disabled for this server session. "
-        "Standing consent for unprompted tool use has ended; approval prompts "
-        "apply according to the configured permission policy."
+        "Operator context: auto-mode is now disabled. Standing consent for "
+        "unprompted tool use has ended; approval prompts apply according to "
+        "the configured permission policy."
     )
 
 

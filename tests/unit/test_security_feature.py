@@ -186,6 +186,71 @@ class TestPermissionStore:
         assert await store.get_permission("WalletAgent", "get_balance") == PermissionLevel.ASK
 
     @pytest.mark.asyncio
+    async def test_always_auto_survives_clear_session(self, store):
+        """The persistent ('always') tier must outlive a session reset."""
+        await store.set_global_auto_mode_scope("always")
+        assert store.get_global_auto_mode_scope() == "always"
+
+        store.clear_session_overrides()
+
+        # Session tier cleared, but persistent Auto remains in effect.
+        assert store.get_global_auto_mode() is True
+        assert store.get_global_auto_mode_scope() == "always"
+
+    @pytest.mark.asyncio
+    async def test_always_auto_rehydrates_on_new_store(self, db_path):
+        """Persistent Auto survives a 'restart' (a fresh store on the same DB)."""
+        store_a = track_store(PermissionStore(db_path))
+        await store_a.initialize()
+        await store_a.set_global_auto_mode_scope("always")
+
+        store_b = track_store(PermissionStore(db_path))
+        await store_b.initialize()
+        assert store_b.get_global_auto_mode() is True
+        assert store_b.get_global_auto_mode_scope() == "always"
+
+    @pytest.mark.asyncio
+    async def test_session_scope_is_not_persisted(self, db_path):
+        """The session tier must NOT rehydrate on a fresh store."""
+        store_a = track_store(PermissionStore(db_path))
+        await store_a.initialize()
+        await store_a.set_global_auto_mode_scope("session")
+        assert store_a.get_global_auto_mode_scope() == "session"
+
+        store_b = track_store(PermissionStore(db_path))
+        await store_b.initialize()
+        assert store_b.get_global_auto_mode_scope() == "off"
+
+    @pytest.mark.asyncio
+    async def test_off_scope_clears_persisted_always(self, db_path):
+        store_a = track_store(PermissionStore(db_path))
+        await store_a.initialize()
+        await store_a.set_global_auto_mode_scope("always")
+        await store_a.set_global_auto_mode_scope("off")
+
+        store_b = track_store(PermissionStore(db_path))
+        await store_b.initialize()
+        assert store_b.get_global_auto_mode_scope() == "off"
+
+    @pytest.mark.asyncio
+    async def test_session_scope_downgrades_persisted_always(self, db_path):
+        """Explicitly choosing 'session' clears a previously persisted 'always'."""
+        store_a = track_store(PermissionStore(db_path))
+        await store_a.initialize()
+        await store_a.set_global_auto_mode_scope("always")
+        await store_a.set_global_auto_mode_scope("session")
+        assert store_a.get_global_auto_mode_scope() == "session"
+
+        store_b = track_store(PermissionStore(db_path))
+        await store_b.initialize()
+        assert store_b.get_global_auto_mode_scope() == "off"
+
+    @pytest.mark.asyncio
+    async def test_set_global_auto_mode_scope_rejects_invalid(self, store):
+        with pytest.raises(ValueError):
+            await store.set_global_auto_mode_scope("forever")
+
+    @pytest.mark.asyncio
     async def test_set_feature_permission(self, store):
         # Register multiple tools
         await store.register_tool("WalletAgent", "get_balance", PermissionLevel.ASK)
