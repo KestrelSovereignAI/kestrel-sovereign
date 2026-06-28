@@ -520,8 +520,19 @@ class ObservabilityStore(UnifiedStoreBase):
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
         limit: int = 100,
+        metadata_equals: Optional[tuple[str, str]] = None,
     ) -> list[ObservabilityEvent]:
-        """Query observability events with filters."""
+        """Query observability events with filters.
+
+        ``metadata_equals`` is a ``(json_key, value)`` pair that matches a
+        top-level string field inside the JSON ``metadata`` column (e.g.
+        ``("metric_name", "assistant_turn_persist_failed")``). It pushes the
+        filter into SQL so ``limit`` applies to the matching rows rather than
+        to every row of the ``event_type``. The predicate uses each backend's
+        native JSON accessor — ``metadata ->> ?`` on PostgreSQL (JSONB),
+        ``json_extract(metadata, ?)`` on SQLite — so it is an exact, portable
+        structural match (not a substring ``LIKE``) on both backends.
+        """
         conditions = []
         params: list[Any] = []
 
@@ -534,6 +545,15 @@ class ObservabilityStore(UnifiedStoreBase):
         if session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
+        if metadata_equals:
+            json_key, json_value = metadata_equals
+            if self.is_postgres:
+                conditions.append("metadata ->> ? = ?")
+                params.append(json_key)
+            else:
+                conditions.append("json_extract(metadata, ?) = ?")
+                params.append(f"$.{json_key}")
+            params.append(json_value)
         if since:
             conditions.append("timestamp >= ?")
             params.append(self.to_timestamp_param(since))
@@ -554,6 +574,90 @@ class ObservabilityStore(UnifiedStoreBase):
             tuple(params),
         )
         return [self._row_to_event(row) for row in rows]
+
+    async def get_metric_summary(
+        self,
+        metric_name: str,
+        agent_name: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        limit: int = 5000,
+        sample_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Summarize a single named metric over a window (#969).
+
+        Metrics are stored as ``event_type='metric'`` rows with the metric name
+        inside the JSON ``metadata`` (there is no dedicated column). Consistent
+        with how this store reads all JSON metadata in Python, we fetch the
+        metric events in the window and aggregate by name in Python — portable
+        across the SQLite and Postgres backends with no backend-specific JSON
+        SQL. Surfaces otherwise-"dark" forensic metrics such as
+        ``assistant_turn_persist_failed``.
+
+        Returns ``metric_name``, ``count``, ``total_value``, ``first_seen``,
+        ``last_seen``, ``by_agent`` counts, recent ``samples`` (each carrying
+        the metric's forensic metadata, e.g. ``error_type``/``session_id``),
+        and ``truncated`` (True if the window held more than ``limit`` metric
+        events, so ``count`` is a lower bound).
+        """
+        # Push the metric-name filter into SQL so ``limit`` bounds THIS metric's
+        # rows, not all metric events. Without this, a rare forensic metric
+        # (e.g. assistant_turn_persist_failed) would be missed entirely when a
+        # high-volume metric (feature_tools_built_streaming) fills the newest
+        # ``limit`` rows. The parsed-metadata check below stays authoritative (#969).
+        events = await self.query_events(
+            agent_name=agent_name,
+            event_type="metric",
+            since=since,
+            until=until,
+            limit=limit + 1,
+            metadata_equals=("metric_name", metric_name),
+        )
+        truncated = len(events) > limit
+        if truncated:
+            events = events[:limit]
+
+        matched = [
+            e for e in events if (e.metadata or {}).get("metric_name") == metric_name
+        ]
+
+        total_value = 0.0
+        for e in matched:
+            try:
+                total_value += float((e.metadata or {}).get("metric_value") or 0)
+            except (TypeError, ValueError):
+                pass
+
+        by_agent: dict[str, int] = {}
+        for e in matched:
+            by_agent[e.agent_name] = by_agent.get(e.agent_name, 0) + 1
+
+        timestamps = [e.timestamp for e in matched if e.timestamp is not None]
+        # query_events returns newest-first, so ``matched`` is already DESC.
+        samples = [
+            {
+                "timestamp": str(e.timestamp),
+                "agent_name": e.agent_name,
+                "value": (e.metadata or {}).get("metric_value"),
+                "metadata": {
+                    k: v
+                    for k, v in (e.metadata or {}).items()
+                    if k not in ("metric_name", "metric_value")
+                },
+            }
+            for e in matched[:sample_limit]
+        ]
+
+        return {
+            "metric_name": metric_name,
+            "count": len(matched),
+            "total_value": total_value,
+            "first_seen": str(min(timestamps)) if timestamps else None,
+            "last_seen": str(max(timestamps)) if timestamps else None,
+            "by_agent": by_agent,
+            "samples": samples,
+            "truncated": truncated,
+        }
 
     async def get_event(self, event_id: str) -> Optional[ObservabilityEvent]:
         """Get a specific event by ID."""

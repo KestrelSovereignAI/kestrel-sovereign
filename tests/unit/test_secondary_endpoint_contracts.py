@@ -138,6 +138,82 @@ def test_file_get_and_observability_summary_contracts():
         _restore_app(app, original)
 
 
+def test_observability_summary_breaks_out_metrics_by_name():
+    # #969: metric events must be visible per-name, not lumped into a single
+    # events_by_type["metric"] count, so dark forensic metrics surface.
+    metric_a = SimpleNamespace(
+        event_type="metric",
+        timestamp=datetime(2026, 3, 17, 14, 0, tzinfo=timezone.utc),
+        metadata={"metric_name": "assistant_turn_persist_failed", "metric_value": 1.0},
+        error_message=None,
+        duration_ms=None,
+    )
+    metric_b = SimpleNamespace(
+        event_type="metric",
+        timestamp=datetime(2026, 3, 17, 14, 1, tzinfo=timezone.utc),
+        metadata={"metric_name": "feature_tools_built_streaming", "metric_value": 7.0},
+        error_message=None,
+        duration_ms=None,
+    )
+    observability_store = MagicMock(
+        query_events=AsyncMock(return_value=[metric_a, metric_a, metric_b])
+    )
+    agent = MagicMock(storage=MagicMock(), observability_store=observability_store)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.get("/api/observability/summary?minutes=30", headers=_api_headers())
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["metrics_by_name"] == {
+            "assistant_turn_persist_failed": 2,
+            "feature_tools_built_streaming": 1,
+        }
+    finally:
+        _restore_app(app, original)
+
+
+def test_metric_summary_endpoint_passes_through_store_summary():
+    # #969: /api/observability/metrics/{name} surfaces a single metric's
+    # count/last_seen/samples for forensic queries.
+    summary = {
+        "metric_name": "assistant_turn_persist_failed",
+        "count": 3,
+        "total_value": 3.0,
+        "first_seen": "2026-03-17 14:00:00+00:00",
+        "last_seen": "2026-03-17 14:05:00+00:00",
+        "by_agent": {"did:test:emma": 2, "did:test:meridian": 1},
+        "samples": [{"timestamp": "t", "agent_name": "did:test:emma",
+                     "value": 1.0, "metadata": {"error_type": "TimeoutError"}}],
+        "truncated": False,
+    }
+    observability_store = MagicMock(get_metric_summary=AsyncMock(return_value=dict(summary)))
+    agent = MagicMock(storage=MagicMock(), observability_store=observability_store)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.get(
+                    "/api/observability/metrics/assistant_turn_persist_failed?minutes=120",
+                    headers=_api_headers(),
+                )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["metric_name"] == "assistant_turn_persist_failed"
+        assert body["count"] == 3
+        assert body["by_agent"] == {"did:test:emma": 2, "did:test:meridian": 1}
+        assert body["time_window_minutes"] == 120
+        # endpoint forwarded the window to the store
+        _, kwargs = observability_store.get_metric_summary.call_args
+        assert kwargs.get("agent_name") is None
+        assert "since" in kwargs
+    finally:
+        _restore_app(app, original)
+
+
 def test_saved_items_listing_filters_and_schema_contracts():
     agent = MagicMock(storage=MagicMock(db=MagicMock(), agent_id="did:agent"), agent_id="did:agent")
     item = MagicMock()
