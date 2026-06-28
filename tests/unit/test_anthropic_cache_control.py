@@ -211,37 +211,82 @@ def test_convert_messages_demotes_unsupported_inline_system(caplog):
     assert "demoting non-leading system" in caplog.text
 
 
-def test_inline_system_validator_rejects_illegal_positions():
+def test_inline_system_repair_demotes_illegal_positions():
+    """#2009: an illegally-positioned inline system message is REPAIRED by
+    demotion to the top-level system prefix, not hard-failed (which wedged
+    every subsequent turn on the route once an orphan was persisted)."""
     adapter = AnthropicAdapter()
 
-    with pytest.raises(ValueError, match="cannot be the first"):
-        adapter._validate_inline_system_messages([
-            {"role": "system", "content": "bad"},
-            {"role": "user", "content": "q"},
-        ])
+    # First message → demote (it's effectively a top-level system).
+    repaired, demoted = adapter._repair_inline_system_messages([
+        {"role": "system", "content": "bad"},
+        {"role": "user", "content": "q"},
+    ])
+    assert repaired == [{"role": "user", "content": "q"}]
+    assert demoted == ["bad"]
 
-    with pytest.raises(ValueError, match="cannot be consecutive"):
-        adapter._validate_inline_system_messages([
-            {"role": "user", "content": "q"},
-            {"role": "system", "content": "one"},
-            {"role": "system", "content": "two"},
-        ])
+    # Consecutive systems → both demoted.
+    repaired, demoted = adapter._repair_inline_system_messages([
+        {"role": "user", "content": "q"},
+        {"role": "system", "content": "one"},
+        {"role": "system", "content": "two"},
+    ])
+    assert repaired == [{"role": "user", "content": "q"}]
+    assert demoted == ["one", "two"]
 
-    with pytest.raises(ValueError, match="must be last"):
-        adapter._validate_inline_system_messages([
-            {"role": "user", "content": "q"},
-            {"role": "system", "content": "operator"},
-            {"role": "user", "content": "bad next"},
-        ])
+    # The poison-pill replay: system followed by a user turn → demote.
+    repaired, demoted = adapter._repair_inline_system_messages([
+        {"role": "user", "content": "q"},
+        {"role": "system", "content": "operator"},
+        {"role": "user", "content": "bad next"},
+    ])
+    assert repaired == [
+        {"role": "user", "content": "q"},
+        {"role": "user", "content": "bad next"},
+    ]
+    assert demoted == ["operator"]
 
-    with pytest.raises(ValueError, match="must immediately follow"):
-        adapter._validate_inline_system_messages([
-            {
-                "role": "assistant",
-                "content": [{"type": "tool_use", "id": "t1"}],
-            },
-            {"role": "system", "content": "bad"},
-        ])
+    # Invalid predecessor (assistant ending in tool_use) → demote.
+    repaired, demoted = adapter._repair_inline_system_messages([
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1"}]},
+        {"role": "system", "content": "bad"},
+    ])
+    assert demoted == ["bad"]
+
+    # Legal position (followed by assistant) is preserved in place.
+    legal = [
+        {"role": "user", "content": "q"},
+        {"role": "system", "content": "operator"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    repaired, demoted = adapter._repair_inline_system_messages(legal)
+    assert repaired == legal
+    assert demoted == []
+
+
+def test_convert_messages_repairs_poison_pill_inline_system():
+    """End-to-end via the converter: a persisted operator-signal system
+    turn that replays as ``[..., system, user]`` must not raise — it is
+    demoted into the top-level system prefix (#2009)."""
+    adapter = AnthropicAdapter()
+    messages = [
+        {"role": "system", "content": "prefix"},
+        {"role": "user", "content": "q1"},
+        {"role": "system", "content": "operator fact"},
+        {"role": "user", "content": "q2"},
+    ]
+
+    converted, system = adapter._convert_messages_to_anthropic(
+        messages,
+        keep_trailing_system=True,
+        model="claude-opus-4-8-20260501",
+    )
+
+    assert converted == [
+        {"role": "user", "content": "q1"},
+        {"role": "user", "content": "q2"},
+    ]
+    assert system == "prefix\n\noperator fact"
 
 
 # ---------------------------------------------------------------------------
