@@ -1,7 +1,7 @@
 """Observability endpoint - query A2A observability events for debugging."""
 from fastapi import APIRouter, Request, Query, HTTPException
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
@@ -120,6 +120,10 @@ async def get_observability_summary(
         tool_call_count = 0
         avg_duration_ms = 0
         durations = []
+        # Break metrics out by name so otherwise-"dark" forensic metrics
+        # (e.g. assistant_turn_persist_failed, #969) are visible at a glance
+        # instead of being lumped into a single events_by_type["metric"] count.
+        metrics_by_name: Dict[str, int] = {}
 
         for e in events:
             type_counts[e.event_type] = type_counts.get(e.event_type, 0) + 1
@@ -133,6 +137,11 @@ async def get_observability_summary(
                         "error_message": e.error_message,
                     })
 
+            if e.event_type == "metric" and e.metadata:
+                name = e.metadata.get("metric_name")
+                if name:
+                    metrics_by_name[name] = metrics_by_name.get(name, 0) + 1
+
             if e.event_type == "tool_response" and e.duration_ms:
                 durations.append(e.duration_ms)
 
@@ -143,6 +152,7 @@ async def get_observability_summary(
             "time_window_minutes": minutes,
             "total_events": len(events),
             "events_by_type": type_counts,
+            "metrics_by_name": metrics_by_name,
             "error_count": error_count,
             "recent_errors": errors,
             "tool_responses_count": len(durations),
@@ -151,3 +161,41 @@ async def get_observability_summary(
     except Exception as e:
         logger.error(f"Error getting observability summary: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to get observability summary")
+
+
+@router.get("/api/observability/metrics/{metric_name}")
+async def get_metric_summary(
+    request: Request,
+    metric_name: str,
+    minutes: int = Query(1440, ge=1, le=43200, description="Time window in minutes (default 24h)"),
+    agent_name: Optional[str] = Query(None, description="Filter to a single agent"),
+) -> Dict[str, Any]:
+    """Summarize a single named metric over a recent window.
+
+    Surfaces otherwise-"dark" forensic metrics — notably
+    ``assistant_turn_persist_failed`` (#969), emitted when the cancellation-safe
+    assistant-turn persist falls back to the error path — with count, last_seen,
+    per-agent breakdown, and recent samples carrying the metric's metadata
+    (e.g. ``error_type``/``session_id``). Generic: works for any metric name.
+    """
+    try:
+        agent = get_agent(request)
+    except HTTPException:
+        raise
+
+    obs_store = getattr(agent, 'observability_store', None)
+    if not obs_store:
+        raise HTTPException(status_code=503, detail="Observability store not available")
+
+    try:
+        since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        summary = await obs_store.get_metric_summary(
+            metric_name,
+            agent_name=agent_name,
+            since=since,
+        )
+        summary["time_window_minutes"] = minutes
+        return summary
+    except Exception as e:
+        logger.error(f"Error getting metric summary for {metric_name}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get metric summary")
