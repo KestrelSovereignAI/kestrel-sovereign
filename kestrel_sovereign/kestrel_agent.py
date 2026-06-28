@@ -3147,28 +3147,36 @@ Expected Duration: {expected_duration}
             messages.append(
                 {"role": operator_batch.role, "content": operator_batch.content}
             )
-            try:
-                await self.privacy_agent.add_conversation(
-                    operator_batch.role,
-                    operator_batch.content,
-                    metadata={
-                        "sent_form": True,
-                        "operator_signal": True,
-                        "operator_signal_sources": [
-                            event.source for event in operator_batch.events
-                        ],
-                        "operator_signal_fallback": operator_batch.fallback,
-                    },
-                    session_id=session_id,
-                    rendered_content=operator_batch.content,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logging.warning(
-                    "Failed to persist operator signal turn; continuing "
-                    "with in-flight delivery only: %s",
-                    exc,
-                    exc_info=True,
-                )
+            # Inline (``system``-role) operator signals are ephemeral
+            # per-turn context, NOT durable conversation. Persisting one as
+            # a standalone ``system`` history turn creates the #2009
+            # poison-pill (replays as ``[..., system, user]`` next turn,
+            # which the Anthropic adapter rejects). Deliver it in-flight
+            # only; the ``user``-role fallback notice IS durable, so it is
+            # still persisted. Mirrors agent/streaming.py.
+            if operator_batch.role != "system":
+                try:
+                    await self.privacy_agent.add_conversation(
+                        operator_batch.role,
+                        operator_batch.content,
+                        metadata={
+                            "sent_form": True,
+                            "operator_signal": True,
+                            "operator_signal_sources": [
+                                event.source for event in operator_batch.events
+                            ],
+                            "operator_signal_fallback": operator_batch.fallback,
+                        },
+                        session_id=session_id,
+                        rendered_content=operator_batch.content,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning(
+                        "Failed to persist operator signal turn; continuing "
+                        "with in-flight delivery only: %s",
+                        exc,
+                        exc_info=True,
+                    )
 
         logging.debug(f"[CONTEXT] Sending {len(messages)} messages to LLM (1 system + {len(context_result.messages)} history + 1 user)")
 

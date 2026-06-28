@@ -547,7 +547,17 @@ class AnthropicAdapter(LLMAdapter):
         flush_tool_results()
 
         if preserve_inline_system:
-            self._validate_inline_system_messages(filtered_messages)
+            filtered_messages, repaired_system = (
+                self._repair_inline_system_messages(filtered_messages)
+            )
+            if repaired_system:
+                logger.info(
+                    "Anthropic inline system message(s) in an illegal "
+                    "position; demoting %d block(s) to the top-level system "
+                    "prefix to avoid wedging the route (#2009).",
+                    len(repaired_system),
+                )
+                system_messages.extend(repaired_system)
         elif keep_trailing_system and demoted_inline_system:
             logger.info(
                 "Anthropic inline system requested but unsupported for model "
@@ -607,46 +617,65 @@ class AnthropicAdapter(LLMAdapter):
             converted_msg["content"] = ""
         return converted_msg
 
-    def _validate_inline_system_messages(
+    def _inline_system_position_ok(
         self,
         messages: List[Dict[str, Any]],
-    ) -> None:
+        index: int,
+    ) -> bool:
+        """Whether the inline (mid-conversation) ``system`` message at
+        ``index`` sits in an Anthropic-legal position: not first, not
+        adjacent to another system turn, following a valid predecessor,
+        and either last or immediately followed by an ``assistant`` turn."""
+        if index == 0:
+            return False
+        previous = messages[index - 1]
+        if previous.get("role") == "system":
+            return False
+        if not self._inline_system_can_follow(previous):
+            return False
+        if index + 1 < len(messages):
+            nxt = messages[index + 1].get("role")
+            if nxt == "system" or nxt != "assistant":
+                return False
+        return True
+
+    def _repair_inline_system_messages(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        """Repair, rather than hard-fail, an illegally-positioned inline
+        ``system`` message.
+
+        Anthropic requires a mid-conversation ``system`` block to be last
+        or immediately followed by an ``assistant`` turn (and to follow a
+        valid predecessor). When a producer wedges one into an invalid
+        slot — most visibly the operator-signal poison-pill, where a
+        persisted standalone ``system`` turn replays as
+        ``[..., system, user]`` on the next turn (#2009) — hard-failing
+        breaks every subsequent turn on the route until the orphan is
+        purged. Instead, demote the offending block to the top-level
+        ``system`` param: the content is still delivered, only its
+        position changes. Legal inline blocks are preserved in place so
+        the cache-position benefit is retained.
+
+        Returns ``(repaired_messages, demoted_system_texts)`` — the caller
+        appends the demoted texts to the top-level system prefix. Validity
+        is evaluated against the input arrangement; because demotion only
+        ever removes ``system`` turns (never an ``assistant`` successor or
+        a non-system predecessor a surviving block depended on), the kept
+        inline blocks remain legal after repair.
+        """
+        repaired: List[Dict[str, Any]] = []
+        demoted: List[str] = []
         for index, msg in enumerate(messages):
-            if msg.get("role") != "system":
+            if (
+                msg.get("role") == "system"
+                and not self._inline_system_position_ok(messages, index)
+            ):
+                demoted.append(_message_content_to_text(msg.get("content", "")))
                 continue
-            if index == 0:
-                raise ValueError(
-                    "Anthropic inline system messages cannot be the first "
-                    "message; use the top-level system parameter."
-                )
-            previous = messages[index - 1]
-            if previous.get("role") == "system":
-                raise ValueError(
-                    "Anthropic inline system messages cannot be consecutive; "
-                    "merge adjacent system turns before sending."
-                )
-            if not self._inline_system_can_follow(previous):
-                raise ValueError(
-                    "Anthropic inline system messages must immediately follow "
-                    "a user turn, a user tool_result turn, or an assistant "
-                    "turn ending in server tool use."
-                )
-            if (
-                index + 1 < len(messages)
-                and messages[index + 1].get("role") == "system"
-            ):
-                raise ValueError(
-                    "Anthropic inline system messages cannot be consecutive; "
-                    "merge adjacent system turns before sending."
-                )
-            if (
-                index + 1 < len(messages)
-                and messages[index + 1].get("role") != "assistant"
-            ):
-                raise ValueError(
-                    "Anthropic inline system messages must be last or "
-                    "immediately followed by an assistant turn."
-                )
+            repaired.append(msg)
+        return repaired, demoted
 
     @staticmethod
     def _inline_system_can_follow(message: Dict[str, Any]) -> bool:
