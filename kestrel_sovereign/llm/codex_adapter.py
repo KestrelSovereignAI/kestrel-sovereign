@@ -122,6 +122,70 @@ def _extract_instructions_and_input(messages):
 _KESTREL_TOOL_NAMESPACE = "kestrel"
 
 
+# The codex app-server RESERVES the ``mcp__`` tool-name prefix for its own
+# MCP integration. ``namespace="kestrel"`` (above) dodges built-in
+# *namespace* collisions, but codex *also* validates the dynamicTool
+# ``name`` string itself against a reserved-prefix set — advertising a
+# tool whose name starts with ``mcp__`` is rejected with JSON-RPC
+# ``-32600`` ("dynamic tool name is reserved") on the next turn. Since
+# kestrel-feature-mcp mounts tools as ``mcp__<server>__<tool>`` (correct
+# for Anthropic/Claude), MCP + ``openai:plan`` are mutually broken the
+# moment any server's tools mount (#2008).
+#
+# Fix: in the codex bridge *only*, alias any reserved-prefix tool name to
+# a safe one on the way out, and restore the real name before dispatch.
+# The MCP feature's standard ``mcp__`` naming is left untouched. Add
+# ``(reserved_prefix, alias_prefix)`` pairs here if codex reserves more.
+_CODEX_RESERVED_TOOL_PREFIX_ALIASES = (("mcp__", "mcptool__"),)
+
+
+def _codex_safe_tool_name(name: str) -> str:
+    """Alias a tool name out of any codex-reserved prefix, else return it
+    unchanged."""
+    for reserved, alias in _CODEX_RESERVED_TOOL_PREFIX_ALIASES:
+        if name.startswith(reserved):
+            return alias + name[len(reserved):]
+    return name
+
+
+def _codex_tool_name_aliases(tools) -> Dict[str, str]:
+    """Build an INJECTIVE ``{alias_name: original_name}`` map for every tool
+    whose name uses a codex-reserved prefix.
+
+    Only genuinely-aliased tools appear in the map, so the reverse lookup
+    in the dispatch handler is unambiguous. The map is also guaranteed
+    collision-free: if a chosen alias would clash with a real (non-aliased)
+    tool already advertised under that name — e.g. an MCP tool
+    ``mcp__srv__echo`` aliasing onto an existing feature tool literally
+    named ``mcptool__srv__echo`` — a numeric suffix is appended until the
+    alias is unique. Without this, both tools would advertise under one
+    name and every call would mis-dispatch to the MCP tool, shadowing the
+    real one (codex review P2). Deterministic for a given tool order, so
+    independent callers (the converter and the handler-map builder)
+    produce identical maps.
+    """
+    names = [
+        tool["function"]["name"]
+        for tool in tools or []
+        if tool.get("type") == "function"
+    ]
+    # Non-aliased tool names occupy the advertised namespace as-is; an
+    # alias must never collide with one of them, nor with another alias.
+    taken = {n for n in names if _codex_safe_tool_name(n) == n}
+    aliases: Dict[str, str] = {}
+    for name in names:
+        safe = _codex_safe_tool_name(name)
+        if safe == name:
+            continue
+        candidate, suffix = safe, 1
+        while candidate in taken:
+            candidate = f"{safe}__{suffix}"
+            suffix += 1
+        aliases[candidate] = name
+        taken.add(candidate)
+    return aliases
+
+
 def _convert_tools_to_codex_dynamic_tools(tools):
     """Convert OpenAI function-tool defs to the app-server's
     ``CodexDynamicToolSpec`` shape: ``{name, description, inputSchema,
@@ -140,12 +204,19 @@ def _convert_tools_to_codex_dynamic_tools(tools):
     """
     if not tools:
         return None
+    # Use the injective alias map so a reserved-prefix tool is advertised
+    # under the SAME collision-free name the dispatch handler will reverse
+    # (see _codex_tool_name_aliases). The map is keyed alias→original;
+    # invert it to rename originals on the way out.
+    original_to_alias = {
+        orig: alias for alias, orig in _codex_tool_name_aliases(tools).items()
+    }
     out = []
     for tool in tools:
         if tool.get("type") == "function":
             func = tool["function"]
             out.append({
-                "name": func["name"],
+                "name": original_to_alias.get(func["name"], func["name"]),
                 "description": func.get("description", ""),
                 "inputSchema": func.get("parameters", {"type": "object"}),
                 "namespace": _KESTREL_TOOL_NAMESPACE,
@@ -1517,6 +1588,7 @@ class CodexAdapter(LLMAdapter):
         self, executor: ToolExecutor, thread_id: str,
         allowed_tools: frozenset,
         executed_log: Optional[List[Dict[str, Any]]] = None,
+        tool_aliases: Optional[Dict[str, str]] = None,
     ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
         """Wrap ``executor`` into an app-server ``item/tool/call``
         handler scoped to this turn's thread.
@@ -1532,6 +1604,13 @@ class CodexAdapter(LLMAdapter):
           resolve through the orchestrator's full registry, bypassing
           per-turn restrictions (denied-tool stripping, capability
           gating).
+
+        ``tool_aliases`` (optional): ``{advertised_name: real_name}`` for
+        tools whose real name was aliased out of a codex-reserved prefix
+        (``mcp__`` → ``mcptool__``, #2008). codex calls the alias; we
+        restore the real name *after* the allow-set check (which is keyed
+        on advertised names) and dispatch + log under the real name so
+        ``execute_named_tool`` resolves the actual MCP tool.
 
         ``executed_log`` (optional): each successful execution appends
         ``{id, name, arguments, result}`` so callers can surface the
@@ -1564,6 +1643,13 @@ class CodexAdapter(LLMAdapter):
                     }],
                     "success": False,
                 }
+            # codex advertised (and therefore calls) the alias for any
+            # reserved-prefix tool; restore the real name now — after the
+            # allow-set check, which is keyed on advertised names — so
+            # dispatch, breadcrumbs, and failure messages all use the
+            # tool's true ``mcp__...`` name (#2008).
+            if tool_aliases:
+                name = tool_aliases.get(name, name)
             args = params.get("arguments") or {}
             if isinstance(args, str):
                 try:
@@ -2207,6 +2293,10 @@ class CodexAdapter(LLMAdapter):
         # to run them — fail loud rather than silently decline + corrupt
         # the loop.
         dyn = _convert_tools_to_codex_dynamic_tools(tools)
+        # {advertised_alias: real_name} for any tool aliased out of a
+        # codex-reserved prefix (#2008). Empty unless an MCP tool is in
+        # the set. Reversed in the item/tool/call dispatch handler.
+        tool_aliases = _codex_tool_name_aliases(tools)
         if dyn and tool_executor is None:
             # The app-server runs tools inline mid-turn via item/tool/call;
             # without a kestrel-side executor wired through the orchestrator
@@ -2290,6 +2380,7 @@ class CodexAdapter(LLMAdapter):
                 "item/tool/call",
                 self._make_tool_call_handler(
                     tool_executor, thread_id, allowed_tools, executed_log,
+                    tool_aliases,
                 ),
                 thread_id=thread_id,
             ))

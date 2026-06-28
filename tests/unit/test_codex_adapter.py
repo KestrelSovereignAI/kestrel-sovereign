@@ -20,6 +20,8 @@ from kestrel_sovereign.llm.codex_adapter import (
     CodexAdapter,
     _build_turn_input,
     _content_to_codex_input_parts,
+    _codex_safe_tool_name,
+    _codex_tool_name_aliases,
     _convert_tools_to_codex_dynamic_tools,
     _extract_instructions_and_input,
     _result_to_codex_response,
@@ -183,6 +185,50 @@ class TestDynamicToolsSpec:
     def test_none_and_empty(self):
         assert _convert_tools_to_codex_dynamic_tools(None) is None
         assert _convert_tools_to_codex_dynamic_tools([]) is None
+
+    def test_mcp_reserved_prefix_is_aliased(self):
+        """#2008: codex reserves the ``mcp__`` tool-name prefix and rejects
+        the whole turn with -32600 if an ``mcp__`` dynamicTool is
+        advertised. The bridge must alias it to a non-reserved name."""
+        result = _convert_tools_to_codex_dynamic_tools([{
+            "type": "function",
+            "function": {
+                "name": "mcp__mcp-kestrel-test-server__echo",
+                "description": "echo",
+                "parameters": {"type": "object"},
+            },
+        }])
+        assert result[0]["name"] == "mcptool__mcp-kestrel-test-server__echo"
+        # Non-reserved names are left untouched.
+        assert _codex_safe_tool_name("get_weather") == "get_weather"
+
+    def test_alias_map_only_holds_reserved_tools(self):
+        aliases = _codex_tool_name_aliases([
+            {"type": "function", "function": {
+                "name": "mcp__srv__echo", "parameters": {}}},
+            {"type": "function", "function": {
+                "name": "get_weather", "parameters": {}}},
+        ])
+        assert aliases == {"mcptool__srv__echo": "mcp__srv__echo"}
+
+    def test_alias_avoids_collision_with_real_tool(self):
+        """codex P2: if a real (non-aliased) tool already occupies the
+        alias name, the alias must be bumped so it stays injective — the
+        real tool keeps its name and the MCP tool gets a distinct alias."""
+        tools = [
+            {"type": "function", "function": {
+                "name": "mcptool__srv__echo", "parameters": {}}},  # real tool
+            {"type": "function", "function": {
+                "name": "mcp__srv__echo", "parameters": {}}},       # MCP tool
+        ]
+        aliases = _codex_tool_name_aliases(tools)
+        # MCP tool aliased to a NON-colliding name.
+        assert aliases == {"mcptool__srv__echo__1": "mcp__srv__echo"}
+        # Advertised names are unique and the real tool is untouched.
+        advertised = [t["name"] for t in
+                      _convert_tools_to_codex_dynamic_tools(tools)]
+        assert advertised == ["mcptool__srv__echo", "mcptool__srv__echo__1"]
+        assert len(advertised) == len(set(advertised))
 
     def test_namespace_attached_to_every_tool(self):
         """Codex's ``codex_core`` registers dynamicTools in a process-
@@ -1239,6 +1285,33 @@ class TestToolExecutorBridge:
             "contentItems": [{"type": "inputText", "text": "salamander"}],
             "success": True,
         }
+
+    @pytest.mark.asyncio
+    async def test_handler_restores_aliased_mcp_tool_name(self):
+        """#2008: codex calls the advertised alias (``mcptool__...``); the
+        handler must check the allow-set on the alias, then dispatch +
+        log under the real ``mcp__...`` name so ``execute_named_tool``
+        resolves the actual MCP tool."""
+        a = CodexAdapter()
+        seen = []
+        log: list = []
+
+        async def exe(name, args):
+            seen.append((name, args))
+            return {"success": True, "result": "pong"}
+
+        handler = a._make_tool_call_handler(
+            exe, "thr-1", frozenset({"mcptool__srv__echo"}), log,
+            {"mcptool__srv__echo": "mcp__srv__echo"},
+        )
+        reply = await handler({
+            "threadId": "thr-1", "tool": "mcptool__srv__echo",
+            "arguments": '{"msg":"hi"}', "callId": "c1",
+        })
+        assert reply["success"] is True
+        # Dispatched under the REAL name, not the alias.
+        assert seen == [("mcp__srv__echo", {"msg": "hi"})]
+        assert log[0]["name"] == "mcp__srv__echo"
 
     @pytest.mark.asyncio
     async def test_handler_rejects_call_for_other_thread(self):
