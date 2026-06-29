@@ -236,6 +236,50 @@ async def test_skips_duplicate_uuid_markers_each_with_own_content(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_skips_two_marker_collision_uuid_then_integer(tmp_path):
+    """The live-Emma 4152cc73 shape: marker A mints the UUID and owns turns
+    filed UNDER the UUID; minutes later marker B inherits the same UUID and
+    owns turns filed under B's integer row-id. Two distinct conversations
+    share the UUID — the migration must NOT merge B's turns into A."""
+    db = await _db(tmp_path)
+    uuid = "ababcdcd-0000-0000-0000-00000000000e"
+    marker_a = await _insert(db, "system", "", {"new_session": True, "session_id": uuid})
+    a1 = await _insert(db, "user", "convA-1", {"session_id": uuid})
+    a2 = await _insert(db, "assistant", "convA-2", {"session_id": uuid})
+    marker_b = await _insert(db, "system", "", {"new_session": True, "session_id": uuid})
+    b1 = await _insert(db, "user", "convB-1", {"session_id": str(marker_b)})
+
+    await migrate_canonical_session_ids(db)
+
+    sids = await _session_ids(db)
+    # Conversation A keeps its UUID rows; conversation B stays under its
+    # integer key — NOT merged.
+    assert sids[a1] == uuid and sids[a2] == uuid
+    assert sids[b1] == str(marker_b)
+
+
+@pytest.mark.asyncio
+async def test_consolidates_single_marker_mixed_key_session(tmp_path):
+    """codex: a SINGLE-marker session whose turns are split between the
+    canonical UUID and the marker's integer row-id is ONE conversation (one
+    client wrote the UUID, the UI wrote the integer). It must consolidate —
+    the integer-keyed rows relink to the UUID."""
+    db = await _db(tmp_path)
+    uuid = "cccccccc-0000-0000-0000-00000000000d"
+    marker = await _insert(db, "system", "", {"new_session": True, "session_id": uuid})
+    # Some turns already carry the canonical UUID (after the marker)...
+    uuid_turn = await _insert(db, "user", "via-uuid", {"session_id": uuid})
+    # ...others were mis-filed under the marker's integer row-id.
+    int_turn = await _insert(db, "assistant", "via-int", {"session_id": str(marker)})
+
+    await migrate_canonical_session_ids(db)
+
+    sids = await _session_ids(db)
+    assert sids[uuid_turn] == uuid
+    assert sids[int_turn] == uuid  # relinked, not left split
+
+
+@pytest.mark.asyncio
 async def test_init_schema_runs_migration_on_startup(tmp_path):
     raw = SQLiteBackend(str(tmp_path / "startup-canonical.db"))
     await raw.connect()

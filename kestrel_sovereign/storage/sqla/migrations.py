@@ -849,13 +849,9 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
         (),
     )
 
-    # Markers (new_session rows) grouped by their UUID, and the distinct
-    # content-CLUSTER keys observed for each UUID. A "cluster key" is the key
-    # under which a non-marker (content) row is filed: its UUID directly, or
-    # the integer row-id of the marker it continues. The inheritance bug can
-    # put the SAME UUID on several markers, each anchoring a DISTINCT
-    # conversation whose turns are still keyed by that marker's integer id —
-    # so we count clusters, not just rows already carrying the UUID.
+    # Markers (new_session rows) grouped by UUID. The inheritance bug can put
+    # the SAME UUID on several markers, each anchoring a DISTINCT conversation
+    # whose turns are still keyed by that marker's integer row-id.
     markers_by_uuid: dict[str, list[int]] = {}
     marker_uuid_of_rowid: dict[int, str] = {}
     for row_id, raw in history_rows:
@@ -867,31 +863,61 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
             markers_by_uuid.setdefault(sid_str, []).append(row_id)
             marker_uuid_of_rowid[row_id] = sid_str
 
-    content_clusters_by_uuid: dict[str, set] = {}
+    # Attribute every CONTENT (non-marker) row to the conversation it belongs
+    # to, then count how many distinct conversations share each UUID. A UUID
+    # is safe to consolidate iff it covers a SINGLE conversation.
+    #
+    # Attribution:
+    #  - integer-keyed content (``session_id`` == a marker's row-id) belongs to
+    #    THAT marker;
+    #  - UUID-keyed content belongs to the most recent ``new_session`` marker
+    #    carrying that UUID and preceding it (by id). UUID-keyed content with
+    #    NO preceding marker is an ``orphan`` — a prior implicit conversation
+    #    that owned the UUID before any marker inherited it.
+    markers_with_content: set[int] = set()
+    orphan_uuid: set[str] = set()
+
+    # Integer-keyed content → its marker.
     for row_id, raw in history_rows:
         meta, sid = _extract_session_id(raw)
         if meta is None or sid is None or meta.get("new_session"):
-            continue  # markers are anchors, not content
+            continue
         sid_str = str(sid)
-        if not sid_str.isdigit():
-            # Content already carrying a UUID → that UUID's own cluster.
-            if sid_str in markers_by_uuid:
-                content_clusters_by_uuid.setdefault(sid_str, set()).add(("uuid", sid_str))
-        else:
-            # Integer-keyed content continues the marker at that row-id;
-            # attribute it to that marker's UUID as a distinct cluster.
-            uuid = marker_uuid_of_rowid.get(int(sid_str))
-            if uuid is not None:
-                content_clusters_by_uuid.setdefault(uuid, set()).add(("int", sid_str))
+        if sid_str.isdigit():
+            mid = int(sid_str)
+            if mid in marker_uuid_of_rowid:
+                markers_with_content.add(mid)
 
-    # A UUID is safe to consolidate iff it has AT MOST ONE content cluster —
-    # then every marker sharing it anchors the same single conversation. With
-    # ≥2 clusters, distinct conversations collided on the UUID via the
-    # inheritance bug and must NOT be merged.
+    # UUID-keyed rows (markers + content), walked per UUID in id order so each
+    # content row is charged to its most recent preceding marker.
+    rows_by_uuid: dict[str, list[tuple]] = {}
+    for row_id, raw in history_rows:
+        meta, sid = _extract_session_id(raw)
+        if meta is None or sid is None:
+            continue
+        sid_str = str(sid)
+        if sid_str.isdigit() or sid_str not in markers_by_uuid:
+            continue
+        rows_by_uuid.setdefault(sid_str, []).append((row_id, bool(meta.get("new_session"))))
+    for uuid, items in rows_by_uuid.items():
+        items.sort()
+        current_marker = None
+        for rid, is_marker in items:
+            if is_marker:
+                current_marker = rid
+            elif current_marker is None:
+                orphan_uuid.add(uuid)
+            else:
+                markers_with_content.add(current_marker)
+
+    # Consolidate a UUID only when it covers exactly one conversation.
     marker_uuid_by_rowid: dict[str, str] = {}
     skipped_inherited = 0
     for uuid, marker_ids in markers_by_uuid.items():
-        if len(content_clusters_by_uuid.get(uuid, ())) <= 1:
+        conversations = sum(1 for m in marker_ids if m in markers_with_content)
+        if uuid in orphan_uuid:
+            conversations += 1
+        if conversations <= 1:
             for marker_row_id in marker_ids:
                 marker_uuid_by_rowid[str(marker_row_id)] = uuid
         else:
