@@ -84,9 +84,14 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
         if not rows:
             return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
 
-        def _new_session(msg_id, timestamp):
+        def _new_session(msg_id, timestamp, session_uuid=None):
+            # Canonical identity (#2012): expose the session's own
+            # metadata.session_id (a UUID minted by the store) so the value the
+            # UI round-trips on the next turn matches where messages are filed.
+            # Fall back to the message row-id only for genuinely legacy clusters
+            # that carry no session_id anywhere in their metadata.
             return {
-                "session_id": str(msg_id),
+                "session_id": str(session_uuid) if session_uuid else str(msg_id),
                 "started_at": timestamp.isoformat(),
                 "last_message_at": timestamp.isoformat(),
                 "message_count": 0,
@@ -156,18 +161,27 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
                 logger.warning(f"Failed to parse timestamp for message {msg_id}: {e}")
                 timestamp = datetime.now()
 
-            # Check for explicit new_session marker in metadata
+            # Check for explicit new_session marker + the session's UUID
+            # identity, both carried in metadata.
             is_new_session_marker = False
+            meta_session_id = None
             if metadata_json:
                 try:
                     meta = json.loads(metadata_json)
                     if meta.get('new_session'):
                         is_new_session_marker = True
+                    sid = meta.get('session_id')
+                    # Only treat non-integer values as a canonical UUID. A
+                    # bare-integer session_id is a mis-filed legacy key (the
+                    # bug being fixed) and the row-id fallback is more stable
+                    # for grouping; the one-time migration rewrites those.
+                    if sid and not str(sid).isdigit():
+                        meta_session_id = sid
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse metadata for message {msg_id}: {e}")
 
             if current_session is None:
-                current_session = _new_session(msg_id, timestamp)
+                current_session = _new_session(msg_id, timestamp, meta_session_id)
 
             last_ts = datetime.fromisoformat(current_session["last_message_at"])
             gap_minutes = (timestamp - last_ts).total_seconds() / 60
@@ -176,7 +190,7 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
             if gap_minutes > SESSION_GAP_MINUTES or is_new_session_marker:
                 if current_session["message_count"] > 0:
                     sessions.append(current_session)
-                current_session = _new_session(msg_id, timestamp)
+                current_session = _new_session(msg_id, timestamp, meta_session_id)
                 # Skip counting the session marker itself
                 if is_new_session_marker:
                     continue
@@ -233,19 +247,17 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
         # Check if encryption is enabled via the wrapper's safe accessor
         encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
 
-        # Use privacy-aware query methods instead of direct storage.db access
-        start_row = await storage.query_conversation_start(session_id, agent_id)
+        # Resolve the session's messages via the store's canonical dual-scheme
+        # resolver (time-gap clustering AND explicit metadata.session_id / UUID
+        # membership). The previous time-gap-only walk here would stop at the
+        # first new_session marker and miss continued turns that were filed
+        # under a different key — the empty-pane-after-refresh bug (#2012).
+        rows = await storage.query_session_rows(session_id, limit=limit)
 
-        if not start_row:
+        if not rows:
             raise HTTPException(status_code=404, detail="Session not found.")
 
-        start_time = start_row[0]
-
-        rows = await storage.query_conversation_messages(agent_id, start_time, limit=limit * 2)
-
         messages = []
-        last_timestamp = None
-        is_first_message = True
 
         for row in rows:
             msg_id, role, content, metadata_json, created_at = row[0], row[1], row[2], row[3], row[4]
@@ -271,22 +283,12 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
                 logger.warning(f"Failed to parse timestamp for message {msg_id} in get_conversation: {e}")
                 timestamp = datetime.now()
 
-            # Check for new_session marker (but include first message even if it's a marker)
             meta = None
             if metadata_json:
                 try:
                     meta = json.loads(metadata_json)
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse metadata for message {msg_id}: {e}")
-
-            # Stop at new_session marker (unless it's the first message which starts the session)
-            if not is_first_message and meta and meta.get('new_session'):
-                break
-
-            if last_timestamp:
-                gap_minutes = (timestamp - last_timestamp).total_seconds() / 60
-                if gap_minutes > SESSION_GAP_MINUTES:
-                    break
 
             display_content = content
             is_encrypted = False
@@ -305,10 +307,9 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
                             decryption_failed = True
                             # Keep encrypted content, mark as still encrypted
 
-            # Skip session markers from message list (they're just metadata)
+            # Skip session markers from message list (they're just metadata).
+            # The resolver already strips these; this is a defensive backstop.
             if meta and meta.get('type') == 'session_marker':
-                last_timestamp = timestamp
-                is_first_message = False
                 continue
 
             # Unwrap user-turn sent-form so the chat UI shows raw user text,
@@ -335,9 +336,6 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
                 message["model"] = model
                 message["provider"] = provider
             messages.append(message)
-
-            last_timestamp = timestamp
-            is_first_message = False
 
             if len(messages) >= limit:
                 break

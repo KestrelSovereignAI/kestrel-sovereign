@@ -754,6 +754,57 @@ class PrivacyEnforcingStorage:
             LIMIT ?
         """, (agent_id, start_time, limit))
 
+    async def query_session_rows(
+        self, session_id: str, limit: int = 100
+    ) -> List[Tuple]:
+        """Resolve every message belonging to ``session_id``, respecting privacy.
+
+        Unlike :meth:`query_conversation_messages` (which only time-gap walks
+        forward from a row-id anchor), this delegates to the store's canonical
+        dual-scheme resolver ``_get_session_messages`` — so it links messages
+        both by time-gap clustering AND by explicit ``metadata.session_id``
+        (UUID) membership. This is what lets a conversation whose continued
+        turns were mis-filed under a different key still load completely on a
+        hard refresh (#2012).
+
+        Returns rows as tuples in the same shape the conversation endpoints
+        expect: ``(id, role, content, metadata, created_at, model, provider)``,
+        in chronological (ASC) order. The store resolver yields an 8-tuple with
+        ``rendered_content`` at index 5; we drop it so positional model/provider
+        accesses in the endpoint stay at indices 5/6.
+        """
+        if self._privacy_config.is_ephemeral():
+            return []
+
+        if self._policy.use_session_storage:
+            # Isolated/temp storage has no persistent UUID sessions; the whole
+            # in-memory list is the session.
+            rows = []
+            for i, conv in enumerate(self._session_conversations):
+                rows.append((
+                    i,
+                    conv.get("role", ""),
+                    conv.get("content", ""),
+                    json.dumps(conv.get("metadata", {})) if conv.get("metadata") else None,
+                    conv.get("created_at", None),
+                    conv.get("model"),
+                    conv.get("provider"),
+                ))
+            return rows[:limit]
+
+        raw_rows = await self._storage._get_session_messages(session_id, limit)
+        # _get_session_messages returns rows DESC; the endpoint walks ASC.
+        normalized = []
+        for row in reversed(raw_rows):
+            # (id, role, content, metadata, created_at, rendered_content,
+            #  model, provider) -> drop rendered_content at index 5.
+            normalized.append((
+                row[0], row[1], row[2], row[3], row[4],
+                row[6] if len(row) > 6 else None,
+                row[7] if len(row) > 7 else None,
+            ))
+        return normalized
+
     async def query_last_conversation_row(
         self, agent_id: str
     ) -> Optional[Tuple]:

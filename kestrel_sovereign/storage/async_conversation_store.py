@@ -477,6 +477,57 @@ class AsyncConversationStore:
         import uuid
         return str(uuid.uuid4())
 
+    async def _canonicalize_session_id(
+        self, session_id: Optional[str]
+    ) -> Optional[str]:
+        """Normalize an incoming session_id to its canonical UUID (#2012).
+
+        The conversation-list endpoint historically keyed each session by the
+        row-id of its first message, so the UI would round-trip a bare integer
+        (e.g. ``"1314"``) as the session_id on the next turn. Stamping that
+        integer onto continued messages splits one conversation across two keys
+        (the integer here vs. the UUID on the session's own ``new_session``
+        marker) — the messages-gone-on-refresh bug.
+
+        If ``session_id`` is integer-shaped AND names a ``new_session`` marker
+        row whose metadata carries a UUID ``session_id``, return that UUID so
+        the continued turn is filed under the canonical key. A genuinely legacy
+        time-gap session (row-id anchor with no marker UUID) is returned
+        unchanged. Non-integer ids (already UUIDs) and ``None`` pass through.
+        """
+        if not session_id or not str(session_id).isdigit():
+            return session_id
+
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is None:
+            return session_id
+
+        try:
+            row = await self.db.fetchone(
+                "SELECT metadata FROM conversation_history "
+                "WHERE id = ? AND agent_id = ?",
+                (row_id, self.agent_id),
+            )
+        except Exception as e:
+            logger.warning(f"Session canonicalization lookup failed: {e}")
+            return session_id
+
+        if not row or not row[0]:
+            return session_id
+        try:
+            meta = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return session_id
+
+        marker_uuid = meta.get("session_id")
+        if meta.get("new_session") and marker_uuid and not str(marker_uuid).isdigit():
+            logger.info(
+                "Canonicalized integer session_id %s -> marker UUID %s",
+                session_id, marker_uuid,
+            )
+            return marker_uuid
+        return session_id
+
     async def get_message_embeddings(
         self,
         message_ids: List[int],
@@ -630,7 +681,7 @@ class AsyncConversationStore:
         derived inside ``add_conversation`` is invisible to the caller.
         """
         if provided:
-            return provided
+            return await self._canonicalize_session_id(provided)
         return await self._derive_implicit_session_id()
 
     async def add_conversation(self, role: str, content: str,
@@ -662,7 +713,12 @@ class AsyncConversationStore:
         """
         meta = dict(metadata) if metadata else {}
 
-        # Resolve session_id: explicit wins; otherwise derive from time gap
+        # Resolve session_id: explicit wins; otherwise derive from time gap.
+        # Canonicalize an explicit id first so a row-id echoed back by an older
+        # UI client is re-linked to its session's UUID rather than splitting the
+        # conversation across two keys (#2012).
+        if session_id:
+            session_id = await self._canonicalize_session_id(session_id)
         if not session_id:
             session_id = await self._derive_implicit_session_id()
 

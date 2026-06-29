@@ -154,6 +154,63 @@ def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview():
         _restore_app(app, original)
 
 
+def test_conversations_endpoint_exposes_marker_uuid_as_session_id():
+    """#2012: the list identifier must be the session's canonical UUID
+    (metadata.session_id on the new_session marker), NOT the message
+    row-id — so the value the UI round-trips matches where messages are
+    filed and the pane doesn't load empty on a hard refresh."""
+    now = datetime(2026, 6, 28, 9, 0, 0)
+    uuid = "e1fd6fe5-885e-4d8b-9aaa-000000000099"
+    # DESC order (newest first) — the endpoint reverses internally.
+    rows = [
+        (44, "assistant", "hello", json.dumps({"session_id": uuid}), now + timedelta(minutes=2)),
+        (43, "user", "hi", json.dumps({"session_id": uuid}), now + timedelta(minutes=1)),
+        (42, "system", "[New conversation started]",
+         json.dumps({"new_session": True, "type": "session_marker", "session_id": uuid}), now),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversations = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/conversations?limit=10", headers=_api_headers())
+        assert response.status_code == 200
+        sessions = response.json()["conversations"]
+        assert len(sessions) == 1
+        # Identity is the UUID, not "42" (the marker's row-id).
+        assert sessions[0]["session_id"] == uuid
+    finally:
+        _restore_app(app, original)
+
+
+def test_conversations_endpoint_falls_back_to_rowid_for_legacy_cluster():
+    """A genuinely legacy cluster with no session_id anywhere still keys
+    by the first message's row-id (the resolver handles those via the
+    row-id time-gap path)."""
+    now = datetime(2026, 6, 28, 11, 0, 0)
+    rows = [
+        (8, "assistant", "reply", "{}", now + timedelta(minutes=1)),
+        (7, "user", "first", "{}", now),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversations = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/conversations?limit=10", headers=_api_headers())
+        assert response.status_code == 200
+        sessions = response.json()["conversations"]
+        assert sessions[0]["session_id"] == "7"
+    finally:
+        _restore_app(app, original)
+
+
 @pytest.mark.asyncio
 async def test_conversations_endpoint_limits_sql_scan_for_large_history(tmp_path):
     agent_id = "did:test:large-conversation-list"
@@ -239,8 +296,7 @@ def test_get_conversation_filters_session_markers_and_decrypts_messages():
         (13, "system", "[New conversation started]", '{"new_session": true, "type": "session_marker"}', now + timedelta(minutes=3)),
     ]
     storage = MagicMock(agent_id="did:agent", encryption_enabled=True)
-    storage.query_conversation_start = AsyncMock(return_value=(now,))
-    storage.query_conversation_messages = AsyncMock(return_value=rows)
+    storage.query_session_rows = AsyncMock(return_value=rows)
     agent = MagicMock(storage=storage)
 
     app, original = _prepare_app(agent)
@@ -274,8 +330,7 @@ def test_get_conversation_filters_pre_tool_reasoning_from_metadata():
         (20, "assistant", "Saved after the tool confirmed it.", json.dumps(metadata), now),
     ]
     storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversation_start = AsyncMock(return_value=(now,))
-    storage.query_conversation_messages = AsyncMock(return_value=rows)
+    storage.query_session_rows = AsyncMock(return_value=rows)
     agent = MagicMock(storage=storage)
 
     app, original = _prepare_app(agent)
@@ -307,8 +362,7 @@ def test_get_conversation_surfaces_assistant_model_provider():
         ),
     ]
     storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
-    storage.query_conversation_start = AsyncMock(return_value=(now,))
-    storage.query_conversation_messages = AsyncMock(return_value=rows)
+    storage.query_session_rows = AsyncMock(return_value=rows)
     agent = MagicMock(storage=storage)
 
     app, original = _prepare_app(agent)
@@ -354,8 +408,7 @@ def test_get_conversation_unwraps_sent_form_user_content():
         ),
     ]
     storage = MagicMock(agent_id="did:agent", encryption_enabled=True)
-    storage.query_conversation_start = AsyncMock(return_value=(now,))
-    storage.query_conversation_messages = AsyncMock(return_value=rows)
+    storage.query_session_rows = AsyncMock(return_value=rows)
     agent = MagicMock(storage=storage)
 
     def fake_decrypt(content, meta, fernet):

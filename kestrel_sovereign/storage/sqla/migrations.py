@@ -797,3 +797,132 @@ async def migrate_compaction_terminology(db: "AsyncDatabase") -> None:
             "conversation_history metadata row(s) (compression → "
             "compaction).", rewritten,
         )
+
+
+def _extract_session_id(raw):
+    """Return ``(meta_dict, session_id)`` from a metadata JSON string.
+
+    ``(None, None)`` if the row has no metadata or it isn't a JSON object.
+    """
+    if not raw:
+        return None, None
+    try:
+        meta = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(meta, dict):
+        return None, None
+    return meta, meta.get("session_id")
+
+
+async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
+    """One-time relink of non-canonical (integer) session ids (#2012).
+
+    The conversation-list endpoint historically keyed each session by the
+    row-id of its first message, so the web UI round-tripped a bare integer
+    (e.g. ``"1314"``) as the ``session_id`` on the next turn. Continued
+    messages were then persisted with ``metadata.session_id = "1314"`` while
+    the session's own ``new_session`` marker carried a UUID — splitting one
+    conversation across two keys. On a hard refresh the message pane rendered
+    empty even though every row was intact in the DB (identity mismatch, no
+    data loss).
+
+    This rewrites every integer ``metadata.session_id`` that names a
+    ``new_session`` marker row to that marker's UUID, in both
+    ``conversation_history`` and ``conversation_titles`` (so user-assigned
+    names follow their conversation). Integer session_ids that name a genuine
+    legacy time-gap anchor (a plain first message with no marker UUID) are
+    left unchanged — the read path still resolves those via the row-id
+    fallback.
+
+    Idempotent by construction: a rewritten row carries a UUID session_id,
+    which no longer matches the integer condition, so re-running is a no-op.
+    Dialect-neutral: plain ``?`` placeholders, no DDL. Plaintext metadata
+    only — ``content`` encryption at rest is untouched (#1401).
+    """
+    # Step 1: build {marker_row_id (str) -> marker UUID} for every
+    # new_session marker that carries a UUID session_id.
+    marker_rows = await db.fetchall(
+        "SELECT id, metadata FROM conversation_history "
+        "WHERE metadata LIKE '%new_session%'",
+        (),
+    )
+    marker_uuid_by_rowid: dict[str, str] = {}
+    for row_id, raw in marker_rows:
+        meta, sid = _extract_session_id(raw)
+        if not meta or not meta.get("new_session"):
+            continue
+        if sid and not str(sid).isdigit():
+            marker_uuid_by_rowid[str(row_id)] = str(sid)
+
+    if not marker_uuid_by_rowid:
+        return
+
+    # Step 2: rewrite conversation_history rows whose session_id is an
+    # integer naming one of those markers.
+    history_rows = await db.fetchall(
+        "SELECT id, metadata FROM conversation_history "
+        "WHERE metadata LIKE '%session_id%'",
+        (),
+    )
+    rewritten_history = 0
+    async with db.transaction():
+        for row_id, raw in history_rows:
+            meta, sid = _extract_session_id(raw)
+            if meta is None or sid is None:
+                continue
+            sid_str = str(sid)
+            if not sid_str.isdigit():
+                continue
+            canonical = marker_uuid_by_rowid.get(sid_str)
+            if not canonical or canonical == sid_str:
+                continue
+            new_meta = dict(meta)
+            new_meta["session_id"] = canonical
+            await db.execute(
+                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                (json.dumps(new_meta), row_id),
+            )
+            rewritten_history += 1
+
+    # Step 3: remap user-assigned conversation names keyed by the integer
+    # session_id. PK is (agent_id, session_id); if a UUID-keyed name already
+    # exists it is authoritative, so drop the stale integer row rather than
+    # colliding on the upsert.
+    title_rows = await db.fetchall(
+        "SELECT agent_id, session_id FROM conversation_titles",
+        (),
+    )
+    remapped_titles = 0
+    async with db.transaction():
+        for agent_id, sid in title_rows:
+            sid_str = str(sid)
+            canonical = marker_uuid_by_rowid.get(sid_str)
+            if not canonical or canonical == sid_str:
+                continue
+            existing = await db.fetchone(
+                "SELECT 1 FROM conversation_titles "
+                "WHERE agent_id = ? AND session_id = ?",
+                (agent_id, canonical),
+            )
+            if existing:
+                await db.execute(
+                    "DELETE FROM conversation_titles "
+                    "WHERE agent_id = ? AND session_id = ?",
+                    (agent_id, sid_str),
+                )
+            else:
+                await db.execute(
+                    "UPDATE conversation_titles SET session_id = ? "
+                    "WHERE agent_id = ? AND session_id = ?",
+                    (canonical, agent_id, sid_str),
+                )
+            remapped_titles += 1
+
+    if rewritten_history or remapped_titles:
+        logger.info(
+            "canonical-session-id migration (#2012): relinked %d "
+            "conversation_history row(s) and %d conversation name(s) "
+            "from integer keys to marker UUIDs.",
+            rewritten_history, remapped_titles,
+        )
