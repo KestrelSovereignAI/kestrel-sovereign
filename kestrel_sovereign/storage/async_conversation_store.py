@@ -540,27 +540,57 @@ class AsyncConversationStore:
         return session_id
 
     async def _marker_owns_uuid(self, row_id: int, uuid: str) -> bool:
-        """True if no row earlier than ``row_id`` carries ``uuid`` as its
-        ``metadata.session_id`` — i.e. the marker at ``row_id`` minted the
-        UUID rather than inheriting it from a still-active prior session.
+        """True if it is safe to canonicalize an integer key to this marker's
+        ``uuid``. Safe requires BOTH:
+
+        1. Exactly ONE ``new_session`` marker carries the UUID. Otherwise the
+           inheritance bug stamped it on several markers, each potentially
+           anchoring a DISTINCT conversation keyed by its own integer row-id —
+           consolidating could merge them.
+        2. No EARLIER (id < ``row_id``) content row already carries the UUID.
+           Such a row is a prior conversation that owns the UUID directly; the
+           marker merely inherited it, so filing new turns under it would merge
+           into that prior conversation.
+
+        The live path is only a transition safety net — the startup migration
+        does the real, fully-analyzable consolidation of multi-marker UUIDs, so
+        here we take the provably-safe position and decline anything ambiguous.
+        This marker's OWN later turns (id > row_id) never block (#2012).
 
         Conservative: on any lookup error, return False (do not canonicalize)
         so an ambiguous marker is never merged into another conversation.
         """
         try:
             esc = _escape_like_session_value(str(uuid))
-            earlier = await self.db.fetchone(
-                "SELECT 1 FROM conversation_history "
-                "WHERE agent_id = ? AND id < ? "
-                "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
-                "LIMIT 1",
+            rows = await self.db.fetchall(
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? "
+                "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\')",
                 (
-                    self.agent_id, row_id,
+                    self.agent_id,
                     f'%"session_id": "{esc}"%',
                     f'%"session_id":"{esc}"%',
                 ),
             )
-            return earlier is None
+            marker_count = 0
+            for rid, meta_json in rows:
+                if not meta_json:
+                    continue
+                try:
+                    meta = json.loads(meta_json)
+                except (json.JSONDecodeError, TypeError):
+                    return False
+                # Exact match (LIKE can substring-collide).
+                if meta.get("session_id") != str(uuid):
+                    continue
+                if meta.get("new_session"):
+                    marker_count += 1
+                    if marker_count > 1:
+                        return False
+                elif rid < row_id:
+                    # Earlier content owns the UUID → prior conversation.
+                    return False
+            return marker_count == 1
         except Exception as e:
             logger.warning(f"Marker ownership check failed: {e}")
             return False

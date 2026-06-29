@@ -841,47 +841,110 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
     only — ``content`` encryption at rest is untouched (#1401).
     """
     # Fetch every row carrying a session_id once, in id (≈chronological)
-    # order, and reuse it for both map-building and the rewrite.
+    # order, and reuse it for both map-building and the rewrite. Sessions are
+    # agent-scoped, so collision analysis is keyed by (agent_id, UUID) — a UUID
+    # reused across agents (imported/restored data) is NOT a collision.
     history_rows = await db.fetchall(
-        "SELECT id, metadata FROM conversation_history "
+        "SELECT id, agent_id, metadata FROM conversation_history "
         "WHERE metadata LIKE '%session_id%' "
         "ORDER BY id ASC",
         (),
     )
 
-    # First occurrence (lowest row-id) of each UUID — the row that minted it.
-    first_rowid_by_uuid: dict[str, int] = {}
-    # Candidate markers: row-id -> its UUID.
-    candidate_markers: dict[int, str] = {}
-    for row_id, raw in history_rows:
+    # Markers (new_session rows) grouped by (agent_id, UUID). The inheritance
+    # bug can put the SAME UUID on several markers, each anchoring a DISTINCT
+    # conversation whose turns are still keyed by that marker's integer row-id.
+    markers_by_key: dict[tuple, list[int]] = {}
+    marker_key_of_rowid: dict[int, tuple] = {}
+    for row_id, agent_id, raw in history_rows:
+        meta, sid = _extract_session_id(raw)
+        if meta is None or sid is None:
+            continue
+        sid_str = str(sid)
+        if not sid_str.isdigit() and meta.get("new_session"):
+            key = (agent_id, sid_str)
+            markers_by_key.setdefault(key, []).append(row_id)
+            marker_key_of_rowid[row_id] = key
+
+    # Attribute every CONTENT (non-marker) row to the conversation it belongs
+    # to, then count how many distinct conversations share each (agent, UUID).
+    # A UUID is safe to consolidate iff it covers a SINGLE conversation.
+    #
+    # Attribution:
+    #  - integer-keyed content (``session_id`` == a marker's row-id) belongs to
+    #    THAT marker;
+    #  - UUID-keyed content belongs to the most recent ``new_session`` marker
+    #    carrying that UUID and preceding it (by id). UUID-keyed content with
+    #    NO preceding marker is an ``orphan`` — a prior implicit conversation
+    #    that owned the UUID before any marker inherited it.
+    markers_with_content: set[int] = set()
+    orphan_keys: set[tuple] = set()
+
+    # Integer-keyed content → its marker (row-ids are a global PK, so the
+    # integer unambiguously names one marker regardless of agent).
+    for row_id, agent_id, raw in history_rows:
+        meta, sid = _extract_session_id(raw)
+        if meta is None or sid is None or meta.get("new_session"):
+            continue
+        sid_str = str(sid)
+        if sid_str.isdigit():
+            mid = int(sid_str)
+            if mid in marker_key_of_rowid:
+                markers_with_content.add(mid)
+
+    # UUID-keyed rows (markers + content), walked per (agent, UUID) in id order
+    # so each content row is charged to its most recent preceding marker.
+    rows_by_key: dict[tuple, list[tuple]] = {}
+    for row_id, agent_id, raw in history_rows:
         meta, sid = _extract_session_id(raw)
         if meta is None or sid is None:
             continue
         sid_str = str(sid)
         if sid_str.isdigit():
             continue
-        first_rowid_by_uuid.setdefault(sid_str, row_id)
-        if meta.get("new_session"):
-            candidate_markers[row_id] = sid_str
+        key = (agent_id, sid_str)
+        if key not in markers_by_key:
+            continue
+        rows_by_key.setdefault(key, []).append((row_id, bool(meta.get("new_session"))))
+    for key, items in rows_by_key.items():
+        items.sort()
+        current_marker = None
+        for rid, is_marker in items:
+            if is_marker:
+                current_marker = rid
+            elif current_marker is None:
+                orphan_keys.add(key)
+            else:
+                markers_with_content.add(current_marker)
 
-    # Build {marker_row_id (str) -> UUID} ONLY for markers that genuinely OWN
-    # their UUID (they are the first row carrying it). A legacy marker written
-    # without an explicit id could have INHERITED the previous still-active
-    # session's UUID via the time-gap heuristic; mapping the marker's row-id to
-    # that inherited UUID would permanently merge two distinct conversations.
+    # Consolidate a UUID only when it covers exactly one conversation.
     marker_uuid_by_rowid: dict[str, str] = {}
     skipped_inherited = 0
-    for marker_row_id, uuid in candidate_markers.items():
-        if first_rowid_by_uuid.get(uuid) == marker_row_id:
-            marker_uuid_by_rowid[str(marker_row_id)] = uuid
+    for key, marker_ids in markers_by_key.items():
+        uuid = key[1]
+        conversations = sum(1 for m in marker_ids if m in markers_with_content)
+        if key in orphan_keys:
+            conversations += 1
+        if conversations <= 1:
+            # Map only markers that BELONG to the single conversation: the one
+            # content-bearing marker (at most one, since conversations<=1), or
+            # a degenerate sole marker (titled but empty). An empty marker that
+            # merely INHERITED the UUID — when the content is owned by another
+            # marker or a prior orphan — is a separate session; mapping it would
+            # move its own title onto the owner's conversation.
+            sole_marker = len(marker_ids) == 1
+            for marker_row_id in marker_ids:
+                owns = marker_row_id in markers_with_content
+                if owns or (sole_marker and key not in orphan_keys):
+                    marker_uuid_by_rowid[str(marker_row_id)] = uuid
         else:
-            skipped_inherited += 1
+            skipped_inherited += len(marker_ids)
 
     if skipped_inherited:
         logger.info(
             "canonical-session-id migration (#2012): skipped %d new_session "
-            "marker(s) that inherited a prior session's UUID (ambiguous — not "
-            "relinked to avoid merging conversations).", skipped_inherited,
+            "marker(s) whose UUID collided across distinct conversations "
+            "(ambiguous — not relinked to avoid merging).", skipped_inherited,
         )
 
     if not marker_uuid_by_rowid:
@@ -891,7 +954,7 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
     # one of those owned markers.
     rewritten_history = 0
     async with db.transaction():
-        for row_id, raw in history_rows:
+        for row_id, _agent_id, raw in history_rows:
             meta, sid = _extract_session_id(raw)
             if meta is None or sid is None:
                 continue
