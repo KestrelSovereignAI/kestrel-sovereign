@@ -792,6 +792,23 @@ class PrivacyEnforcingStorage:
                 ))
             return rows[:limit]
 
+        # Preserve the live-anchor guard the previous detail-read path had
+        # (via query_conversation_start's `deleted_at IS NULL` filter): for a
+        # numeric session_id, _get_session_messages looks up the anchor row
+        # IGNORING deleted_at (it needs the trashed anchor's timestamp for
+        # restore workflows), so a soft-deleted anchor whose cluster siblings
+        # are still live would otherwise leak rows instead of 404ing. UUID ids
+        # have no single anchor row — their live filtering is intrinsic.
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is not None:
+            anchor = await self._storage.db.fetchone(
+                "SELECT 1 FROM conversation_history "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (row_id, self._storage.agent_id),
+            )
+            if not anchor:
+                return []
+
         raw_rows = await self._storage._get_session_messages(session_id, limit)
         # _get_session_messages returns rows DESC; the endpoint walks ASC.
         normalized = []

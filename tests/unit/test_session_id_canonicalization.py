@@ -118,3 +118,29 @@ async def test_continued_turns_load_under_canonical_uuid(store):
     # Marker stripped; both content turns present under the UUID.
     assert roles.count("user") == 1
     assert roles.count("assistant") == 1
+
+
+@pytest.mark.asyncio
+async def test_query_session_rows_404s_on_soft_deleted_numeric_anchor(store):
+    """Regression (codex): a numeric session_id whose anchor row is
+    soft-deleted must resolve to no rows (→ 404) even when later rows in
+    the cluster are still live — _get_session_messages ignores deleted_at
+    on the anchor lookup for restore workflows, so the privacy wrapper
+    must reapply the live-anchor guard the old detail path had."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    await store.add_conversation("user", "first", session_id="sess-z")
+    anchor_id = (await store.db.fetchone(
+        "SELECT id FROM conversation_history ORDER BY id DESC LIMIT 1", ()
+    ))[0]
+    await store.add_conversation("assistant", "reply", session_id="sess-z")
+    # Soft-delete only the anchor row, leaving the live sibling behind.
+    await store.db.execute_commit(
+        "UPDATE conversation_history SET deleted_at = datetime('now') WHERE id = ?",
+        (anchor_id,),
+    )
+
+    wrapper = PrivacyEnforcingStorage(store, PrivacyMode.NORMAL)
+    rows = await wrapper.query_session_rows(str(anchor_id), limit=50)
+    assert rows == []
