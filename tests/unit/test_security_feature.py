@@ -430,6 +430,69 @@ class TestApprovalQueue:
         assert scope == "timeout"
 
     @pytest.mark.asyncio
+    async def test_test_instance_returns_no_approver_without_blocking(self, tmp_path):
+        """#2029: a headless test instance must NOT block forever on an
+        unanswerable approval. With no human attached, ``request_approval``
+        short-circuits to a non-blocking ``(False, "no_approver")`` instead of
+        queuing a request that nobody can decide (the exact spawn_agent hang).
+        """
+        store = track_store(PermissionStore(str(tmp_path / "perms.db")))
+        await store.initialize()
+        await store.register_tool("SpawnFeature", "spawn_agent", PermissionLevel.ASK)
+
+        agent = MagicMock()
+        agent.is_test_instance = True
+        queue = ApprovalQueue(permission_store=store, agent=agent)
+
+        # Must return promptly without anything ever submitting a decision.
+        approved, scope = await asyncio.wait_for(
+            queue.request_approval(
+                feature_name="SpawnFeature",
+                tool_name="spawn_agent",
+                tool_args={"name": "child", "purpose": "x"},
+            ),
+            timeout=1.0,
+        )
+
+        assert approved is False
+        assert scope == "no_approver"
+        # Nothing was queued — the worker is not wedged.
+        assert queue.pending_requests == []
+        # Audited distinctly, NOT as a user denial (#1542).
+        logs = await store.get_audit_log(limit=1)
+        assert logs[0]["decision"] == "no_approver"
+
+    @pytest.mark.asyncio
+    async def test_non_test_agent_still_queues_for_human(self, tmp_path):
+        """A production/sovereign agent (``is_test_instance`` falsy) keeps the
+        interactive behavior: the request is queued and waits for a human
+        decision rather than short-circuiting (#2029 scope guard)."""
+        store = track_store(PermissionStore(str(tmp_path / "perms.db")))
+        await store.initialize()
+        await store.register_tool("SpawnFeature", "spawn_agent", PermissionLevel.ASK)
+
+        agent = MagicMock()
+        agent.is_test_instance = False
+        queue = ApprovalQueue(permission_store=store, agent=agent)
+
+        async def approve_later():
+            await asyncio.sleep(0.05)
+            pending = queue.pending_requests
+            assert len(pending) == 1
+            await queue.submit_decision(pending[0].id, True, "once")
+
+        asyncio.create_task(approve_later())
+
+        approved, scope = await queue.request_approval(
+            feature_name="SpawnFeature",
+            tool_name="spawn_agent",
+            tool_args={"name": "child"},
+        )
+
+        assert approved is True
+        assert scope == "once"
+
+    @pytest.mark.asyncio
     async def test_cancel_request(self, queue):
         # Start a request
         request_task = asyncio.create_task(
@@ -814,6 +877,38 @@ class TestSecurityHook:
         output = await hook.execute(input)
         assert output.continue_execution is False
         assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_ask_mode_headless_test_instance_denies_non_blocking(
+        self, permission_store
+    ):
+        """#2029: an ASK-gated tool on a headless test instance returns a
+        non-blocking DENY (requires-approval / no approver) instead of queuing
+        forever. This is what stops a single spawn_agent call from wedging the
+        agent's request worker until restart.
+        """
+        await permission_store.register_tool(
+            "SpawnFeature", "spawn_agent", PermissionLevel.ASK
+        )
+        agent = MagicMock()
+        agent.is_test_instance = True
+        queue = ApprovalQueue(permission_store=permission_store, agent=agent)
+        hook = SecurityHook(permission_store, queue)
+
+        input = HookInput(
+            session_id="test",
+            hook_event_name="PreToolUse",
+            tool_name="spawn_agent",
+            feature_name="SpawnFeature",
+            tool_input={"name": "child", "purpose": "x"},
+        )
+
+        output = await asyncio.wait_for(hook.execute(input), timeout=1.0)
+
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+        # No request was ever queued.
+        assert queue.pending_requests == []
 
     @pytest.mark.asyncio
     async def test_ask_approve_always_updates_permission(

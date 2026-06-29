@@ -11,7 +11,10 @@ from typing import Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
-from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+from kestrel_sovereign.features.security.approval_queue import (
+    ApprovalQueue,
+    classify_denial,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +151,46 @@ class SecurityHook(Hook):
             )
 
             if not approved:
-                logger.info(f"User denied or timeout: {feature_name}.{tool_name}")
-                return HookOutput.deny(f"User denied: {feature_name}.{tool_name}")
+                # Branch on the denial provenance — only an explicit human deny
+                # is a user denial (#1542). classify_denial is the shared source
+                # of truth so this hook and the direct queue consumers
+                # (ComputeFeature, KeysFeature, …) can't drift.
+                denial = classify_denial(scope)
+
+                # Headless test instance with no one to answer the queue
+                # (#2029). The queue short-circuited rather than blocking
+                # forever; surface an honest, non-blocking "requires approval /
+                # no approver available" denial instead of mislabeling it as a
+                # user denial. This is what keeps a single spawn_agent call
+                # from wedging the agent's request worker until restart.
+                if scope == "no_approver":
+                    logger.warning(
+                        "No interactive approver for %s.%s; returning "
+                        "requires-approval (non-blocking).",
+                        feature_name,
+                        tool_name,
+                    )
+                    return HookOutput.deny(
+                        f"{feature_name}.{tool_name} requires approval, but no "
+                        "interactive approver is available (headless/test "
+                        "instance). Not queuing to avoid an indefinite block. "
+                        "Enable non-interactive approval "
+                        "(KESTREL_TEST_AUTO_APPROVE=1) or run with an attached "
+                        "approver."
+                    )
+                if denial.is_user_denial:
+                    logger.info(f"User denied: {feature_name}.{tool_name}")
+                    return HookOutput.deny(f"User denied: {feature_name}.{tool_name}")
+                logger.info(
+                    "Not approved (%s): %s.%s",
+                    denial.reason,
+                    feature_name,
+                    tool_name,
+                )
+                return HookOutput.deny(
+                    f"{feature_name}.{tool_name} not approved — "
+                    f"{denial.description}."
+                )
 
             logger.info(f"User approved ({scope}): {feature_name}.{tool_name}")
             return HookOutput.allow(f"User approved: {scope}")
