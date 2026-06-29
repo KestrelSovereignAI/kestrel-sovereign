@@ -259,6 +259,28 @@ async def test_skips_two_marker_collision_uuid_then_integer(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_collision_analysis_is_agent_scoped(tmp_path):
+    """codex: a UUID reused across two agents (imported/restored data) is NOT
+    a collision — each agent's session must still consolidate independently."""
+    db = await _db(tmp_path)
+    uuid = "5a5a5a5a-0000-0000-0000-00000000000f"
+    # Agent A: marker + integer-keyed continuation.
+    ma = await _insert(db, "system", "", {"new_session": True, "session_id": uuid}, agent_id="agent-A")
+    a1 = await _insert(db, "user", "A-turn", {"session_id": str(ma)}, agent_id="agent-A")
+    # Agent B: same UUID, its own marker + continuation.
+    mb = await _insert(db, "system", "", {"new_session": True, "session_id": uuid}, agent_id="agent-B")
+    b1 = await _insert(db, "user", "B-turn", {"session_id": str(mb)}, agent_id="agent-B")
+
+    await migrate_canonical_session_ids(db)
+
+    sids = await _session_ids(db)
+    # Each agent's integer-keyed turn relinks to the (shared) UUID — neither
+    # is skipped as a false cross-agent collision.
+    assert sids[a1] == uuid
+    assert sids[b1] == uuid
+
+
+@pytest.mark.asyncio
 async def test_consolidates_single_marker_mixed_key_session(tmp_path):
     """codex: a SINGLE-marker session whose turns are split between the
     canonical UUID and the marker's integer row-id is ONE conversation (one
