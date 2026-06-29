@@ -656,6 +656,48 @@ def test_new_conversation_delete_message_and_transcript_contracts():
         _restore_app(app, original)
 
 
+def test_get_conversation_marker_only_session_returns_empty_not_404():
+    """#2012 (codex): a freshly started session has only a stripped marker, so
+    the resolver yields zero rows — but the session EXISTS, so the detail
+    endpoint must return 200 with an empty message list, not 404."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_session_rows = AsyncMock(return_value=[])
+    storage.session_exists = AsyncMock(return_value=True)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/conversations/some-uuid", headers=_api_headers()
+                )
+        assert response.status_code == 200
+        assert response.json()["messages"] == []
+        assert response.json()["message_count"] == 0
+    finally:
+        _restore_app(app, original)
+
+
+def test_get_conversation_missing_session_404s():
+    """A session that doesn't exist at all still 404s."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_session_rows = AsyncMock(return_value=[])
+    storage.session_exists = AsyncMock(return_value=False)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/conversations/ghost-uuid", headers=_api_headers()
+                )
+        assert response.status_code == 404
+    finally:
+        _restore_app(app, original)
+
+
 def test_transcript_resolves_uuid_session_id():
     """#2012 (codex): the list API now advertises marker UUIDs, so the
     transcript endpoint must resolve a UUID session_id via the same

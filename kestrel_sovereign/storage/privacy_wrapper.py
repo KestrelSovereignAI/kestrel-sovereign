@@ -29,6 +29,7 @@ from kestrel_sovereign.privacy import (
     privacy_config_to_mode,
 )
 from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
+from kestrel_sovereign.storage.async_conversation_store import _escape_like_session_value
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -821,6 +822,48 @@ class PrivacyEnforcingStorage:
                 row[7] if len(row) > 7 else None,
             ))
         return normalized
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Whether a session exists at all, respecting privacy.
+
+        ``query_session_rows`` strips ``session_marker`` rows, so a freshly
+        started (marker-only) session resolves to zero rows. Callers use this
+        to tell "session exists but has no displayable messages yet" (→ 200
+        with an empty list) from "session not found" (→ 404), preserving the
+        old ``query_conversation_start`` contract (#2012).
+
+        - numeric session_id: existence is a LIVE anchor row (so a
+          soft-deleted anchor still 404s, matching the trash semantics).
+        - UUID session_id: any LIVE row carrying it in ``metadata.session_id``
+          (the marker alone is enough).
+        """
+        if self._privacy_config.is_ephemeral():
+            return False
+        if self._policy.use_session_storage:
+            return bool(self._session_conversations)
+
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is not None:
+            anchor = await self._storage.db.fetchone(
+                "SELECT 1 FROM conversation_history "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (row_id, self._storage.agent_id),
+            )
+            return anchor is not None
+
+        esc = _escape_like_session_value(str(session_id))
+        row = await self._storage.db.fetchone(
+            "SELECT 1 FROM conversation_history "
+            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
+            "LIMIT 1",
+            (
+                self._storage.agent_id,
+                f'%"session_id": "{esc}"%',
+                f'%"session_id":"{esc}"%',
+            ),
+        )
+        return row is not None
 
     async def query_last_conversation_row(
         self, agent_id: str

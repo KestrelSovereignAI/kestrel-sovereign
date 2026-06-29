@@ -215,3 +215,47 @@ async def test_query_session_rows_works_through_async_storage_facade(tmp_path):
     rows = await wrapper.query_session_rows(uuid, limit=50)
     assert [r[1] for r in rows] == ["user"]
     await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_session_exists_marker_only_true_missing_false(store):
+    """session_exists distinguishes a real-but-empty (marker-only) session
+    from a missing one — the input to the detail/transcript 404 decision."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    uuid = "11111111-0000-0000-0000-00000000000a"
+    await store.add_conversation(
+        "system", "",
+        metadata={"type": "session_marker", "new_session": True},
+        session_id=uuid,
+    )
+    wrapper = PrivacyEnforcingStorage(store, PrivacyMode.NORMAL)
+
+    # Marker-only session exists (the marker carries the UUID, is live)...
+    assert await wrapper.session_exists(uuid) is True
+    # ...but the resolver strips the marker → zero displayable rows.
+    assert await wrapper.query_session_rows(uuid, limit=10) == []
+    # A UUID nobody has does not exist.
+    assert await wrapper.session_exists("99999999-0000-0000-0000-000000000000") is False
+
+
+@pytest.mark.asyncio
+async def test_session_exists_false_for_soft_deleted_numeric_anchor(store):
+    """A numeric session_id whose anchor row is soft-deleted does not exist
+    (→ 404), even if mis-filed live siblings remain — matching the old
+    query_conversation_start(deleted_at IS NULL) contract."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    await store.add_conversation("user", "first", session_id="sess-q")
+    anchor_id = (await store.db.fetchone(
+        "SELECT id FROM conversation_history ORDER BY id DESC LIMIT 1", ()
+    ))[0]
+    await store.db.execute_commit(
+        "UPDATE conversation_history SET deleted_at = datetime('now') WHERE id = ?",
+        (anchor_id,),
+    )
+
+    wrapper = PrivacyEnforcingStorage(store, PrivacyMode.NORMAL)
+    assert await wrapper.session_exists(str(anchor_id)) is False

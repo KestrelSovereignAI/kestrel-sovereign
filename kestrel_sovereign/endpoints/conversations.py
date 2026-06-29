@@ -254,7 +254,10 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
         # under a different key — the empty-pane-after-refresh bug (#2012).
         rows = await storage.query_session_rows(session_id, limit=limit)
 
-        if not rows:
+        # The resolver strips session_marker rows, so a freshly started
+        # (marker-only) session legitimately yields zero messages — only 404
+        # when the session genuinely doesn't exist (#2012).
+        if not rows and not await storage.session_exists(session_id):
             raise HTTPException(status_code=404, detail="Session not found.")
 
         messages = []
@@ -747,10 +750,12 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
         # now advertises (not just numeric row-ids) — #2012.
         rows = await storage.query_session_rows(session_id, limit=1000)
 
-        if not rows:
+        # A freshly started (marker-only) session resolves to zero displayable
+        # rows; only 404 when the session genuinely doesn't exist (#2012).
+        if not rows and not await storage.session_exists(session_id):
             raise HTTPException(status_code=404, detail="Session not found.")
 
-        start_time = rows[0][4]
+        start_time = rows[0][4] if rows else ""
 
         # Build markdown transcript
         transcript_lines = [
