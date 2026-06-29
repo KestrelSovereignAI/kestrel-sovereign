@@ -19,9 +19,23 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.save.feature import SaveFeature
 
 
+class _FacadeStorage:
+    """Fake storage with the production facade shape.
+
+    ``PrivacyEnforcingStorage`` (and ``AsyncStorage``) forward
+    ``get_nodes_by_type`` as a facade method; the recall fallback must
+    use that, NOT a raw ``.graph`` attribute. This fake deliberately
+    exposes only the facade method (no ``.graph``) so a regression back
+    to ``self.storage.graph`` is caught (#2020).
+    """
+
+    def __init__(self):
+        self.get_nodes_by_type = AsyncMock(return_value=[])
+
+
 def _make_feature(store, conv_store=None):
     feat = SaveFeature(agent=MagicMock())
-    feat.storage = MagicMock()
+    feat.storage = _FacadeStorage()
     feat._db = MagicMock()
     feat.context_manager = MagicMock()
     feat.context_manager._get_conversation_store = MagicMock(return_value=conv_store)
@@ -248,13 +262,16 @@ async def test_save_item_propagates_store_failure():
 async def test_recall_no_matches_returns_ok_with_zero_count():
     store = AsyncMock()
     store.search = AsyncMock(return_value=[])
+    store.has_embedding_service = MagicMock(return_value=True)
     feat = _make_feature(store)
+    feat.storage.get_nodes_by_type = AsyncMock(return_value=[])
 
     result = await feat.recall(query="anything")
 
     assert result.status is ToolResultStatus.OK
     assert result.data["result_count"] == 0
     assert result.data["results"] == []
+    assert result.data["semantic_search_available"] is True
     assert "no matches" in result.confirmation.lower()
 
 
@@ -274,7 +291,9 @@ async def test_recall_with_matches_returns_ok_with_results():
             },
         }
     ])
+    store.has_embedding_service = MagicMock(return_value=True)
     feat = _make_feature(store)
+    feat.storage.get_nodes_by_type = AsyncMock(return_value=[])
 
     result = await feat.recall(query="thing")
 
@@ -303,6 +322,87 @@ async def test_recall_list_returns_ok():
     assert result.status is ToolResultStatus.OK
     assert result.data["count"] == 2
     assert {it["id"] for it in result.data["items"]} == {"i-1", "i-2"}
+
+
+# ---------------------------------------------------------------------------
+# recall — #2020: embedding-less honesty + learned_fact keyword fallback
+# ---------------------------------------------------------------------------
+
+def _fake_fact_node(subject, predicate, value, agent_id="did:test:agent"):
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    return GraphNode(
+        node_id=f"fact:{agent_id}:{subject}:{predicate}",
+        node_type="learned_fact",
+        label=f"{predicate.replace('_', ' ').title()}: {value}",
+        properties={
+            "subject": subject,
+            "predicate": predicate,
+            "value": value,
+            "confidence": 1.0,
+            "source": "agent_tool",
+            "saved_at": "2026-06-29T00:00:00+00:00",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_surfaces_unavailable_when_no_embedding_provider():
+    """No embedding provider -> recall must say so, not return silent empty."""
+    store = AsyncMock()
+    store.search = AsyncMock(return_value=[])
+    store.has_embedding_service = MagicMock(return_value=False)
+    feat = _make_feature(store)
+    feat.storage.get_nodes_by_type = AsyncMock(return_value=[])
+
+    result = await feat.recall(query="nothing here")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["semantic_search_available"] is False
+    assert "semantic search unavailable" in result.confirmation.lower()
+    assert "no embedding provider" in result.confirmation.lower()
+
+
+@pytest.mark.asyncio
+async def test_recall_finds_learned_fact_without_embeddings():
+    """A saved_fact learned_fact node is recoverable via keyword fallback
+    even when no embedding provider is configured (#2020)."""
+    store = AsyncMock()
+    store.search = AsyncMock(return_value=[])
+    store.has_embedding_service = MagicMock(return_value=False)
+    feat = _make_feature(store)
+    feat.storage.get_nodes_by_type = AsyncMock(return_value=[
+        _fake_fact_node("Q3 internal audit", "codename", "BLUE_HERON_42"),
+        _fake_fact_node("user", "favorite_color", "blue"),
+    ])
+
+    result = await feat.recall(query="Q3 audit codename")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["fact_match_count"] >= 1
+    fact_results = [r for r in result.data["results"] if r["type"] == "learned_fact"]
+    assert any(r["value"] == "BLUE_HERON_42" for r in fact_results)
+    # The honesty signal still rides along even though we found a fact.
+    assert result.data["semantic_search_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_recall_fact_fallback_skipped_when_item_type_filtered():
+    """An explicit saved-item type filter scopes recall to saved items,
+    so the learned_fact store is not consulted."""
+    store = AsyncMock()
+    store.search = AsyncMock(return_value=[])
+    store.has_embedding_service = MagicMock(return_value=True)
+    feat = _make_feature(store)
+    feat.storage.get_nodes_by_type = AsyncMock(
+        return_value=[_fake_fact_node("user", "name", "Alice")]
+    )
+
+    result = await feat.recall(query="name", item_type="stash")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["fact_match_count"] == 0
+    feat.storage.get_nodes_by_type.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +522,7 @@ async def test_save_item_valid_type_persists_and_is_recallable():
             },
         }
     ])
+    store.has_embedding_service = MagicMock(return_value=True)
     feat = _make_feature(store)
 
     saved = await feat.save_item(name="n", content="c", item_type="excerpt")

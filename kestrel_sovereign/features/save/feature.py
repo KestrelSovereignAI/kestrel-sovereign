@@ -505,9 +505,11 @@ class SaveFeature(Feature):
     @tool(
         name="recall",
         description=(
-            "Search saved items using semantic search. Find previously saved "
-            "stashes, excerpts, files, and items by meaning. Optional item_type "
-            "filter must be one of: stash, file, excerpt, structured."
+            "Search saved items and learned facts. Find previously saved "
+            "stashes, excerpts, files, and items by meaning, plus facts saved "
+            "via save_fact (matched by keyword). Optional item_type filter "
+            "must be one of: stash, file, excerpt, structured; passing one "
+            "scopes the search to saved items only."
         ),
         category=ToolCategory.MEMORY,
         command_prefix="!recall"
@@ -538,6 +540,12 @@ class SaveFeature(Feature):
             if filter_type not in self._VALID_ITEM_TYPES:
                 return self._item_type_error(filter_type, context="filter")
 
+        # #2020: when no embedding provider is configured, semantic
+        # search silently degrades to a keyword (text-LIKE) scan. Detect
+        # that up front so an empty result reads as "semantic search
+        # unavailable" rather than a false "no matching memory".
+        semantic_available = store.has_embedding_service()
+
         try:
             results = await store.search(
                 query=query,
@@ -561,21 +569,131 @@ class SaveFeature(Feature):
                 "created_at": item.get("created_at")
             })
 
+        # #2020: ``save_fact`` persists learned facts as ``learned_fact``
+        # Knowledge Graph nodes, which live in a different store than
+        # saved items and so are never surfaced by the vector/text search
+        # above. Without an embedding provider those facts were
+        # completely unrecoverable through recall. Extend the keyword
+        # fallback to cover them so saved facts are findable. The fact
+        # store is only queried when the caller isn't filtering to a
+        # saved-item type (stash/file/excerpt/structured).
+        fact_matches: List[Dict[str, Any]] = []
+        if not filter_type:
+            fact_matches = await self._recall_learned_facts(query, limit)
+            formatted.extend(fact_matches)
+
         data = {
             "success": True,
             "query": query,
             "result_count": len(formatted),
             "results": formatted,
+            "semantic_search_available": semantic_available,
+            "fact_match_count": len(fact_matches),
         }
+
+        # Honesty signal: an empty semantic result with no embedding
+        # provider is "search couldn't run", not "nothing matched".
+        unavailable_note = (
+            " (semantic search unavailable — no embedding provider configured;"
+            " keyword fallback only)"
+            if not semantic_available
+            else ""
+        )
+
         if not formatted:
             return ToolResult.ok(
-                confirmation=f"No matches for query: {query!r}",
+                confirmation=f"No matches for query: {query!r}{unavailable_note}",
                 data=data,
             )
         return ToolResult.ok(
-            confirmation=f"Found {len(formatted)} match(es) for {query!r}",
+            confirmation=(
+                f"Found {len(formatted)} match(es) for {query!r}{unavailable_note}"
+            ),
             data=data,
         )
+
+    async def _recall_learned_facts(
+        self, query: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Keyword search over ``learned_fact`` Knowledge Graph nodes.
+
+        Facts saved via ``save_fact`` are stored as graph nodes, not
+        saved items, so the saved-item vector/text search never returns
+        them. This keyword fallback makes them recoverable through
+        ``recall`` even when no embedding provider is available (#2020).
+        """
+        # Production wraps storage in ``PrivacyEnforcingStorage``, whose
+        # canonical surface is the facade method ``get_nodes_by_type``
+        # (mirrored on ``AsyncStorage``). Prefer that; only fall back to a
+        # raw ``.graph`` attribute for bare/legacy storage objects.
+        getter = getattr(self.storage, "get_nodes_by_type", None)
+        if getter is None:
+            graph = getattr(self.storage, "graph", None)
+            getter = getattr(graph, "get_nodes_by_type", None)
+        if getter is None:
+            return []
+
+        terms = [t for t in query.lower().split() if t]
+        if not terms:
+            return []
+
+        try:
+            nodes = await getter("learned_fact")
+        except Exception as e:
+            logger.warning(f"recall learned_fact lookup failed: {e}")
+            return []
+
+        prefix = f"fact:{self.agent_id}:"
+        scored: List[Dict[str, Any]] = []
+        for node in nodes:
+            node_id = getattr(node, "node_id", "")
+            # DB is per-agent, but fact ids are agent-namespaced; keep the
+            # guard so a shared/migrated DB can't leak another agent's facts.
+            if node_id and not node_id.startswith(prefix):
+                continue
+            props = getattr(node, "properties", None) or {}
+            subject = str(props.get("subject", ""))
+            predicate = str(props.get("predicate", ""))
+            value = str(props.get("value", ""))
+            haystack = " ".join(
+                [subject, predicate, value, str(getattr(node, "label", ""))]
+            ).lower()
+            hits = sum(1 for t in terms if t in haystack)
+            if hits == 0:
+                continue
+            scored.append(
+                {
+                    "node": node,
+                    "hits": hits,
+                    "summary": f"{subject}.{predicate} = {value}",
+                    "value": value,
+                    "subject": subject,
+                    "predicate": predicate,
+                    "node_id": node_id,
+                    "confidence": props.get("confidence"),
+                    "saved_at": props.get("saved_at"),
+                }
+            )
+
+        scored.sort(key=lambda m: m["hits"], reverse=True)
+        formatted: List[Dict[str, Any]] = []
+        for m in scored[: max(0, limit)]:
+            formatted.append(
+                {
+                    "id": m["node_id"],
+                    "name": m["summary"],
+                    "type": "learned_fact",
+                    "summary": m["summary"][:200],
+                    "score": round(m["hits"] / len(terms), 3),
+                    "tags": [],
+                    "created_at": m["saved_at"],
+                    "subject": m["subject"],
+                    "predicate": m["predicate"],
+                    "value": m["value"],
+                    "confidence": m["confidence"],
+                }
+            )
+        return formatted
 
     @tool(
         name="recall_list",
