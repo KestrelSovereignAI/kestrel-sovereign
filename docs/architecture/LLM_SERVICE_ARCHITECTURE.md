@@ -249,28 +249,31 @@ The frontend groups the dropdown by vendor. When a vendor has more than one rout
 
 ## Visibility
 
-No maintained "always show" or "always hide" allowlists. Capability and usage signals drive curation.
+No maintained "always show" or "always hide" allowlists. Curation is **computed from provider-supplied metadata** — chiefly the `created_at` timestamp every adapter already reads (OpenAI `created`, Anthropic `created_at`). Recency is read from that timestamp, **not** by parsing a version number out of the model id. Name-parsing is brittle: it can't order codename tiers (Anthropic `opus`/`sonnet`/`haiku`, OpenAI's `gpt-5.6` Sol/Terra/Luna) and ranks a number-less id below `gpt-3.5`. Ranking on `created_at` is naming-agnostic — the newest release wins however the vendor names it. (#2015)
 
-### Auto-hide (computed from discovered metadata)
+### Category (computed)
 
-- `category != "chat"` — filtered out of chat dropdowns. Covered by `[categories.embedding|image|audio|completion]` in `model_catalog.toml`.
-- Vendor-reported `description` contains "deprecated" | "legacy" | "will be retired" — marked hidden at enrichment.
-- Present in the previous discovery cache but absent from today's run — marked deprecated (structural signal; vendor retired it).
+`category != "chat"` is filtered out of chat dropdowns. Resolution order: explicit `[categories.*]` in `model_catalog.toml` → **id-pattern inference** (catches the `tts`/`whisper`/`transcribe`/`realtime`/`image`/`video` models that OpenAI's API stamps as plain `chat`) → adapter-reported category.
 
-### Auto-feature (computed)
+### Deprecation (computed)
 
-- `frecency_score > 0` — you've used it, it floats up.
-- **Canonical alias:** the ID has no date suffix in a lineage where dated siblings exist. Pure string analysis, no config.
-- Newest `created_at` in a lineage + `supports_tools` + not preview.
+- Vendor-reported `description` contains "deprecated" | "legacy" | "will be retired" → `is_deprecated`.
+- **Age-based:** a chat model older than `deprecate_after_days` *when a newer chat model exists for the vendor* → `is_deprecated`. Computable, zero-maintenance — this is what demotes `gpt-3.5-turbo`/`gpt-4` even though OpenAI's API returns no description. Deprecated models stay selectable under "Show all"; they're only kept out of the featured set.
+
+### Featured (computed, recency-gated)
+
+Per vendor, the featured set is the **top `featured_per_vendor` chat models by `created_at`**, excluding hidden/deprecated/preview, and preferring an undated alias over its dated snapshots. `is_canonical_alias` is still detected (to break alias-vs-snapshot ties) but no longer auto-features on its own — "undated lineage root" is forever-true and used to float stale roots (`gpt-3.5-turbo`, `gpt-4`) into the dropdown indefinitely. Legacy `[featured]` membership and `frecency_score > 0` remain additive promotions.
+
+The selector defaults to this featured set (a clean handful) with an explicit **"Show all N models"** expander; each vendor switch resets to the featured view.
 
 ### Emergency overrides
 
 `model_catalog.toml` carries a `[hidden]` section keyed by vendor. Empty by default. Use only when a vendor mislabels something. There is **no** `[always_show]` or `[pinned]` counterpart — pinning a specific ID is user-state, not catalog-state.
 
-### Two dials, not lists
+### Two dials, not lists — `[visibility]` in `model_catalog.toml`
 
-- `visibility_auto_hide_deprecated_months` — grace period before truly removing deprecated models from the cache.
-- `visibility_preview_demotion_terms` — substrings that demote a model from featured (default: `["preview", "beta", "experimental", "exp"]`).
+- `featured_per_vendor` (default `8`) — cap on how many models per vendor are featured. Hard bound against the "everything featured" regression.
+- `deprecate_after_days` (default `365`) — age past which a superseded chat model is marked deprecated.
 
 ---
 

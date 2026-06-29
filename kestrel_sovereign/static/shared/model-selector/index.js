@@ -65,6 +65,10 @@ class ModelSelector {
         this.selectedModel = '';
         this.selectedRoute = '';
         this.isInitialLoad = true;
+        // The dropdown defaults to the featured set (a clean handful of current
+        // models per vendor) with an explicit "Show all" expander. Flips to true
+        // when the operator expands; reset per vendor switch. (#2015)
+        this.showAllModels = false;
 
         // Model IDs the user must not be able to pick from the dropdown — e.g.
         // the OpenAI Realtime model, which is owned by the mic button. Rendered
@@ -282,24 +286,40 @@ class ModelSelector {
         const buckets = this.allModelsData?.by_vendor;
         if (!vendor || !buckets) return;
 
-        const models = [...(buckets[vendor] || [])];
+        const all = [...(buckets[vendor] || [])];
 
-        if (models.length === 0) {
+        if (all.length === 0) {
             this.modelSelect.innerHTML = '<option value="">No models available</option>';
             return;
         }
 
-        // Sort: featured first, then alphabetically by display name
-        models.sort((a, b) => {
-            if (a.is_featured !== b.is_featured) return b.is_featured ? 1 : -1;
-            return (a.display_name || a.id).localeCompare(b.display_name || b.id);
-        });
+        // Featured-first, but PRESERVE server order within each group. The
+        // server ranks each vendor bucket by recency (newest ``created_at``
+        // first), so the first featured entry is the best default — re-sorting
+        // alphabetically here is exactly what used to float ``gpt-3.5-turbo`` to
+        // the top of OpenAI. Stable sort on the featured flag only. (#2015)
+        const ordered = [...all].sort((a, b) =>
+            (a.is_featured === b.is_featured) ? 0 : (b.is_featured ? 1 : -1));
+
+        const featured = ordered.filter(m => m.is_featured);
+        const hasFeatured = featured.length > 0;
+        // Default to the featured set; if a vendor has none, fall back to all so
+        // the dropdown is never empty.
+        const showAll = this.showAllModels || !hasFeatured;
+        let visible = showAll ? ordered : featured.slice();
+
+        // Keep the current selection visible even when it's not featured (e.g. a
+        // deprecated/older model the operator deliberately picked).
+        if (this.selectedModel && !visible.some(m => m.id === this.selectedModel)) {
+            const sel = ordered.find(m => m.id === this.selectedModel);
+            if (sel) visible = [...visible, sel];
+        }
 
         // Build model options.  Unpickable models render as <option disabled>
         // with a 🎙 prefix so the operator can see they exist but cannot
         // select them by hand (the mic button drives them).  Selecting the
         // option programmatically still works — see lockToVoiceModel().
-        this.modelSelect.innerHTML = models.map(m => {
+        const optionsHtml = visible.map(m => {
             const isUnpickable = this._unpickableModels.has(m.id);
             const star = m.is_featured ? '★ ' : '';
             const glyph = isUnpickable ? '🎙 ' : '';
@@ -308,17 +328,29 @@ class ModelSelector {
             return `<option value="${m.id}"${disabled}>${star}${glyph}${displayName}</option>`;
         }).join('');
 
-        // Seed order: saved model > server default > alphabetical first.
-        if (this.selectedModel && models.some(m => m.id === this.selectedModel)) {
+        // Expander / collapser. These are sentinel <option>s intercepted in
+        // _handleModelChange — picking one re-renders without committing a model.
+        let toggleHtml = '';
+        if (!showAll && all.length > featured.length) {
+            toggleHtml = `<option value="__show_all__">⋯ Show all ${all.length} models…</option>`;
+        } else if (this.showAllModels && hasFeatured) {
+            toggleHtml = `<option value="__show_featured__">▴ Show featured only</option>`;
+        }
+        this.modelSelect.innerHTML = optionsHtml + toggleHtml;
+
+        // Seed order: saved model > server default (when visible) > first
+        // visible. The first visible entry is the top-ranked featured model, so
+        // this is the sane default — never an alphabetical accident. (#2015)
+        if (this.selectedModel && visible.some(m => m.id === this.selectedModel)) {
             this.modelSelect.value = this.selectedModel;
-        } else if (models.length > 0) {
+        } else if (visible.length > 0) {
             const defaultId = this.allModelsData?.default;
-            if (defaultId && models.some(m => m.id === defaultId)) {
+            if (defaultId && visible.some(m => m.id === defaultId)) {
                 this.modelSelect.value = defaultId;
                 this.selectedModel = defaultId;
             } else {
-                this.modelSelect.value = models[0].id;
-                this.selectedModel = models[0].id;
+                this.modelSelect.value = visible[0].id;
+                this.selectedModel = visible[0].id;
             }
         }
     }
@@ -368,6 +400,8 @@ class ModelSelector {
     _handleProviderChange() {
         this.selectedProvider = this.providerSelect.value;
         this.selectedRoute = '';
+        // Each vendor switch starts collapsed to the featured set.
+        this.showAllModels = false;
         this._saveState();
         this._populateRoutes();
         this._populateModels();
@@ -377,7 +411,16 @@ class ModelSelector {
     }
 
     _handleModelChange() {
-        this.selectedModel = this.modelSelect.value;
+        const picked = this.modelSelect.value;
+        // Sentinel options toggle the featured/all view rather than selecting a
+        // model. Re-render and stop — no commit, no state change. (#2015)
+        if (picked === '__show_all__' || picked === '__show_featured__') {
+            this.showAllModels = (picked === '__show_all__');
+            this._populateModels();
+            this.modelSelect.value = this.selectedModel || '';
+            return;
+        }
+        this.selectedModel = picked;
         this._saveState();
         this._maybeCommit();
     }
@@ -422,14 +465,18 @@ class ModelSelector {
 
             for (const [vendor, models] of search) {
                 if (models.some(m => m.id === bareModel)) {
-                    if (this.providerSelect.value !== vendor) {
-                        this.providerSelect.value = vendor;
-                        this.selectedProvider = vendor;
-                        this._populateRoutes();
-                        this._populateModels();
-                    }
-                    this.modelSelect.value = bareModel;
+                    const vendorChanged = this.providerSelect.value !== vendor;
+                    this.providerSelect.value = vendor;
+                    this.selectedProvider = vendor;
+                    // Set the selection BEFORE (re)populating so the collapsed
+                    // featured-only view still renders the current model when it
+                    // is non-featured (e.g. an operator already on a deprecated
+                    // gpt-4). Otherwise modelSelect.value targets an option that
+                    // was never rendered and the dropdown shows blank. (#2015)
                     this.selectedModel = bareModel;
+                    if (vendorChanged) this._populateRoutes();
+                    this._populateModels();
+                    this.modelSelect.value = bareModel;
                     if (this.routeSelect && targetRoute) {
                         const opts = Array.from(this.routeSelect.options).map(o => o.value);
                         if (opts.includes(targetRoute)) {
@@ -504,15 +551,21 @@ class ModelSelector {
                     : syncData.model);
 
             if (vendor && bareModel) {
-                if (this.providerSelect && this.providerSelect.value !== vendor) {
+                // Set the selection BEFORE (re)populating so a non-featured
+                // target (e.g. an agent that switched to a deprecated model)
+                // is still rendered under the collapsed featured-only view —
+                // otherwise modelSelect.value would target a missing option and
+                // show blank. (#2015)
+                const vendorChanged = this.providerSelect && this.providerSelect.value !== vendor;
+                if (this.providerSelect && vendorChanged) {
                     this.providerSelect.value = vendor;
                     this.selectedProvider = vendor;
-                    this._populateRoutes();
-                    this._populateModels();
                 }
+                this.selectedModel = bareModel;
+                if (this.providerSelect && vendorChanged) this._populateRoutes();
                 if (this.modelSelect) {
+                    this._populateModels();
                     this.modelSelect.value = bareModel;
-                    this.selectedModel = bareModel;
                 }
                 if (this.routeSelect && route) {
                     const opts = Array.from(this.routeSelect.options).map(o => o.value);

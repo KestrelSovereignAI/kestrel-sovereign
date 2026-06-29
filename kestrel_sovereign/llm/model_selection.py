@@ -44,11 +44,18 @@ def _rank_cached_candidates(models: list[ModelInfo]) -> list[ModelInfo]:
         # Rank on the canonical id, not the formatted display_name. display_name
         # rewrites separators (e.g. ``"Gpt 5.4 Mini 2026 03 17"``) which made
         # the legacy date-stripping regex miss embedded dates.
+        # Recency comes from the provider-supplied ``created_at`` FIRST, with
+        # name-version parsing only as a fallback when no timestamp exists
+        # (local/ollama models). Parsing a version out of the id is brittle and
+        # already fails for codename schemes (Anthropic opus/sonnet/haiku, and
+        # OpenAI's upcoming gpt-5.6 Sol/Terra/Luna tiers) — ``created_at`` is
+        # naming-agnostic, so the newest release wins regardless of how the
+        # vendor names it. (#2015)
         return (
             not model.supports_tools,
             previewish,
-            _numeric_rank(model.id),
             _created_rank(model.created_at),
+            _numeric_rank(model.id),
             not model.is_featured,
             model.id.lower(),
         )

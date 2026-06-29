@@ -82,9 +82,34 @@ class ModelDiscoveryMixin:
         # This ensures models like xai/grok show up even without API discovery
         discovered_ids = set(m.id for m in all_models)
         api_discovered_ids = set(discovered_ids)  # Snapshot before synthetic additions
+        # Concrete models pinned in config are operator intent — they must stay
+        # featured regardless of recency (a private/just-released model has no
+        # useful created_at and would otherwise fall outside the recency top-N).
+        # We pass these through enrichment as an explicit featured signal rather
+        # than relying on the incoming is_featured flag, which the authoritative
+        # featured recomputation treats as untrusted cache state. (#2015 codex r2)
+        #
+        # Key by the bare VENDOR, not provider['name']: 'name' is the composite
+        # route key ("openai:api") on multi-route providers, while discovered
+        # ModelInfo.provider is the vendor ("openai") — which is what
+        # _apply_recency_visibility looks up. (#2015 codex r3)
+        def _vendor_of(provider) -> Optional[str]:
+            vendor = provider.get('vendor')
+            if vendor:
+                return vendor
+            name = provider.get('name')
+            return name.split(':', 1)[0] if name else None
+
+        configured_featured: Dict[str, set] = {}
         if hasattr(self, 'providers') and isinstance(self.providers, list):
             for provider in self.providers:
-                provider_name = provider.get('name')
+                vendor = _vendor_of(provider)
+                model_id = provider.get('model')
+                if model_id and model_id != "auto" and vendor:
+                    configured_featured.setdefault(vendor, set()).add(model_id)
+        if hasattr(self, 'providers') and isinstance(self.providers, list):
+            for provider in self.providers:
+                provider_name = _vendor_of(provider)
                 model_id = provider.get('model')
                 if model_id and model_id != "auto" and model_id not in discovered_ids:
                     # Tool support follows the route's cloud/local flag,
@@ -114,7 +139,7 @@ class ModelDiscoveryMixin:
                     logger.debug(f"Added configured model: {provider_name}/{model_id}")
 
         # Enrich models with catalog data
-        all_models = catalog.enrich_models(all_models)
+        all_models = catalog.enrich_models(all_models, pinned_featured=configured_featured)
 
         # Register discovered context limits into TokenCounter
         from kestrel_sovereign.agent.token_counter import register_discovered_limits
