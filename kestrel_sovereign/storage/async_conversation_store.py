@@ -490,10 +490,16 @@ class AsyncConversationStore:
         marker) — the messages-gone-on-refresh bug.
 
         If ``session_id`` is integer-shaped AND names a ``new_session`` marker
-        row whose metadata carries a UUID ``session_id``, return that UUID so
-        the continued turn is filed under the canonical key. A genuinely legacy
+        row that genuinely OWNS its UUID ``session_id``, return that UUID so the
+        continued turn is filed under the canonical key. A genuinely legacy
         time-gap session (row-id anchor with no marker UUID) is returned
         unchanged. Non-integer ids (already UUIDs) and ``None`` pass through.
+
+        Ownership matters: a legacy ``new_session`` marker written without an
+        explicit id could INHERIT the previous still-active session's UUID via
+        the time-gap heuristic. Canonicalizing to an inherited UUID would merge
+        the new conversation into the old one, so we only canonicalize when no
+        earlier row already carries that UUID (#2012).
         """
         if not session_id or not str(session_id).isdigit():
             return session_id
@@ -520,13 +526,44 @@ class AsyncConversationStore:
             return session_id
 
         marker_uuid = meta.get("session_id")
-        if meta.get("new_session") and marker_uuid and not str(marker_uuid).isdigit():
+        if (
+            meta.get("new_session")
+            and marker_uuid
+            and not str(marker_uuid).isdigit()
+            and await self._marker_owns_uuid(row_id, marker_uuid)
+        ):
             logger.info(
                 "Canonicalized integer session_id %s -> marker UUID %s",
                 session_id, marker_uuid,
             )
             return marker_uuid
         return session_id
+
+    async def _marker_owns_uuid(self, row_id: int, uuid: str) -> bool:
+        """True if no row earlier than ``row_id`` carries ``uuid`` as its
+        ``metadata.session_id`` — i.e. the marker at ``row_id`` minted the
+        UUID rather than inheriting it from a still-active prior session.
+
+        Conservative: on any lookup error, return False (do not canonicalize)
+        so an ambiguous marker is never merged into another conversation.
+        """
+        try:
+            esc = _escape_like_session_value(str(uuid))
+            earlier = await self.db.fetchone(
+                "SELECT 1 FROM conversation_history "
+                "WHERE agent_id = ? AND id < ? "
+                "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
+                "LIMIT 1",
+                (
+                    self.agent_id, row_id,
+                    f'%"session_id": "{esc}"%',
+                    f'%"session_id":"{esc}"%',
+                ),
+            )
+            return earlier is None
+        except Exception as e:
+            logger.warning(f"Marker ownership check failed: {e}")
+            return False
 
     async def get_message_embeddings(
         self,
@@ -720,7 +757,15 @@ class AsyncConversationStore:
         if session_id:
             session_id = await self._canonicalize_session_id(session_id)
         if not session_id:
-            session_id = await self._derive_implicit_session_id()
+            if meta.get('new_session'):
+                # A new_session marker anchors a NEW session, so it must MINT
+                # and own a fresh UUID — never inherit the previous still-active
+                # session's id from the time-gap heuristic. Inheriting it would
+                # merge the new conversation into the old one once continued
+                # turns canonicalize to the marker's id (#2012).
+                session_id = self._new_session_id()
+            else:
+                session_id = await self._derive_implicit_session_id()
 
         if session_id:
             meta['session_id'] = session_id

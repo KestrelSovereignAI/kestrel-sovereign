@@ -168,6 +168,30 @@ async def test_idempotent_second_run_is_noop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_skips_marker_that_inherited_prior_session_uuid(tmp_path):
+    """A legacy new_session marker written without an explicit id could
+    INHERIT the previous still-active session's UUID via the time-gap
+    heuristic. The migration must NOT map the marker's row-id to that
+    inherited UUID — doing so would merge two distinct conversations."""
+    db = await _db(tmp_path)
+    shared_uuid = "abababab-0000-0000-0000-000000000007"
+    # Conversation A owns the UUID (earliest row carrying it).
+    await _insert(db, "user", "A1", {"session_id": shared_uuid})
+    # An inherited new_session marker carrying the SAME UUID.
+    inherited_marker = await _insert(
+        db, "system", "", {"new_session": True, "session_id": shared_uuid}
+    )
+    # Conversation B's continued turn, mis-filed under the marker row-id.
+    b_turn = await _insert(db, "user", "B1", {"session_id": str(inherited_marker)})
+
+    await migrate_canonical_session_ids(db)
+
+    sids = await _session_ids(db)
+    # B's turn must NOT have been merged into A's UUID — left as the integer.
+    assert sids[b_turn] == str(inherited_marker)
+
+
+@pytest.mark.asyncio
 async def test_init_schema_runs_migration_on_startup(tmp_path):
     raw = SQLiteBackend(str(tmp_path / "startup-canonical.db"))
     await raw.connect()

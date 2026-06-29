@@ -121,6 +121,50 @@ async def test_continued_turns_load_under_canonical_uuid(store):
 
 
 @pytest.mark.asyncio
+async def test_new_session_marker_mints_fresh_uuid_not_inherited(store):
+    """Root fix: a new_session marker written without an explicit id while a
+    prior session is still active (within the gap window) must MINT a fresh
+    UUID, not inherit the previous session's — else the new conversation
+    merges into the old one once continued turns canonicalize."""
+    # Prior active session.
+    await store.add_conversation("user", "earlier", session_id="prior-uuid-1")
+    # New-conversation marker, exactly as POST /conversations/new writes it.
+    await store.add_conversation(
+        "system", "",
+        metadata={"type": "session_marker", "new_session": True},
+    )
+    marker_meta = await store.db.fetchone(
+        "SELECT metadata FROM conversation_history ORDER BY id DESC LIMIT 1", ()
+    )
+    marker_uuid = json.loads(marker_meta[0])["session_id"]
+    assert marker_uuid != "prior-uuid-1"
+    assert marker_uuid  # a real fresh UUID was minted
+
+
+@pytest.mark.asyncio
+async def test_canonicalize_skips_inherited_marker(store):
+    """Defense for the transition window: an OLD marker that inherited a
+    prior session's UUID (the UUID appears on an earlier row) must NOT be
+    canonicalized — the integer is returned unchanged so the conversations
+    don't merge."""
+    shared = "cdcdcdcd-0000-0000-0000-000000000009"
+    await store.add_conversation("user", "A1", session_id=shared)
+    # Hand-craft an inherited marker carrying the same UUID.
+    await store.db.execute_commit(
+        "INSERT INTO conversation_history (agent_id, role, content, metadata) "
+        "VALUES (?, ?, ?, ?)",
+        ("test-agent", "system", "",
+         json.dumps({"new_session": True, "type": "session_marker", "session_id": shared})),
+    )
+    marker_id = (await store.db.fetchone(
+        "SELECT id FROM conversation_history ORDER BY id DESC LIMIT 1", ()
+    ))[0]
+
+    # The inherited marker is NOT owned → integer returned unchanged.
+    assert await store._canonicalize_session_id(str(marker_id)) == str(marker_id)
+
+
+@pytest.mark.asyncio
 async def test_query_session_rows_404s_on_soft_deleted_numeric_anchor(store):
     """Regression (codex): a numeric session_id whose anchor row is
     soft-deleted must resolve to no rows (→ 404) even when later rows in

@@ -840,31 +840,55 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
     Dialect-neutral: plain ``?`` placeholders, no DDL. Plaintext metadata
     only — ``content`` encryption at rest is untouched (#1401).
     """
-    # Step 1: build {marker_row_id (str) -> marker UUID} for every
-    # new_session marker that carries a UUID session_id.
-    marker_rows = await db.fetchall(
+    # Fetch every row carrying a session_id once, in id (≈chronological)
+    # order, and reuse it for both map-building and the rewrite.
+    history_rows = await db.fetchall(
         "SELECT id, metadata FROM conversation_history "
-        "WHERE metadata LIKE '%new_session%'",
+        "WHERE metadata LIKE '%session_id%' "
+        "ORDER BY id ASC",
         (),
     )
-    marker_uuid_by_rowid: dict[str, str] = {}
-    for row_id, raw in marker_rows:
+
+    # First occurrence (lowest row-id) of each UUID — the row that minted it.
+    first_rowid_by_uuid: dict[str, int] = {}
+    # Candidate markers: row-id -> its UUID.
+    candidate_markers: dict[int, str] = {}
+    for row_id, raw in history_rows:
         meta, sid = _extract_session_id(raw)
-        if not meta or not meta.get("new_session"):
+        if meta is None or sid is None:
             continue
-        if sid and not str(sid).isdigit():
-            marker_uuid_by_rowid[str(row_id)] = str(sid)
+        sid_str = str(sid)
+        if sid_str.isdigit():
+            continue
+        first_rowid_by_uuid.setdefault(sid_str, row_id)
+        if meta.get("new_session"):
+            candidate_markers[row_id] = sid_str
+
+    # Build {marker_row_id (str) -> UUID} ONLY for markers that genuinely OWN
+    # their UUID (they are the first row carrying it). A legacy marker written
+    # without an explicit id could have INHERITED the previous still-active
+    # session's UUID via the time-gap heuristic; mapping the marker's row-id to
+    # that inherited UUID would permanently merge two distinct conversations.
+    marker_uuid_by_rowid: dict[str, str] = {}
+    skipped_inherited = 0
+    for marker_row_id, uuid in candidate_markers.items():
+        if first_rowid_by_uuid.get(uuid) == marker_row_id:
+            marker_uuid_by_rowid[str(marker_row_id)] = uuid
+        else:
+            skipped_inherited += 1
+
+    if skipped_inherited:
+        logger.info(
+            "canonical-session-id migration (#2012): skipped %d new_session "
+            "marker(s) that inherited a prior session's UUID (ambiguous — not "
+            "relinked to avoid merging conversations).", skipped_inherited,
+        )
 
     if not marker_uuid_by_rowid:
         return
 
-    # Step 2: rewrite conversation_history rows whose session_id is an
-    # integer naming one of those markers.
-    history_rows = await db.fetchall(
-        "SELECT id, metadata FROM conversation_history "
-        "WHERE metadata LIKE '%session_id%'",
-        (),
-    )
+    # Rewrite conversation_history rows whose session_id is an integer naming
+    # one of those owned markers.
     rewritten_history = 0
     async with db.transaction():
         for row_id, raw in history_rows:
