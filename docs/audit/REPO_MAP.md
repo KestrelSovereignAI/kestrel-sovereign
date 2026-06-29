@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-28
-**Scope:** 1842 tracked files (1208 `.py`, 318 `.md`, 316 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-29
+**Scope:** 1843 tracked files (1209 `.py`, 318 `.md`, 316 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -260,7 +260,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/endpoints/models.py** — Model, wallet, and IPFS status endpoints.
   - `class CreateAgentRequest`; `async def get_agents(request)`; `async def create_agent(request, body)`; `async def delete_agent(request, agent_name)`; `async def get_identity(request)`; `class UpdateIdentityRequest`; `class SetAvatarUrlRequest`; `class GenerateAvatarRequest`; `…`
 - **kestrel_sovereign/endpoints/observability.py** — Observability endpoint - query A2A observability events for debugging.
-  - `async def get_observability_events(request, agent_name, event_type, session_id, …)`; `async def get_observability_summary(request, minutes)`
+  - `async def get_observability_events(request, agent_name, event_type, session_id, …)`; `async def get_observability_summary(request, minutes)`; `async def get_metric_summary(request, metric_name, minutes, agent_name)`
 - **kestrel_sovereign/endpoints/rasa_shim.py** — Rasa-compatible webhook shim for Kestrel AI.
   - `class RasaWebhookRequest`; `class RasaWebhookResponse`; `async def rasa_webhook(request, payload)`
 - **kestrel_sovereign/endpoints/restart_events.py** — Restart status-event API — repaint the bubble trail on chat reload.
@@ -1881,7 +1881,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_sovereignty_v2.py** — —
   - `class MockStorageResult`; `class MockFilecoinAdapter`; `def temp_db()`; `async def test_sovereignty_export_v3_car(temp_db)`; `class MockLLMService`; `class MockWallet`; `async def test_agent_export_command(temp_db, skip_bootstrap)`
 - **tests/integration/test_storage_backend_parity.py** — SQLite/PostgreSQL semantic parity contracts for storage seams.
-  - `async def test_conversation_session_queries_are_backend_neutral(db_backend)`; `async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backend)`; `async def test_database_introspection_helpers_are_backend_neutral(db_backend)`; `async def test_webhook_registration_and_audit_history_are_backend_neutral(db_backend)`; `async def test_db_explorer_scopes_rows_to_requesting_agent(db_backend)`; `async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend)`; `async def test_db_explorer_scopes_graph_nodes_by_properties_agent_id(db_backend)`; `async def test_db_explorer_scopes_graph_edges_via_node_membership(db_backend)`
+  - `async def test_conversation_session_queries_are_backend_neutral(db_backend)`; `async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backend)`; `async def test_database_introspection_helpers_are_backend_neutral(db_backend)`; `async def test_webhook_registration_and_audit_history_are_backend_neutral(db_backend)`; `async def test_db_explorer_scopes_rows_to_requesting_agent(db_backend)`; `async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend)`; `async def test_db_explorer_scopes_graph_nodes_by_properties_agent_id(db_backend)`; `async def test_db_explorer_scopes_graph_edges_via_node_membership(db_backend)`; `…`
 - **tests/integration/test_sync_layer.py** — Sync Layer Integration Tests
   - `class MockSyncState`; `class MockSyncTarget`; `def temp_db(tmp_path)`; `def temp_db_with_keeper(tmp_path)`; `def temp_db_with_data(tmp_path)`; `def mock_target()`; `def failing_target()`; `def network_partition_target()`; `…`
 - **tests/integration/test_tool_calling_e2e.py** — Integration tests for OpenAI-style tool calling with Features as Subagents.
@@ -2106,7 +2106,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_cli_serve.py** — ``kestrel serve`` CLI tests — local model server launcher/registry.
   - `def test_resolve_gguf_single_file(tmp_path)`; `def test_resolve_gguf_picks_first_shard(tmp_path)`; `def test_resolve_gguf_no_match_raises(tmp_path)`; `def test_resolve_gguf_ambiguous_raises(tmp_path)`; `def test_load_registry_applies_default_port(tmp_path)`; `def test_resolve_registry_path_prefers_env(tmp_path, monkeypatch)`; `def test_resolve_registry_path_none_when_absent(tmp_path, monkeypatch)`; `def test_build_command_path_binary_and_flags(tmp_path)`; `…`
 - **tests/unit/test_cli_update.py** — Tests for ``kestrel update`` — one-shot pull + install + sync + restart.
-  - `def stub_project_dir(tmp_path, monkeypatch)`; `def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir)`; `def test_update_short_circuits_when_pull_fails(stub_project_dir)`; `def test_update_short_circuits_when_install_fails(stub_project_dir)`; `def test_dirty_working_tree_refuses_pull(stub_project_dir, capsys)`; `def test_allow_dirty_lets_pull_proceed(stub_project_dir)`; `def test_dry_run_invokes_no_shell_commands(stub_project_dir, capsys)`; `def test_no_flag_skips_individual_step(stub_project_dir, skipped_flag, expected_absent)`; `…`
+  - `def stub_project_dir(tmp_path, monkeypatch)`; `def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir)`; `def test_update_runs_feature_sync_before_reconcile(stub_project_dir)`; `def test_update_no_host_manifest_skips_sync_but_still_reconciles(stub_project_dir, capsys)`; `def test_update_short_circuits_when_pull_fails(stub_project_dir)`; `def test_update_short_circuits_when_install_fails(stub_project_dir)`; `def test_dirty_working_tree_refuses_pull(stub_project_dir, capsys)`; `def test_allow_dirty_lets_pull_proceed(stub_project_dir)`; `…`
 - **tests/unit/test_cli_update_reconcile.py** — Tests for the ``kestrel update`` reconcile step (#1788).
   - `def patched(monkeypatch, tmp_path)`; `def test_reconcile_installs_missing_allowlisted_feature(patched, capsys)`; `def test_reconcile_errors_on_unresolvable_class(monkeypatch, tmp_path, capsys)`; `def test_reconcile_dry_run_mutates_nothing(patched)`; `def test_execute_editable_update_runs_git_pull_only()`; `def test_execute_editable_install_pulls_then_links()`; `def test_execute_editable_relink_switches_from_pypi_install()`; `def test_execute_editable_pull_failure_reports_and_skips_link()`; `…`
 - **tests/unit/test_cli_verify_install.py** — ``kestrel verify-install`` CLI tests — sub-PR 2.2 of epic #1050 (bash-to-Python port of ``scripts/verify_clean_install.sh``).
@@ -2467,6 +2467,8 @@ Repo entry points and standard project files.
   - `class TestUpdateAccessActuallyWrites`; `class TestRetrieveTriggersAccessUpdate`; `class TestMemoryConsolidateToolExists`; `class TestSchedulerDefaultsIncludeConsolidation`
 - **tests/unit/test_memory_wiring_integration.py** — Tests requested by Nellie on PR #633 review:
   - `class TestMemoryConsolidateEndToEnd`; `class TestRetrievalScoreChangesWithAccess`; `class TestNoStraySessionGapDefinitions`
+- **tests/unit/test_metric_summary.py** — Unit tests for ObservabilityStore.get_metric_summary (#969 item 2).
+  - `async def test_metric_summary_counts_aggregates_and_carries_forensic_metadata(tmp_path)`; `async def test_metric_summary_filters_by_agent(tmp_path)`; `async def test_metric_summary_empty_when_metric_never_emitted(tmp_path)`; `async def test_metric_summary_finds_rare_metric_amid_high_volume_other(tmp_path)`; `async def test_metric_summary_truncated_flag_when_window_exceeds_limit(tmp_path)`
 - **tests/unit/test_microcompact.py** — Tests for microcompact — zero-cost stale tool result clearing.
   - `def context_manager()`; `class TestMicrocompactBasic`; `class TestMicrocompactProtection`; `class TestMicrocompactMarkerFormat`; `class TestMicrocompactMixedHistory`
 - **tests/unit/test_migrate_llm_config.py** — Unit tests for kestrel_sovereign.setup.migrate_llm_config (#939).
@@ -2654,9 +2656,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_search_history_tokenized_fallback.py** — Regression: broad natural-language queries must find relevant memories.
   - `class TestTokenizeForSearch`; `class TestNegationGate`; `class TestTechnicalTermsUnregressed`; `class TestTokenMatchScore`; `async def test_broad_query_finds_relevant_row_via_token_fallback()`; `async def test_exact_substring_still_works()`; `async def test_token_fallback_does_not_match_low_overlap()`; `async def test_exact_matches_ranked_before_token_fallback()`; `…`
 - **tests/unit/test_secondary_endpoint_contracts.py** — Focused contract tests for remaining database/files/observability/saved-items routes.
-  - `def test_database_table_query_contract_supports_search_and_pagination()`; `def test_file_get_and_observability_summary_contracts()`; `def test_saved_items_listing_filters_and_schema_contracts()`; `def test_saved_items_endpoint_refuses_privacy_hidden_modes()`; `def test_saved_items_item_crud_search_and_pin_contracts()`
+  - `def test_database_table_query_contract_supports_search_and_pagination()`; `def test_file_get_and_observability_summary_contracts()`; `def test_observability_summary_breaks_out_metrics_by_name()`; `def test_metric_summary_endpoint_passes_through_store_summary()`; `def test_saved_items_listing_filters_and_schema_contracts()`; `def test_saved_items_endpoint_refuses_privacy_hidden_modes()`; `def test_saved_items_item_crud_search_and_pin_contracts()`
 - **tests/unit/test_security_endpoint_contracts.py** — Focused contract tests for security endpoints.
-  - `def test_security_tree_pending_and_audit_endpoints_serialize_expected_shapes()`; `def test_security_permission_mutation_endpoints_validate_levels_and_scope()`; `def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()`; `def test_security_global_auto_mode_endpoints_are_session_scoped()`; `def test_security_endpoints_return_503_when_feature_is_unavailable()`
+  - `def test_security_tree_pending_and_audit_endpoints_serialize_expected_shapes()`; `def test_security_permission_mutation_endpoints_validate_levels_and_scope()`; `def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()`; `def test_security_global_auto_mode_endpoints_support_scopes()`; `def test_security_global_auto_mode_rejects_invalid_scope()`; `def test_security_endpoints_return_503_when_feature_is_unavailable()`
 - **tests/unit/test_security_feature.py** — Unit Tests for Kestrel Security Feature.
   - `def track_store(store)`; `class TestPermissionStore`; `class TestApprovalQueue`; `class TestSecurityHook`; `class TestSecurityIntegration`; `class TestApprovalQueueScopePersistence`; `class TestSecurityFeature`; `class TestSetPermissionUnknownTarget`
 - **tests/unit/test_security_feature_lookup.py** — Regression test for the security-feature-lookup bug.
