@@ -387,6 +387,16 @@ class SavedItemsStore:
             logger.warning(f"Embedding service not available: {e}")
             return None
 
+    def has_embedding_service(self) -> bool:
+        """Whether an embedding provider is available for semantic search.
+
+        When this is False, ``search`` silently degrades to a keyword
+        (text-LIKE) scan. Callers surface this so an empty semantic
+        result reads as "semantic search unavailable (no embedding
+        provider)" instead of "no matching memory" (#2020).
+        """
+        return self._get_embedding_service() is not None
+
     async def save_item(
         self,
         item_type: str,
