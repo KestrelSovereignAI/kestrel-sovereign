@@ -876,6 +876,22 @@ class AsyncDatabase:
                 e, exc_info=True,
             )
 
+        # #2012: relink conversation messages whose session_id was stored as a
+        # bare integer (the list endpoint's old row-id key, echoed back by the
+        # UI) to the canonical UUID on the session's new_session marker — in
+        # both conversation_history and conversation_titles. Idempotent +
+        # transactional; non-fatal because un-relinked rows only degrade the
+        # web message pane on refresh, not boot.
+        try:
+            from .sqla.migrations import migrate_canonical_session_ids
+            await migrate_canonical_session_ids(self)
+        except Exception as e:
+            logger.error(
+                "canonical-session-id migration (#2012) failed: %s. Legacy "
+                "integer-keyed messages remain split until next boot.",
+                e, exc_info=True,
+            )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _migrate_add_column(

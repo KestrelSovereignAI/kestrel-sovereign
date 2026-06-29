@@ -29,6 +29,7 @@ from kestrel_sovereign.privacy import (
     privacy_config_to_mode,
 )
 from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
+from kestrel_sovereign.storage.async_conversation_store import _escape_like_session_value
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -753,6 +754,116 @@ class PrivacyEnforcingStorage:
             ORDER BY created_at ASC
             LIMIT ?
         """, (agent_id, start_time, limit))
+
+    async def query_session_rows(
+        self, session_id: str, limit: int = 100
+    ) -> List[Tuple]:
+        """Resolve every message belonging to ``session_id``, respecting privacy.
+
+        Unlike :meth:`query_conversation_messages` (which only time-gap walks
+        forward from a row-id anchor), this delegates to the store's canonical
+        dual-scheme resolver ``_get_session_messages`` — so it links messages
+        both by time-gap clustering AND by explicit ``metadata.session_id``
+        (UUID) membership. This is what lets a conversation whose continued
+        turns were mis-filed under a different key still load completely on a
+        hard refresh (#2012).
+
+        Returns rows as tuples in the same shape the conversation endpoints
+        expect: ``(id, role, content, metadata, created_at, model, provider)``,
+        in chronological (ASC) order. The store resolver yields an 8-tuple with
+        ``rendered_content`` at index 5; we drop it so positional model/provider
+        accesses in the endpoint stay at indices 5/6.
+        """
+        if self._privacy_config.is_ephemeral():
+            return []
+
+        if self._policy.use_session_storage:
+            # Isolated/temp storage has no persistent UUID sessions; the whole
+            # in-memory list is the session.
+            rows = []
+            for i, conv in enumerate(self._session_conversations):
+                rows.append((
+                    i,
+                    conv.get("role", ""),
+                    conv.get("content", ""),
+                    json.dumps(conv.get("metadata", {})) if conv.get("metadata") else None,
+                    conv.get("created_at", None),
+                    conv.get("model"),
+                    conv.get("provider"),
+                ))
+            return rows[:limit]
+
+        # Preserve the live-anchor guard the previous detail-read path had
+        # (via query_conversation_start's `deleted_at IS NULL` filter): for a
+        # numeric session_id, _get_session_messages looks up the anchor row
+        # IGNORING deleted_at (it needs the trashed anchor's timestamp for
+        # restore workflows), so a soft-deleted anchor whose cluster siblings
+        # are still live would otherwise leak rows instead of 404ing. UUID ids
+        # have no single anchor row — their live filtering is intrinsic.
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is not None:
+            anchor = await self._storage.db.fetchone(
+                "SELECT 1 FROM conversation_history "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (row_id, self._storage.agent_id),
+            )
+            if not anchor:
+                return []
+
+        raw_rows = await self._storage.get_session_message_rows(session_id, limit)
+        # get_session_message_rows returns rows DESC; the endpoint walks ASC.
+        normalized = []
+        for row in reversed(raw_rows):
+            # (id, role, content, metadata, created_at, rendered_content,
+            #  model, provider) -> drop rendered_content at index 5.
+            normalized.append((
+                row[0], row[1], row[2], row[3], row[4],
+                row[6] if len(row) > 6 else None,
+                row[7] if len(row) > 7 else None,
+            ))
+        return normalized
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Whether a session exists at all, respecting privacy.
+
+        ``query_session_rows`` strips ``session_marker`` rows, so a freshly
+        started (marker-only) session resolves to zero rows. Callers use this
+        to tell "session exists but has no displayable messages yet" (→ 200
+        with an empty list) from "session not found" (→ 404), preserving the
+        old ``query_conversation_start`` contract (#2012).
+
+        - numeric session_id: existence is a LIVE anchor row (so a
+          soft-deleted anchor still 404s, matching the trash semantics).
+        - UUID session_id: any LIVE row carrying it in ``metadata.session_id``
+          (the marker alone is enough).
+        """
+        if self._privacy_config.is_ephemeral():
+            return False
+        if self._policy.use_session_storage:
+            return bool(self._session_conversations)
+
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is not None:
+            anchor = await self._storage.db.fetchone(
+                "SELECT 1 FROM conversation_history "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (row_id, self._storage.agent_id),
+            )
+            return anchor is not None
+
+        esc = _escape_like_session_value(str(session_id))
+        row = await self._storage.db.fetchone(
+            "SELECT 1 FROM conversation_history "
+            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
+            "LIMIT 1",
+            (
+                self._storage.agent_id,
+                f'%"session_id": "{esc}"%',
+                f'%"session_id":"{esc}"%',
+            ),
+        )
+        return row is not None
 
     async def query_last_conversation_row(
         self, agent_id: str

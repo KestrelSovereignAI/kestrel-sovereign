@@ -477,6 +477,94 @@ class AsyncConversationStore:
         import uuid
         return str(uuid.uuid4())
 
+    async def _canonicalize_session_id(
+        self, session_id: Optional[str]
+    ) -> Optional[str]:
+        """Normalize an incoming session_id to its canonical UUID (#2012).
+
+        The conversation-list endpoint historically keyed each session by the
+        row-id of its first message, so the UI would round-trip a bare integer
+        (e.g. ``"1314"``) as the session_id on the next turn. Stamping that
+        integer onto continued messages splits one conversation across two keys
+        (the integer here vs. the UUID on the session's own ``new_session``
+        marker) — the messages-gone-on-refresh bug.
+
+        If ``session_id`` is integer-shaped AND names a ``new_session`` marker
+        row that genuinely OWNS its UUID ``session_id``, return that UUID so the
+        continued turn is filed under the canonical key. A genuinely legacy
+        time-gap session (row-id anchor with no marker UUID) is returned
+        unchanged. Non-integer ids (already UUIDs) and ``None`` pass through.
+
+        Ownership matters: a legacy ``new_session`` marker written without an
+        explicit id could INHERIT the previous still-active session's UUID via
+        the time-gap heuristic. Canonicalizing to an inherited UUID would merge
+        the new conversation into the old one, so we only canonicalize when no
+        earlier row already carries that UUID (#2012).
+        """
+        if not session_id or not str(session_id).isdigit():
+            return session_id
+
+        row_id = coerce_persistent_message_id(session_id)
+        if row_id is None:
+            return session_id
+
+        try:
+            row = await self.db.fetchone(
+                "SELECT metadata FROM conversation_history "
+                "WHERE id = ? AND agent_id = ?",
+                (row_id, self.agent_id),
+            )
+        except Exception as e:
+            logger.warning(f"Session canonicalization lookup failed: {e}")
+            return session_id
+
+        if not row or not row[0]:
+            return session_id
+        try:
+            meta = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return session_id
+
+        marker_uuid = meta.get("session_id")
+        if (
+            meta.get("new_session")
+            and marker_uuid
+            and not str(marker_uuid).isdigit()
+            and await self._marker_owns_uuid(row_id, marker_uuid)
+        ):
+            logger.info(
+                "Canonicalized integer session_id %s -> marker UUID %s",
+                session_id, marker_uuid,
+            )
+            return marker_uuid
+        return session_id
+
+    async def _marker_owns_uuid(self, row_id: int, uuid: str) -> bool:
+        """True if no row earlier than ``row_id`` carries ``uuid`` as its
+        ``metadata.session_id`` — i.e. the marker at ``row_id`` minted the
+        UUID rather than inheriting it from a still-active prior session.
+
+        Conservative: on any lookup error, return False (do not canonicalize)
+        so an ambiguous marker is never merged into another conversation.
+        """
+        try:
+            esc = _escape_like_session_value(str(uuid))
+            earlier = await self.db.fetchone(
+                "SELECT 1 FROM conversation_history "
+                "WHERE agent_id = ? AND id < ? "
+                "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
+                "LIMIT 1",
+                (
+                    self.agent_id, row_id,
+                    f'%"session_id": "{esc}"%',
+                    f'%"session_id":"{esc}"%',
+                ),
+            )
+            return earlier is None
+        except Exception as e:
+            logger.warning(f"Marker ownership check failed: {e}")
+            return False
+
     async def get_message_embeddings(
         self,
         message_ids: List[int],
@@ -630,7 +718,7 @@ class AsyncConversationStore:
         derived inside ``add_conversation`` is invisible to the caller.
         """
         if provided:
-            return provided
+            return await self._canonicalize_session_id(provided)
         return await self._derive_implicit_session_id()
 
     async def add_conversation(self, role: str, content: str,
@@ -662,9 +750,22 @@ class AsyncConversationStore:
         """
         meta = dict(metadata) if metadata else {}
 
-        # Resolve session_id: explicit wins; otherwise derive from time gap
+        # Resolve session_id: explicit wins; otherwise derive from time gap.
+        # Canonicalize an explicit id first so a row-id echoed back by an older
+        # UI client is re-linked to its session's UUID rather than splitting the
+        # conversation across two keys (#2012).
+        if session_id:
+            session_id = await self._canonicalize_session_id(session_id)
         if not session_id:
-            session_id = await self._derive_implicit_session_id()
+            if meta.get('new_session'):
+                # A new_session marker anchors a NEW session, so it must MINT
+                # and own a fresh UUID — never inherit the previous still-active
+                # session's id from the time-gap heuristic. Inheriting it would
+                # merge the new conversation into the old one once continued
+                # turns canonicalize to the marker's id (#2012).
+                session_id = self._new_session_id()
+            else:
+                session_id = await self._derive_implicit_session_id()
 
         if session_id:
             meta['session_id'] = session_id
@@ -1190,6 +1291,18 @@ class AsyncConversationStore:
             f"Invalid deleted_filter={deleted_filter!r}; "
             "expected 'live', 'deleted', or 'all'"
         )
+
+    async def get_session_message_rows(
+        self, session_id: str, limit: int = 100
+    ) -> List[tuple]:
+        """Public entry point to the canonical dual-scheme session resolver.
+
+        Thin wrapper over :meth:`_get_session_messages` so callers outside
+        this module (the ``AsyncStorage`` facade, the privacy wrapper, the
+        conversation endpoints) can resolve a session by either a UUID or a
+        legacy row-id without reaching into a private method (#2012).
+        """
+        return await self._get_session_messages(session_id, limit)
 
     async def _get_session_messages(
         self,
