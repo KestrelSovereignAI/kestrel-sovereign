@@ -925,15 +925,18 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
         conversations = sum(1 for m in marker_ids if m in markers_with_content)
         if key in orphan_keys:
             conversations += 1
-        if conversations <= 1 and key not in orphan_keys:
-            # The single conversation is owned by these marker(s) (not by a
-            # prior orphan), so their integer keys — content rows AND titles —
-            # belong to this UUID. When the lone conversation is orphan-owned,
-            # the markers are separate inherited/empty sessions; mapping them
-            # would move their own titles onto the prior conversation, so we
-            # leave them untouched.
+        if conversations <= 1:
+            # Map only markers that BELONG to the single conversation: the one
+            # content-bearing marker (at most one, since conversations<=1), or
+            # a degenerate sole marker (titled but empty). An empty marker that
+            # merely INHERITED the UUID — when the content is owned by another
+            # marker or a prior orphan — is a separate session; mapping it would
+            # move its own title onto the owner's conversation.
+            sole_marker = len(marker_ids) == 1
             for marker_row_id in marker_ids:
-                marker_uuid_by_rowid[str(marker_row_id)] = uuid
+                owns = marker_row_id in markers_with_content
+                if owns or (sole_marker and key not in orphan_keys):
+                    marker_uuid_by_rowid[str(marker_row_id)] = uuid
         else:
             skipped_inherited += len(marker_ids)
 

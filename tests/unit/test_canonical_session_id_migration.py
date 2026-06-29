@@ -284,6 +284,28 @@ async def test_empty_inherited_marker_title_not_remapped(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_empty_inherited_marker_over_marker_owned_content_keeps_title(tmp_path):
+    """codex (symmetric to the orphan case): marker A owns the UUID with its
+    own UUID-keyed turns; a later marker B inherits the UUID but is empty.
+    B's title must stay under B's own key — not move onto A's conversation."""
+    db = await _db(tmp_path)
+    uuid = "b0b0b0b0-0000-0000-0000-000000000011"
+    await _insert(db, "system", "", {"new_session": True, "session_id": uuid})  # marker A
+    await _insert(db, "user", "A owns this", {"session_id": uuid})               # A content
+    marker_b = await _insert(db, "system", "", {"new_session": True, "session_id": uuid})
+    await db.execute(
+        "INSERT INTO conversation_titles (agent_id, session_id, name) VALUES (?, ?, ?)",
+        ("test-agent", str(marker_b), "B fresh title"),
+    )
+
+    await migrate_canonical_session_ids(db)
+
+    rows = await db.fetchall("SELECT session_id, name FROM conversation_titles", ())
+    assert (str(marker_b), "B fresh title") in rows
+    assert all(sid != uuid for sid, _ in rows)
+
+
+@pytest.mark.asyncio
 async def test_collision_analysis_is_agent_scoped(tmp_path):
     """codex: a UUID reused across two agents (imported/restored data) is NOT
     a collision — each agent's session must still consolidate independently."""
