@@ -238,6 +238,54 @@ class TestExecuteNamedToolGovernance:
         assert post.feature_name == "email"
 
     @pytest.mark.asyncio
+    async def test_dispatches_dynamically_mounted_direct_tool(self):
+        """A dynamically-mounted tool — e.g. an MCP server's tools mounted via
+        register_dynamic_tools — lives in ``_direct_tools``, NOT in any
+        feature's ``get_tools()``. execute_named_tool must resolve + dispatch it
+        (the chat path already does), not raise ToolNotRegisteredError.
+
+        Emma's MCP dogfood: ``mcp__<server>__<tool>`` was advertised to the LLM
+        but failed on invocation with 'not registered with any enabled feature'
+        because execute_named_tool only walked feature tools + subagents.
+        """
+        tool = _FakeTool(
+            "mcp__test_server__echo", returns={"success": True, "echo": "hi"}
+        )
+        agent = _MinimalOrchestrator(
+            features={}, hooks_manager=_FakeHooksManager()
+        )
+        # Mounted dynamic tool (not exposed by any feature.get_tools()).
+        agent._direct_tools = {"mcp__test_server__echo": tool}
+        agent._tool_to_feature = {"mcp__test_server__echo": "mcp_agent"}
+
+        result = await agent.execute_named_tool(
+            "mcp__test_server__echo",
+            {"text": "hi"},
+            session_id="mcp-1",
+            source="mcp",
+        )
+
+        # Dispatched (not ToolNotRegisteredError) and returned the tool result.
+        assert tool.calls == [{"text": "hi"}]
+        assert result == {"success": True, "echo": "hi"}
+        # Governance still applied to the dynamic tool.
+        assert len(agent.hooks_manager.pre_calls) == 1
+        assert agent.hooks_manager.pre_calls[0].tool_name == "mcp__test_server__echo"
+        assert len(agent.hooks_manager.post_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_still_raises_when_direct_tools_present(self):
+        """A name absent from features AND _direct_tools still raises — the new
+        dynamic-tool branch must not swallow genuinely-unknown tools."""
+        agent = _MinimalOrchestrator(
+            features={}, hooks_manager=_FakeHooksManager()
+        )
+        agent._direct_tools = {"mcp__test_server__echo": _FakeTool("x")}
+        agent._tool_to_feature = {}
+        with pytest.raises(ToolNotRegisteredError):
+            await agent.execute_named_tool("does_not_exist", {}, session_id="s")
+
+    @pytest.mark.asyncio
     async def test_pre_hook_deny_blocks_execution(self, fake_tool):
         """The headline #1314 behavior — a DENY decision must NOT run the tool."""
         feature = _FakeFeature("email", [fake_tool])
