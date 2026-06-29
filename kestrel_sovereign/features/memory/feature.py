@@ -1195,6 +1195,56 @@ class MemoryFeature(Feature):
         )
 
     @tool(
+        name="list_trashed_messages",
+        description="List soft-deleted (trashed) individual messages so you can find one to restore_message_by_id or purge_message_by_id. Returns message_id, session_id, role, a short preview, and when it was trashed — most-recently-trashed first. This is the message-level counterpart to list_conversations(include_trashed=True), which lists whole trashed sessions; use this to find messages that were trashed individually (e.g. by delete_messages) inside otherwise-live conversations.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory trash"
+    )
+    async def list_trashed_messages(self, limit: int = 100) -> ToolResult:
+        """List individual soft-deleted messages for navigation (#2025).
+
+        Args:
+            limit: Maximum number of trashed messages to return
+                (most-recently-trashed first).
+        """
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        try:
+            limit_val = max(1, min(int(limit), 1000))
+        except (TypeError, ValueError):
+            limit_val = 100
+
+        try:
+            rows = await storage.list_trashed_conversations(limit=limit_val)
+        except Exception as e:
+            logger.error(f"list_trashed_messages failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        messages = []
+        for row in rows:
+            meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            content = row.get("content") or ""
+            # Unwrap sent-form so the preview is the raw user text, consistent
+            # with list_conversations (no-op on assistant / legacy rows).
+            preview = extract_raw_user_content(content) if content else ""
+            if preview:
+                preview = preview[:80] + ("..." if len(preview) > 80 else "")
+            messages.append({
+                "message_id": row.get("id"),
+                "session_id": meta.get("session_id"),
+                "role": row.get("role"),
+                "preview": preview,
+                "deleted_at": row.get("deleted_at"),
+            })
+
+        return ToolResult.ok(
+            confirmation=f"{len(messages)} trashed message(s)",
+            data={"messages": messages, "count": len(messages)},
+        )
+
+    @tool(
         name="memory_consolidate",
         description="Consolidate recent messages into narrative episodes, detect temporal patterns, and archive decayed memories. Runs the cognitive memory pipeline that turns raw conversation into structured long-term memory. Safe to schedule periodically (e.g. nightly).",
         category=ToolCategory.MEMORY,
