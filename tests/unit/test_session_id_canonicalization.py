@@ -165,6 +165,33 @@ async def test_canonicalize_skips_inherited_marker(store):
 
 
 @pytest.mark.asyncio
+async def test_canonicalize_relinks_double_marker_same_session(store):
+    """Two new_session markers sharing a UUID with NO content row between
+    them are ONE session — an integer key naming the second marker must
+    canonicalize to the shared UUID (the live-Emma 1313/1314 case)."""
+    shared = "e1fd6fe5-885e-43b2-b6e2-cfbea64f66a2"
+    # First marker mints the UUID.
+    await store.db.execute_commit(
+        "INSERT INTO conversation_history (agent_id, role, content, metadata) "
+        "VALUES (?, ?, ?, ?)",
+        ("test-agent", "system", "",
+         json.dumps({"new_session": True, "type": "session_marker", "session_id": shared})),
+    )
+    # Second marker re-stamps the same UUID, no content in between.
+    await store.db.execute_commit(
+        "INSERT INTO conversation_history (agent_id, role, content, metadata) "
+        "VALUES (?, ?, ?, ?)",
+        ("test-agent", "system", "",
+         json.dumps({"new_session": True, "type": "session_marker", "session_id": shared})),
+    )
+    marker2_id = (await store.db.fetchone(
+        "SELECT id FROM conversation_history ORDER BY id DESC LIMIT 1", ()
+    ))[0]
+
+    assert await store._canonicalize_session_id(str(marker2_id)) == shared
+
+
+@pytest.mark.asyncio
 async def test_query_session_rows_404s_on_soft_deleted_numeric_anchor(store):
     """Regression (codex): a numeric session_id whose anchor row is
     soft-deleted must resolve to no rows (→ 404) even when later rows in

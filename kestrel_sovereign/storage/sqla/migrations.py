@@ -849,8 +849,12 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
         (),
     )
 
-    # First occurrence (lowest row-id) of each UUID — the row that minted it.
-    first_rowid_by_uuid: dict[str, int] = {}
+    # First occurrence (lowest row-id) of each UUID among CONTENT rows (i.e.
+    # NOT new_session markers). A marker is safe to canonicalize to only if no
+    # earlier content row already owns its UUID — earlier markers sharing the
+    # UUID are the same session (e.g. a double new-conversation marker), not a
+    # prior conversation.
+    first_content_rowid_by_uuid: dict[str, int] = {}
     # Candidate markers: row-id -> its UUID.
     candidate_markers: dict[int, str] = {}
     for row_id, raw in history_rows:
@@ -860,28 +864,30 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
         sid_str = str(sid)
         if sid_str.isdigit():
             continue
-        first_rowid_by_uuid.setdefault(sid_str, row_id)
         if meta.get("new_session"):
             candidate_markers[row_id] = sid_str
+        else:
+            first_content_rowid_by_uuid.setdefault(sid_str, row_id)
 
-    # Build {marker_row_id (str) -> UUID} ONLY for markers that genuinely OWN
-    # their UUID (they are the first row carrying it). A legacy marker written
-    # without an explicit id could have INHERITED the previous still-active
-    # session's UUID via the time-gap heuristic; mapping the marker's row-id to
-    # that inherited UUID would permanently merge two distinct conversations.
+    # Build {marker_row_id (str) -> UUID}, skipping markers that INHERITED a
+    # prior real conversation's UUID (a content row earlier than the marker
+    # already carries it) — relinking those would merge two distinct
+    # conversations. Markers whose UUID is only shared by earlier markers are
+    # the same session and ARE relinked.
     marker_uuid_by_rowid: dict[str, str] = {}
     skipped_inherited = 0
     for marker_row_id, uuid in candidate_markers.items():
-        if first_rowid_by_uuid.get(uuid) == marker_row_id:
-            marker_uuid_by_rowid[str(marker_row_id)] = uuid
-        else:
+        content_first = first_content_rowid_by_uuid.get(uuid)
+        if content_first is not None and content_first < marker_row_id:
             skipped_inherited += 1
+        else:
+            marker_uuid_by_rowid[str(marker_row_id)] = uuid
 
     if skipped_inherited:
         logger.info(
             "canonical-session-id migration (#2012): skipped %d new_session "
-            "marker(s) that inherited a prior session's UUID (ambiguous — not "
-            "relinked to avoid merging conversations).", skipped_inherited,
+            "marker(s) that inherited a prior conversation's UUID (ambiguous — "
+            "not relinked to avoid merging conversations).", skipped_inherited,
         )
 
     if not marker_uuid_by_rowid:

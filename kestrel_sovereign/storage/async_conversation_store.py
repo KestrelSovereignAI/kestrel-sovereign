@@ -540,27 +540,46 @@ class AsyncConversationStore:
         return session_id
 
     async def _marker_owns_uuid(self, row_id: int, uuid: str) -> bool:
-        """True if no row earlier than ``row_id`` carries ``uuid`` as its
-        ``metadata.session_id`` — i.e. the marker at ``row_id`` minted the
-        UUID rather than inheriting it from a still-active prior session.
+        """True if it is safe to canonicalize an integer key to this marker's
+        ``uuid`` — i.e. no EARLIER non-``new_session`` (content) row already
+        carries ``uuid``.
+
+        Earlier *markers* sharing the UUID are fine: they are the same session
+        (e.g. a double new-conversation marker that re-stamped the same id), so
+        relinking unifies one conversation. An earlier *content* row carrying
+        the UUID means the marker INHERITED a prior real conversation's id via
+        the old time-gap heuristic; canonicalizing to it would merge two
+        distinct conversations, so we refuse (#2012).
 
         Conservative: on any lookup error, return False (do not canonicalize)
         so an ambiguous marker is never merged into another conversation.
         """
         try:
             esc = _escape_like_session_value(str(uuid))
-            earlier = await self.db.fetchone(
-                "SELECT 1 FROM conversation_history "
+            earlier_rows = await self.db.fetchall(
+                "SELECT metadata FROM conversation_history "
                 "WHERE agent_id = ? AND id < ? "
-                "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
-                "LIMIT 1",
+                "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\')",
                 (
                     self.agent_id, row_id,
                     f'%"session_id": "{esc}"%',
                     f'%"session_id":"{esc}"%',
                 ),
             )
-            return earlier is None
+            for (meta_json,) in earlier_rows:
+                if not meta_json:
+                    continue
+                try:
+                    meta = json.loads(meta_json)
+                except (json.JSONDecodeError, TypeError):
+                    # Unparseable earlier row carrying the UUID — treat as
+                    # ambiguous content and refuse.
+                    return False
+                # Match by exact session_id (LIKE can substring-collide); only
+                # an earlier CONTENT row (not a new_session marker) blocks.
+                if meta.get("session_id") == str(uuid) and not meta.get("new_session"):
+                    return False
+            return True
         except Exception as e:
             logger.warning(f"Marker ownership check failed: {e}")
             return False

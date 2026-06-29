@@ -192,6 +192,29 @@ async def test_skips_marker_that_inherited_prior_session_uuid(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_relinks_double_marker_same_session(tmp_path):
+    """Two back-to-back new_session markers can share a UUID (the second
+    inherited it from the first, with NO content row in between) — that is
+    ONE session, not a prior conversation. Continued turns keyed by the
+    second marker's row-id must relink to the shared UUID (the live-Emma
+    1313/1314 MCP case)."""
+    db = await _db(tmp_path)
+    shared_uuid = "e1fd6fe5-885e-43b2-b6e2-cfbea64f66a2"
+    await _insert(db, "system", "", {"new_session": True, "session_id": shared_uuid})
+    marker2 = await _insert(
+        db, "system", "", {"new_session": True, "session_id": shared_uuid}
+    )
+    u1 = await _insert(db, "user", "hi", {"session_id": str(marker2)})
+    a1 = await _insert(db, "assistant", "hello", {"session_id": str(marker2)})
+
+    await migrate_canonical_session_ids(db)
+
+    sids = await _session_ids(db)
+    assert sids[u1] == shared_uuid
+    assert sids[a1] == shared_uuid
+
+
+@pytest.mark.asyncio
 async def test_init_schema_runs_migration_on_startup(tmp_path):
     raw = SQLiteBackend(str(tmp_path / "startup-canonical.db"))
     await raw.connect()
