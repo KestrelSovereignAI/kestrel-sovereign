@@ -735,21 +735,15 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
         # Check if encryption is enabled via the wrapper's safe accessor
         encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
 
-        # Get the session start time using privacy-aware method
-        start_row = await storage.query_conversation_start(session_id, agent_id)
-
-        if not start_row:
-            raise HTTPException(status_code=404, detail="Session not found.")
-
-        start_time = start_row[0]
-
-        # Get messages starting from session_id using privacy-aware method
-        # We fetch more than needed and rely on session boundary detection
-        # (time gaps > SESSION_GAP_MINUTES or new_session markers) to stop
-        rows = await storage.query_conversation_messages(agent_id, start_time, limit=1000)
+        # Resolve the session's messages via the canonical dual-scheme
+        # resolver so transcripts work for the UUID identifiers the list API
+        # now advertises (not just numeric row-ids) — #2012.
+        rows = await storage.query_session_rows(session_id, limit=1000)
 
         if not rows:
-            raise HTTPException(status_code=404, detail="No messages found in session.")
+            raise HTTPException(status_code=404, detail="Session not found.")
+
+        start_time = rows[0][4]
 
         # Build markdown transcript
         transcript_lines = [
@@ -762,7 +756,6 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
             transcript_lines.append("_Note: This conversation was encrypted at rest._")
             transcript_lines.append("")
 
-        last_timestamp = None
         message_count = 0
 
         for row in rows:
@@ -795,19 +788,10 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
                 except json.JSONDecodeError:
                     pass
 
-            # Check for session boundary
-            if meta and meta.get('new_session') and message_count > 0:
-                break
-
-            # Check for time gap (session boundary detection)
-            if last_timestamp:
-                gap_minutes = (timestamp - last_timestamp).total_seconds() / 60
-                if gap_minutes > SESSION_GAP_MINUTES:
-                    break
-
-            # Skip session markers
+            # Skip session markers (the resolver already strips these; this is
+            # a defensive backstop). Session boundaries are handled upstream by
+            # query_session_rows, so no gap/new_session break is needed here.
             if meta and meta.get('type') == 'session_marker':
-                last_timestamp = timestamp
                 continue
 
             # Decrypt content if needed
@@ -858,7 +842,6 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
 
             transcript_lines.append("")
 
-            last_timestamp = timestamp
             message_count += 1
 
         # Add footer

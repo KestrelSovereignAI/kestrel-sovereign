@@ -616,8 +616,7 @@ def test_new_conversation_delete_message_and_transcript_contracts():
     storage.add_conversation = AsyncMock()
     storage.query_last_conversation_row = AsyncMock(return_value=(20, "2026-03-17T11:00:00"))
     storage.delete_conversation_message = AsyncMock(return_value=True)
-    storage.query_conversation_start = AsyncMock(return_value=(now,))
-    storage.query_conversation_messages = AsyncMock(return_value=transcript_rows)
+    storage.query_session_rows = AsyncMock(return_value=transcript_rows)
     agent = MagicMock(storage=storage)
 
     app, original = _prepare_app(agent)
@@ -649,6 +648,36 @@ def test_new_conversation_delete_message_and_transcript_contracts():
         assert "**User**" in transcript
         assert "Type: context_summary" in transcript
         assert "Original messages: 1-2" in transcript
+    finally:
+        _restore_app(app, original)
+
+
+def test_transcript_resolves_uuid_session_id():
+    """#2012 (codex): the list API now advertises marker UUIDs, so the
+    transcript endpoint must resolve a UUID session_id via the same
+    dual-scheme resolver — not 404 because it only understood row-ids."""
+    now = datetime(2026, 6, 28, 14, 0, 0)
+    uuid = "e1fd6fe5-885e-4d8b-9aaa-0000000000ff"
+    rows = [
+        (50, "user", "hi", json.dumps({"session_id": uuid}), now),
+        (51, "assistant", "hello", json.dumps({"session_id": uuid}), now + timedelta(minutes=1)),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_session_rows = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    f"/api/conversations/{uuid}/transcript", headers=_api_headers()
+                )
+        assert response.status_code == 200
+        text = response.text
+        assert f"# Conversation Transcript - Session {uuid}" in text
+        assert "hi" in text and "hello" in text
+        storage.query_session_rows.assert_awaited_once_with(uuid, limit=1000)
     finally:
         _restore_app(app, original)
 
