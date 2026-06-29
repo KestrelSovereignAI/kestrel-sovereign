@@ -90,6 +90,66 @@ class DecisionResult:
         return self.in_memory
 
 
+@dataclass(frozen=True)
+class DenialClassification:
+    """Provenance of an ``approved=False`` result from ``request_approval``.
+
+    ``request_approval`` returns ``(False, scope)`` for several distinct
+    reasons, and only one of them — an explicit human "deny" — is a real
+    user denial. Every consumer that reports the outcome (SecurityHook,
+    ComputeFeature, KeysFeature, the CLI, the Talon verifier, …) must branch
+    on the provenance so a policy block, a headless ``no_approver``
+    short-circuit (#2029), a timeout, or a torn-down task is never mislabeled
+    as "the user said no" (#1542). This is the single source of truth for that
+    classification so the consumers can't drift apart.
+    """
+
+    scope: str
+    is_user_denial: bool
+    reason: str        # machine category, suitable for audit/metadata
+    description: str   # human-readable phrase for messages
+
+
+# Non-user-denial provenance scopes → (audit reason, human description). Any
+# scope NOT in this map (notably "user_denied", or a user-chosen approve scope
+# returned with approved=False) is treated as a genuine user denial.
+_NON_USER_DENIAL_SCOPES: Dict[str, tuple] = {
+    "denied": ("policy_denied", "blocked by an operator/auto policy"),
+    "no_approver": (
+        "no_approver",
+        "no interactive approver is available (headless/test instance)",
+    ),
+    "timeout": ("timeout", "the approval request timed out"),
+    "cancelled": ("cancelled", "the approval request was cancelled"),
+    "cancelled_all": ("cancelled", "the approval request was cancelled"),
+}
+
+
+def classify_denial(scope: Optional[str]) -> DenialClassification:
+    """Classify the ``scope`` of an ``approved=False`` approval result.
+
+    Returns a :class:`DenialClassification` whose ``is_user_denial`` is True
+    only for an explicit human deny. Consumers should report
+    ``denied_by_user`` / "denied by user" strictly off ``is_user_denial`` and
+    use ``reason`` / ``description`` for everything else.
+    """
+    key = scope or ""
+    if key in _NON_USER_DENIAL_SCOPES:
+        reason, description = _NON_USER_DENIAL_SCOPES[key]
+        return DenialClassification(
+            scope=key,
+            is_user_denial=False,
+            reason=reason,
+            description=description,
+        )
+    return DenialClassification(
+        scope=key or "user_denied",
+        is_user_denial=True,
+        reason="user_denied",
+        description="denied by the user",
+    )
+
+
 # Type for the SSE callbacks
 OnRequestAddedCallback = Callable[[ApprovalRequest], Awaitable[None]]
 # ``reason`` is one of "timeout" | "cancelled" — the request exited
@@ -199,6 +259,8 @@ class ApprovalQueue:
               "auto_approve:<id>" for policy auto-approval). On deny, the
               scope carries provenance: "user_denied" for an explicit human
               denial, "denied" for an operator/auto policy DENY,
+              "no_approver" when the agent is a headless test instance with
+              no one to answer the queue (#2029), and
               "timeout"/"cancelled"/"cancelled_all" when no user ever
               decided. Consumers MUST NOT treat anything but "user_denied"
               (or a user-chosen approve scope returned with approved=False)
@@ -340,6 +402,40 @@ class ApprovalQueue:
                     f"{feature_name}.{tool_name}: {e}",
                     exc_info=True,
                 )
+
+        # Non-interactive guard (#2029). A tagged test instance is headless by
+        # definition — driven via ``kestrel ask`` / the API, with no human
+        # attached to answer the approval queue. If we reach this point the
+        # request would block on ``resume_event`` indefinitely (the default
+        # ``timeout`` is ``None`` = wait forever), wedging the agent's request
+        # worker until restart. That is the exact #2029 hang: a single
+        # ``spawn_agent`` call (ASK-gated) bricks the agent. Reaching here also
+        # means global auto-mode is OFF — the AUTO fast-path above returns
+        # before this — i.e. the operator did NOT opt this test instance into
+        # non-interactive auto-approve (KESTREL_TEST_AUTO_APPROVE, #1936). So
+        # there is genuinely no approver: return an honest, non-blocking
+        # ``no_approver`` result instead of queuing forever. Production /
+        # sovereign agents (``is_test_instance`` falsy) are unaffected — their
+        # Sovereign answers asynchronously via the Mews approval panel, so a
+        # pending request legitimately stays open for them.
+        if bool(getattr(self._agent, "is_test_instance", False)):
+            await self._persist_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                approved=False,
+                scope="no_approver",
+            )
+            logger.warning(
+                "ApprovalQueue: %s.%s requires approval but no interactive "
+                "approver is attached (headless test instance); returning "
+                "non-blocking 'no_approver' instead of queuing. Set "
+                "KESTREL_TEST_AUTO_APPROVE=1 to auto-approve ASK-level tools "
+                "on this test instance.",
+                feature_name,
+                tool_name,
+            )
+            return (False, "no_approver")
 
         request = ApprovalRequest(
             id=str(uuid4()),
@@ -513,6 +609,11 @@ class ApprovalQueue:
                 decision = "timeout"
             elif scope in ("cancelled", "cancelled_all"):
                 decision = "user_cancelled"
+            elif scope == "no_approver":
+                # Headless/no-approver block (#2029) — emphatically NOT a
+                # user denial. Audited distinctly so operators (and the Talon
+                # verifier's classify_denial) never mislabel it as one.
+                decision = "no_approver"
             else:
                 decision = "user_denied"
 

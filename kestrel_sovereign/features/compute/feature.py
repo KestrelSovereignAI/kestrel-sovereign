@@ -548,15 +548,38 @@ class ComputeFeature(Feature):
                 )
                 
                 if not approved:
+                    # Branch on the denial provenance: only an explicit human
+                    # deny is a user denial. A policy block, a headless
+                    # ``no_approver`` short-circuit (#2029), a timeout, or a
+                    # torn-down task must NOT be reported as "denied by user"
+                    # (#1542). classify_denial is the shared source of truth so
+                    # this consumer can't drift from SecurityHook.
+                    from kestrel_sovereign.features.security.approval_queue import (
+                        classify_denial,
+                    )
+
+                    denial = classify_denial(scope)
                     script.state = ScriptState.REJECTED
-                    script.review_notes = f"User denied execution (scope: {scope})"
+                    if denial.is_user_denial:
+                        script.review_notes = f"User denied execution (scope: {scope})"
+                        message = f"❌ Script execution denied by user ({scope})"
+                    else:
+                        script.review_notes = (
+                            f"Execution not approved: {denial.description} "
+                            f"(scope: {scope})"
+                        )
+                        message = (
+                            f"❌ Script execution not approved — "
+                            f"{denial.description} ({scope})"
+                        )
                     await self.script_store.update(script)
                     return ToolResult.failed(
-                        f"❌ Script execution denied by user ({scope})",
+                        message,
                         data={
                             "script_id": script.id,
                             "state": ScriptState.REJECTED.value,
-                            "denied_by_user": True,
+                            "denied_by_user": denial.is_user_denial,
+                            "denial_reason": denial.reason,
                             "scope": scope,
                         },
                     )
