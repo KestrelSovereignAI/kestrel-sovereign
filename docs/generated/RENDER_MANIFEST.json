@@ -3655,8 +3655,8 @@
       "missing_links": [],
       "path": "docs/diagrams/06-llm-management.md",
       "privacy": "public",
-      "render": "internal",
-      "status": "needs-revalidation",
+      "render": "public",
+      "status": "current",
       "title": "06 - LLM Management",
       "type": "Diagram"
     },
