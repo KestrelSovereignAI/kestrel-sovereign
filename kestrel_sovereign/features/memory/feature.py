@@ -692,16 +692,22 @@ class MemoryFeature(Feature):
 
     @tool(
         name="delete_messages",
-        description="Delete conversation messages matching a pattern. Use for cleaning up test data or removing unwanted messages. Requires Sovereign authorization.",
+        description="Delete individual conversation messages matching a text pattern. Pass session_id to confine deletion to one conversation (recommended) so the pattern can't reach across unrelated sessions; omit it only to sweep all conversations. To discard a whole conversation, prefer delete_conversation. Requires Sovereign authorization.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory delete"
     )
-    async def delete_messages(self, pattern: str, confirm: bool = False) -> ToolResult:
+    async def delete_messages(
+        self, pattern: str, confirm: bool = False, session_id: Optional[str] = None
+    ) -> ToolResult:
         """
         Delete messages matching a content pattern.
 
         Args:
             pattern: Text pattern to match (case-insensitive)
+            session_id: If provided, only messages in this conversation are
+                eligible — the pattern cannot match across other sessions
+                (#2019). Omit to sweep the whole history (the legacy, blunter
+                behavior).
             confirm: Must be True to actually delete (safety check). The
                 LLM occasionally passes truthy strings like "false"; we
                 accept only the literal Python bool ``True`` for the
@@ -715,15 +721,15 @@ class MemoryFeature(Feature):
                 f"got {type(confirm).__name__}={confirm!r}"
             )
 
-        conv_store = self._get_conversation_store()
-        if not conv_store:
-            return ToolResult.failed("Conversation store not available")
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        scope = f" in session {session_id}" if session_id else ""
 
         if not confirm:
             try:
-                history = await conv_store.get_full_history_with_ids(
-                    include_excluded=True, include_stashed=True
-                )
+                matched = await storage.find_messages_matching(pattern, session_id)
             except (AttributeError, TypeError, KeyError) as e:
                 logger.error(f"delete_messages preview failed: {e}")
                 return ToolResult.failed(str(e))
@@ -731,27 +737,26 @@ class MemoryFeature(Feature):
                 logger.error(f"delete_messages preview failed: {e}", exc_info=True)
                 return ToolResult.failed(str(e))
 
-            pattern_lower = pattern.lower()
             matches = [
-                {"id": msg["id"], "role": msg["role"], "preview": msg.get("content", "")[:100]}
-                for msg in history
-                if pattern_lower in msg.get("content", "").lower()
+                {"id": msg.get("id"), "role": msg.get("role"), "preview": (msg.get("content") or "")[:100]}
+                for msg in matched
             ]
             return ToolResult.ok(
                 confirmation=(
                     f"Preview only — {len(matches)} message(s) match pattern "
-                    f"{pattern!r} (call with confirm=True to delete)"
+                    f"{pattern!r}{scope} (call with confirm=True to delete)"
                 ),
                 data={
                     "mode": "preview",
                     "would_delete": len(matches),
                     "matches": matches[:20],
                     "pattern": pattern,
+                    "session_id": session_id,
                 },
             )
 
         try:
-            deleted = await conv_store.delete_messages_matching(pattern)
+            deleted = await storage.delete_messages_matching(pattern, session_id)
         except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"delete_messages failed: {e}")
             return ToolResult.failed(str(e))
@@ -760,12 +765,255 @@ class MemoryFeature(Feature):
             return ToolResult.failed(str(e))
 
         return ToolResult.ok(
-            confirmation=f"Deleted {deleted} message(s) matching {pattern!r}",
+            confirmation=f"Deleted {deleted} message(s) matching {pattern!r}{scope}",
             data={
                 "mode": "delete",
                 "deleted": deleted,
                 "pattern": pattern,
+                "session_id": session_id,
             },
+        )
+
+    # ------------------------------------------------------------------
+    # Conversation/session navigation + lifecycle (#2019)
+    # ------------------------------------------------------------------
+    # Message-pattern deletion above is a scalpel with no eyes. These tools
+    # let the agent *see* its conversations and operate at session
+    # granularity, reusing the soft-delete-aware store primitives
+    # (delete/restore/purge_conversation_session) that already back the
+    # conversations UI. They route through the privacy-aware storage facade
+    # (``agent.storage``) — NOT the raw conversation store — so EPHEMERAL /
+    # ISOLATED modes are enforced and memory-pin cleanup runs, exactly as the
+    # HTTP endpoints do.
+
+    def _get_storage(self):
+        """Privacy-aware storage facade that enforces the active privacy mode."""
+        return getattr(self, "storage", None) or getattr(self.agent, "storage", None)
+
+    def _storage_agent_id(self, storage) -> str:
+        """The agent id the storage facade scopes writes/pin-cleanup to."""
+        return getattr(storage, "agent_id", None) or getattr(self, "agent_id", "") or ""
+
+    async def _find_session_summary(
+        self, storage, session_id: str, include_trashed: bool
+    ) -> Optional[Dict[str, Any]]:
+        """Return the summary for ``session_id`` if it exists, else None."""
+        sessions = await storage.list_conversation_sessions(
+            limit=1000, include_trashed=include_trashed
+        )
+        for session in sessions:
+            if session.get("session_id") == str(session_id):
+                return session
+        return None
+
+    @tool(
+        name="list_conversations",
+        description="List your conversation sessions so you can navigate them before pruning. Returns session_id, title, message counts, timestamps and a short preview, most-recent first. Pass include_trashed=True to list soft-deleted sessions available to restore. Use the returned session_id with delete_conversation / restore_conversation / purge_conversation.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory conversations"
+    )
+    async def list_conversations(
+        self, limit: int = 50, include_trashed: bool = False
+    ) -> ToolResult:
+        """List conversation sessions for navigation.
+
+        Args:
+            limit: Maximum number of sessions to return (most-recent first).
+            include_trashed: List soft-deleted (Trash) sessions instead of
+                live ones — use to find a session to restore.
+        """
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        try:
+            limit_val = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit_val = 50
+
+        try:
+            sessions = await storage.list_conversation_sessions(
+                limit=limit_val, include_trashed=bool(include_trashed)
+            )
+        except Exception as e:
+            logger.error(f"list_conversations failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        scope = "trashed" if include_trashed else "active"
+        return ToolResult.ok(
+            confirmation=f"{len(sessions)} {scope} conversation(s)",
+            data={"sessions": sessions, "count": len(sessions), "scope": scope},
+        )
+
+    @tool(
+        name="delete_conversation",
+        description="Soft-delete an entire conversation session (moves it to Trash; recoverable with restore_conversation). This is the right tool for discarding a whole disposable/test conversation — use it instead of pattern-matching delete_messages. Requires Sovereign authorization.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory delete-conversation"
+    )
+    async def delete_conversation(
+        self, session_id: str, confirm: bool = False
+    ) -> ToolResult:
+        """Soft-delete every message in a conversation session.
+
+        Args:
+            session_id: The session to move to Trash (from list_conversations).
+            confirm: Must be the literal True to perform the delete; without
+                it the call previews how many messages would be removed.
+        """
+        if not isinstance(confirm, bool):
+            return ToolResult.failed(
+                "confirm must be a boolean (True/False), "
+                f"got {type(confirm).__name__}={confirm!r}"
+            )
+
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        if not confirm:
+            summary = await self._find_session_summary(storage, session_id, False)
+            if summary is None:
+                return ToolResult.failed(
+                    f"No active conversation found for session_id {session_id!r}"
+                )
+            return ToolResult.ok(
+                confirmation=(
+                    f"Preview only — would move {summary['message_count']} message(s) "
+                    f"in session {session_id} to Trash (call with confirm=True)"
+                ),
+                data={"mode": "preview", "session": summary},
+            )
+
+        try:
+            deleted = await storage.delete_conversation_session(
+                session_id, self._storage_agent_id(storage)
+            )
+        except Exception as e:
+            logger.error(f"delete_conversation failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if deleted == 0:
+            return ToolResult.failed(
+                f"No active conversation found for session_id {session_id!r}"
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Moved {deleted} message(s) in session {session_id} to Trash "
+                f"(restore with restore_conversation)"
+            ),
+            data={"mode": "delete", "deleted": deleted, "session_id": session_id},
+        )
+
+    @tool(
+        name="restore_conversation",
+        description="Restore a soft-deleted conversation session from Trash, bringing its messages back into normal history. Find restorable sessions with list_conversations(include_trashed=True).",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory restore-conversation"
+    )
+    async def restore_conversation(self, session_id: str) -> ToolResult:
+        """Restore a soft-deleted conversation session.
+
+        Args:
+            session_id: The trashed session to restore.
+        """
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        try:
+            restored = await storage.restore_conversation_session(
+                session_id, self._storage_agent_id(storage)
+            )
+        except Exception as e:
+            logger.error(f"restore_conversation failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if restored == 0:
+            return ToolResult.failed(
+                f"No trashed conversation found for session_id {session_id!r}"
+            )
+        return ToolResult.ok(
+            confirmation=f"Restored {restored} message(s) in session {session_id}",
+            data={"mode": "restore", "restored": restored, "session_id": session_id},
+        )
+
+    @tool(
+        name="purge_conversation",
+        description="PERMANENTLY delete a conversation session — there is no recovery. Use only to destroy data for good; otherwise prefer delete_conversation (Trash). Requires Sovereign authorization.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory purge-conversation"
+    )
+    async def purge_conversation(
+        self, session_id: str, confirm: bool = False, reason: str = "agent-initiated"
+    ) -> ToolResult:
+        """Permanently delete a conversation session (no recovery).
+
+        Args:
+            session_id: The session to destroy.
+            confirm: Must be the literal True to perform the purge; without it
+                the call previews how many messages would be destroyed.
+            reason: Audit-trail reason recorded with the purge.
+        """
+        if not isinstance(confirm, bool):
+            return ToolResult.failed(
+                "confirm must be a boolean (True/False), "
+                f"got {type(confirm).__name__}={confirm!r}"
+            )
+
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        if not confirm:
+            # purge_conversation_session destroys BOTH live and already-trashed
+            # rows (deleted_filter="all"). Count via the SAME resolver so the
+            # destructive preview is exact — a grouped summary mis-keys the
+            # deleted subset of a partially-trashed legacy session and would
+            # understate the impact.
+            try:
+                total = await storage.count_session_messages(session_id, "all")
+                live_count = await storage.count_session_messages(session_id, "live")
+            except Exception as e:
+                logger.error(f"purge_conversation preview failed: {e}", exc_info=True)
+                return ToolResult.failed(str(e))
+            if total == 0:
+                return ToolResult.failed(
+                    f"No conversation found for session_id {session_id!r}"
+                )
+            trashed_count = total - live_count
+            return ToolResult.ok(
+                confirmation=(
+                    f"Preview only — would PERMANENTLY destroy {total} message(s) "
+                    f"({live_count} live + {trashed_count} trashed) in session "
+                    f"{session_id} (call with confirm=True; this cannot be undone)"
+                ),
+                data={
+                    "mode": "preview",
+                    "session_id": session_id,
+                    "would_destroy": total,
+                    "live": live_count,
+                    "trashed": trashed_count,
+                },
+            )
+
+        try:
+            purged = await storage.purge_conversation_session(
+                session_id, self._storage_agent_id(storage), reason
+            )
+        except Exception as e:
+            logger.error(f"purge_conversation failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if purged == 0:
+            return ToolResult.failed(
+                f"No conversation found for session_id {session_id!r}"
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Permanently destroyed {purged} message(s) in session {session_id}"
+            ),
+            data={"mode": "purge", "purged": purged, "session_id": session_id},
         )
 
     @tool(

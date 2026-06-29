@@ -17,6 +17,8 @@ check privacy mode, the storage layer will enforce it.
 import json
 import logging
 import warnings
+
+from kestrel_sovereign.storage.session_grouping import summarize_sessions
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
 from enum import Enum
 from dataclasses import dataclass
@@ -45,6 +47,43 @@ def get_anonymize_text():
     return _anonymize_text
 
 logger = logging.getLogger(__name__)
+
+
+# Stable id bucketing ISOLATED in-memory messages that were stored without an
+# explicit session_id, so list_conversation_sessions never returns a synthetic
+# index that delete_conversation_session can't resolve (#2019).
+_ISOLATED_UNLABELED_SESSION_ID = "session-local"
+
+
+def _conv_session_id(conv: Dict[str, Any]) -> Optional[str]:
+    """The session id of an in-memory ISOLATED message.
+
+    ISOLATED entries carry ``session_id`` as a top-level field (see
+    ``add_conversation``); fall back to ``metadata.session_id`` for safety.
+    """
+    sid = conv.get("session_id")
+    if sid is None:
+        sid = (conv.get("metadata") or {}).get("session_id")
+    return sid
+
+
+def _in_session(conv: Dict[str, Any], session_id: Optional[str]) -> bool:
+    """True if an in-memory ISOLATED message belongs to ``session_id``.
+
+    ``session_id=None`` means unscoped (every message qualifies). When a
+    session is named, a message qualifies only if its own ``session_id``
+    matches — so scoped deletes can't reach across isolated conversations that
+    happen to share text, and deleting one listed isolated session never wipes
+    the others (#2019).
+    """
+    if session_id is None:
+        return True
+    sid = _conv_session_id(conv)
+    if sid is None:
+        # Unlabeled isolated entries are bucketed under the sentinel id that
+        # list_conversation_sessions surfaces, so they stay deletable.
+        return str(session_id) == _ISOLATED_UNLABELED_SESSION_ID
+    return str(sid) == str(session_id)
 
 
 class PrivacyViolationError(Exception):
@@ -662,14 +701,23 @@ class PrivacyEnforcingStorage:
             return []
 
         if self._policy.use_session_storage:
-            # Return session conversations formatted as tuple rows
+            # Return session conversations formatted as tuple rows. Surface the
+            # resolved session_id in the metadata (real id, else the sentinel)
+            # so the /api/conversations grouping labels each session with an id
+            # that delete_conversation_session can actually resolve — the UI and
+            # the agent tools share one identity (#2019).
             rows = []
             for i, conv in enumerate(self._session_conversations):
+                meta = dict(conv.get("metadata") or {})
+                sid = _conv_session_id(conv)
+                meta["session_id"] = (
+                    sid if sid is not None else _ISOLATED_UNLABELED_SESSION_ID
+                )
                 rows.append((
-                    i,  # synthetic id
+                    i,  # synthetic row id (message id, not session id)
                     conv.get("role", ""),
                     conv.get("content", ""),
-                    json.dumps(conv.get("metadata", {})) if conv.get("metadata") else None,
+                    json.dumps(meta),
                     conv.get("created_at", None),
                     conv.get("model"),
                     conv.get("provider"),
@@ -778,10 +826,14 @@ class PrivacyEnforcingStorage:
             return []
 
         if self._policy.use_session_storage:
-            # Isolated/temp storage has no persistent UUID sessions; the whole
-            # in-memory list is the session.
+            # Isolated/temp storage keeps conversations in memory. Scope to the
+            # requested session_id with the SAME matcher the delete path uses,
+            # so opening one listed isolated session never shows another's
+            # messages (#2019).
             rows = []
             for i, conv in enumerate(self._session_conversations):
+                if not _in_session(conv, session_id):
+                    continue
                 rows.append((
                     i,
                     conv.get("role", ""),
@@ -840,7 +892,12 @@ class PrivacyEnforcingStorage:
         if self._privacy_config.is_ephemeral():
             return False
         if self._policy.use_session_storage:
-            return bool(self._session_conversations)
+            # Scope to the requested session_id (same matcher as the delete and
+            # detail-read paths) so existence is per-session, not "any isolated
+            # message at all" (#2019).
+            return any(
+                _in_session(conv, session_id) for conv in self._session_conversations
+            )
 
         row_id = coerce_persistent_message_id(session_id)
         if row_id is not None:
@@ -1123,12 +1180,17 @@ class PrivacyEnforcingStorage:
             )
 
         if self._policy.use_session_storage:
-            # In ISOLATED mode conversations live in an in-memory list
-            # without durable session grouping.  The practical match for
-            # "delete this session" is "clear the in-memory backlog."
-            removed = len(self._session_conversations)
-            self._session_conversations.clear()
-            return removed
+            # ISOLATED conversations live in an in-memory list. Scope the delete
+            # to the requested session_id so removing one listed isolated
+            # conversation never wipes the others (#2019). Use clear_session()
+            # to drop the whole buffer.
+            before = len(self._session_conversations)
+            self._session_conversations = [
+                conv
+                for conv in self._session_conversations
+                if not _in_session(conv, session_id)
+            ]
+            return before - len(self._session_conversations)
 
         await self._check_write_permission("delete_conversation_session")
         count = await self._storage.delete_conversation_session(session_id)
@@ -1165,6 +1227,135 @@ class PrivacyEnforcingStorage:
             logger.debug(
                 "Pin cleanup skipped (memory_pins likely absent): %s", e
             )
+
+    async def list_conversation_sessions(
+        self, limit: int = 50, include_trashed: bool = False
+    ) -> List[Dict[str, Any]]:
+        """List session summaries for navigation, respecting privacy mode (#2019).
+
+        EPHEMERAL exposes no persistent data, so returns ``[]``. ISOLATED
+        summarizes the in-memory session buffer (which has no Trash
+        distinction, so ``include_trashed`` yields ``[]``). Otherwise delegates
+        to the persistent store.
+        """
+        if self._privacy_config.is_ephemeral():
+            return []
+
+        if self._policy.use_session_storage:
+            if include_trashed:
+                return []
+            messages = []
+            for i, conv in enumerate(self._session_conversations):
+                meta = dict(conv.get("metadata") or {})
+                # ISOLATED entries hold session_id at the top level; surface it
+                # in metadata so the grouper labels each summary with the real
+                # session_id — the same value delete_conversation_session scopes
+                # on (#2019).
+                # Always assign a resolvable id: the real session_id when
+                # present, else the sentinel bucket — never the grouper's
+                # synthetic index, which delete can't match (#2019).
+                sid = _conv_session_id(conv)
+                meta["session_id"] = sid if sid is not None else _ISOLATED_UNLABELED_SESSION_ID
+                messages.append({
+                    "id": i,
+                    "role": conv.get("role"),
+                    "content": conv.get("content"),
+                    "metadata": meta,
+                    "created_at": conv.get("created_at"),
+                })
+            return summarize_sessions(messages, limit=limit)
+
+        return await self._storage.list_conversation_sessions(
+            limit=limit, include_trashed=include_trashed
+        )
+
+    async def count_session_messages(
+        self, session_id: str, deleted_filter: str = "all"
+    ) -> int:
+        """Count a session's messages, respecting privacy mode (#2019).
+
+        EPHEMERAL has no persistent data → 0. ISOLATED counts matching in-memory
+        rows (which have no Trash, so ``deleted_filter='deleted'`` → 0).
+        Otherwise delegates to the resolver-based store count.
+        """
+        if self._privacy_config.is_ephemeral():
+            return 0
+
+        if self._policy.use_session_storage:
+            if deleted_filter == "deleted":
+                return 0
+            return sum(
+                1
+                for conv in self._session_conversations
+                if _in_session(conv, session_id)
+            )
+
+        return await self._storage.count_session_messages(
+            session_id, deleted_filter=deleted_filter
+        )
+
+    async def find_messages_matching(
+        self, content_pattern: str, session_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Find messages matching a pattern, respecting privacy mode (#2019).
+
+        EPHEMERAL returns ``[]`` (no persistent data). ISOLATED searches the
+        in-memory buffer. Otherwise delegates to the persistent store.
+        """
+        if self._privacy_config.is_ephemeral():
+            return []
+
+        if self._policy.use_session_storage:
+            pattern_lower = content_pattern.lower()
+            return [
+                {
+                    "id": i,
+                    "role": conv.get("role"),
+                    "content": conv.get("content"),
+                    "metadata": conv.get("metadata") or {},
+                }
+                for i, conv in enumerate(self._session_conversations)
+                if pattern_lower in (conv.get("content") or "").lower()
+                and _in_session(conv, session_id)
+            ]
+
+        return await self._storage.find_messages_matching(
+            content_pattern, session_id=session_id
+        )
+
+    async def delete_messages_matching(
+        self, content_pattern: str, session_id: Optional[str] = None
+    ) -> int:
+        """Soft-delete messages matching a pattern, respecting privacy mode (#2019).
+
+        EPHEMERAL raises (no persistent data). ISOLATED removes matches from the
+        in-memory buffer. Otherwise delegates to the persistent store.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot delete conversations in ephemeral mode (no persistent data)."
+            )
+
+        if self._policy.use_session_storage:
+            pattern_lower = content_pattern.lower()
+            before = len(self._session_conversations)
+            # Drop only messages that match the pattern AND (when a session is
+            # named) belong to that session — never reach across isolated
+            # conversations that happen to share text (#2019).
+            self._session_conversations = [
+                conv
+                for conv in self._session_conversations
+                if not (
+                    pattern_lower in (conv.get("content") or "").lower()
+                    and _in_session(conv, session_id)
+                )
+            ]
+            return before - len(self._session_conversations)
+
+        await self._check_write_permission("delete_messages_matching")
+        return await self._storage.delete_messages_matching(
+            content_pattern, session_id=session_id
+        )
 
     async def list_trashed_conversations(
         self, limit: int = 200

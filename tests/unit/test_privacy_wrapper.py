@@ -640,16 +640,23 @@ class TestPrivacyAwareQueries:
             await wrapper.delete_conversation_session("sess-123", "agent-1")
 
     @pytest.mark.asyncio
-    async def test_delete_conversation_session_isolated_clears_session_list(self, mock_storage):
-        """ISOLATED mode clears the in-memory session backlog."""
+    async def test_delete_conversation_session_isolated_scopes_by_session(self, mock_storage):
+        """ISOLATED delete removes only the requested session's in-memory rows,
+        never the whole backlog — so deleting one isolated conversation can't
+        wipe the others (#2019)."""
         wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.ISOLATED)
-        await wrapper.add_conversation("user", "hi")
-        await wrapper.add_conversation("assistant", "hello")
-        assert len(wrapper._session_conversations) == 2
+        await wrapper.add_conversation("user", "hi", session_id="s1")
+        await wrapper.add_conversation("assistant", "hello", session_id="s1")
+        await wrapper.add_conversation("user", "other", session_id="s2")
+        assert len(wrapper._session_conversations) == 3
 
-        count = await wrapper.delete_conversation_session("ignored", "agent-1")
+        count = await wrapper.delete_conversation_session("s1", "agent-1")
         assert count == 2
-        assert wrapper._session_conversations == []
+        assert [c["session_id"] for c in wrapper._session_conversations] == ["s2"]
+
+        # An unknown session deletes nothing (no accidental full wipe).
+        assert await wrapper.delete_conversation_session("nope", "agent-1") == 0
+        assert len(wrapper._session_conversations) == 1
 
     # --- set_conversation_name (#716) ---
 

@@ -314,6 +314,46 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.delete_conversation_session(session_id)
 
+    async def list_conversation_sessions(
+        self, limit: int = 50, include_trashed: bool = False
+    ) -> List[Dict[str, Any]]:
+        """List session summaries for navigation — facade delegator (#2019)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.list_conversation_sessions(
+            limit=limit, include_trashed=include_trashed
+        )
+
+    async def count_session_messages(
+        self, session_id: str, deleted_filter: str = "all"
+    ) -> int:
+        """Count a session's messages via the resolver — facade delegator (#2019)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.count_session_messages(
+            session_id, deleted_filter=deleted_filter
+        )
+
+    async def find_messages_matching(
+        self, content_pattern: str, session_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Find messages matching a pattern — facade delegator (#2019)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.find_messages_matching(
+            content_pattern, session_id=session_id
+        )
+
+    async def delete_messages_matching(
+        self, content_pattern: str, session_id: Optional[str] = None
+    ) -> int:
+        """Soft-delete messages matching a pattern — facade delegator (#2019)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.delete_messages_matching(
+            content_pattern, session_id=session_id
+        )
+
     async def delete_message(self, message_id: int) -> bool:
         """Soft-delete a single message — facade delegator (#763)."""
         if not self._initialized:

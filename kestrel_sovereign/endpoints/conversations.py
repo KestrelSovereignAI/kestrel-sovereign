@@ -7,7 +7,10 @@ import logging
 
 from kestrel_sovereign.rate_limit import limiter
 
-from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
+from kestrel_sovereign.storage.session_grouping import (
+    coalesce_sessions_by_session_id,
+    group_messages_into_sessions,
+)
 from kestrel_sovereign.security.encryption import get_fernet, get_agent_fernet, decrypt_string_fernet as decrypt_string
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
@@ -84,49 +87,29 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
         if not rows:
             return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
 
-        def _new_session(msg_id, timestamp, session_uuid=None):
-            # Canonical identity (#2012): expose the session's own
-            # metadata.session_id (a UUID minted by the store) so the value the
-            # UI round-trips on the next turn matches where messages are filed.
-            # Fall back to the message row-id only for genuinely legacy clusters
-            # that carry no session_id anywhere in their metadata.
-            return {
-                "session_id": str(session_uuid) if session_uuid else str(msg_id),
-                "started_at": timestamp.isoformat(),
-                "last_message_at": timestamp.isoformat(),
-                "message_count": 0,
-                "user_message_count": 0,
-                "preview": "",
-                "messages": [],
-                "_preview_content": None,
-                "_preview_metadata_json": None,
-            }
-
         def _decorate_preview(session):
-            preview_content = session.pop("_preview_content", None)
-            metadata_json = session.pop("_preview_metadata_json", None)
+            # The shared grouper hands back the raw first-user-message content
+            # plus its metadata dict; the UI layer decrypts + unwraps it here.
+            preview_content = session.pop("preview_content", None)
+            meta = session.pop("preview_metadata", None) or {}
+            session.setdefault("messages", [])
             if preview_content is None:
+                session["preview"] = ""
                 return
 
             is_encrypted = False
             decryption_failed = False
-            preview_is_sent_form = False
-            if metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                    if meta.get('enc'):
-                        is_encrypted = True
-                        if decrypt:
-                            fernet = get_agent_fernet(agent_id) if agent_id else get_fernet()
-                            if fernet:
-                                try:
-                                    preview_content = decrypt_string(preview_content, meta, fernet)
-                                except Exception as decrypt_err:
-                                    logger.warning(f"Failed to decrypt preview: {decrypt_err}")
-                                    decryption_failed = True
-                    preview_is_sent_form = bool(meta.get('sent_form'))
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for preview: {e}")
+            preview_is_sent_form = bool(meta.get('sent_form'))
+            if meta.get('enc'):
+                is_encrypted = True
+                if decrypt:
+                    fernet = get_agent_fernet(agent_id) if agent_id else get_fernet()
+                    if fernet:
+                        try:
+                            preview_content = decrypt_string(preview_content, meta, fernet)
+                        except Exception as decrypt_err:
+                            logger.warning(f"Failed to decrypt preview: {decrypt_err}")
+                            decryption_failed = True
 
             # Unwrap sent-form so the UI shows raw user text, not the
             # <retrieved_context>.../<user_input>... wrappers that were stored
@@ -136,77 +119,38 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
             session["preview"] = preview_content[:100] + ("..." if len(preview_content) > 100 else "")
             session["preview_encrypted"] = is_encrypted and (not decrypt or decryption_failed)
 
-        sessions = []
-        current_session = None
-
+        # Normalize raw rows (newest-first from SQL) into oldest-first dicts and
+        # run them through the shared session-boundary algorithm (#2019) — the
+        # same one the agent's list_conversations tool uses, so the UI and the
+        # agent never disagree on where a session begins. Metadata is parsed to
+        # a dict here but its enc/sent_form flags are preserved for preview
+        # decoration above.
+        normalized = []
         for row in reversed(rows):
             msg_id, role, content, metadata_json, created_at = row[0], row[1], row[2], row[3], row[4]
-
-            try:
-                if isinstance(created_at, str):
-                    timestamp = None
-                    for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S.%f']:
-                        try:
-                            timestamp = datetime.strptime(created_at, fmt)
-                            break
-                        except ValueError:
-                            continue
-                    if timestamp is None:
-                        timestamp = datetime.now()
-                elif created_at is not None:
-                    timestamp = created_at
-                else:
-                    timestamp = datetime.now()
-            except (TypeError, ValueError) as e:
-                logger.warning(f"Failed to parse timestamp for message {msg_id}: {e}")
-                timestamp = datetime.now()
-
-            # Check for explicit new_session marker + the session's UUID
-            # identity, both carried in metadata.
-            is_new_session_marker = False
-            meta_session_id = None
+            meta = {}
             if metadata_json:
                 try:
                     meta = json.loads(metadata_json)
-                    if meta.get('new_session'):
-                        is_new_session_marker = True
-                    sid = meta.get('session_id')
-                    # Only treat non-integer values as a canonical UUID. A
-                    # bare-integer session_id is a mis-filed legacy key (the
-                    # bug being fixed) and the row-id fallback is more stable
-                    # for grouping; the one-time migration rewrites those.
-                    if sid and not str(sid).isdigit():
-                        meta_session_id = sid
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse metadata for message {msg_id}: {e}")
+                    meta = {}
+            normalized.append({
+                "id": msg_id,
+                "role": role,
+                "content": content,
+                "metadata": meta,
+                "created_at": created_at,
+            })
 
-            if current_session is None:
-                current_session = _new_session(msg_id, timestamp, meta_session_id)
-
-            last_ts = datetime.fromisoformat(current_session["last_message_at"])
-            gap_minutes = (timestamp - last_ts).total_seconds() / 60
-
-            # Start new session if time gap OR explicit new_session marker
-            if gap_minutes > SESSION_GAP_MINUTES or is_new_session_marker:
-                if current_session["message_count"] > 0:
-                    sessions.append(current_session)
-                current_session = _new_session(msg_id, timestamp, meta_session_id)
-                # Skip counting the session marker itself
-                if is_new_session_marker:
-                    continue
-
-            current_session["message_count"] += 1
-            current_session["last_message_at"] = timestamp.isoformat()
-            if role == "user":
-                current_session["user_message_count"] += 1
-                if current_session["_preview_content"] is None:
-                    current_session["_preview_content"] = content
-                    current_session["_preview_metadata_json"] = metadata_json
-
-        if current_session and current_session["message_count"] > 0:
-            sessions.append(current_session)
-
-        sessions = list(reversed(sessions))[:limit]
+        # Coalesce same-UUID clusters (resumed-past-the-gap conversations) so a
+        # listed session_id is a unique delete target, matching the lifecycle
+        # tools and avoiding a delete-one-destroys-both collision (#2019).
+        grouped = coalesce_sessions_by_session_id(group_messages_into_sessions(normalized))
+        # Newest-first by last activity so a resumed conversation ranks by its
+        # latest message rather than its first cluster's position (#2019).
+        grouped.sort(key=lambda s: s["last_message_at"], reverse=True)
+        sessions = grouped[:limit]
         for session in sessions:
             _decorate_preview(session)
 
