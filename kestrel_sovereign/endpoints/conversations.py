@@ -362,19 +362,26 @@ async def start_new_conversation(request: Request):
         agent = get_agent(request)
         storage = agent.storage
 
+        # Mint the canonical UUID up front and stamp it on the marker, so the
+        # client round-trips the SAME id the list endpoint advertises and any
+        # rename lands under it (#2012). Without this the response returned the
+        # marker row-id, diverging from the list/rename key.
+        import uuid as _uuid
+        new_session_id = str(_uuid.uuid4())
         await storage.add_conversation(
             role="system",
             content="[New conversation started]",
-            metadata={"type": "session_marker", "new_session": True}
+            metadata={"type": "session_marker", "new_session": True},
+            session_id=new_session_id,
         )
 
-        # Get the newly created session using privacy-aware method
+        # Surface the created-at for the new marker (privacy-aware accessor).
         agent_id = getattr(storage, 'agent_id', '')
         row = await storage.query_last_conversation_row(agent_id)
 
         return {
             "success": True,
-            "session_id": str(row[0]) if row else None,
+            "session_id": new_session_id,
             "started_at": row[1] if row else None,
             "message": "New conversation started"
         }

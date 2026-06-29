@@ -633,12 +633,16 @@ def test_new_conversation_delete_message_and_transcript_contracts():
                     headers=_api_headers(),
                 )
         assert new_response.status_code == 200
-        assert new_response.json()["session_id"] == "20"
-        storage.add_conversation.assert_awaited_once_with(
-            role="system",
-            content="[New conversation started]",
-            metadata={"type": "session_marker", "new_session": True},
-        )
+        # #2012: the response is the canonical UUID stamped on the marker (the
+        # same id the list endpoint advertises and rename lands under), not the
+        # marker row-id.
+        new_sid = new_response.json()["session_id"]
+        call = storage.add_conversation.await_args
+        assert call.kwargs["role"] == "system"
+        assert call.kwargs["content"] == "[New conversation started]"
+        assert call.kwargs["metadata"] == {"type": "session_marker", "new_session": True}
+        assert call.kwargs["session_id"] == new_sid
+        assert new_sid and new_sid != "20"
         assert delete_response.status_code == 200
         assert delete_response.json() == {"success": True, "message_id": 21}
         assert transcript_response.status_code == 200

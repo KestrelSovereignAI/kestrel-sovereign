@@ -188,3 +188,30 @@ async def test_query_session_rows_404s_on_soft_deleted_numeric_anchor(store):
     wrapper = PrivacyEnforcingStorage(store, PrivacyMode.NORMAL)
     rows = await wrapper.query_session_rows(str(anchor_id), limit=50)
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_query_session_rows_works_through_async_storage_facade(tmp_path):
+    """Production wraps the AsyncStorage FACADE, not the conversation store —
+    _get_session_messages lives on facade.conversation. Exercise the real
+    shape so the resolver delegation can't regress to an AttributeError 500
+    (codex)."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    storage = AsyncStorage(str(tmp_path / "facade.db"))
+    storage.agent_id = "did:facade"
+    await storage.initialize()
+    uuid = "facade00-0000-0000-0000-0000000000ab"
+    await storage.conversation.add_conversation(
+        "system", "",
+        metadata={"new_session": True, "type": "session_marker"},
+        session_id=uuid,
+    )
+    await storage.conversation.add_conversation("user", "hi", session_id=uuid)
+
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    rows = await wrapper.query_session_rows(uuid, limit=50)
+    assert [r[1] for r in rows] == ["user"]
+    await storage.close()

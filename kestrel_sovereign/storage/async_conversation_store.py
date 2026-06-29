@@ -1292,6 +1292,18 @@ class AsyncConversationStore:
             "expected 'live', 'deleted', or 'all'"
         )
 
+    async def get_session_message_rows(
+        self, session_id: str, limit: int = 100
+    ) -> List[tuple]:
+        """Public entry point to the canonical dual-scheme session resolver.
+
+        Thin wrapper over :meth:`_get_session_messages` so callers outside
+        this module (the ``AsyncStorage`` facade, the privacy wrapper, the
+        conversation endpoints) can resolve a session by either a UUID or a
+        legacy row-id without reaching into a private method (#2012).
+        """
+        return await self._get_session_messages(session_id, limit)
+
     async def _get_session_messages(
         self,
         session_id: str,

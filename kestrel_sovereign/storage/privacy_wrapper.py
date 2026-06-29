@@ -809,8 +809,8 @@ class PrivacyEnforcingStorage:
             if not anchor:
                 return []
 
-        raw_rows = await self._storage._get_session_messages(session_id, limit)
-        # _get_session_messages returns rows DESC; the endpoint walks ASC.
+        raw_rows = await self._storage.get_session_message_rows(session_id, limit)
+        # get_session_message_rows returns rows DESC; the endpoint walks ASC.
         normalized = []
         for row in reversed(raw_rows):
             # (id, role, content, metadata, created_at, rendered_content,

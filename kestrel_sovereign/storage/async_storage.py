@@ -257,6 +257,22 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.get_conversation_history(limit, session_id=session_id)
 
+    async def get_session_message_rows(
+        self, session_id: str, limit: int = 100
+    ) -> List[tuple]:
+        """Raw rows for a session via the canonical dual-scheme resolver —
+        facade delegator (#2012).
+
+        Returns the 8-tuples ``_get_session_messages`` yields
+        ``(id, role, content, metadata, created_at, rendered_content, model,
+        provider)``. The privacy wrapper normalizes/decrypts; the endpoints
+        format. Exists on the facade because ``PrivacyEnforcingStorage`` wraps
+        this ``AsyncStorage``, not the underlying conversation store.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.get_session_message_rows(session_id, limit)
+
     async def resolve_session_id(self, provided: Optional[str]) -> Optional[str]:
         """Resolve the effective session_id for an incoming turn — facade delegator.
 
