@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
+from .session_grouping import summarize_sessions
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
 from .encryption import (
@@ -2193,33 +2194,129 @@ class AsyncConversationStore:
             )
         return purged
 
-    async def delete_messages_matching(self, content_pattern: str) -> int:
-        """Delete messages containing a specific pattern (case-insensitive).
+    async def list_conversation_sessions(
+        self, limit: int = 50, include_trashed: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Return lightweight session summaries for this agent (#2019).
 
-        WARNING: This searches decrypted content, so it loads all messages first.
+        Shares the session-boundary algorithm with the
+        ``GET /api/conversations`` endpoint via
+        :func:`group_messages_into_sessions`, so the agent's
+        ``list_conversations`` tool and the UI never disagree on where one
+        conversation ends and the next begins.
+
+        Args:
+            limit: maximum number of sessions to return, most-recent first.
+            include_trashed: when True, list soft-deleted (Trash) sessions
+                instead of live ones — used to find a session to restore.
+
+        Returns:
+            list of ``{session_id, name, message_count, user_message_count,
+            started_at, last_message_at, preview, is_trashed}`` dicts ordered
+            most-recent first. ``name`` is omitted for untitled sessions.
+        """
+        history = await self.get_full_history_with_ids(
+            include_excluded=True,
+            include_stashed=True,
+            only_deleted=include_trashed,
+        )
+        try:
+            names = await self.get_conversation_names()
+        except Exception as e:  # titles are best-effort decoration
+            logger.warning(f"list_conversation_sessions: name lookup failed: {e}")
+            names = {}
+
+        # get_full_history_with_ids returns oldest-first, exactly what the
+        # shared summarizer expects; it groups, coalesces same-UUID clusters
+        # into unique delete targets (#2019), and shapes the newest-first list.
+        return summarize_sessions(
+            history,
+            names=names,
+            limit=limit,
+            include_trashed=include_trashed,
+            # Unwrap sent-form so the preview is the raw user text, not the
+            # <retrieved_context>.../<user_input>... replay wrappers.
+            preview_transform=extract_raw_user_content,
+        )
+
+    async def count_session_messages(
+        self, session_id: str, deleted_filter: str = "all"
+    ) -> int:
+        """Count messages a session resolves to (#2019).
+
+        Uses the SAME resolver (``_get_session_messages``) that delete / restore
+        / purge use, so a destructive preview counts exactly what the operation
+        will touch — including legacy row-id sessions only partially in Trash,
+        whose deleted subset a grouped summary would mis-key.
+
+        Args:
+            session_id: UUID or legacy numeric session id.
+            deleted_filter: ``live`` / ``deleted`` / ``all`` (default ``all``,
+                matching ``purge_conversation_session``).
+        """
+        rows = await self._get_session_messages(
+            session_id, limit=10_000, deleted_filter=deleted_filter
+        )
+        return len(rows)
+
+    async def find_messages_matching(
+        self, content_pattern: str, session_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Return live messages whose content matches a pattern (#2019).
+
+        Shared by the delete preview and the delete itself so the two always
+        agree on which rows are in scope.
+
+        WARNING: searches decrypted content, so it loads all messages first.
         Use carefully on large histories.
 
         Args:
-            content_pattern: Text pattern to match in message content
+            content_pattern: case-insensitive substring to match.
+            session_id: when provided, only messages belonging to this session
+                are considered — the pattern can no longer reach across
+                unrelated conversations. Accepts a UUID session_id or a legacy
+                numeric message-id, same as the session lifecycle primitives.
 
         Returns:
-            Number of messages deleted
+            list of matching message dicts (id, role, content, metadata, ...).
         """
-        # Get all messages with IDs
-        history = await self.get_full_history_with_ids(include_excluded=True, include_stashed=True)
+        history = await self.get_full_history_with_ids(
+            include_excluded=True, include_stashed=True
+        )
 
-        # Find matching IDs
+        # Confine the search to one session when asked, using the same
+        # session-resolution logic the soft-delete primitives use.
+        allowed_ids: Optional[set] = None
+        if session_id is not None:
+            rows = await self._get_session_messages(session_id, limit=10_000)
+            allowed_ids = {row[0] for row in rows}
+
         pattern_lower = content_pattern.lower()
-        ids_to_delete = []
+        matches = []
         for msg in history:
+            if allowed_ids is not None and msg["id"] not in allowed_ids:
+                continue
             if pattern_lower in msg.get("content", "").lower():
-                ids_to_delete.append(msg["id"])
+                matches.append(msg)
+        return matches
 
-        # Delete them
-        for msg_id in ids_to_delete:
-            await self.delete_message(msg_id)
+    async def delete_messages_matching(
+        self, content_pattern: str, session_id: Optional[str] = None
+    ) -> int:
+        """Soft-delete messages containing a pattern (#2019 adds session scope).
 
-        return len(ids_to_delete)
+        Args:
+            content_pattern: Text pattern to match in message content.
+            session_id: when provided, confine deletion to that session so the
+                pattern cannot reach across unrelated conversations.
+
+        Returns:
+            Number of messages deleted.
+        """
+        matches = await self.find_messages_matching(content_pattern, session_id)
+        for msg in matches:
+            await self.delete_message(msg["id"])
+        return len(matches)
 
     async def get_full_history_with_ids(
         self,

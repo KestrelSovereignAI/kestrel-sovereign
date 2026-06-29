@@ -34,6 +34,10 @@ REQUIRED_DELEGATORS = [
     ("set_conversation_name", {"session_id": "sess-1", "name": "x"}, "#716 rename"),
     ("get_conversation_name", {"session_id": "sess-1"}, "#716 read"),
     ("get_conversation_names", {}, "#716 bulk read"),
+    ("list_conversation_sessions", {"limit": 5}, "#2019 session list"),
+    ("find_messages_matching", {"content_pattern": "x"}, "#2019 find"),
+    ("delete_messages_matching", {"content_pattern": "x"}, "#2019 scoped delete"),
+    ("count_session_messages", {"session_id": "sess-1"}, "#2019 resolver count"),
 ]
 
 
