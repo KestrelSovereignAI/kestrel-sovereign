@@ -793,6 +793,24 @@ class OrchestratorEngineMixin:
             return await handler(**(args or {}))
 
         found_tool, found_feature = self._resolve_named_tool(tool_name)
+        direct_tool_feature_name: Optional[str] = None
+        if found_tool is None and tool_name in getattr(self, "_direct_tools", {}):
+            # Dynamically-mounted tools — e.g. an MCP server's tools mounted as
+            # first-class LLM tools via ``register_dynamic_tools`` — live in the
+            # ``_direct_tools`` registry, NOT in any feature's ``get_tools()``.
+            # The chat path dispatches these via ``_dispatch_direct_tool``, but
+            # ``execute_named_tool`` (codex inline-executor, voice realtime, A2A,
+            # the MCP managed-call path) only walked feature tools + subagent
+            # dispatchers — so a dynamically-mounted tool the LLM was explicitly
+            # told it could call failed with ToolNotRegisteredError. Resolve it
+            # here so every transport can dispatch it. (Emma's MCP dogfood:
+            # ``mcp__<server>__<tool>`` was advertised but "not registered with
+            # any enabled feature" on invocation.) The shared input-guardrail /
+            # PRE+POST hook / permission flow below then applies uniformly.
+            found_tool = self._direct_tools[tool_name]
+            direct_tool_feature_name = self._security_feature_name_for_tool(
+                tool_name
+            )
         if found_tool is None:
             # Subagent-dispatcher fallback. Every feature that supports
             # subagent dispatch is advertised to the LLM as a tool named
@@ -823,7 +841,8 @@ class OrchestratorEngineMixin:
             )
 
         feature_name = (
-            getattr(found_feature, "tool_name", None)
+            direct_tool_feature_name
+            or getattr(found_feature, "tool_name", None)
             or getattr(found_feature, "name", None)
             or type(found_feature).__name__
         )
