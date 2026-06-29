@@ -102,6 +102,26 @@ async def test_preview_unwraps_sent_form(store):
 
 
 @pytest.mark.asyncio
+async def test_trashed_session_markers_are_hidden(store):
+    # Deleting a session trashes its new_session marker (#2027); that structural
+    # row must NOT show in the message-level Trash listing or inflate the count.
+    await _insert(store, "user", "real msg", "2026-06-30 10:00:00")
+    await store.db.execute_commit(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+        (store.agent_id, "system", "",
+         json.dumps({"session_id": SID, "type": "session_marker", "new_session": True}),
+         "2026-06-30 10:00:01"),
+    )
+    await store.delete_conversation_session(SID)  # trashes content + marker
+
+    result = await _feature(store).list_trashed_messages()
+    assert "system" not in [m["role"] for m in result.data["messages"]]  # marker hidden
+    assert result.data["count"] == 1  # only the real message
+    assert result.data["messages"][0]["preview"] == "real msg"
+
+
+@pytest.mark.asyncio
 async def test_empty_trash_returns_zero(store):
     await _insert(store, "user", "live only", "2026-06-30 10:00:00")
     result = await _feature(store).list_trashed_messages()
