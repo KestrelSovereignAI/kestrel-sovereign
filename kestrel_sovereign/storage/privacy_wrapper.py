@@ -1294,6 +1294,31 @@ class PrivacyEnforcingStorage:
             session_id, deleted_filter=deleted_filter
         )
 
+    async def message_belongs_to_session(
+        self, message_id: Any, session_id: str
+    ) -> bool:
+        """Whether a message resolves within a session, respecting privacy (#2022).
+
+        EPHEMERAL has no persistent data → False. ISOLATED checks the in-memory
+        entry at ``message_id`` (its buffer index) against the session. Otherwise
+        delegates to the resolver-based store check.
+        """
+        if self._privacy_config.is_ephemeral():
+            return False
+
+        if self._policy.use_session_storage:
+            try:
+                idx = int(message_id)
+            except (TypeError, ValueError):
+                return False
+            if 0 <= idx < len(self._session_conversations):
+                return _in_session(self._session_conversations[idx], session_id)
+            return False
+
+        return await self._storage.message_belongs_to_session(
+            message_id, session_id
+        )
+
     async def find_messages_matching(
         self, content_pattern: str, session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:

@@ -334,6 +334,16 @@ class AsyncStorage:
             session_id, deleted_filter=deleted_filter
         )
 
+    async def message_belongs_to_session(
+        self, message_id: Any, session_id: str
+    ) -> bool:
+        """Whether a message resolves within a session — facade delegator (#2022)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.message_belongs_to_session(
+            message_id, session_id
+        )
+
     async def find_messages_matching(
         self, content_pattern: str, session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:

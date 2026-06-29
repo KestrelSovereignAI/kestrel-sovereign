@@ -2259,6 +2259,25 @@ class AsyncConversationStore:
         )
         return len(rows)
 
+    async def message_belongs_to_session(
+        self, message_id: Any, session_id: str
+    ) -> bool:
+        """True if ``message_id`` resolves within ``session_id`` (#2022).
+
+        Uses the SAME resolver (``_get_session_messages`` with
+        ``deleted_filter='all'``) that delete / restore / purge use, so a
+        ``session_id`` guard on a single-message operation agrees exactly with
+        the session-grain tools — across live AND trashed rows (a restore guard
+        must match a message already in Trash). Identity, never content.
+        """
+        target = coerce_persistent_message_id(message_id)
+        if target is None:
+            return False
+        rows = await self._get_session_messages(
+            session_id, limit=10_000, deleted_filter="all"
+        )
+        return any(row[0] == target for row in rows)
+
     async def find_messages_matching(
         self, content_pattern: str, session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
