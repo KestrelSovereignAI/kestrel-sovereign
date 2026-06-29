@@ -8,8 +8,8 @@ tags:
 - docs
 - diagrams
 - diagram
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-06-29T00:00:00Z'
+status: current
 owner: documentation
 canonical: false
 generated: false
@@ -404,8 +404,8 @@ graph TD
     end
 
     subgraph catalog["ModelCatalogService"]
-        TOML["model_catalog.toml"]
-        FEATURED_LIST["Featured models list"]
+        TOML["model_catalog.toml [visibility] dials"]
+        FEATURED_CALC["Featured = top-N by created_at<br/>(recency, naming-agnostic)"]
         OVERRIDES["Display name overrides"]
     end
 
@@ -421,7 +421,7 @@ graph TD
     style ENDPOINT fill:#145a32,stroke:#58d68d
 ```
 
-**Curated catalog.** Surface the best models, hide the noise.
+**Curated catalog.** Featuring is computed from the provider-supplied `created_at` (recency), not from maintained lists — the newest chat models per vendor are featured and stale ones (e.g. `gpt-3.5-turbo`) sink. Naming-agnostic, so codename tiers (Sol/Terra/Luna) work too. See [LLM_SERVICE_ARCHITECTURE.md → Visibility](../architecture/LLM_SERVICE_ARCHITECTURE.md). (#2015)
 
 ---
 
@@ -435,14 +435,14 @@ sequenceDiagram
     participant LLM as LLMService
 
     U->>UI: Open model selector
-    UI->>API: GET /api/models?featured_only=true
-    API->>LLM: discover_all_models()
-    LLM-->>API: List[ModelInfo]
-    API-->>UI: Featured models
-
-    U->>UI: Toggle "Show All"
     UI->>API: GET /api/models
-    API-->>UI: All models
+    API->>LLM: discover_all_models()
+    LLM-->>API: List[ModelInfo] (per-vendor: featured-first, recency-ranked)
+    API-->>UI: All models + is_featured flags
+    Note over UI: Default view = featured only (a clean handful)
+
+    U->>UI: Pick "⋯ Show all N models"
+    Note over UI: Client-side filter — no extra round-trip
 
     U->>UI: Select a model
     UI->>API: POST /api/model/set

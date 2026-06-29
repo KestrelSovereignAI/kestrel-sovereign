@@ -251,6 +251,124 @@ test('_populateProviders seeds vendor from server default rather than alphabetic
     assert.equal(selector.selectedProvider, 'openai');
 });
 
+// ----------------------------------------------------------------------
+// Featured-only default + "Show all" expander (#2015)
+// ----------------------------------------------------------------------
+
+function _openaiMixedData() {
+    return {
+        default: null,
+        by_vendor: {
+            // Server order: featured-first, recency-ranked. gpt-3.5-turbo is a
+            // non-featured stale model that must NOT seed or show by default.
+            openai: [
+                { id: 'gpt-5.5', provider: 'openai', display_name: 'GPT-5.5', is_featured: true },
+                { id: 'gpt-5.4', provider: 'openai', display_name: 'GPT-5.4', is_featured: true },
+                { id: 'gpt-3.5-turbo', provider: 'openai', display_name: 'GPT-3.5 Turbo', is_featured: false },
+                { id: 'gpt-4', provider: 'openai', display_name: 'GPT-4', is_featured: false },
+            ],
+        },
+        routes: [{ vendor: 'openai', route: 'api', model: 'auto' }],
+    };
+}
+
+test('_populateModels defaults to featured set, seeds best featured, offers Show all', () => {
+    const { ModelSelector, providerSelect, modelSelect } = loadModelSelector();
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        storagePrefix: 'test',
+    });
+    selector.allModelsData = _openaiMixedData();
+    providerSelect.value = 'openai';
+    selector.selectedModel = '';
+
+    selector._populateModels();
+
+    // Featured-only by default: stale models hidden, expander present.
+    assert.ok(modelSelect.innerHTML.includes('gpt-5.5'));
+    assert.ok(!modelSelect.innerHTML.includes('"gpt-3.5-turbo"'));
+    assert.ok(modelSelect.innerHTML.includes('__show_all__'));
+    // Seed is the best featured model — never the alphabetical gpt-3.5-turbo.
+    assert.equal(modelSelect.value, 'gpt-5.5');
+    assert.equal(selector.selectedModel, 'gpt-5.5');
+});
+
+test('selecting the Show all sentinel reveals every model without committing', () => {
+    const commits = [];
+    const { ModelSelector, providerSelect, modelSelect } = loadModelSelector();
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        storagePrefix: 'test',
+        onModelChange: (...a) => commits.push(a),
+    });
+    selector.allModelsData = _openaiMixedData();
+    providerSelect.value = 'openai';
+    selector.isInitialLoad = false;
+    selector._populateModels();         // featured-only
+    selector.selectedModel = 'gpt-5.5';
+
+    // Operator picks the "Show all" sentinel.
+    modelSelect.value = '__show_all__';
+    selector._handleModelChange();
+
+    assert.equal(selector.showAllModels, true);
+    assert.ok(modelSelect.innerHTML.includes('"gpt-3.5-turbo"'));
+    // Sentinel must not be treated as a model selection — no commit fired.
+    assert.equal(commits.length, 0);
+    assert.equal(selector.selectedModel, 'gpt-5.5');
+});
+
+test('checkForModelChange renders a non-featured current model under the collapsed view', () => {
+    // Regression (#2015): switching the agent to a deprecated/non-featured model
+    // must still show it, even though the dropdown defaults to featured-only.
+    const { ModelSelector, providerSelect, modelSelect } = loadModelSelector();
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        storagePrefix: 'test',
+    });
+    selector.allModelsData = {
+        by_vendor: {
+            openai: [
+                { id: 'gpt-5.5', provider: 'openai', display_name: 'GPT-5.5', is_featured: true },
+                { id: 'gpt-4', provider: 'openai', display_name: 'GPT-4', is_featured: false },
+            ],
+        },
+        routes: [{ vendor: 'openai', route: 'api', model: 'auto' }],
+    };
+    providerSelect.value = 'openai';
+    selector.selectedModel = 'gpt-5.5';
+    selector._populateModels();                     // collapsed: gpt-4 not rendered
+    assert.ok(!modelSelect.innerHTML.includes('"gpt-4"'));
+
+    const changed = selector.checkForModelChange(
+        'MODEL_CHANGED:{"vendor":"openai","model":"openai/gpt-4","model_name":"gpt-4"}');
+
+    assert.equal(changed, true);
+    assert.ok(modelSelect.innerHTML.includes('"gpt-4"'));  // now rendered
+    assert.equal(modelSelect.value, 'gpt-4');
+    assert.equal(selector.selectedModel, 'gpt-4');
+});
+
+test('vendor switch resets back to the featured view', () => {
+    const { ModelSelector, providerSelect } = loadModelSelector();
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        storagePrefix: 'test',
+    });
+    selector.allModelsData = _openaiMixedData();
+    selector.showAllModels = true;
+    providerSelect.value = 'openai';
+    selector.isInitialLoad = false;
+
+    selector._handleProviderChange();
+
+    assert.equal(selector.showAllModels, false);
+});
+
 test('_populateProviders prefers saved selection over server default', () => {
     // localStorage > server default > alphabetical. Saved must win.
     const { ModelSelector, providerSelect } = loadModelSelector();

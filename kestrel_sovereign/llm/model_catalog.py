@@ -64,13 +64,148 @@ def _mark_canonical_aliases(models: List[ModelInfo]) -> None:
         for root, members in lineages.items():
             if len(members) < 2:
                 continue
-            # Canonical = no date suffix in the ID.
+            # Canonical = no date suffix in the ID. We mark the alias so the
+            # featuring pass can prefer it over its dated snapshots, but we do
+            # NOT feature it here: "undated lineage root" is a forever-true
+            # structural fact, so auto-featuring on it alone floats stale roots
+            # (gpt-3.5-turbo, gpt-4) into the dropdown indefinitely. Featuring
+            # is recency-gated in ``_apply_recency_visibility``. (#2015)
             undated = [m for m in members if not _has_date_suffix(m.id)]
-            if undated:
-                for m in undated:
-                    m.is_canonical_alias = True
-                    # Canonical alias auto-features in the chat dropdown.
-                    m.is_featured = True
+            for m in undated:
+                m.is_canonical_alias = True
+
+
+# Tokens that mark a model as a preview/experimental cut rather than a GA
+# release. Preview models are never featured (still selectable under "show
+# all"). Purely lexical — no specific IDs.
+_PREVIEW_TOKENS = ("preview", "beta", "experimental", "-exp", "exp-")
+
+
+def _is_previewish(model: ModelInfo) -> bool:
+    blob = f"{model.id} {model.display_name or ''}".lower()
+    return any(tok in blob for tok in _PREVIEW_TOKENS)
+
+
+def _created_key(created_at: Optional[str]) -> tuple[int, ...]:
+    """Comparable recency key (ascending = oldest first) from a provider
+    timestamp. Handles both unix-epoch strings (OpenAI ``created``) and ISO
+    datetimes (Anthropic ``created_at``). Naming-agnostic — reads the
+    provider-supplied timestamp, never the model id. Missing/garbage → all
+    zeros, which sorts oldest. (#2015)
+    """
+    numbers = [int(part) for part in re.findall(r"\d+", created_at or "")]
+    return tuple((numbers + [0] * 6)[:6])
+
+
+# Pattern-based category inference for vendors whose model-list API does not
+# return a category (OpenAI, Anthropic). Each entry: substrings that, when
+# present in the id, imply a non-chat category. Checked only as a FALLBACK —
+# an explicit catalog ``[categories]`` entry always wins. (#2015)
+_CATEGORY_ID_PATTERNS: tuple[tuple[ModelCategory, tuple[str, ...]], ...] = (
+    (ModelCategory.EMBEDDING, ("embedding", "embed", "text-embedding")),
+    (ModelCategory.IMAGE, ("dall-e", "dalle", "-image", "image-", "gpt-image", "video", "imagine")),
+    # Realtime/voice/transcription/TTS are audio-surface models, not chat.
+    (ModelCategory.AUDIO, ("tts", "whisper", "transcribe", "realtime", "audio", "speech")),
+)
+
+
+def _infer_category_from_id(model_id: str) -> Optional[ModelCategory]:
+    low = model_id.lower()
+    for category, tokens in _CATEGORY_ID_PATTERNS:
+        if any(tok in low for tok in tokens):
+            return category
+    return None
+
+
+def _apply_recency_visibility(
+    models: List[ModelInfo],
+    *,
+    featured_per_vendor: int,
+    deprecate_after_days: int,
+    explicit_featured: Optional[Dict[str, Set[str]]] = None,
+) -> None:
+    """Compute ``is_featured`` / ``is_deprecated`` from provider-supplied
+    recency + category, per vendor. This replaces "feature every undated
+    lineage root forever" with a recency-gated set that works identically for
+    numbered (``gpt-5.5``), codenamed (``claude-opus-4-8``, future
+    ``gpt-5.6-sol``), and dated schemes — because it ranks on ``created_at``,
+    not on parsing a version out of the id. (#2015)
+    """
+    from datetime import datetime, timezone
+
+    explicit_featured = explicit_featured or {}
+    now = datetime.now(timezone.utc)
+
+    def age_days(created_at: Optional[str]) -> Optional[float]:
+        if not created_at:
+            return None
+        try:
+            txt = str(created_at)
+            if txt.isdigit():
+                ts = datetime.fromtimestamp(int(txt), tz=timezone.utc)
+            else:
+                ts = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            return (now - ts).total_seconds() / 86400.0
+        except (ValueError, OverflowError, OSError):
+            return None
+
+    by_vendor: dict[str, list[ModelInfo]] = defaultdict(list)
+    for m in models:
+        by_vendor[m.provider].append(m)
+
+    for vendor_models in by_vendor.values():
+        chat = [m for m in vendor_models if m.category == ModelCategory.CHAT]
+
+        # Age-based deprecation: a chat model older than the window IS
+        # deprecated when a newer chat model exists for the vendor. Models
+        # with no timestamp are left alone (can't tell). Description-keyword
+        # deprecation from per-model enrichment is preserved (never un-set).
+        ages = {id(m): age_days(m.created_at) for m in chat}
+        # Age of the NEWEST chat model for the vendor (smallest age). A model is
+        # deprecated only when something newer exists — i.e. this model's age
+        # exceeds the newest's. Guards against deprecating a vendor's only/oldest
+        # line when it simply hasn't shipped recently.
+        youngest = min((a for a in ages.values() if a is not None), default=None)
+        for m in chat:
+            a = ages[id(m)]
+            if a is not None and a > deprecate_after_days and youngest is not None and youngest < a:
+                m.is_deprecated = True
+
+        # Featured pool: GA chat models that aren't hidden or deprecated.
+        pool = [
+            m for m in chat
+            if not m.is_hidden and not m.is_deprecated and not _is_previewish(m)
+        ]
+        # Prefer the undated alias over its dated snapshots: drop a dated
+        # snapshot when its lineage root is itself in the pool.
+        roots_in_pool = {m.id for m in pool if not _has_date_suffix(m.id)}
+        pool = [
+            m for m in pool
+            if not (_has_date_suffix(m.id) and _strip_date_suffix(m.id) in roots_in_pool)
+        ]
+        # Rank newest-first by provider timestamp; canonical alias breaks ties.
+        pool.sort(key=lambda m: (_created_key(m.created_at), not m.is_canonical_alias), reverse=True)
+        featured_ids = {m.id for m in pool[:max(0, featured_per_vendor)]}
+
+        for m in vendor_models:
+            # Final featured decision is AUTHORITATIVE — recomputed from scratch
+            # and set on EVERY model, so stale ``is_featured=True`` carried in
+            # from a previous discovery cache or an adapter cannot survive (that
+            # is what let gpt-3.5-turbo stay featured on upgrade and bypass the
+            # recency cap — codex P2 on #2015). It is the OR of three recomputed
+            # signals only:
+            #   1. recency top-N for the vendor (the main driver),
+            #   2. explicit legacy [featured] TOML membership (operator intent,
+            #      re-derived from config — NOT the incoming model flag),
+            #   3. real usage (frecency) for an in-category, visible model.
+            m.is_featured = (
+                m.id in featured_ids
+                or m.id in explicit_featured.get(m.provider, frozenset())
+                or (m.frecency_score > 0 and not m.is_hidden and m.category == ModelCategory.CHAT)
+            )
+
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +355,12 @@ class ModelCatalogService:
         # Legacy support: if old-style [featured] section exists, still load it
         self._featured: Dict[str, Set[str]] = {}
 
+        # Visibility dials (#2015) — knobs, NOT maintained model lists. Drive
+        # recency-based featuring + age deprecation. Overridable via the
+        # ``[visibility]`` section of model_catalog.toml.
+        self._featured_per_vendor: int = 8
+        self._deprecate_after_days: int = 365
+
         self._loaded = False
 
     def load(self) -> None:
@@ -316,6 +457,22 @@ class ModelCatalogService:
             featured = self._config.get("featured", {})
             for provider, models in featured.items():
                 self._featured[provider] = set(models)
+
+            # Visibility dials (#2015). Knobs, not lists. Best-effort: a
+            # bad value degrades to the default rather than raising.
+            visibility = self._config.get("visibility", {}) or {}
+            try:
+                self._featured_per_vendor = int(
+                    visibility.get("featured_per_vendor", self._featured_per_vendor)
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                self._deprecate_after_days = int(
+                    visibility.get("deprecate_after_days", self._deprecate_after_days)
+                )
+            except (TypeError, ValueError):
+                pass
 
             self._loaded = True
             logger.info(f"Loaded model catalog from {self.config_path}")
@@ -671,11 +828,21 @@ class ModelCatalogService:
         # Hidden: emergency override from [hidden].
         model.is_hidden = self.is_hidden(model.provider, model.id)
 
-        # Category: only override when the catalog explicitly knows about this
-        # model. Preserves adapter-detected categories (e.g. Ollama embedding).
+        # Category resolution order (#2015):
+        #   1. explicit catalog [categories] entry — highest, operator intent.
+        #   2. pattern inference from the id — catches the audio/image/realtime
+        #      models that OpenAI's /models API stamps as plain CHAT (it returns
+        #      no category), so tts/whisper/transcribe/realtime/dall-e stop
+        #      polluting the chat dropdown.
+        #   3. otherwise keep the adapter-detected category (e.g. Ollama
+        #      embedding, Gemini's reported category).
         catalog_category = self._get_explicit_category(model.provider, model.id)
         if catalog_category is not None:
             model.category = catalog_category
+        elif model.category == ModelCategory.CHAT:
+            inferred = _infer_category_from_id(model.id)
+            if inferred is not None:
+                model.category = inferred
 
         # Display name override
         override = self._display_names.get(model.id)
@@ -707,12 +874,40 @@ class ModelCatalogService:
 
         return model
 
-    def enrich_models(self, models: List[ModelInfo]) -> List[ModelInfo]:
-        """Enrich a list of models. Runs per-model enrichment, then adds
-        cross-model signals (canonical-alias detection) that need the full list.
+    def enrich_models(
+        self,
+        models: List[ModelInfo],
+        pinned_featured: Optional[Dict[str, Set[str]]] = None,
+    ) -> List[ModelInfo]:
+        """Enrich a list of models. Runs per-model enrichment, then the
+        cross-model passes that need the full list: canonical-alias detection,
+        then recency-based featuring + age deprecation (#2015). Order matters —
+        featuring reads ``is_canonical_alias`` (to prefer aliases over dated
+        snapshots) and the per-model deprecation/category already applied above.
+
+        ``pinned_featured`` (``{vendor: {model_id}}``) are concrete models the
+        caller wants kept featured as operator intent — e.g. models configured
+        in ``kestrel.toml``, which may have no useful ``created_at`` and would
+        otherwise fall outside the recency top-N. Merged with the legacy
+        ``[featured]`` TOML set; both are re-derived each run, so featuring never
+        depends on an incoming/cached ``is_featured`` flag.
         """
+        self._ensure_loaded()
         enriched = [self.enrich_model(m) for m in models]
         _mark_canonical_aliases(enriched)
+
+        explicit_featured: Dict[str, Set[str]] = {
+            vendor: set(ids) for vendor, ids in self._featured.items()
+        }
+        for vendor, ids in (pinned_featured or {}).items():
+            explicit_featured.setdefault(vendor, set()).update(ids)
+
+        _apply_recency_visibility(
+            enriched,
+            featured_per_vendor=self._featured_per_vendor,
+            deprecate_after_days=self._deprecate_after_days,
+            explicit_featured=explicit_featured,
+        )
         return enriched
 
     def get_featured_models(self, provider: str) -> Set[str]:

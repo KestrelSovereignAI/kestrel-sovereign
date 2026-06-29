@@ -1162,7 +1162,9 @@ async def list_agent_models(
     List available LLM models from all providers.
 
     Query Parameters:
-        featured_only: Only return featured models (default: true)
+        featured_only: Only return featured models (default: false — the
+            selector fetches the full set once and filters featured/all
+            client-side via the "Show all" expander)
         category: Filter by category (chat, embedding, image, audio)
         providers: Comma-separated list of providers to include
         use_cache: Use cached results (default: true)
@@ -1211,6 +1213,23 @@ async def list_agent_models(
         by_vendor: Dict[str, List[Dict]] = {}
         for model in models:
             by_vendor.setdefault(model.provider, []).append(model.to_dict())
+
+        # Rank each vendor bucket: featured first, then newest-first by the
+        # provider-supplied ``created_at`` (naming-agnostic recency), then by
+        # id. This makes the FIRST entry per vendor the best default — the UI
+        # seeds to it, so an empty/cross-vendor server default no longer falls
+        # through to an alphabetical accident like ``gpt-3.5-turbo``. (#2015)
+        from kestrel_sovereign.llm.model_catalog import _created_key
+
+        def _bucket_sort_key(m: Dict):
+            return (
+                not m.get("is_featured"),
+                tuple(-n for n in _created_key(m.get("created_at"))),
+                m.get("id", ""),
+            )
+
+        for bucket in by_vendor.values():
+            bucket.sort(key=_bucket_sort_key)
 
         # Featured models (computed per ModelCatalogService rules)
         featured = [m.to_dict() for m in models if m.is_featured]
