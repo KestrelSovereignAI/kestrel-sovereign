@@ -259,6 +259,31 @@ async def test_skips_two_marker_collision_uuid_then_integer(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_empty_inherited_marker_title_not_remapped(tmp_path):
+    """codex: when a UUID already has orphan (prior) content and a later
+    inherited marker is still empty, the empty marker must NOT be mapped —
+    otherwise its own conversation_titles row would be moved onto the prior
+    UUID-owned conversation."""
+    db = await _db(tmp_path)
+    uuid = "f0f0f0f0-0000-0000-0000-000000000010"
+    # Orphan/prior conversation owns the UUID directly (no preceding marker).
+    await _insert(db, "user", "prior", {"session_id": uuid})
+    # A later inherited marker carrying the same UUID, with no content yet.
+    empty_marker = await _insert(db, "system", "", {"new_session": True, "session_id": uuid})
+    await db.execute(
+        "INSERT INTO conversation_titles (agent_id, session_id, name) VALUES (?, ?, ?)",
+        ("test-agent", str(empty_marker), "Fresh conversation"),
+    )
+
+    await migrate_canonical_session_ids(db)
+
+    rows = await db.fetchall("SELECT session_id, name FROM conversation_titles", ())
+    # Title stays under the empty marker's own key, not moved onto the UUID.
+    assert (str(empty_marker), "Fresh conversation") in rows
+    assert all(sid != uuid for sid, _ in rows)
+
+
+@pytest.mark.asyncio
 async def test_collision_analysis_is_agent_scoped(tmp_path):
     """codex: a UUID reused across two agents (imported/restored data) is NOT
     a collision — each agent's session must still consolidate independently."""
