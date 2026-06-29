@@ -849,45 +849,59 @@ async def migrate_canonical_session_ids(db: "AsyncDatabase") -> None:
         (),
     )
 
-    # First occurrence (lowest row-id) of each UUID among CONTENT rows (i.e.
-    # NOT new_session markers). A marker is safe to canonicalize to only if no
-    # earlier content row already owns its UUID — earlier markers sharing the
-    # UUID are the same session (e.g. a double new-conversation marker), not a
-    # prior conversation.
-    first_content_rowid_by_uuid: dict[str, int] = {}
-    # Candidate markers: row-id -> its UUID.
-    candidate_markers: dict[int, str] = {}
+    # Markers (new_session rows) grouped by their UUID, and the distinct
+    # content-CLUSTER keys observed for each UUID. A "cluster key" is the key
+    # under which a non-marker (content) row is filed: its UUID directly, or
+    # the integer row-id of the marker it continues. The inheritance bug can
+    # put the SAME UUID on several markers, each anchoring a DISTINCT
+    # conversation whose turns are still keyed by that marker's integer id —
+    # so we count clusters, not just rows already carrying the UUID.
+    markers_by_uuid: dict[str, list[int]] = {}
+    marker_uuid_of_rowid: dict[int, str] = {}
     for row_id, raw in history_rows:
         meta, sid = _extract_session_id(raw)
         if meta is None or sid is None:
             continue
         sid_str = str(sid)
-        if sid_str.isdigit():
-            continue
-        if meta.get("new_session"):
-            candidate_markers[row_id] = sid_str
-        else:
-            first_content_rowid_by_uuid.setdefault(sid_str, row_id)
+        if not sid_str.isdigit() and meta.get("new_session"):
+            markers_by_uuid.setdefault(sid_str, []).append(row_id)
+            marker_uuid_of_rowid[row_id] = sid_str
 
-    # Build {marker_row_id (str) -> UUID}, skipping markers that INHERITED a
-    # prior real conversation's UUID (a content row earlier than the marker
-    # already carries it) — relinking those would merge two distinct
-    # conversations. Markers whose UUID is only shared by earlier markers are
-    # the same session and ARE relinked.
+    content_clusters_by_uuid: dict[str, set] = {}
+    for row_id, raw in history_rows:
+        meta, sid = _extract_session_id(raw)
+        if meta is None or sid is None or meta.get("new_session"):
+            continue  # markers are anchors, not content
+        sid_str = str(sid)
+        if not sid_str.isdigit():
+            # Content already carrying a UUID → that UUID's own cluster.
+            if sid_str in markers_by_uuid:
+                content_clusters_by_uuid.setdefault(sid_str, set()).add(("uuid", sid_str))
+        else:
+            # Integer-keyed content continues the marker at that row-id;
+            # attribute it to that marker's UUID as a distinct cluster.
+            uuid = marker_uuid_of_rowid.get(int(sid_str))
+            if uuid is not None:
+                content_clusters_by_uuid.setdefault(uuid, set()).add(("int", sid_str))
+
+    # A UUID is safe to consolidate iff it has AT MOST ONE content cluster —
+    # then every marker sharing it anchors the same single conversation. With
+    # ≥2 clusters, distinct conversations collided on the UUID via the
+    # inheritance bug and must NOT be merged.
     marker_uuid_by_rowid: dict[str, str] = {}
     skipped_inherited = 0
-    for marker_row_id, uuid in candidate_markers.items():
-        content_first = first_content_rowid_by_uuid.get(uuid)
-        if content_first is not None and content_first < marker_row_id:
-            skipped_inherited += 1
+    for uuid, marker_ids in markers_by_uuid.items():
+        if len(content_clusters_by_uuid.get(uuid, ())) <= 1:
+            for marker_row_id in marker_ids:
+                marker_uuid_by_rowid[str(marker_row_id)] = uuid
         else:
-            marker_uuid_by_rowid[str(marker_row_id)] = uuid
+            skipped_inherited += len(marker_ids)
 
     if skipped_inherited:
         logger.info(
             "canonical-session-id migration (#2012): skipped %d new_session "
-            "marker(s) that inherited a prior conversation's UUID (ambiguous — "
-            "not relinked to avoid merging conversations).", skipped_inherited,
+            "marker(s) whose UUID collided across distinct conversations "
+            "(ambiguous — not relinked to avoid merging).", skipped_inherited,
         )
 
     if not marker_uuid_by_rowid:

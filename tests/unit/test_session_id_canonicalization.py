@@ -165,30 +165,34 @@ async def test_canonicalize_skips_inherited_marker(store):
 
 
 @pytest.mark.asyncio
-async def test_canonicalize_relinks_double_marker_same_session(store):
-    """Two new_session markers sharing a UUID with NO content row between
-    them are ONE session — an integer key naming the second marker must
-    canonicalize to the shared UUID (the live-Emma 1313/1314 case)."""
+async def test_canonicalize_declines_multi_marker_uuid(store):
+    """When a UUID is carried by more than one new_session marker, the LIVE
+    path conservatively declines (returns the integer unchanged) — the
+    startup migration does the fully-analyzable double-marker consolidation.
+    This protects the codex merge case where two markers each anchor distinct
+    integer-keyed conversations."""
     shared = "e1fd6fe5-885e-43b2-b6e2-cfbea64f66a2"
-    # First marker mints the UUID.
-    await store.db.execute_commit(
-        "INSERT INTO conversation_history (agent_id, role, content, metadata) "
-        "VALUES (?, ?, ?, ?)",
-        ("test-agent", "system", "",
-         json.dumps({"new_session": True, "type": "session_marker", "session_id": shared})),
-    )
-    # Second marker re-stamps the same UUID, no content in between.
-    await store.db.execute_commit(
-        "INSERT INTO conversation_history (agent_id, role, content, metadata) "
-        "VALUES (?, ?, ?, ?)",
-        ("test-agent", "system", "",
-         json.dumps({"new_session": True, "type": "session_marker", "session_id": shared})),
-    )
+    for _ in range(2):
+        await store.db.execute_commit(
+            "INSERT INTO conversation_history (agent_id, role, content, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            ("test-agent", "system", "",
+             json.dumps({"new_session": True, "type": "session_marker", "session_id": shared})),
+        )
     marker2_id = (await store.db.fetchone(
         "SELECT id FROM conversation_history ORDER BY id DESC LIMIT 1", ()
     ))[0]
 
-    assert await store._canonicalize_session_id(str(marker2_id)) == shared
+    assert await store._canonicalize_session_id(str(marker2_id)) == str(marker2_id)
+
+
+@pytest.mark.asyncio
+async def test_canonicalize_single_marker_relinks(store):
+    """The common case: a single marker owns its UUID and continued turns
+    echoing the marker row-id canonicalize to it."""
+    uuid = "abcdef00-0000-0000-0000-0000000000c1"
+    marker_id = await _marker_with_uuid(store, uuid)
+    assert await store._canonicalize_session_id(str(marker_id)) == uuid
 
 
 @pytest.mark.asyncio

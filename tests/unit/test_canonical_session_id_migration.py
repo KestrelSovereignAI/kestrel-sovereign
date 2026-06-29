@@ -215,6 +215,27 @@ async def test_relinks_double_marker_same_session(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_skips_duplicate_uuid_markers_each_with_own_content(tmp_path):
+    """codex: two markers share a UUID but EACH already has its own continued
+    messages keyed by its integer row-id (two distinct conversations that
+    collided on the UUID via the inheritance bug). The migration must NOT
+    relink either — that would merge the two conversations."""
+    db = await _db(tmp_path)
+    shared_uuid = "dddddddd-0000-0000-0000-00000000000c"
+    m1 = await _insert(db, "system", "", {"new_session": True, "session_id": shared_uuid})
+    c1 = await _insert(db, "user", "conv1", {"session_id": str(m1)})
+    m2 = await _insert(db, "system", "", {"new_session": True, "session_id": shared_uuid})
+    c2 = await _insert(db, "user", "conv2", {"session_id": str(m2)})
+
+    await migrate_canonical_session_ids(db)
+
+    sids = await _session_ids(db)
+    # Neither conversation merged into the shared UUID — both stay split.
+    assert sids[c1] == str(m1)
+    assert sids[c2] == str(m2)
+
+
+@pytest.mark.asyncio
 async def test_init_schema_runs_migration_on_startup(tmp_path):
     raw = SQLiteBackend(str(tmp_path / "startup-canonical.db"))
     await raw.connect()

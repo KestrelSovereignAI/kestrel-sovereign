@@ -541,45 +541,56 @@ class AsyncConversationStore:
 
     async def _marker_owns_uuid(self, row_id: int, uuid: str) -> bool:
         """True if it is safe to canonicalize an integer key to this marker's
-        ``uuid`` — i.e. no EARLIER non-``new_session`` (content) row already
-        carries ``uuid``.
+        ``uuid``. Safe requires BOTH:
 
-        Earlier *markers* sharing the UUID are fine: they are the same session
-        (e.g. a double new-conversation marker that re-stamped the same id), so
-        relinking unifies one conversation. An earlier *content* row carrying
-        the UUID means the marker INHERITED a prior real conversation's id via
-        the old time-gap heuristic; canonicalizing to it would merge two
-        distinct conversations, so we refuse (#2012).
+        1. Exactly ONE ``new_session`` marker carries the UUID. Otherwise the
+           inheritance bug stamped it on several markers, each potentially
+           anchoring a DISTINCT conversation keyed by its own integer row-id —
+           consolidating could merge them.
+        2. No EARLIER (id < ``row_id``) content row already carries the UUID.
+           Such a row is a prior conversation that owns the UUID directly; the
+           marker merely inherited it, so filing new turns under it would merge
+           into that prior conversation.
+
+        The live path is only a transition safety net — the startup migration
+        does the real, fully-analyzable consolidation of multi-marker UUIDs, so
+        here we take the provably-safe position and decline anything ambiguous.
+        This marker's OWN later turns (id > row_id) never block (#2012).
 
         Conservative: on any lookup error, return False (do not canonicalize)
         so an ambiguous marker is never merged into another conversation.
         """
         try:
             esc = _escape_like_session_value(str(uuid))
-            earlier_rows = await self.db.fetchall(
-                "SELECT metadata FROM conversation_history "
-                "WHERE agent_id = ? AND id < ? "
+            rows = await self.db.fetchall(
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE agent_id = ? "
                 "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\')",
                 (
-                    self.agent_id, row_id,
+                    self.agent_id,
                     f'%"session_id": "{esc}"%',
                     f'%"session_id":"{esc}"%',
                 ),
             )
-            for (meta_json,) in earlier_rows:
+            marker_count = 0
+            for rid, meta_json in rows:
                 if not meta_json:
                     continue
                 try:
                     meta = json.loads(meta_json)
                 except (json.JSONDecodeError, TypeError):
-                    # Unparseable earlier row carrying the UUID — treat as
-                    # ambiguous content and refuse.
                     return False
-                # Match by exact session_id (LIKE can substring-collide); only
-                # an earlier CONTENT row (not a new_session marker) blocks.
-                if meta.get("session_id") == str(uuid) and not meta.get("new_session"):
+                # Exact match (LIKE can substring-collide).
+                if meta.get("session_id") != str(uuid):
+                    continue
+                if meta.get("new_session"):
+                    marker_count += 1
+                    if marker_count > 1:
+                        return False
+                elif rid < row_id:
+                    # Earlier content owns the UUID → prior conversation.
                     return False
-            return True
+            return marker_count == 1
         except Exception as e:
             logger.warning(f"Marker ownership check failed: {e}")
             return False
