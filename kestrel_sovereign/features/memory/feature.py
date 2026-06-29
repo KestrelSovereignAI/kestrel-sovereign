@@ -1016,6 +1016,184 @@ class MemoryFeature(Feature):
             data={"mode": "purge", "purged": purged, "session_id": session_id},
         )
 
+    # ------------------------------------------------------------------
+    # Single-message lifecycle by identity (#2022)
+    # ------------------------------------------------------------------
+    # delete_messages (above) matches by CONTENT, which is the wrong primitive
+    # for surgical edits — text is not identity, so a pattern can hit the same
+    # string in another turn or session. These tools address ONE row by its
+    # message_id, with an optional session_id guard, routing through the same
+    # privacy-aware facade (pin cleanup + EPHEMERAL/ISOLATED enforcement).
+
+    async def _guard_message_session(
+        self, storage, message_id, session_id: Optional[str]
+    ) -> Optional[ToolResult]:
+        """Refuse if a session_id guard is given and the message isn't in it.
+
+        Returns a failed ToolResult to short-circuit, or None to proceed.
+        """
+        if session_id is None:
+            return None
+        try:
+            belongs = await storage.message_belongs_to_session(message_id, session_id)
+        except Exception as e:
+            logger.error(f"message-session guard failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+        if not belongs:
+            return ToolResult.failed(
+                f"Message {message_id} does not belong to session {session_id!r} "
+                f"— refusing (the id may be stale or from another conversation)."
+            )
+        return None
+
+    @tool(
+        name="delete_message_by_id",
+        description="Soft-delete a SINGLE conversation message by its message_id (moves it to Trash; recoverable with restore_message_by_id). Use this for surgical removal of one specific message — it addresses the row by identity, unlike delete_messages which matches by text. Pass session_id to guard: the delete is refused if that message isn't in the named conversation. Requires Sovereign authorization.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory delete-message"
+    )
+    async def delete_message_by_id(
+        self, message_id: int, session_id: Optional[str] = None
+    ) -> ToolResult:
+        """Soft-delete one message by id.
+
+        Args:
+            message_id: The message to move to Trash.
+            session_id: Optional guard — refuse if the message isn't in this
+                conversation (defends against a stale/misremembered id).
+        """
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        guard = await self._guard_message_session(storage, message_id, session_id)
+        if guard is not None:
+            return guard
+
+        try:
+            deleted = await storage.delete_conversation_message(
+                message_id, self._storage_agent_id(storage)
+            )
+        except Exception as e:
+            logger.error(f"delete_message_by_id failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if not deleted:
+            return ToolResult.failed(
+                f"No live message found with id {message_id} (already deleted or absent)"
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Message {message_id} moved to Trash "
+                f"(restore with restore_message_by_id)"
+            ),
+            data={"mode": "delete", "message_id": message_id, "session_id": session_id},
+        )
+
+    @tool(
+        name="restore_message_by_id",
+        description="Restore a single soft-deleted message from Trash by its message_id, bringing it back into normal history. Pass session_id to guard against acting on the wrong message.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory restore-message"
+    )
+    async def restore_message_by_id(
+        self, message_id: int, session_id: Optional[str] = None
+    ) -> ToolResult:
+        """Restore one soft-deleted message by id.
+
+        Args:
+            message_id: The trashed message to restore.
+            session_id: Optional guard — refuse if the message isn't in this
+                conversation.
+        """
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        guard = await self._guard_message_session(storage, message_id, session_id)
+        if guard is not None:
+            return guard
+
+        try:
+            restored = await storage.restore_conversation_message(
+                message_id, self._storage_agent_id(storage)
+            )
+        except Exception as e:
+            logger.error(f"restore_message_by_id failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if not restored:
+            return ToolResult.failed(
+                f"No trashed message found with id {message_id}"
+            )
+        return ToolResult.ok(
+            confirmation=f"Restored message {message_id}",
+            data={"mode": "restore", "message_id": message_id, "session_id": session_id},
+        )
+
+    @tool(
+        name="purge_message_by_id",
+        description="PERMANENTLY delete a single message by its message_id — there is no recovery. This is the intentionally-harder path: prefer delete_message_by_id (Trash) unless you must destroy the data for good. Requires confirm=True and Sovereign authorization.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory purge-message"
+    )
+    async def purge_message_by_id(
+        self,
+        message_id: int,
+        confirm: bool = False,
+        session_id: Optional[str] = None,
+        reason: str = "agent-initiated",
+    ) -> ToolResult:
+        """Permanently delete one message by id (no recovery).
+
+        Args:
+            message_id: The message to destroy.
+            confirm: Must be the literal True to perform the purge.
+            session_id: Optional guard — refuse if the message isn't in this
+                conversation.
+            reason: Audit-trail reason recorded with the purge.
+        """
+        if not isinstance(confirm, bool):
+            return ToolResult.failed(
+                "confirm must be a boolean (True/False), "
+                f"got {type(confirm).__name__}={confirm!r}"
+            )
+
+        storage = self._get_storage()
+        if not storage:
+            return ToolResult.failed("Storage not available")
+
+        guard = await self._guard_message_session(storage, message_id, session_id)
+        if guard is not None:
+            return guard
+
+        if not confirm:
+            return ToolResult.ok(
+                confirmation=(
+                    f"Preview only — would PERMANENTLY destroy message {message_id} "
+                    f"(call with confirm=True; this cannot be undone). Prefer "
+                    f"delete_message_by_id to keep it recoverable."
+                ),
+                data={"mode": "preview", "message_id": message_id, "session_id": session_id},
+            )
+
+        try:
+            purged = await storage.purge_conversation_message(
+                message_id, self._storage_agent_id(storage), reason
+            )
+        except Exception as e:
+            logger.error(f"purge_message_by_id failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if not purged:
+            return ToolResult.failed(
+                f"No message found with id {message_id}"
+            )
+        return ToolResult.ok(
+            confirmation=f"Permanently destroyed message {message_id}",
+            data={"mode": "purge", "message_id": message_id, "session_id": session_id},
+        )
+
     @tool(
         name="memory_consolidate",
         description="Consolidate recent messages into narrative episodes, detect temporal patterns, and archive decayed memories. Runs the cognitive memory pipeline that turns raw conversation into structured long-term memory. Safe to schedule periodically (e.g. nightly).",

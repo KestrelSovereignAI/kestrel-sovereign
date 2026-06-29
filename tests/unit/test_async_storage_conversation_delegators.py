@@ -38,6 +38,7 @@ REQUIRED_DELEGATORS = [
     ("find_messages_matching", {"content_pattern": "x"}, "#2019 find"),
     ("delete_messages_matching", {"content_pattern": "x"}, "#2019 scoped delete"),
     ("count_session_messages", {"session_id": "sess-1"}, "#2019 resolver count"),
+    ("message_belongs_to_session", {"message_id": 1, "session_id": "sess-1"}, "#2022 guard"),
 ]
 
 
