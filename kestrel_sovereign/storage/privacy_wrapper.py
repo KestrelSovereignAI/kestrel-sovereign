@@ -1390,6 +1390,11 @@ class PrivacyEnforcingStorage:
         Returns rows where ``deleted_at IS NOT NULL`` for this agent,
         sorted most-recently-trashed first. EPHEMERAL and ISOLATED modes
         return an empty list — neither has a persistent Trash store.
+
+        Structural ``session_marker`` rows are excluded: lifecycle deletes now
+        trash a session's marker alongside its content (#2027), but the marker
+        is not a displayable message — surfacing it would show a blank system
+        row and inflate the deleted-message total.
         """
         if self._privacy_config.is_ephemeral():
             return []
@@ -1401,6 +1406,10 @@ class PrivacyEnforcingStorage:
             include_stashed=True,
             only_deleted=True,
         )
+        history = [
+            m for m in history
+            if (m.get("metadata") or {}).get("type") != "session_marker"
+        ]
         history.sort(key=lambda m: m.get("deleted_at") or "", reverse=True)
         return history[:limit]
 

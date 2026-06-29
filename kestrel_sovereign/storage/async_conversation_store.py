@@ -1340,6 +1340,7 @@ class AsyncConversationStore:
         session_id: str,
         limit: int,
         deleted_filter: str = "live",
+        include_markers: bool = False,
     ) -> List[tuple]:
         """Get messages belonging to a specific session.
 
@@ -1355,6 +1356,14 @@ class AsyncConversationStore:
             deleted_filter: ``live`` (default — for reads),
                 ``deleted`` (for restore / Trash view), or
                 ``all`` (for purge — finds rows in any state).
+            include_markers: When True, include the session's ``new_session``
+                marker row(s) in the result. Reads/display keep the default
+                (markers are structural, not displayable), but session
+                LIFECYCLE ops (delete/restore/purge) pass True so the marker —
+                the session's live anchor — is acted on too. Otherwise deleting
+                a session's content leaves a live orphan marker that keeps the
+                session in the active list yet unresolvable by a later delete
+                (#2027).
 
         Returns:
             List of raw rows
@@ -1485,8 +1494,10 @@ class AsyncConversationStore:
                     # Continue looking for resumed messages that explicitly belong to this session
                     continue
 
-            # Skip session markers from results
-            if metadata_json:
+            # Skip session markers from results, UNLESS a lifecycle op asked to
+            # include them (so delete/restore/purge clears the session's anchor
+            # and never leaves an orphan marker — #2027).
+            if not include_markers and metadata_json:
                 try:
                     meta = json.loads(metadata_json)
                     if meta.get('type') == 'session_marker':
@@ -1864,7 +1875,12 @@ class AsyncConversationStore:
             callers must be rejected at the privacy wrapper above —
             this method does not read the privacy config.
         """
-        rows = await self._get_session_messages(session_id, limit=10_000)
+        # include_markers=True so soft-deleting a session also trashes its
+        # new_session marker — otherwise the live orphan marker keeps the
+        # session in the active list yet unresolvable by a later delete (#2027).
+        rows = await self._get_session_messages(
+            session_id, limit=10_000, include_markers=True
+        )
         if not rows:
             return 0
 
@@ -1917,8 +1933,10 @@ class AsyncConversationStore:
             Number of rows restored. Zero if the session has no soft-
             deleted rows or doesn't exist.
         """
+        # include_markers=True so a marker trashed alongside its session
+        # (#2027) is restored too, keeping delete/restore symmetric.
         rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="deleted"
+            session_id, limit=10_000, deleted_filter="deleted", include_markers=True
         )
         if not rows:
             return 0
@@ -1990,8 +2008,10 @@ class AsyncConversationStore:
         Returns:
             Number of rows destroyed.
         """
+        # include_markers=True so purge also destroys the session's marker —
+        # no orphan anchor left behind (#2027).
         rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="all"
+            session_id, limit=10_000, deleted_filter="all", include_markers=True
         )
         if not rows:
             return 0
@@ -2254,8 +2274,10 @@ class AsyncConversationStore:
             deleted_filter: ``live`` / ``deleted`` / ``all`` (default ``all``,
                 matching ``purge_conversation_session``).
         """
+        # include_markers=True so the purge preview count matches what purge
+        # actually destroys (which now includes the marker — #2027).
         rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter=deleted_filter
+            session_id, limit=10_000, deleted_filter=deleted_filter, include_markers=True
         )
         return len(rows)
 
@@ -2273,8 +2295,10 @@ class AsyncConversationStore:
         target = coerce_persistent_message_id(message_id)
         if target is None:
             return False
+        # include_markers=True: a session's marker row genuinely belongs to it,
+        # so a by-id guard on the marker resolves consistently (#2027).
         rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="all"
+            session_id, limit=10_000, deleted_filter="all", include_markers=True
         )
         return any(row[0] == target for row in rows)
 
