@@ -3843,19 +3843,22 @@ function checkForModelChange(content) {
  * which is reset per turn, rather than scraping marker text out of a card.
  *
  * @param {object} pane - The chat pane whose turn just completed.
+ * @param {object} [selector] - Selector to re-sync; defaults to the module
+ *   ``sharedModelSelector`` (the default is read at call time). Parameterized
+ *   so the detection logic is unit-testable without mounting the selector.
  */
-async function syncSelectorIfModelToolUsed(pane) {
-    if (!sharedModelSelector || !pane) return;
+export async function syncSelectorIfModelToolUsed(pane, selector = sharedModelSelector) {
+    if (!selector || !pane) return;
     const events = pane.toolEvents || [];
     const usedSetModel = events.some(
         (e) => e && (e.name === 'set_model' || e.tool === 'set_model'),
     );
     if (!usedSetModel) return;
-    await sharedModelSelector.syncWithServer();
-    deps().state.selectedModel = sharedModelSelector.selectedModel;
-    deps().state.selectedProvider = sharedModelSelector.selectedProvider;
-    deps().state.selectedVendor = sharedModelSelector.selectedProvider;
-    deps().state.selectedRoute = sharedModelSelector.selectedRoute || null;
+    await selector.syncWithServer();
+    deps().state.selectedModel = selector.selectedModel;
+    deps().state.selectedProvider = selector.selectedProvider;
+    deps().state.selectedVendor = selector.selectedProvider;
+    deps().state.selectedRoute = selector.selectedRoute || null;
 }
 
 // ============================================================================

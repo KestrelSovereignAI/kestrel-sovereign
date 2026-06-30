@@ -237,6 +237,73 @@ def test_stream_with_tool_detection_records_usage_exactly_once(monkeypatch):
     assert lk["metadata"] == {"streamed": True}
 
 
+class _FakeStreamingAdapter:
+    """Adapter exposing ``get_streaming_response`` (no-tools streaming path)."""
+
+    async def get_streaming_response(self, *, client, model, messages, **kwargs):
+        yield "ok"
+
+
+class _AutoRoutingService(_RoutingService):
+    """A ``_RoutingService`` whose route is seeded ``model="auto"`` until
+    discovery resolves it, with a per-instance ``discover_all_models`` spy.
+
+    Used to pin the #2069 WIRING: the streaming entry points must run the
+    lazy discovery warm-up BEFORE routing. If an entry point is reverted to
+    call ``resolve_provider_routing`` directly, ``discover_all_models`` is
+    never awaited and the asserts below fail.
+    """
+
+    def __init__(self, adapter):
+        super().__init__(adapter)
+        self._auto_state = {"model": "auto"}
+
+        async def _discover(use_cache: bool = True):
+            self._auto_state["model"] = "claude-x"
+            return []
+
+        self.discover_all_models = AsyncMock(side_effect=_discover)
+
+    def _available_providers(self, providers=None):
+        return [{"name": "anthropic:api", "model": self._auto_state["model"]}]
+
+
+def test_stream_with_tool_detection_warms_discovery_on_auto(monkeypatch):
+    """#2069 wiring guard for the tool-detection path (what companion chat
+    uses): a cold-cache ``auto`` route must trigger discovery before routing."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.streaming.provider_cache_body", lambda provider: None
+    )
+    svc = _AutoRoutingService(_FakeStreamAdapter())
+
+    async def _run():
+        async for _ in svc.stream_with_tool_detection(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "x"}}],
+        ):
+            pass
+
+    asyncio.run(_run())
+    svc.discover_all_models.assert_awaited_once()
+
+
+def test_get_streaming_response_warms_discovery_on_auto(monkeypatch):
+    """#2069 wiring guard for the plain streaming path."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.streaming.provider_cache_body", lambda provider: None
+    )
+    svc = _AutoRoutingService(_FakeStreamingAdapter())
+
+    async def _run():
+        async for _ in svc.get_streaming_response(
+            system_prompt="s", user_prompt="hi",
+        ):
+            pass
+
+    asyncio.run(_run())
+    svc.discover_all_models.assert_awaited_once()
+
+
 # --------------------------------------------------------------------------
 # 4. Other adapters emit a terminal LLMResponse with usage too (#1684)
 # --------------------------------------------------------------------------
