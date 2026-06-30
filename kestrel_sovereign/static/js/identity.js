@@ -13,6 +13,7 @@ import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 import { reapplyActiveSelectorLock } from './voice/ui.js';
 import { UI } from './ui-ext/registry.js';
 import Panels from './ui-ext/panels.js';
+import { loadFeatureUIContributions } from './ui-ext/feature-loader.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -174,8 +175,20 @@ export function initNavigation() {
     // runtime feature flips toggle visibility on the surviving tabs instead, so
     // a re-enable can restore a panel without a page reload.
     if (typeof globalThis !== 'undefined' && typeof globalThis.addEventListener === 'function') {
-        globalThis.addEventListener('capabilities:changed', reconcileNavigationCapabilities);
+        globalThis.addEventListener('capabilities:changed', onCapabilitiesChanged);
     }
+}
+
+// #2048: a feature enabled at runtime may only NOW appear in the
+// ``/api/ui/contributions`` manifest — at boot (and while it was disabled) the
+// server enabled-filtered it out, so its panel module was never imported and
+// re-gating alone could not surface its tab. (Re)load the manifest first so any
+// newly-enabled feature's module is imported and self-registers its panel, THEN
+// re-gate the nav. A disable is symmetric: the module stays import-cached but
+// its gate now returns false, so reconcile/syncNav removes the tab + body.
+async function onCapabilitiesChanged() {
+    await loadFeatureUIContributions();
+    reconcileNavigationCapabilities();
 }
 
 // Promote the first visible tab to active when the active one is gone/hidden.
@@ -903,6 +916,17 @@ window.selectAgent = async function(agentName) {
     // prune left every tab present because capsMap was empty). Done before the
     // panel loaders below so each self-guards against the fresh set.
     await API.refreshCapabilities();
+
+    // #2048: (re)load the feature UI-contributions manifest now that routing is
+    // pinned. In multi-agent host mode the boot-time call in app.js hit the
+    // host's un-prefixed /api/ui/contributions with NO active agent and 503'd, so
+    // feature-owned panel modules (the extracted Spawn panel) were never imported
+    // and their tabs never appeared. With the host agent set the request resolves
+    // and each enabled feature's module imports + self-registers its panel. The
+    // capabilities:changed emitted by refreshCapabilities above may already have
+    // kicked off this same load — the loader coalesces concurrent runs, and we
+    // await here so the panels are registered before the reactivation below.
+    await loadFeatureUIContributions();
 
     // Mount the new agent's chat pane. Streams already in flight
     // against the previous agent's pane keep painting into that
