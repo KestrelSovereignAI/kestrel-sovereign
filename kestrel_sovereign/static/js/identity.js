@@ -12,6 +12,8 @@ import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
 import { UI } from './ui-ext/registry.js';
+import Panels from './ui-ext/panels.js';
+import { loadFeatureUIContributions } from './ui-ext/feature-loader.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -43,7 +45,6 @@ let loadExports = null;
 let loadTasks = null;
 let loadResources = null;
 let loadMetrics = null;
-let loadSpawn = null;
 let loadFeatureStore = null;
 let loadApprovals = null;
 
@@ -54,7 +55,6 @@ export function setLazyLoaders(loaders) {
     loadTasks = loaders.loadTasks;
     loadResources = loaders.loadResources;
     loadMetrics = loaders.loadMetrics;
-    loadSpawn = loaders.loadSpawn;
     loadFeatureStore = loaders.loadFeatureStore;
     loadApprovals = loaders.loadApprovals;
 }
@@ -84,7 +84,6 @@ const PANEL_CAPABILITIES = {
     sovereignty: ['sovereignty'],
     resources: ['keys', 'wallet'],
     metrics: ['metrics'],
-    spawn: ['spawn'],
     features: ['featureStore'],
     security: ['audit', 'permissions'],
     approvals: ['permissions'],
@@ -96,10 +95,49 @@ function panelIsEnabled(panelId) {
     return caps.some((cap) => API.hasCapability(cap));
 }
 
+// Activate a nav panel: flip the active tab/panel classes, run the core lazy
+// loader (for panels still owned by index.html), then route through the panel
+// registry so contributed panels (#2048, e.g. the extracted Spawn panel) get
+// their body rendered on first show and a `panel:shown` event fires. Called from
+// the delegated nav click handler so tabs inserted later by `registerPanel`
+// (feature panels register AFTER initNavigation runs) activate identically.
+function activatePanel(panelId) {
+    if (!panelId) return;
+
+    document.querySelectorAll('.nav-tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.panel === panelId);
+    });
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.getElementById(`panel-${panelId}`)?.classList.add('active');
+
+    state.currentPanel = panelId;
+
+    if (panelId === 'constitution' && !state.constitution && loadConstitution) loadConstitution();
+    if (panelId === 'memories' && !state.memories && loadMemories) loadMemories();
+    if (panelId === 'sovereignty' && !state.exports && loadExports) loadExports();
+    if (panelId === 'tasks' && loadTasks) loadTasks();
+    if (panelId === 'resources' && loadResources) loadResources();
+    if (panelId === 'metrics' && loadMetrics) loadMetrics();
+    if (panelId === 'features' && loadFeatureStore) loadFeatureStore();
+    if (panelId === 'approvals' && loadApprovals) loadApprovals();
+
+    // Registry-driven activation (ticket 06): renders a contributed panel's body
+    // the first time it is shown and emits `panel:shown` (+ mounts panel-section
+    // contributions). Safe for core panels still declared in index.html — the
+    // body render is skipped and only the section/event path runs.
+    Panels.activate(panelId, { api: API });
+}
+
 export function initNavigation() {
+    const navEl = document.querySelector('.nav-tabs');
+    const hostEl = document.querySelector('.main-content');
+
     // Pass 1: prune nav tabs and panel DOM for any panel whose backing
     // capability is explicitly disabled.  Done before wiring click
     // handlers so we don't leave dangling listeners on removed nodes.
+    // Registry-contributed panels (no PANEL_CAPABILITIES entry, and not yet
+    // registered at this point in boot) are gated by the panel registry's own
+    // `gate` instead — see Panels.renderNav / Panels.syncNav.
     document.querySelectorAll('.nav-tab').forEach((tab) => {
         const panelId = tab.dataset.panel;
         if (!panelIsEnabled(panelId)) {
@@ -109,29 +147,23 @@ export function initNavigation() {
         }
     });
 
-    document.querySelectorAll('.nav-tab').forEach(tab => {
-        tab.addEventListener('click', () => {
-            const panelId = tab.dataset.panel;
+    // Bind the panel registry (ticket 06) to the live nav + panel host BEFORE
+    // wiring click handling. Feature panel modules load later in boot
+    // (loadFeatureUIContributions) and call registerPanel(); with the nav bound
+    // here, those registrations insert their tab/container immediately.
+    Panels.renderNav({ navEl, hostEl, ctx: { api: API } });
 
-            document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
-            tab.classList.add('active');
-
-            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-            document.getElementById(`panel-${panelId}`).classList.add('active');
-
-            state.currentPanel = panelId;
-
-            if (panelId === 'constitution' && !state.constitution && loadConstitution) loadConstitution();
-            if (panelId === 'memories' && !state.memories && loadMemories) loadMemories();
-            if (panelId === 'sovereignty' && !state.exports && loadExports) loadExports();
-            if (panelId === 'tasks' && loadTasks) loadTasks();
-            if (panelId === 'resources' && loadResources) loadResources();
-            if (panelId === 'metrics' && loadMetrics) loadMetrics();
-            if (panelId === 'spawn' && loadSpawn) loadSpawn();
-            if (panelId === 'features' && loadFeatureStore) loadFeatureStore();
-            if (panelId === 'approvals' && loadApprovals) loadApprovals();
+    // Delegated click handling: a single listener on the nav container activates
+    // any `.nav-tab`, including ones inserted AFTER boot by registerPanel — a
+    // per-tab listener would miss those. This is what lets a feature-owned panel
+    // become clickable without a core edit.
+    if (navEl) {
+        navEl.addEventListener('click', (e) => {
+            const tab = e.target.closest && e.target.closest('.nav-tab');
+            if (!tab || !navEl.contains(tab)) return;
+            activatePanel(tab.dataset.panel);
         });
-    });
+    }
 
     // If the default-active "chat" tab was removed because the host
     // opted out, promote the first surviving tab to active so the page
@@ -143,8 +175,20 @@ export function initNavigation() {
     // runtime feature flips toggle visibility on the surviving tabs instead, so
     // a re-enable can restore a panel without a page reload.
     if (typeof globalThis !== 'undefined' && typeof globalThis.addEventListener === 'function') {
-        globalThis.addEventListener('capabilities:changed', reconcileNavigationCapabilities);
+        globalThis.addEventListener('capabilities:changed', onCapabilitiesChanged);
     }
+}
+
+// #2048: a feature enabled at runtime may only NOW appear in the
+// ``/api/ui/contributions`` manifest — at boot (and while it was disabled) the
+// server enabled-filtered it out, so its panel module was never imported and
+// re-gating alone could not surface its tab. (Re)load the manifest first so any
+// newly-enabled feature's module is imported and self-registers its panel, THEN
+// re-gate the nav. A disable is symmetric: the module stays import-cached but
+// its gate now returns false, so reconcile/syncNav removes the tab + body.
+async function onCapabilitiesChanged() {
+    await loadFeatureUIContributions();
+    reconcileNavigationCapabilities();
 }
 
 // Promote the first visible tab to active when the active one is gone/hidden.
@@ -167,6 +211,10 @@ function promoteActiveTabIfNeeded() {
 // feature enable/disable flips the UI without a reload.
 export function reconcileNavigationCapabilities() {
     document.querySelectorAll('.nav-tab').forEach((tab) => {
+        // Registry-owned tabs (e.g. the extracted Spawn panel, #2048) are gated
+        // by the panel registry below, not by PANEL_CAPABILITIES — skip them so
+        // this loop doesn't force a registry-gated tab visible.
+        if (tab.dataset.panelRegistry === 'true') return;
         const panelId = tab.dataset.panel;
         const on = panelIsEnabled(panelId);
         tab.style.display = on ? '' : 'none';
@@ -176,6 +224,10 @@ export function reconcileNavigationCapabilities() {
             panel.classList.remove('active');
         }
     });
+    // Re-gate registry-contributed panels (#2048): the registry owns the gate
+    // for panels backed by a feature's enabled state. syncNav adds/removes their
+    // tab + container when the capability flips at runtime (no reload).
+    Panels.syncNav();
     promoteActiveTabIfNeeded();
 }
 
@@ -865,6 +917,17 @@ window.selectAgent = async function(agentName) {
     // panel loaders below so each self-guards against the fresh set.
     await API.refreshCapabilities();
 
+    // #2048: (re)load the feature UI-contributions manifest now that routing is
+    // pinned. In multi-agent host mode the boot-time call in app.js hit the
+    // host's un-prefixed /api/ui/contributions with NO active agent and 503'd, so
+    // feature-owned panel modules (the extracted Spawn panel) were never imported
+    // and their tabs never appeared. With the host agent set the request resolves
+    // and each enabled feature's module imports + self-registers its panel. The
+    // capabilities:changed emitted by refreshCapabilities above may already have
+    // kicked off this same load — the loader coalesces concurrent runs, and we
+    // await here so the panels are registered before the reactivation below.
+    await loadFeatureUIContributions();
+
     // Mount the new agent's chat pane. Streams already in flight
     // against the previous agent's pane keep painting into that
     // (now-detached) pane — when the user switches back, their work
@@ -942,8 +1005,14 @@ window.selectAgent = async function(agentName) {
     if (panel === 'sovereignty' && loadExports) loadExports();
     if (panel === 'tasks' && loadTasks) loadTasks();
     if (panel === 'resources' && loadResources) loadResources();
-    if (panel === 'spawn' && loadSpawn) loadSpawn();
     if (panel === 'features' && loadFeatureStore) loadFeatureStore();
+    // Registry-owned panels (#2048, e.g. Spawn) reload their data off the
+    // `panel:shown` event the registry emits; re-activate the active one so it
+    // refetches for the newly-selected agent (Panels.activate is idempotent —
+    // the body render is skipped after the first show).
+    if (panel && Panels.panels().some(p => p.panelId === panel)) {
+        Panels.activate(panel, { api: API });
+    }
 };
 
 // ============================================================================

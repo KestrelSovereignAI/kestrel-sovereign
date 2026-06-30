@@ -893,6 +893,30 @@
     },
     {
       "existing_code_refs": [
+        "host.py",
+        "kestrel_sovereign/server.py",
+        "kestrel_sovereign/static/index.html",
+        "kestrel_sovereign/static/js/ui-ext/panels.js",
+        "kestrel_sovereign/ui_contributions.py",
+        "server.py",
+        "tests/frontend/feature_ui_contributions_loader.test.mjs",
+        "tests/frontend/ui_ext_panels_teardown.test.mjs",
+        "tests/integration/test_feature_ui_runtime_enable.py",
+        "tests/integration/test_host_proxy_integration.py",
+        "tests/unit/test_ui_contributions_runtime_enable.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/features/PANEL_EXTRACTION_PLAYBOOK.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "current",
+      "title": "Panel extraction playbook",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
         "kestrel_sovereign/agent/orchestrator_engine.py",
         "kestrel_sovereign/agent/streaming.py",
         "kestrel_sovereign/features/response_audit/hook.py",

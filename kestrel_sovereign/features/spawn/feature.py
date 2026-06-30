@@ -59,6 +59,25 @@ class SpawnFeature(Feature):
         from kestrel_sovereign.endpoints.spawn import router
         return router
 
+    def get_ui_contributions(self):
+        """Declare the Spawn panel frontend served from this feature package.
+
+        The panel JS (nav tab + ``#panel-spawn`` body) lives in this package's
+        ``static/`` directory rather than core ``static/`` (#2048, epic #2038).
+        The server mounts the directory at ``/features/{name}/static/`` and the
+        frontend boot loader ``import()``s ``spawn.js``, which self-registers the
+        panel through the slot/panel registry. The ``spawn`` capability gates it
+        and is derived from this feature's enabled state (#2041).
+        """
+        from kestrel_sovereign.features.base import UIContributions
+
+        static_dir = str((Path(__file__).parent / "static").resolve())
+        return UIContributions(
+            modules=["spawn.js"],
+            static_dir=static_dir,
+            capability="spawn",
+        )
+
     def _get_agent_manager(self):
         """Lazily resolve or create an AgentManager.
 

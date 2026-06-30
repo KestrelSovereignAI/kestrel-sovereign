@@ -316,7 +316,9 @@ const PANEL_CAPABILITIES_FOR_TEST = {
     // lands, add it here AND in identity.js together.
     resources: ['keys', 'wallet'],
     metrics: ['metrics'],
-    spawn: ['spawn'],
+    // `spawn` was extracted into the spawn feature package (#2048): its panel is
+    // registry-contributed and gated by the feature's enabled state, no longer
+    // a static PANEL_CAPABILITIES entry. Kept out of this mirror to match.
     features: ['featureStore'],
     security: ['audit', 'permissions'],
     approvals: ['permissions'],

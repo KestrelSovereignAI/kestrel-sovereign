@@ -21,6 +21,11 @@ import {
 } from './panels.js';
 import { mount as mountChat, loadModels, connectNotifications, updateContextStatus, subscribeSSE } from './chat.js';
 import { UI } from './ui-ext/registry.js';
+// Manifest-driven feature UI loader (#2043). Extracted into its own module
+// (#2048) so identity.js can re-run it after agent selection / capability flips
+// without an app.js ⇄ identity.js import cycle — in multi-agent host mode the
+// boot call below 503s (no active agent) and must run again post-selection.
+import { loadFeatureUIContributions } from './ui-ext/feature-loader.js';
 // Voice UI is loaded via the manifest loader (#2043, ticket 05) — its core-bundled
 // manifest entry points at js/voice/boot.js, which imports voice/ui.js; that module
 // self-registers its slot contributions on import (#2038, ticket 04). No bare import
@@ -29,63 +34,15 @@ import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
 import { initMetrics, loadMetrics } from './metrics.js';
-import { initSpawn, loadSpawn } from './spawn.js';
+// Spawn UI is no longer a core static module (#2048, epic #2038). It was
+// extracted into the spawn feature package and loads via the manifest
+// (loadFeatureUIContributions below), self-registering its nav tab + panel
+// body through the panel registry like any out-of-tree feature panel.
 import { initFeatureStore, loadFeatureStore } from './feature-store.js';
 import { initApprovals, loadApprovals } from './approvals.js';
 // Import modules with side effects that define window.* functions
 import './database.js';  // Defines window.toggleDbExplorer
 import './ipfs.js';      // Defines window.toggleIpfsStatus
-
-// ============================================================================
-// Feature UI contributions (manifest-driven, out-of-tree asset loading; #2043)
-// ============================================================================
-
-// Inject a feature-contributed stylesheet once. Idempotent — the manifest may
-// be (re)loaded and a stylesheet must not be appended twice.
-function injectFeatureStylesheet(href) {
-    if (!href) return;
-    if (document.querySelector(`link[data-ui-ext-css="${CSS.escape(href)}"]`)) return;
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = href;
-    link.dataset.uiExtCss = href;
-    document.head.appendChild(link);
-}
-
-// Fetch the merged UI-contributions manifest and dynamically import each enabled
-// feature's modules in declared order. The server enabled-filters and rejects
-// cross-origin module URLs; we additionally honor the client capability set so a
-// host force-off also suppresses loading. A failed import for one feature is
-// isolated so it cannot abort the rest of boot.
-async function loadFeatureUIContributions() {
-    let contributions = [];
-    try {
-        const data = await API.request('/api/ui/contributions');
-        if (data && Array.isArray(data.contributions)) {
-            contributions = data.contributions;
-        }
-    } catch (e) {
-        console.warn('[ui-ext] failed to fetch UI contributions manifest:', e);
-        return;
-    }
-
-    for (const entry of contributions) {
-        if (entry.capability && !API.hasCapability(entry.capability)) continue;
-        for (const href of entry.css || []) {
-            injectFeatureStylesheet(href);
-        }
-        for (const mod of entry.modules || []) {
-            try {
-                await import(mod);
-            } catch (e) {
-                console.error(
-                    `[ui-ext] failed to import feature module ${mod} (feature ${entry.feature}):`,
-                    e,
-                );
-            }
-        }
-    }
-}
 
 // ============================================================================
 // Application Initialization
@@ -123,7 +80,6 @@ async function init() {
         loadTasks,
         loadResources,
         loadMetrics,
-        loadSpawn,
         loadFeatureStore,
         loadApprovals,
     });
@@ -183,6 +139,13 @@ async function init() {
     // core today but is loaded via the manifest like any other feature. Voice's
     // module self-registers its shell (🎙️ button, path badge, picker modal,
     // per-agent controls) into the slot zones on import.
+    //
+    // #2048: in multi-agent host mode no agent is selected yet, so this call hits
+    // the host's un-prefixed /api/ui/contributions with no active agent and 503s
+    // (imports nothing). That's expected — selectAgent() re-runs the loader once
+    // routing is pinned, and onCapabilitiesChanged() re-runs it on a runtime
+    // feature enable. In standalone mode an agent IS resolved here, so this boot
+    // call does the real import.
     await loadFeatureUIContributions();
 
     // Initialize tasks component
@@ -190,9 +153,6 @@ async function init() {
 
     // Initialize metrics component
     initMetrics();
-
-    // Initialize spawn component
-    initSpawn();
 
     // Initialize feature store component
     initFeatureStore();

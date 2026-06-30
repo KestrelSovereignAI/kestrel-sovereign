@@ -288,7 +288,12 @@ def _mount_feature_ui_assets(app: FastAPI) -> None:
     pending: list = []
 
     def _collect(agent) -> None:
-        for mount_path, directory in feature_static_mounts(agent):
+        # include_disabled=True: mount every feature that declares a static_dir,
+        # even one that starts disabled, so enabling it at runtime from the
+        # Feature Store serves its JS without a restart (the runtime-enable 404,
+        # #2048). The manifest at GET /api/ui/contributions still lists only
+        # enabled features, so a disabled feature's mount is dormant until enabled.
+        for mount_path, directory in feature_static_mounts(agent, include_disabled=True):
             if mount_path in seen:
                 continue
             seen.add(mount_path)

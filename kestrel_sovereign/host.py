@@ -23,6 +23,7 @@ Key principle: No agent is privileged. The host treats all agents as equal peers
 """
 
 import os
+import re
 import secrets
 import logging
 from pathlib import Path
@@ -68,6 +69,21 @@ logger = logging.getLogger(__name__)
 
 # Security Configuration
 API_KEY_NAME = "X-API-Key"
+
+# Feature UI static assets are loaded by header-less browser mechanisms
+# (``<link href=…>`` / ``await import(mod)``), so they can't attach the
+# X-API-Key header and must bypass API-key auth — same exemption server.py
+# makes for its direct ``/features/{slug}/static/`` mounts (#2043/#2048).
+#
+# In multi-agent host mode the frontend pins the asset URL to the SELECTED agent
+# (see ``pinFeatureAssetUrl`` in ui-ext/feature-loader.js) so the generic
+# ``/api/agents/{id}/…`` proxy routes it to the agent whose manifest declared the
+# contribution — not an arbitrary first agent that may not serve it. This regex
+# therefore also matches that agent-prefixed form. The required ``/static/``
+# segment keeps feature *API* routes (``/features/{slug}/api/…``) protected.
+FEATURE_STATIC_ASSET_RE = re.compile(
+    r"^(?:/api/agents/[^/]+)?/features/[^/]+/static/"
+)
 
 # Paths (suffixes) where API key query parameter auth is allowed.
 # EventSource/SSE connections cannot send custom headers, so these endpoints
@@ -252,6 +268,12 @@ async def auth_middleware(request: Request, call_next):
     if request.url.path in public_paths or request.url.path in auth_paths:
         return await call_next(request)
     if any(request.url.path.startswith(p) for p in static_prefixes):
+        return await call_next(request)
+    # Out-of-tree feature UI assets reach a backing agent via the generic
+    # /api/agents/{id}/... proxy (the frontend pins them to the selected agent).
+    # They're loaded header-less, so bypass API-key auth — matched precisely so
+    # feature *API* routes stay protected. See FEATURE_STATIC_ASSET_RE (#2048).
+    if FEATURE_STATIC_ASSET_RE.match(request.url.path):
         return await call_next(request)
     # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth
     if request.url.path.startswith("/webhooks/"):
@@ -619,6 +641,23 @@ async def github_app_webhook_proxy(request: Request):
     except Exception as e:
         print(_json.dumps({"severity": "ERROR", "message": f"HOST: proxy ERROR: {e}"}), flush=True)
         raise
+
+
+# --- Feature UI static-asset delivery (#2048) ---
+# In multi-agent host mode the per-agent manifest from /api/ui/contributions
+# lists module URLs like /features/{name}/static/spawn.js. The host serves only
+# core static trees, so an extracted feature panel (e.g. Spawn) must reach a
+# backing agent for its JS. There is NO dedicated host route for this on purpose:
+# proxying to a fixed first agent is wrong, because that agent may not have the
+# feature loaded/mounted while the SELECTED agent does (heterogeneous configs).
+#
+# Instead the frontend pins each feature-static URL to the selected agent
+# (pinFeatureAssetUrl in ui-ext/feature-loader.js), turning it into
+# /api/agents/{selected}/features/{name}/static/spawn.js — which the generic
+# /api/agents/{id}/{path} proxy below forwards to the exact agent whose manifest
+# declared the contribution. The auth middleware exempts that path via
+# FEATURE_STATIC_ASSET_RE so the header-less import() still resolves. In
+# standalone mode the URL stays root-relative and the server serves it directly.
 
 
 # --- Proxy Route (must be AFTER specific routes to avoid path conflicts) ---

@@ -1,9 +1,126 @@
 /**
- * Kestrel Sovereign Console - Spawn Panel
- * Active children, delegation chains, budget meters, TTL countdowns, spawn history
+ * Kestrel Sovereign Console - Spawn Panel (feature-owned)
+ *
+ * Extracted out of core `static/` into the backing spawn feature package
+ * (#2048, epic #2038 — the "north star" core-panel extraction). The
+ * SpawnFeature declares this file in `get_ui_contributions()`; the boot loader
+ * (`app.js` `loadFeatureUIContributions`, #2043) `import()`s it from
+ * `/features/spawnfeature/static/spawn.js`, and it self-registers a panel
+ * (`nav-tabs` + `panel-root` zones, #2044/ticket 06) through the panel registry.
+ *
+ * There is NO entry for spawn in `index.html`, `app.js` (`setLazyLoaders`/
+ * imports), or `PANEL_CAPABILITIES` anymore — the spawn panel now leaves core
+ * exactly the way a third-party feature panel would, and its capability is
+ * derived from the feature's enabled state (#2041). Disabling the feature
+ * removes the tab/panel and flips the `spawn` capability at runtime (no reload);
+ * re-enabling restores it.
+ *
+ * Imports resolve against the host-served core modules (`/js/...`) so this
+ * out-of-tree asset shares the SAME registry/bus/API singletons core uses.
  */
 
-import API from './api.js';
+import API from '/js/api.js';
+import { registerPanel } from '/js/ui-ext/panels.js';
+import bus from '/js/ui-ext/bus.js';
+
+// ============================================================================
+// Panel body markup (moved verbatim from index.html `#panel-spawn`)
+// ============================================================================
+//
+// The panel registry creates the `#panel-spawn` container and its
+// `.panel-content` wrapper; `render` fills the wrapper with this inner markup.
+// `data-label-key` attributes are preserved so the i18n layer translates the
+// dynamically-injected DOM (English text is the inline fallback).
+const PANEL_HTML = `
+    <div class="row-between mb-4">
+        <h2 class="m-0" data-label-key="spawn_title">Spawn Manager</h2>
+        <div class="row-center row-gap-lg">
+            <label style="font-size: 0.8rem; color: var(--text-secondary);">
+                Auto-refresh
+                <select id="spawn-refresh-interval" style="
+                    margin-left: 0.25rem;
+                    padding: 0.2rem 0.4rem;
+                    background: var(--bg-tertiary);
+                    color: var(--text-primary);
+                    border: 1px solid var(--border-color);
+                    border-radius: 4px;
+                    font-size: 0.8rem;
+                ">
+                    <option value="0">Off</option>
+                    <option value="5">5s</option>
+                    <option value="10" selected>10s</option>
+                    <option value="30">30s</option>
+                </select>
+            </label>
+            <button id="btn-refresh-spawn" style="
+                padding: 0.375rem 0.75rem;
+                background: var(--bg-tertiary);
+                border: 1px solid var(--border-color);
+                border-radius: 4px;
+                color: var(--text-primary);
+                cursor: pointer;
+                font-size: 0.85rem;
+            ">&#x21BB; Refresh</button>
+        </div>
+    </div>
+
+    <!-- Active Children -->
+    <div class="mb-4">
+        <h3 class="card-heading" data-label-key="spawn_active_children">Active Children</h3>
+        <div id="spawn-children-list">
+            <div class="empty-state text-sm">
+                <span data-label-key="spawn_empty_state">Click refresh or switch to this tab to load spawn data</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Two-column layout: Delegation Chain + Budget Chart -->
+    <div style="
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5rem;
+        margin-bottom: 1.5rem;
+    ">
+        <!-- Delegation Chain -->
+        <div style="
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+        ">
+            <h3 class="card-heading" data-label-key="spawn_delegation_chain">Delegation Chain</h3>
+            <div class="text-md" id="spawn-delegation-chain">
+                <div class="text-muted text-sm" data-label-key="spawn_no_delegation">No delegation chain</div>
+            </div>
+        </div>
+
+        <!-- Budget Chart -->
+        <div style="
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+        ">
+            <h3 class="card-heading" data-label-key="spawn_budget_allocation">Budget Allocation</h3>
+            <div class="chart-canvas-wrap">
+                <canvas id="spawn-budget-chart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Spawn History -->
+    <div style="
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 1rem;
+    ">
+        <h3 class="card-heading" data-label-key="spawn_history_title">Spawn History</h3>
+        <div class="scroll-y-lg" id="spawn-history-list">
+            <p class="text-muted text-sm text-center" data-label-key="spawn_no_history">No spawn events recorded</p>
+        </div>
+    </div>
+`;
 
 // ============================================================================
 // DOM References & State
@@ -15,14 +132,16 @@ let autoRefreshInterval = null;
 let budgetChart = null;
 
 // ============================================================================
-// Initialization
+// Panel registration (nav-tabs + panel-root zones, ticket 06)
 // ============================================================================
 
-export function initSpawn() {
-    // #879: short-circuit when the host has no spawn surface.  Skipping
-    // setupAutoRefresh() also avoids attaching a MutationObserver to a
-    // panel that initNavigation() may have removed.
-    if (!API.hasCapability('spawn')) return;
+// Render the panel body the first time the spawn tab is activated (lazy, mirrors
+// the old `setLazyLoaders`/`initSpawn` semantics). Wires the refresh controls and
+// the auto-refresh observer, then re-hydrates i18n labels for the new DOM.
+function renderSpawnPanel(bodyEl) {
+    if (!bodyEl) return;
+    bodyEl.innerHTML = PANEL_HTML;
+
     refreshBtn = document.getElementById('btn-refresh-spawn');
     refreshSelect = document.getElementById('spawn-refresh-interval');
 
@@ -36,7 +155,44 @@ export function initSpawn() {
     });
 
     setupAutoRefresh();
+
+    // Translate the freshly-injected DOM into the active locale; the inline text
+    // is only the English fallback. No-op when the theme layer isn't present.
+    try {
+        const theme = (typeof window !== 'undefined') && window.KestrelTheme;
+        if (theme && typeof theme._hydrate === 'function') {
+            theme._hydrate(theme.getCurrentLabels());
+        }
+    } catch (_) { /* labels stay at their inline fallback */ }
 }
+
+registerPanel({
+    panelId: 'spawn',
+    label: 'Spawn',
+    labelKey: 'tab_spawn',
+    // Preserve the original nav position (between Metrics and Features).
+    before: 'features',
+    // Capability derived from the feature's enabled state (#2041). Re-evaluated
+    // when the panel registry re-gates on `capabilities:changed`.
+    gate: () => API.hasCapability('spawn'),
+    render: renderSpawnPanel,
+});
+
+// Load (and refresh) data every time the panel becomes visible — `panel:shown`
+// is emitted by the registry's `activate()` after the body render, replacing the
+// old per-tab-click `loadSpawn()` dispatch in `initNavigation`.
+bus.on('panel:shown', (payload) => {
+    if (payload && payload.panelId === 'spawn') loadSpawn();
+});
+
+// Explicit teardown when the panel gates off at runtime (feature disabled while
+// being viewed). The panel registry detaches the `#panel-spawn` node, which
+// fires no `active`-class mutation, so the auto-refresh observer alone would
+// never stop the interval — it would keep issuing hidden /api/spawn/children
+// requests. `panel:hidden` is the deterministic stop signal.
+bus.on('panel:hidden', (payload) => {
+    if (payload && payload.panelId === 'spawn') stopAutoRefresh();
+});
 
 // ============================================================================
 // Auto-refresh
