@@ -893,13 +893,16 @@
     },
     {
       "existing_code_refs": [
+        "host.py",
         "kestrel_sovereign/server.py",
         "kestrel_sovereign/static/index.html",
         "kestrel_sovereign/static/js/ui-ext/panels.js",
         "kestrel_sovereign/ui_contributions.py",
         "server.py",
+        "tests/frontend/feature_ui_contributions_loader.test.mjs",
         "tests/frontend/ui_ext_panels_teardown.test.mjs",
         "tests/integration/test_feature_ui_runtime_enable.py",
+        "tests/integration/test_host_proxy_integration.py",
         "tests/unit/test_ui_contributions_runtime_enable.py"
       ],
       "findings": [],
