@@ -272,6 +272,13 @@ async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 
     svc = LLMService()
+    # Constructing a real LLMService loads the on-disk discovery cache into the
+    # process-wide singleton. This test relies on gpt-4o being treated as
+    # vision-capable (empty cache → permissive); a disk cache written by an
+    # earlier test (real discovery) could mark it text-only. Clear post-
+    # construction so vision capability is deterministic regardless of order.
+    from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+    get_shared_model_cache().clear()
     svc._backend = BackendType.REMOTE_GPU
     svc._remote_client = object()
     monkeypatch.setattr(svc, "_remote_first_allowed", lambda *a, **k: True)

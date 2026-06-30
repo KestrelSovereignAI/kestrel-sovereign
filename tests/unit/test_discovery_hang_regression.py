@@ -226,7 +226,41 @@ async def test_resolve_local_auto_routes_contacts_local_routes_only():
     await svc._resolve_local_auto_routes()
 
     assert contacted == ["ollama"], "must contact ONLY the local route, never cloud"
-    svc._resolve_auto_providers.assert_called_once_with(["local-model-info"])
+    # Resolution is scoped to the local providers only — never the cloud route.
+    svc._resolve_auto_providers.assert_called_once_with(
+        ["local-model-info"], only_providers=[local]
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_local_auto_routes_does_not_mutate_cloud_sharing_vendor():
+    """#2069 codex r4: a cloud route that SHARES a vendor with a local route
+    must not be resolved to a locally-discovered model id (else a later
+    non-local request would send a local-only model to the cloud route).
+    End-to-end through the real _resolve_auto_providers."""
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
+
+    svc = LLMService.__new__(LLMService)
+    # Same vendor "acme", two routes: cloud (auto) and local (auto).
+    cloud = {"name": "acme:api", "vendor": "acme", "model": "auto", "is_local": False,
+             "selection_hints": []}
+    local = {"name": "acme:local", "vendor": "acme", "model": "auto", "is_local": True,
+             "selection_hints": []}
+    svc.providers = [cloud, local]
+    svc._select_discovery_routes = MagicMock(return_value=[("acme", local)])
+    svc._ensure_route_catalogs_sync = MagicMock()
+    svc._route_catalogs = {}
+    local_model = ModelInfo(
+        id="acme-local-7b", provider="acme", display_name="Acme Local 7B",
+        category=ModelCategory.CHAT, is_featured=True, is_hidden=False,
+    )
+    svc._discover_for_vendor_route = AsyncMock(return_value=[local_model])
+
+    await svc._resolve_local_auto_routes()
+
+    assert local["model"] == "acme-local-7b", "local route must resolve"
+    assert cloud["model"] == "auto", "cloud route sharing the vendor must stay 'auto'"
 
 
 @pytest.mark.asyncio
