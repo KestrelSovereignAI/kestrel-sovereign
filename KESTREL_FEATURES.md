@@ -725,6 +725,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `GET /v1/models`
 - [`kestrel_sovereign/endpoints/observability.py`](kestrel_sovereign/endpoints/observability.py)
   - `GET /api/observability/events`
+  - `POST /api/observability/events`
   - `GET /api/observability/summary`
   - `GET /api/observability/metrics/{metric_name}`
 - [`kestrel_sovereign/endpoints/rasa_shim.py`](kestrel_sovereign/endpoints/rasa_shim.py)
