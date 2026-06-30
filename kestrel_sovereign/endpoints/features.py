@@ -20,6 +20,7 @@ from kestrel_sovereign.feature_registry import (
     get_skills_for_package,
 )
 from kestrel_sovereign.ui_capabilities import compute_feature_capabilities
+from kestrel_sovereign.ui_contributions import compute_ui_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,22 @@ async def get_ui_capabilities(request: Request) -> Dict[str, Any]:
     """
     agent = get_agent(request)
     return {"capabilities": compute_feature_capabilities(agent)}
+
+
+@router.get("/api/ui/contributions")
+async def get_ui_contributions(request: Request) -> Dict[str, Any]:
+    """Merged UI-asset manifest for the current agent's ENABLED features.
+
+    Each entry is ``{feature, capability, modules: [...], css: [...]}`` where
+    ``modules``/``css`` are same-origin asset URLs (out-of-tree features are
+    served under ``/features/{name}/static/``). The frontend boot loader
+    dynamically ``import()``s each module in declared order so a pip-installed
+    feature can mount slot contributions with no edits to core ``static/`` or
+    ``app.js``. Disabled / uninstalled features contribute nothing, and remote /
+    cross-origin module URLs are rejected when the manifest is built.
+    """
+    agent = get_agent(request)
+    return {"contributions": compute_ui_manifest(agent)}
 
 
 # ---------------------------------------------------------------------------

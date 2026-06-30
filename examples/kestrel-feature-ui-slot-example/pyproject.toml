@@ -1,0 +1,27 @@
+[project]
+name = "kestrel-feature-ui-slot-example"
+version = "0.1.0"
+description = "Reference feature proving manifest-driven, out-of-tree UI asset loading for Kestrel Sovereign (epic #2038, ticket #2043)"
+requires-python = ">=3.11,<3.15"
+dependencies = []
+
+# This is a reference/example package, intentionally tiny. It ships its frontend
+# asset (static/ui.js) inside its OWN package — NOT in core static/ — and points
+# the host at it via UISlotExampleFeature.get_ui_contributions(). Installing it
+# (pip/uv pip install -e .) registers the feature through the entry-point group
+# below; on the next agent restart the host mounts the package's static/ dir at
+# /features/ui-slot-example/static/ and the manifest at /api/ui/contributions
+# advertises the module, which app.js dynamically imports — adding one button to
+# the chat input row with zero edits to core static/ or app.js.
+[project.entry-points."kestrel_sovereign.features"]
+UISlotExampleFeature = "kestrel_feature_ui_slot_example:UISlotExampleFeature"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kestrel_feature_ui_slot_example"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"kestrel_feature_ui_slot_example/static" = "kestrel_feature_ui_slot_example/static"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
