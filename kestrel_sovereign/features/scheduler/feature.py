@@ -654,7 +654,7 @@ class SchedulerFeature(Feature):
             return True
         try:
             last_msg_raw = await db.fetchval(
-                "SELECT MAX(created_at) FROM conversation_history WHERE agent_id = ?",
+                "SELECT MAX(created_at) FROM conversation_history WHERE agent_id = ? AND deleted_at IS NULL",
                 (self._agent_id,),
             )
             last_msg = self._parse_ts_utc(last_msg_raw)
