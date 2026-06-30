@@ -510,6 +510,113 @@ class TestUpdateFeatureConfig:
 
 
 # ---------------------------------------------------------------------------
+# Secret masking / UI hints (#2045)
+# ---------------------------------------------------------------------------
+
+
+SECRET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "api_key": {"type": "string", "writeOnly": True, "format": "password"},
+        "status": {"type": "string", "readOnly": True},
+        "enabled": {"type": "boolean"},
+    },
+}
+
+
+class TestSecretMasking:
+    def test_get_config_strips_secret_and_reports_presence(self):
+        feature = _make_feature(
+            config_schema=SECRET_SCHEMA,
+            config={"api_key": "sk-super-secret", "status": "Connected", "enabled": True},
+        )
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.get("/api/features/TestFeature/config")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        # Secret value never returned in plaintext.
+        assert "api_key" not in data["config"]
+        # Presence is surfaced for the UI.
+        assert data["secrets_set"]["api_key"] is True
+        # Non-secret fields pass through.
+        assert data["config"]["status"] == "Connected"
+        assert data["config"]["enabled"] is True
+
+    def test_get_config_reports_unset_secret(self):
+        feature = _make_feature(
+            config_schema=SECRET_SCHEMA,
+            config={"status": "Not configured"},
+        )
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.get("/api/features/TestFeature/config")
+
+        data = resp.json()
+        assert data["secrets_set"]["api_key"] is False
+
+    def test_patch_omitted_secret_preserves_stored_value(self):
+        feature = _make_feature(
+            config_schema=SECRET_SCHEMA,
+            config={"api_key": "stored-key", "enabled": True},
+        )
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"enabled": False}},
+            )
+
+        assert resp.status_code == 200
+        # The stored secret is re-injected so it is not cleared.
+        saved = feature.set_config.await_args.args[0]
+        assert saved["api_key"] == "stored-key"
+        assert saved["enabled"] is False
+
+    def test_patch_new_secret_overrides(self):
+        feature = _make_feature(
+            config_schema=SECRET_SCHEMA,
+            config={"api_key": "old-key"},
+        )
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"api_key": "new-key"}},
+            )
+
+        assert resp.status_code == 200
+        saved = feature.set_config.await_args.args[0]
+        assert saved["api_key"] == "new-key"
+
+    def test_patch_response_does_not_echo_secret(self):
+        feature = _make_feature(
+            config_schema=SECRET_SCHEMA,
+            config={"api_key": "stored-key", "enabled": True},
+        )
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"enabled": True}},
+            )
+
+        assert resp.status_code == 200
+        assert "api_key" not in resp.json()["config"]
+
+
+# ---------------------------------------------------------------------------
 # GET /api/features/{name}/skills
 # ---------------------------------------------------------------------------
 

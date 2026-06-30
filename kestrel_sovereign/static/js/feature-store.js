@@ -571,11 +571,174 @@ function renderDetailModal(detail) {
 // Config Form
 // ============================================================================
 
+// A field is a secret when the schema marks it writeOnly or format=password.
+// Standard JSON Schema keywords — see CONFIG_SCHEMA_UI_HINTS.md.
+function isSecretField(prop) {
+    return prop && (prop.writeOnly === true || prop.format === 'password');
+}
+
+// Render a single config field's input. `secretSet` indicates whether a
+// write-only secret already has a stored value (so we can hint "unchanged").
+function renderConfigField(key, prop, currentConfig, required, secretsSet) {
+    const value = currentConfig[key] !== undefined ? currentConfig[key] : prop.default;
+    const isRequired = required.includes(key);
+    const label = prop.title || key;
+    const desc = prop.description || '';
+    const labelHtml = `<label style="display: block; font-size: 0.825rem; font-weight: 500; margin-bottom: 0.25rem;">${escapeHtml(label)}${isRequired ? ' *' : ''}</label>`;
+    const fieldStyle = `width: 100%; padding: 0.5rem; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-primary); color: var(--text-primary); font-size: 0.825rem;`;
+
+    let inputHtml = '';
+
+    if (prop.readOnly === true) {
+        // Computed / status field — display only, never submitted.
+        const display = value === undefined || value === null || value === '' ? '—' : String(value);
+        inputHtml = `${labelHtml}
+            <div data-config-key="${escapeHtml(key)}" data-config-readonly="1" style="
+                ${fieldStyle} background: var(--bg-tertiary); color: var(--text-secondary);
+            ">${escapeHtml(display)}</div>`;
+    } else if (isSecretField(prop)) {
+        // Write-only secret: never pre-filled; only submitted when changed.
+        const isSet = !!(secretsSet && secretsSet[key]);
+        const placeholder = isSet ? '•••••••• (unchanged — leave blank to keep)' : (desc || 'Enter a value');
+        inputHtml = `${labelHtml}
+            <input type="password" autocomplete="new-password" data-config-key="${escapeHtml(key)}" data-config-secret="1"
+                value="" placeholder="${escapeHtml(placeholder)}" style="${fieldStyle}">`;
+    } else if (prop.type === 'boolean') {
+        inputHtml = `
+            <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                <input type="checkbox" data-config-key="${escapeHtml(key)}" ${value ? 'checked' : ''} style="
+                    width: 1rem; height: 1rem; cursor: pointer;
+                ">
+                <span style="font-size: 0.825rem;">${escapeHtml(label)}</span>
+            </label>`;
+    } else if (prop.enum) {
+        inputHtml = `${labelHtml}
+            <select data-config-key="${escapeHtml(key)}" style="${fieldStyle}">
+                ${prop.enum.map(opt => `<option value="${escapeHtml(String(opt))}" ${String(value) === String(opt) ? 'selected' : ''}>${escapeHtml(String(opt))}</option>`).join('')}
+            </select>`;
+    } else if (prop.type === 'integer' || prop.type === 'number') {
+        inputHtml = `${labelHtml}
+            <input type="number" data-config-key="${escapeHtml(key)}" value="${value !== undefined ? value : ''}"
+                ${prop.minimum !== undefined ? `min="${prop.minimum}"` : ''}
+                ${prop.maximum !== undefined ? `max="${prop.maximum}"` : ''}
+                style="${fieldStyle}">`;
+    } else if (prop.format === 'textarea') {
+        inputHtml = `${labelHtml}
+            <textarea data-config-key="${escapeHtml(key)}" rows="4" placeholder="${escapeHtml(desc)}"
+                style="${fieldStyle} resize: vertical;">${escapeHtml(String(value || ''))}</textarea>`;
+    } else {
+        inputHtml = `${labelHtml}
+            <input type="text" data-config-key="${escapeHtml(key)}" value="${escapeHtml(String(value || ''))}"
+                placeholder="${escapeHtml(desc)}" style="${fieldStyle}">`;
+    }
+
+    const showDesc = desc && prop.type !== 'boolean' && !isSecretField(prop);
+    return `
+        <div style="margin-bottom: 0.75rem;">
+            ${inputHtml}
+            ${showDesc ? `<div style="font-size: 0.7rem; color: var(--text-tertiary); margin-top: 0.25rem;">${escapeHtml(desc)}</div>` : ''}
+        </div>`;
+}
+
+// Resolve sections from an optional `x-kestrel-ui.sections` hint. Fields not
+// named by any section are collected into a trailing unlabelled group so a
+// partial section list still renders every property.
+function resolveSections(properties, ui) {
+    const allKeys = Object.keys(properties);
+    const declared = Array.isArray(ui.sections) ? ui.sections : null;
+    if (!declared || declared.length === 0) {
+        return [{ title: '', description: '', fields: allKeys }];
+    }
+    const sections = declared.map(s => ({
+        title: s.title || '',
+        description: s.description || '',
+        fields: (s.fields || []).filter(k => properties[k] !== undefined),
+    }));
+    const grouped = new Set(sections.flatMap(s => s.fields));
+    const leftover = allKeys.filter(k => !grouped.has(k));
+    if (leftover.length) sections.push({ title: '', description: '', fields: leftover });
+    return sections;
+}
+
+// Render action buttons declared via `x-kestrel-ui.actions`. Each action is
+// {label, method, path, confirm?} and targets the feature's own router.
+function renderConfigActions(actions) {
+    if (!Array.isArray(actions) || actions.length === 0) return '';
+    const btns = actions.map((a, i) => {
+        const meta = escapeHtml(JSON.stringify({
+            label: a.label || 'Run',
+            method: (a.method || 'POST').toUpperCase(),
+            path: a.path || '',
+            confirm: a.confirm || '',
+        }));
+        return `<button type="button" class="btn btn-secondary" data-config-action="${meta}"
+            onclick="FeatureStore.runConfigAction(this)" style="font-size: 0.8rem; padding: 0.375rem 0.75rem;">
+            ${escapeHtml(a.label || 'Run')}
+        </button>`;
+    }).join('');
+    return `
+        <div style="margin-top: 1rem; border-top: 1px solid var(--border-color); padding-top: 0.75rem;">
+            <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">${btns}</div>
+            <div id="feature-config-action-result" style="font-size: 0.75rem; margin-top: 0.5rem;"></div>
+        </div>`;
+}
+
+async function runConfigAction(btn) {
+    let action;
+    try {
+        action = JSON.parse(btn.getAttribute('data-config-action'));
+    } catch (e) {
+        return;
+    }
+    if (!action.path) return;
+    if (action.confirm) {
+        const ok = await Modal.confirm(action.label || 'Confirm', escapeHtml(action.confirm));
+        if (!ok) return;
+    }
+
+    const resultEl = document.getElementById('feature-config-action-result');
+    const setResult = (text, color) => {
+        if (resultEl) {
+            resultEl.textContent = text;
+            resultEl.style.color = color;
+        }
+    };
+
+    const original = btn.textContent;
+    btn.disabled = true;
+    setResult('Running…', 'var(--text-secondary)');
+    try {
+        const opts = { method: action.method };
+        if (action.method !== 'GET' && action.method !== 'HEAD') {
+            opts.body = JSON.stringify({});
+        }
+        const result = await API.request(action.path, opts);
+        // Honor a {ok, message} convention; otherwise treat 2xx as success.
+        const ok = result && typeof result.ok === 'boolean' ? result.ok : true;
+        const message = (result && result.message) || (ok ? 'Success' : 'Failed');
+        if (ok) {
+            setResult(`✓ ${message}`, 'var(--success)');
+            Toast.success(message);
+        } else {
+            setResult(`✗ ${message}`, 'var(--error)');
+            Toast.error(message);
+        }
+    } catch (error) {
+        console.error('Config action failed:', error);
+        setResult(`✗ ${error.message}`, 'var(--error)');
+        Toast.error(`Action failed: ${error.message}`);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+    }
+}
+
 async function showConfigForm(name) {
     try {
         const data = await API.request(`/api/features/${encodeURIComponent(name)}/config`);
         const schema = data.config_schema;
         const currentConfig = data.config || {};
+        const secretsSet = data.secrets_set || {};
 
         if (!schema || !schema.properties) {
             Toast.info('This feature has no configurable options.');
@@ -584,80 +747,33 @@ async function showConfigForm(name) {
 
         const properties = schema.properties;
         const required = schema.required || [];
+        const ui = schema['x-kestrel-ui'] || {};
 
-        const fieldsHtml = Object.entries(properties).map(([key, prop]) => {
-            const value = currentConfig[key] !== undefined ? currentConfig[key] : prop.default;
-            const isRequired = required.includes(key);
-            const label = prop.title || key;
-            const desc = prop.description || '';
-
-            let inputHtml = '';
-            if (prop.type === 'boolean') {
-                inputHtml = `
-                    <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
-                        <input type="checkbox" data-config-key="${escapeHtml(key)}" ${value ? 'checked' : ''} style="
-                            width: 1rem; height: 1rem; cursor: pointer;
-                        ">
-                        <span style="font-size: 0.825rem;">${escapeHtml(label)}</span>
-                    </label>
-                `;
-            } else if (prop.enum) {
-                inputHtml = `
-                    <label style="display: block; font-size: 0.825rem; font-weight: 500; margin-bottom: 0.25rem;">
-                        ${escapeHtml(label)}${isRequired ? ' *' : ''}
-                    </label>
-                    <select data-config-key="${escapeHtml(key)}" style="
-                        width: 100%; padding: 0.5rem; border: 1px solid var(--border-color);
-                        border-radius: 6px; background: var(--bg-primary); color: var(--text-primary);
-                        font-size: 0.825rem;
-                    ">
-                        ${prop.enum.map(opt => `<option value="${escapeHtml(String(opt))}" ${String(value) === String(opt) ? 'selected' : ''}>${escapeHtml(String(opt))}</option>`).join('')}
-                    </select>
-                `;
-            } else if (prop.type === 'integer' || prop.type === 'number') {
-                inputHtml = `
-                    <label style="display: block; font-size: 0.825rem; font-weight: 500; margin-bottom: 0.25rem;">
-                        ${escapeHtml(label)}${isRequired ? ' *' : ''}
-                    </label>
-                    <input type="number" data-config-key="${escapeHtml(key)}" value="${value !== undefined ? value : ''}"
-                        ${prop.minimum !== undefined ? `min="${prop.minimum}"` : ''}
-                        ${prop.maximum !== undefined ? `max="${prop.maximum}"` : ''}
-                        style="
-                            width: 100%; padding: 0.5rem; border: 1px solid var(--border-color);
-                            border-radius: 6px; background: var(--bg-primary); color: var(--text-primary);
-                            font-size: 0.825rem;
-                        ">
-                `;
-            } else {
-                // Default: string input
-                inputHtml = `
-                    <label style="display: block; font-size: 0.825rem; font-weight: 500; margin-bottom: 0.25rem;">
-                        ${escapeHtml(label)}${isRequired ? ' *' : ''}
-                    </label>
-                    <input type="text" data-config-key="${escapeHtml(key)}" value="${escapeHtml(String(value || ''))}"
-                        placeholder="${escapeHtml(desc)}"
-                        style="
-                            width: 100%; padding: 0.5rem; border: 1px solid var(--border-color);
-                            border-radius: 6px; background: var(--bg-primary); color: var(--text-primary);
-                            font-size: 0.825rem;
-                        ">
-                `;
-            }
-
-            return `
-                <div style="margin-bottom: 0.75rem;">
-                    ${inputHtml}
-                    ${desc && prop.type !== 'boolean' ? `<div style="font-size: 0.7rem; color: var(--text-tertiary); margin-top: 0.25rem;">${escapeHtml(desc)}</div>` : ''}
-                </div>
-            `;
+        const sections = resolveSections(properties, ui);
+        const sectionsHtml = sections.map(sec => {
+            const fields = sec.fields
+                .map(key => renderConfigField(key, properties[key], currentConfig, required, secretsSet))
+                .join('');
+            const header = sec.title
+                ? `<h4 style="margin: 0 0 0.25rem 0; font-size: 0.85rem; color: var(--text-primary);">${escapeHtml(sec.title)}</h4>`
+                : '';
+            const subdesc = sec.description
+                ? `<p style="margin: 0 0 0.5rem 0; font-size: 0.72rem; color: var(--text-tertiary);">${escapeHtml(sec.description)}</p>`
+                : '';
+            return `<div style="margin-bottom: 1rem;">${header}${subdesc}${fields}</div>`;
         }).join('');
+
+        const actionsHtml = renderConfigActions(ui.actions);
 
         Modal.show({
             title: `Configure ${escapeHtml(name)}`,
             content: `
-                <form id="feature-config-form" style="max-height: 60vh; overflow-y: auto;">
-                    ${fieldsHtml}
-                </form>
+                <div style="max-height: 60vh; overflow-y: auto;">
+                    <form id="feature-config-form">
+                        ${sectionsHtml}
+                    </form>
+                    ${actionsHtml}
+                </div>
             `,
             buttons: [
                 {
@@ -686,6 +802,16 @@ async function saveConfig(name, properties) {
     for (const [key, prop] of Object.entries(properties)) {
         const el = form.querySelector(`[data-config-key="${key}"]`);
         if (!el) continue;
+
+        // Read-only/computed fields are never submitted.
+        if (el.getAttribute('data-config-readonly') === '1') continue;
+
+        if (isSecretField(prop)) {
+            // Write-only: only include when the user typed a new value, so an
+            // untouched secret is omitted and the stored value is preserved.
+            if (el.value !== '') config[key] = el.value;
+            continue;
+        }
 
         if (prop.type === 'boolean') {
             config[key] = el.checked;
@@ -719,6 +845,7 @@ window.FeatureStore = {
     reload: loadFeatureStore,
     showDetail,
     showConfigForm,
+    runConfigAction,
     installFeature,
     enableFeature,
     disableFeature,
