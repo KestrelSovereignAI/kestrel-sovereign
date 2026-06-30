@@ -897,16 +897,13 @@
         "kestrel_sovereign/static/index.html",
         "kestrel_sovereign/static/js/ui-ext/panels.js",
         "kestrel_sovereign/ui_contributions.py",
-        "server.py"
-      ],
-      "findings": [
-        "missing_code_refs"
-      ],
-      "missing_code_refs": [
+        "server.py",
         "tests/frontend/ui_ext_panels_teardown.test.mjs",
         "tests/integration/test_feature_ui_runtime_enable.py",
         "tests/unit/test_ui_contributions_runtime_enable.py"
       ],
+      "findings": [],
+      "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/features/PANEL_EXTRACTION_PLAYBOOK.md",
       "privacy": "public",
