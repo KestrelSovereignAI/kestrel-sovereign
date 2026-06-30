@@ -28,7 +28,7 @@ from kestrel_sdk.channels import ChannelAdapter
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
-from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.base import Feature, UIContributions
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,32 @@ class ProxyFeature(Feature):
         if self._client is not None and hasattr(self._client, "get_router"):
             return self._client.get_router()
         return None
+
+    def get_ui_contributions(self) -> Optional[UIContributions]:
+        """Forward UI contributions an isolated service reports over the SDK
+        init handshake (design option (a) of ticket #2043).
+
+        The out-of-process service advertises its UI assets in its
+        ``initialize`` capabilities under ``ui_contributions`` — modules/css
+        plus an absolute ``static_dir`` that lives on the same host. The host
+        then mounts and serves those assets through the same single asset path
+        as in-process features, so isolated-venv features can contribute UI
+        without the host proxying every static request.
+        """
+        caps = self._client_capabilities()
+        ui = caps.get("ui_contributions") or caps.get("ui")
+        if not isinstance(ui, dict):
+            return None
+        modules = ui.get("modules")
+        if not isinstance(modules, list) or not modules:
+            return None
+        css = ui.get("css")
+        return UIContributions(
+            modules=[str(m) for m in modules],
+            css=[str(c) for c in css] if isinstance(css, list) else [],
+            static_dir=ui.get("static_dir"),
+            capability=ui.get("capability"),
+        )
 
     async def get_config(self) -> Dict:
         if self._client is not None and hasattr(self._client, "get_config"):

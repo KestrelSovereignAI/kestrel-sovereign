@@ -267,6 +267,80 @@ def _unmount_feature_routers(app: FastAPI) -> None:
         logger.info("Removed %d dynamically-mounted feature routes", count)
 
 
+def _mount_feature_ui_assets(app: FastAPI) -> None:
+    """Mount per-feature static asset directories (#2043).
+
+    A feature that returns a ``UIContributions`` with a ``static_dir`` from
+    ``get_ui_contributions()`` gets that directory served at
+    ``/features/{name}/static/`` — so a pip-installed, out-of-tree feature can
+    ship its own frontend JS/CSS without the assets living in core ``static/``.
+    The manifest served at ``GET /api/ui/contributions`` references these mounts.
+
+    Mounted BEFORE ``_mount_feature_routers`` so the feature routers remain the
+    trailing block its index-based ``_unmount`` deletes; these mounts are removed
+    by object identity in ``_unmount_feature_ui_assets``.
+    """
+    if not SERVE_UI:
+        return
+    from kestrel_sovereign.ui_contributions import feature_static_mounts
+
+    seen: set = set()
+    pending: list = []
+
+    def _collect(agent) -> None:
+        for mount_path, directory in feature_static_mounts(agent):
+            if mount_path in seen:
+                continue
+            seen.add(mount_path)
+            pending.append((mount_path, directory))
+
+    agent = getattr(app.state, "agent", None)
+    if agent is not None:
+        _collect(agent)
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        for agent_name in manager.list_agents():
+            a = manager.get_agent(agent_name)
+            if a is not None:
+                _collect(a)
+
+    added = []
+    for mount_path, directory in pending:
+        try:
+            app.mount(
+                mount_path,
+                StaticFiles(directory=directory),
+                name=f"feature-ui:{mount_path}",
+            )
+            added.append(app.routes[-1])
+        except Exception as exc:  # noqa: BLE001 - never block startup on one feature
+            logger.warning("Failed to mount feature UI assets at %s: %s", mount_path, exc)
+
+    app.state._feature_ui_mounts = added
+    if added:
+        logger.info(
+            "Mounted feature UI asset dirs: %s",
+            ", ".join(m for m, _ in pending),
+        )
+
+
+def _unmount_feature_ui_assets(app: FastAPI) -> None:
+    """Remove feature static mounts added by ``_mount_feature_ui_assets``.
+
+    Removes by route object identity (not trailing index) so it is robust to
+    other dynamic routes added after it within the same lifespan.
+    """
+    added = getattr(app.state, "_feature_ui_mounts", None)
+    if not added:
+        return
+    for route in added:
+        try:
+            app.routes.remove(route)
+        except ValueError:
+            pass
+    app.state._feature_ui_mounts = []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the application's lifespan."""
@@ -386,6 +460,10 @@ async def lifespan(app: FastAPI):
             app.state.agent = None
             _set_startup_error(app, e)
 
+    # Per-feature static asset mounts (#2043). Done BEFORE router mounting so the
+    # feature routers stay the trailing block _unmount_feature_routers deletes.
+    _mount_feature_ui_assets(app)
+
     # Dynamic router mounting: features contribute routers via get_router()
     _mount_feature_routers(app)
 
@@ -420,6 +498,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Server shutting down...")
     _unmount_feature_routers(app)
+    _unmount_feature_ui_assets(app)
     if getattr(app.state, 'agent_manager', None):
         await app.state.agent_manager.shutdown_all()
         logger.info("All agents shutdown complete.")
@@ -702,6 +781,17 @@ async def auth_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
     if SERVE_UI and any(request.url.path.startswith(p) for p in static_prefixes):
+        return await call_next(request)
+    # Out-of-tree feature UI assets are mounted at /features/{name}/static/ (#2043)
+    # and loaded by raw browser mechanisms (<link href=...> / await import(mod))
+    # that can't attach the X-API-Key header. Bypass auth for those static mounts,
+    # matched narrowly as /features/{slug}/static/ so /features/ API routes (if any)
+    # stay protected.
+    if (
+        SERVE_UI
+        and request.url.path.startswith("/features/")
+        and "/static/" in request.url.path
+    ):
         return await call_next(request)
 
     try:

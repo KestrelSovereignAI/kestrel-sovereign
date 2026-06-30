@@ -144,8 +144,49 @@ def summarize_tool_result_for_audit(result: Any) -> Any:
         summary["success"] = result["success"]
     err = result.get("error")
     if err:
-        summary["error"] = err[:500] if isinstance(err, str) else err
+        summary["error"] = (err if isinstance(err, str) else str(err))[:500]
     return summary
+
+
+def merge_narration_verdicts(
+    narration_verdict: NarrationVerdict,
+    escalation_verdict: NarrationVerdict,
+) -> NarrationVerdict:
+    """Fold the narration and escalation-attribution verdicts together.
+
+    The two honesty-layer signals are additive. When BOTH fire we take
+    the most severe ``risk_boost`` but concatenate both reasonings so
+    the operator sees every rule that fired — regardless of which boost
+    was higher (previously a higher-boost escalation verdict dropped the
+    narration reasoning entirely, #2057). When only one fires, the
+    higher-boost verdict wins outright.
+
+    Pure function: same inputs always yield the same merged verdict,
+    so the merge policy is unit-testable in isolation from the async
+    audit hook.
+    """
+    if escalation_verdict.risk_boost > 0 and narration_verdict.risk_boost > 0:
+        return NarrationVerdict(
+            risk_boost=max(
+                narration_verdict.risk_boost,
+                escalation_verdict.risk_boost,
+            ),
+            reasoning=(
+                f"{narration_verdict.reasoning} | "
+                f"{escalation_verdict.reasoning}"
+            ),
+            offending_verb=(
+                narration_verdict.offending_verb
+                or escalation_verdict.offending_verb
+            ),
+            offending_tool=(
+                narration_verdict.offending_tool
+                or escalation_verdict.offending_tool
+            ),
+        )
+    if escalation_verdict.risk_boost > narration_verdict.risk_boost:
+        return escalation_verdict
+    return narration_verdict
 
 
 def _result_indicates_failure(result: Any) -> bool:

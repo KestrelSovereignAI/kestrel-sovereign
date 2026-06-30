@@ -226,6 +226,33 @@ class TestSummarizeForAudit:
         assert s["status"] == "error"
         assert len(s["error"]) == 500
 
+    def test_caps_non_string_error_to_500_chars(self):
+        """#2057: the cap must apply to NON-string errors too. A tool
+        returning a dict/list error whose ``str()`` exceeds 500 chars
+        was previously passed through verbatim (the ``isinstance(err,
+        str)`` guard skipped the slice), reintroducing the log-bomb
+        amplification the cap exists to prevent."""
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+        # A dict whose str() is well over 500 chars.
+        big_dict_err = {f"k{i}": "boom" for i in range(200)}
+        assert len(str(big_dict_err)) > 500
+        s = summarize_tool_result_for_audit(
+            {"status": "error", "error": big_dict_err}
+        )
+        assert isinstance(s["error"], str)
+        assert len(s["error"]) == 500
+
+        # A list error likewise gets coerced via str() then capped.
+        big_list_err = ["boom"] * 500
+        assert len(str(big_list_err)) > 500
+        s2 = summarize_tool_result_for_audit(
+            {"status": "error", "error": big_list_err}
+        )
+        assert isinstance(s2["error"], str)
+        assert len(s2["error"]) == 500
+
     def test_non_dict_coerced_to_opaque_unknown_envelope(self):
         """Codex re-review of #1076: tools that return raw primitives
         (string file contents, search snippets, etc.) MUST NOT leak
@@ -288,6 +315,68 @@ class TestVerdictShape:
         v = analyze_narration(None, None)
         with pytest.raises(Exception):
             v.risk_boost = 99  # frozen dataclass → can't mutate
+
+
+class TestMergeNarrationVerdicts:
+    """``merge_narration_verdicts`` folds the narration and
+    escalation-attribution signals together (#2057)."""
+
+    def test_both_fire_concatenates_reasonings_and_takes_max_boost(self):
+        """#2057 core gap: when BOTH rules fire and escalation has the
+        HIGHER boost, the merged verdict must keep BOTH reasonings and
+        the boost must equal the max — previously the higher-boost
+        escalation verdict replaced the narration verdict outright,
+        dropping its reasoning."""
+        from kestrel_sovereign.security.narration_check import (
+            merge_narration_verdicts,
+        )
+        narration = NarrationVerdict(
+            risk_boost=2,
+            reasoning="narration rule fired",
+            offending_verb="saved",
+            offending_tool="save_memory",
+        )
+        escalation = NarrationVerdict(
+            risk_boost=5,  # strictly higher than narration
+            reasoning="escalation rule fired",
+            offending_verb="rejected by user",
+            offending_tool="",
+        )
+        merged = merge_narration_verdicts(narration, escalation)
+        assert merged.risk_boost == max(2, 5) == 5
+        assert "narration rule fired" in merged.reasoning
+        assert "escalation rule fired" in merged.reasoning
+        # First-non-empty offender fields are preserved from narration.
+        assert merged.offending_verb == "saved"
+        assert merged.offending_tool == "save_memory"
+
+    def test_both_fire_equal_boost_still_concatenates(self):
+        from kestrel_sovereign.security.narration_check import (
+            merge_narration_verdicts,
+        )
+        narration = NarrationVerdict(risk_boost=2, reasoning="A")
+        escalation = NarrationVerdict(risk_boost=2, reasoning="B")
+        merged = merge_narration_verdicts(narration, escalation)
+        assert merged.risk_boost == 2
+        assert "A" in merged.reasoning and "B" in merged.reasoning
+
+    def test_only_escalation_fires_returns_escalation(self):
+        from kestrel_sovereign.security.narration_check import (
+            merge_narration_verdicts,
+        )
+        narration = NarrationVerdict(risk_boost=0, reasoning="")
+        escalation = NarrationVerdict(risk_boost=2, reasoning="esc only")
+        merged = merge_narration_verdicts(narration, escalation)
+        assert merged is escalation
+
+    def test_only_narration_fires_returns_narration(self):
+        from kestrel_sovereign.security.narration_check import (
+            merge_narration_verdicts,
+        )
+        narration = NarrationVerdict(risk_boost=2, reasoning="narr only")
+        escalation = NarrationVerdict(risk_boost=0, reasoning="")
+        merged = merge_narration_verdicts(narration, escalation)
+        assert merged is narration
 
 
 # ---------------------------------------------------------------------------

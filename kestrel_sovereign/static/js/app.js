@@ -21,10 +21,10 @@ import {
 } from './panels.js';
 import { mount as mountChat, loadModels, connectNotifications, updateContextStatus, subscribeSSE } from './chat.js';
 import { UI } from './ui-ext/registry.js';
-// Voice UI self-registers its slot contributions on import (#2038, ticket 04).
-// This bare side-effect import stays until ticket 05's manifest loader imports
-// voice as an out-of-tree module.
-import './voice/ui.js';
+// Voice UI is loaded via the manifest loader (#2043, ticket 05) — its core-bundled
+// manifest entry points at js/voice/boot.js, which imports voice/ui.js; that module
+// self-registers its slot contributions on import (#2038, ticket 04). No bare import
+// or named init() call from core anymore.
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
@@ -35,6 +35,57 @@ import { initApprovals, loadApprovals } from './approvals.js';
 // Import modules with side effects that define window.* functions
 import './database.js';  // Defines window.toggleDbExplorer
 import './ipfs.js';      // Defines window.toggleIpfsStatus
+
+// ============================================================================
+// Feature UI contributions (manifest-driven, out-of-tree asset loading; #2043)
+// ============================================================================
+
+// Inject a feature-contributed stylesheet once. Idempotent — the manifest may
+// be (re)loaded and a stylesheet must not be appended twice.
+function injectFeatureStylesheet(href) {
+    if (!href) return;
+    if (document.querySelector(`link[data-ui-ext-css="${CSS.escape(href)}"]`)) return;
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = href;
+    link.dataset.uiExtCss = href;
+    document.head.appendChild(link);
+}
+
+// Fetch the merged UI-contributions manifest and dynamically import each enabled
+// feature's modules in declared order. The server enabled-filters and rejects
+// cross-origin module URLs; we additionally honor the client capability set so a
+// host force-off also suppresses loading. A failed import for one feature is
+// isolated so it cannot abort the rest of boot.
+async function loadFeatureUIContributions() {
+    let contributions = [];
+    try {
+        const data = await API.request('/api/ui/contributions');
+        if (data && Array.isArray(data.contributions)) {
+            contributions = data.contributions;
+        }
+    } catch (e) {
+        console.warn('[ui-ext] failed to fetch UI contributions manifest:', e);
+        return;
+    }
+
+    for (const entry of contributions) {
+        if (entry.capability && !API.hasCapability(entry.capability)) continue;
+        for (const href of entry.css || []) {
+            injectFeatureStylesheet(href);
+        }
+        for (const mod of entry.modules || []) {
+            try {
+                await import(mod);
+            } catch (e) {
+                console.error(
+                    `[ui-ext] failed to import feature module ${mod} (feature ${entry.feature}):`,
+                    e,
+                );
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Application Initialization
@@ -124,10 +175,15 @@ async function init() {
         });
     }
 
-    // The voice UI shell (🎙️ button, path badge, picker modal, per-agent
-    // controls) mounts itself through the slot registry — it self-registered on
-    // import above and renders when core renders each zone (chat-input-actions,
-    // input-footer-status, modal-root, agent-card-actions).
+    // UI extension slots (#2043, ticket 05): load out-of-tree feature frontend
+    // assets from the manifest. Each enabled feature's ES modules are imported
+    // in declared order; each module calls UI.register(...). This is how a
+    // pip-installed feature mounts slot contributions with no edits to core
+    // static/ or app.js — including features (voice) whose JS still lives in
+    // core today but is loaded via the manifest like any other feature. Voice's
+    // module self-registers its shell (🎙️ button, path badge, picker modal,
+    // per-agent controls) into the slot zones on import.
+    await loadFeatureUIContributions();
 
     // Initialize tasks component
     initTasks();
