@@ -133,17 +133,47 @@ export function initNavigation() {
     // If the default-active "chat" tab was removed because the host
     // opted out, promote the first surviving tab to active so the page
     // doesn't open onto a vanished panel.
-    const active = document.querySelector('.nav-tab.active');
-    if (!active) {
-        const first = document.querySelector('.nav-tab');
-        if (first) {
-            first.classList.add('active');
-            const panelId = first.dataset.panel;
-            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-            document.getElementById(`panel-${panelId}`)?.classList.add('active');
-            state.currentPanel = panelId;
-        }
+    promoteActiveTabIfNeeded();
+
+    // #2041: re-gate live when a feature is enabled/disabled at runtime. The
+    // boot prune above is destructive (host opt-out is static and authoritative);
+    // runtime feature flips toggle visibility on the surviving tabs instead, so
+    // a re-enable can restore a panel without a page reload.
+    if (typeof globalThis !== 'undefined' && typeof globalThis.addEventListener === 'function') {
+        globalThis.addEventListener('capabilities:changed', reconcileNavigationCapabilities);
     }
+}
+
+// Promote the first visible tab to active when the active one is gone/hidden.
+function promoteActiveTabIfNeeded() {
+    const visibleTabs = Array.from(document.querySelectorAll('.nav-tab'))
+        .filter((t) => t.style.display !== 'none');
+    const active = visibleTabs.find((t) => t.classList.contains('active'));
+    if (active) return;
+    const first = visibleTabs[0];
+    if (!first) return;
+    first.classList.add('active');
+    const panelId = first.dataset.panel;
+    document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+    document.getElementById(`panel-${panelId}`)?.classList.add('active');
+    state.currentPanel = panelId;
+}
+
+// #2041: non-destructive re-gate driven by the capabilities:changed event.
+// Toggles tab/panel visibility for panels still present in the DOM so a runtime
+// feature enable/disable flips the UI without a reload.
+export function reconcileNavigationCapabilities() {
+    document.querySelectorAll('.nav-tab').forEach((tab) => {
+        const panelId = tab.dataset.panel;
+        const on = panelIsEnabled(panelId);
+        tab.style.display = on ? '' : 'none';
+        const panel = document.getElementById(`panel-${panelId}`);
+        if (panel && !on) {
+            tab.classList.remove('active');
+            panel.classList.remove('active');
+        }
+    });
+    promoteActiveTabIfNeeded();
 }
 
 // ============================================================================
@@ -806,6 +836,17 @@ window.selectAgent = async function(agentName) {
 
     // Set host agent routing in API layer
     API.setHostAgent(agentName);
+
+    // #2041: derive this agent's capability set now that routing is pinned. At
+    // boot in multi-agent host mode no agent is selected yet, so the server
+    // could not inject featureCapabilities and the boot-time refresh hit the
+    // host's un-prefixed /api/ui/capabilities (no agent context) and was
+    // swallowed — leaving feature-backed panels defaulting on. With routing set,
+    // /api/ui/capabilities is host-agent-prefixed and resolves; applying it emits
+    // capabilities:changed which non-destructively re-gates the nav (the boot
+    // prune left every tab present because capsMap was empty). Done before the
+    // panel loaders below so each self-guards against the fresh set.
+    await API.refreshCapabilities();
 
     // Mount the new agent's chat pane. Streams already in flight
     // against the previous agent's pane keep painting into that

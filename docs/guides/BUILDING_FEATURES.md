@@ -314,6 +314,63 @@ class MyFeature(Feature):
 
 The agent mounts the router after all features are loaded. Endpoints are available at the agent's HTTP server (e.g., `http://localhost:8888/my-feature/status`).
 
+## CLI Subcommands (`kestrel <feature> ...`)
+
+A feature can contribute a `kestrel <feature> ...` subcommand group with **zero**
+edits to core `cli.py`, discovered via the `kestrel_sovereign.cli` entry-point
+group — mirroring the `kestrel_sovereign.features` discovery the backend already
+uses.
+
+### Critical constraint: the CLI is out-of-process
+
+The `kestrel` CLI runs **host-side, out-of-process from the live agent**. A
+feature CLI command **cannot** touch in-process feature state (its tools, its
+loaded instance). It operates against host config or the agent's HTTP API —
+exactly like `kestrel feature` does today.
+
+So a feature CLI command is a **thin client over the feature's router** (the real
+primitive): `kestrel <feature> status` should hit the feature's own router
+endpoint over HTTP, not call an in-process tool. Build the router first; the CLI
+is a convenience wrapper over its HTTP surface and can ship independently.
+
+### Registering a CLI group
+
+Point an entry point at an `add_<name>_subparser(subparsers)` callable. The
+entry-point **name is the subcommand name**:
+
+```toml
+[project.entry-points."kestrel_sovereign.cli"]
+myfeature = "my_package.cli:add_myfeature_subparser"
+```
+
+```python
+# my_package/cli.py
+def add_myfeature_subparser(subparsers):
+    parser = subparsers.add_parser("myfeature", help="My feature commands")
+    sub = parser.add_subparsers(dest="myfeature_command")
+    sub.add_parser("status", help="Show feature status")
+    # Register the dispatch handler the same way cli_serve / cli_embeddings do —
+    # the CLI dispatcher drains args._handler for extension commands.
+    parser.set_defaults(_handler=run)
+
+
+def run(args):
+    if args.myfeature_command == "status":
+        # Thin client: GET the feature's router endpoint over HTTP.
+        ...
+    return 0
+```
+
+`kestrel_sovereign/cli_extension_example.py` is a complete reference
+implementation of the thin-client-over-router pattern.
+
+### Isolation guarantees
+
+Discovery is defensive: a feature whose entry-point name collides with a core
+command is rejected (**core wins**, logged at startup), and an extension that
+raises while registering is logged and skipped — one broken extension never
+breaks the whole CLI.
+
 ## Configuration
 
 Features can declare a JSON Schema for their settings. The UI can render a configuration form from this schema.

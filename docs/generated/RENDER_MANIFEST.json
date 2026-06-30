@@ -4019,6 +4019,7 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/cli_extension_example.py",
         "kestrel_sovereign/data/feature_registry.toml",
         "pyproject.toml",
         "tests/conftest.py"
@@ -4087,6 +4088,26 @@
       "status": "active",
       "title": "The Constitution of the United States",
       "type": "Principle Document"
+    },
+    {
+      "existing_code_refs": [
+        "kestrel_sovereign/static/js/api_client.mjs",
+        "kestrel_sovereign/static/js/app.js",
+        "kestrel_sovereign/static/js/chat.js",
+        "kestrel_sovereign/static/js/identity.js",
+        "kestrel_sovereign/static/js/resources.js",
+        "kestrel_sovereign/static/js/ui-ext/contract.js",
+        "kestrel_sovereign/static/js/voice/ui.js"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/proposals/ui-extension-slots/SLOTS.md",
+      "privacy": "",
+      "render": "public",
+      "status": "proposed",
+      "title": "UI Extension Slot Taxonomy & Contribution Contract",
+      "type": "Architecture Spec"
     },
     {
       "existing_code_refs": [

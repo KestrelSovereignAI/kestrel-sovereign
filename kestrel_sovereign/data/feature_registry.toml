@@ -51,6 +51,9 @@ description = "Permission management, audit logging, and session security"
 tags = ["core", "security", "permissions"]
 icon = "shield"
 core = true
+# Backs both the Security (audit) and Approvals (permissions) UI panels; the
+# registry short name "security" matches neither frontend capability key.
+ui_capabilities = ["audit", "permissions"]
 
 [peers]
 package = "kestrel-sovereign"
@@ -373,6 +376,9 @@ description = "Event tracking, metrics, and observability dashboard"
 tags = ["monitoring", "observability", "metrics"]
 icon = "activity"
 core = false
+# Backs the Metrics UI panel (hasCapability('metrics')); the registry short name
+# "observability" does not match the frontend capability key.
+ui_capabilities = ["metrics"]
 
 [scheduler]
 package = "kestrel-feature-scheduler"

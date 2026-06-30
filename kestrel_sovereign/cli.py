@@ -1783,6 +1783,13 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_runpod import add_runpod_subcommand
     add_runpod_subcommand(subparsers)
 
+    # Feature-contributed CLI groups — discovered via the
+    # ``kestrel_sovereign.cli`` entry-point group so a feature package can add
+    # a `kestrel <feature> ...` subcommand with zero edits here (#2046). Runs
+    # last so the core groups above are reserved and win any name collision.
+    from kestrel_sovereign.cli_extensions import register_cli_extensions
+    register_cli_extensions(subparsers)
+
     return parser
 
 
@@ -1860,7 +1867,14 @@ def main() -> int:
         "serve": cmd_serve,
     }
 
+    # Core dispatch dict first; then the extension registry. Feature-contributed
+    # CLI groups (discovered via the ``kestrel_sovereign.cli`` entry-point group)
+    # register their handler through argparse's ``set_defaults(_handler=...)`` —
+    # the same convention cli_serve / cli_embeddings use — which we drain here
+    # for any command core doesn't own (#2046).
     handler = commands.get(args.command)
+    if handler is None:
+        handler = getattr(args, "_handler", None)
     if handler is None:
         parser.print_help()
         return 1
