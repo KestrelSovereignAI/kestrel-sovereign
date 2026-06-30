@@ -7,6 +7,13 @@ import API from './api.js';
 import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import bus from './ui-ext/bus.js';
+import {
+    registerRenderer,
+    findToolRenderer,
+    findContentTypeRenderer,
+    renderToSafeHtml,
+    mountRenderers,
+} from './ui-ext/renderers.js';
 
 let _deps = {
     api: null,
@@ -418,9 +425,17 @@ function applyThinkingStatusWord(phase) {
 // same ``.tool-activity-container`` markup the emoji path produced — the CSS
 // is unchanged; only the data source moved from regex-scraped text to typed
 // events (#1659).
-export function renderToolCardsHtml(cards) {
+export function renderToolCardsHtml(cards, ctx = {}) {
     if (!cards || !cards.length) return '';
     const callsHtml = cards.map((card) => {
+        // #2038 ticket 06: feature tool-output renderer dispatch hook. The tool
+        // card path is positional (segmented by stream position) and was NOT
+        // `registerPartRenderer`-driven, so customizing a tool's inline card
+        // requires a dispatch hook HERE. A matching feature renderer returns an
+        // INERT HTML STRING that core sanitizes (return-based contract); a
+        // misbehaving / absent renderer falls back to the default card below.
+        const custom = renderToolCardViaRegistry(card, ctx);
+        if (custom != null) return custom;
         const n = card.events.length;
         const eventCount = n === 1 ? '1 event' : `${n} events`;
         const detail = card.detail ? ` · ${card.detail}` : '';
@@ -440,6 +455,37 @@ export function renderToolCardsHtml(cards) {
     `;
     }).join('');
     return `<div class="tool-activity-container">${callsHtml}</div>`;
+}
+
+// Attribute-escaper for the renderer-wrapper id (renderers.js wraps sanitized
+// output in `[data-ui-ext-renderer]`). Reuses the shared text escaper, which is
+// sufficient for a quoted attribute value.
+function _rendererAttrEscape(s) {
+    return deps().escapeHtml(String(s == null ? '' : s));
+}
+
+// Try a registered feature renderer for this tool card. Returns sanitized markup
+// or null (no match / bad output → core default card). The renderer's `render`
+// gets a defensive copy of the card payload so it cannot mutate core state.
+function renderToolCardViaRegistry(card, ctx = {}) {
+    const renderer = findToolRenderer(card.name, ctx);
+    if (!renderer) return null;
+    const sanitize = (deps().markdown && deps().markdown.sanitizeHtml) || null;
+    if (typeof sanitize !== 'function') return null; // fail closed: no sanitizer → default card
+    const payload = {
+        tool: card.name,
+        status: card.status,
+        detail: card.detail,
+        events: Array.isArray(card.events) ? card.events.slice() : [],
+    };
+    return renderToSafeHtml(renderer, payload, { ...ctx, card: payload }, sanitize, _rendererAttrEscape);
+}
+
+// After core builds live DOM from a sanitized tool-card string, invoke any
+// matched renderer's optional `mount(rootEl, ctx)` hook (canvas/chart/handlers)
+// on the renderer-owned roots. No-op when no renderer mounted.
+export function mountToolRenderers(containerEl, ctx = {}) {
+    return mountRenderers(containerEl, ctx);
 }
 
 /**
@@ -479,6 +525,9 @@ async function finalizeAgentContent(contentDiv, content, toolEvents = null) {
     // With tool runs: one innerHTML write keeps card/prose ordering exact;
     // highlight + mermaid + math then run once over the whole container.
     contentDiv.innerHTML = renderAgentContentHtml(content, { toolEvents });
+    // #2038 ticket 06: run any feature tool renderer's `mount` hook on the
+    // sanitized, now-live tool-card roots (canvas/chart/click handlers).
+    mountToolRenderers(contentDiv);
     markdown.highlightCodeBlocks(contentDiv);
     await markdown.renderMermaidDiagrams(contentDiv);
     if (markdown.renderMath) await markdown.renderMath(contentDiv);
@@ -709,6 +758,8 @@ function chatComponentApi() {
         setChatRoot,
         registerHeaderAction,
         registerPartRenderer,
+        registerRenderer,
+        mountToolRenderers,
         registerCoreParts,
         appendMessagePart,
         splitContentByParts,
@@ -3470,6 +3521,10 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
         // grouped cards in document order, no tools → a single markdown pass.
         contentDiv.innerHTML = `${thinkingHtml}${renderAgentContentHtml(content, { streaming: true, toolEvents })}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);
+        // Tool cards may carry feature-renderer wrappers; mount their imperative
+        // hooks after the markup is live. Idempotent per element, so re-running on
+        // each streaming tick won't double-mount.
+        mountToolRenderers(contentDiv);
 
         // Scroll-sync only when this msgDiv is in the live viewport;
         // detached panes update their `scrollPos` lazily on remount.
@@ -3647,6 +3702,15 @@ export function appendMessagePart(type, data, paneElement = null) {
     contentDiv.className = 'message-content';
 
     const renderer = _partRenderers[type];
+    // Two distinct trust levels (#2038 ticket 06), kept distinct:
+    //   1. HOST/embedder part (registerPartRenderer): host-trusted markup, host
+    //      owns sanitization, written via innerHTML / appended as a Node. The
+    //      documented, intentional contract for code the embedder ships. First.
+    //   2. FEATURE content-type renderer (registerRenderer match.contentType):
+    //      renders non-author-trusted payload, MUST go through core
+    //      sanitization via the inert-string contract. Consulted only when no
+    //      host renderer claims the type, so the host contract is unchanged.
+    const featureRenderer = renderer ? null : findContentTypeRenderer(type, { type });
     if (renderer) {
         try {
             const out = renderer(data);
@@ -3662,6 +3726,19 @@ export function appendMessagePart(type, data, paneElement = null) {
             // not abort message rendering for the whole conversation (#1644).
             // Degrade to escaped text and log, so one bad renderer is isolated.
             console.error(`part renderer for "${type}" threw:`, err);
+            contentDiv.textContent = String(data == null ? '' : data);
+        }
+    } else if (featureRenderer) {
+        const sanitize = (deps().markdown && deps().markdown.sanitizeHtml) || null;
+        const safe = typeof sanitize === 'function'
+            ? renderToSafeHtml(featureRenderer, data, { type }, sanitize, _rendererAttrEscape)
+            : null;
+        if (safe != null) {
+            contentDiv.innerHTML = safe;
+            mountToolRenderers(contentDiv, { type });
+        } else {
+            // Bad renderer output (non-string) or missing sanitizer — fail
+            // closed to escaped text rather than risk unsanitized markup.
             contentDiv.textContent = String(data == null ? '' : data);
         }
     } else {

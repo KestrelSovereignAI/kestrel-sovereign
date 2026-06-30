@@ -29,7 +29,7 @@
  */
 
 import API from '../api.js';
-import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml } from '../chat.js';
+import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml, mountToolRenderers } from '../chat.js';
 import { getOrCreateChatPane } from '../ui.js';
 import UI from '../ui-ext/registry.js';
 import bus from '../ui-ext/bus.js';
@@ -1352,6 +1352,8 @@ function renderVoiceToolCard(session, card) {
   if (content) {
     content.classList.remove('streaming');
     content.innerHTML = renderToolCardsHtml([card]);
+    // Voice tool cards may carry feature-renderer wrappers; mount their hooks.
+    mountToolRenderers(content);
   }
   return div;
 }
@@ -1359,7 +1361,10 @@ function renderVoiceToolCard(session, card) {
 
 function updateVoiceToolCard(div, card) {
   const content = div?.querySelector?.('.message-content');
-  if (content) content.innerHTML = renderToolCardsHtml([card]);
+  if (content) {
+    content.innerHTML = renderToolCardsHtml([card]);
+    mountToolRenderers(content);
+  }
 }
 
 

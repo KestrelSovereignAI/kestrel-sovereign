@@ -56,5 +56,9 @@ window.SharedMarkdown = {
     renderMath: _renderMathSafe,
     renderMarkdownInto,
     renderStreamingMarkdownInto,
-    finalizeMarkdown
+    finalizeMarkdown,
+    // The core DOMPurify entry (parse.js), exposed so the feature tool-output
+    // renderer registry (ui-ext/renderers.js, #2038 ticket 06) can route a
+    // renderer's inert HTML string through the SAME sanitizer as core markdown.
+    sanitizeHtml
 };

@@ -1110,13 +1110,21 @@ class AsyncConversationStore:
         else:
             raise DecryptionError(f"{error_msg}: No encryption keys available")
 
-    async def _migrate_message(self, row_id: int, decrypted_content: str) -> None:
-        """Re-encrypt a message with per-agent key."""
+    async def _migrate_message(
+        self, row_id: int, decrypted_content: str, meta: Optional[Dict] = None
+    ) -> None:
+        """Re-encrypt a message with per-agent key.
+
+        Preserves existing row metadata (``session_id``, ``sent_form``,
+        ``excluded_from_context``, ``privacy_mode``, …); only ``enc`` and
+        ``key_version`` are added/updated, mirroring the one-shot backfill in
+        ``security/encryption_backfill.py``.
+        """
         if not self._agent_fernet:
             return
 
         new_content, _ = encrypt_string(decrypted_content, self._agent_fernet)
-        new_meta = {"enc": True, "key_version": CURRENT_KEY_VERSION}
+        new_meta = {**(meta or {}), "enc": True, "key_version": CURRENT_KEY_VERSION}
 
         await self.db.execute_commit(
             "UPDATE conversation_history SET content = ?, metadata = ? WHERE id = ?",
@@ -1264,7 +1272,7 @@ class AsyncConversationStore:
             # Opportunistic migration to per-agent key
             if needs_migration and self._migrate_on_read:
                 try:
-                    await self._migrate_message(row_id, content)
+                    await self._migrate_message(row_id, content, meta)
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id}: {e}")
 
@@ -1541,7 +1549,7 @@ class AsyncConversationStore:
             # Opportunistic per-agent key migration
             if needs_migration and self._migrate_on_read:
                 try:
-                    await self._migrate_message(row_id, content)
+                    await self._migrate_message(row_id, content, meta)
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id} in get_full_history: {e}")
 
@@ -1656,7 +1664,7 @@ class AsyncConversationStore:
             # Opportunistic per-agent key migration
             if needs_migration and self._migrate_on_read:
                 try:
-                    await self._migrate_message(row_id, content)
+                    await self._migrate_message(row_id, content, meta)
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id} in search_history: {e}")
 
@@ -2412,7 +2420,7 @@ class AsyncConversationStore:
             # Opportunistic migration
             if needs_migration and self._migrate_on_read:
                 try:
-                    await self._migrate_message(row_id, content)
+                    await self._migrate_message(row_id, content, meta)
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id}: {e}")
 
@@ -2843,7 +2851,7 @@ class AsyncConversationStore:
             # Opportunistic migration
             if needs_migration and self._migrate_on_read:
                 try:
-                    await self._migrate_message(row_id, content)
+                    await self._migrate_message(row_id, content, meta)
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id} in get_all_audit_failures: {e}")
 
