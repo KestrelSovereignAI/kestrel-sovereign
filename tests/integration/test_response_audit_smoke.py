@@ -12,7 +12,7 @@ is exercised nowhere:
     ``_resolve_model_selector`` → ``_filter_providers_by_selector`` →
     ``_model_available_for_route``),
   * AI-Integrity-Auditor system-prompt assembly,
-  * ``adapter.get_response(format="json")`` call + JSON parse,
+  * ``adapter.get_response(response_format=AuditResult)`` call + JSON parse,
   * fail-closed error folding.
 
 That routing is the documented bit-rot risk for this dormant feature. This
@@ -29,6 +29,7 @@ import os
 import pytest
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sdk.llm import ProviderCapabilities, StructuredOutputMode
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.features.response_audit.hook import ResponseAuditHook
@@ -48,14 +49,34 @@ class _StubAuditAdapter:
     the real auditor prompt and the routed model reached the adapter.
     """
 
-    def __init__(self, name: str, *, payload: dict | None = None, raise_exc: Exception | None = None):
+    def __init__(self, name: str, *, payload: dict | None = None, raise_exc: Exception | None = None,
+                 supports_structured_output: bool = True):
         self.name = name
         self._payload = payload if payload is not None else {"risk_level": 1, "reasoning": "Normal response"}
         self._raise_exc = raise_exc
+        self._supports_structured_output = supports_structured_output
         self.calls: list[dict] = []
 
-    async def get_response(self, *, client, model, messages, format=None, **kwargs):
-        self.calls.append({"model": model, "messages": messages, "format": format})
+    def provider_capabilities(self) -> ProviderCapabilities:
+        # The audit path requires structured-output support to get parseable
+        # JSON back (#2032). Real Anthropic/OpenAI routes advertise True; the
+        # direct Gemini route advertises False and must be skipped.
+        return ProviderCapabilities(
+            supports_structured_output=self._supports_structured_output,
+            structured_output_mode=(
+                StructuredOutputMode.TOOL_FORCED
+                if self._supports_structured_output
+                else StructuredOutputMode.NONE
+            ),
+        )
+
+    async def get_response(self, *, client, model, messages, format=None, response_format=None, **kwargs):
+        self.calls.append({
+            "model": model,
+            "messages": messages,
+            "format": format,
+            "response_format": response_format,
+        })
         if self._raise_exc is not None:
             raise self._raise_exc
         return LLMResponse(content=json.dumps(self._payload))
@@ -93,10 +114,14 @@ async def test_get_audit_response_real_routing_returns_parsed_verdict():
     verdict = await svc.get_audit_response("A reasonably long agent response under audit.")
 
     assert verdict == {"risk_level": 2, "reasoning": "Borderline phrasing"}
-    # The real auditor system prompt reached the adapter as JSON-mode.
+    # The real auditor system prompt reached the adapter via a Pydantic
+    # response_format (cross-adapter structured output), NOT the OpenAI-only
+    # format="json" string that the Anthropic adapter ignores (#2032).
     assert len(adapter.calls) == 1
     call = adapter.calls[0]
-    assert call["format"] == "json"
+    assert call["format"] is None
+    from kestrel_sovereign.llm.service import AuditResult
+    assert call["response_format"] is AuditResult
     assert call["model"] == "claude-x"
     system_msg = next((m for m in call["messages"] if m.get("role") == "system"), None)
     assert system_msg is not None
@@ -123,6 +148,45 @@ async def test_get_audit_response_folds_provider_error_failclosed():
 
     assert verdict["risk_level"] == 3
     assert "audit backend down" in verdict["reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_get_audit_response_skips_route_without_structured_output():
+    """A first route that cannot honor response_format (e.g. direct Gemini)
+    must be skipped, not allowed to return prose that fails JSON parsing and
+    forces risk_level=3. The audit falls through to a structured-capable route
+    (#2032)."""
+    gemini = _StubAuditAdapter(
+        "google:api", payload={"risk_level": 1, "reasoning": "unused"},
+        supports_structured_output=False,
+    )
+    anthropic = _StubAuditAdapter("anthropic:api", payload={"risk_level": 1, "reasoning": "ok"})
+    svc = _service([
+        _provider("google:api", "google", "gemini-x", gemini),
+        _provider("anthropic:api", "anthropic", "claude-x", anthropic),
+    ])
+
+    verdict = await svc.get_audit_response("A reasonably long agent response under audit.")
+
+    assert verdict == {"risk_level": 1, "reasoning": "ok"}
+    assert gemini.calls == []  # never reached the wire — capability-filtered out
+    assert [c["model"] for c in anthropic.calls] == ["claude-x"]
+
+
+@pytest.mark.asyncio
+async def test_get_audit_response_failclosed_when_only_route_unsupported():
+    """If the only route cannot honor structured output, fail closed (risk 3)
+    rather than falling through to the benign 'no providers' risk 1."""
+    gemini = _StubAuditAdapter(
+        "google:api", payload={"risk_level": 1, "reasoning": "unused"},
+        supports_structured_output=False,
+    )
+    svc = _service([_provider("google:api", "google", "gemini-x", gemini)])
+
+    verdict = await svc.get_audit_response("A reasonably long agent response under audit.")
+
+    assert verdict["risk_level"] == 3
+    assert gemini.calls == []
 
 
 # =========================================================================

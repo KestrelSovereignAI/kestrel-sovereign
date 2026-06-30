@@ -65,6 +65,18 @@ _LAST_RESPONSE_IDENTITY: ContextVar[Optional[Dict[str, Optional[str]]]] = (
 )
 
 
+class AuditResult(BaseModel):
+    """Structured result of a response-integrity audit.
+
+    Requested via ``response_format`` so structured output is honored across
+    adapters (Anthropic via its tool pattern, OpenAI natively) rather than the
+    OpenAI-style ``format="json"`` string the Anthropic adapter ignores (#2032).
+    """
+
+    risk_level: int
+    reasoning: str
+
+
 async def _wait_for_close_result(result: Any) -> None:
     """Await asynchronous close results while accepting synchronous close APIs."""
     if inspect.isawaitable(result):
@@ -2116,6 +2128,29 @@ No other text or formatting.
                         provider["name"], exc,
                     )
                     continue
+
+                # The audit relies on a Pydantic response_format to get parseable
+                # JSON back. A route that does not honor structured output (e.g.
+                # the direct Gemini adapter, which ignores response_format and
+                # replies in prose) would reproduce the original #2032 failure on
+                # another provider class. Skip such routes so we fall through to a
+                # structured-capable one instead of forcing risk_level=3.
+                try:
+                    supports_structured = provider["adapter"].provider_capabilities().supports_structured_output
+                except Exception as exc:  # capability introspection must never hard-fail the audit
+                    supports_structured = False
+                    logger.debug(
+                        "Audit: could not read capabilities for %s (%s); treating as no structured output",
+                        provider["name"], exc,
+                    )
+                if not supports_structured:
+                    errors[provider["name"]] = "route does not support structured output (response_format)"
+                    logger.debug(
+                        "Audit: skipping %s (no structured-output support)",
+                        provider["name"],
+                    )
+                    continue
+
                 messages = messages_for(
                     provider["adapter"],
                     user_prompt=text_to_audit,
@@ -2123,16 +2158,29 @@ No other text or formatting.
                 )
 
                 try:
+                    # Request structured output via a Pydantic response_format so
+                    # the audit JSON is honored across adapters (Anthropic via its
+                    # tool pattern, OpenAI natively). The OpenAI-style format="json"
+                    # string is silently ignored by the Anthropic adapter, which
+                    # made every audit return malformed JSON → risk_level=3 (#2032).
                     response = await provider["adapter"].get_response(
                         client=provider["client"],
                         model=effective_model,
                         messages=messages,
-                        format="json",
+                        response_format=AuditResult,
                     )
-                    response_json = json.loads(response.content)
+                    content = response.content if isinstance(response, LLMResponse) else response
+                    response_json = json.loads(content)
                     if "risk_level" not in response_json or "reasoning" not in response_json:
                         raise ValueError("Missing required keys in audit response.")
                     return response_json
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                    # A malformed/unparseable audit payload from this route must
+                    # not short-circuit the whole audit (#2032): record it and try
+                    # the next eligible provider rather than forcing risk_level=3.
+                    errors[provider["name"]] = f"malformed audit response: {exc}"
+                    logger.warning(f"Audit provider {provider['name']} returned unparseable JSON: {exc}")
+                    continue
                 except (LLMProviderError, openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError) as exc:
                     errors[provider["name"]] = str(exc)
                     logger.warning(f"Audit provider {provider['name']} failed: {exc}")
