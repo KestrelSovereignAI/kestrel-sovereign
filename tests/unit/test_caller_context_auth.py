@@ -122,7 +122,7 @@ async def test_non_governance_command_works_for_oauth_user():
     handler, agent = _make_handler()
 
     caller = CallerContext.authenticated("user@example.com")
-    result = await handler.handle("!status", caller=caller)
+    result = await handler.handle("!help", caller=caller)
 
     assert "agent" in result.lower()
 
@@ -131,7 +131,7 @@ async def test_non_governance_command_works_for_oauth_user():
 async def test_non_governance_command_works_with_no_caller():
     handler, agent = _make_handler()
 
-    result = await handler.handle("!status", caller=None)
+    result = await handler.handle("!help", caller=None)
 
     assert "agent" in result.lower()
 
