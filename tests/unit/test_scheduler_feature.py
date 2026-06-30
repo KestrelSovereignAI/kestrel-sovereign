@@ -302,6 +302,80 @@ class TestSleepCronHandler:
         assert agent.sleep.await_args.kwargs["skip_reflection"] is False
 
 
+class TestSleepActivityGateSoftDelete:
+    """The activity gate must measure *live* conversation activity only.
+
+    Soft-deleted rows (deleted_at IS NOT NULL) are not real activity, so a
+    soft-delete as the sole change since the last episode must read as idle
+    (#2061). The gate biases toward "active" on uncertainty, so the only way
+    to get this wrong is to count deleted rows.
+    """
+
+    @staticmethod
+    def _make_feature(rows):
+        """Build a SchedulerFeature whose db.fetchval honors the soft-delete
+        filter the way real SQLite would.
+
+        ``rows`` is a list of (created_at, deleted_at) conversation rows. The
+        fake fetchval returns MAX(created_at) over the rows that match the
+        query's WHERE clause — respecting ``deleted_at IS NULL`` when present.
+        """
+
+        async def fetchval(query, params=()):
+            if "memory_episodes" in query:
+                return None  # no prior episode → "newest msg" decides
+            candidates = rows
+            if "deleted_at IS NULL" in query:
+                candidates = [r for r in rows if r[1] is None]
+            stamps = [r[0] for r in candidates]
+            return max(stamps) if stamps else None
+
+        agent = _make_mock_agent()
+        agent.storage = MagicMock()
+        agent.storage.db = MagicMock()
+        agent.storage.db.fetchval = AsyncMock(side_effect=fetchval)
+        f = SchedulerFeature(agent)
+        f._agent_id = "did:test:scheduler-agent"
+        return f
+
+    @pytest.mark.asyncio
+    async def test_soft_deleted_only_message_is_idle(self):
+        # The only row newer than the (absent) last episode is soft-deleted.
+        f = self._make_feature([("2026-06-12 10:00:00", "2026-06-12 11:00:00")])
+        assert await f._sleep_had_activity() is False
+
+    @pytest.mark.asyncio
+    async def test_live_message_is_active(self):
+        # A live (non-deleted) message → active, even alongside a deleted one.
+        f = self._make_feature(
+            [
+                ("2026-06-11 09:00:00", "2026-06-11 09:30:00"),
+                ("2026-06-12 10:00:00", None),
+            ]
+        )
+        assert await f._sleep_had_activity() is True
+
+    @pytest.mark.asyncio
+    async def test_query_filters_deleted_at(self):
+        # Guard the literal filter so the fix can't silently regress.
+        captured = []
+
+        async def fetchval(query, params=()):
+            captured.append(query)
+            return None
+
+        agent = _make_mock_agent()
+        agent.storage = MagicMock()
+        agent.storage.db = MagicMock()
+        agent.storage.db.fetchval = AsyncMock(side_effect=fetchval)
+        f = SchedulerFeature(agent)
+        f._agent_id = "did:test:scheduler-agent"
+        await f._sleep_had_activity()
+
+        conv_query = next(q for q in captured if "conversation_history" in q)
+        assert "deleted_at IS NULL" in conv_query
+
+
 # =========================================================================
 # schedule_add
 # =========================================================================
