@@ -64,6 +64,16 @@ function injectFeatureStylesheet(href) {
 
 let _inFlight = null;
 
+// Canonical (pre-pin) identities of assets already imported, so the same feature
+// asset executes exactly once even across agent switches. In multi-agent host
+// mode pinFeatureAssetUrl() yields a different per-agent URL for the same module
+// (e.g. /api/agents/A/features/.../spawn.js vs …/B/…); the browser module cache
+// treats those as distinct modules and would re-run the module's top-level side
+// effects (slot registration, bus.on('panel:shown') handlers), causing duplicate
+// loads/renders. Keying dedupe on the unprefixed `feature::asset` identity avoids
+// that while the first fetch still routes through the selected agent.
+const _importedModules = new Set();
+
 // Fetch the merged UI-contributions manifest and dynamically import each enabled
 // feature's modules in declared order. The server enabled-filters and rejects
 // cross-origin module URLs; we additionally honor the client capability set so a
@@ -87,11 +97,17 @@ export async function loadFeatureUIContributions() {
         for (const entry of contributions) {
             if (entry.capability && !API.hasCapability(entry.capability)) continue;
             for (const href of entry.css || []) {
+                // injectFeatureStylesheet is idempotent via a DOM <link> check.
                 injectFeatureStylesheet(pinFeatureAssetUrl(href));
             }
             for (const mod of entry.modules || []) {
+                const modKey = `${entry.feature}::${mod}`;
+                if (_importedModules.has(modKey)) continue;
                 try {
                     await import(pinFeatureAssetUrl(mod));
+                    // Mark imported only on success so a failed import can retry
+                    // on the next run (e.g. after the feature is re-enabled).
+                    _importedModules.add(modKey);
                 } catch (e) {
                     console.error(
                         `[ui-ext] failed to import feature module ${mod} (feature ${entry.feature}):`,
