@@ -77,8 +77,12 @@ Distinguish three capability classes (the precedence rules in step 3 depend on i
 4. Wire enable/disable endpoints
    ([features.py:247/268](../../../kestrel_sovereign/endpoints/features.py)) to push
    `capabilities:changed`.
-5. Tests: feature enabled → capability true; disabled → false + teardown; host
-   override still wins.
+5. Tests, per capability class:
+   - feature-backed: enabled → true; disabled → false + teardown; host override can
+     force a feature **off** but a force-**true** on a disabled feature is ignored
+     (capability stays false, manifest still excludes it);
+   - core-static: host override (on or off) wins over the static default;
+   - host-chrome: embed-mode toggle independent of features.
 
 ## Acceptance criteria
 
