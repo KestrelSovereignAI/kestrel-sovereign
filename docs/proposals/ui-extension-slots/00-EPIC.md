@@ -117,6 +117,12 @@ user-visible change** — the safest way to introduce a framework.
   spike; they need no registry and deliver immediate value.
 - **01 → 02 → 03 → 04** is the spine. 04 (voice migration) is the gate: nothing in
   05/06/09 is exposed to external feature authors until voice proves the contracts.
+- **Each spine ticket is strictly additive until the next supersedes it** — a
+  no-broken-window invariant. 02 emits generic bus events *alongside* the legacy
+  voice calls (never removing them). 04 removes the legacy *named calls* but keeps a
+  bare side-effect `import './voice/ui.js'` so voice still loads. 05's manifest loader
+  removes that last import. At no commit is voice unloaded or unwired. Reviewers
+  should reject any spine PR that severs a voice path before its replacement is live.
 - **09** is deliberately *after* 04 because the model-selector lock is the one
   coupling we expect the slot model *not* to absorb; we want to discover its real
   shape during the voice migration, not guess it up front.

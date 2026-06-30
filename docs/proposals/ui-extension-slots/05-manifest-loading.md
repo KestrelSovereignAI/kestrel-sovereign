@@ -74,6 +74,11 @@ Decide and document; (a) is simpler and keeps asset serving in one place.
 5. Provide a **reference example feature** (smallest possible: one button in
    `chat-input-actions`) living *outside* the core static tree, proving end-to-end
    out-of-tree contribution.
+6. Remove the interim bare `import './voice/ui.js'` left in app.js by ticket 04 —
+   voice now loads via the manifest like any other feature (its assets can stay
+   in-tree under a `/features/voice/static/`-style mount, or move to their own
+   package later; either way app.js no longer imports it directly). After this,
+   `grep -ri voice kestrel_sovereign/static/js/app.js` returns nothing.
 
 ## Acceptance criteria
 

@@ -16,7 +16,7 @@ depends on them.
 
 | Coupling to delete | Replaced by |
 |---|---|
-| `import { initVoiceUI } from './voice/ui.js'` in [app.js:77](../../../kestrel_sovereign/static/js/app.js) | dynamic import via manifest (ticket 05) OR, interim, voice self-registers at module load |
+| named call `initVoiceUI()` from [app.js:77](../../../kestrel_sovereign/static/js/app.js) | replaced by a **bare side-effect import** `import './voice/ui.js'` whose module body self-registers via `UI.register(...)`. The import line stays in app.js through this ticket (voice assets are still in-tree); ticket 05 removes it once the manifest loader imports voice as an out-of-tree module. **Do not delete the import in this ticket — only the named `initVoiceUI()` call.** |
 | `mountAgentVoiceControls(item, ...)` call in [identity.js:758](../../../kestrel_sovereign/static/js/identity.js) | `UI.renderSlot('agent-card-actions', ctx)` (core) + voice registration |
 | `onVoiceAgentSwitch(...)` call in [identity.js:817](../../../kestrel_sovereign/static/js/identity.js) | core `bus.emit('agent:switch', ...)`; voice subscribes |
 | mic button `insertBefore(#send-button)` [voice/ui.js:454](../../../kestrel_sovereign/static/js/voice/ui.js) | `chat-input-actions` zone registration |
@@ -33,7 +33,10 @@ depends on them.
    ([voice/ui.js:224/298](../../../kestrel_sovereign/static/js/voice/ui.js)).
 2. Replace voice's bespoke refresh (`refreshAgentVoiceCard`) with reliance on
    registry re-render driven by `session:change` / `agent:switch` bus events.
-3. Delete the core→voice imports/calls in app.js and identity.js.
+3. Delete the core→voice **named calls** in app.js (`initVoiceUI()`) and identity.js
+   (`mountAgentVoiceControls`, `onVoiceAgentSwitch`). Keep the bare
+   `import './voice/ui.js'` side-effect import in app.js so the module still loads and
+   self-registers — that import is removed by ticket 05's manifest loader, not here.
 4. Leave the model-selector lock **as-is** for now — it is ticket 09's subject. Note
    it explicitly in the PR so it is not mistaken for an oversight.
 5. Manual + Kestrel Eye verification: mic button, agent-card 🎧/🎤, footer badge,
@@ -43,9 +46,11 @@ depends on them.
 ## Acceptance criteria
 
 - **Zero user-visible change.** Voice works exactly as before.
-- `grep -ri voice kestrel_sovereign/static/js/app.js kestrel_sovereign/static/js/identity.js`
-  returns **nothing** (core no longer references voice by name). The model-selector
-  lock in chat.js is the one allowed remaining reference, pending ticket 09.
+- `identity.js` no longer references voice by name (no `mountAgentVoiceControls` /
+  `onVoiceAgentSwitch`). `app.js` retains exactly **one** voice reference — the bare
+  `import './voice/ui.js'` side-effect import — removed in ticket 05. The
+  model-selector lock in chat.js is the other allowed remaining reference, pending
+  ticket 09. No *named-call* coupling remains in either file.
 - Every row in the coupling table above is closed or explicitly deferred to a named
   ticket with rationale.
 - `npm run test:js` green.

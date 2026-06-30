@@ -50,23 +50,30 @@ Add `UI.renderSlot(...)` calls at each zone's natural render site:
 - chat input row / `.input-footer` construction (chat.js / index.html hydration)
 - a single `modal-root` mount target appended once at boot
 
-Core must emit `agent:switch` where it already calls `onVoiceAgentSwitch`
-([identity.js:817](../../../kestrel_sovereign/static/js/identity.js)) — but emit a
-*generic* event, not a voice-named call.
+Core must emit a generic `agent:switch` event at the point where it currently calls
+`onVoiceAgentSwitch` ([identity.js:817](../../../kestrel_sovereign/static/js/identity.js)).
+**This ticket is strictly additive: emit the generic event *alongside* the existing
+`onVoiceAgentSwitch`/`mountAgentVoiceControls` calls — do NOT remove them here.** The
+core→voice calls are deleted only in ticket 04, after voice subscribes to the bus.
+Removing them in this ticket would sever agent-switch/session refresh from voice
+until 04 lands (a multi-PR window of broken voice). Same rule for every other
+core→feature call: add the generic emit, leave the legacy call until 04.
 
 ## Tasks
 
 1. Implement registry + bus with the ticket-01 contract.
 2. Wire `renderSlot` into each zone render site (still no feature registered — zones
    render empty).
-3. Replace direct `onVoiceAgentSwitch`-style core→feature calls with bus `emit`.
+3. Add bus `emit` calls **next to** existing `onVoiceAgentSwitch`-style core→feature
+   calls (additive — the legacy calls stay until ticket 04).
 4. Unit tests: ordering, gate re-evaluation on event, teardown-on-rerender, error
    isolation, dedupe-by-id, empty-zone no-op.
 
 ## Acceptance criteria
 
 - All existing UI behaves identically (zones render empty; voice still works via its
-  current hardcoded path — **not yet migrated**, that's ticket 04).
+  current hardcoded path **which remains fully intact** — not yet migrated, that's
+  ticket 04). Generic bus events fire in parallel with the legacy voice calls.
 - `npm run test:js` green; new tests cover the registry/bus invariants above.
 - No feature-name strings (`voice`, etc.) appear in registry/bus code.
 
