@@ -29,13 +29,15 @@ own conventions where possible to avoid inventing a dialect):
   "Test connection", "Reset queue". The button declares
   `{label, method, path, confirm?}`; the action targets the feature's existing
   endpoints, not a new mechanism.
-- **Widget hints** (`format`/`x-kestrel-widget`: textarea, secret/password masking,
-  select-from-endpoint).
+- **Widget hints** via standard JSON Schema `format` (e.g. `textarea`, `password`,
+  select-from-endpoint), **not** a custom flat keyword.
 
 ## Tasks
 
-1. Define the hint vocabulary (documented; prefer standard JSON Schema keywords +
-   one namespaced `x-kestrel-ui` object for the rest).
+1. Define the hint vocabulary (documented; **pure-standard-where-possible**: `format`
+   for widgets, `readOnly` for status fields, `writeOnly` for secrets; a single
+   namespaced `x-kestrel-ui` object **only** for sections + action buttons, which have
+   no standard equivalent). There is no flat `x-kestrel-widget` keyword.
 2. Extend the Feature Store config renderer to honor hints (sections, readonly,
    widgets, action buttons).
 3. Secret masking for sensitive config (do not render API keys in plaintext).
