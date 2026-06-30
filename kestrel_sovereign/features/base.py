@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -150,6 +151,43 @@ def parse_docstring_params(docstring: Optional[str]) -> Dict[str, str]:
             param_descriptions[param_name] = description
     
     return param_descriptions
+
+@dataclass
+class UIContributions:
+    """Static frontend assets + entry modules a feature contributes to the web UI.
+
+    Returned by ``Feature.get_ui_contributions()`` and merged into the manifest
+    served at ``GET /api/ui/contributions``. Mirrors ``get_router()``: the server
+    discovers it after all features load and serves the assets it describes.
+
+    Fields:
+        modules: Ordered list of ES module paths to ``import()`` at boot. Each
+            module is expected to call ``UI.register(...)`` when imported.
+        css: Optional list of stylesheet paths to inject (``<link rel=stylesheet>``).
+        static_dir: Absolute filesystem path of the directory holding this
+            feature's assets. When set, the server mounts it at
+            ``/features/{name}/static/`` and ``modules``/``css`` are interpreted
+            as paths RELATIVE to that mount (e.g. ``"ui.js"`` →
+            ``/features/{name}/static/ui.js``). This is how a pip-installed,
+            out-of-tree feature ships assets that don't live in core ``static/``.
+            When ``None`` the feature serves no directory of its own and
+            ``modules``/``css`` MUST be root-relative same-origin paths the host
+            already serves (e.g. core-bundled ``/js/...`` assets).
+        capability: UI capability key this contribution gates on. Defaults to the
+            feature's registry name (keeps it in sync with the capability set);
+            ``None`` lets the server resolve the default.
+
+    Security: paths must be same-origin (root-relative or relative); remote /
+    absolute (scheme-bearing or protocol-relative ``//host``) URLs are rejected
+    server-side. ``installed = trusted`` — a feature's UI JS is no greater
+    privilege than its Python (pip already grants arbitrary code execution).
+    """
+
+    modules: List[str] = field(default_factory=list)
+    css: List[str] = field(default_factory=list)
+    static_dir: Optional[str] = None
+    capability: Optional[str] = None
+
 
 class Feature(_SdkFeature):
     """
@@ -316,6 +354,22 @@ class Feature(_SdkFeature):
 
         Returns:
             Optional APIRouter instance, or None.
+        """
+        return None
+
+    def get_ui_contributions(self) -> Optional["UIContributions"]:
+        """Static assets + entry modules this feature contributes to the web UI.
+
+        Returns a ``UIContributions`` descriptor or ``None``. Mirrors
+        ``get_router()``: the server discovers it after all features load,
+        mounts any declared ``static_dir`` at ``/features/{name}/static/``, and
+        merges the manifest into ``GET /api/ui/contributions`` (enabled-only).
+        The frontend boot loader dynamically ``import()``s the declared modules
+        in order; each module registers its slot contributions via
+        ``UI.register(...)``.
+
+        Returns:
+            Optional ``UIContributions``, or None.
         """
         return None
 
