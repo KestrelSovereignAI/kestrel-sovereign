@@ -260,7 +260,7 @@ class StreamingMixin:
     - discover_all_models(use_cache: bool) -> Awaitable[...]
     """
 
-    async def _ensure_models_discovered(self) -> None:
+    async def _ensure_models_discovered(self, *, force_local_only: bool = False) -> None:
         """Trigger model discovery once if any route is still seeded ``"auto"``.
 
         Routes start with ``model = "auto"`` in ``kestrel.toml`` and only
@@ -279,7 +279,17 @@ class StreamingMixin:
         provider list's ``"auto"`` entries (``_resolve_auto_providers``), so
         the guard short-circuits on subsequent turns. Discovery failure is
         non-fatal — the route walk still runs and fails loudly per route.
+
+        ``force_local_only``: privacy gate. ``discover_all_models`` contacts
+        *every* configured vendor — including cloud — to enumerate models, and
+        writes the merged result to the shared/disk cache. For a local-only
+        turn (ISOLATED/EPHEMERAL privacy session) that would both leak which
+        cloud keys exist and risk poisoning the cache, so we skip the warm-up
+        entirely. Privacy wins even at the cost of a cold-cache local ``"auto"``
+        route failing loudly — consistent with the force-local embedding gate.
         """
+        if force_local_only:
+            return
         if any(p.get("model") == "auto" for p in (self._available_providers() or [])):
             try:
                 await self.discover_all_models(use_cache=True)
@@ -304,7 +314,7 @@ class StreamingMixin:
         hard-failing the route walk. Sync callers of ``resolve_provider_routing``
         (e.g. embedding resolution) keep their own no-warm-up behavior.
         """
-        await self._ensure_models_discovered()
+        await self._ensure_models_discovered(force_local_only=force_local_only)
         return self.resolve_provider_routing(
             model_override=model_override,
             force_local_only=force_local_only,

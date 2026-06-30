@@ -2674,11 +2674,13 @@ No other text or formatting.
         # Lazy auto-resolution warm-up (#2069): resolve any ``model = "auto"``
         # route before the walk so a fresh-boot cold cache doesn't surface a
         # hard ``ModelNotAvailableForRoute``. Shared with the streaming and
-        # ``get_response`` paths via ``_ensure_models_discovered``. Re-fetch
-        # the local provider list afterward — this path resolves routing
-        # inline (it does not call ``resolve_provider_routing``), so it needs
-        # the freshly resolved provider models.
-        await self._ensure_models_discovered()
+        # ``get_response`` paths via ``_ensure_models_discovered``. Pass
+        # ``force_local_only`` so a local-only turn skips the cloud-contacting
+        # warm-up (privacy). Re-fetch the local provider list afterward — this
+        # path resolves routing inline (it does not call
+        # ``resolve_provider_routing``), so it needs the freshly resolved
+        # provider models.
+        await self._ensure_models_discovered(force_local_only=force_local_only)
         providers = self._available_providers()
 
         if force_local_only:

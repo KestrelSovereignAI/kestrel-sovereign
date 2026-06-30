@@ -153,6 +153,29 @@ async def test_ensure_models_discovered_skips_when_already_resolved():
 
 
 @pytest.mark.asyncio
+async def test_ensure_models_discovered_skips_cloud_discovery_when_local_only():
+    """#2069 codex r2 (privacy): a ``force_local_only`` turn must NOT run the
+    cloud-contacting discovery warm-up, even when a cloud route is still
+    ``model='auto'``. ``discover_all_models`` enumerates every configured
+    vendor (incl. cloud) and writes the shared/disk cache — a leak + cache
+    poisoning risk for an ISOLATED/EPHEMERAL session."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+    svc.providers = [{"name": "openai:api", "vendor": "openai", "model": "auto"}]
+    svc.discover_all_models = AsyncMock(return_value=[])
+
+    await svc._ensure_models_discovered(force_local_only=True)
+    svc.discover_all_models.assert_not_awaited()
+
+    # Sanity: the SAME cold-auto state DOES warm when not local-only, so the
+    # skip above is the privacy gate, not a dead guard.
+    await svc._ensure_models_discovered(force_local_only=False)
+    svc.discover_all_models.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_process_discovery_message_times_out_on_llm_hang():
     """A hung LLM call is bounded by ``DISCOVERY_LLM_TIMEOUT_SECONDS``.
 
