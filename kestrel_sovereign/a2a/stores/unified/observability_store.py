@@ -382,10 +382,15 @@ class ObservabilityStore(UnifiedStoreBase):
         tool_name: str,
         session_id: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
+        timestamp: Optional[datetime] = None,
     ) -> str:
-        """Log start of tool call. Returns event_id for timing."""
+        """Log start of tool call. Returns event_id for timing.
+
+        ``timestamp`` lets an external producer preserve the original event
+        time (e.g. telemetry pushed after the fact); defaults to now.
+        """
         event_id = generate_id()
-        now = self.now_utc_param()
+        now = self.to_timestamp_param(timestamp) if timestamp else self.now_utc_param()
 
         await self._backend.execute(
             """
@@ -430,10 +435,15 @@ class ObservabilityStore(UnifiedStoreBase):
         success: bool = True,
         session_id: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
+        timestamp: Optional[datetime] = None,
     ) -> str:
-        """Log an agent response. Returns event_id."""
+        """Log an agent response. Returns event_id.
+
+        ``timestamp`` preserves an external producer's original event time;
+        defaults to now.
+        """
         event_id = generate_id()
-        now = self.now_utc_param()
+        now = self.to_timestamp_param(timestamp) if timestamp else self.now_utc_param()
 
         await self._backend.execute(
             """
@@ -461,12 +471,17 @@ class ObservabilityStore(UnifiedStoreBase):
         error_message: str,
         session_id: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
+        timestamp: Optional[datetime] = None,
     ) -> str:
-        """Log an error event. Returns event_id."""
+        """Log an error event. Returns event_id.
+
+        ``timestamp`` preserves an external producer's original event time;
+        defaults to now.
+        """
         event_id = generate_id()
         meta = metadata or {}
         meta["error_type"] = error_type
-        now = self.now_utc_param()
+        now = self.to_timestamp_param(timestamp) if timestamp else self.now_utc_param()
 
         await self._backend.execute(
             """
@@ -493,21 +508,27 @@ class ObservabilityStore(UnifiedStoreBase):
         metric_name: str,
         metric_value: float,
         metadata: Optional[dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
     ) -> str:
-        """Log a metric value. Returns event_id."""
+        """Log a metric value. Returns event_id.
+
+        ``timestamp`` preserves an external producer's original event time;
+        defaults to now.
+        """
         event_id = generate_id()
         meta = metadata or {}
         meta["metric_name"] = metric_name
         meta["metric_value"] = metric_value
-        now = self.now_utc_param()
+        now = self.to_timestamp_param(timestamp) if timestamp else self.now_utc_param()
 
         await self._backend.execute(
             """
             INSERT INTO a2a_observability
-            (id, timestamp, agent_name, event_type, metadata)
-            VALUES (?, ?, ?, 'metric', ?)
+            (id, timestamp, agent_name, session_id, event_type, metadata)
+            VALUES (?, ?, ?, ?, 'metric', ?)
             """,
-            (event_id, now, agent_name, json_dumps(meta)),
+            (event_id, now, agent_name, session_id, json_dumps(meta)),
         )
 
         return event_id
