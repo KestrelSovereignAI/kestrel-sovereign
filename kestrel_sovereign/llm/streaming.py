@@ -283,6 +283,60 @@ class StreamingMixin:
                 vendors.add(key.split(":", 1)[0])
         return vendors
 
+    def _allow_paid_fallback(self) -> bool:
+        """Whether the operator permits falling from a plan/free route to a
+        metered ``:api`` route within the fallback chain.
+
+        Defaults to **True** to preserve the historical availability-over-cost
+        behavior (the whole fallback chain — and its test suite — assumes a
+        failed ``:plan`` route may drop to a same-/cross-vendor paid route).
+
+        Set ``[llm] allow_paid_fallback = false`` for cost-over-availability:
+        a 429 throttle or failure on a subscription ``:plan`` route then means
+        "wait / try again", and the chain refuses to silently start billing the
+        metered API — it reaches another plan/free route or fails loudly.
+        """
+        config = getattr(self, "config", None) or {}
+        try:
+            return bool(config.get("allow_paid_fallback", True))
+        except AttributeError:
+            return True
+
+    @staticmethod
+    def _route_is_paid(provider: dict) -> bool:
+        """True when ``provider`` is a metered API-key route (``vendor:api``),
+        as opposed to a subscription ``:plan`` route or a free ``:local`` one.
+
+        Derives the route from the explicit ``route`` field, falling back to
+        the ``vendor:route`` name so it works on the minimal provider dicts
+        the loop carries.
+        """
+        route = provider.get("route")
+        if not route:
+            name = provider.get("name", "") or ""
+            route = name.rsplit(":", 1)[-1] if ":" in name else ""
+        return route == "api"
+
+    def _skip_paid_fallback(self, provider: dict, providers: list, index: int) -> bool:
+        """True when the loop must NOT silently fall to a metered ``:api`` route
+        past a plan/free route the operator preferred.
+
+        Once the chain has passed a non-paid (``:plan``/``:local``) route, a
+        later paid route is refused — the loop reaches another plan/free route
+        or raises loudly, but never silently starts billing on a throttle or
+        plan failure. Gated off by ``[llm] allow_paid_fallback = true``, and it
+        never fires for an all-paid config (no preceding non-paid route to
+        prefer), so a deliberately metered deployment is unaffected.
+        """
+        if self._allow_paid_fallback():
+            return False
+        if not self._route_is_paid(provider):
+            return False
+        # Only refuse when a non-paid route preceded this one — i.e. we'd be
+        # downgrading away from a route the operator would rather use. A paid
+        # route reached as the primary (all-paid config) is legitimate.
+        return any(not self._route_is_paid(p) for p in providers[:index])
+
     def _skip_unconfigured_route(
         self, provider: dict, configured_vendors: Optional[set] = None
     ) -> bool:
@@ -697,6 +751,16 @@ class StreamingMixin:
         last_error = None
         last_provider_name = None
         for provider_index, provider in enumerate(providers_to_use):
+            if not explicit_selection and self._skip_paid_fallback(
+                provider, providers_to_use, provider_index
+            ):
+                logger.warning(
+                    "Refusing silent plan->paid downgrade to %s (a plan/free "
+                    "route was preferred; set llm.allow_paid_fallback=true to "
+                    "permit). Not billing the metered API on a plan failure.",
+                    provider.get("name"),
+                )
+                continue
             if not explicit_selection and self._skip_unconfigured_route(
                 provider, configured_vendors
             ):
@@ -944,6 +1008,16 @@ class StreamingMixin:
         last_error = None
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
+            if not explicit_selection and self._skip_paid_fallback(
+                provider, providers, provider_index
+            ):
+                logger.warning(
+                    "Refusing silent plan->paid downgrade to %s (a plan/free "
+                    "route was preferred; set llm.allow_paid_fallback=true to "
+                    "permit). Not billing the metered API on a plan failure.",
+                    provider.get("name"),
+                )
+                continue
             if not explicit_selection and self._skip_unconfigured_route(
                 provider, configured_vendors
             ):
@@ -1248,6 +1322,16 @@ class StreamingMixin:
         last_error = None
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
+            if not explicit_selection and self._skip_paid_fallback(
+                provider, providers, provider_index
+            ):
+                logger.warning(
+                    "Refusing silent plan->paid downgrade to %s (a plan/free "
+                    "route was preferred; set llm.allow_paid_fallback=true to "
+                    "permit). Not billing the metered API on a plan failure.",
+                    provider.get("name"),
+                )
+                continue
             if not explicit_selection and self._skip_unconfigured_route(
                 provider, configured_vendors
             ):
