@@ -8,10 +8,10 @@
  * this thin entry is what the core-bundled manifest entry points at, so voice
  * loads through the same path as any out-of-tree feature.
  *
- * Importing this module initializes the voice UI shell exactly as the old
- * `initVoiceUI()` call in `app.js` did.
+ * Importing this module initializes the voice UI shell. As of #2042 (ticket 04)
+ * voice/ui.js self-registers its slot contributions at import time, so the bare
+ * side-effect import below is all that's needed — there is no `initVoiceUI()` to
+ * call anymore.
  */
 
-import { initVoiceUI } from './ui.js';
-
-initVoiceUI();
+import './ui.js';

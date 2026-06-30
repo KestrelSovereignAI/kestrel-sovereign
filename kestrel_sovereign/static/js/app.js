@@ -21,6 +21,10 @@ import {
 } from './panels.js';
 import { mount as mountChat, loadModels, connectNotifications, updateContextStatus, subscribeSSE } from './chat.js';
 import { UI } from './ui-ext/registry.js';
+// Voice UI is loaded via the manifest loader (#2043, ticket 05) — its core-bundled
+// manifest entry points at js/voice/boot.js, which imports voice/ui.js; that module
+// self-registers its slot contributions on import (#2038, ticket 04). No bare import
+// or named init() call from core anymore.
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
@@ -147,8 +151,8 @@ async function init() {
 
     // Bridge the server-push SSE channel onto the UI extension bus (#2038):
     // backend `tools_updated` events become generic bus events so contributions
-    // re-gate/re-render without subscribing to SSE directly. Additive — voice
-    // keeps its own subscribeSSE('tools_updated', …) until ticket 04.
+    // re-gate/re-render without subscribing to SSE directly. Voice consumes this
+    // on the bus (ticket 04) instead of its own subscribeSSE.
     subscribeSSE('tools_updated', (evt) => {
         let payload = null;
         try {
@@ -157,12 +161,28 @@ async function init() {
         UI.emit('tools_updated', payload);
     });
 
+    // Bridge runtime capability changes (#2041) onto the UI extension bus
+    // (#2038). `API.applyServerCapabilities()` dispatches a DOM
+    // `capabilities:changed` event on globalThis when a feature is enabled /
+    // disabled at runtime; the slot registry only listens on the UI bus, so
+    // without this bridge a capability flip would never re-gate slot
+    // contributions (e.g. voice mounting/tearing-down its mic + controls).
+    // Forward it so any contribution that opts into `capabilities:changed`
+    // re-gates without a page reload.
+    if (typeof globalThis !== 'undefined' && typeof globalThis.addEventListener === 'function') {
+        globalThis.addEventListener('capabilities:changed', (evt) => {
+            UI.emit('capabilities:changed', evt && evt.detail ? evt.detail : null);
+        });
+    }
+
     // UI extension slots (#2043, ticket 05): load out-of-tree feature frontend
     // assets from the manifest. Each enabled feature's ES modules are imported
     // in declared order; each module calls UI.register(...). This is how a
     // pip-installed feature mounts slot contributions with no edits to core
     // static/ or app.js — including features (voice) whose JS still lives in
-    // core today but is loaded via the manifest like any other feature.
+    // core today but is loaded via the manifest like any other feature. Voice's
+    // module self-registers its shell (🎙️ button, path badge, picker modal,
+    // per-agent controls) into the slot zones on import.
     await loadFeatureUIContributions();
 
     // Initialize tasks component
