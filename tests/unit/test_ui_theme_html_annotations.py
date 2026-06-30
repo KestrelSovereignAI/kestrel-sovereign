@@ -92,7 +92,6 @@ def test_inline_text_for_a_few_keys_matches_legacy_value(html_text, legacy_label
         ("sidebar_agents", "Agents"),
         ("chat_thinking", "Thinking..."),
         ("memories_title", "Knowledge Graph"),
-        ("spawn_title", "Spawn Manager"),
         ("constitution_title", "Kestrel Constitution"),
         ("metrics_title", "Metrics Dashboard"),
         ("features_title", "Feature Store"),
@@ -306,10 +305,15 @@ def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
     in this scan and shouldn't fail it. We only check theme-class keys
     that are clearly tied to specific UI surfaces.
     """
+    # NOTE: spawn_* keys (and tab_spawn) are intentionally absent — the
+    # Spawn panel was extracted into the in-tree features/spawn package
+    # (#2048, epic #2038). Its markup + data-label-key annotations now live
+    # in features/spawn/static/spawn.js, not index.html, so they are no
+    # longer surface-anchored to this file.
     surface_anchored_keys = {
         "tab_identity", "tab_chat", "tab_constitution", "tab_memories",
         "tab_tasks", "tab_sovereignty", "tab_resources", "tab_metrics",
-        "tab_spawn", "tab_features", "tab_security",
+        "tab_features", "tab_security",
         "sidebar_agents",
         "chat_history_title", "chat_welcome_message", "chat_thinking",
         "chat_input_placeholder",
@@ -323,8 +327,6 @@ def test_no_orphan_label_keys_in_legacy_theme(html_text, legacy_labels):
         "resources_wallet_title", "resources_usage_title",
         "metrics_title", "metrics_event_timeline", "metrics_tool_duration",
         "metrics_event_distribution", "metrics_recent_errors",
-        "spawn_title", "spawn_active_children", "spawn_delegation_chain",
-        "spawn_budget_allocation", "spawn_history_title",
         "features_title",
         "security_title", "security_pending_approvals",
         "security_permission_tree", "security_session_controls",
