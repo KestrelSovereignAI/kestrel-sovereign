@@ -179,6 +179,36 @@ class ModelDiscoveryMixin:
             providers=providers
         )
 
+    async def _resolve_local_auto_routes(self) -> None:
+        """Resolve ``model="auto"`` LOCAL routes WITHOUT contacting cloud.
+
+        The force-local-only generation path (ISOLATED/EPHEMERAL privacy
+        session) needs a cold-cache local route's ``"auto"`` to resolve to a
+        concrete model, but must not enumerate or contact cloud vendors
+        (privacy) nor write the shared/disk cache with a local-only model set
+        (which would poison it for a later cloud request). So discovery here is
+        scoped to local routes only, and ``_resolve_auto_providers`` mutates the
+        provider list in place against just those models — cloud routes (which
+        the force-local filter drops from the turn anyway) keep ``"auto"``.
+        Unlike :meth:`discover_all_models`, this never calls
+        ``shared_cache.set``/``write_cache``.
+        """
+        local_routes = [
+            (vendor, route)
+            for vendor, route in self._select_discovery_routes()
+            if route.get("is_local")
+        ]
+        if not local_routes:
+            return
+        models: list = []
+        for vendor, route in local_routes:
+            try:
+                models.extend(await self._discover_for_vendor_route(vendor, route))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Local-only discovery failed for %s: %s", vendor, exc)
+        if models:
+            self._resolve_auto_providers(models)
+
     def _resolve_auto_providers(self, models: list) -> None:
         """Resolve routes whose configured model is ``"auto"`` using discovered models.
 

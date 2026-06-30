@@ -153,46 +153,80 @@ async def test_ensure_models_discovered_skips_when_already_resolved():
 
 
 @pytest.mark.asyncio
-async def test_ensure_models_discovered_skips_cloud_discovery_when_local_only():
-    """#2069 codex r2 (privacy): a ``force_local_only`` turn must NOT run the
-    cloud-contacting discovery warm-up, even when a cloud route is still
-    ``model='auto'``. ``discover_all_models`` enumerates every configured
-    vendor (incl. cloud) and writes the shared/disk cache — a leak + cache
-    poisoning risk for an ISOLATED/EPHEMERAL session."""
+async def test_ensure_models_discovered_never_runs_global_discovery_when_local_only():
+    """#2069 codex r2 (privacy): a ``force_local_only`` turn must NEVER call the
+    global ``discover_all_models`` — it enumerates every configured vendor
+    (incl. cloud) and writes the shared/disk cache, a leak + cache-poisoning
+    risk for an ISOLATED/EPHEMERAL session. A cloud-only ``auto`` route warms
+    nothing (the force-local filter drops it from the turn)."""
     from kestrel_sovereign.llm.service import LLMService
 
     svc = LLMService.__new__(LLMService)
     svc._disabled_routes = {}
-    # A cloud route (openai) is configured — discovery would contact it.
     svc.providers = [{"name": "openai:api", "vendor": "openai", "model": "auto"}]
     svc.discover_all_models = AsyncMock(return_value=[])
+    svc._resolve_local_auto_routes = AsyncMock()
 
     await svc._ensure_models_discovered(force_local_only=True)
     svc.discover_all_models.assert_not_awaited()
+    svc._resolve_local_auto_routes.assert_not_awaited()  # no LOCAL auto route
 
-    # Sanity: the SAME cold-auto state DOES warm when not local-only, so the
-    # skip above is the privacy gate, not a dead guard.
+    # Sanity: the SAME cold-auto state DOES run global discovery when not
+    # local-only — so the gate above is real, not a dead branch.
     await svc._ensure_models_discovered(force_local_only=False)
     svc.discover_all_models.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_ensure_models_discovered_warms_all_local_even_when_local_only():
-    """#2069 codex r3: an all-local deployment (e.g. Ollama-only) has no cloud
-    route to leak to, so a ``force_local_only`` cold-cache ``auto`` LOCAL route
-    must still warm — otherwise the first private chat fails to resolve a model.
-    The privacy skip applies only when a non-local route would be enumerated."""
+async def test_ensure_models_discovered_resolves_local_auto_when_local_only():
+    """#2069 codex r3: a ``force_local_only`` turn with a cold ``auto`` LOCAL
+    route — in BOTH all-local and mixed cloud/local configs — must resolve that
+    local route via the local-scoped path (no cloud contact, no cache write),
+    not fail. It must NOT fall back to the global ``discover_all_models``."""
     from kestrel_sovereign.llm.service import LLMService
 
+    # Mixed config: a cloud route AND a local auto route. This is codex's case.
     svc = LLMService.__new__(LLMService)
     svc._disabled_routes = {}
     svc.providers = [
-        {"name": "ollama:local", "vendor": "ollama", "model": "auto", "is_local": True}
+        {"name": "openai:api", "vendor": "openai", "model": "gpt-5.4-mini"},
+        {"name": "ollama:local", "vendor": "ollama", "model": "auto", "is_local": True},
     ]
     svc.discover_all_models = AsyncMock(return_value=[])
+    svc._resolve_local_auto_routes = AsyncMock()
 
     await svc._ensure_models_discovered(force_local_only=True)
-    svc.discover_all_models.assert_awaited_once()
+    svc._resolve_local_auto_routes.assert_awaited_once()
+    svc.discover_all_models.assert_not_awaited()  # never the cloud-contacting path
+
+
+@pytest.mark.asyncio
+async def test_resolve_local_auto_routes_contacts_local_routes_only():
+    """``_resolve_local_auto_routes`` must scope discovery to LOCAL routes only
+    (never a cloud route) and resolve autos in place without writing the cache."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    svc = LLMService.__new__(LLMService)
+    cloud = {"name": "openai:api", "vendor": "openai", "model": "auto", "is_local": False}
+    local = {"name": "ollama:local", "vendor": "ollama", "model": "auto", "is_local": True}
+    svc.providers = [cloud, local]
+    svc._select_discovery_routes = MagicMock(
+        return_value=[("openai", cloud), ("ollama", local)]
+    )
+    discovered = {"models": ["local-model-info"]}
+    contacted = []
+
+    async def _discover(vendor, route):
+        contacted.append(vendor)
+        return discovered["models"]
+
+    svc._discover_for_vendor_route = AsyncMock(side_effect=_discover)
+    svc._resolve_auto_providers = MagicMock()
+
+    await svc._resolve_local_auto_routes()
+
+    assert contacted == ["ollama"], "must contact ONLY the local route, never cloud"
+    svc._resolve_auto_providers.assert_called_once_with(["local-model-info"])
 
 
 @pytest.mark.asyncio

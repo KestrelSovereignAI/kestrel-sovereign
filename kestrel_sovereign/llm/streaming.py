@@ -281,17 +281,26 @@ class StreamingMixin:
         non-fatal — the route walk still runs and fails loudly per route.
 
         ``force_local_only``: privacy gate. ``discover_all_models`` enumerates
-        every configured vendor (via ``_select_discovery_routes`` over
+        *every* configured vendor (via ``_select_discovery_routes`` over
         ``self.providers``) and writes the merged result to the shared/disk
-        cache. For a local-only turn (ISOLATED/EPHEMERAL privacy session) that
-        would leak which cloud keys exist and poison the cache — *if* a cloud
-        route is configured. So we skip the warm-up only when a non-local route
-        would actually be contacted. An all-local deployment (e.g. Ollama-only)
-        has no cloud to leak to, so a cold-cache local ``"auto"`` route still
-        warms via purely-local discovery and resolves rather than failing.
+        cache — contacting cloud vendors and poisoning the cache for a
+        local-only turn (ISOLATED/EPHEMERAL privacy session). So for a
+        local-only turn we never call it; instead, if a LOCAL route is still
+        ``"auto"``, we warm via :meth:`_resolve_local_auto_routes`, which scopes
+        discovery to local routes only (no cloud contact, no cache write) so a
+        cold-cache local route still resolves to a concrete model — covering
+        both all-local and mixed cloud/local configs.
         """
         providers = self._available_providers() or []
-        if force_local_only and any(not p.get("is_local", False) for p in providers):
+        if force_local_only:
+            if any(p.get("model") == "auto" and p.get("is_local") for p in providers):
+                try:
+                    await self._resolve_local_auto_routes()
+                except Exception as exc:
+                    logger.warning(
+                        "Local-only model discovery failed (continuing with "
+                        "provider['model'] as-is): %s", exc,
+                    )
             return
         if any(p.get("model") == "auto" for p in providers):
             try:
