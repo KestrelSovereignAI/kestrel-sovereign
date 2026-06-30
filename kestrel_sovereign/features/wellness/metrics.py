@@ -201,6 +201,7 @@ class InteractionDepthCalculator:
                 """
                 SELECT role, content, metadata FROM conversation_history
                 WHERE agent_id = ?
+                AND deleted_at IS NULL
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
