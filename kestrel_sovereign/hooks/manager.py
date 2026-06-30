@@ -7,7 +7,7 @@ hooks are called in priority order with proper timeout handling.
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.hooks.base import (
     Hook,
@@ -229,6 +229,11 @@ class HooksManager:
         accumulated_warnings: list[str] = []
         max_warning_severity: Optional[str] = None
         severity_order = {"info": 0, "warning": 1, "critical": 2}
+        # Carry the most recent MODIFY rewrite so it round-trips to the
+        # caller on the final ALLOW. Without this a POST_RESPONSE hook's
+        # ``modify(updated_input={"response_text": ...})`` is applied to the
+        # next hook's input but dropped from the returned output (#2033).
+        accumulated_updated_input: Optional[Dict[str, Any]] = None
 
         for hook in matching_hooks:
             try:
@@ -278,6 +283,12 @@ class HooksManager:
                 # than silently dropped by truthiness fallback.
                 if output.updated_input is not None:
                     input.tool_input = output.updated_input
+                    accumulated_updated_input = output.updated_input
+                    # POST_RESPONSE hooks rewrite the response text rather
+                    # than tool args; keep ``input.response_text`` in sync so
+                    # a subsequent hook in the chain audits the rewritten text.
+                    if "response_text" in output.updated_input:
+                        input.response_text = output.updated_input["response_text"]
 
             except asyncio.TimeoutError:
                 # FAIL CLOSED for enforcing hooks: a deny-capable hook that times
@@ -314,6 +325,8 @@ class HooksManager:
                 continue
 
         result = HookOutput.allow()
+        if accumulated_updated_input is not None:
+            result.updated_input = accumulated_updated_input
         if accumulated_warnings:
             result.warning_message = " | ".join(accumulated_warnings)
             result.warning_severity = max_warning_severity

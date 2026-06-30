@@ -1069,6 +1069,75 @@ class TestPostSubagentCall:
         assert len(post_hook.received_inputs) == 1
 
 
+# === POST_RESPONSE MODIFY propagation (#2033) ===
+
+
+class PostResponseModifyHook(Hook):
+    """POST_RESPONSE hook that rewrites the response text via MODIFY.
+
+    Mirrors response_audit's warn mode, which appends an audit
+    annotation through ``HookOutput.modify(updated_input={"response_text": ...})``.
+    """
+
+    def __init__(self, suffix: str, name: str = "post_response_modify", priority: int = 100):
+        super().__init__(name=name, events=[HookEvent.POST_RESPONSE], priority=priority)
+        self.suffix = suffix
+        self.call_count = 0
+        self.seen_response_text: "str | None" = None
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        self.call_count += 1
+        self.seen_response_text = input.response_text
+        return HookOutput.modify(
+            updated_input={"response_text": (input.response_text or "") + self.suffix},
+            reason="audit annotation",
+        )
+
+
+class TestPostResponseModify:
+    """Regression tests for #2033: POST_RESPONSE MODIFY must round-trip
+    its ``updated_input`` back to the caller, not be dropped on the
+    final ALLOW."""
+
+    @pytest.mark.asyncio
+    async def test_post_response_modify_propagates_to_returned_output(self):
+        """A POST_RESPONSE hook returning modify(updated_input={"response_text": "X"})
+        must surface on execute_hooks(...).updated_input["response_text"]."""
+        manager = HooksManager()
+        manager.register(PostResponseModifyHook(suffix=" [warned]"))
+
+        hook_input = HookInput(
+            session_id="test",
+            hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text="original",
+        )
+
+        output = await manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
+        assert output.continue_execution is True
+        assert output.updated_input is not None
+        assert output.updated_input["response_text"] == "original [warned]"
+
+    @pytest.mark.asyncio
+    async def test_post_response_modify_chains_across_hooks(self):
+        """A second hook in the chain audits the rewritten text, and the
+        final accumulated rewrite reaches the caller."""
+        manager = HooksManager()
+        manager.register(PostResponseModifyHook(suffix=" [first]", name="first", priority=50))
+        second = PostResponseModifyHook(suffix=" [second]", name="second", priority=100)
+        manager.register(second)
+
+        hook_input = HookInput(
+            session_id="test",
+            hook_event_name=HookEvent.POST_RESPONSE.value,
+            response_text="base",
+        )
+
+        output = await manager.execute_hooks(HookEvent.POST_RESPONSE, hook_input)
+        # Second hook saw the first hook's rewrite threaded into response_text.
+        assert second.seen_response_text == "base [first]"
+        assert output.updated_input["response_text"] == "base [first] [second]"
+
+
 # === Run tests ===
 
 if __name__ == "__main__":
