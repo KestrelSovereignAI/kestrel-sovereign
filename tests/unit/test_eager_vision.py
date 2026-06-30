@@ -277,6 +277,12 @@ async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
     monkeypatch.setattr(svc, "_remote_first_allowed", lambda *a, **k: True)
     monkeypatch.setattr(svc, "_check_policy", lambda *a, **k: None)
     monkeypatch.setattr(svc, "_ensure_remote_active", lambda *a, **k: None)
+    # Neutralize the #2069 lazy-discovery warm-up: this test drives a real
+    # LLMService whose seeded routes are model="auto", so the streaming path
+    # would otherwise run REAL discovery — pointless here (the test mocks
+    # routing) and it pollutes the process-wide shared model cache, flipping
+    # gpt-4o's vision capability for this test AND leaking to sibling tests.
+    monkeypatch.setattr(svc, "_ensure_models_discovered", AsyncMock())
     monkeypatch.setattr(svc, "_record_streamed_usage", AsyncMock())
     monkeypatch.setattr(svc, "_check_model_tool_support", lambda providers, tools, mo: tools)
     monkeypatch.setattr(svc, "_resolve_concrete_model", lambda tm, p: "gpt-4o")
