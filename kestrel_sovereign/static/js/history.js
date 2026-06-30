@@ -13,6 +13,7 @@ import {
     messageAttachmentsHtml,
     handleRestartStatus,
     appendMessagePart,
+    mountToolRenderers,
 } from './chat.js';
 
 // #1659: tool cards on reload come from the structured, position-stamped
@@ -855,6 +856,9 @@ function addMessageToChat(
             // protected any math spans through the shared renderer).
             contentDiv.innerHTML = bodyHtml;
             mathPass(contentDiv);
+            // Reloaded tool cards may carry feature-renderer wrappers; mount
+            // their imperative hooks now that the markup is live.
+            mountToolRenderers(contentDiv);
         } else if (role === 'assistant' && window.marked) {
             contentDiv.innerHTML = renderAssistantHtml(content);
             mathPass(contentDiv);
