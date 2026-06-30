@@ -163,6 +163,7 @@ async def test_ensure_models_discovered_skips_cloud_discovery_when_local_only():
 
     svc = LLMService.__new__(LLMService)
     svc._disabled_routes = {}
+    # A cloud route (openai) is configured — discovery would contact it.
     svc.providers = [{"name": "openai:api", "vendor": "openai", "model": "auto"}]
     svc.discover_all_models = AsyncMock(return_value=[])
 
@@ -172,6 +173,25 @@ async def test_ensure_models_discovered_skips_cloud_discovery_when_local_only():
     # Sanity: the SAME cold-auto state DOES warm when not local-only, so the
     # skip above is the privacy gate, not a dead guard.
     await svc._ensure_models_discovered(force_local_only=False)
+    svc.discover_all_models.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_models_discovered_warms_all_local_even_when_local_only():
+    """#2069 codex r3: an all-local deployment (e.g. Ollama-only) has no cloud
+    route to leak to, so a ``force_local_only`` cold-cache ``auto`` LOCAL route
+    must still warm — otherwise the first private chat fails to resolve a model.
+    The privacy skip applies only when a non-local route would be enumerated."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+    svc.providers = [
+        {"name": "ollama:local", "vendor": "ollama", "model": "auto", "is_local": True}
+    ]
+    svc.discover_all_models = AsyncMock(return_value=[])
+
+    await svc._ensure_models_discovered(force_local_only=True)
     svc.discover_all_models.assert_awaited_once()
 
 

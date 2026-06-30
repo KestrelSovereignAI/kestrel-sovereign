@@ -280,17 +280,20 @@ class StreamingMixin:
         the guard short-circuits on subsequent turns. Discovery failure is
         non-fatal — the route walk still runs and fails loudly per route.
 
-        ``force_local_only``: privacy gate. ``discover_all_models`` contacts
-        *every* configured vendor — including cloud — to enumerate models, and
-        writes the merged result to the shared/disk cache. For a local-only
-        turn (ISOLATED/EPHEMERAL privacy session) that would both leak which
-        cloud keys exist and risk poisoning the cache, so we skip the warm-up
-        entirely. Privacy wins even at the cost of a cold-cache local ``"auto"``
-        route failing loudly — consistent with the force-local embedding gate.
+        ``force_local_only``: privacy gate. ``discover_all_models`` enumerates
+        every configured vendor (via ``_select_discovery_routes`` over
+        ``self.providers``) and writes the merged result to the shared/disk
+        cache. For a local-only turn (ISOLATED/EPHEMERAL privacy session) that
+        would leak which cloud keys exist and poison the cache — *if* a cloud
+        route is configured. So we skip the warm-up only when a non-local route
+        would actually be contacted. An all-local deployment (e.g. Ollama-only)
+        has no cloud to leak to, so a cold-cache local ``"auto"`` route still
+        warms via purely-local discovery and resolves rather than failing.
         """
-        if force_local_only:
+        providers = self._available_providers() or []
+        if force_local_only and any(not p.get("is_local", False) for p in providers):
             return
-        if any(p.get("model") == "auto" for p in (self._available_providers() or [])):
+        if any(p.get("model") == "auto" for p in providers):
             try:
                 await self.discover_all_models(use_cache=True)
             except Exception as exc:
