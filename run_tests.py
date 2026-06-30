@@ -46,17 +46,6 @@ from typing import Optional
 # Use uv for running pytest to ensure correct environment
 UV_PREFIX = ["uv", "run"]
 
-# Ceiling for the import-validation collection pass. This phase only proves the
-# test files import cleanly (no missing modules, syntax errors, or import
-# cycles) — it is NOT a speed budget. The suite has grown past 9,800 tests, so
-# `pytest --collect-only` takes ~16s locally and noticeably longer on slower CI
-# runners; a too-tight ceiling killed the subprocess mid-collection and was
-# misreported as a hang. Keep enough headroom that only a genuine hang trips it.
-IMPORT_VALIDATION_TIMEOUT = 120
-# Soft threshold: collection slower than this is flagged (heavy import smell)
-# but does NOT fail the phase.
-IMPORT_VALIDATION_SLOW_WARN = 30
-
 # Service configuration - loaded lazily when needed
 # Environment variables are validated only when service checks are performed
 API_BASE_URL = os.getenv("BASE_URL", "http://localhost:7777")
@@ -212,7 +201,7 @@ class SmartTestRunner:
             cmd,
             capture_output=True,
             text=True,
-            timeout=IMPORT_VALIDATION_TIMEOUT,
+            timeout=30,
             cwd=self.root_dir,
         )
 
@@ -231,8 +220,9 @@ class SmartTestRunner:
             return False
 
         # Warn about slow collection but don't fail - CI environments are slower
-        if elapsed > IMPORT_VALIDATION_SLOW_WARN:
+        if elapsed > 30:
             self.log(f"Collection took {elapsed:.1f}s - check for heavy imports!", "warning")
+            return False
         elif elapsed > 10:
             self.log(f"Collection took {elapsed:.1f}s (slow but acceptable)", "warning")
 
@@ -613,11 +603,7 @@ Examples:
                 print("=" * 60)
                 sys.exit(1)
         except subprocess.TimeoutExpired:
-            runner.log(
-                f"Import validation TIMED OUT (>{IMPORT_VALIDATION_TIMEOUT}s) - "
-                "likely a genuine import hang, not just a slow runner",
-                "error",
-            )
+            runner.log("Import validation TIMED OUT (>30s)", "error")
             sys.exit(1)
         except KeyboardInterrupt:
             print("\n⏹️ Validation interrupted")
