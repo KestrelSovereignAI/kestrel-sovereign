@@ -82,12 +82,13 @@ class ResponseAuditHook(Hook):
         # Fold both verdicts together: take the most severe risk
         # boost, concatenate reasonings so the operator sees every
         # rule that fired.
-        if escalation_verdict.risk_boost > narration_verdict.risk_boost:
-            narration_verdict = escalation_verdict
-        elif (
+        if (
             escalation_verdict.risk_boost > 0
             and narration_verdict.risk_boost > 0
         ):
+            # Both rules fired: take the max boost but concatenate
+            # reasonings so the operator sees every rule that fired,
+            # regardless of which boost is higher.
             narration_verdict = NarrationVerdict(
                 risk_boost=max(
                     narration_verdict.risk_boost,
@@ -106,6 +107,8 @@ class ResponseAuditHook(Hook):
                     or escalation_verdict.offending_tool
                 ),
             )
+        elif escalation_verdict.risk_boost > narration_verdict.risk_boost:
+            narration_verdict = escalation_verdict
         self.last_narration_verdict = narration_verdict
 
         # Honesty doctrine: a narration violation is a constitutional

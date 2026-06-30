@@ -144,7 +144,7 @@ def summarize_tool_result_for_audit(result: Any) -> Any:
         summary["success"] = result["success"]
     err = result.get("error")
     if err:
-        summary["error"] = err[:500] if isinstance(err, str) else err
+        summary["error"] = (err if isinstance(err, str) else str(err))[:500]
     return summary
 
 
