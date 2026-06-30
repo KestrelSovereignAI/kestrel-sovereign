@@ -32,6 +32,49 @@ chat input bar, has **no way to do it** without editing core files. That does no
 scale, and it is the opposite of the "discovered, not hand-curated" doctrine the
 backend already follows.
 
+### The monolith is history, not the target
+
+An audit of the frontend found ~19 capability flags
+([api_client.mjs:27-47](../../../kestrel_sovereign/static/js/api_client.mjs)) gating
+panels — Security, Tasks, Spawn, Sovereignty/IPFS, Memory, Approvals, Metrics,
+Resources, and more, via the `PANEL_CAPABILITIES` map
+([identity.js:75-88](../../../kestrel_sovereign/static/js/identity.js)). Today these
+are **core panels living in the core static tree**, and their capabilities are a
+**host-embedding contract** (`window.KESTREL_UI_CONFIG.capabilities`) — *not* derived
+from which features are installed.
+
+**That arrangement is a historical accident of starting as a monolith, not the
+desired end state.** The north star: each of those panels is the UI of a capability
+that *should* be a feature package contributing its own UI through the same extension
+mechanism this epic builds. Security UI ships with the security feature; Spawn UI with
+the spawn feature; and so on. The registry is the **universal UI composition layer**,
+and the existing core panels are **migration candidates onto it** — not a separate,
+privileged class of UI.
+
+This reframes the epic's scope. It is not "let external features bolt widgets onto a
+fixed core." It is "make UI composition uniform, so core and feature UI are the same
+kind of thing," then migrate inward over time. Voice (ticket 04) is the first proof
+that an *inline-injecting* feature fits. Extracting a representative core panel into a
+feature package (ticket 10) is the second proof and the direction of travel.
+
+### Two pre-existing extension seams to reconcile (survey-first)
+
+The audit also found the codebase already grew two partial extension APIs in
+`chat.js`. We build *with* the platform, not parallel to it:
+
+- **`registerPartRenderer(type, fn)`** ([chat.js:3583](../../../kestrel_sovereign/static/js/chat.js))
+  — a **solid** type-dispatch renderer registry (error-isolated, realm-safe,
+  documented fallback). It is the foundation for ticket 06's chat-renderer registry.
+  Caveat: it renders *host-trusted* standalone bubbles via `innerHTML` with no core
+  sanitization, and it is a **separate path** from positional tool cards
+  (`renderToolCardsHtml`), which have **no** renderer hook today.
+- **`registerHeaderAction(action)`** ([chat.js:684](../../../kestrel_sovereign/static/js/chat.js))
+  — effectively **abandoned**: exported but never called internally, and voice
+  deliberately bypasses it (it is header-only, rebuilds all buttons on every call
+  destroying live state, supports only `onClick`, and models no per-agent context).
+  Its limitations are not a foundation — they are the **acceptance criteria** the slot
+  registry (ticket 02) must satisfy and then supersede.
+
 ## What voice actually needs (the surface area)
 
 Voice is not a "panel." It injects inline widgets into a small, finite set of
@@ -44,8 +87,21 @@ voice rather than inventing it:
 | `agent-card-actions` | 🎧 listen / 🎤 talk per agent card | [voice/ui.js:297](../../../kestrel_sovereign/static/js/voice/ui.js) `appendChild`, invoked from [identity.js:758](../../../kestrel_sovereign/static/js/identity.js) |
 | `input-footer-status` | path badge + privacy banner | [voice/ui.js:483](../../../kestrel_sovereign/static/js/voice/ui.js) |
 | `modal-root` | voice picker dialog | [voice/ui.js:505](../../../kestrel_sovereign/static/js/voice/ui.js) → `document.body` |
-| `chat-message-renderers` | realtime tool cards / bubbles | delegates to `addMessage` / `finalizeStreamingMessage` |
+| `chat-message-renderers` | realtime tool cards / bubbles | delegates to `addMessage` / `finalizeStreamingMessage`; cf. existing `registerPartRenderer` |
 | `nav-tabs` + panel | (the existing panel case) | hardcoded list in [app.js:53](../../../kestrel_sovereign/static/js/app.js) + `index.html` |
+| `panel-section` | (none yet — but Resources composes sub-sections per sub-capability) | individual `keys.agent`/`keys.user`/`keys.platform`/`wallet` gates in [resources.js:29-64](../../../kestrel_sovereign/static/js/resources.js); a feature contributing a section *into* an existing panel needs this finer grain |
+
+Two patterns deliberately **outside** the slot model (they are not mount points):
+
+- **Host embed mode (`chrome`).** `chrome:false` hides the entire nav/sidebar for
+  chat-only embeds ([app.js:48](../../../kestrel_sovereign/static/js/app.js)). This is
+  a host-level mode toggle, handled with the singleton/host-config mechanism, not a
+  zone.
+- **Event-driven, panel-independent UI.** The notifications SSE and approval modals
+  are gated by a *union* of capabilities and fire even when their panel is hidden
+  ([chat.js:1242-1245](../../../kestrel_sovereign/static/js/chat.js)). A feature may
+  need to surface a modal without owning a visible panel — `modal-root` covers the
+  mount, but the trigger is an event subscription, addressed by the bus (ticket 02).
 
 Two further coupling categories that are **not** slots and must be handled
 distinctly:
@@ -110,6 +166,7 @@ user-visible change** — the safest way to introduce a framework.
 | 07 | [Config-schema UI hints (quick win)](07-config-schema-hints.md) | — | Low |
 | 08 | [CLI extension via entry-point group](08-cli-entrypoint-group.md) | — | Low |
 | 09 | [Shared-singleton claim/release collaboration API](09-singleton-claims.md) | 02, 04 | Med |
+| 10 | [Extract a core panel into a feature package (second proof / north star)](10-core-panel-extraction.md) | 02, 03, 05, 06 | High |
 
 ## Sequencing rationale
 
@@ -126,6 +183,12 @@ user-visible change** — the safest way to introduce a framework.
 - **09** is deliberately *after* 04 because the model-selector lock is the one
   coupling we expect the slot model *not* to absorb; we want to discover its real
   shape during the voice migration, not guess it up front.
+- **10** is the north-star proof and comes last: extracting a core panel into a
+  feature package exercises every primitive at once (panel + section + capability
+  derivation + manifest delivery). It is intentionally *not* attempted until voice
+  (04) has validated the inline contracts and 05/06 exist. Doing it proves the
+  monolith→feature direction is real and not just aspirational — but it is one panel,
+  not a big-bang extraction of all of them.
 
 ## Out of scope
 

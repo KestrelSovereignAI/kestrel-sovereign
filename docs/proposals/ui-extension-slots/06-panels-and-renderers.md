@@ -20,22 +20,44 @@ Convert to data-driven:
 - `nav-tabs` zone: a contribution declares `{label, icon, panelId, order, gate}`.
 - `panel-root` zone: the panel body, lazily rendered on first activation (preserve
   the existing lazy-load semantics from `setLazyLoaders`).
-- **Migrate at least one existing core panel** (e.g. Metrics or Spawn) onto the
-  mechanism so there is a single code path, not a plugin sidecar bolted next to a
-  hardcoded list. (Do not migrate all core panels in this ticket — one is the proof.)
+- **Data-drive at least one existing core panel** (e.g. Metrics or Spawn) through the
+  registry so there is a single code path, not a plugin sidecar bolted next to a
+  hardcoded list. **Scope boundary:** here the panel stays in the core `static/` tree —
+  this proves the *registry/nav path*. Relocating a panel out into a feature package
+  (with capability derivation + manifest delivery) is ticket 10. 06 = data-drive in
+  place; 10 = extract out-of-tree. Do not conflate them.
 
 ## Part B — Chat-renderer registry
 
-Voice renders realtime tool cards by delegating to core `addMessage` /
-`finalizeStreamingMessage` / `renderToolCardsHtml`. Generalize: a feature registers a
-renderer keyed by **tool name** or **content type**, and the chat pipeline dispatches
-to it.
+**Build on the existing `registerPartRenderer`, do not create a parallel system.**
+The codebase already has a working type-dispatch renderer registry
+([chat.js:3583](../../../kestrel_sovereign/static/js/chat.js)): error-isolated,
+realm-safe, with a documented escaped-text fallback, consumed by `appendMessagePart`
+in the streaming path via the `PART_SENTINEL` protocol. That is the foundation. This
+ticket **generalizes it**, with two reconciliations the audit surfaced:
+
+1. **Two distinct trust levels — keep them distinct.**
+   - *Host/embedder parts* (existing `registerPartRenderer`, e.g. Frinz's selfie
+     `<img>`): host-trusted markup written via `innerHTML`, **host owns
+     sanitization**. This is the documented, intentional contract for code the
+     embedder ships. Leave it as-is.
+   - *Feature tool-output renderers* (new, this ticket): render **tool/model payload**
+     — data that is NOT author-trusted. These MUST go through **core
+     sanitization** and therefore use the inert-string contract below. A feature
+     renderer is not the same trust class as an embedder part; do not let it use the
+     host-trusted `innerHTML` path.
+2. **Tool cards are a SEPARATE, positional path with no hook today.** Tool output is
+   rendered by `renderToolCardsHtml` (collapsible cards segmented by stream position),
+   which is **not** `registerPartRenderer`-driven and exposes **no** renderer hook.
+   Rendering custom *tool* output therefore requires adding a new dispatch hook inside
+   the tool-card path — it cannot be done by registering a "part". Scope that hook
+   here explicitly; do not pretend parts cover it.
 
 - Hook into the existing chat rendering dispatch (the sanitize / mermaid / katex /
   tool-sentinel pipeline) rather than creating a parallel one — survey it first
   (`static/shared/markdown/*`, chat.js tool-card rendering) and map onto the existing
   dispatch point.
-- Contract: `registerRenderer({match: {tool?|contentType?}, render(payload, ctx) =>
+- Contract (feature tool-output renderers): `registerRenderer({match: {tool?|contentType?}, render(payload, ctx) =>
   string, mount?(rootEl, ctx) => (void | () => void)})`. `render` returns **inert
   markup only — a plain HTML string** (never live DOM, never a `Node`/`Element`/
   `DocumentFragment`). Core parses and sanitizes that string itself, then creates the
@@ -61,8 +83,13 @@ to it.
 
 ## Tasks
 
-1. `nav-tabs` + `panel-root` zones + contribution shape; migrate one core panel.
-2. Chat-renderer registry hooked into the existing rendering dispatch.
+1. `nav-tabs` + `panel-root` + `panel-section` zones + contribution shape; migrate one
+   core panel. (`panel-section` is required by the Resources composite-panel pattern —
+   sub-sections gated per sub-capability,
+   [resources.js:29-64](../../../kestrel_sovereign/static/js/resources.js).)
+2. Chat-renderer registry: extend `registerPartRenderer` for the host-trusted-part
+   case (keep its contract) AND add the inert-string feature tool-output renderer +
+   the new tool-card dispatch hook. One registry, two documented trust contracts.
 3. Update the voice tool-card path (deferred row from ticket 04) to use the renderer
    registry — closing that ticket-04 deferral.
 4. Tests: panel show/hide + lazy load; renderer dispatch by tool/content type;

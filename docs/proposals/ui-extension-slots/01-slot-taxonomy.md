@@ -30,10 +30,30 @@ and *pressure-tests it against every voice touch point* before any code is writt
    - `chat-message-renderers` — custom renderers keyed by tool name / content type
      (separate contract; see ticket 06).
    - `nav-tabs` + `panel-root` — whole-panel contributions (ticket 06).
-2. For each zone define: stable string id, the **context object** passed to
+   - `panel-section` — a section contributed *into* an existing panel (finer grain
+     than a whole panel). Empirically required: the Resources panel already composes
+     sub-sections gated individually by `keys.agent`/`keys.user`/`keys.platform`/
+     `wallet` ([resources.js:29-64](../../../kestrel_sovereign/static/js/resources.js)).
+     A feature adding "its section" to Resources/Security/etc. needs this.
+2. **Inventory the two pre-existing extension APIs and decide build-on vs supersede**
+   (survey-platform-first — do this before designing anything new):
+   - `registerPartRenderer(type, fn)`
+     ([chat.js:3583](../../../kestrel_sovereign/static/js/chat.js)) — SOLID type
+     dispatch; the basis for the ticket-06 renderer registry. Note its current trust
+     model (host-trusted `innerHTML`, no core sanitization) and that it is a
+     **separate path** from positional tool cards (`renderToolCardsHtml`), which have
+     **no** hook today.
+   - `registerHeaderAction(action)`
+     ([chat.js:684](../../../kestrel_sovereign/static/js/chat.js)) — abandoned;
+     voice bypasses it. Its limitations (header-only position, full rebuild on every
+     call, `onClick`-only, no per-agent context) become **explicit requirements** for
+     the ticket-02 registry, which supersedes it.
+   - Document `chrome`/embed mode and event-driven panel-independent UI as **out of
+     slot scope** (host mode + event bus respectively).
+3. For each zone define: stable string id, the **context object** passed to
    `render(el, ctx)`, the DOM anchor semantics (insert-before / append / replace),
    and which **events** can trigger re-render.
-3. Define the contribution contract:
+4. Define the contribution contract:
    ```js
    /**
     * @typedef {Object} UIContribution
@@ -46,16 +66,16 @@ and *pressure-tests it against every voice touch point* before any code is writt
     * @property {string[]} [events] - event names that retrigger gate+render for this contribution
     */
    ```
-4. Define the per-zone **context contract** explicitly (what keys each zone
+5. Define the per-zone **context contract** explicitly (what keys each zone
    guarantees). Cross-check against what voice reads today (`agentName`,
    standalone flag, session state, `api`).
-5. Define the **event vocabulary** the bus must emit (`agent:switch`,
+6. Define the **event vocabulary** the bus must emit (`agent:switch`,
    `session:change`, `tools_updated`, `capabilities:changed`, `panel:shown`).
    Cross-reference voice's existing triggers: `onAgentSwitch`
    ([identity.js:817](../../../kestrel_sovereign/static/js/identity.js)),
    `refreshAgentVoiceCard`, the `tools_updated` SSE subscription
    ([voice/ui.js:258](../../../kestrel_sovereign/static/js/voice/ui.js)).
-6. Identify couplings that the slot model **cannot** express and document them as
+7. Identify couplings that the slot model **cannot** express and document them as
    explicitly out-of-scope-for-slots, to be handled by ticket 09:
    - model-selector lock (`acquireVoiceLock`/`releaseVoiceLock`).
 

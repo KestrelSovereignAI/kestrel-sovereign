@@ -23,6 +23,24 @@ Derive the capability set from **enabled features**, which the backend already k
 registrations activate. Disabling a feature at runtime flips the capability and the
 registry tears its contributions down.
 
+## This is the linchpin, not a side-quest
+
+The frontend audit showed ~12 capability-gated panels (Security, Tasks, Spawn,
+Sovereignty, Memory, Approvals, Metrics, Resources, …) whose flags are **host-embed
+config today, decoupled from feature presence** (see `PANEL_CAPABILITIES`,
+[identity.js:75-88](../../../kestrel_sovereign/static/js/identity.js)). Per the epic's
+monolith-is-history thesis, these panels are destined to become feature-contributed
+UI. Capability derivation is the **bridge that makes that possible**: once a panel's
+capability is computed from its backing feature's enabled state, the panel can be
+extracted into a feature package (ticket 10) without the UI gate breaking. Treat this
+ticket as a foundational primitive for the whole epic, not a voice convenience.
+
+Distinguish three capability classes (the precedence rules in step 3 depend on it):
+- **Host-chrome** (`chrome`) — pure embed-mode toggle, host-owned (not feature-backed).
+- **Core-static** (e.g. `chat`) — always present in a full console; host may disable.
+- **Feature-backed** (`voice`, `permissions`, `spawn`, `metrics`, …) — derived from
+  the backing feature's enabled state. This is the class this ticket newly governs.
+
 ## Design
 
 1. Backend: extend the bootstrap config injected into `window.KESTREL_UI_CONFIG`

@@ -9,6 +9,24 @@
 Implement the runtime that contributions register into and that core renders zones
 through. Two collaborating primitives: a **slot registry** and an **event bus**.
 
+This registry **supersedes the abandoned `registerHeaderAction`**
+([chat.js:684](../../../kestrel_sovereign/static/js/chat.js)). That API failed for
+voice — and the exact reasons it failed are the requirements here. The registry MUST:
+
+- support anchors **other than the chat header** (voice needs the chat *input row*,
+  left of `#send-button`; Resources needs a panel section) — anchor semantics are
+  per-zone, not a single fixed slot;
+- update a single contribution **without rebuilding/destroying its siblings**
+  (`registerHeaderAction` did `slot.innerHTML = ''` on every call, dropping live
+  state and listeners — fatal for voice's high-frequency button-state updates);
+- carry **per-context state** (e.g. `agentName`) so the same contribution renders
+  differently per agent card;
+- preserve a contribution's DOM element/closures across re-gates where possible
+  (stable identity), tearing down only on actual removal.
+
+If the registry cannot do all four, it has not improved on `registerHeaderAction` and
+voice will bypass it again.
+
 ## Design
 
 ### Slot registry (`static/js/ui-ext/registry.js`)
@@ -16,15 +34,20 @@ through. Two collaborating primitives: a **slot registry** and an **event bus**.
 ```js
 export const UI = {
   register(contribution) { /* validate against contract, store, dedupe by id */ },
-  unregister(slot, id) { /* ... */ },
-  renderSlot(slot, ctx) { /* sort by order, gate, render, track teardowns */ },
-  refreshSlot(slot) { /* re-render last-known ctx for a zone */ },
+  unregister(slot, id) { /* tear down just this contribution */ },
+  renderSlot(slot, ctx) { /* first pass: sort by order, gate, render all; track per-contribution teardowns */ },
+  refreshContribution(slot, id) { /* re-gate + re-render ONE contribution; siblings untouched */ },
+  refreshSlot(slot) { /* re-evaluate the whole zone vs last-known ctx (used sparingly) */ },
 };
 ```
 
-- `renderSlot` is idempotent: re-invoking with the same element clears prior
-  contribution mounts (calling their teardown fns) before re-rendering. This is what
-  makes voice's `refreshAgentVoiceCard` fall out for free.
+- Teardown and re-render are **per-contribution**, keyed by `(slot, element, id)` —
+  **not** wholesale on the zone. An event affecting contribution A must re-gate/
+  re-render *only* A and call *only* A's teardown; sibling B's DOM, listeners, and
+  closures are untouched. (This is the `registerHeaderAction` failure inverted: it
+  blew away the whole slot every call.) A full first-pass `renderSlot` mounts all
+  contributions; subsequent event-driven updates are granular. This is also what makes
+  voice's `refreshAgentVoiceCard` fall out for free — its button updates in place.
 - Contributions are sorted by `order`; ties broken by registration order (stable).
 - A contribution that throws in `render` is isolated (logged, skipped) so one
   feature cannot blank a whole zone.
@@ -74,8 +97,13 @@ core→feature call: add the generic emit, leave the legacy call until 04.
 - All existing UI behaves identically (zones render empty; voice still works via its
   current hardcoded path **which remains fully intact** — not yet migrated, that's
   ticket 04). Generic bus events fire in parallel with the legacy voice calls.
-- `npm run test:js` green; new tests cover the registry/bus invariants above.
+- `npm run test:js` green; new tests cover the registry/bus invariants above —
+  including a test that updating one contribution does **not** tear down a sibling.
 - No feature-name strings (`voice`, etc.) appear in registry/bus code.
+- `registerHeaderAction` is either reimplemented as a thin shim over
+  `UI.register('chat-input-actions'|'chat-header-actions', ...)` or marked deprecated
+  with a migration note — there must be exactly one action-registration mechanism,
+  not two. (Document the decision; do not leave both as independent live paths.)
 
 ## Risks / decisions to resolve
 
