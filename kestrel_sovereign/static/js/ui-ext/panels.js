@@ -85,6 +85,9 @@ function _buildTab(def) {
     const btn = document.createElement('button');
     btn.className = 'nav-tab';
     btn.dataset.panel = def.panelId;
+    // Mark registry-owned tabs so core's PANEL_CAPABILITIES re-gate
+    // (reconcileNavigationCapabilities) leaves them to the registry's own gate.
+    btn.dataset.panelRegistry = 'true';
     const labelKey = def.labelKey || '';
     const iconHtml = def.icon ? `<span class="${_escapeAttr(def.icon)}"></span> ` : '';
     const keyAttr = labelKey ? ` data-label-key="${_escapeAttr(labelKey)}"` : '';
@@ -99,6 +102,9 @@ function _ensurePanelContainer(def) {
     const panel = document.createElement('div');
     panel.className = 'panel';
     panel.id = `panel-${def.panelId}`;
+    // Mark registry-created containers so a gated-off panel can drop its body
+    // (an in-place core panel declared in index.html is never removed here).
+    panel.dataset.registryOwned = 'true';
     const content = document.createElement('div');
     content.className = 'panel-content';
     panel.appendChild(content);
@@ -114,6 +120,12 @@ function _syncNav() {
         const tab = _tabFor(def.panelId);
         if (!_gateOk(def)) {
             if (tab) tab.remove();
+            // Drop a registry-created panel body when the panel gates off at
+            // runtime (feature disabled), and forget its rendered state so a
+            // re-enable re-renders fresh. In-place core panels are left alone.
+            const panel = document.getElementById(`panel-${def.panelId}`);
+            if (panel && panel.dataset.registryOwned === 'true') panel.remove();
+            _rendered.delete(def.panelId);
             continue;
         }
         if (!tab) {
@@ -171,6 +183,16 @@ export function renderNav({ navEl, hostEl, ctx } = {}) {
 }
 
 /**
+ * Re-evaluate every registered panel's gate against the bound nav/host and
+ * add/remove its tab + container accordingly. Core calls this when capabilities
+ * change at runtime (a feature enabled/disabled) so registry panels appear or
+ * disappear without a page reload. No-op until `renderNav` has bound the nav.
+ */
+export function syncNav() {
+    _syncNav();
+}
+
+/**
  * Activate a panel: lazily render a contributed panel's body the first time it
  * is shown (idempotent), then emit `panel:shown` and render the `panel-section`
  * zone for this panel. Safe to call for panels NOT registered here (core panels
@@ -219,6 +241,7 @@ export const Panels = {
     registerPanel,
     unregisterPanel,
     renderNav,
+    syncNav,
     activate,
     panels,
     _reset,

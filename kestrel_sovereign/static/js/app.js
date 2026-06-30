@@ -29,7 +29,10 @@ import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
 import { initMetrics, loadMetrics } from './metrics.js';
-import { initSpawn, loadSpawn } from './spawn.js';
+// Spawn UI is no longer a core static module (#2048, epic #2038). It was
+// extracted into the spawn feature package and loads via the manifest
+// (loadFeatureUIContributions below), self-registering its nav tab + panel
+// body through the panel registry like any out-of-tree feature panel.
 import { initFeatureStore, loadFeatureStore } from './feature-store.js';
 import { initApprovals, loadApprovals } from './approvals.js';
 // Import modules with side effects that define window.* functions
@@ -123,7 +126,6 @@ async function init() {
         loadTasks,
         loadResources,
         loadMetrics,
-        loadSpawn,
         loadFeatureStore,
         loadApprovals,
     });
@@ -190,9 +192,6 @@ async function init() {
 
     // Initialize metrics component
     initMetrics();
-
-    // Initialize spawn component
-    initSpawn();
 
     // Initialize feature store component
     initFeatureStore();

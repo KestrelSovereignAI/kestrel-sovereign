@@ -41,7 +41,6 @@
             <button class="nav-tab" data-panel="sovereignty" data-label-key="tab_sovereignty">Sovereignty</button>
             <button class="nav-tab" data-panel="resources" data-label-key="tab_resources">Resources</button>
             <button class="nav-tab" data-panel="metrics" data-label-key="tab_metrics">Metrics</button>
-            <button class="nav-tab" data-panel="spawn" data-label-key="tab_spawn">Spawn</button>
             <button class="nav-tab" data-panel="features" data-label-key="tab_features">Features</button>
             <button class="nav-tab" data-panel="security">
                 <span class="ki ki-lock"></span> <span data-label-key="tab_security">Security</span>
@@ -673,100 +672,6 @@
                         <div class="scroll-y-md" id="metrics-errors-list">
                             <p class="text-muted text-sm" data-label-key="metrics_no_errors">No errors recorded</p>
                         </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Spawn Panel -->
-        <div class="panel" id="panel-spawn">
-            <div class="panel-content">
-                <div class="row-between mb-4">
-                    <h2 class="m-0" data-label-key="spawn_title">Spawn Manager</h2>
-                    <div class="row-center row-gap-lg">
-                        <label style="font-size: 0.8rem; color: var(--text-secondary);">
-                            Auto-refresh
-                            <select id="spawn-refresh-interval" style="
-                                margin-left: 0.25rem;
-                                padding: 0.2rem 0.4rem;
-                                background: var(--bg-tertiary);
-                                color: var(--text-primary);
-                                border: 1px solid var(--border-color);
-                                border-radius: 4px;
-                                font-size: 0.8rem;
-                            ">
-                                <option value="0">Off</option>
-                                <option value="5">5s</option>
-                                <option value="10" selected>10s</option>
-                                <option value="30">30s</option>
-                            </select>
-                        </label>
-                        <button id="btn-refresh-spawn" style="
-                            padding: 0.375rem 0.75rem;
-                            background: var(--bg-tertiary);
-                            border: 1px solid var(--border-color);
-                            border-radius: 4px;
-                            color: var(--text-primary);
-                            cursor: pointer;
-                            font-size: 0.85rem;
-                        ">&#x21BB; Refresh</button>
-                    </div>
-                </div>
-
-                <!-- Active Children -->
-                <div class="mb-4">
-                    <h3 class="card-heading" data-label-key="spawn_active_children">Active Children</h3>
-                    <div id="spawn-children-list">
-                        <div class="empty-state text-sm">
-                            <span data-label-key="spawn_empty_state">Click refresh or switch to this tab to load spawn data</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Two-column layout: Delegation Chain + Budget Chart -->
-                <div style="
-                    display: grid;
-                    grid-template-columns: 1fr 1fr;
-                    gap: 1.5rem;
-                    margin-bottom: 1.5rem;
-                ">
-                    <!-- Delegation Chain -->
-                    <div style="
-                        background: var(--bg-secondary);
-                        border: 1px solid var(--border-color);
-                        border-radius: 8px;
-                        padding: 1rem;
-                    ">
-                        <h3 class="card-heading" data-label-key="spawn_delegation_chain">Delegation Chain</h3>
-                        <div class="text-md" id="spawn-delegation-chain">
-                            <div class="text-muted text-sm" data-label-key="spawn_no_delegation">No delegation chain</div>
-                        </div>
-                    </div>
-
-                    <!-- Budget Chart -->
-                    <div style="
-                        background: var(--bg-secondary);
-                        border: 1px solid var(--border-color);
-                        border-radius: 8px;
-                        padding: 1rem;
-                    ">
-                        <h3 class="card-heading" data-label-key="spawn_budget_allocation">Budget Allocation</h3>
-                        <div class="chart-canvas-wrap">
-                            <canvas id="spawn-budget-chart"></canvas>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Spawn History -->
-                <div style="
-                    background: var(--bg-secondary);
-                    border: 1px solid var(--border-color);
-                    border-radius: 8px;
-                    padding: 1rem;
-                ">
-                    <h3 class="card-heading" data-label-key="spawn_history_title">Spawn History</h3>
-                    <div class="scroll-y-lg" id="spawn-history-list">
-                        <p class="text-muted text-sm text-center" data-label-key="spawn_no_history">No spawn events recorded</p>
                     </div>
                 </div>
             </div>
