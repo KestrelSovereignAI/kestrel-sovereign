@@ -21,7 +21,10 @@ import {
 } from './panels.js';
 import { mount as mountChat, loadModels, connectNotifications, updateContextStatus, subscribeSSE } from './chat.js';
 import { UI } from './ui-ext/registry.js';
-import { initVoiceUI } from './voice/ui.js';
+// Voice UI self-registers its slot contributions on import (#2038, ticket 04).
+// This bare side-effect import stays until ticket 05's manifest loader imports
+// voice as an out-of-tree module.
+import './voice/ui.js';
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
 import { loadResources } from './resources.js';
@@ -97,8 +100,8 @@ async function init() {
 
     // Bridge the server-push SSE channel onto the UI extension bus (#2038):
     // backend `tools_updated` events become generic bus events so contributions
-    // re-gate/re-render without subscribing to SSE directly. Additive — voice
-    // keeps its own subscribeSSE('tools_updated', …) until ticket 04.
+    // re-gate/re-render without subscribing to SSE directly. Voice consumes this
+    // on the bus (ticket 04) instead of its own subscribeSSE.
     subscribeSSE('tools_updated', (evt) => {
         let payload = null;
         try {
@@ -107,10 +110,24 @@ async function init() {
         UI.emit('tools_updated', payload);
     });
 
-    // Initialize voice UI shell — adds the 🎙️ button, transcript drawer,
-    // voice picker. Auto-fallback Realtime → Pipeline based on the
-    // server-side voice path resolver.
-    initVoiceUI();
+    // Bridge runtime capability changes (#2041) onto the UI extension bus
+    // (#2038). `API.applyServerCapabilities()` dispatches a DOM
+    // `capabilities:changed` event on globalThis when a feature is enabled /
+    // disabled at runtime; the slot registry only listens on the UI bus, so
+    // without this bridge a capability flip would never re-gate slot
+    // contributions (e.g. voice mounting/tearing-down its mic + controls).
+    // Forward it so any contribution that opts into `capabilities:changed`
+    // re-gates without a page reload.
+    if (typeof globalThis !== 'undefined' && typeof globalThis.addEventListener === 'function') {
+        globalThis.addEventListener('capabilities:changed', (evt) => {
+            UI.emit('capabilities:changed', evt && evt.detail ? evt.detail : null);
+        });
+    }
+
+    // The voice UI shell (🎙️ button, path badge, picker modal, per-agent
+    // controls) mounts itself through the slot registry — it self-registered on
+    // import above and renders when core renders each zone (chat-input-actions,
+    // input-footer-status, modal-root, agent-card-actions).
 
     // Initialize tasks component
     initTasks();

@@ -19,13 +19,19 @@
  * - Voice picker modal (provider voices + session-instructions field).
  * - Privacy banner when the active mode is non-NORMAL.
  *
- * Single export `initVoiceUI()` is called once from app.js after
- * `initChat()`. Everything else is internal.
+ * This module self-registers its UI into the slot registry (#2038) at import
+ * time: app.js loads it as a bare side-effect import (`import './voice/ui.js'`)
+ * and each surface above is a `UI.register({ slot, gate, render, events })`
+ * contribution. Core no longer calls voice by name to mount it. The
+ * model-selector ownership lock (`reapplyActiveSelectorLock` and friends) is the
+ * one surface left coupled by name, pending ticket 09.
  */
 
 import API from '../api.js';
-import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml, subscribeSSE } from '../chat.js';
+import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml } from '../chat.js';
 import { getOrCreateChatPane } from '../ui.js';
+import UI from '../ui-ext/registry.js';
+import bus from '../ui-ext/bus.js';
 import { Events } from './events.js';
 import {
   createRealtimeClient,
@@ -216,26 +222,31 @@ function settingsForAgent(agent) {
 
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Slot registration (#2038, ticket 04)
+//
+// Every voice surface mounts through the slot registry instead of a named
+// `initVoiceUI()` call from core. Each contribution gates on the `voice`
+// capability via `ctx.api.hasCapability('voice')` — the same check voice used
+// to do by hand — so a host without voice renders nothing. The registry calls
+// `render(el, ctx)` once core renders the zone; mid-session repaints ride the
+// `session:change` / `agent:switch` bus events (see `setState` /
+// `applyActiveSessionPolicy`).
 // ---------------------------------------------------------------------------
 
 
-export function initVoiceUI() {
-  if (!API.hasCapability('voice')) return;
+function voiceGate(ctx) {
+  const api = ctx && ctx.api;
+  return !!(api && typeof api.hasCapability === 'function' && api.hasCapability('voice'));
+}
 
-  const header = document.querySelector('.chat-header');
-  if (!header) {
-    // Voice UI is opt-in — if the chat header isn't present (e.g. mounted
-    // somewhere unusual) we don't crash the page.
-    console.warn('[voice/ui] chat header not found; voice UI not mounted');
-    return;
-  }
-
-  injectStyles();
-  mountButton(header);
-  mountStatusIndicator();
-  mountPickerModal();
-  applyActiveSessionState();
+// One-time global wiring (push-to-talk, crash-recovery selector release, and
+// the bus subscriptions). Bound lazily the first time a voice zone actually
+// renders — the render only happens once `voiceGate` passes, so this never runs
+// for a host without voice. Idempotent via the guard.
+let _globalWiringDone = false;
+function ensureGlobalVoiceWiring() {
+  if (_globalWiringDone) return;
+  _globalWiringDone = true;
 
   // Push-to-talk: hold spacebar (when not in a text input) to start voice.
   bindGlobalShortcuts();
@@ -251,19 +262,16 @@ export function initVoiceUI() {
     if (document.visibilityState === 'hidden') onLeave();
   });
 
-  // Progressive tool disclosure (#1315): subscribe to tool updates from the
-  // backend. When the orchestrator explores a feature for the first time,
-  // it emits a tools_updated event. For realtime sessions, we forward this
-  // as a session.update over the data channel to refresh the LLM's tool set.
-  subscribeSSE('tools_updated', (evt) => {
+  // Progressive tool disclosure (#1315): the backend `tools_updated` SSE event
+  // is bridged onto the UI extension bus by app.js (#2038), so voice listens on
+  // the bus instead of subscribing to SSE directly. For realtime sessions, we
+  // forward the new tool set as a session.update over the data channel.
+  bus.on('tools_updated', (data) => {
     try {
-      const data = JSON.parse(evt.data);
-      const { tools } = data;
-
+      const tools = data && data.tools;
       // Apply to the active realtime session (if any)
       const session = activeSession();
       if (!session?.client || session.client.path !== 'realtime') return;
-
       // Call updateTools on the realtime client to push the new tool list
       // over the WebRTC data channel as a session.update message
       if (typeof session.client.updateTools === 'function') {
@@ -273,13 +281,93 @@ export function initVoiceUI() {
       console.error('Failed to handle tools_updated event:', err);
     }
   });
+
+  // Agent switch arrives over the bus (emitted by identity.js `selectAgent`)
+  // rather than a named core→voice call.
+  bus.on('agent:switch', (payload) => {
+    const { prev, next } = payload || {};
+    onAgentSwitch(prev, next);
+  });
 }
 
-export function onAgentSwitch(prevAgent, nextAgent) {
-  // No-op until the voice UI is actually mounted. When chat/voice capability
-  // is disabled, initVoiceUI() returns before creating `buttonEl`, but
-  // selectAgent() still fires this hook — and applyActiveSessionState() →
-  // setState() would dereference the null `buttonEl` and crash the switch.
+// Mic button (chat-input-actions zone): renders left of #send-button via the
+// zone anchor. Wiring the global shortcuts + initial button state here keeps
+// them gated behind the same capability check as the button itself.
+UI.register({
+  slot: 'chat-input-actions',
+  id: 'voice-mic',
+  order: 100,
+  gate: voiceGate,
+  events: ['capabilities:changed'],
+  render: (el) => {
+    injectStyles();
+    mountButton(el);
+    ensureGlobalVoiceWiring();
+    applyActiveSessionState();
+    // Teardown when voice capability flips off (or the zone is rebuilt): the
+    // registry removes the button container, so drop the stale reference. The
+    // global wiring (push-to-talk, bus subscriptions) all guard on `buttonEl`,
+    // so nulling it here renders that wiring inert until voice is re-enabled
+    // and the contribution re-renders a fresh button. Release the selector lock
+    // first — same posture as the pagehide crash-recovery path — so a live
+    // realtime session doesn't leave the chat-model selector pinned.
+    return () => {
+      releaseSelectorOwnership(activeSession());
+      buttonEl = null;
+    };
+  },
+});
+
+// Path/privacy chips (input-footer-status zone): mounted once; their content is
+// mutated in place by setState / setPathBadge during a session.
+UI.register({
+  slot: 'input-footer-status',
+  id: 'voice-status',
+  order: 100,
+  gate: voiceGate,
+  events: ['capabilities:changed'],
+  render: (el) => {
+    injectStyles();
+    mountStatusIndicator(el);
+    // Drop the stale chip references when the registry removes the container so
+    // setState/setPathBadge (which guard on these) become inert until voice
+    // re-mounts a fresh status indicator.
+    return () => {
+      pathBadgeEl = null;
+      privacyBannerEl = null;
+    };
+  },
+});
+
+// Per-agent listen/talk controls (agent-card-actions zone): rendered once per
+// card, repainted on agent:switch / session:change.
+UI.register({
+  slot: 'agent-card-actions',
+  id: 'voice-controls',
+  order: 100,
+  gate: voiceGate,
+  events: ['agent:switch', 'session:change', 'capabilities:changed'],
+  render: (el, ctx) => {
+    mountAgentVoiceControls(el, ctx);
+  },
+});
+
+// Voice picker modal (modal-root zone): replaces the old append-to-document.body
+// mount with the shared overlay root.
+UI.register({
+  slot: 'modal-root',
+  id: 'voice-picker',
+  gate: voiceGate,
+  events: ['capabilities:changed'],
+  render: (el) => mountPickerModal(el),
+});
+
+function onAgentSwitch(prevAgent, nextAgent) {
+  // No-op until the voice UI is actually mounted. When voice capability is
+  // disabled the mic-button contribution never renders (so `buttonEl` is null
+  // and the agent:switch bus subscription is never even wired); this guard is
+  // belt-and-suspenders so applyActiveSessionState() → setState() can't
+  // dereference a null `buttonEl` and crash the switch.
   if (!buttonEl) return;
   const prevSession = prevAgent === undefined ? null : sessionForAgent(prevAgent);
   const nextSession = sessionForAgent(nextAgent);
@@ -294,14 +382,20 @@ export function onAgentSwitch(prevAgent, nextAgent) {
   }
 }
 
-export function mountAgentVoiceControls(item, agentName) {
-  if (!API.hasCapability('voice')) return;
-  if (!item) return;
-  // Voice cards are located by their OWN attribute, NOT `data-agent-name`.
-  // The voice session key for standalone mode is `null` (≠ the real agent name
-  // the row still carries in `data-agent-name` for thinking-dot / stop-button
-  // lookups), so the two identities genuinely differ and must not share a key.
-  item.dataset.voiceAgentKey = voiceKeyToAttr(agentName);
+// Render the per-agent listen/talk controls into the agent-card-actions slot
+// container `el`. `ctx` carries the card's `agentName` (the real name) and the
+// `standalone` flag; the voice SESSION KEY is `null` in standalone mode and the
+// agent name otherwise — distinct from the row's `data-agent-name`, which always
+// carries the real name for thinking-dot / stop-button lookups.
+function mountAgentVoiceControls(el, ctx) {
+  if (!el || !ctx) return;
+  injectStyles();
+  const agentKey = ctx.standalone ? null : ctx.agentName;
+  // Voice cards are located by their OWN attribute, NOT `data-agent-name`. The
+  // zone anchor (`ctx.element`) is appended into the `.agent-item` card, so its
+  // parent is the row we tag + repaint.
+  const row = ctx.element && ctx.element.parentNode;
+  if (row && row.dataset) row.dataset.voiceAgentKey = voiceKeyToAttr(agentKey);
   const controls = document.createElement('div');
   controls.className = 'agent-voice-controls';
   controls.innerHTML = `
@@ -317,17 +411,17 @@ export function mountAgentVoiceControls(item, agentName) {
   controls.querySelector('.agent-voice-solo')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
     if (ev.shiftKey || ev.altKey) {
-      toggleAgentSolo(agentName);
+      toggleAgentSolo(agentKey);
     } else {
-      toggleAgentOutput(agentName);
+      toggleAgentOutput(agentKey);
     }
   });
   controls.querySelector('.agent-voice-arm')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    toggleAgentArm(agentName);
+    toggleAgentArm(agentKey);
   });
-  item.appendChild(controls);
-  refreshAgentVoiceCard(agentName);
+  el.appendChild(controls);
+  refreshAgentVoiceCard(agentKey);
 }
 
 // Map a voice session key (string agent name, or `null` for standalone) to/from
@@ -344,7 +438,7 @@ function cssEscape(s) {
     : String(s).replace(/["\\]/g, '\\$&');
 }
 
-export function refreshAgentVoiceCard(agentName) {
+function refreshAgentVoiceCard(agentName) {
   const selector = `.agent-item[data-voice-agent-key="${cssEscape(voiceKeyToAttr(agentName))}"]`;
   const row = document.querySelector(selector);
   if (!row) return;
@@ -377,13 +471,6 @@ export function refreshAgentVoiceCard(agentName) {
     armBtn.setAttribute('aria-pressed', pane.micArmed ? 'true' : 'false');
   }
 }
-
-function refreshAllAgentVoiceCards() {
-  document.querySelectorAll('.agent-item[data-voice-agent-key]').forEach((row) => {
-    refreshAgentVoiceCard(attrToVoiceKey(row.dataset.voiceAgentKey));
-  });
-}
-
 
 // explicitMuted is a per-agent tri-state: true = forced silent, false = pinned
 // audible (in the additive mix), null = follow focus (v0 default).
@@ -451,15 +538,13 @@ export function reapplyActiveSelectorLock() {
 // ---------------------------------------------------------------------------
 
 
-function mountButton() {
+function mountButton(el) {
   // Mic lives in the chat input row, immediately to the LEFT of #send-button
   // — same affordance as ChatGPT's voice button. Voice is treated as an
-  // input modality on the existing chat, NOT a parallel session.
-  const sendBtn = document.getElementById('send-button');
-  if (!sendBtn || !sendBtn.parentElement) {
-    console.warn('[voice/ui] #send-button not found; voice button not mounted');
-    return;
-  }
+  // input modality on the existing chat, NOT a parallel session. The
+  // chat-input-actions zone anchor (`el`) sits left of #send-button in the
+  // input row, so appending here preserves the textarea | mic | send order.
+  if (!el) return;
   buttonEl = document.createElement('button');
   buttonEl.id = 'voice-toggle-btn';
   buttonEl.type = 'button';
@@ -475,17 +560,17 @@ function mountButton() {
     ev.preventDefault();
     openPicker();
   });
-  // Insert before the send button so the row reads: textarea | mic | send.
-  sendBtn.parentElement.insertBefore(buttonEl, sendBtn);
+  el.appendChild(buttonEl);
 }
 
 
-function mountStatusIndicator() {
+function mountStatusIndicator(el) {
   // Tiny path/state indicator floats in the input footer next to the
   // context-status. Replaces the old separate-drawer header. Hidden when
   // idle so the existing chat UI is visually unchanged outside a session.
-  const footer = document.querySelector('.input-footer');
-  if (!footer) return;
+  // The input-footer-status zone anchor (`el`) is already positioned at the
+  // left of the footer, so it doesn't fight the right-aligned context-status.
+  if (!el) return;
 
   pathBadgeEl = document.createElement('span');
   pathBadgeEl.className = 'kestrel-voice-path-badge';
@@ -495,15 +580,15 @@ function mountStatusIndicator() {
   privacyBannerEl.className = 'kestrel-voice-privacy-banner';
   privacyBannerEl.hidden = true;
 
-  // Insert at the left of the footer so it doesn't fight the existing
-  // right-aligned context-status text.
-  footer.insertBefore(privacyBannerEl, footer.firstChild);
-  footer.insertBefore(pathBadgeEl, footer.firstChild);
+  // Order reads path badge then privacy banner (matching the prior insertion).
+  el.appendChild(pathBadgeEl);
+  el.appendChild(privacyBannerEl);
 }
 
 
-function mountPickerModal() {
+function mountPickerModal(el) {
   // Lazy-render: build the modal nodes upfront but keep them hidden.
+  if (!el) return;
   pickerModalEl = document.createElement('div');
   pickerModalEl.id = 'voice-picker-modal';
   pickerModalEl.className = 'kestrel-voice-modal';
@@ -554,7 +639,9 @@ function mountPickerModal() {
   pickerModalEl.addEventListener('click', (ev) => {
     if (ev.target === pickerModalEl) closePicker();  // click outside card
   });
-  document.body.appendChild(pickerModalEl);
+  // Mount into the shared modal-root overlay zone rather than document.body
+  // (#2038, ticket 04), so modal teardown is scoped to the registry.
+  el.appendChild(pickerModalEl);
 
   card.querySelector('#voice-picker-cancel').addEventListener('click', closePicker);
   card.querySelector('#voice-picker-save').addEventListener('click', savePicker);
@@ -568,8 +655,11 @@ function mountPickerModal() {
 
 function setState(next, session = activeSession()) {
   session.state = next;
-  refreshAgentVoiceCard(session.agent);
-  if (session === controlSession()) {
+  // Repaint the per-agent cards through the registry rather than a bespoke
+  // direct call — every agent-card-actions contribution subscribed to
+  // `session:change` re-renders from current state (#2038, ticket 04).
+  UI.emit('session:change', { agent: session.agent });
+  if (session === controlSession() && buttonEl) {
     buttonEl.textContent = STATE_GLYPH[next];
     buttonEl.title = STATE_LABELS[next];
     buttonEl.setAttribute('aria-label', STATE_LABELS[next]);
@@ -598,7 +688,9 @@ function applyActiveSessionPolicy() {
     try { session.client?.setMuted?.(isOutputMuted(agent, session)); } catch (_) {}
     try { session.client?.setInputMuted?.(agent !== armedAgent); } catch (_) {}
   }
-  refreshAllAgentVoiceCards();
+  // Repaint every card via the registry (session:change re-renders all
+  // agent-card-actions instances), replacing the bespoke refreshAllAgentVoiceCards.
+  UI.emit('session:change');
 }
 
 function isOutputMuted(agent, session = sessionForAgent(agent)) {

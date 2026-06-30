@@ -8,7 +8,9 @@ import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
-import { mountAgentVoiceControls, onAgentSwitch as onVoiceAgentSwitch, reapplyActiveSelectorLock } from './voice/ui.js';
+// Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
+// named coupling is the model-selector ownership lock, deferred to ticket 09.
+import { reapplyActiveSelectorLock } from './voice/ui.js';
 import { UI } from './ui-ext/registry.js';
 
 // ============================================================================
@@ -749,7 +751,6 @@ export async function loadAgents() {
         for (const agent of agents) {
             const isOnline = agent.status !== 'offline';
             const isThinking = state.waitingAgents.has(agent.name);
-            const voiceAgentKey = isStandalone ? null : agent.name;
             const item = document.createElement('div');
             item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}${isThinking ? ' agent-thinking' : ''}`;
             // Always carry the real agent name — thinking-dot / stop-button
@@ -786,13 +787,12 @@ export async function loadAgents() {
                 });
             }
             container.appendChild(item);
-            mountAgentVoiceControls(item, voiceAgentKey);
 
-            // UI extension slot (#2038, ticket 02): per-card actions zone. The
-            // anchor is a dedicated container appended to the card; the registry
-            // mounts contributions (none yet — renders empty) and tears them
-            // down when the card detaches on the next list rebuild. Additive:
-            // the voice controls above stay until ticket 04.
+            // UI extension slot (#2038): per-card actions zone. The anchor is a
+            // dedicated container appended to the card; the registry mounts
+            // contributions (voice's 🎧/🎤 controls register into this zone as of
+            // ticket 04) and tears them down when the card detaches on the next
+            // list rebuild.
             const cardActionsAnchor = document.createElement('div');
             cardActionsAnchor.dataset.slot = 'agent-card-actions';
             cardActionsAnchor.className = 'agent-card-actions';
@@ -872,10 +872,9 @@ window.selectAgent = async function(agentName) {
     // bump any generation; only within-agent context changes
     // (clear/new chat, conversation switch, delete) do.
     mountChatPane(agentName);
-    onVoiceAgentSwitch(previousAgentName, agentName);
-    // UI extension bus (#2038, ticket 02): emit the generic agent-switch event
-    // ALONGSIDE the legacy voice call above. This is strictly additive — the
-    // core→voice call stays until ticket 04 migrates voice onto the bus.
+    // UI extension bus (#2038): the generic agent-switch event drives voice's
+    // per-agent card repaint + session policy (voice subscribes on the bus as of
+    // ticket 04 — no named core→voice call).
     UI.emit('agent:switch', { prev: previousAgentName, next: agentName });
 
     // Refresh the chat-input "Thinking…" indicator + send/input disabled
@@ -930,8 +929,10 @@ window.selectAgent = async function(agentName) {
     ]);
 
     // loadModels() above rebuilt the chat-model selector, discarding any lock
-    // onVoiceAgentSwitch() acquired. Re-lock to the now-active agent's live
-    // Realtime session (no-op otherwise) so voice keeps owning the model.
+    // the agent:switch handler acquired. Re-lock to the now-active agent's live
+    // Realtime session (no-op otherwise) so voice keeps owning the model. This
+    // is the model-selector ownership lock — the one voice surface still coupled
+    // by name, deferred to ticket 09.
     reapplyActiveSelectorLock();
 
     // Reload the currently active panel (its cached state was cleared above)

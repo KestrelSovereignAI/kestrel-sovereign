@@ -1,87 +1,98 @@
+// Voice UI migrated onto the slot registry (#2038, ticket 04). It no longer
+// exposes `initVoiceUI()` / `mountAgentVoiceControls()` — it self-registers slot
+// contributions on import, each gated on the `voice` capability via
+// `ctx.api.hasCapability('voice')`. These tests pin that the contributions are
+// registered into the expected zones and that the gate blocks mounting when
+// voice is off (the behavior the old manual `if (!API.hasCapability('voice'))`
+// guard used to enforce).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { JSDOM } from 'jsdom';
 
-function makeNode(tag = 'div') {
-    return {
-        tagName: tag.toUpperCase(),
-        nodeType: 1,
-        id: '',
-        children: [],
-        childNodes: [],
-        parentNode: null,
-        classList: {
-            _set: new Set(),
-            add(c) { this._set.add(c); },
-            remove(c) { this._set.delete(c); },
-            toggle(c, on) {
-                if (on === undefined) {
-                    this._set.has(c) ? this._set.delete(c) : this._set.add(c);
-                } else if (on) {
-                    this._set.add(c);
-                } else {
-                    this._set.delete(c);
-                }
-                return this._set.has(c);
-            },
-            contains(c) { return this._set.has(c); },
-        },
-        dataset: {},
-        style: {},
-        innerHTML: '',
-        textContent: '',
-        addEventListener() {},
-        appendChild(child) {
-            child.parentNode = this;
-            this.children.push(child);
-            this.childNodes.push(child);
-            return child;
-        },
-        querySelector(selector) {
-            if (!selector.startsWith('.')) return null;
-            const klass = selector.slice(1);
-            const stack = [...this.children];
-            while (stack.length) {
-                const child = stack.shift();
-                if (child.classList?.contains(klass)) return child;
-                stack.push(...(child.children || []));
-            }
-            return null;
-        },
-        querySelectorAll() { return []; },
-    };
-}
-
-const header = makeNode('header');
-header.classList.add('chat-header');
-
-globalThis.window = globalThis.window || {};
-globalThis.document = {
-    querySelector(selector) {
-        return selector === '.chat-header' ? header : null;
-    },
-    querySelectorAll() { return []; },
-    createElement: (tag) => makeNode(tag),
-    head: makeNode('head'),
-    body: makeNode('body'),
-    addEventListener() {},
-};
-globalThis.sessionStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
-globalThis.location = { href: '/', search: '' };
-globalThis.fetch = async () => ({ ok: false, status: 404 });
+const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
+globalThis.window = dom.window;
+globalThis.document = dom.window.document;
+globalThis.Node = dom.window.Node;
+globalThis.location = dom.window.location;
+globalThis.sessionStorage = dom.window.sessionStorage;
+globalThis.localStorage = dom.window.localStorage;
+globalThis.navigator = dom.window.navigator;
+globalThis.CSS = dom.window.CSS || { escape: (s) => String(s) };
+globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
 globalThis.kicon = () => '';
-globalThis.CSS = { escape: (s) => String(s) };
 globalThis.KESTREL_UI_CONFIG = { capabilities: { voice: false } };
 
-const { initVoiceUI, mountAgentVoiceControls } = await import(
-    '../../kestrel_sovereign/static/js/voice/ui.js'
-);
+const { UI } = await import('../../kestrel_sovereign/static/js/ui-ext/registry.js');
+// Importing the module runs its top-level UI.register(...) calls.
+await import('../../kestrel_sovereign/static/js/voice/ui.js');
 
-test('voice capability false prevents mic UI from mounting', () => {
-    initVoiceUI();
-    assert.equal(header.querySelector('.voice-toggle-btn'), null);
-    assert.equal(header.children.length, 0);
+function anchor() {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    return el;
+}
 
-    const row = makeNode('div');
-    mountAgentVoiceControls(row, 'agent-a');
-    assert.equal(row.children.length, 0);
+function capApi(voiceOn) {
+    return { hasCapability: (k) => (k === 'voice' ? voiceOn : false) };
+}
+
+test('voice self-registers contributions into its four zones', () => {
+    const has = (slot, id) => UI.contributions(slot).some((c) => c.id === id);
+    assert.ok(has('chat-input-actions', 'voice-mic'), 'mic button registered');
+    assert.ok(has('input-footer-status', 'voice-status'), 'footer status registered');
+    assert.ok(has('agent-card-actions', 'voice-controls'), 'agent-card controls registered');
+    assert.ok(has('modal-root', 'voice-picker'), 'picker modal registered');
+});
+
+test('voice capability false prevents the mic button from mounting', () => {
+    const el = anchor();
+    UI.renderSlot('chat-input-actions', { element: el, api: capApi(false) });
+    assert.equal(el.children.length, 0, 'gate blocked → no container mounted');
+});
+
+test('voice capability true mounts the mic button into the zone', () => {
+    const el = anchor();
+    UI.renderSlot('chat-input-actions', { element: el, api: capApi(true) });
+    assert.equal(el.children.length, 1, 'one per-contribution container mounted');
+    assert.ok(el.querySelector('#voice-toggle-btn'), 'mic button rendered into the zone');
+});
+
+test('runtime capabilities:changed re-gates the mic without a reload', () => {
+    // A mutable api whose `voice` answer flips at runtime — mirrors the live
+    // `API` object after `applyServerCapabilities()` rewrites its caps map.
+    const live = { voice: false };
+    const api = { hasCapability: (k) => (k === 'voice' ? live.voice : false) };
+
+    const el = anchor();
+    // Boot with voice OFF: nothing mounts, but the instance ctx is retained.
+    UI.renderSlot('chat-input-actions', { element: el, api });
+    assert.equal(el.children.length, 0, 'voice off at boot → no mic');
+
+    // Feature enabled at runtime: api flips, the bridged bus event fires.
+    // (Assert via the scoped class, not `#voice-toggle-btn` — by this point in
+    // the file several instances carry a button with that duplicate id, and
+    // jsdom's id-selector fast-path resolves it globally to the wrong subtree.)
+    live.voice = true;
+    UI.emit('capabilities:changed', { capabilities: { voice: true } });
+    assert.ok(el.querySelector('.kestrel-voice-btn'), 'mic mounts on enable, no reload');
+
+    // Feature disabled at runtime: the contribution gates out and tears down.
+    live.voice = false;
+    UI.emit('capabilities:changed', { capabilities: { voice: false } });
+    assert.equal(el.children.length, 0, 'mic torn down on disable');
+});
+
+test('agent-card controls gate on voice capability', () => {
+    const off = anchor();
+    UI.renderSlot('agent-card-actions', {
+        element: off, api: capApi(false), agentName: 'Alpha', standalone: false,
+    });
+    assert.equal(off.children.length, 0, 'gated out → no controls');
+
+    const on = anchor();
+    UI.renderSlot('agent-card-actions', {
+        element: on, api: capApi(true), agentName: 'Alpha', standalone: false,
+    });
+    assert.ok(on.querySelector('.agent-voice-solo'), 'listen control mounted');
+    assert.ok(on.querySelector('.agent-voice-arm'), 'talk control mounted');
 });
