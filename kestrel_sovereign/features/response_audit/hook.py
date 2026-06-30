@@ -2,9 +2,9 @@
 import logging
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sovereign.security.narration_check import (
-    NarrationVerdict,
     analyze_narration,
     check_escalation_attribution,
+    merge_narration_verdicts,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,34 +81,11 @@ class ResponseAuditHook(Hook):
         )
         # Fold both verdicts together: take the most severe risk
         # boost, concatenate reasonings so the operator sees every
-        # rule that fired.
-        if (
-            escalation_verdict.risk_boost > 0
-            and narration_verdict.risk_boost > 0
-        ):
-            # Both rules fired: take the max boost but concatenate
-            # reasonings so the operator sees every rule that fired,
-            # regardless of which boost is higher.
-            narration_verdict = NarrationVerdict(
-                risk_boost=max(
-                    narration_verdict.risk_boost,
-                    escalation_verdict.risk_boost,
-                ),
-                reasoning=(
-                    f"{narration_verdict.reasoning} | "
-                    f"{escalation_verdict.reasoning}"
-                ),
-                offending_verb=(
-                    narration_verdict.offending_verb
-                    or escalation_verdict.offending_verb
-                ),
-                offending_tool=(
-                    narration_verdict.offending_tool
-                    or escalation_verdict.offending_tool
-                ),
-            )
-        elif escalation_verdict.risk_boost > narration_verdict.risk_boost:
-            narration_verdict = escalation_verdict
+        # rule that fired (#2057). Delegated to a pure helper so the
+        # merge policy is unit-testable in isolation.
+        narration_verdict = merge_narration_verdicts(
+            narration_verdict, escalation_verdict,
+        )
         self.last_narration_verdict = narration_verdict
 
         # Honesty doctrine: a narration violation is a constitutional
