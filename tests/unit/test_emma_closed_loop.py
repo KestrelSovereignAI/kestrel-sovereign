@@ -244,6 +244,47 @@ async def test_canonical_deny_blocks_auto_approve(store):
     assert approved is False and scope == "denied"
 
 
+@pytest.mark.asyncio
+async def test_pre_approval_read_error_fails_closed(store):
+    """#2056: a permission-store read error on the pre-approval check must
+    fail CLOSED. A tool that has a matching auto-approve rule must NOT be
+    auto-approved when the store can't confirm the tool is not ALWAYS_ASK —
+    it must be queued (here: ``no_approver`` on a headless test instance),
+    never ``(True, "auto_approve:*")``."""
+    agent = SimpleNamespace(
+        _agent_name="Emma", did="did:pkh:emma", is_test_instance=True,
+    )
+    pol = AutoApprovePolicy(
+        [AutoApproveRule(
+            pattern=r"^gh issue create -R o/r",
+            repo_scope="o/r", agent="Emma",
+        )],
+        store,
+    )
+    q = ApprovalQueue(permission_store=store, auto_approve_policy=pol,
+                      agent=agent)
+    args = {"argv": ["gh", "issue", "create", "-R", "o/r", "--title", "t"]}
+
+    # The very first (pre-approval) read raises; everything else is healthy.
+    real_get_permission = store.get_permission
+    calls = {"n": 0}
+
+    async def flaky_get_permission(feature_name, tool_name):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("permission store read failed")
+        return await real_get_permission(feature_name, tool_name)
+
+    store.get_permission = flaky_get_permission
+
+    approved, scope = await q.request_approval(
+        "computer_use", "shell", args, timeout=1,
+    )
+    assert approved is False
+    assert not scope.startswith("auto_approve:")
+    assert scope == "no_approver"
+
+
 # --------------------------------------------------------------------------
 # D3 - pre-turn state block
 # --------------------------------------------------------------------------
