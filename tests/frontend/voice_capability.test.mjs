@@ -16,7 +16,13 @@ globalThis.Node = dom.window.Node;
 globalThis.location = dom.window.location;
 globalThis.sessionStorage = dom.window.sessionStorage;
 globalThis.localStorage = dom.window.localStorage;
-globalThis.navigator = dom.window.navigator;
+// Node 25 exposes `globalThis.navigator` as a read-only getter, so a bare
+// assignment throws. Redefine the property to point at jsdom's navigator.
+Object.defineProperty(globalThis, 'navigator', {
+    value: dom.window.navigator,
+    configurable: true,
+    writable: true,
+});
 globalThis.CSS = dom.window.CSS || { escape: (s) => String(s) };
 globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
 globalThis.kicon = () => '';
