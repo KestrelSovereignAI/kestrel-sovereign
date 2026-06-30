@@ -255,7 +255,82 @@ class StreamingMixin:
     - _mandate_preference: Dict[str, Optional[str]]
     - _ensure_remote_active() -> None
     - _deactivate_remote_backend(reason: Optional[str]) -> None
+    - resolve_provider_routing(...) -> RoutingResolution
+    - _available_providers() -> List[Dict[str, Any]]
+    - discover_all_models(use_cache: bool) -> Awaitable[...]
     """
+
+    async def _ensure_models_discovered(self, *, force_local_only: bool = False) -> None:
+        """Trigger model discovery once if any route is still seeded ``"auto"``.
+
+        Routes start with ``model = "auto"`` in ``kestrel.toml`` and only
+        resolve to a concrete id when the disk cache is populated
+        (``_load_from_disk_cache`` at ``__init__``) or the model picker UI
+        calls ``discover_all_models`` via ``/api/models``. On a fresh
+        deployment neither has happened when the first chat arrives, so the
+        cache that backs ``resolve_provider_default`` is empty: every route
+        fails auto-resolution in ``_resolve_concrete_model`` and the fallback
+        walk surfaces the *last* route's ``ModelNotAvailableForRoute`` (e.g.
+        ``ollama:local``) as a hard error, even when a key-backed vendor is
+        configured (#2069).
+
+        Trigger discovery here, once, on demand. ``use_cache=True`` makes
+        repeat calls a cache hit, and ``discover_all_models`` re-resolves the
+        provider list's ``"auto"`` entries (``_resolve_auto_providers``), so
+        the guard short-circuits on subsequent turns. Discovery failure is
+        non-fatal — the route walk still runs and fails loudly per route.
+
+        ``force_local_only``: privacy gate. ``discover_all_models`` enumerates
+        *every* configured vendor (via ``_select_discovery_routes`` over
+        ``self.providers``) and writes the merged result to the shared/disk
+        cache — contacting cloud vendors and poisoning the cache for a
+        local-only turn (ISOLATED/EPHEMERAL privacy session). So for a
+        local-only turn we never call it; instead, if a LOCAL route is still
+        ``"auto"``, we warm via :meth:`_resolve_local_auto_routes`, which scopes
+        discovery to local routes only (no cloud contact, no cache write) so a
+        cold-cache local route still resolves to a concrete model — covering
+        both all-local and mixed cloud/local configs.
+        """
+        providers = self._available_providers() or []
+        if force_local_only:
+            if any(p.get("model") == "auto" and p.get("is_local") for p in providers):
+                try:
+                    await self._resolve_local_auto_routes()
+                except Exception as exc:
+                    logger.warning(
+                        "Local-only model discovery failed (continuing with "
+                        "provider['model'] as-is): %s", exc,
+                    )
+            return
+        if any(p.get("model") == "auto" for p in providers):
+            try:
+                await self.discover_all_models(use_cache=True)
+            except Exception as exc:
+                logger.warning(
+                    "Lazy model discovery failed (continuing with "
+                    "provider['model'] as-is): %s", exc,
+                )
+
+    async def _resolve_routing_with_discovery(
+        self,
+        *,
+        model_override: Optional[str] = None,
+        force_local_only: bool = False,
+    ) -> "RoutingResolution":
+        """:meth:`resolve_provider_routing` preceded by a lazy discovery
+        warm-up (#2069).
+
+        The async generation entry points (``get_response`` and the streaming
+        paths) call this instead of ``resolve_provider_routing`` directly so a
+        cold-cache fresh boot resolves ``"auto"`` to a real model rather than
+        hard-failing the route walk. Sync callers of ``resolve_provider_routing``
+        (e.g. embedding resolution) keep their own no-warm-up behavior.
+        """
+        await self._ensure_models_discovered(force_local_only=force_local_only)
+        return self.resolve_provider_routing(
+            model_override=model_override,
+            force_local_only=force_local_only,
+        )
 
     def _configured_route_vendors(self) -> set:
         """Vendors the operator EXPLICITLY chose via ``route_priority``.
@@ -687,7 +762,7 @@ class StreamingMixin:
             Text chunks as they arrive
         """
         self._check_policy()
-        resolution = self.resolve_provider_routing(
+        resolution = await self._resolve_routing_with_discovery(
             model_override=model_override,
             force_local_only=force_local_only,
         )
@@ -934,7 +1009,7 @@ class StreamingMixin:
                 self._deactivate_remote_backend(reason=str(exc))
 
         # Fall back to standard providers — use centralized routing
-        resolution = self.resolve_provider_routing(
+        resolution = await self._resolve_routing_with_discovery(
             model_override=model_override,
             force_local_only=force_local_only,
         )
@@ -1235,7 +1310,7 @@ class StreamingMixin:
                 self._deactivate_remote_backend(reason=str(exc))
 
         # Use centralized provider routing
-        resolution = self.resolve_provider_routing(
+        resolution = await self._resolve_routing_with_discovery(
             model_override=model_override,
             force_local_only=force_local_only,
         )

@@ -190,6 +190,25 @@ def setup_test_config():
         target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_shared_model_cache():
+    """Reset the process-wide model-discovery cache around every test.
+
+    ``SharedModelCache`` is a module-level singleton shared across all
+    ``LLMService`` instances and persists across tests within an xdist worker.
+    Tests that warm it (real discovery, ``.set(...)``) would otherwise leak a
+    vendor catalog into unrelated tests, silently flipping cache-sensitive
+    assertions — model availability (``_model_available_for_route``) and vision
+    capability (``_apply_eager_vision``) — based purely on xdist worker
+    assignment. The teardown clear guarantees each test ends with a cold cache,
+    so the next test is order-independent regardless of what ran before it.
+    """
+    from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+    get_shared_model_cache().clear()
+    yield
+    get_shared_model_cache().clear()
+
+
 @pytest.fixture(scope="session")
 def project_root() -> Path:
     """Return the project root directory."""

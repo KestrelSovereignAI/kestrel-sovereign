@@ -2240,7 +2240,7 @@ No other text or formatting.
         # Use mandate-aware model from prompt if no explicit override
         effective_override = model_override if model_override else self._get_model_for_prompt(user_prompt)
 
-        resolution = self.resolve_provider_routing(
+        resolution = await self._resolve_routing_with_discovery(
             model_override=effective_override,
             force_local_only=force_local_only,
         )
@@ -2671,25 +2671,17 @@ No other text or formatting.
         # Fall back to standard providers (skip any disabled by auth failure).
         providers = self._available_providers()
 
-        # Lazy auto-resolution. Routes are seeded with ``model = "auto"`` in
-        # ``kestrel.toml`` and only get resolved to a real model id when the
-        # disk cache is populated (``_load_from_disk_cache`` runs at __init__)
-        # or when the model-picker UI calls ``discover_all_models`` explicitly.
-        # On a fresh ``--quickstart`` setup neither has happened yet, so the
-        # very first chat call would otherwise hit the adapter with the
-        # literal string ``"auto"`` — Ollama returns 404, which the SDK turns
-        # into either a fast error (recent ollama) or an indefinite hang
-        # (older client/server combos). Trigger discovery here, once, on
-        # demand. ``use_cache=True`` makes subsequent calls a cache hit.
-        if any(p.get("model") == "auto" for p in providers):
-            try:
-                await self.discover_all_models(use_cache=True)
-            except Exception as exc:
-                logger.warning(
-                    "Lazy model discovery failed in generate_with_messages "
-                    "(continuing with provider['model'] as-is): %s", exc,
-                )
-            providers = self._available_providers()
+        # Lazy auto-resolution warm-up (#2069): resolve any ``model = "auto"``
+        # route before the walk so a fresh-boot cold cache doesn't surface a
+        # hard ``ModelNotAvailableForRoute``. Shared with the streaming and
+        # ``get_response`` paths via ``_ensure_models_discovered``. Pass
+        # ``force_local_only`` so a local-only turn skips the cloud-contacting
+        # warm-up (privacy). Re-fetch the local provider list afterward — this
+        # path resolves routing inline (it does not call
+        # ``resolve_provider_routing``), so it needs the freshly resolved
+        # provider models.
+        await self._ensure_models_discovered(force_local_only=force_local_only)
+        providers = self._available_providers()
 
         if force_local_only:
             providers = [p for p in providers if p.get("is_local")]

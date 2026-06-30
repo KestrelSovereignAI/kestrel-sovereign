@@ -83,6 +83,193 @@ async def test_generate_with_messages_lazy_resolves_auto_models():
 
 
 @pytest.mark.asyncio
+async def test_streaming_path_lazy_resolves_auto_models():
+    """#2069: the STREAMING entry points must trigger the same lazy
+    discovery warm-up as ``generate_with_messages``.
+
+    Pre-fix, only ``generate_with_messages`` warmed discovery; the streaming
+    paths (``get_streaming_response`` / ``stream_with_messages`` /
+    ``stream_with_tool_detection``) called ``resolve_provider_routing``
+    directly. On a fresh boot with a cold cache, every route fails
+    ``_resolve_concrete_model`` and the walk surfaces the LAST route's
+    ``ModelNotAvailableForRoute`` (e.g. ``ollama:local``) as a hard error —
+    even though a key-backed vendor is configured. This pins that the shared
+    ``_resolve_routing_with_discovery`` warm-up runs on the streaming path."""
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.streaming import RoutingResolution
+
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+
+    seed_provider = {
+        "name": "ollama:local",
+        "vendor": "ollama",
+        "model": "auto",
+    }
+    svc.providers = [seed_provider]
+
+    async def _fake_discover(use_cache: bool = True):
+        seed_provider["model"] = "llama3.2:3b"
+        return []
+
+    svc.discover_all_models = AsyncMock(side_effect=_fake_discover)
+
+    captured = {}
+
+    def _fake_resolve(*, model_override=None, force_local_only=False):
+        # Capture the provider model AT RESOLUTION TIME so the test proves the
+        # warm-up ran BEFORE routing, not after.
+        captured["model_at_resolve"] = seed_provider["model"]
+        return RoutingResolution([], None, (False, set()))
+
+    svc.resolve_provider_routing = MagicMock(side_effect=_fake_resolve)
+
+    resolution = await svc._resolve_routing_with_discovery(
+        model_override=None, force_local_only=False,
+    )
+
+    svc.discover_all_models.assert_awaited_once()
+    assert captured["model_at_resolve"] == "llama3.2:3b", (
+        "discovery warm-up must run before resolve_provider_routing so the "
+        "route walk sees a concrete model, not 'auto'"
+    )
+    assert isinstance(resolution, RoutingResolution)
+
+
+@pytest.mark.asyncio
+async def test_ensure_models_discovered_skips_when_already_resolved():
+    """The warm-up is a no-op once every route has a concrete model — it must
+    not fire discovery on every turn after the first."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+    svc.providers = [{"name": "openai:api", "vendor": "openai", "model": "gpt-5.4-mini"}]
+    svc.discover_all_models = AsyncMock(return_value=[])
+
+    await svc._ensure_models_discovered()
+
+    svc.discover_all_models.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_models_discovered_never_runs_global_discovery_when_local_only():
+    """#2069 codex r2 (privacy): a ``force_local_only`` turn must NEVER call the
+    global ``discover_all_models`` — it enumerates every configured vendor
+    (incl. cloud) and writes the shared/disk cache, a leak + cache-poisoning
+    risk for an ISOLATED/EPHEMERAL session. A cloud-only ``auto`` route warms
+    nothing (the force-local filter drops it from the turn)."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+    svc.providers = [{"name": "openai:api", "vendor": "openai", "model": "auto"}]
+    svc.discover_all_models = AsyncMock(return_value=[])
+    svc._resolve_local_auto_routes = AsyncMock()
+
+    await svc._ensure_models_discovered(force_local_only=True)
+    svc.discover_all_models.assert_not_awaited()
+    svc._resolve_local_auto_routes.assert_not_awaited()  # no LOCAL auto route
+
+    # Sanity: the SAME cold-auto state DOES run global discovery when not
+    # local-only — so the gate above is real, not a dead branch.
+    await svc._ensure_models_discovered(force_local_only=False)
+    svc.discover_all_models.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_models_discovered_resolves_local_auto_when_local_only():
+    """#2069 codex r3: a ``force_local_only`` turn with a cold ``auto`` LOCAL
+    route — in BOTH all-local and mixed cloud/local configs — must resolve that
+    local route via the local-scoped path (no cloud contact, no cache write),
+    not fail. It must NOT fall back to the global ``discover_all_models``."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    # Mixed config: a cloud route AND a local auto route. This is codex's case.
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+    svc.providers = [
+        {"name": "openai:api", "vendor": "openai", "model": "gpt-5.4-mini"},
+        {"name": "ollama:local", "vendor": "ollama", "model": "auto", "is_local": True},
+    ]
+    svc.discover_all_models = AsyncMock(return_value=[])
+    svc._resolve_local_auto_routes = AsyncMock()
+
+    await svc._ensure_models_discovered(force_local_only=True)
+    svc._resolve_local_auto_routes.assert_awaited_once()
+    svc.discover_all_models.assert_not_awaited()  # never the cloud-contacting path
+
+
+@pytest.mark.asyncio
+async def test_resolve_local_auto_routes_contacts_local_routes_only():
+    """``_resolve_local_auto_routes`` must scope discovery to LOCAL routes only
+    (never a cloud route) and resolve autos in place without writing the cache."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    svc = LLMService.__new__(LLMService)
+    cloud = {"name": "openai:api", "vendor": "openai", "model": "auto", "is_local": False}
+    local = {"name": "ollama:local", "vendor": "ollama", "model": "auto", "is_local": True}
+    svc.providers = [cloud, local]
+    contacted = []
+
+    async def _discover(vendor, route):
+        contacted.append(vendor)
+        return ["local-model-info"]
+
+    svc._discover_for_vendor_route = AsyncMock(side_effect=_discover)
+    svc._resolve_auto_providers = MagicMock()
+
+    await svc._resolve_local_auto_routes()
+
+    assert contacted == ["ollama"], "must contact ONLY the local route, never cloud"
+    # Resolution is scoped to the local providers only — never the cloud route.
+    svc._resolve_auto_providers.assert_called_once_with(
+        ["local-model-info"], only_providers=[local]
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_local_auto_routes_does_not_mutate_cloud_sharing_vendor():
+    """#2069 codex r4/r5: a cloud route that SHARES a vendor with a local route
+    must (a) still get its local route discovered+resolved — even though
+    _select_discovery_routes collapses to one route per vendor and might pick
+    the cloud one — and (b) NOT have the cloud route itself resolved to a
+    locally-discovered model id (else a later non-local request would send a
+    local-only model to the cloud route). End-to-end through real
+    _resolve_auto_providers and real local-route iteration (no _select mock)."""
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
+
+    svc = LLMService.__new__(LLMService)
+    # Same vendor "acme", two routes: cloud (auto) and local (auto). The cloud
+    # route is listed FIRST so a per-vendor selector would prefer it.
+    cloud = {"name": "acme:api", "vendor": "acme", "model": "auto", "is_local": False,
+             "selection_hints": []}
+    local = {"name": "acme:local", "vendor": "acme", "model": "auto", "is_local": True,
+             "selection_hints": []}
+    svc.providers = [cloud, local]
+    svc._ensure_route_catalogs_sync = MagicMock()
+    svc._route_catalogs = {}
+    local_model = ModelInfo(
+        id="acme-local-7b", provider="acme", display_name="Acme Local 7B",
+        category=ModelCategory.CHAT, is_featured=True, is_hidden=False,
+    )
+    contacted = []
+
+    async def _discover(vendor, route):
+        contacted.append(route["name"])
+        return [local_model]
+
+    svc._discover_for_vendor_route = AsyncMock(side_effect=_discover)
+
+    await svc._resolve_local_auto_routes()
+
+    assert contacted == ["acme:local"], "must discover the LOCAL route directly"
+    assert local["model"] == "acme-local-7b", "local route must resolve"
+    assert cloud["model"] == "auto", "cloud route sharing the vendor must stay 'auto'"
+
+
+@pytest.mark.asyncio
 async def test_process_discovery_message_times_out_on_llm_hang():
     """A hung LLM call is bounded by ``DISCOVERY_LLM_TIMEOUT_SECONDS``.
 

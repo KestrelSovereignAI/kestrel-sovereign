@@ -187,9 +187,21 @@ async def llm_service(mock_config, mock_mandate_config, mock_provider_registry):
         service._usage_database_url = None
         service._db_backend = "sqlite"
 
+        # The shared model cache is a PROCESS-WIDE singleton. Tests here assume
+        # a cold cache (e.g. an unknown model_override is permitted when
+        # discovery hasn't run — _model_available_for_route returns True on an
+        # empty cache). Another test on the same xdist worker can leave the
+        # singleton warm with a different vendor catalog, which silently flips
+        # those assumptions depending on worker assignment. Clear it so every
+        # test using this fixture is hermetic regardless of execution order.
+        from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+        get_shared_model_cache().clear()
+
         yield service
 
-        # Cleanup
+        # Cleanup — also clear so this module doesn't leak cache state to the
+        # next test on the worker.
+        get_shared_model_cache().clear()
         await service.close()
 
 

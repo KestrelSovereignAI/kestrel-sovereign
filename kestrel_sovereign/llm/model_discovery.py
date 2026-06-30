@@ -179,7 +179,44 @@ class ModelDiscoveryMixin:
             providers=providers
         )
 
-    def _resolve_auto_providers(self, models: list) -> None:
+    async def _resolve_local_auto_routes(self) -> None:
+        """Resolve ``model="auto"`` LOCAL routes WITHOUT contacting cloud.
+
+        The force-local-only generation path (ISOLATED/EPHEMERAL privacy
+        session) needs a cold-cache local route's ``"auto"`` to resolve to a
+        concrete model, but must not enumerate or contact cloud vendors
+        (privacy) nor write the shared/disk cache with a local-only model set
+        (which would poison it for a later cloud request). So discovery here is
+        scoped to local routes only, and ``_resolve_auto_providers`` mutates the
+        provider list in place against just those models — cloud routes (which
+        the force-local filter drops from the turn anyway) keep ``"auto"``.
+        Unlike :meth:`discover_all_models`, this never calls
+        ``shared_cache.set``/``write_cache``.
+        """
+        if not hasattr(self, "providers") or not isinstance(self.providers, list):
+            return
+        # Iterate the ACTUAL local provider routes — NOT _select_discovery_routes,
+        # which collapses to one route per vendor and may pick the cloud route,
+        # dropping a local route that shares that vendor (leaving it "auto").
+        local_providers = [p for p in self.providers if p.get("is_local")]
+        if not local_providers:
+            return
+        models: list = []
+        for route in local_providers:
+            vendor = route.get("vendor") or route.get("name", "").split(":", 1)[0]
+            try:
+                models.extend(await self._discover_for_vendor_route(vendor, route))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Local-only discovery failed for %s: %s", route.get("name"), exc
+                )
+        if models:
+            # Mutate ONLY local routes — never a cloud route that happens to
+            # share a vendor with a local route (else a later non-local request
+            # would send this local-only model id to the cloud route).
+            self._resolve_auto_providers(models, only_providers=local_providers)
+
+    def _resolve_auto_providers(self, models: list, only_providers: Optional[list] = None) -> None:
         """Resolve routes whose configured model is ``"auto"`` using discovered models.
 
         Most routes inherit the model catalog of their *vendor*; selection is
@@ -190,15 +227,23 @@ class ModelDiscoveryMixin:
         THAT catalog instead — its serveable set differs from the vendor's
         full discovery (``openai:api``'s full OpenAI catalog), so resolving
         against the shared catalog picks models codex rejects.
+
+        ``only_providers``: restrict mutation to this exact subset of route
+        dicts instead of every provider. The local-only resolver
+        (:meth:`_resolve_local_auto_routes`) passes its local routes here so a
+        cloud route that *shares a vendor* with a ``local = true`` route is NOT
+        resolved to a locally-discovered model id — which would later send a
+        local-only model to the cloud route.
         """
         if not hasattr(self, 'providers') or not isinstance(self.providers, list):
             return
+        targets = only_providers if only_providers is not None else self.providers
         # On the sync cache-hit paths (``_load_from_disk_cache``) route catalogs
         # haven't been built by the async discovery phase yet — build them now
         # so route-scoped routes still resolve correctly. No-op if already built.
         self._ensure_route_catalogs_sync()
         route_catalogs = getattr(self, "_route_catalogs", None) or {}
-        for provider in self.providers:
+        for provider in targets:
             if provider.get("model") != "auto":
                 continue
             vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
