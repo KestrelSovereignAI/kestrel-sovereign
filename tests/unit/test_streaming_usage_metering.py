@@ -190,6 +190,12 @@ class _RoutingService(StreamingMixin):
         meta = self._compute_route_authorization(**kwargs)
         return RoutingResolution(providers, "claude-x", meta)
 
+    def _available_providers(self, providers=None):
+        # Concrete model => the #2069 lazy-discovery warm-up is a no-op here.
+        return [{"name": "anthropic", "model": "claude-x"}]
+
+    discover_all_models = AsyncMock(return_value=[])
+
     def _check_model_tool_support(self, providers, tools, model_override):
         return tools
 

@@ -83,6 +83,76 @@ async def test_generate_with_messages_lazy_resolves_auto_models():
 
 
 @pytest.mark.asyncio
+async def test_streaming_path_lazy_resolves_auto_models():
+    """#2069: the STREAMING entry points must trigger the same lazy
+    discovery warm-up as ``generate_with_messages``.
+
+    Pre-fix, only ``generate_with_messages`` warmed discovery; the streaming
+    paths (``get_streaming_response`` / ``stream_with_messages`` /
+    ``stream_with_tool_detection``) called ``resolve_provider_routing``
+    directly. On a fresh boot with a cold cache, every route fails
+    ``_resolve_concrete_model`` and the walk surfaces the LAST route's
+    ``ModelNotAvailableForRoute`` (e.g. ``ollama:local``) as a hard error —
+    even though a key-backed vendor is configured. This pins that the shared
+    ``_resolve_routing_with_discovery`` warm-up runs on the streaming path."""
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.streaming import RoutingResolution
+
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+
+    seed_provider = {
+        "name": "ollama:local",
+        "vendor": "ollama",
+        "model": "auto",
+    }
+    svc.providers = [seed_provider]
+
+    async def _fake_discover(use_cache: bool = True):
+        seed_provider["model"] = "llama3.2:3b"
+        return []
+
+    svc.discover_all_models = AsyncMock(side_effect=_fake_discover)
+
+    captured = {}
+
+    def _fake_resolve(*, model_override=None, force_local_only=False):
+        # Capture the provider model AT RESOLUTION TIME so the test proves the
+        # warm-up ran BEFORE routing, not after.
+        captured["model_at_resolve"] = seed_provider["model"]
+        return RoutingResolution([], None, (False, set()))
+
+    svc.resolve_provider_routing = MagicMock(side_effect=_fake_resolve)
+
+    resolution = await svc._resolve_routing_with_discovery(
+        model_override=None, force_local_only=False,
+    )
+
+    svc.discover_all_models.assert_awaited_once()
+    assert captured["model_at_resolve"] == "llama3.2:3b", (
+        "discovery warm-up must run before resolve_provider_routing so the "
+        "route walk sees a concrete model, not 'auto'"
+    )
+    assert isinstance(resolution, RoutingResolution)
+
+
+@pytest.mark.asyncio
+async def test_ensure_models_discovered_skips_when_already_resolved():
+    """The warm-up is a no-op once every route has a concrete model — it must
+    not fire discovery on every turn after the first."""
+    from kestrel_sovereign.llm.service import LLMService
+
+    svc = LLMService.__new__(LLMService)
+    svc._disabled_routes = {}
+    svc.providers = [{"name": "openai:api", "vendor": "openai", "model": "gpt-5.4-mini"}]
+    svc.discover_all_models = AsyncMock(return_value=[])
+
+    await svc._ensure_models_discovered()
+
+    svc.discover_all_models.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_process_discovery_message_times_out_on_llm_hang():
     """A hung LLM call is bounded by ``DISCOVERY_LLM_TIMEOUT_SECONDS``.
 
