@@ -17,7 +17,8 @@ This document is the authoritative, **empirically-derived** list of UI zones a
 feature may contribute into, and the contract every contribution obeys. It is
 derived from voice's existing injection points — not invented — and is
 pressure-tested against **every** voice touch point in the epic table
-([00-EPIC.md](00-EPIC.md)) below. Where the slot model cannot express a voice
+([epic #2038](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2038))
+below. Where the slot model cannot express a voice
 behavior, that gap is recorded as a finding (it reshapes ticket 02), never as a
 "TBD".
 
@@ -238,7 +239,8 @@ cross-referenced to the voice trigger it replaces:
 ## 5. Voice walkthrough — every injection point mapped (no residue)
 
 Each row of the epic's voice surface-area table
-([00-EPIC.md](00-EPIC.md)) mapped to a zone or to the ticket-09 escape hatch.
+([epic #2038](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2038))
+mapped to a zone or to the ticket-09 escape hatch.
 **No "TBD".**
 
 | Voice injection point | Today's coupling | Maps to | Resolution |
