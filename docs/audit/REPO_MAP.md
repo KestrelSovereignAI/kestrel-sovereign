@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-29
-**Scope:** 1843 tracked files (1209 `.py`, 318 `.md`, 316 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-30
+**Scope:** 1852 tracked files (1218 `.py`, 318 `.md`, 316 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -486,7 +486,7 @@ Repo entry points and standard project files.
   - `class ScheduledTask`; `class ExecutionRecord`; `class SchedulerRunner`
 - **kestrel_sovereign/features/security/__init__.py** — Kestrel Security Feature - Permission management and approval queue.
 - **kestrel_sovereign/features/security/approval_queue.py** — Kestrel Security - Queue-based Approval System.
-  - `class ApprovalStatus`; `class ApprovalRequest`; `class DecisionResult`; `class ApprovalQueue`
+  - `class ApprovalStatus`; `class ApprovalRequest`; `class DecisionResult`; `class DenialClassification`; `def classify_denial(scope)`; `class ApprovalQueue`
 - **kestrel_sovereign/features/security/component.yaml** — (configuration)
 - **kestrel_sovereign/features/security/feature.py** — Kestrel Security Feature - Main feature class.
   - `def default_permission_for_feature(feature_name, fallback)`; `class SecurityFeature`
@@ -1037,6 +1037,8 @@ Repo entry points and standard project files.
   - `class SavedItemType`; `class SourceType`; `def get_schema(schema_id)`; `def list_schemas()`; `def validate_structured_content(content, schema_id)`; `class SavedItem`; `class SavedItemsStore`
 - **kestrel_sovereign/storage/schema_router.py** — Schema-aware routing: promote extracted structure to typed storage.
   - `class ActionItem`; `class PersonMatch`; `class PersonResolver`; `class ActionItemExtractor`; `class DecisionExtractor`; `def extract_interaction_sentiment(content)`; `class SchemaRouter`
+- **kestrel_sovereign/storage/session_grouping.py** — Shared session-boundary algorithm (#2019).
+  - `def group_messages_into_sessions(messages, gap_minutes, now)`; `def coalesce_sessions_by_session_id(sessions)`; `def summarize_sessions(messages, names, limit, include_trashed, …)`
 - **kestrel_sovereign/storage/sovereign_adapter.py** — Sovereign Storage Adapter V2 - The Encrypted Merkle Forest.
   - `class ShardMetadata`; `class AssetDescriptor`; `class AssetMetadata`; `class AssetCollector`; `class AssetRestorer`; `class RootManifest`; `class ImportCheck`; `class ImportContinuity`; `…`
 - **kestrel_sovereign/storage/sovereign_import_consent.py** — Sovereignty-CAR import-consent wiring (#1379, follow-up to #1273).
@@ -1053,7 +1055,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/sqla/episode.py** — SQLAlchemy mapping of the ``memory_episodes`` table.
   - `class MemoryEpisodeRow`; `def build_episode_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/migrations.py** — One-time data migrations for sovereign-core SQLAlchemy entities.
-  - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`; `async def migrate_conversation_history_add_embedding_vec(db)`; `async def migrate_add_embedding_profile_id(db)`; `async def migrate_create_embedding_profiles(db)`; `async def migrate_compaction_terminology(db)`
+  - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`; `async def migrate_conversation_history_add_embedding_vec(db)`; `async def migrate_add_embedding_profile_id(db)`; `async def migrate_create_embedding_profiles(db)`; `async def migrate_compaction_terminology(db)`; `async def migrate_canonical_session_ids(db)`
 - **kestrel_sovereign/storage/sqla/saved_item.py** — SQLAlchemy mapping of the ``saved_items`` table.
   - `class SavedItem`; `def build_saved_item_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/session.py** — Construct async SQLAlchemy session factories that connect to the same database as a given :class:`AsyncDatabase`.
@@ -2041,6 +2043,8 @@ Repo entry points and standard project files.
   - `def test_chat_completions_propagates_sovereign_caller_from_api_key()`; `def test_bridge_invoke_propagates_sovereign_caller_from_api_key()`; `def test_bridge_stream_propagates_sovereign_caller_from_api_key()`
 - **tests/unit/test_canonical_inventory_sync.py** — Sync checks between the canonical inventory and the live code surface.
   - `def test_canonical_inventory_keeps_feature_snapshot_counts_in_sync()`; `def test_canonical_inventory_mentions_all_router_files()`; `def test_canonical_inventory_mentions_all_discoverable_feature_modules()`; `def test_canonical_inventory_mentions_all_router_routes()`; `def test_canonical_inventory_mentions_all_app_routes()`; `def test_canonical_inventory_links_point_to_existing_paths()`
+- **tests/unit/test_canonical_session_id_migration.py** — Tests for the canonical-session-id data migration (#2012).
+  - `async def test_relinks_integer_session_id_to_marker_uuid(tmp_path)`; `async def test_leaves_legacy_timegap_anchor_alone(tmp_path)`; `async def test_leaves_uuid_session_ids_alone(tmp_path)`; `async def test_remaps_conversation_title(tmp_path)`; `async def test_title_collision_drops_integer_keeps_uuid(tmp_path)`; `async def test_idempotent_second_run_is_noop(tmp_path)`; `async def test_skips_marker_that_inherited_prior_session_uuid(tmp_path)`; `async def test_relinks_double_marker_same_session(tmp_path)`; `…`
 - **tests/unit/test_canonical_transport_split.py** — Canonical/transport split for the conversation record (#1402).
   - `async def store()`; `class TestNewWritePath`; `class TestLazySplitMigration`; `class TestNoDoubleStamp`; `class TestSearchHistoryDoesNotMatchRetrieval`; `class TestFormatConversationHistoryReplaysVerbatim`; `class TestPrivacyModesPreserveRenderedContent`; `class TestHumanRoleStillGetsUserInputWrapper`; `…`
 - **tests/unit/test_car_builder.py** — Tests for CAR v1 builder and reader.
@@ -2140,7 +2144,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_command_type_coercion.py** — Unit tests for command argument type coercion in tools/base.py.
   - `class MockToolWithTypes`; `class TestTypeCoercion`; `class TestParseCommandArgs`; `class TestMemoryCommandSimulation`
 - **tests/unit/test_commands_conversations_endpoint_contracts.py** — Focused contract tests for commands and conversations endpoints.
-  - `def test_commands_endpoint_merges_builtin_and_feature_commands()`; `def test_commands_endpoint_builtin_inventory_matches_command_handler_specs()`; `def test_sessions_endpoint_returns_message_totals_from_history()`; `def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview()`; `async def test_conversations_endpoint_limits_sql_scan_for_large_history(tmp_path)`; `def test_get_conversation_filters_session_markers_and_decrypts_messages()`; `def test_get_conversation_filters_pre_tool_reasoning_from_metadata()`; `def test_get_conversation_surfaces_assistant_model_provider()`; `…`
+  - `def test_commands_endpoint_merges_builtin_and_feature_commands()`; `def test_commands_endpoint_builtin_inventory_matches_command_handler_specs()`; `def test_sessions_endpoint_returns_message_totals_from_history()`; `def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview()`; `def test_conversations_endpoint_exposes_marker_uuid_as_session_id()`; `def test_conversations_endpoint_falls_back_to_rowid_for_legacy_cluster()`; `async def test_conversations_endpoint_limits_sql_scan_for_large_history(tmp_path)`; `def test_get_conversation_filters_session_markers_and_decrypts_messages()`; `…`
 - **tests/unit/test_compaction_terminology_migration.py** — Tests for the compress → compact terminology data migration.
   - `async def test_rewrites_compaction_marker_metadata(tmp_path)`; `async def test_rewrites_hierarchical_marker_and_salvage_reason(tmp_path)`; `async def test_leaves_unrelated_rows_alone(tmp_path)`; `async def test_idempotent_second_run_is_noop(tmp_path)`; `async def test_tolerates_invalid_metadata_json(tmp_path)`; `async def test_init_schema_runs_migration_on_startup(tmp_path)`
 - **tests/unit/test_compute_feature.py** — Unit tests for Kestrel Compute Feature.
@@ -2191,6 +2195,8 @@ Repo entry points and standard project files.
   - `class TestContinuationCursor`; `class TestInMemoryContinuationStore`
 - **tests/unit/test_continuity_verifier.py** — Unit tests for the Continuity Verifier module.
   - `class TestIdentityChallenge`; `class TestChallengeResult`; `class TestContinuityScore`; `class TestMigrationCertificate`; `class TestChallengeGenerator`; `class TestContinuityVerifier`; `class TestAuditTrail`; `class TestVerifyMigration`
+- **tests/unit/test_conversation_lifecycle_tools.py** — Session-grain navigation + lifecycle, store and memory-tool layers (#2019).
+  - `async def store()`; `async def test_list_sessions_groups_and_orders_newest_first(store)`; `async def test_resumed_session_lists_once_and_deletes_wholly(store)`; `async def test_find_messages_matching_scopes_to_session(store)`; `async def test_scoped_delete_does_not_touch_other_sessions(store)`; `async def test_delete_restore_purge_session_round_trip(store)`; `async def test_list_conversations_tool_returns_sessions(store)`; `async def test_delete_conversation_tool_preview_then_confirm(store)`; `…`
 - **tests/unit/test_conversation_manager.py** — Unit tests for ConversationManager.
   - `class MockTokenCounter`; `class MockTokenBudget`; `class MockConversationStore`; `class MockAsyncStorage`; `class MockLLMService`; `def mock_storage()`; `def conversation_manager(mock_storage)`; `def mock_counter()`; `…`
 - **tests/unit/test_conversation_message_sqla.py** — Tests for the ``conversation_history`` SQLAlchemy entity + greenfield ``embedding_vec`` migration.
@@ -2427,6 +2433,8 @@ Repo entry points and standard project files.
   - `class TestLighthousePayment`; `class TestLighthouseBalance`; `class TestLighthousePaymentIntegration`
 - **tests/unit/test_lighthouse_rest.py** — Tests for Lighthouse REST client.
   - `def client()`; `def mock_response()`; `class TestLighthouseRestClient`
+- **tests/unit/test_list_trashed_messages_tool.py** — Message-level trash navigation (#2025).
+  - `async def store()`; `async def test_lists_only_trashed_messages(store)`; `async def test_discover_then_restore_round_trip(store)`; `async def test_preview_unwraps_sent_form(store)`; `async def test_trashed_session_markers_are_hidden(store)`; `async def test_empty_trash_returns_zero(store)`; `async def test_ephemeral_and_isolated_expose_no_trash(store)`
 - **tests/unit/test_llm_provider_capabilities.py** — —
   - `class BareAdapter`; `class DictCapabilitiesAdapter`; `def test_provider_capabilities_to_dict_uses_wire_values()`; `def test_adapter_capabilities_normalizes_plugin_dicts()`; `def test_base_adapter_capabilities_are_conservative()`; `def test_llm_service_route_dicts_include_capabilities()`; `def test_llm_service_embedding_provider_follows_active_route()`; `def test_llm_service_embedding_provider_degrades_when_active_route_cannot_embed()`; `…`
 - **tests/unit/test_llm_service.py** — Unit tests for LLMService core methods.
@@ -2467,6 +2475,8 @@ Repo entry points and standard project files.
   - `class TestUpdateAccessActuallyWrites`; `class TestRetrieveTriggersAccessUpdate`; `class TestMemoryConsolidateToolExists`; `class TestSchedulerDefaultsIncludeConsolidation`
 - **tests/unit/test_memory_wiring_integration.py** — Tests requested by Nellie on PR #633 review:
   - `class TestMemoryConsolidateEndToEnd`; `class TestRetrievalScoreChangesWithAccess`; `class TestNoStraySessionGapDefinitions`
+- **tests/unit/test_message_by_id_tools.py** — Single-message lifecycle by identity (#2022).
+  - `async def store()`; `async def test_message_belongs_to_session_matches_by_identity(store)`; `async def test_delete_by_id_removes_exactly_one_of_duplicate_text(store)`; `async def test_wrong_session_guard_refuses_and_deletes_nothing(store)`; `async def test_correct_session_guard_allows_delete(store)`; `async def test_delete_then_restore_round_trip(store)`; `async def test_purge_requires_confirm_and_is_permanent(store)`; `async def test_delete_and_purge_drop_pins(store)`; `…`
 - **tests/unit/test_metric_summary.py** — Unit tests for ObservabilityStore.get_metric_summary (#969 item 2).
   - `async def test_metric_summary_counts_aggregates_and_carries_forensic_metadata(tmp_path)`; `async def test_metric_summary_filters_by_agent(tmp_path)`; `async def test_metric_summary_empty_when_metric_never_emitted(tmp_path)`; `async def test_metric_summary_finds_rare_metric_amid_high_volume_other(tmp_path)`; `async def test_metric_summary_truncated_flag_when_window_exceeds_limit(tmp_path)`
 - **tests/unit/test_microcompact.py** — Tests for microcompact — zero-cost stale tool result clearing.
@@ -2487,6 +2497,8 @@ Repo entry points and standard project files.
   - `def test_resolve_concrete_model_route_scoped_never_uses_vendor_cache()`; `def test_resolve_concrete_model_non_route_scoped_still_resolves_default()`; `def test_resolve_provider_default_prefers_explicit_model()`; `def test_resolve_provider_default_uses_selection_hints_against_cached_models()`; `def test_resolve_provider_default_prefers_newest_matching_model_from_discovery()`; `def test_resolve_provider_default_uses_vendor_catalog_for_subscription_route()`; `def test_rank_cached_candidates_handles_unix_epoch_created_at()`; `def test_rank_cached_candidates_also_handles_iso_created_at()`; `…`
 - **tests/unit/test_model_set_openrouter.py** — Unit tests for model-set command with OpenRouter models.
   - `class TestModelSetOpenRouter`
+- **tests/unit/test_model_visibility_recency.py** — Recency-driven model visibility (#2015).
+  - `def test_stale_canonical_roots_are_not_featured_and_are_deprecated()`; `def test_default_seed_is_best_featured_never_alphabetical()`; `def test_created_at_primary_ranking_survives_codename_tiers()`; `def test_anthropic_codenames_get_featured()`; `def test_non_chat_models_reclassified_and_unfeatured()`; `def test_stale_cached_featured_flag_does_not_survive()`; `def test_pinned_configured_model_stays_featured_without_created_at()`; `def test_featured_set_is_bounded_per_vendor()`
 - **tests/unit/test_models_configuration_endpoint_contracts.py** — Focused contract tests for model/configuration endpoints.
   - `def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter()`; `def test_wallet_endpoint_prefers_wallet_agent_and_falls_back_to_identity_balance()`; `def test_keys_endpoints_use_storage_contract_without_exposing_secrets()`; `def test_keys_endpoints_refuse_privacy_hidden_persistent_storage()`; `def test_key_read_endpoints_keep_empty_shape_when_storage_absent()`; `def test_key_write_endpoint_still_errors_when_storage_absent()`; `def test_key_update_delete_and_usage_endpoints_preserve_provider_contracts()`; `def test_models_endpoint_groups_results_and_rejects_invalid_category()`; `…`
 - **tests/unit/test_module_contracts.py** — Structural contracts for the modular runtime boundary scaffold.
@@ -2515,6 +2527,8 @@ Repo entry points and standard project files.
   - `async def test_auto_mode_uses_inline_system_when_route_and_model_support_it()`; `async def test_auto_mode_falls_back_to_visible_user_notice_on_unsupported_route()`; `async def test_budget_notice_emits_only_when_crossing_low_threshold()`; `async def test_governance_delta_emits_initial_state_and_dedupes_unchanged_state()`; `def test_supports_inline_system_requires_route_and_model_capability()`
 - **tests/unit/test_orchestrator_hook_arg_rewrites.py** — —
   - `async def test_dispatch_direct_tool_executes_with_pre_tool_use_rewrite()`; `async def test_dispatch_feature_tool_executes_with_pre_tool_use_rewrite()`
+- **tests/unit/test_orphan_marker_deletable.py** — Orphaned new_session marker must not make a session undeletable (#2027).
+  - `async def store()`; `async def test_orphan_marker_session_lists_but_now_deletes(store)`; `async def test_delete_only_touches_tagged_rows(store)`; `async def test_delete_restore_round_trip_includes_marker(store)`; `async def test_purge_destroys_marker_too(store)`; `async def test_healthy_session_delete_unchanged(store)`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
   - `def test_no_traversal_rejects_dotdot()`; `def test_no_traversal_rejects_nul()`; `def test_no_traversal_allows_clean_paths()`; `def test_resolve_realpath_canonicalizes(tmp_path)`; `def test_resolve_realpath_follows_symlink(tmp_path)`; `def test_resolve_realpath_rejects_traversal(tmp_path)`; `def test_resolve_realpath_handles_nonexistent_leaf(tmp_path)`; `def test_resolve_realpath_expands_user()`; `…`
 - **tests/unit/test_paths.py** — Unit tests for :mod:`kestrel_sovereign.paths`.
@@ -2669,6 +2683,10 @@ Repo entry points and standard project files.
   - `def app_with_send(monkeypatch)`; `def test_send_task_persists_sender_artifacts(app_with_send)`; `def test_send_task_without_artifacts_passes_none(app_with_send)`; `def test_send_task_rejects_non_list_artifacts(app_with_send)`; `def test_send_task_rejects_malformed_artifact(app_with_send)`; `def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send)`; `def test_valid_signed_envelope_verifies(app_with_send)`; `def test_valid_signed_envelope_with_artifacts_verifies(app_with_send)`; `…`
 - **tests/unit/test_server_health.py** — Focused tests for server health endpoint behavior.
   - `def test_health_returns_503_when_agent_missing()`; `def test_health_detailed_uses_health_feature_from_feature_dict()`; `def test_health_surfaces_llm_reachability()`
+- **tests/unit/test_session_grouping.py** — Unit tests for the shared session-boundary algorithm (#2019).
+  - `def test_quick_succession_is_one_session()`; `def test_time_gap_splits_sessions()`; `def test_new_session_marker_splits_and_is_not_counted()`; `def test_session_id_change_splits_even_within_gap()`; `def test_legacy_then_uuid_stays_merged_to_match_resolver()`; `def test_unlabeled_turn_stays_with_current_session()`; `def test_legacy_cluster_without_metadata_falls_back_to_row_id()`; `def test_integer_session_id_is_treated_as_legacy_not_canonical()`; `…`
+- **tests/unit/test_session_id_canonicalization.py** — End-to-end storage tests for canonical session identity (#2012).
+  - `async def store()`; `async def test_canonicalize_maps_integer_marker_rowid_to_uuid(store)`; `async def test_canonicalize_leaves_non_marker_integer_alone(store)`; `async def test_add_conversation_relinks_integer_echo_to_uuid(store)`; `async def test_resolve_session_id_canonicalizes_explicit_integer(store)`; `async def test_continued_turns_load_under_canonical_uuid(store)`; `async def test_new_session_marker_mints_fresh_uuid_not_inherited(store)`; `async def test_canonicalize_skips_inherited_marker(store)`; `…`
 - **tests/unit/test_session_id_in_hooks.py** — Verify session_id is correctly threaded to hook calls during tool dispatch (#885).
   - `class TestSessionIdInHooks`
 - **tests/unit/test_session_id_threading.py** — Verify ``session_id`` threads from agent loop to LLMService callers (#821).
