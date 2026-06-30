@@ -2680,6 +2680,11 @@ export async function sendMessage(overrideText, overrideAgent) {
                 }
                 if (isCurrentVisible()) {
                     await checkForModelChange(fullContent);
+                    // #2068: an agent-driven set_model lands the MODEL_CHANGED
+                    // marker in the tool-result card, not in fullContent — so
+                    // re-sync the selector from the server when this turn used
+                    // the tool.
+                    await syncSelectorIfModelToolUsed(pane);
                 }
             } catch (streamError) {
                 if (streamError.name === 'AbortError') {
@@ -3901,6 +3906,38 @@ function checkForModelChange(content) {
             }
         }
     }
+}
+
+/**
+ * Re-sync the model selector from the server when the AGENT changed the model
+ * via its ``set_model`` tool (#2068).
+ *
+ * The user-driven REST path and a streamed assistant message both carry the
+ * ``MODEL_CHANGED:`` marker in the assistant text, which ``checkForModelChange``
+ * consumes. But when the LLM calls the ``set_model`` tool, that marker lands in
+ * the rendered tool-result card — NOT in the streamed assistant text — so the
+ * selector goes stale. The server state is already updated, so the most robust
+ * fix is to re-fetch ``/api/model/current`` whenever this turn invoked
+ * ``set_model``. Keyed on the structured tool events (``pane.toolEvents``),
+ * which is reset per turn, rather than scraping marker text out of a card.
+ *
+ * @param {object} pane - The chat pane whose turn just completed.
+ * @param {object} [selector] - Selector to re-sync; defaults to the module
+ *   ``sharedModelSelector`` (the default is read at call time). Parameterized
+ *   so the detection logic is unit-testable without mounting the selector.
+ */
+export async function syncSelectorIfModelToolUsed(pane, selector = sharedModelSelector) {
+    if (!selector || !pane) return;
+    const events = pane.toolEvents || [];
+    const usedSetModel = events.some(
+        (e) => e && (e.name === 'set_model' || e.tool === 'set_model'),
+    );
+    if (!usedSetModel) return;
+    await selector.syncWithServer();
+    deps().state.selectedModel = selector.selectedModel;
+    deps().state.selectedProvider = selector.selectedProvider;
+    deps().state.selectedVendor = selector.selectedProvider;
+    deps().state.selectedRoute = selector.selectedRoute || null;
 }
 
 // ============================================================================

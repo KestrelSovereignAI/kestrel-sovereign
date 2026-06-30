@@ -17,9 +17,11 @@ function createSelect() {
     };
 }
 
-function loadModelSelector() {
+function loadModelSelector({ fetchImpl } = {}) {
     const providerSelect = createSelect();
     const modelSelect = createSelect();
+    const routeSelect = createSelect();
+    routeSelect.options = [];
     const storage = new Map();
 
     const context = {
@@ -33,6 +35,7 @@ function loadModelSelector() {
             getElementById(id) {
                 if (id === 'provider-selector') return providerSelect;
                 if (id === 'model-selector') return modelSelect;
+                if (id === 'route-selector') return routeSelect;
                 return null;
             },
         },
@@ -47,9 +50,9 @@ function loadModelSelector() {
                 storage.delete(key);
             },
         },
-        fetch: async () => {
+        fetch: fetchImpl || (async () => {
             throw new Error('unexpected fetch');
-        },
+        }),
         setTimeout,
         clearTimeout,
     };
@@ -59,6 +62,7 @@ function loadModelSelector() {
         ModelSelector: context.window.SharedModelSelector,
         providerSelect,
         modelSelect,
+        routeSelect,
         storage,
     };
 }
@@ -396,4 +400,52 @@ test('_populateProviders prefers saved selection over server default', () => {
     // Saved choice wins — user agency over server default.
     assert.equal(providerSelect.value, 'anthropic');
     assert.equal(selector.selectedProvider, 'anthropic');
+});
+
+test('syncWithServer reflects an agent-driven model change (#2068)', async () => {
+    // #2068: when the LLM calls the set_model tool, the MODEL_CHANGED marker
+    // lands in the tool-result card, not in the streamed assistant text, so
+    // checkForModelChange never fires. chat.js detects the set_model tool
+    // event and re-syncs from /api/model/current; this pins that the re-sync
+    // mechanism actually moves the selector to the new server-side model.
+    let fetched = 0;
+    const { ModelSelector, providerSelect, modelSelect } = loadModelSelector({
+        fetchImpl: async (url) => {
+            fetched += 1;
+            return {
+                ok: true,
+                json: async () => ({
+                    model: 'openai:api/gpt-5.4-mini',
+                    model_name: 'gpt-5.4-mini',
+                    vendor: 'openai',
+                    route: 'api',
+                }),
+            };
+        },
+    });
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        storagePrefix: 'test',
+    });
+
+    // Selector currently shows Anthropic (what the user manually picked).
+    selector.allModelsData = {
+        by_vendor: {
+            anthropic: [{ id: 'claude-haiku-4-5', provider: 'anthropic' }],
+            openai: [{ id: 'gpt-5.4-mini', provider: 'openai' }],
+        },
+    };
+    providerSelect.value = 'anthropic';
+    modelSelect.value = 'claude-haiku-4-5';
+    selector.selectedProvider = 'anthropic';
+    selector.selectedModel = 'claude-haiku-4-5';
+
+    await selector.syncWithServer();
+
+    assert.equal(fetched, 1);
+    assert.equal(providerSelect.value, 'openai');
+    assert.equal(modelSelect.value, 'gpt-5.4-mini');
+    assert.equal(selector.selectedProvider, 'openai');
+    assert.equal(selector.selectedModel, 'gpt-5.4-mini');
 });

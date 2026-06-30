@@ -272,11 +272,24 @@ async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 
     svc = LLMService()
+    # Constructing a real LLMService loads the on-disk discovery cache into the
+    # process-wide singleton. This test relies on gpt-4o being treated as
+    # vision-capable (empty cache → permissive); a disk cache written by an
+    # earlier test (real discovery) could mark it text-only. Clear post-
+    # construction so vision capability is deterministic regardless of order.
+    from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+    get_shared_model_cache().clear()
     svc._backend = BackendType.REMOTE_GPU
     svc._remote_client = object()
     monkeypatch.setattr(svc, "_remote_first_allowed", lambda *a, **k: True)
     monkeypatch.setattr(svc, "_check_policy", lambda *a, **k: None)
     monkeypatch.setattr(svc, "_ensure_remote_active", lambda *a, **k: None)
+    # Neutralize the #2069 lazy-discovery warm-up: this test drives a real
+    # LLMService whose seeded routes are model="auto", so the streaming path
+    # would otherwise run REAL discovery — pointless here (the test mocks
+    # routing) and it pollutes the process-wide shared model cache, flipping
+    # gpt-4o's vision capability for this test AND leaking to sibling tests.
+    monkeypatch.setattr(svc, "_ensure_models_discovered", AsyncMock())
     monkeypatch.setattr(svc, "_record_streamed_usage", AsyncMock())
     monkeypatch.setattr(svc, "_check_model_tool_support", lambda providers, tools, mo: tools)
     monkeypatch.setattr(svc, "_resolve_concrete_model", lambda tm, p: "gpt-4o")
