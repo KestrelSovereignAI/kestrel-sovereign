@@ -36,18 +36,23 @@ to it.
   (`static/shared/markdown/*`, chat.js tool-card rendering) and map onto the existing
   dispatch point.
 - Contract: `registerRenderer({match: {tool?|contentType?}, render(payload, ctx) =>
-  string | {html: string} | DocumentFragment})`. The renderer **returns** markup/a
-  fragment; it is **not** handed the live target element. Core sanitizes the returned
-  value and inserts it. This makes sanitization enforceable *by construction* — a
-  renderer cannot write to the DOM before DOMPurify runs.
-  - Rationale: a `render(el, ...)` contract that hands over the live element cannot
-    guarantee sanitization — a buggy/adversarial renderer could assign `el.innerHTML`
-    or attach inline handlers before core ever sees the output. Return-based output is
-    the only contract where the sanitization guarantee actually holds.
-  - If a renderer genuinely needs imperative DOM (e.g. a canvas/chart), it returns a
-    placeholder element via the sanitized fragment and attaches behavior in a
-    follow-up `mount(rootEl, ctx)` callback that operates **only** on the element core
-    created from the sanitized markup — never on arbitrary core DOM.
+  string, mount?(rootEl, ctx) => (void | () => void)})`. `render` returns **inert
+  markup only — a plain HTML string** (never live DOM, never a `Node`/`Element`/
+  `DocumentFragment`). Core parses and sanitizes that string itself, then creates the
+  live DOM. The renderer is **not** handed the live target element in `render`. This
+  makes sanitization enforceable *by construction*.
+  - Rationale: any contract that lets the renderer touch live DOM defeats
+    sanitization. `render(el, ...)` lets it assign `el.innerHTML`. Returning a
+    `Node`/`DocumentFragment` is just as unsafe — DOMPurify sanitizes *attributes and
+    elements*, but cannot remove listeners already attached via `addEventListener` on
+    nodes the renderer built. Only an **inert string** that core parses guarantees the
+    output passed through sanitization with no pre-attached behavior. The contract
+    therefore accepts a string and nothing else.
+  - If a renderer needs imperative behavior (canvas/chart, click handlers), it does so
+    **exclusively** in the optional `mount(rootEl, ctx)` hook, which core invokes
+    *after* it has parsed+sanitized the markup and created `rootEl`. `mount` operates
+    only on `rootEl` (the element core built from the sanitized string) and its
+    descendants — never on arbitrary core DOM. `mount` may return a teardown fn.
 - Renderers are gated by capability like every other contribution.
 - **Sanitization is non-negotiable and structural:** all returned markup flows through
   the same DOMPurify path as core
