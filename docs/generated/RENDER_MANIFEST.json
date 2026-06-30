@@ -879,6 +879,20 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/features/web_search/feature.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/features/CONFIG_SCHEMA_UI_HINTS.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "current",
+      "title": "Config-schema UI hints",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [
         "kestrel_sovereign/agent/orchestrator_engine.py",
         "kestrel_sovereign/agent/streaming.py",
         "kestrel_sovereign/features/response_audit/hook.py",
