@@ -866,10 +866,25 @@ if SERVE_UI:
         """Serve the main web UI."""
         try:
             with open(STATIC_DIR / "index.html", encoding="utf-8") as f:
-                return HTMLResponse(content=f.read(), status_code=200)
+                html = f.read()
         except FileNotFoundError:
             logger.error(f"{STATIC_DIR / 'index.html'} not found.")
             raise HTTPException(status_code=404, detail="Index file not found.")
+
+        # #2041: seed window.KESTREL_UI_CONFIG.featureCapabilities before the
+        # module scripts load so the capability set is known before app.js runs
+        # feature registrations / nav gating. Only possible when a single agent
+        # is resolvable here; in multi-agent host mode the frontend fetches
+        # /api/ui/capabilities (host-agent-prefixed) during boot instead.
+        agent = getattr(request.state, "agent", None) or getattr(
+            request.app.state, "agent", None
+        )
+        if agent is not None and "</head>" in html:
+            from kestrel_sovereign.ui_capabilities import render_ui_config_script
+
+            html = html.replace("</head>", f"{render_ui_config_script(agent)}\n</head>", 1)
+
+        return HTMLResponse(content=html, status_code=200)
 
 
 @app.get("/api/auth/key")

@@ -11,6 +11,11 @@ import {
 //     authProvider?: <object implementing the provider contract>,
 //     bearerToken?: { getToken, onUnauthenticated?, headerName?, tokenPrefix? },
 //     fetchFn?: (url, options) => Response,
+//     // #2041: server-derived feature-backed capability map, seeded at page
+//     // render. Host code does not normally set this — the Kestrel server
+//     // injects it. Merged UNDER `capabilities` overrides (a host may force a
+//     // feature capability off, but not force a disabled one on).
+//     featureCapabilities?: { voice: true, spawn: false, ... },
 //     capabilities?: {
 //       // Boolean for simple on/off — missing keys default to true
 //       chrome: false,
@@ -39,6 +44,7 @@ const API = createApiClient({
     authProvider,
     fetchFn: config.fetchFn || globalThis.fetch,
     capabilities: config.capabilities || null,
+    featureCapabilities: config.featureCapabilities || null,
 });
 
 export default API;

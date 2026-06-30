@@ -63,6 +63,14 @@ class FeaturePackageInfo:
     core: bool = False
     skills: List[SkillInfo] = field(default_factory=list)
     status: FeatureStatus = FeatureStatus.AVAILABLE
+    # Frontend capability keys this feature's UI panels gate on (#2041). The
+    # registry short name and the frontend ``hasCapability(...)`` key usually
+    # match, but some diverge — ``observability`` backs the ``metrics`` panel,
+    # ``security`` backs both ``audit`` and ``permissions``. When set, these keys
+    # are what ``compute_feature_capabilities`` emits instead of the short name,
+    # so the derived capability set lines up with ``PANEL_CAPABILITIES``. Empty
+    # means "use the short name".
+    ui_capabilities: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,7 @@ def load_registry(path: Optional[Path] = None) -> Dict[str, FeaturePackageInfo]:
             icon=entry.get("icon", ""),
             core=entry.get("core", False),
             skills=skills,
+            ui_capabilities=entry.get("ui_capabilities", []),
         )
 
     return registry
