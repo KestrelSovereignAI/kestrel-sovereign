@@ -309,7 +309,11 @@ class ApprovalQueue:
                     )
                     return (True, "auto")
             except Exception as e:  # noqa: BLE001
-                always_ask = False
+                # Fail CLOSED: a security gate must not auto-approve on a
+                # store-read error. We cannot confirm the tool is NOT
+                # ALWAYS_ASK, so assume it is — this skips the scoped
+                # auto-approve path below and queues a human (#2056).
+                always_ask = True
                 logger.warning(
                     "ApprovalQueue: failed to evaluate pre-approval policy for "
                     f"{feature_name}.{tool_name}: {e}",
