@@ -286,6 +286,175 @@ class TestWebSearchFeature:
 
 
 # =============================================================================
+# Config-schema UI hints dogfood (#2045)
+# =============================================================================
+
+class TestWebSearchConfigHints:
+    """The web_search feature dogfoods config-schema UI hints (#2045)."""
+
+    @pytest.fixture
+    def mock_agent(self):
+        agent = MagicMock()
+        agent.agent_id = "test-agent"
+        # No storage → persisted-config helpers no-op gracefully.
+        agent.storage = None
+        return agent
+
+    def test_schema_declares_secret_and_status(self, mock_agent):
+        feature = WebSearchFeature(mock_agent)
+        schema = feature.config_schema
+        props = schema["properties"]
+        # Write-only masked secret.
+        assert props["api_key"]["writeOnly"] is True
+        assert props["api_key"]["format"] == "password"
+        # Read-only computed status.
+        assert props["status"]["readOnly"] is True
+
+    def test_schema_declares_sections_and_action(self, mock_agent):
+        feature = WebSearchFeature(mock_agent)
+        ui = feature.config_schema["x-kestrel-ui"]
+        section_titles = [s["title"] for s in ui["sections"]]
+        assert "Credentials" in section_titles
+        action = ui["actions"][0]
+        assert action["path"] == "/api/features/web_search/test"
+        assert action["label"] == "Test connection"
+
+    @pytest.mark.asyncio
+    async def test_status_reflects_enabled_state(self, mock_agent):
+        with patch.dict("os.environ", {}, clear=True):
+            feature = WebSearchFeature(mock_agent)
+            await feature.initialize()
+        config = await feature.get_config()
+        assert config["status"] == "Not configured"
+
+    @pytest.mark.asyncio
+    async def test_set_config_enables_and_merges(self, mock_agent):
+        with patch.dict("os.environ", {}, clear=True):
+            feature = WebSearchFeature(mock_agent)
+            await feature.initialize()
+            assert feature.tool.enabled is False
+
+            await feature.set_config({"api_key": "new-key"})
+            assert feature.tool.enabled is True
+
+        config = await feature.get_config()
+        assert config["status"] == "Connected"
+        # status (read-only) is not persisted into stored config.
+        assert "status" not in feature._config
+        assert feature._config["api_key"] == "new-key"
+
+    @pytest.mark.asyncio
+    async def test_set_config_ignores_status_field(self, mock_agent):
+        with patch.dict("os.environ", {}, clear=True):
+            feature = WebSearchFeature(mock_agent)
+            await feature.initialize()
+            await feature.set_config({"api_key": "k", "status": "garbage"})
+        assert feature._config.get("status") is None
+
+    @pytest.mark.asyncio
+    async def test_test_endpoint_disabled(self, mock_agent):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        with patch.dict("os.environ", {}, clear=True):
+            feature = WebSearchFeature(mock_agent)
+            await feature.initialize()
+
+        mock_agent.features = {"WebSearchFeature": feature}
+        app = FastAPI()
+        app.state.agent = mock_agent
+        app.include_router(feature.get_router())
+        with TestClient(app) as client:
+            resp = client.get("/api/features/web_search/test")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is False
+        assert "provider" in body["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_test_endpoint_success(self, mock_agent):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        with patch.dict("os.environ", {"TAVILY_API_KEY": "test-key"}):
+            feature = WebSearchFeature(mock_agent)
+            await feature.initialize()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"answer": "ok", "results": [{"title": "t", "url": "u", "content": "c"}]}
+
+        mock_agent.features = {"WebSearchFeature": feature}
+        app = FastAPI()
+        app.state.agent = mock_agent
+        app.include_router(feature.get_router())
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post.return_value = mock_response
+            mock_instance.__aenter__.return_value = mock_instance
+            mock_instance.__aexit__.return_value = None
+            mock_client.return_value = mock_instance
+
+            with TestClient(app) as client:
+                resp = client.get("/api/features/web_search/test")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert "tavily" in body["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_test_endpoint_resolves_request_agent_not_closure(self, mock_agent):
+        """The action route must operate on the request's agent, not ``self``.
+
+        In multi-agent mode every agent's router mounts at the same global path,
+        so FastAPI matches the first-registered handler. If that handler closed
+        over its own ``self.tool`` it would report the wrong agent's state. Here
+        the router is built from a DISABLED feature, but the request's agent
+        carries an ENABLED feature instance — the response must reflect the
+        request's agent (enabled), proving request-scoped resolution.
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        # Router owner: disabled feature (simulates the "first mounted" agent).
+        with patch.dict("os.environ", {}, clear=True):
+            router_owner = WebSearchFeature(mock_agent)
+            await router_owner.initialize()
+        assert router_owner.tool.enabled is False
+
+        # The request's agent carries a DIFFERENT, enabled feature instance.
+        with patch.dict("os.environ", {"TAVILY_API_KEY": "test-key"}):
+            request_feature = WebSearchFeature(mock_agent)
+            await request_feature.initialize()
+        assert request_feature.tool.enabled is True
+
+        request_agent = MagicMock()
+        request_agent.features = {"WebSearchFeature": request_feature}
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"answer": "ok", "results": [{"title": "t", "url": "u", "content": "c"}]}
+
+        app = FastAPI()
+        app.state.agent = request_agent
+        app.include_router(router_owner.get_router())
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post.return_value = mock_response
+            mock_instance.__aenter__.return_value = mock_instance
+            mock_instance.__aexit__.return_value = None
+            mock_client.return_value = mock_instance
+
+            with TestClient(app) as client:
+                resp = client.get("/api/features/web_search/test")
+
+        assert resp.status_code == 200
+        # Reflects the request's (enabled) agent, NOT the router owner (disabled).
+        assert resp.json()["ok"] is True
+
+
+# =============================================================================
 # Integration-style Tests (still unit, but more comprehensive)
 # =============================================================================
 

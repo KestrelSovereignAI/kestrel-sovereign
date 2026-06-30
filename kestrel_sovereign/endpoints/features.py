@@ -394,17 +394,53 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _secret_field_names(schema: Optional[Dict[str, Any]]) -> set:
+    """Return property names that hold secrets and must never be returned.
+
+    A field is treated as a secret when the schema marks it ``writeOnly: true``
+    or ``format: "password"`` (standard JSON Schema keywords — see
+    ``docs/architecture/features/CONFIG_SCHEMA_UI_HINTS.md``).
+    """
+    if not schema:
+        return set()
+    properties = schema.get("properties", {})
+    secrets = set()
+    for key, prop in properties.items():
+        if not isinstance(prop, dict):
+            continue
+        if prop.get("writeOnly") is True or prop.get("format") == "password":
+            secrets.add(key)
+    return secrets
+
+
 @router.get("/api/features/{name}/config")
 async def get_feature_config(request: Request, name: str) -> Dict[str, Any]:
-    """Current configuration for a loaded feature."""
+    """Current configuration for a loaded feature.
+
+    Secret fields (``writeOnly``/``format: password``) are never returned in
+    plaintext. They are stripped from ``config`` and surfaced only as a boolean
+    in ``secrets_set`` so the UI can show whether a value is already stored
+    (write-only semantics).
+    """
     agent = get_agent(request)
     feature = _get_feature_or_404(agent, name)
 
     config = await feature.get_config()
+    schema = feature.config_schema
+
+    secrets_set: Dict[str, bool] = {}
+    secret_fields = _secret_field_names(schema)
+    if secret_fields and isinstance(config, dict):
+        config = dict(config)
+        for key in secret_fields:
+            secrets_set[key] = bool(config.get(key))
+            config.pop(key, None)
+
     return {
         "name": name,
         "config": config,
-        "config_schema": feature.config_schema,
+        "config_schema": schema,
+        "secrets_set": secrets_set,
     }
 
 
@@ -418,16 +454,34 @@ async def update_feature_config(
     Update feature configuration.
 
     Validates against the feature's config_schema if available.
+
+    Write-only secret fields omitted from the request body are preserved: the
+    stored value is re-injected before validation/save, so the frontend can
+    leave an unchanged secret out of the PATCH without clearing it.
     """
     agent = get_agent(request)
     feature = _get_feature_or_404(agent, name)
 
     schema = feature.config_schema
-    if schema is not None:
-        _validate_config(body.config, schema)
+    incoming = dict(body.config)
 
-    await feature.set_config(body.config)
+    secret_fields = _secret_field_names(schema)
+    if secret_fields:
+        current = await feature.get_config()
+        if isinstance(current, dict):
+            for key in secret_fields:
+                if key not in incoming and key in current:
+                    incoming[key] = current[key]
+
+    if schema is not None:
+        _validate_config(incoming, schema)
+
+    await feature.set_config(incoming)
     updated = await feature.get_config()
+
+    # Never echo secret values back to the client.
+    if secret_fields and isinstance(updated, dict):
+        updated = {k: v for k, v in updated.items() if k not in secret_fields}
 
     return {
         "name": name,
