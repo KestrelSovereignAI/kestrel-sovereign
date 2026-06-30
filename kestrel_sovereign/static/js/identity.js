@@ -9,6 +9,7 @@ import { disconnectNotifications, connectNotifications, loadModels, updateContex
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 import { mountAgentVoiceControls, onAgentSwitch as onVoiceAgentSwitch, reapplyActiveSelectorLock } from './voice/ui.js';
+import { UI } from './ui-ext/registry.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -786,6 +787,22 @@ export async function loadAgents() {
             }
             container.appendChild(item);
             mountAgentVoiceControls(item, voiceAgentKey);
+
+            // UI extension slot (#2038, ticket 02): per-card actions zone. The
+            // anchor is a dedicated container appended to the card; the registry
+            // mounts contributions (none yet — renders empty) and tears them
+            // down when the card detaches on the next list rebuild. Additive:
+            // the voice controls above stay until ticket 04.
+            const cardActionsAnchor = document.createElement('div');
+            cardActionsAnchor.dataset.slot = 'agent-card-actions';
+            cardActionsAnchor.className = 'agent-card-actions';
+            item.appendChild(cardActionsAnchor);
+            UI.renderSlot('agent-card-actions', {
+                element: cardActionsAnchor,
+                api: API,
+                agentName: agent.name,
+                standalone: isStandalone,
+            });
         }
 
         // Demo-server misconfig (#868): a server in demo_mode that mounted
@@ -856,6 +873,10 @@ window.selectAgent = async function(agentName) {
     // (clear/new chat, conversation switch, delete) do.
     mountChatPane(agentName);
     onVoiceAgentSwitch(previousAgentName, agentName);
+    // UI extension bus (#2038, ticket 02): emit the generic agent-switch event
+    // ALONGSIDE the legacy voice call above. This is strictly additive — the
+    // core→voice call stays until ticket 04 migrates voice onto the bus.
+    UI.emit('agent:switch', { prev: previousAgentName, next: agentName });
 
     // Refresh the chat-input "Thinking…" indicator + send/input disabled
     // state from the new agent's waiting status. If the previous agent

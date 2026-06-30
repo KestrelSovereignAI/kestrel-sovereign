@@ -109,7 +109,20 @@ function freshRootWithHeader() {
 function buttonByTitle(root, title) {
     const slot = root.querySelector('#chat-header-actions');
     assert.ok(slot, 'header-actions slot was created');
-    return slot.children.find((b) => b.title === title);
+    // As of slot-extension ticket 02, registerHeaderAction is a shim over the
+    // slot registry: each button lives inside its own registry-owned container
+    // under the slot. Walk the subtree and match by title (the registry retains
+    // contributions across these tests, so several buttons may be present).
+    const stack = [...slot.children];
+    while (stack.length) {
+        const n = stack.shift();
+        if (String(n.className || '').split(/\s+/).includes('chat-header-action')
+            && n.title === title) {
+            return n;
+        }
+        stack.push(...(n.children || []));
+    }
+    return undefined;
 }
 
 test('registerHeaderAction escapes a third-party label string (no raw HTML)', () => {

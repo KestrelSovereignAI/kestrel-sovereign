@@ -5,6 +5,7 @@
 
 import API from './api.js';
 import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
+import { UI } from './ui-ext/registry.js';
 
 let _deps = {
     api: null,
@@ -675,17 +676,25 @@ function trimPartialStreamSentinel(text) {
 // ============================================================================
 
 let _chatRoot = document;
-const _headerActions = [];
 
 export function setChatRoot(el) {
     _chatRoot = el || document;
 }
 
+// `registerHeaderAction` is the public embedder API (#1623/#1627). As of the
+// slot-extension epic (#2038, ticket 02) it is a THIN SHIM over the slot
+// registry: each action becomes a contribution in the `chat-header-actions`
+// zone, so there is exactly one action-registration mechanism, not two. The
+// public signature/behavior is preserved — embedders pass the same
+// `{ id, title, label, icon, onClick }` shape and the same button renders.
 export function registerHeaderAction(action) {
     if (!action || !action.id) return;
-    const i = _headerActions.findIndex((a) => a.id === action.id);
-    if (i >= 0) _headerActions[i] = action;
-    else _headerActions.push(action);
+    UI.register({
+        slot: 'chat-header-actions',
+        id: action.id,
+        order: typeof action.order === 'number' ? action.order : undefined,
+        render: (container) => renderHeaderActionButton(container, action),
+    });
     renderHeaderActions();
 }
 
@@ -758,7 +767,8 @@ function autocompleteEl() {
 function renderHeaderActions() {
     let slot = el('chat-header-actions');
     if (!slot) {
-        if (_headerActions.length === 0) return;
+        // Nothing to mount and no anchor yet — don't materialize an empty zone.
+        if (UI.contributions('chat-header-actions').length === 0) return;
         const root = (_chatRoot === document ? document : _chatRoot);
         const header = root.querySelector ? root.querySelector('.chat-header') : null;
         if (!header) return;
@@ -766,35 +776,41 @@ function renderHeaderActions() {
         slot.id = 'chat-header-actions';
         header.appendChild(slot);
     }
-    slot.innerHTML = '';
-    for (const action of _headerActions) {
-        const btn = document.createElement('button');
-        btn.className = 'chat-header-action';
-        btn.title = action.title || '';
-        // `registerHeaderAction` is the exported embedder API (#1623/#1627),
-        // so label/icon can be third-party supplied. `label` is always text —
-        // escape it. `icon` is an icon slot: pass a DOM Node for rich/SVG icons
-        // (appended safely), or a string treated as embedder-trusted markup for
-        // simple glyphs. Never interpolate an untrusted string as the icon (#1650).
-        // Duck-type the Node check (nodeType) so it's realm-safe (an icon built
-        // in another window/iframe still appends) rather than `instanceof Node`.
-        const iconIsNode = action.icon
-            && typeof action.icon === 'object'
-            && typeof action.icon.nodeType === 'number';
-        const sep = action.icon && action.label ? ' ' : '';
-        if (iconIsNode) {
-            btn.appendChild(action.icon);
-            if (action.label) {
-                btn.appendChild(document.createTextNode(sep + action.label));
-            }
-        } else {
-            btn.innerHTML =
-                (action.icon || '') +
-                (action.label ? sep + escapeHtml(action.label) : '');
+    UI.renderSlot('chat-header-actions', { element: slot, api: deps().api });
+}
+
+// Builds a single header-action button into the registry-owned container.
+// Factored out of the old `renderHeaderActions` so the slot registry drives
+// per-contribution rendering while the exact button markup (and its #1650 XSS
+// posture) is preserved verbatim.
+function renderHeaderActionButton(container, action) {
+    const btn = document.createElement('button');
+    btn.className = 'chat-header-action';
+    btn.title = action.title || '';
+    // `registerHeaderAction` is the exported embedder API (#1623/#1627),
+    // so label/icon can be third-party supplied. `label` is always text —
+    // escape it. `icon` is an icon slot: pass a DOM Node for rich/SVG icons
+    // (appended safely), or a string treated as embedder-trusted markup for
+    // simple glyphs. Never interpolate an untrusted string as the icon (#1650).
+    // Duck-type the Node check (nodeType) so it's realm-safe (an icon built
+    // in another window/iframe still appends) rather than `instanceof Node`.
+    const iconIsNode = action.icon
+        && typeof action.icon === 'object'
+        && typeof action.icon.nodeType === 'number';
+    const sep = action.icon && action.label ? ' ' : '';
+    if (iconIsNode) {
+        btn.appendChild(action.icon);
+        if (action.label) {
+            btn.appendChild(document.createTextNode(sep + action.label));
         }
-        btn.addEventListener('click', (event) => action.onClick && action.onClick(event));
-        slot.appendChild(btn);
+    } else {
+        btn.innerHTML =
+            (action.icon || '') +
+            (action.label ? sep + escapeHtml(action.label) : '');
     }
+    const handler = (event) => action.onClick && action.onClick(event);
+    btn.addEventListener('click', handler);
+    container.appendChild(btn);
 }
 
 let chatContainer = null;
@@ -1190,6 +1206,23 @@ export function initChat() {
     // - MultiAgent mode: selectAgent() handles both
     // - Standalone mode: app.js init handles both after loadAgents()
     renderHeaderActions();
+
+    // UI extension slots (#2038, ticket 02): first-pass render of the input-row
+    // zones. No feature is registered yet, so these render empty — wiring the
+    // call sites is the contract; features mount later via UI.register.
+    const root = (_chatRoot === document ? document : _chatRoot);
+    const inputActionsSlot = root.querySelector
+        ? root.querySelector('[data-slot="chat-input-actions"]')
+        : null;
+    if (inputActionsSlot) {
+        UI.renderSlot('chat-input-actions', { element: inputActionsSlot, api: deps().api });
+    }
+    const footerStatusSlot = root.querySelector
+        ? root.querySelector('[data-slot="input-footer-status"]')
+        : null;
+    if (footerStatusSlot) {
+        UI.renderSlot('input-footer-status', { element: footerStatusSlot, api: deps().api });
+    }
 }
 
 // ============================================================================

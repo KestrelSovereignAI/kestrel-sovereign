@@ -19,7 +19,8 @@ import {
     loadLocalFiles,
     loadIpfsStatus,
 } from './panels.js';
-import { mount as mountChat, loadModels, connectNotifications, updateContextStatus } from './chat.js';
+import { mount as mountChat, loadModels, connectNotifications, updateContextStatus, subscribeSSE } from './chat.js';
+import { UI } from './ui-ext/registry.js';
 import { initVoiceUI } from './voice/ui.js';
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
@@ -81,6 +82,30 @@ async function init() {
     // use, so the console dogfoods the extracted component instead of the old
     // initChat() path. Falls back to a document root if the panel is absent.
     mountChat(document.getElementById('panel-chat'));
+
+    // UI extension slots (#2038, ticket 02): mount the single shared overlay
+    // root once at boot and render its zone (empty until a feature contributes a
+    // modal). A dedicated `#modal-root` scopes modal teardown rather than
+    // leaking dialogs onto document.body.
+    let modalRoot = document.getElementById('modal-root');
+    if (!modalRoot) {
+        modalRoot = document.createElement('div');
+        modalRoot.id = 'modal-root';
+        document.body.appendChild(modalRoot);
+    }
+    UI.renderSlot('modal-root', { element: modalRoot, api: API });
+
+    // Bridge the server-push SSE channel onto the UI extension bus (#2038):
+    // backend `tools_updated` events become generic bus events so contributions
+    // re-gate/re-render without subscribing to SSE directly. Additive — voice
+    // keeps its own subscribeSSE('tools_updated', …) until ticket 04.
+    subscribeSSE('tools_updated', (evt) => {
+        let payload = null;
+        try {
+            payload = evt && evt.data ? JSON.parse(evt.data) : null;
+        } catch (_) { /* forward the bare event when the body isn't JSON */ }
+        UI.emit('tools_updated', payload);
+    });
 
     // Initialize voice UI shell — adds the 🎙️ button, transcript drawer,
     // voice picker. Auto-fallback Realtime → Pipeline based on the
