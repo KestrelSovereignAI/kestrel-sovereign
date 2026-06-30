@@ -428,6 +428,26 @@ async def stop_agent_request(request: Request):
         raise HTTPException(status_code=500, detail="Error stopping agent.")
 
 
+def _audit_status(agent) -> dict:
+    """Derive response-audit state from the real ResponseAuditFeature hook.
+
+    The previous ``audit_enabled`` boolean was a dead flag the audit hook
+    never consulted (#2034). Report the live hook's mode/registration so
+    the status API and the on/off switch share one state machine.
+    """
+    features = getattr(agent, "features", None) or {}
+    feature = features.get("ResponseAuditFeature")
+    if feature is None:
+        return {"available": False, "mode": "skip", "hook_registered": False}
+    hook = getattr(feature, "_hook", None)
+    hook_registered = hook is not None and getattr(hook, "enabled", False)
+    return {
+        "available": True,
+        "mode": getattr(feature, "_mode", "skip"),
+        "hook_registered": hook_registered,
+    }
+
+
 @router.get("/info")
 async def get_agent_info(request: Request):
     """Get agent information including DID and privacy mode."""
@@ -437,7 +457,7 @@ async def get_agent_info(request: Request):
             "agent_id": agent.agent_id,
             "privacy_mode": agent.privacy_mode.value if hasattr(agent.privacy_mode, 'value') else str(agent.privacy_mode),
             "features": list(agent.features.keys()) if hasattr(agent, 'features') else [],
-            "audit_enabled": getattr(agent, 'audit_enabled', True),
+            "audit": _audit_status(agent),
         }
     except Exception as e:
         logger.error(f"Error getting agent info: {e}", exc_info=True)
