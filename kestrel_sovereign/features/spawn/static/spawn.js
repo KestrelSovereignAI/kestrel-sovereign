@@ -185,6 +185,15 @@ bus.on('panel:shown', (payload) => {
     if (payload && payload.panelId === 'spawn') loadSpawn();
 });
 
+// Explicit teardown when the panel gates off at runtime (feature disabled while
+// being viewed). The panel registry detaches the `#panel-spawn` node, which
+// fires no `active`-class mutation, so the auto-refresh observer alone would
+// never stop the interval — it would keep issuing hidden /api/spawn/children
+// requests. `panel:hidden` is the deterministic stop signal.
+bus.on('panel:hidden', (payload) => {
+    if (payload && payload.panelId === 'spawn') stopAutoRefresh();
+});
+
 // ============================================================================
 // Auto-refresh
 // ============================================================================

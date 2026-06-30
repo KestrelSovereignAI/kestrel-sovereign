@@ -124,7 +124,20 @@ function _syncNav() {
             // runtime (feature disabled), and forget its rendered state so a
             // re-enable re-renders fresh. In-place core panels are left alone.
             const panel = document.getElementById(`panel-${def.panelId}`);
-            if (panel && panel.dataset.registryOwned === 'true') panel.remove();
+            if (panel) {
+                // Run the panel's deactivation path BEFORE detaching/hiding it.
+                // Panel code keys teardown off losing the `active` class (e.g.
+                // Spawn's auto-refresh MutationObserver), and a detached node
+                // fires no class mutation — so a gated-off panel viewed live
+                // would keep doing work (polling /api/spawn/children) forever.
+                // Strip `active` (drives the observer path) and fire an explicit
+                // `panel:hidden` teardown event (the deterministic path).
+                if (panel.classList.contains('active')) {
+                    panel.classList.remove('active');
+                }
+                bus.emit('panel:hidden', { panelId: def.panelId });
+                if (panel.dataset.registryOwned === 'true') panel.remove();
+            }
             _rendered.delete(def.panelId);
             continue;
         }

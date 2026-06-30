@@ -121,15 +121,19 @@ def _resolve_asset_url(
     return f"{mount_path}/{path}"
 
 
-def _enabled_feature_items(agent) -> List[Tuple[str, UIContributions]]:
-    """Yield ``(feature_key, contributions)`` for enabled features that declare UI.
+def _feature_items(agent, *, include_disabled: bool = False) -> List[Tuple[str, UIContributions]]:
+    """Yield ``(feature_key, contributions)`` for features that declare UI.
 
     A feature present in ``agent.features`` and not runtime-disabled is enabled.
+    When ``include_disabled`` is True, runtime-disabled features are included too
+    — used by the server to mount asset dirs for ALL features that declare a
+    ``static_dir`` so a feature enabled at runtime serves its JS without a restart
+    (the manifest at ``GET /api/ui/contributions`` still lists only enabled ones).
     """
     features = getattr(agent, "features", {}) or {}
     items: List[Tuple[str, UIContributions]] = []
     for name, feature in features.items():
-        if not getattr(feature, "enabled", True):
+        if not include_disabled and not getattr(feature, "enabled", True):
             continue
         getter = getattr(feature, "get_ui_contributions", None)
         if not callable(getter):
@@ -167,16 +171,22 @@ def _default_capability(feature_key: str, contrib: UIContributions) -> str:
     return feature_key
 
 
-def feature_static_mounts(agent) -> List[Tuple[str, str]]:
+def feature_static_mounts(agent, *, include_disabled: bool = False) -> List[Tuple[str, str]]:
     """Return ``(mount_path, directory)`` pairs for the server to mount.
 
-    One per enabled feature that declares an existing ``static_dir``. The server
-    mounts each at ``mount_path`` (``/features/{name}/static``) so the feature's
-    own assets are served same-origin.
+    One per feature that declares an existing ``static_dir``. The server mounts
+    each at ``mount_path`` (``/features/{name}/static``) so the feature's own
+    assets are served same-origin.
+
+    The server passes ``include_disabled=True`` so a feature that starts DISABLED
+    still gets its asset dir mounted at startup. Otherwise enabling it from the
+    Feature Store would surface its contribution in the manifest while its
+    ``static_dir`` was never mounted — the dynamic ``import()`` would 404 and the
+    tab would never appear until a restart (the runtime-enable 404, #2048).
     """
     mounts: List[Tuple[str, str]] = []
     seen: set = set()
-    for feature_key, contrib in _enabled_feature_items(agent):
+    for feature_key, contrib in _feature_items(agent, include_disabled=include_disabled):
         if not contrib.static_dir:
             continue
         directory = Path(contrib.static_dir).expanduser()
@@ -203,7 +213,7 @@ def compute_ui_manifest(agent) -> List[Dict[str, Any]]:
     """
     manifest: List[Dict[str, Any]] = []
 
-    for feature_key, contrib in _enabled_feature_items(agent):
+    for feature_key, contrib in _feature_items(agent):
         mount_path = (
             f"/features/{_feature_mount_name(feature_key)}/static"
             if contrib.static_dir
