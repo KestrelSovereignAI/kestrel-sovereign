@@ -22,9 +22,10 @@
  * This module self-registers its UI into the slot registry (#2038) at import
  * time: app.js loads it as a bare side-effect import (`import './voice/ui.js'`)
  * and each surface above is a `UI.register({ slot, gate, render, events })`
- * contribution. Core no longer calls voice by name to mount it. The
- * model-selector ownership lock (`reapplyActiveSelectorLock` and friends) is the
- * one surface left coupled by name, pending ticket 09.
+ * contribution. Core no longer calls voice by name to mount it, nor for the
+ * model-selector takeover: voice seizes the selector through its generic
+ * claim/release/refresh API (`ModelSelector.claims`, #2047) and reacts to the
+ * `model-selector:ready` bus event, so `chat.js` carries no voice references.
  */
 
 import API from '../api.js';
@@ -288,6 +289,20 @@ function ensureGlobalVoiceWiring() {
     const { prev, next } = payload || {};
     onAgentSwitch(prev, next);
   });
+
+  // chat.js rebuilds the shared model selector from scratch on init and on every
+  // agent switch, announcing it on the bus (#2047). React generically: re-mark
+  // the Realtime model unpickable, and re-assert any live session's claim that
+  // the rebuild discarded (the generalization of the old reapplyActiveSelectorLock
+  // path). No core→voice-by-name coupling remains in chat.js.
+  bus.on('model-selector:ready', () => {
+    markRealtimeModelUnpickable();
+    reapplyActiveSelectorLock();
+  });
+
+  // The selector may already exist by the time voice wires up (ordering depends
+  // on standalone vs multi-agent boot), so mark it once now too.
+  markRealtimeModelUnpickable();
 }
 
 // Mic button (chat-input-actions zone): renders left of #send-button via the
@@ -731,6 +746,11 @@ async function toggleSession() {
 // ---------------------------------------------------------------------------
 
 
+// Voice's id in the model selector's generic claim registry (#2047). Voice is
+// the sole claimant of the selector today; the registry enforces single-holder.
+const VOICE_CLAIM_ID = 'voice';
+
+
 function _chatModelSelector() {
   // Exposed by chat.js loadModels().  Returns null when chat isn't initialized
   // (e.g. headless dev pages), in which case ownership becomes a noop.
@@ -741,25 +761,64 @@ function _chatModelSelector() {
 function acquireSelectorOwnership(realtimeModelId, session = activeSession()) {
   if (!isActiveSession(session)) return;
   const sel = _chatModelSelector();
-  if (!sel || typeof sel.lockToVoiceModel !== 'function') return;
-  // OpenAI is the only Realtime vendor today; if that ever changes the
-  // session payload should carry the vendor so we can pass it through here.
-  sel.lockToVoiceModel(
-    { vendor: 'openai', model: realtimeModelId },
-    '🎙 voice owns this — stop voice to change',
-  );
+  if (!sel || !sel.claims) return;
   session.realtimeModel = realtimeModelId;
   session.ownsSelector = true;
+
+  // Pin the selector to the live Realtime model. The pin reads the model from
+  // the session each time, so onRefresh (after the dropdown rebuilds its
+  // options) re-asserts against whatever model is current. OpenAI is the only
+  // Realtime vendor today; if that changes the session payload should carry the
+  // vendor so we can pass it through here.
+  const pin = (widget) => widget.pinToModel(
+    {
+      vendor: 'openai',
+      model: session.realtimeModel,
+      label: `🎙 ${session.realtimeModel}`,
+    },
+    '🎙 voice owns this — stop voice to change',
+  );
+
+  const alreadyOurs = sel.claims.has(VOICE_CLAIM_ID);
+  // Single-holder claim. Voice is the only claimant, so acquire succeeds (or is
+  // a no-op when voice already holds it); auto-released when the voice
+  // capability drops (registry watches `capabilities:changed`).
+  sel.claims.acquire(VOICE_CLAIM_ID, {
+    capability: 'voice',
+    onAcquire: pin,
+    onRefresh: pin,
+    onRelease: (widget) => widget.unpinSelection(),
+  });
+  // Re-assert when we already held the claim (e.g. the realtime model changed):
+  // a fresh acquire ran onAcquire already, so only refresh the existing holder.
+  if (alreadyOurs) sel.claims.refresh();
 }
 
 
 function releaseSelectorOwnership(session = activeSession()) {
   if (!session.ownsSelector) return;
   const sel = _chatModelSelector();
-  if (sel && typeof sel.unlockToPrior === 'function') {
-    sel.unlockToPrior();
-  }
+  if (sel && sel.claims) sel.claims.release(VOICE_CLAIM_ID);
   session.ownsSelector = false;
+}
+
+
+// Mark the voice route's Realtime model as unpickable in the chat-model
+// dropdown so the operator can see it exists but cannot select it by hand for
+// text chat (the mic button owns it — #1371). Driven by voice's own capability,
+// not a core→voice branch in chat.js (#2047). Fire-and-forget: a missing voice
+// feature or auth failure just leaves the selector fully pickable.
+async function markRealtimeModelUnpickable() {
+  const sel = _chatModelSelector();
+  if (!sel || typeof sel.setUnpickableModels !== 'function') return;
+  try {
+    const route = await fetchRoute();
+    if (route && route.voice_model) {
+      sel.setUnpickableModels([route.voice_model]);
+    }
+  } catch (_) {
+    // Voice not configured / network noise — selector stays usable.
+  }
 }
 
 

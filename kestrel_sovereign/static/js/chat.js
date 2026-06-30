@@ -6,6 +6,7 @@
 import API from './api.js';
 import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
+import bus from './ui-ext/bus.js';
 import {
     registerRenderer,
     findToolRenderer,
@@ -293,9 +294,9 @@ export function registerCoreParts() {
 // Maps a tool name (the `<name>` from a `🔧 Calling <name>...` marker) to
 // the status phase shown while that tool runs. Tuned against the live
 // Kestrel tool inventory (core + feature extensions: fs_*, git_*,
-// recall_*, schedule_*, council_*, health_*, voice, etc.). First rule
+// recall_*, schedule_*, council_*, health_*, say_*, etc.). First rule
 // that matches wins, so ORDER MATTERS — the specific verbs (search,
-// recall, orchestration, voice, run, push) lead, then the broad mutation
+// recall, orchestration, speak, run, push) lead, then the broad mutation
 // family, then the broad read family last. Token boundaries are deliberate:
 // bare `web` would mis-flag `webhooks_*`, and bare `ask` would mis-flag
 // `*_task` — both are pinned by the unit tests.
@@ -308,7 +309,7 @@ const TOOL_PHASE_RULES = [
     [/ask_|consult|delegate|subagent|dispatch|council|deploy_agent|_task\b|task_|_child\b|child_|list_peers|terminate_child/i, 'consulting'],
     // Vision / documents we "look" at.
     [/image|vision|\bsee\b|\blook\b|photo|screenshot|camera|ccda|visual/i, 'looking'],
-    // Voice out / in.
+    // Speech out / in.
     [/\bspeak\b|\btts\b|say_/i, 'speaking'],
     [/transcribe|\bstt\b|\blisten/i, 'listening'],
     // Run / execute.
@@ -877,6 +878,10 @@ let composerModeToggle = null;  // #1257 send-while-busy mode toggle
 
 // Shared model selector instance
 let sharedModelSelector = null;
+// One-time guard: the selector claim auto-release bridge (capabilities:changed →
+// claims.onCapabilitiesChanged) is wired once, then forwards to whatever
+// selector is live. See loadModels(). (#2047)
+let _selectorClaimAutoReleaseWired = false;
 
 // Autocomplete state
 let autocompleteSelectedIndex = -1;
@@ -893,7 +898,7 @@ function getChatContainer() {
 /**
  * Resolve the chat pane element a write should target. When called
  * with no arg, defaults to the currently-mounted agent's pane — this
- * is what voice/ui.js and other no-arg consumers rely on so a single
+ * is what no-arg consumers (e.g. the aside-reply pipe) rely on so a single
  * helper signature works for both "write to the visible chat" and
  * "write to a specific agent's detached pane".
  */
@@ -3423,7 +3428,7 @@ window.compactContext = async function() {
 /**
  * Append a streaming message bubble. Optional paneElement targets a
  * specific agent's detached pane; without it, defaults to the visible
- * (mounted) agent's pane so single-agent and voice-pipe call sites
+ * (mounted) agent's pane so single-agent and background-pane call sites
  * continue to work without modification. Scroll-syncs only when the
  * write lands on the currently-mounted pane.
  */
@@ -3535,9 +3540,9 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
  * Final-render a streaming bubble. `paneOrElement` accepts either a
  * pane element directly or a full pane object — passing the pane lets
  * us defer mermaid rendering when the pane is currently detached. The
- * caller in sendMessage passes the pane; voice/ui.js passes nothing
- * and gets the visible-pane default (mermaid runs immediately because
- * the pane is already mounted).
+ * caller in sendMessage passes the pane; background-pane callers pass
+ * nothing and get the visible-pane default (mermaid runs immediately
+ * because the pane is already mounted).
  *
  * Note: this no longer calls checkForModelChange(). The shared model
  * selector is a global singleton — letting helpers mutate it from a
@@ -3547,9 +3552,10 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
 export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = null, opts = {}) {
     // `includePaneArtifacts`: whether to prepend THIS pane's accumulated
     // text-chat stream artifacts (thinking bubbles, tool cards) onto the
-    // finalized bubble. Text-chat turns want this; voice turns pass the pane
+    // finalized bubble. Text-chat turns want this; aside turns (a streamed
+    // reply rendered into an already-mounted pane out of band) pass the pane
     // for targeting + mermaid deferral but set this false so a prior text
-    // turn's thinking/tool cards don't bleed into the voice reply. #1771.
+    // turn's thinking/tool cards don't bleed into the aside reply. #1771.
     const includePaneArtifacts = opts.includePaneArtifacts !== false;
     const contentDiv = msgDiv.querySelector('.message-content');
     if (!contentDiv) return;
@@ -3845,34 +3851,30 @@ export async function loadModels() {
     // Expose globally so other modules (identity.js) can auto-switch on privacy change
     window._sharedModelSelector = sharedModelSelector;
 
+    // Forward runtime capability changes to the selector's claim registry once
+    // (#2047). A feature that has seized the selector declares the capability
+    // backing its claim; the registry auto-releases the claim when that
+    // capability is disabled at runtime. The closure reads the live
+    // `sharedModelSelector` binding, so it always targets the current selector
+    // across rebuilds. Generic — no feature is named here.
+    if (!_selectorClaimAutoReleaseWired) {
+        _selectorClaimAutoReleaseWired = true;
+        bus.on('capabilities:changed', (payload) => {
+            if (sharedModelSelector && sharedModelSelector.claims) {
+                sharedModelSelector.claims.onCapabilitiesChanged(payload);
+            }
+        });
+    }
+
     // Update state with initial selection (both provider and model)
     const selection = sharedModelSelector.getSelection();
     deps().state.selectedModel = selection.model;
     deps().state.selectedProvider = selection.provider;
 
-    if (deps().api.hasCapability('voice')) {
-        // Discover the voice route's Realtime model and mark it unpickable in the
-        // dropdown.  The mic button owns this model (see #1371) — the user can see
-        // it exists but should not pick it manually for text chat.  Fire-and-forget:
-        // a missing voice feature or auth failure just means no unpickable models
-        // (the selector stays usable).
-        (async () => {
-            try {
-                const headers = await deps().api.applyAuth({});
-                const resp = await fetch(
-                    deps().api.buildAgentUrl('/voice/realtime/route'),
-                    { headers },
-                );
-                if (!resp.ok) return;
-                const route = await resp.json();
-                if (route?.voice_model) {
-                    sharedModelSelector.setUnpickableModels([route.voice_model]);
-                }
-            } catch (_) {
-                // Voice not configured / network noise — selector stays usable.
-            }
-        })();
-    }
+    // Announce that the shared selector is (re)built so features that decorate
+    // or temporarily seize it can (re)attach (#2047). chat.js itself stays
+    // feature-agnostic: it publishes the event, it does not know who listens.
+    UI.emit('model-selector:ready', { selector: sharedModelSelector });
 }
 
 /**

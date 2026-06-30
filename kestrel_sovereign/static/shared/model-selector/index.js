@@ -74,11 +74,22 @@ class ModelSelector {
         // the OpenAI Realtime model, which is owned by the mic button. Rendered
         // as <option disabled> with a 🎙 prefix. See kestrel-sovereign#1371.
         this._unpickableModels = new Set();
-        // Voice-owned lock state. Non-null while the mic button has taken the
-        // selector. Stores prior selection so we can restore on every voice
-        // exit path. Lock state is intentionally NOT persisted to localStorage:
-        // it is transient UI ownership, not a user choice.
-        this._voiceLock = null;
+        // Pin state. Non-null while a feature holds an exclusive claim that has
+        // pinned the selector to a specific model. Stores the prior selection so
+        // we can restore on release. Intentionally NOT persisted to localStorage:
+        // it is transient UI ownership, not a user choice. See `pinToModel`.
+        this._pinnedSelection = null;
+        // Re-entrancy guard: `pinToModel` calls `_populateModels`, which calls
+        // back into the claim's `onRefresh` — set this while applying a pin so
+        // that re-assert can't recurse. See `_populateModels`.
+        this._applyingPin = false;
+
+        // Generic single-holder claim/release/refresh negotiation for this
+        // shared widget (kestrel-sovereign#2047). A feature (today: voice) that
+        // needs to temporarily seize the selector acquires a claim here. The
+        // registry is widget-agnostic; the claim's callbacks drive the actual
+        // pin via `pinToModel`/`unpinSelection`.
+        this.claims = new WidgetClaimRegistry(this);
 
         this._loadState();
     }
@@ -318,7 +329,7 @@ class ModelSelector {
         // Build model options.  Unpickable models render as <option disabled>
         // with a 🎙 prefix so the operator can see they exist but cannot
         // select them by hand (the mic button drives them).  Selecting the
-        // option programmatically still works — see lockToVoiceModel().
+        // option programmatically still works — see pinToModel().
         const optionsHtml = visible.map(m => {
             const isUnpickable = this._unpickableModels.has(m.id);
             const star = m.is_featured ? '★ ' : '';
@@ -352,6 +363,14 @@ class ModelSelector {
                 this.modelSelect.value = visible[0].id;
                 this.selectedModel = visible[0].id;
             }
+        }
+
+        // If a feature holds an exclusive claim, the option rebuild above may
+        // have wiped its pinned/injected option — let it re-assert. Guarded by
+        // `_applyingPin` so the re-assert (which itself rebuilds options via
+        // pinToModel → _populateModels) cannot recurse. (#2047)
+        if (!this._applyingPin && this.claims && this.claims.isHeld()) {
+            this.claims.refresh();
         }
     }
 
@@ -738,83 +757,101 @@ class ModelSelector {
     }
 
     /**
-     * Voice took ownership of the selector for the lifetime of one mic
-     * engagement.  Captures the prior selection, switches the visible
-     * vendor + model to the given Realtime model, and disables every select
-     * (provider / route / model) until ``unlockToPrior`` runs.  No localStorage
-     * write — the lock is transient UI state.
+     * Pin the selector to a specific model for the lifetime of a feature's
+     * exclusive claim (the generic mechanism behind voice's realtime takeover —
+     * #2047).  Captures the prior selection on the first pin, switches the
+     * visible vendor + model to ``target``, and disables every select
+     * (provider / route / model) until ``unpinSelection`` runs.  No localStorage
+     * write — the pin is transient UI state.
+     *
+     * Safe to call again while already pinned: a re-pin re-asserts the same
+     * target without clobbering the captured prior selection.  This is the
+     * ``onRefresh`` path — after ``_populateModels`` rebuilds the option list,
+     * the held claim re-asserts so the pinned option survives the rebuild.
      *
      * If the target model isn't present in any vendor bucket (e.g. discovery
      * hasn't surfaced it yet), a transient <option> is injected so the value
-     * can still be displayed; that option is removed on unlock.
+     * can still be displayed; that option is removed on release.
      *
      * @param {Object} target
-     * @param {string} target.vendor   Vendor key the Realtime model lives under.
+     * @param {string} target.vendor   Vendor key the model lives under.
      * @param {string} target.model    Model id (e.g. ``gpt-realtime-2``).
      * @param {string} [target.route]  Optional route id.
-     * @param {string} [reason]        Human-readable tooltip explaining the lock.
+     * @param {string} [target.label]  Option text for the injected marker
+     *           (defaults to the model id; voice passes ``🎙 <model>``).
+     * @param {string} [reason]        Human-readable tooltip explaining the pin.
      */
-    lockToVoiceModel(target, reason) {
-        if (this._voiceLock) return;  // re-entrant: keep the first capture
-        const { vendor, model, route } = target || {};
+    pinToModel(target, reason) {
+        const { vendor, model, route, label } = target || {};
         if (!model) return;
 
-        this._voiceLock = {
-            priorProvider: this.selectedProvider,
-            priorModel: this.selectedModel,
-            priorRoute: this.selectedRoute,
-            injectedOption: false,
-        };
+        // Capture prior selection only on the FIRST pin; a re-assert (onRefresh)
+        // must keep the original prior so unpin restores the user's pre-pin pick.
+        if (!this._pinnedSelection) {
+            this._pinnedSelection = {
+                priorProvider: this.selectedProvider,
+                priorModel: this.selectedModel,
+                priorRoute: this.selectedRoute,
+                injectedOption: false,
+            };
+        }
 
-        // Flip the visible vendor first so _populateModels rebuilds the bucket.
-        if (vendor && this.providerSelect) {
-            this.providerSelect.value = vendor;
-            this.selectedProvider = vendor;
-            this._populateModels();
-        }
-        if (route && this.routeSelect) {
-            this.routeSelect.value = route;
-            this.selectedRoute = route;
-        }
-        // If the target model isn't in the rebuilt option list, inject a
-        // transient marker option.  Tagged so we can find + remove it.
-        if (this.modelSelect) {
-            const existing = Array.from(this.modelSelect.options).some(o => o.value === model);
-            if (!existing) {
-                const opt = document.createElement('option');
-                opt.value = model;
-                opt.textContent = `🎙 ${model}`;
-                opt.dataset.voiceInjected = 'true';
-                opt.disabled = true;  // unpickable, but value-assignable
-                this.modelSelect.appendChild(opt);
-                this._voiceLock.injectedOption = true;
+        // Re-entrancy guard so the _populateModels call below doesn't recurse
+        // back through the claim's onRefresh into pinToModel.
+        this._applyingPin = true;
+        try {
+            // Flip the visible vendor first so _populateModels rebuilds the bucket.
+            if (vendor && this.providerSelect) {
+                this.providerSelect.value = vendor;
+                this.selectedProvider = vendor;
+                this._populateModels();
             }
-            this.modelSelect.value = model;
-            this.selectedModel = model;
-        }
+            if (route && this.routeSelect) {
+                this.routeSelect.value = route;
+                this.selectedRoute = route;
+            }
+            // If the target model isn't in the rebuilt option list, inject a
+            // transient marker option.  Tagged so we can find + remove it.
+            if (this.modelSelect) {
+                const existing = Array.from(this.modelSelect.options).some(o => o.value === model);
+                if (!existing) {
+                    const opt = document.createElement('option');
+                    opt.value = model;
+                    opt.textContent = label || model;
+                    opt.dataset.claimInjected = 'true';
+                    opt.disabled = true;  // unpickable, but value-assignable
+                    this.modelSelect.appendChild(opt);
+                    this._pinnedSelection.injectedOption = true;
+                }
+                this.modelSelect.value = model;
+                this.selectedModel = model;
+            }
 
-        // Disable every select.  ``disabled`` keeps the value visible while
-        // blocking user interaction; aria-disabled + title make the reason
-        // discoverable.
-        for (const el of [this.providerSelect, this.routeSelect, this.modelSelect]) {
-            if (!el) continue;
-            el.disabled = true;
-            el.setAttribute('aria-disabled', 'true');
-            if (reason) el.title = reason;
+            // Disable every select.  ``disabled`` keeps the value visible while
+            // blocking user interaction; aria-disabled + title make the reason
+            // discoverable.
+            for (const el of [this.providerSelect, this.routeSelect, this.modelSelect]) {
+                if (!el) continue;
+                el.disabled = true;
+                el.setAttribute('aria-disabled', 'true');
+                if (reason) el.title = reason;
+            }
+        } finally {
+            this._applyingPin = false;
         }
     }
 
     /**
-     * Release the voice lock and restore the captured prior selection.
+     * Release the pin and restore the captured prior selection.
      * Idempotent — safe to call from every exit path (close, fatal error,
      * page unload, agent switch) without bookkeeping.
      */
-    unlockToPrior() {
-        if (!this._voiceLock) return;
-        const { priorProvider, priorModel, priorRoute, injectedOption } = this._voiceLock;
-        this._voiceLock = null;
+    unpinSelection() {
+        if (!this._pinnedSelection) return;
+        const { priorProvider, priorModel, priorRoute, injectedOption } = this._pinnedSelection;
+        this._pinnedSelection = null;
 
-        // Re-enable selects + clear the lock tooltip.
+        // Re-enable selects + clear the pin tooltip.
         for (const el of [this.providerSelect, this.routeSelect, this.modelSelect]) {
             if (!el) continue;
             el.disabled = false;
@@ -822,8 +859,8 @@ class ModelSelector {
             el.removeAttribute('title');
         }
 
-        // Restore prior selection.  setSelection writes localStorage; voice
-        // never wrote anything, so this just restores the pre-engage value.
+        // Restore prior selection.  setSelection writes localStorage; the pin
+        // never wrote anything, so this just restores the pre-pin value.
         if (priorProvider && this.providerSelect) {
             this.providerSelect.value = priorProvider;
             this.selectedProvider = priorProvider;
@@ -838,29 +875,154 @@ class ModelSelector {
             this.selectedModel = priorModel;
         }
 
-        // Drop any transient option we injected so re-engagements re-inject
-        // cleanly and the dropdown doesn't grow stale entries.
+        // Drop any transient option we injected so re-pins re-inject cleanly and
+        // the dropdown doesn't grow stale entries.
         if (injectedOption && this.modelSelect) {
             for (const opt of Array.from(this.modelSelect.options)) {
-                if (opt.dataset && opt.dataset.voiceInjected === 'true') {
+                if (opt.dataset && opt.dataset.claimInjected === 'true') {
                     opt.remove();
                 }
             }
         }
     }
 
-    /** True while the voice lock is engaged. */
-    isVoiceLocked() {
-        return this._voiceLock !== null;
+    /** True while the selector is pinned by an exclusive claim. */
+    isPinned() {
+        return this._pinnedSelection !== null;
+    }
+}
+
+/**
+ * Generic single-holder claim/release/refresh negotiation for a shared widget
+ * (kestrel-sovereign#2047).
+ *
+ * Some core widgets are occasionally seized by a feature for the lifetime of a
+ * session — the canonical case is voice taking over the model selector during a
+ * realtime session ("while my session is live, this control is mine, then I give
+ * it back"). That is a negotiation, not a mount point, so it gets this small
+ * contract instead of being forced into the slot model.
+ *
+ * Single-holder: while a claim is held a second `acquire` by a DIFFERENT holder
+ * is rejected (returns false); re-`acquire` by the SAME holder is an idempotent
+ * success. The claim is released automatically when the claiming feature's
+ * capability drops (forward the UI bus `capabilities:changed` payload to
+ * `onCapabilitiesChanged`).
+ *
+ * The registry is deliberately widget-agnostic — `widget` is opaque and simply
+ * handed back to each callback. Any shared widget can own one of these; only
+ * the model selector does today.
+ */
+class WidgetClaimRegistry {
+    /** @param {object} widget - the shared widget this registry guards. */
+    constructor(widget) {
+        this._widget = widget;
+        /** @type {{id: string, capability?: string, onAcquire?: Function, onRelease?: Function, onRefresh?: Function} | null} */
+        this._claim = null;
+    }
+
+    /**
+     * Seize the widget for ``claimId``.
+     *
+     * @param {string} claimId  Stable id identifying the holder.
+     * @param {Object} [spec]
+     * @param {string}   [spec.capability]  Capability whose loss auto-releases
+     *           this claim (see {@link onCapabilitiesChanged}).
+     * @param {(widget: any) => void} [spec.onAcquire]  Run on successful acquire.
+     * @param {(widget: any) => void} [spec.onRelease]  Run on release.
+     * @param {(widget: any) => void} [spec.onRefresh]  Run when the widget asks
+     *           the holder to re-assert (e.g. after it rebuilds its options).
+     * @returns {boolean} true if acquired (or already held by this id); false if
+     *           held by a different id (single-holder reject).
+     */
+    acquire(claimId, spec = {}) {
+        if (!claimId) return false;
+        if (this._claim) {
+            // Single-holder: same holder re-acquiring is an idempotent success;
+            // a different holder is rejected (the stated safe default — #2047).
+            return this._claim.id === claimId;
+        }
+        this._claim = { id: claimId, ...spec };
+        this._run('onAcquire');
+        return true;
+    }
+
+    /**
+     * Relinquish the claim. Idempotent: a no-op when nothing is held, or when
+     * ``claimId`` is supplied and does not match the current holder.
+     *
+     * @param {string} [claimId] When given, only releases if it matches.
+     */
+    release(claimId) {
+        if (!this._claim) return;
+        if (claimId && this._claim.id !== claimId) return;
+        const claim = this._claim;
+        this._claim = null;
+        this._invoke(claim, 'onRelease');
+    }
+
+    /** Ask the current holder to re-assert its claim. No-op when unheld. */
+    refresh() {
+        this._run('onRefresh');
+    }
+
+    /** True while any claim is held. */
+    isHeld() {
+        return this._claim !== null;
+    }
+
+    /** The id of the current holder, or null. */
+    heldBy() {
+        return this._claim ? this._claim.id : null;
+    }
+
+    /** True when ``claimId`` is the current holder. */
+    has(claimId) {
+        return this._claim !== null && this._claim.id === claimId;
+    }
+
+    /**
+     * React to a UI-bus ``capabilities:changed`` payload: if the current holder
+     * declared a ``capability`` and it is now absent/false in the payload's
+     * capability map, auto-release. This is how a claim is relinquished when the
+     * claiming feature is disabled at runtime (#2047 / ticket 03). Generic — the
+     * registry doesn't know which capability any particular feature uses.
+     *
+     * @param {{capabilities?: Record<string, boolean>} | null} payload
+     */
+    onCapabilitiesChanged(payload) {
+        const claim = this._claim;
+        if (!claim || !claim.capability) return;
+        const caps = payload && payload.capabilities;
+        // Only act when we actually have a capability map to judge against; a
+        // bare/empty payload can't prove the capability is gone.
+        if (!caps || typeof caps !== 'object') return;
+        if (!caps[claim.capability]) this.release(claim.id);
+    }
+
+    /** Invoke a callback on the CURRENT claim (used by acquire/refresh). */
+    _run(hook) {
+        if (this._claim) this._invoke(this._claim, hook);
+    }
+
+    /** Invoke ``hook`` on ``claim``, isolating throws so one bad holder can't wedge the widget. */
+    _invoke(claim, hook) {
+        const fn = claim[hook];
+        if (typeof fn !== 'function') return;
+        try {
+            fn(this._widget);
+        } catch (err) {
+            console.error(`[widget-claims] ${hook} for "${claim.id}" threw:`, err);
+        }
     }
 }
 
 // Export for ES modules
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { ModelSelector, VENDOR_NAMES, PROVIDER_NAMES };
+    module.exports = { ModelSelector, WidgetClaimRegistry, VENDOR_NAMES, PROVIDER_NAMES };
 }
 
 // Export globally for script tag usage
 window.SharedModelSelector = ModelSelector;
+window.WidgetClaimRegistry = WidgetClaimRegistry;
 window.VENDOR_NAMES = VENDOR_NAMES;
 window.PROVIDER_NAMES = PROVIDER_NAMES;
