@@ -44,7 +44,18 @@ registry tears its contributions down.
 
 1. Add server-side capability computation from the enabled-feature set.
 2. Inject into `window.KESTREL_UI_CONFIG.capabilities` at page render.
-3. Merge precedence: explicit host override > server-derived > static default.
+3. Merge precedence — **asymmetric, because a disabled feature has no assets to gate
+   into:**
+   - **Core/static capabilities** (chrome, conversations, …): explicit host override >
+     static default (unchanged from today).
+   - **Feature-derived capabilities:** server-derived *disabled* is **authoritative**
+     and cannot be overridden true. A host override may only force a feature
+     capability **off** (force-true on a disabled feature is ignored, with a console
+     warning). Rationale: ticket 05 filters `/api/ui/contributions` to *enabled*
+     features, so a forced-true-but-disabled feature would gate its UI "available"
+     while its modules were never loaded — a guaranteed-broken state. Disabled means
+     disabled, end to end.
+   - Effective value = `serverEnabled && (hostOverride !== false)`.
 4. Wire enable/disable endpoints
    ([features.py:247/268](../../../kestrel_sovereign/endpoints/features.py)) to push
    `capabilities:changed`.
@@ -58,6 +69,9 @@ registry tears its contributions down.
 - A new feature gains a working `hasCapability(<name>)` with **zero** edits to
   `api_client.mjs`.
 - Runtime enable/disable flips UI without reload.
+- A host override cannot force a *disabled* feature's capability true (verified: gate
+  stays false, contributions stay torn down, manifest still excludes it). Host
+  override force-*off* on an enabled feature does work.
 
 ## Risk
 

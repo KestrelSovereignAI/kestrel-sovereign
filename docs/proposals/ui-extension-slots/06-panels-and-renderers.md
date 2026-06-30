@@ -35,11 +35,24 @@ to it.
   tool-sentinel pipeline) rather than creating a parallel one — survey it first
   (`static/shared/markdown/*`, chat.js tool-card rendering) and map onto the existing
   dispatch point.
-- Contract: `registerRenderer({match: {tool?|contentType?}, render(el, payload, ctx)})`.
+- Contract: `registerRenderer({match: {tool?|contentType?}, render(payload, ctx) =>
+  string | {html: string} | DocumentFragment})`. The renderer **returns** markup/a
+  fragment; it is **not** handed the live target element. Core sanitizes the returned
+  value and inserts it. This makes sanitization enforceable *by construction* — a
+  renderer cannot write to the DOM before DOMPurify runs.
+  - Rationale: a `render(el, ...)` contract that hands over the live element cannot
+    guarantee sanitization — a buggy/adversarial renderer could assign `el.innerHTML`
+    or attach inline handlers before core ever sees the output. Return-based output is
+    the only contract where the sanitization guarantee actually holds.
+  - If a renderer genuinely needs imperative DOM (e.g. a canvas/chart), it returns a
+    placeholder element via the sanitized fragment and attaches behavior in a
+    follow-up `mount(rootEl, ctx)` callback that operates **only** on the element core
+    created from the sanitized markup — never on arbitrary core DOM.
 - Renderers are gated by capability like every other contribution.
-- **Sanitization is non-negotiable:** feature renderer output flows through the same
-  DOMPurify path as core ([static/shared/markdown](../../../kestrel_sovereign/static/shared/markdown)).
-  A renderer cannot bypass sanitization.
+- **Sanitization is non-negotiable and structural:** all returned markup flows through
+  the same DOMPurify path as core
+  ([static/shared/markdown](../../../kestrel_sovereign/static/shared/markdown)). The
+  contract shape (return, don't mutate) is what enforces it.
 
 ## Tasks
 
@@ -56,7 +69,9 @@ to it.
 - A feature can add a nav panel and a custom tool renderer with no core edits.
 - Voice tool cards now render via the registry; ticket-04's deferred row is closed.
 - All renderer output is sanitized; an adversarial renderer returning a `<script>`
-  payload is neutralized (test it).
+  payload, an inline `onerror=` handler, or a `javascript:` href is neutralized
+  (test all three). Because the contract is return-based, there is no code path by
+  which a renderer can write unsanitized markup to the DOM.
 
 ## Risk
 
