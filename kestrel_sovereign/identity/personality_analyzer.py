@@ -168,6 +168,7 @@ class PersonalityAnalyzer:
             """SELECT content FROM conversation_history
                WHERE agent_id = ? AND role = 'assistant'
                AND content IS NOT NULL AND content != ''
+               AND deleted_at IS NULL
                ORDER BY id DESC LIMIT ?""",
             (self.agent_id, self.sample_limit)
         )
@@ -428,6 +429,7 @@ class PersonalityAnalyzer:
                WHERE ch1.agent_id = ? AND ch1.role = 'user'
                AND ch2.agent_id = ? AND ch2.role = 'assistant'
                AND ch1.content IS NOT NULL AND ch2.content IS NOT NULL
+               AND ch1.deleted_at IS NULL AND ch2.deleted_at IS NULL
                AND length(ch1.content) > 20 AND length(ch2.content) > 50
                ORDER BY ch1.id DESC
                LIMIT 50""",
