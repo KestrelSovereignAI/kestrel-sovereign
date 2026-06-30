@@ -21,7 +21,6 @@ BUILTIN_COMMAND_SPECS = [
     # System
     {"cmd": "!status", "handler": "_cmd_status", "description": "Show agent status", "category": "System"},
     {"cmd": "!help", "handler": "_cmd_help", "description": "Show available commands", "category": "System"},
-    {"cmd": "!audit", "handler": "_cmd_audit", "description": "Toggle or check audit status", "args": "[on|off]", "category": "System"},
     {"cmd": "!reload-context", "handler": "_cmd_reload_context", "description": "Hot-reload bootstrap files from disk", "category": "System"},
     {"cmd": "!heartbeat", "handler": "_cmd_heartbeat", "description": "Trigger a manual heartbeat check", "category": "System"},
 
@@ -351,7 +350,6 @@ class CommandHandler:
             "System:",
             "  !status              - Show agent status",
             "  !help                - Show this help",
-            "  !audit [on|off]      - Toggle or check audit status",
             "  !reload-context      - Hot-reload bootstrap files from disk",
             "  !heartbeat           - Trigger a manual heartbeat check",
             "",
@@ -395,20 +393,13 @@ class CommandHandler:
                     lines.append(f"  {cmd:<20} - {desc}")
 
         return "\n".join(lines)
-    
-    def _cmd_audit(self, user_input: str) -> str:
-        """Handle !audit command."""
-        parts = user_input.split()
-        if len(parts) > 1:
-            opt = parts[1].lower()
-            if opt == "off":
-                self.agent.audit_enabled = False
-                return "Audit disabled."
-            if opt == "on":
-                self.agent.audit_enabled = True
-                return "Audit enabled."
-        return f"Audit is {'enabled' if self.agent.audit_enabled else 'disabled'}."
-    
+
+    # !audit / !audit-on / !audit-off are handled by ResponseAuditFeature
+    # (command_prefix on its audit_status / audit_enable / audit_disable
+    # tools). There is intentionally no built-in audit handler — a legacy
+    # stub here would shadow the real feature and report a dead flag the
+    # audit hook never consults (#2034).
+
     # === Constitution Commands ===
     
     async def _cmd_verify_constitution(self, user_input: str) -> str:

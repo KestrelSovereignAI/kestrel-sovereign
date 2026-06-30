@@ -86,9 +86,6 @@ async def demo_sovereignty_export():
         privacy_mode=PrivacyMode.NORMAL
     )
 
-    # Disable audit for demo (would need real LLM)
-    agent.audit_enabled = False
-
     print("✅ Agent initialized")
     print()
 

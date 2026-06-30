@@ -120,22 +120,20 @@ async def test_anonymous_rejected_from_reanchor():
 @pytest.mark.asyncio
 async def test_non_governance_command_works_for_oauth_user():
     handler, agent = _make_handler()
-    agent.audit_enabled = True
 
     caller = CallerContext.authenticated("user@example.com")
-    result = await handler.handle("!audit", caller=caller)
+    result = await handler.handle("!help", caller=caller)
 
-    assert "audit" in result.lower()
+    assert "agent" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_non_governance_command_works_with_no_caller():
     handler, agent = _make_handler()
-    agent.audit_enabled = False
 
-    result = await handler.handle("!audit", caller=None)
+    result = await handler.handle("!help", caller=None)
 
-    assert "audit" in result.lower()
+    assert "agent" in result.lower()
 
 
 @pytest.mark.asyncio

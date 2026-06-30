@@ -1360,7 +1360,6 @@ class KestrelAgent(
             # Initialize state
             self.conversations = {}
             self.extension = None
-            self.audit_enabled = True
             self._session_briefed = False
             self._safe_mode = False
             self._constitution_verified = False
@@ -1376,11 +1375,6 @@ class KestrelAgent(
                 await self.hooks_manager.execute_hooks_parallel(
                     HookEvent.SESSION_START, hook_input
                 )
-
-            # Disable audit if only mock providers are available (demo mode)
-            if self.llm_service.providers and all(p["name"] == "mock" for p in self.llm_service.providers):
-                self.audit_enabled = False
-                logging.info("Audit disabled - only mock LLM providers available (demo mode)")
 
             # Ensure agent graph node exists
             logging.info(f"Getting agent node from storage (agent_id={self.agent_id})")

@@ -36,7 +36,9 @@ These are the core commands handled directly by the orchestrator. Additional fea
 ### System Commands
 - `!status` - Show your agent ID and current privacy mode status
 - `!help` - Show available commands
-- `!audit [on|off]` - Toggle or check audit status
+- `!audit` - Show response-audit status (mode, hook registration)
+- `!audit-on [warn|strict]` - Enable response audit
+- `!audit-off` - Disable response audit
 
 ### Constitution & Integrity Commands
 - `!constitution` - Get full text of the Constitution
