@@ -322,9 +322,12 @@ async function installFeature(name) {
 
 async function enableFeature(name) {
     try {
-        await API.request(`/api/features/${encodeURIComponent(name)}/enable`, {
+        const resp = await API.request(`/api/features/${encodeURIComponent(name)}/enable`, {
             method: 'POST',
         });
+        // #2041: re-derive capabilities from the new enabled set and emit
+        // capabilities:changed so the UI re-gates without a page reload.
+        if (resp && resp.capabilities) API.applyServerCapabilities(resp.capabilities);
         Toast.success(`${name} enabled`);
         await loadFeatureStore();
     } catch (error) {
@@ -335,9 +338,12 @@ async function enableFeature(name) {
 
 async function disableFeature(name) {
     try {
-        await API.request(`/api/features/${encodeURIComponent(name)}/disable`, {
+        const resp = await API.request(`/api/features/${encodeURIComponent(name)}/disable`, {
             method: 'POST',
         });
+        // #2041: a disabled feature flips its capability false; re-derive and
+        // emit so the registry tears its contributions down (no reload).
+        if (resp && resp.capabilities) API.applyServerCapabilities(resp.capabilities);
         Toast.success(`${name} disabled`);
         await loadFeatureStore();
     } catch (error) {

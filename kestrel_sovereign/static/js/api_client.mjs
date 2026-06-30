@@ -15,12 +15,19 @@
 
 const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
 
-// Canonical list of UI capabilities a host can opt out of (#879).  Embedded
-// hosts populate ``KESTREL_UI_CONFIG.capabilities`` with a subset of these
-// keys set to ``false`` (or to a nested object for partial support); missing
-// keys default to ``true`` so standalone Kestrel renders unchanged.  This is
-// the single source of truth — when a new panel ships, add its key here and
-// have the panel guard its init() with ``API.hasCapability(key)``.
+// Canonical list of known UI capability keys (#879, #2041).
+//
+// Two classes live here:
+//   * core/static — host-chrome + console capabilities with no backing feature
+//     (chrome, chat, conversations, …). A host opts out by setting the key
+//     ``false`` on ``KESTREL_UI_CONFIG.capabilities``; missing keys default to
+//     ``true`` so standalone Kestrel renders unchanged.
+//   * feature-backed (#2041) — voice, spawn, memory, … . These are NO LONGER
+//     static defaults: their effective value is *derived* from the enabled
+//     feature set, computed server-side and delivered via
+//     ``KESTREL_UI_CONFIG.featureCapabilities`` (or ``GET /api/ui/capabilities``).
+//     A new feature gains a working ``hasCapability(<name>)`` with zero edits
+//     here. The entries below stay only as a canonical-name catalogue.
 //
 // Object-shaped values are supported via dot-paths (e.g. ``keys.agent``):
 // any sub-key absent from the host config is treated as ``true``.
@@ -249,6 +256,48 @@ export function resolveCapability(capabilities, path) {
     return true;
 }
 
+// #2041: merge the server-derived feature capability map over host overrides.
+//
+// The merge is ASYMMETRIC, because a disabled feature has no UI assets to gate
+// into:
+//   * Feature-backed keys (present in ``featureCaps``): the server's *disabled*
+//     verdict is authoritative. A host override may only force a capability
+//     OFF; a force-TRUE on a disabled feature is ignored (with a console
+//     warning). Effective = ``serverEnabled && (hostOverride !== false)``.
+//   * Core/static keys (only in host overrides): host override wins, exactly as
+//     before. Keys absent from both stay default-on via ``resolveCapability``.
+//
+// Exported for unit tests.
+export function mergeCapabilities(featureCaps, hostOverrides, logger = globalThis.console) {
+    const features = (featureCaps && typeof featureCaps === 'object') ? featureCaps : {};
+    const overrides = (hostOverrides && typeof hostOverrides === 'object') ? hostOverrides : {};
+    const merged = {};
+
+    for (const [key, enabled] of Object.entries(features)) {
+        const override = overrides[key];
+        if (enabled) {
+            merged[key] = override === false ? false : true;
+        } else {
+            if (override === true) {
+                logger?.warn?.(
+                    `[capabilities] ignoring host override forcing disabled feature '${key}' on — `
+                    + 'a disabled feature has no UI assets to gate into',
+                );
+            }
+            merged[key] = false;
+        }
+    }
+
+    // Core/static + nested host overrides flow through untouched. Feature-backed
+    // keys were already resolved above and must not be re-overwritten here.
+    for (const [key, val] of Object.entries(overrides)) {
+        if (key in merged) continue;
+        merged[key] = val;
+    }
+
+    return merged;
+}
+
 export function createApiClient({
     fetchFn = globalThis.fetch,
     sessionStorage = globalThis.sessionStorage,
@@ -258,6 +307,7 @@ export function createApiClient({
     TextDecoderCtor = globalThis.TextDecoder,
     authProvider = null,
     capabilities = null,
+    featureCapabilities = null,
 } = {}) {
     const fetchImpl = getRequiredDependency('fetch', fetchFn);
     const sessionStore = getRequiredDependency('sessionStorage', sessionStorage);
@@ -273,11 +323,32 @@ export function createApiClient({
         logger: log,
     });
 
-    // Capabilities map (#879).  ``null`` and ``{}`` both mean "host did not
-    // opt out of anything"; missing keys default to ``true``.  Stored as a
-    // plain object so callers can read it via ``client.getCapabilities()``
-    // for diagnostics, but the resolver is the only sanctioned read path.
-    const capsMap = capabilities && typeof capabilities === 'object' ? capabilities : {};
+    // Capabilities (#879, #2041).  ``capabilities`` carries host overrides
+    // (``null``/``{}`` = opted out of nothing); ``featureCapabilities`` is the
+    // server-derived feature-backed map.  The effective ``capsMap`` is the
+    // merge of the two (see ``mergeCapabilities``); missing keys still default
+    // to ``true`` via the resolver.  ``capsMap`` is mutable so a runtime
+    // enable/disable can re-derive it without a page reload — read it only via
+    // ``hasCapability``/``getCapabilities``.
+    const hostOverrides = capabilities && typeof capabilities === 'object' ? capabilities : {};
+    let serverFeatureCaps =
+        featureCapabilities && typeof featureCapabilities === 'object' ? featureCapabilities : {};
+    let capsMap = mergeCapabilities(serverFeatureCaps, hostOverrides, log);
+
+    function emitCapabilitiesChanged() {
+        // #2041: notify the (interim) bus so the registry / navigation re-gates
+        // without a reload. Dispatched on globalThis so DOM and non-DOM hosts
+        // can both subscribe; a no-op where CustomEvent/dispatchEvent are absent.
+        try {
+            if (typeof CustomEvent === 'function' && typeof globalThis.dispatchEvent === 'function') {
+                globalThis.dispatchEvent(
+                    new CustomEvent('capabilities:changed', { detail: { capabilities: capsMap } }),
+                );
+            }
+        } catch (_) {
+            /* non-DOM environment — nothing subscribes */
+        }
+    }
 
     const state = {
         selectedHostAgent: null,
@@ -704,6 +775,29 @@ export function createApiClient({
             return resolveCapability(capsMap, path);
         },
         getCapabilities() {
+            return capsMap;
+        },
+        // #2041: re-derive the capability set from a fresh server-side feature
+        // map (host overrides are re-applied with the same precedence), then
+        // emit ``capabilities:changed`` so the UI re-gates without a reload.
+        applyServerCapabilities(featureCaps, { emit = true } = {}) {
+            serverFeatureCaps = featureCaps && typeof featureCaps === 'object' ? featureCaps : {};
+            capsMap = mergeCapabilities(serverFeatureCaps, hostOverrides, log);
+            if (emit) emitCapabilitiesChanged();
+            return capsMap;
+        },
+        // Fetch the current feature capability map from the server and apply it.
+        // Used at boot when the page render did not inject ``featureCapabilities``
+        // (e.g. multi-agent host mode) and after a runtime enable/disable.
+        async refreshCapabilities() {
+            try {
+                const data = await client.request('/api/ui/capabilities');
+                if (data && data.capabilities) {
+                    this.applyServerCapabilities(data.capabilities);
+                }
+            } catch (e) {
+                log.warn?.('[capabilities] refresh failed; keeping current set', e);
+            }
             return capsMap;
         },
     };

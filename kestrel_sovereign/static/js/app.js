@@ -49,6 +49,17 @@ async function init() {
         document.body.classList.add('console-chrome-hidden');
     }
 
+    // #2041: the capability set is derived from enabled features. The standalone
+    // server injects window.KESTREL_UI_CONFIG.featureCapabilities at page render
+    // so the merge is ready synchronously. In multi-agent host / embed mode where
+    // the render could not resolve a single agent, fetch the map now — BEFORE
+    // initNavigation prunes panels or any feature registration runs (boot order:
+    // config+capabilities → registry/nav → render).
+    const bootConfig = (typeof globalThis !== 'undefined' && globalThis.KESTREL_UI_CONFIG) || {};
+    if (!bootConfig.featureCapabilities) {
+        await API.refreshCapabilities();
+    }
+
     // Set up lazy loaders for navigation (panels loaded on tab click)
     setLazyLoaders({
         loadConstitution,

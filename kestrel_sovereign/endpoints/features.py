@@ -19,6 +19,7 @@ from kestrel_sovereign.feature_registry import (
     get_registry,
     get_skills_for_package,
 )
+from kestrel_sovereign.ui_capabilities import compute_feature_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,24 @@ async def list_installed_features(request: Request) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# UI capability derivation (#2041)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/ui/capabilities")
+async def get_ui_capabilities(request: Request) -> Dict[str, Any]:
+    """Feature-backed UI capability set for the current agent.
+
+    Each key is a feature's registry name; the value is whether that feature is
+    enabled on this agent. The frontend merges this over its core/static
+    defaults — see ``mergeCapabilities`` in ``api_client.mjs``. Re-fetched after
+    a runtime enable/disable so the UI re-gates without a page reload.
+    """
+    agent = get_agent(request)
+    return {"capabilities": compute_feature_capabilities(agent)}
+
+
+# ---------------------------------------------------------------------------
 # Single-feature detail & lifecycle
 # ---------------------------------------------------------------------------
 
@@ -254,15 +273,39 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     agent = get_agent(request)
     feature = _get_feature_or_404(agent, name)
 
-    # Re-register hooks with the agent's HooksManager
+    # Re-register hooks with the agent's HooksManager. Track what we registered
+    # so a failing on_enable() can be fully rolled back — otherwise the feature
+    # would be left half-enabled (hooks live, `enabled` flag true) while the
+    # endpoint reports an error, and the next capability computation would see it
+    # as enabled.
     hooks_manager = getattr(agent, "hooks_manager", None)
+    registered_hooks = []
     if hooks_manager:
         for hook in feature.get_hooks():
             hooks_manager.register(hook)
+            registered_hooks.append(hook)
             logger.info(f"Re-registered hook '{hook.name}' for feature '{name}'")
 
-    await feature.on_enable()
-    return {"name": name, "status": "enabled"}
+    # Flip the flag only after on_enable() succeeds. If the lifecycle hook
+    # raises, unwind the hook registrations and leave `enabled` untouched so the
+    # feature stays authoritatively off.
+    try:
+        await feature.on_enable()
+    except Exception:
+        if hooks_manager:
+            for hook in registered_hooks:
+                hooks_manager.unregister(hook)
+                logger.info(
+                    f"Rolled back hook '{hook.name}' for feature '{name}' after on_enable() failed"
+                )
+        raise
+
+    feature.enabled = True
+    return {
+        "name": name,
+        "status": "enabled",
+        "capabilities": compute_feature_capabilities(agent),
+    }
 
 
 @router.post("/api/features/{name}/disable")
@@ -285,7 +328,12 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
             hooks_manager.unregister(hook)
             logger.info(f"Unregistered hook '{hook.name}' for feature '{name}'")
 
-    return {"name": name, "status": "disabled"}
+    feature.enabled = False
+    return {
+        "name": name,
+        "status": "disabled",
+        "capabilities": compute_feature_capabilities(agent),
+    }
 
 
 @router.post("/api/features/{name}/remove")
