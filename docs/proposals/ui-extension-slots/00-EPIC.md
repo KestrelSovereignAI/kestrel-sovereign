@@ -69,11 +69,14 @@ The audit also found the codebase already grew two partial extension APIs in
   sanitization, and it is a **separate path** from positional tool cards
   (`renderToolCardsHtml`), which have **no** renderer hook today.
 - **`registerHeaderAction(action)`** ([chat.js:684](../../../kestrel_sovereign/static/js/chat.js))
-  — effectively **abandoned**: exported but never called internally, and voice
-  deliberately bypasses it (it is header-only, rebuilds all buttons on every call
-  destroying live state, supports only `onClick`, and models no per-agent context).
-  Its limitations are not a foundation — they are the **acceptance criteria** the slot
-  registry (ticket 02) must satisfy and then supersede.
+  — a **documented embedder-facing API** (#1623/#1627,
+  [chat.js:774](../../../kestrel_sovereign/static/js/chat.js)) with **no internal
+  feature adoption**: voice deliberately bypasses it (it is header-only, rebuilds all
+  buttons on every call destroying live state, supports only `onClick`, models no
+  per-agent context). Its limitations are not a foundation — they are the **acceptance
+  criteria** the slot registry (ticket 02) must satisfy and then supersede. Because
+  embedders may depend on it, ticket 02 must **preserve its contract** (shim over the
+  new registry), not delete it.
 
 ## What voice actually needs (the surface area)
 

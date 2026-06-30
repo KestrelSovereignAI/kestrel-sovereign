@@ -44,10 +44,12 @@ and *pressure-tests it against every voice touch point* before any code is writt
      **separate path** from positional tool cards (`renderToolCardsHtml`), which have
      **no** hook today.
    - `registerHeaderAction(action)`
-     ([chat.js:684](../../../kestrel_sovereign/static/js/chat.js)) — abandoned;
-     voice bypasses it. Its limitations (header-only position, full rebuild on every
-     call, `onClick`-only, no per-agent context) become **explicit requirements** for
-     the ticket-02 registry, which supersedes it.
+     ([chat.js:684](../../../kestrel_sovereign/static/js/chat.js)) — a documented
+     embedder API (#1623/#1627) with no internal feature adoption; voice bypasses it.
+     Its limitations (header-only position, full rebuild on every call, `onClick`-only,
+     no per-agent context) become **explicit requirements** for the ticket-02 registry,
+     which supersedes it **while preserving its public contract** (embedders depend on
+     it).
    - Document `chrome`/embed mode and event-driven panel-independent UI as **out of
      slot scope** (host mode + event bus respectively).
 3. For each zone define: stable string id, the **context object** passed to

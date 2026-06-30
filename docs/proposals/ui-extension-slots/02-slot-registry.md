@@ -100,10 +100,12 @@ core→feature call: add the generic emit, leave the legacy call until 04.
 - `npm run test:js` green; new tests cover the registry/bus invariants above —
   including a test that updating one contribution does **not** tear down a sibling.
 - No feature-name strings (`voice`, etc.) appear in registry/bus code.
-- `registerHeaderAction` is either reimplemented as a thin shim over
-  `UI.register('chat-input-actions'|'chat-header-actions', ...)` or marked deprecated
-  with a migration note — there must be exactly one action-registration mechanism,
-  not two. (Document the decision; do not leave both as independent live paths.)
+- `registerHeaderAction` is reimplemented as a thin shim over
+  `UI.register('chat-input-actions'|'chat-header-actions', ...)` so there is exactly
+  one action-registration mechanism, not two. Its **public signature/behavior is
+  preserved** — it is a documented embedder API (#1623/#1627) that external hosts may
+  depend on; do not break or silently drop it. (Document the shim; do not leave two
+  independent live paths.)
 
 ## Risks / decisions to resolve
 
