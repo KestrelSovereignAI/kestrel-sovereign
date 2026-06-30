@@ -7,16 +7,21 @@ like rate limiting (429) and server errors (5xx).
 import asyncio
 import logging
 import random
-from typing import Any, Callable, TypeVar
-
-from kestrel_sovereign.kestrel_config.constants import LLM_RETRY_MAX_DELAY_SECONDS
+from typing import Any, Callable, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
-# Retry configuration
-MAX_RETRIES = 5
-BASE_DELAY = 1.0  # seconds
-MAX_DELAY = LLM_RETRY_MAX_DELAY_SECONDS
+# Retry configuration.
+#
+# Tuned for *plan-route* throttling: a 429 on a subscription route (Claude
+# Max / ChatGPT plan) is "you're going too fast — wait", NOT "this route is
+# dead, fall back to the paid API". We must ride out a normal rate-limit
+# window on the plan route rather than silently downgrade to metered billing,
+# so the budget is deliberately patient (8 attempts, 2-minute cap). Honoring
+# the server's ``Retry-After`` (below) keeps the actual waits accurate.
+MAX_RETRIES = 8       # was 5
+BASE_DELAY = 1.0      # seconds
+MAX_DELAY = 120.0     # seconds — was LLM_RETRY_MAX_DELAY_SECONDS (60.0)
 
 # HTTP status codes that warrant retry. 401/403/404 are permanent and MUST
 # NOT appear here — retrying a dead API key burns wall-time on an error that
@@ -58,6 +63,44 @@ NON_RETRYABLE_PATTERNS = [
 T = TypeVar('T')
 
 
+def retry_after_seconds(error: Exception) -> Optional[float]:
+    """Extract the server-advised cool-down from a provider exception.
+
+    Honors the actual ``Retry-After`` (or ``retry-after-ms``) response header
+    the SDK exception carries, so we wait the amount the *server* asked for
+    instead of guessing with exponential backoff. Returns ``None`` when no
+    usable value is present (caller falls back to exponential backoff).
+    """
+    # SDK exceptions (anthropic/openai) carry the httpx response.
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            getter = headers.get
+        except AttributeError:
+            getter = None
+        if getter is not None:
+            ms = getter("retry-after-ms")
+            if ms:
+                try:
+                    return max(0.0, float(ms) / 1000.0)
+                except (TypeError, ValueError):
+                    pass
+            secs = getter("retry-after")
+            if secs:
+                try:
+                    # Numeric seconds. (An HTTP-date form is rare here and not
+                    # worth parsing — exponential backoff covers that case.)
+                    return max(0.0, float(secs))
+                except (TypeError, ValueError):
+                    pass
+    # Some SDKs surface a parsed attribute directly.
+    attr = getattr(error, "retry_after", None)
+    if isinstance(attr, (int, float)):
+        return max(0.0, float(attr))
+    return None
+
+
 def is_retryable_error(error: Exception) -> bool:
     """
     Check if an error is transient and should be retried.
@@ -72,7 +115,21 @@ def is_retryable_error(error: Exception) -> bool:
     Permanent-failure checks win first so a 401 error message that happens
     to contain the word "internal" in a nested detail doesn't trigger a
     misguided retry loop.
+
+    The provider's *structured* status code (``error.status_code`` on the
+    Anthropic/OpenAI SDK exceptions) is consulted before any string matching,
+    so a real ``RateLimitError`` is recognized as a 429 even when its message
+    text doesn't literally contain the number — we classify on the actual
+    error, not a hopeful substring.
     """
+    # 0. Structured status code from the SDK exception (most authoritative).
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        if status_code in NON_RETRYABLE_STATUS_CODES:
+            return False
+        if status_code in RETRYABLE_STATUS_CODES:
+            return True
+
     error_str = str(error).lower()
 
     # 1. Hard non-retryable status codes — word-boundary check to avoid
@@ -142,10 +199,22 @@ async def with_retry(
             if not is_retryable_error(e) or attempt == max_retries - 1:
                 raise
 
-            # Calculate delay with exponential backoff + jitter
-            delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+            # Prefer the server-advised cool-down; otherwise exponential
+            # backoff + jitter. Both are capped at ``max_delay``.
+            advised = retry_after_seconds(e)
+            if advised is not None:
+                delay = min(advised + random.uniform(0, 1), max_delay)
+            else:
+                delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+
+            # Log the *actual* error — type, status code, and advised wait —
+            # so a throttle that's being ridden out (rather than billed via
+            # fallback) is visible, not silent.
+            status_code = getattr(e, "status_code", None)
             logger.warning(
-                f"Retry {attempt + 1}/{max_retries} after {delay:.1f}s: {e}"
+                "LLM retry %d/%d after %.1fs (status=%s, retry_after=%s): %s: %s",
+                attempt + 1, max_retries, delay, status_code, advised,
+                type(e).__name__, e,
             )
             await asyncio.sleep(delay)
 

@@ -10,9 +10,31 @@ The retry layer must:
     through).
 """
 
+from unittest.mock import patch
+
 import pytest
 
-from kestrel_sovereign.llm.retry import is_retryable_error
+from kestrel_sovereign.llm.retry import (
+    is_retryable_error,
+    retry_after_seconds,
+    with_retry,
+)
+
+
+class _FakeResponse:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+class _FakeRateLimit(Exception):
+    """Shaped like an SDK ``RateLimitError``: carries a structured
+    ``status_code`` and a response with headers, regardless of message text."""
+
+    def __init__(self, message="rate limited", *, status_code=429, headers=None):
+        super().__init__(message)
+        self.status_code = status_code
+        if headers is not None:
+            self.response = _FakeResponse(headers)
 
 
 NON_RETRYABLE_CASES = [
@@ -93,3 +115,81 @@ def test_status_code_word_boundary():
     # No structural 401-status indicator (no "401 ", " 401", "code: 401", etc.)
     # so this falls through to unknown → no retry by default.
     assert is_retryable_error(err) is False
+
+
+# --- Structured-status classification (classify on the ACTUAL error) ---------
+
+
+def test_structured_429_retryable_even_without_429_in_text():
+    """A real RateLimitError may not contain '429' in its message; we must
+    classify on the structured status code, not a hopeful substring."""
+    err = _FakeRateLimit("You're sending requests too quickly", status_code=429)
+    assert is_retryable_error(err) is True
+
+
+def test_structured_401_non_retryable_even_with_retry_wording():
+    err = _FakeRateLimit("rate stuff but actually auth", status_code=401)
+    assert is_retryable_error(err) is False
+
+
+# --- Retry-After extraction --------------------------------------------------
+
+
+def test_retry_after_header_seconds():
+    assert retry_after_seconds(_FakeRateLimit(headers={"retry-after": "12"})) == 12.0
+
+
+def test_retry_after_header_millis():
+    assert retry_after_seconds(_FakeRateLimit(headers={"retry-after-ms": "2500"})) == 2.5
+
+
+def test_retry_after_absent_returns_none():
+    assert retry_after_seconds(_FakeRateLimit(headers={})) is None
+    assert retry_after_seconds(Exception("plain error, no response")) is None
+
+
+# --- with_retry actually retries a throttle (instead of propagating) ---------
+
+
+@pytest.mark.asyncio
+async def test_with_retry_rides_out_throttle_then_succeeds():
+    """The core fix: a 429 is retried (honoring Retry-After) and ultimately
+    succeeds — it does NOT propagate to the caller's fallback chain on the
+    first throttle."""
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _FakeRateLimit("429 slow down", status_code=429, headers={"retry-after": "5"})
+        return "ok"
+
+    slept = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
+        result = await with_retry(flaky)
+
+    assert result == "ok"
+    assert calls["n"] == 3
+    # Honored the server's 5s cool-down (+ <1s jitter), not blind 1s/2s backoff.
+    assert all(5.0 <= d < 6.0 for d in slept), slept
+
+
+@pytest.mark.asyncio
+async def test_with_retry_caps_advised_delay_at_max():
+    async def throttled():
+        raise _FakeRateLimit("429", status_code=429, headers={"retry-after": "9999"})
+
+    slept = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
+        with pytest.raises(_FakeRateLimit):
+            await with_retry(throttled, max_retries=2)
+
+    assert slept and all(d <= 120.0 for d in slept)
