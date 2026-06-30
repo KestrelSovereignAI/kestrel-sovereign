@@ -210,15 +210,11 @@ async def test_resolve_local_auto_routes_contacts_local_routes_only():
     cloud = {"name": "openai:api", "vendor": "openai", "model": "auto", "is_local": False}
     local = {"name": "ollama:local", "vendor": "ollama", "model": "auto", "is_local": True}
     svc.providers = [cloud, local]
-    svc._select_discovery_routes = MagicMock(
-        return_value=[("openai", cloud), ("ollama", local)]
-    )
-    discovered = {"models": ["local-model-info"]}
     contacted = []
 
     async def _discover(vendor, route):
         contacted.append(vendor)
-        return discovered["models"]
+        return ["local-model-info"]
 
     svc._discover_for_vendor_route = AsyncMock(side_effect=_discover)
     svc._resolve_auto_providers = MagicMock()
@@ -234,31 +230,41 @@ async def test_resolve_local_auto_routes_contacts_local_routes_only():
 
 @pytest.mark.asyncio
 async def test_resolve_local_auto_routes_does_not_mutate_cloud_sharing_vendor():
-    """#2069 codex r4: a cloud route that SHARES a vendor with a local route
-    must not be resolved to a locally-discovered model id (else a later
-    non-local request would send a local-only model to the cloud route).
-    End-to-end through the real _resolve_auto_providers."""
+    """#2069 codex r4/r5: a cloud route that SHARES a vendor with a local route
+    must (a) still get its local route discovered+resolved — even though
+    _select_discovery_routes collapses to one route per vendor and might pick
+    the cloud one — and (b) NOT have the cloud route itself resolved to a
+    locally-discovered model id (else a later non-local request would send a
+    local-only model to the cloud route). End-to-end through real
+    _resolve_auto_providers and real local-route iteration (no _select mock)."""
     from kestrel_sovereign.llm.service import LLMService
     from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 
     svc = LLMService.__new__(LLMService)
-    # Same vendor "acme", two routes: cloud (auto) and local (auto).
+    # Same vendor "acme", two routes: cloud (auto) and local (auto). The cloud
+    # route is listed FIRST so a per-vendor selector would prefer it.
     cloud = {"name": "acme:api", "vendor": "acme", "model": "auto", "is_local": False,
              "selection_hints": []}
     local = {"name": "acme:local", "vendor": "acme", "model": "auto", "is_local": True,
              "selection_hints": []}
     svc.providers = [cloud, local]
-    svc._select_discovery_routes = MagicMock(return_value=[("acme", local)])
     svc._ensure_route_catalogs_sync = MagicMock()
     svc._route_catalogs = {}
     local_model = ModelInfo(
         id="acme-local-7b", provider="acme", display_name="Acme Local 7B",
         category=ModelCategory.CHAT, is_featured=True, is_hidden=False,
     )
-    svc._discover_for_vendor_route = AsyncMock(return_value=[local_model])
+    contacted = []
+
+    async def _discover(vendor, route):
+        contacted.append(route["name"])
+        return [local_model]
+
+    svc._discover_for_vendor_route = AsyncMock(side_effect=_discover)
 
     await svc._resolve_local_auto_routes()
 
+    assert contacted == ["acme:local"], "must discover the LOCAL route directly"
     assert local["model"] == "acme-local-7b", "local route must resolve"
     assert cloud["model"] == "auto", "cloud route sharing the vendor must stay 'auto'"
 

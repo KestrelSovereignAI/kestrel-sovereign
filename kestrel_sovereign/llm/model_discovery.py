@@ -195,24 +195,25 @@ class ModelDiscoveryMixin:
         """
         if not hasattr(self, "providers") or not isinstance(self.providers, list):
             return
-        local_routes = [
-            (vendor, route)
-            for vendor, route in self._select_discovery_routes()
-            if route.get("is_local")
-        ]
-        if not local_routes:
+        # Iterate the ACTUAL local provider routes — NOT _select_discovery_routes,
+        # which collapses to one route per vendor and may pick the cloud route,
+        # dropping a local route that shares that vendor (leaving it "auto").
+        local_providers = [p for p in self.providers if p.get("is_local")]
+        if not local_providers:
             return
         models: list = []
-        for vendor, route in local_routes:
+        for route in local_providers:
+            vendor = route.get("vendor") or route.get("name", "").split(":", 1)[0]
             try:
                 models.extend(await self._discover_for_vendor_route(vendor, route))
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Local-only discovery failed for %s: %s", vendor, exc)
+                logger.warning(
+                    "Local-only discovery failed for %s: %s", route.get("name"), exc
+                )
         if models:
             # Mutate ONLY local routes — never a cloud route that happens to
             # share a vendor with a local route (else a later non-local request
             # would send this local-only model id to the cloud route).
-            local_providers = [p for p in self.providers if p.get("is_local")]
             self._resolve_auto_providers(models, only_providers=local_providers)
 
     def _resolve_auto_providers(self, models: list, only_providers: Optional[list] = None) -> None:
