@@ -21,6 +21,35 @@
 
 import API from '../api.js';
 
+// Pin a feature-static asset URL to the selected agent in multi-agent host mode.
+//
+// The manifest is fetched per selected agent (host-agent-prefixed), but the
+// module/css URLs it carries are root-relative — ``/features/{slug}/static/…``.
+// Imported as-is, that root-relative URL would be served by the HOST, which owns
+// no feature mounts; the host would have to guess which backing agent serves the
+// asset, and the first-configured agent is the WRONG one whenever agents have
+// heterogeneous feature sets (the selected agent may have the feature enabled
+// while the first does not) (#2048). Pinning the URL to the selected agent makes
+// the existing ``/api/agents/{id}/…`` proxy route it to the agent whose manifest
+// actually declared the contribution — no host-side guessing, no homogeneity
+// assumption.
+//
+// Only ``/features/…`` (feature-shipped, static_dir-backed) URLs are pinned.
+// Core-bundled assets (``/js/…``) are served by the host directly and must stay
+// un-prefixed. In standalone mode ``buildAgentUrl`` is a no-op (no selected
+// agent), so the URL is returned unchanged and the server's own
+// ``/features/{slug}/static/`` mount serves it.
+function pinFeatureAssetUrl(url) {
+    if (
+        typeof url === 'string'
+        && url.startsWith('/features/')
+        && typeof API.buildAgentUrl === 'function'
+    ) {
+        return API.buildAgentUrl(url);
+    }
+    return url;
+}
+
 // Inject a feature-contributed stylesheet once. Idempotent — the manifest may
 // be (re)loaded and a stylesheet must not be appended twice.
 function injectFeatureStylesheet(href) {
@@ -58,11 +87,11 @@ export async function loadFeatureUIContributions() {
         for (const entry of contributions) {
             if (entry.capability && !API.hasCapability(entry.capability)) continue;
             for (const href of entry.css || []) {
-                injectFeatureStylesheet(href);
+                injectFeatureStylesheet(pinFeatureAssetUrl(href));
             }
             for (const mod of entry.modules || []) {
                 try {
-                    await import(mod);
+                    await import(pinFeatureAssetUrl(mod));
                 } catch (e) {
                     console.error(
                         `[ui-ext] failed to import feature module ${mod} (feature ${entry.feature}):`,

@@ -120,6 +120,63 @@ test('feature disabled at boot then enabled at runtime mounts without reload', a
     );
 });
 
+test('multi-agent host mode pins feature-static URLs to the selected agent; leaves core-bundled /js/ URLs alone (#2048)', async () => {
+    // The manifest carries root-relative feature-static URLs (/features/…) and a
+    // core-bundled URL (/js/…). In host mode the loader must pin ONLY the feature
+    // assets to the selected agent so the /api/agents/{id} proxy reaches the agent
+    // that declared them; /js/ assets are host-served and must stay un-prefixed.
+    const buildCalls = [];
+    const originalBuild = API.buildAgentUrl;
+    API.buildAgentUrl = (url) => {
+        buildCalls.push(url);
+        return `/api/agents/agentB${url}`;
+    };
+    try {
+        installApiStub({
+            manifestFor: () => ({
+                contributions: [
+                    {
+                        feature: 'spawnfeature',
+                        capability: 'spawn',
+                        modules: ['/features/spawnfeature/static/spawn.js', '/js/voice/boot.js'],
+                        css: ['/features/spawnfeature/static/spawn.css'],
+                    },
+                ],
+            }),
+            caps: { spawn: true },
+        });
+        // import() of /api/agents/... would 404 in jsdom; the loader isolates a
+        // failed import, so we only need to observe which URLs were pinned.
+        await loadFeatureUIContributions();
+
+        // The feature module + css were routed through buildAgentUrl; the bundled
+        // /js/ module was NOT.
+        assert.ok(
+            buildCalls.includes('/features/spawnfeature/static/spawn.js'),
+            'feature-static module must be pinned to the selected agent',
+        );
+        assert.ok(
+            buildCalls.includes('/features/spawnfeature/static/spawn.css'),
+            'feature-static stylesheet must be pinned to the selected agent',
+        );
+        assert.ok(
+            !buildCalls.includes('/js/voice/boot.js'),
+            'core-bundled /js/ asset must NOT be agent-pinned (host serves it directly)',
+        );
+
+        // The injected stylesheet href is the agent-pinned URL (raw attribute,
+        // not jsdom's document-resolved absolute form).
+        const link = document.head.querySelector('link[data-ui-ext-css]');
+        assert.ok(link, 'feature stylesheet must be injected');
+        assert.equal(
+            link.getAttribute('href'),
+            '/api/agents/agentB/features/spawnfeature/static/spawn.css',
+        );
+    } finally {
+        API.buildAgentUrl = originalBuild;
+    }
+});
+
 test('injects a feature stylesheet once even across repeated loads', async () => {
     installApiStub({
         manifestFor: () => ({

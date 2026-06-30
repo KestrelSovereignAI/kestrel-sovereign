@@ -62,6 +62,17 @@ def mock_agent_app():
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
+    @agent.get("/features/{feature}/static/{path:path}")
+    async def feature_static(feature: str, path: str):
+        # Simulates server.py's _mount_feature_ui_assets serving an extracted
+        # feature's shipped JS — the agent exempts these from auth like /js/.
+        from fastapi.responses import Response
+
+        return Response(
+            content="export const SPAWN = 1;\n",
+            media_type="application/javascript",
+        )
+
     return agent
 
 
@@ -270,6 +281,90 @@ class TestHostAgentIntegration:
                         content = resp.text
                         assert "hello" in content
                         assert "world" in content
+                    finally:
+                        await mock_client.aclose()
+                        await original_client.aclose()
+        finally:
+            host_module.load_multi_agent_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_host_serves_agent_pinned_feature_static_without_auth(
+        self, mock_agent_app, integration_config
+    ):
+        """Host delivers a feature's static asset pinned to the SELECTED agent (#2048).
+
+        In multi-agent host mode the frontend pins each feature-static URL to the
+        selected agent (pinFeatureAssetUrl), so the browser imports
+        /api/agents/{agent}/features/spawn/static/spawn.js — routed by the generic
+        /api/agents/{id} proxy to the exact agent whose manifest declared the
+        contribution (NOT an arbitrary first agent). The import is header-less, so
+        the asset must also be exempt from auth. Asserted WITHOUT an X-API-Key
+        header.
+        """
+        test_key = "integration-test-key"
+
+        from kestrel_sovereign import host as host_module
+        the_app = host_module.app
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: integration_config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(the_app):
+                    mock_client, original_client = _swap_http_client(the_app, mock_agent_app)
+
+                    try:
+                        async with httpx.AsyncClient(
+                            transport=httpx.ASGITransport(app=the_app),
+                            base_url="http://testhost",
+                        ) as client:
+                            # No auth header — mirrors a header-less ES module import
+                            # of the agent-pinned URL the frontend emits in host mode.
+                            resp = await client.get(
+                                "/api/agents/test-agent/features/spawn/static/spawn.js"
+                            )
+
+                        assert resp.status_code == 200
+                        assert "export const SPAWN" in resp.text
+                    finally:
+                        await mock_client.aclose()
+                        await original_client.aclose()
+        finally:
+            host_module.load_multi_agent_config = original_fn
+
+    @pytest.mark.asyncio
+    async def test_host_protects_non_static_feature_route(
+        self, mock_agent_app, integration_config
+    ):
+        """The feature-static auth bypass is scoped to /static/, not all /features/.
+
+        Both the bare and the agent-pinned forms of a feature *API* route (no
+        /static/ segment) must still require auth — the regex must not over-match.
+        """
+        test_key = "integration-test-key"
+
+        from kestrel_sovereign import host as host_module
+        the_app = host_module.app
+        original_fn = host_module.load_multi_agent_config
+        host_module.load_multi_agent_config = lambda: integration_config
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": test_key}):
+                from asgi_lifespan import LifespanManager
+                async with LifespanManager(the_app):
+                    mock_client, original_client = _swap_http_client(the_app, mock_agent_app)
+
+                    try:
+                        async with httpx.AsyncClient(
+                            transport=httpx.ASGITransport(app=the_app),
+                            base_url="http://testhost",
+                        ) as client:
+                            bare = await client.get("/features/spawn/api/secret")
+                            pinned = await client.get(
+                                "/api/agents/test-agent/features/spawn/api/secret"
+                            )
+
+                        assert bare.status_code == 401
+                        assert pinned.status_code == 401
                     finally:
                         await mock_client.aclose()
                         await original_client.aclose()

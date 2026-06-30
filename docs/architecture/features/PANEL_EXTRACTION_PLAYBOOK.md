@@ -175,13 +175,47 @@ bus.on('panel:hidden', (payload) => {
 Any panel that starts background work (intervals, observers, sockets) on
 activation MUST stop it on `panel:hidden`.
 
-### 8. Tests
+### 8. Handle multi-agent host mode: pin assets to the selected agent
+
+The wrong-agent trap (#2048): in multi-agent host mode the UI is served by the
+host (`host.py`), a thin proxy that owns no feature static mounts. The host runs
+agents as separate processes that may have **heterogeneous** feature sets — the
+selected agent can have a feature enabled (and its `static_dir` mounted) while
+the first-configured agent does not. The per-agent manifest is fetched
+host-agent-prefixed, but the module/css URLs it carries are root-relative
+(`/features/{slug}/static/…`). A host route that proxied those to a *fixed* first
+agent would 404 whenever that agent lacks the feature — and serves the wrong code
+in the general case.
+
+Fix (the simpler robust option of the two in #2048): **pin feature-static URLs to
+the selected agent on the frontend**, not on the host. `pinFeatureAssetUrl`
+(`ui-ext/feature-loader.js`) rewrites a `/features/…` URL to
+`/api/agents/{selected}/features/…` via `API.buildAgentUrl`, so the existing
+generic `/api/agents/{id}/{path}` proxy forwards it to the exact agent whose
+manifest declared the contribution. The host exempts that path from API-key auth
+via `FEATURE_STATIC_ASSET_RE` (header-less `import()` again). Core-bundled
+`/js/…` assets are NOT pinned — the host serves those directly. In standalone
+mode `buildAgentUrl` is a no-op, so the URL stays root-relative and the server's
+own `/features/{slug}/static/` mount serves it — one manifest, both modes.
+
+Why pin on the client rather than serve on the host: serving on the host would
+force it to discover and mount every installed feature's `static_dir` (it has no
+agent), duplicating `_mount_feature_ui_assets` and assuming a homogeneous
+install. Pinning reuses the proxy that already exists and routes to the agent
+that genuinely serves the asset.
+
+### 9. Tests
 
 Mirror the Spawn coverage:
 
 - **Runtime-enable serving** — assert a disabled feature's `static_dir` is still
   mounted/served (`tests/integration/test_feature_ui_runtime_enable.py`,
   `tests/unit/test_ui_contributions_runtime_enable.py`).
+- **Multi-agent host delivery** — assert the host serves an agent-pinned
+  feature-static asset header-less, and keeps feature *API* routes protected
+  (`tests/integration/test_host_proxy_integration.py`); assert the loader pins
+  `/features/…` URLs but not `/js/…`
+  (`tests/frontend/feature_ui_contributions_loader.test.mjs`).
 - **Teardown on disable** — assert the panel stops its work (interval cleared /
   `panel:hidden` fired) when its gate flips off
   (`tests/frontend/ui_ext_panels_teardown.test.mjs`).
@@ -194,7 +228,8 @@ Mirror the Spawn coverage:
 - [ ] `get_ui_contributions()` returns `static_dir` + `modules` + `capability`
 - [ ] Removed from `index.html`, `app.js` `setLazyLoaders`, `PANEL_CAPABILITIES`
 - [ ] Server mounts disabled features' assets (`include_disabled=True`)
-- [ ] Tests for runtime-enable serving + teardown-on-disable
+- [ ] Multi-agent host: frontend pins `/features/…` URLs to the selected agent
+- [ ] Tests for runtime-enable serving + host delivery + teardown-on-disable
 
 ## References
 
