@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch, MagicMock
 from kestrel_sovereign.features import (
     discover_features,
     discover_feature_class_by_name,
+    resolve_feature_canonical_name,
     discover_feature_modules,
     discover_entrypoint_feature_classes,
     get_disabled_features,
@@ -81,6 +82,38 @@ class TestDiscoverFeatureModules:
 
         assert feature_class is not None
         assert feature_class.__name__ == "BootstrapFeature"
+
+
+class TestResolveFeatureCanonicalName:
+    """resolve_feature_canonical_name must cover isolated-venv features that
+    discover_feature_class_by_name cannot import (#1946 codex follow-up)."""
+
+    def test_resolves_in_process_feature_to_class_name(self):
+        assert resolve_feature_canonical_name("bootstrap") == "BootstrapFeature"
+        assert resolve_feature_canonical_name("BootstrapFeature") == "BootstrapFeature"
+
+    def test_unknown_feature_returns_none(self):
+        assert resolve_feature_canonical_name("definitely-not-a-feature") is None
+
+    def test_resolves_isolated_feature_by_class_name_and_shorthand(self):
+        """An installed isolated-venv feature (never imported in-process) must
+        resolve — by exact class name AND shorthand — to its class name, so
+        spawn validation does not reject a feature the child loader can load."""
+        runtime = MagicMock()
+        runtime.runtime = "isolated-venv"
+        runtime.class_name = "WeatherFeature"
+
+        fake_runtimes = {"WeatherFeature": runtime}
+        with patch(
+            "kestrel_sovereign.feature_registry.discover_installed_feature_runtimes",
+            return_value=fake_runtimes,
+        ):
+            # Not resolvable as an importable class...
+            assert discover_feature_class_by_name("WeatherFeature") is None
+            # ...but resolvable as a loadable isolated feature, by class name...
+            assert resolve_feature_canonical_name("WeatherFeature") == "WeatherFeature"
+            # ...and by shorthand (loader keys on the exact class name).
+            assert resolve_feature_canonical_name("weather") == "WeatherFeature"
 
 
 class TestDiscoverFeatures:

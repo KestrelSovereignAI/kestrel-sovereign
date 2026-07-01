@@ -209,20 +209,23 @@ class SpawnFeature(Feature):
         # non-functional grant (#1946). Reject unknowns here, and resolve
         # accepted names to their canonical CLASS name (shorthand "memory"
         # -> "MemoryFeature"), because the child's feature loader
-        # (discover_features) filters the allowlist by ``feature_cls.__name__``.
-        # Storing the raw shorthand would pass validation but still fail to
-        # load the feature in the child.
+        # (discover_features) filters the allowlist by class name.
+        # ``resolve_feature_canonical_name`` covers local, entry-point AND
+        # isolated-venv feature packages — the last are loaded as ProxyFeature
+        # and keyed by their exact class name, so validating with the narrower
+        # ``discover_feature_class_by_name`` would wrongly reject an installed
+        # isolated feature the child could actually load.
         if features_list:
-            from kestrel_sovereign.features import discover_feature_class_by_name
+            from kestrel_sovereign.features import resolve_feature_canonical_name
 
             unknown_features = []
             canonical_features = []
             for f in features_list:
-                feature_cls = discover_feature_class_by_name(f)
-                if feature_cls is None:
+                canonical = resolve_feature_canonical_name(f)
+                if canonical is None:
                     unknown_features.append(f)
-                elif feature_cls.__name__ not in canonical_features:
-                    canonical_features.append(feature_cls.__name__)
+                elif canonical not in canonical_features:
+                    canonical_features.append(canonical)
             if unknown_features:
                 return ToolResult.failed(
                     error=(
