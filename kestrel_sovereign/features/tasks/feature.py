@@ -42,9 +42,10 @@ _STEP_REF_PATTERN = re.compile(r"\{\{(steps\.(\d+)\.(\w+)|prev\.(\w+))\}\}")
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
 
 # ``list_my_tasks`` filters ``task_type`` (a metadata field, no SQL column) in
-# Python. When that filter is active we over-fetch up to this cap so the
-# caller's ``limit`` bounds matching rows, not pre-filter rows. Bounded to keep
-# a large inbox from loading the whole table.
+# Python. When that filter is active we over-fetch at least this many rows so
+# the caller's ``limit`` bounds matching rows, not pre-filter rows (a larger
+# requested limit is still honoured). A floor, not a ceiling — it just keeps a
+# small requested limit from missing matches beyond the first page.
 _TASK_TYPE_FILTER_FETCH_CAP = 1000
 
 
@@ -859,7 +860,12 @@ class TaskFeature(Feature):
             # pre-filter rows — otherwise a page of non-matching tasks could
             # hide matches just beyond it. The final truncation to ``limit_val``
             # happens after the filter.
-            fetch_limit = limit_val if not task_type else _TASK_TYPE_FILTER_FETCH_CAP
+            # The cap is a FLOOR on the over-fetch, not a ceiling on the
+            # caller's limit — honour a requested limit larger than the cap.
+            fetch_limit = (
+                limit_val if not task_type
+                else max(limit_val, _TASK_TYPE_FILTER_FETCH_CAP)
+            )
 
             if task_state is not None:
                 # A status filter must query the full task table — get_pending_tasks
