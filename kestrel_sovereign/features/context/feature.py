@@ -740,7 +740,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="context_stash_pop",
-        description="Pop the most recent stash (restore messages and remove from stash list). Like git stash pop.",
+        description="Pop a stash (restore messages and remove from stash list). Like git stash pop. Pass stash_id to target a specific stash; leave stash_id empty (\"\") to target the most recent stash.",
         category=ToolCategory.MEMORY,
         command_prefix="!context stash pop"
     )
@@ -775,7 +775,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="context_stash_apply",
-        description="Apply a stash without removing it (restore messages but keep stash for reuse). Like git stash apply.",
+        description="Apply a stash without removing it (restore messages but keep stash for reuse). Like git stash apply. Pass stash_id to target a specific stash; leave stash_id empty (\"\") to target the most recent stash.",
         category=ToolCategory.MEMORY,
         command_prefix="!context stash apply"
     )
@@ -844,7 +844,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="context_stash_drop",
-        description="Drop a stash without restoring (discard stashed messages). Messages become excluded from context.",
+        description="Drop a stash without restoring (discard stashed messages). Messages become excluded from context. Pass stash_id to target a specific stash; leave stash_id empty (\"\") to target the most recent stash.",
         category=ToolCategory.MEMORY,
         command_prefix="!context stash drop"
     )
@@ -879,7 +879,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="context_stash_save",
-        description="Save a stash to long-term storage with semantic search capability. Use when you want to preserve context for future retrieval via !recall.",
+        description="Save a stash to long-term storage with semantic search capability. Use when you want to preserve context for future retrieval via !recall. Pass stash_id to target a specific stash; leave stash_id empty (\"\") to target the most recent stash.",
         category=ToolCategory.MEMORY,
         command_prefix="!context stash save"
     )
@@ -920,7 +920,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="context_stash_peek",
-        description="Peek at stash contents without restoring. Use to explore stashed context programmatically (RLM-inspired context-as-variable).",
+        description="Peek at stash contents without restoring. Use to explore stashed context programmatically (RLM-inspired context-as-variable). Pass stash_id to target a specific stash; leave stash_id empty (\"\") to target the most recent stash.",
         category=ToolCategory.MEMORY,
         command_prefix="!context stash peek"
     )
@@ -1031,7 +1031,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="recursive_query",
-        description="Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections, compacted originals, or excluded messages without using main model quota.",
+        description="Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections, compacted originals, or excluded messages without using main model quota. context_source must be one of: 'stash:name', 'excluded', 'compacted:ID', 'summary:ID', 'last_N' (N = message count).",
         category=ToolCategory.MEMORY,
         command_prefix="!context query"
     )

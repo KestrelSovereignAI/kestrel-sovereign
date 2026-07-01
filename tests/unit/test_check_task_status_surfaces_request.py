@@ -144,6 +144,72 @@ async def test_list_my_tasks_includes_request_content_per_row():
 
 
 @pytest.mark.asyncio
+async def test_list_my_tasks_status_filter_queries_full_table_not_pending():
+    """A ``status`` filter must query the full task table, not the pending
+    (SUBMITTED-only) inbox.
+
+    Regression for #1946: ``list_my_tasks`` advertised filters for all
+    TaskState values but always called ``get_pending_tasks()``, whose store
+    query is ``WHERE status = 'submitted'``. So ``status="completed"`` (and
+    working/failed/canceled) returned empty in production even when matching
+    tasks existed. The fix routes a status filter through ``list_tasks`` so the
+    DB filters by that state. Here ``get_pending_tasks`` returns nothing (as
+    the real store would for non-submitted states); only ``list_tasks``
+    surfaces the completed task.
+    """
+    completed_task = Task(
+        id="task-done",
+        sessionId="sess-done",
+        status=TaskStatus(
+            state=TaskState.COMPLETED,
+            message=Message(role="agent", parts=[TextPart(text="PONG")]),
+        ),
+        history=[Message(role="user", parts=[TextPart(text="ping")])],
+        metadata={"sender": "Emma"},
+    )
+
+    async def get_pending_tasks(limit=10):
+        # The real store returns ONLY submitted tasks here — no completed ones.
+        return []
+
+    captured = {}
+
+    async def list_tasks(status=None, limit=100, session_id=None, user_id=None):
+        captured["status"] = status
+        captured["limit"] = limit
+        return [completed_task] if status == TaskState.COMPLETED else []
+
+    feature = TaskFeature(agent=None)
+    feature.task_manager = MagicMock()
+    feature.task_manager.get_pending_tasks = get_pending_tasks
+    feature.task_manager.list_tasks = list_tasks
+
+    result = await feature.list_my_tasks(status="completed", limit=5)
+    assert result.status.value == "ok", result
+
+    # It must have queried list_tasks with the COMPLETED state, NOT relied on
+    # the pending inbox.
+    assert captured.get("status") == TaskState.COMPLETED
+    assert captured.get("limit") == 5
+
+    rows = (result.data or {}).get("tasks") or []
+    assert len(rows) == 1
+    assert rows[0]["task_id"] == "task-done"
+    assert rows[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_list_my_tasks_invalid_status_rejected():
+    """An unknown status is rejected up-front (case-insensitive validation)."""
+    feature = TaskFeature(agent=None)
+    feature.task_manager = MagicMock()
+
+    result = await feature.list_my_tasks(status="bogus")
+    assert result.status.value == "error"
+    assert "Invalid status" in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_get_task_result_includes_request_content_for_completed_task():
     feature, task = _make_feature_with_inbox_task(
         request_text="please ack",

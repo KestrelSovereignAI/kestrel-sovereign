@@ -745,7 +745,7 @@ class TaskFeature(Feature):
 
     @tool(
         name="check_task_status",
-        description="Check the status of a background task by ID.",
+        description="Check the status of a background task by ID. Returns two distinct content fields: request_content (what was ASKED — the inbound sender's message) and message (the REPLY that has been written back, if any).",
         category=ToolCategory.UTILITY,
         command_prefix="!task-status"
     )
@@ -755,6 +755,11 @@ class TaskFeature(Feature):
 
         Args:
             task_id: The task ID to check
+
+        Returns two distinct content fields in ``data``:
+            request_content: What was ASKED — the inbound sender's original
+                             message (load-bearing for tasks awaiting a reply).
+            message: The REPLY that has been written back to the task, if any.
         """
         data = await self._get_task_status_data(task_id)
         if not data["ok"]:
@@ -795,7 +800,7 @@ class TaskFeature(Feature):
 
     @tool(
         name="list_my_tasks",
-        description="List background tasks, optionally filtered by status or type.",
+        description="List background tasks, optionally filtered by status or type. status must be one of the TaskState values: submitted, working, completed, failed, canceled (case-insensitive). With no status, returns the pending (submitted) inbox; a status filter queries tasks across ALL states.",
         category=ToolCategory.UTILITY,
         command_prefix="!tasks"
     )
@@ -809,7 +814,9 @@ class TaskFeature(Feature):
         List tasks, optionally filtered.
 
         Args:
-            status: Filter by status (submitted, working, completed, failed, canceled)
+            status: Filter by status — one of the TaskState values submitted,
+                    working, completed, failed, canceled. Case-insensitive
+                    (normalized to lowercase before matching).
             task_type: Filter by type (selfie_generation, lora_training, etc.)
             limit: Maximum number of tasks to return (the request — actual
                    count returned may be lower if fewer tasks exist).
@@ -829,17 +836,28 @@ class TaskFeature(Feature):
         try:
             from kestrel_sovereign.a2a.types import TaskState
 
-            tasks = await self.task_manager.get_pending_tasks(limit=limit_val)
-
+            task_state = None
             if status:
+                normalized_status = status.strip().lower()
                 try:
-                    task_state = TaskState(status)
+                    task_state = TaskState(normalized_status)
                 except ValueError:
                     return ToolResult.failed(
                         f"Invalid status: {status!r}. Valid: submitted, "
                         "working, completed, failed, canceled"
                     )
-                tasks = [t for t in tasks if t.status.state == task_state]
+
+            if task_state is not None:
+                # A status filter must query the full task table — get_pending_tasks
+                # only ever returns SUBMITTED rows, so any other state would come
+                # back empty in production (#1946). Route through the store-level
+                # list_tasks passthrough which filters by state in SQL.
+                tasks = await self.task_manager.list_tasks(
+                    status=task_state, limit=limit_val
+                )
+            else:
+                # No status filter — the inbox view (pending/submitted work).
+                tasks = await self.task_manager.get_pending_tasks(limit=limit_val)
 
             if task_type:
                 tasks = [
@@ -908,7 +926,7 @@ class TaskFeature(Feature):
 
     @tool(
         name="get_task_result",
-        description="Get the result/artifacts from a completed task.",
+        description="Get the result/artifacts from a completed task. The returned message field is the REPLY content, distinct from request_content (what was originally ASKED) surfaced by check_task_status.",
         category=ToolCategory.UTILITY,
         command_prefix="!task-result"
     )
@@ -918,6 +936,10 @@ class TaskFeature(Feature):
 
         Args:
             task_id: The task ID to get results from
+
+        The returned ``message`` is the REPLY content written back to the
+        task — distinct from ``request_content`` (what was originally ASKED),
+        which check_task_status surfaces.
         """
         data = await self._get_task_status_data(task_id)
         if not data["ok"]:

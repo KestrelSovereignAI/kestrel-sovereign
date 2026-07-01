@@ -224,13 +224,15 @@ class StrategicMemoryFeature(Feature):
             "blockers": self._format_blockers,
             "patterns": self._format_patterns,
         }
-        renderer = section_renderers.get(section)
+        normalized_section = section.strip().lower() if isinstance(section, str) else section
+        renderer = section_renderers.get(normalized_section)
         if renderer is None:
             return ToolResult.failed(
                 f"Unknown section: {section}. Available: "
                 + ", ".join(section_renderers.keys()),
                 data={"section": section},
             )
+        section = normalized_section
         body = renderer()
         return ToolResult.ok(
             confirmation=body,
