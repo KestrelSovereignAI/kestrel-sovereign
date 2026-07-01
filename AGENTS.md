@@ -26,6 +26,11 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 
 See the full testing guide: [`docs/architecture/testing/TESTING_GUIDE.md`](docs/architecture/testing/TESTING_GUIDE.md)
 
+To verify a "claimed-done" feature on the **live path** (unit tests are not enough), drive an
+isolated test agent — see [`docs/architecture/testing/LIVE_AGENT_DOGFOODING.md`](docs/architecture/testing/LIVE_AGENT_DOGFOODING.md)
+("Kite": enable the feature, drive it via the HTTP invoke API with adversarial input, confirm
+behavior matches the code, then file → fix via Talon → re-verify).
+
 ### Quick Start
 
 ```bash

@@ -1305,6 +1305,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/testing/LIVE_AGENT_DOGFOODING.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Live-Agent Dogfooding \u2014 driving a real test agent (Kite)",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "tests/integration/test_llm_model_pulling_e2e.py",
         "tests/integration/test_llm_space_mgmt_e2e.py"
