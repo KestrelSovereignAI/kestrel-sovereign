@@ -79,6 +79,8 @@ uv run kestrel start Kestrel    # if you only ran --quickstart
 uv run kestrel start MyAgent    # if you ran step 5 (works regardless of autostart)
 ```
 
+> **Refreshing later — use the `kestrel` CLI, not raw `uv sync`.** The `uv sync` above is only for this first install. To pull in upstream changes afterward, run **`kestrel update`** (pull → install → reconcile → feature sync → restart). Plain `uv sync` makes the venv match `pyproject.toml` exactly and therefore **prunes out-of-tree feature packages** (`kestrel-feature-*`, voice/provider packages); `kestrel update` restores them in the same pass. See [Pulling in upstream changes](#pulling-in-upstream-changes-kestrel-update).
+
 If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
 
 Your agent is now running. Two ports to know about, depending on which start form you used:
