@@ -114,9 +114,20 @@ object (e.g. `kestrel restart <name>`) does **not** reload changed module code.
 4. **Wait for ready** (poll `/api/auth/key`, then `ask("Reply READY")`) and re-verify the module
    origin from step 1.
 
-Pure-Python feature changes need no dependency work. If the worktree was moved to a newer commit
-that changed SDK deps, run `uv sync` in it first — **but `uv sync` prunes hand-installed
-out-of-tree editable feature packages**, so reinstall those (`uv pip install -e <path> ...`) after.
+**Pulling in new code + deps + features: use the supported CLI, not raw `uv`.** From the
+worktree, run its **own** kestrel so the update targets the test env (not your primary install):
+
+```bash
+git -C <worktree> pull                    # get the new code
+<worktree>/.venv/bin/kestrel update       # syncs dependencies AND reconciles feature packages
+```
+
+`kestrel update` is the durable path — it handles both the dependency sync and the installed
+feature packages in one step. **Do not** hand-run `uv sync` for this: `uv sync` prunes the
+out-of-tree editable feature packages, forcing manual reinstalls. Feature provisioning is
+declared in `.kestrel-host-features.toml` and reconciled by `kestrel update` / `kestrel feature
+sync` (see the feature-provisioning docs). Updating the install does **not** reload a running
+`uvicorn` — restart the host process afterward (steps 2–4 above).
 
 ## Verifying a PR's tests locally (without polluting a venv)
 
