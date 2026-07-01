@@ -787,6 +787,26 @@ class TaskManager:
         """Get all pending (submitted) tasks ready for processing."""
         return await self.task_store.get_pending_tasks(limit=limit)
 
+    async def list_tasks(
+        self,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[TaskState] = None,
+        limit: int = 100,
+    ) -> list[Task]:
+        """List tasks with optional filters, across ALL states.
+
+        Unlike ``get_pending_tasks`` (which only returns SUBMITTED tasks),
+        this passes through to the store's full-table query so callers can
+        filter by any ``TaskState`` (completed, failed, working, canceled).
+        """
+        return await self.task_store.list_tasks(
+            session_id=session_id,
+            user_id=user_id,
+            status=status,
+            limit=limit,
+        )
+
     async def cancel_task(
         self,
         task_id: str,

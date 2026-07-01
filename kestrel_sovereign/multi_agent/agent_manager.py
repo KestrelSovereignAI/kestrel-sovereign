@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
@@ -208,7 +208,12 @@ class AgentManager:
                 logger.warning(f"Agent '{name}' shutdown issue: {e}")
             return True
 
-    async def create_agent(self, name: str, parent_did: str = None) -> KestrelAgent:
+    async def create_agent(
+        self,
+        name: str,
+        parent_did: str = None,
+        features: Optional[List[str]] = None,
+    ) -> KestrelAgent:
         """Create a new agent via inception and load it.
 
         Runs the inception service to generate a new DID and database,
@@ -217,6 +222,12 @@ class AgentManager:
         Args:
             name: Name for the new agent (used as directory name and routing key).
             parent_did: Optional DID of parent agent for delegation chain.
+            features: Optional allowlist of feature class names the agent may
+                load. ``None`` loads all discovered features (backward
+                compatible); a list restricts loading to those class names
+                (mandatory features are always loaded regardless). Threaded
+                into the agent's ``LocalAgentConfig`` so the restriction
+                actually reaches ``load_agent`` / ``discover_features`` (#1946).
 
         Returns:
             The newly created and initialized KestrelAgent.
@@ -246,6 +257,7 @@ class AgentManager:
             data_dir=Path("agent_data") / name,
             port=self._port_seq,  # monotonic — never reuses an unloaded agent's port
             autostart=True,
+            features=features,
         )
         return await self.load_agent(name, config)
 
@@ -327,8 +339,18 @@ class AgentManager:
                 parent_identity=parent_identity,
             )
 
-        # Create the child via the existing create_agent flow
-        child = await self.create_agent(name, parent_did=parent_agent.agent_id)
+        # Create the child via the existing create_agent flow. Thread the
+        # mandate's feature allowlist into the child's config so the grant is
+        # actually enforced at load time — without this the child loads ALL
+        # features regardless of what the mandate permitted (#1946). An empty
+        # list is a real (empty) allowlist; only ``None`` means "load all".
+        features_allowed = getattr(mandate, "features_allowed", None)
+        child_features = features_allowed if features_allowed else None
+        child = await self.create_agent(
+            name,
+            parent_did=parent_agent.agent_id,
+            features=child_features,
+        )
 
         # Fill in child DID on the mandate
         mandate.child_did = child.agent_id

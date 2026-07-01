@@ -337,6 +337,74 @@ class TestSpawnAgent:
     @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_spawn_wires_mandate_features_into_child(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
+    ):
+        """The mandate's feature allowlist must reach the child KestrelAgent.
+
+        Regression for #1946: spawn validated ``features_allowed`` but never
+        threaded it into the child's config, so ``load_agent`` built the child
+        with ``allowed_features=None`` and it loaded ALL features regardless of
+        what the mandate permitted. This drives the real
+        spawn_agent -> _do_spawn -> create_agent -> load_agent chain (only
+        inception/DID/KestrelAgent/LLMService are mocked) and asserts the child
+        is constructed with the allowlist as ``allowed_features``.
+        """
+        mock_get_did.return_value = "did:featured-child"
+        mock_child = _make_mock_agent("did:featured-child")
+        mock_agent_cls.return_value = mock_child
+
+        manager = AgentManager(base_data_dir=tmp_path)
+
+        parent = _make_mock_agent("did:parent-feat")
+        parent._private_key = None  # No key — skip signing
+
+        mandate = SpawnMandate(
+            parent_did="did:parent-feat",
+            purpose="restricted child",
+            features_allowed=["MemoryFeature", "WebSearchFeature"],
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager.spawn_agent("FeaturedBot", parent, mandate)
+
+        # The child KestrelAgent must be built WITH the allowlist, not None.
+        assert mock_agent_cls.call_count == 1
+        child_kwargs = mock_agent_cls.call_args.kwargs
+        assert child_kwargs["allowed_features"] == {"MemoryFeature", "WebSearchFeature"}
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_spawn_without_features_loads_all(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
+    ):
+        """An empty (default) mandate allowlist means "load all" (allowed_features=None)."""
+        mock_get_did.return_value = "did:open-child"
+        mock_child = _make_mock_agent("did:open-child")
+        mock_agent_cls.return_value = mock_child
+
+        manager = AgentManager(base_data_dir=tmp_path)
+
+        parent = _make_mock_agent("did:parent-open")
+        parent._private_key = None
+
+        # No features_allowed → default empty list → load all features.
+        mandate = SpawnMandate(parent_did="did:parent-open", purpose="open child")
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager.spawn_agent("OpenBot", parent, mandate)
+
+        assert mock_agent_cls.call_count == 1
+        assert mock_agent_cls.call_args.kwargs["allowed_features"] is None
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
     async def test_spawn_duplicate_name_raises(
         self, mock_llm_cls, mock_agent_cls, mock_get_did, mock_inception, tmp_path
     ):

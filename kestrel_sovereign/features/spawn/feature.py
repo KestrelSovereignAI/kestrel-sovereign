@@ -138,7 +138,15 @@ class SpawnFeature(Feature):
         description=(
             "Create a new child agent with a specific purpose and constraints. "
             "The child runs in-process and is governed by a signed SpawnMandate. "
-            "Returns the child's name and DID on success."
+            "Returns the child's name and DID on success. "
+            "constraints is a comma-separated list where each item is either "
+            "'key=value' (recorded verbatim) or a bare 'flag' (recorded as "
+            "flag=true), e.g. 'max_tokens=1000,no_web'. features is a "
+            "comma-separated list of feature names the child may use (class "
+            "name or shorthand, e.g. 'memory,web_search'); unknown names are "
+            "rejected up-front. ttl is the child's time-to-live in seconds; "
+            "ttl<=0 makes the child PERSISTENT (no automatic expiry) instead "
+            "of ephemeral."
         ),
         category=ToolCategory.AGENT_MANAGEMENT,
     )
@@ -158,14 +166,23 @@ class SpawnFeature(Feature):
             name: Unique name for the child agent
             purpose: What the child agent is for (stored in mandate)
             budget: Budget allocation for the child (default 0)
-            ttl: Time-to-live in seconds (default 3600)
-            constraints: Comma-separated additional constraints
-            features: Comma-separated list of allowed features
+            ttl: Time-to-live in seconds (default 3600). A value <= 0 makes
+                 the child PERSISTENT (registered with SpawnMode.PERSISTENT,
+                 no automatic TTL expiry) rather than ephemeral.
+            constraints: Comma-separated additional constraints. Each item is
+                 either 'key=value' (stored verbatim) or a bare token 'flag'
+                 (stored as flag=true). Example: "max_tokens=1000,no_web".
+            features: Comma-separated list of allowed feature names. Each name
+                 is resolved against the discoverable feature registry (class
+                 name like "MemoryFeature" or shorthand like "memory"). Unknown
+                 names are rejected up-front rather than silently producing a
+                 non-functional mandate.
 
         Returns:
             ToolResult.ok with child name + DID + purpose + TTL.
             ERROR when no AgentManager is wired up (agent isn't
-            running in a multi-agent host) or the spawn raised.
+            running in a multi-agent host), when a requested feature name is
+            unknown, or the spawn raised.
         """
         manager = self._get_agent_manager()
         if manager is None:
@@ -185,6 +202,46 @@ class SpawnFeature(Feature):
                     constraint_dict[item] = "true"
 
         features_list = [f.strip() for f in features.split(",") if f.strip()] if features else []
+
+        # Validate AND canonicalize requested feature names up-front. An
+        # unresolvable name would be carried into the mandate's
+        # ``features_allowed`` but never match a real feature — a silent,
+        # non-functional grant (#1946). Reject unknowns here, and resolve
+        # accepted names to their canonical CLASS name (shorthand "memory"
+        # -> "MemoryFeature"), because the child's feature loader
+        # (discover_features) filters the allowlist by class name.
+        # ``resolve_feature_canonical_name`` covers local, entry-point AND
+        # isolated-venv feature packages — the last are loaded as ProxyFeature
+        # and keyed by their exact class name, so validating with the narrower
+        # ``discover_feature_class_by_name`` would wrongly reject an installed
+        # isolated feature the child could actually load.
+        if features_list:
+            from kestrel_sovereign.features import resolve_feature_canonical_name
+
+            unknown_features = []
+            canonical_features = []
+            for f in features_list:
+                canonical = resolve_feature_canonical_name(f)
+                if canonical is None:
+                    unknown_features.append(f)
+                elif canonical not in canonical_features:
+                    canonical_features.append(canonical)
+            if unknown_features:
+                return ToolResult.failed(
+                    error=(
+                        f"Unknown feature(s): {unknown_features}. Each entry in "
+                        "'features' must resolve to a discoverable feature "
+                        "(class name like 'MemoryFeature' or shorthand like "
+                        "'memory'). Nothing was spawned."
+                    ),
+                    data={
+                        "unknown_features": unknown_features,
+                        "requested_features": features_list,
+                    },
+                )
+            # Persist the resolved class names so the mandate's allowlist
+            # matches what the child's loader compares against.
+            features_list = canonical_features
 
         # Build the mandate
         from kestrel_sovereign.spawn.mandate import SpawnMandate

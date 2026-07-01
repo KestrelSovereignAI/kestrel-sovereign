@@ -145,7 +145,10 @@ class TestSpawnFeatureWithManager:
         assert mandate.budget_allocation == 10.0
         assert mandate.ttl_seconds == 1800
         assert mandate.additional_constraints == {"max_tokens": "1000", "no_web": "true"}
-        assert mandate.features_allowed == ["memory", "web_search"]
+        # Shorthand feature names are canonicalized to their class names so the
+        # child's feature loader (which filters by cls.__name__) can match them
+        # (#1946).
+        assert mandate.features_allowed == ["MemoryFeature", "WebSearchFeature"]
 
     @pytest.mark.asyncio
     async def test_spawn_agent_failure(self):

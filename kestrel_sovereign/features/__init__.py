@@ -329,6 +329,48 @@ def discover_feature_class_by_name(name: str) -> Optional[Type[Feature]]:
     return None
 
 
+def resolve_feature_canonical_name(name: str) -> Optional[str]:
+    """Resolve a feature name (class name / module / shorthand) to the canonical
+    class name the loader (``discover_features``) filters an ``allowed_features``
+    set by, or ``None`` if no discoverable feature matches.
+
+    Unlike :func:`discover_feature_class_by_name`, this ALSO resolves
+    isolated-venv feature packages, whose class is not importable in-process —
+    ``discover_features`` loads them as ``ProxyFeature`` and filters them by the
+    exact ``runtime.class_name``. Callers validating a requested feature set
+    (e.g. spawn's mandate allowlist) must use this so an installed isolated
+    feature is not wrongly rejected as unknown.
+    """
+    target = _normalize_feature_lookup(name)
+    if not target:
+        return None
+
+    # In-process (local + entry-point) classes — alias-aware.
+    feature_class = discover_feature_class_by_name(name)
+    if feature_class is not None:
+        return feature_class.__name__
+
+    # Isolated-venv runtimes: match against class-name-derived aliases. The
+    # loader keys these by the exact ``class_name`` string, so that is the
+    # canonical form to return.
+    try:
+        from kestrel_sovereign.feature_registry import discover_installed_feature_runtimes
+
+        for class_name, runtime in discover_installed_feature_runtimes().items():
+            if getattr(runtime, "runtime", None) != "isolated-venv":
+                continue
+            aliases = {
+                _normalize_feature_lookup(class_name),
+                _normalize_feature_lookup(class_name.removesuffix("Feature")),
+            }
+            if target in {a for a in aliases if a}:
+                return class_name
+    except Exception as e:  # discovery is best-effort — never block a spawn on it
+        logger.warning("Failed to inspect isolated feature runtimes: %s", e)
+
+    return None
+
+
 def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> List[Feature]:
     """
     Discover and instantiate Feature classes from local directory and entry_points.

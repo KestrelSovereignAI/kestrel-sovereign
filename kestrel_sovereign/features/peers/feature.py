@@ -866,6 +866,16 @@ class PeersFeature(Feature):
                 ``a2a.question_answered`` signal with
                 ``state='expired'`` so the asking lineage still
                 resumes cleanly. Default 300s.
+            artifacts: Optional send-side handoff payload attached to the
+                question. Each item is a dict with ``name`` and a body
+                (``text`` for raw text, ``data`` for a structured dict, or
+                pre-shaped ``parts``), plus optional ``description``,
+                ``metadata``, ``index``, ``last_chunk``. Persisted on the
+                recipient's task so it can retrieve them while answering.
+            references: Optional durable references (pointers to
+                saved-memory / recall items, URIs). Each item is a dict
+                descriptor; carried as structured-data artifacts in the
+                ``references`` group.
         """
         task_data, chain, err = await self._post_a2a_task(
             recipient=recipient, message=message,
@@ -2154,7 +2164,10 @@ class PeersFeature(Feature):
             recipient: Peer agent name (e.g. "Meridian").
             message: The task description / prompt for the recipient.
             skill_id: Optional A2A skill id from the receiver's
-                AgentCard (e.g. ``"workflow.assign"``). Defaults to
+                AgentCard (e.g. ``"workflow.assign"``). The valid set is
+                whatever that specific recipient advertises in its
+                AgentCard — call ``list_peers`` first to discover each
+                peer's advertised capabilities/skills. Defaults to
                 empty — the receiver routes via their default handler.
             session_id: Optional A2A session id; auto-generated when
                 empty so multiple sends are independent sessions.

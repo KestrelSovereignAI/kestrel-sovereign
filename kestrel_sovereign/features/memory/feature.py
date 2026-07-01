@@ -541,7 +541,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="recall_emotional",
-        description="Recall memories with human-like weighting (importance, emotion, recency). Use alongside search_memory for emotionally-aware recall. Scores memories like a human would - important moments and emotionally-charged memories surface first.",
+        description="Recall memories with human-like weighting (importance, emotion, recency). Use alongside search_memory for emotionally-aware recall. Scores memories like a human would - important moments and emotionally-charged memories surface first. mood must be one of: positive, negative, neutral (case-insensitive); an unrecognized mood is treated as neutral and the result is returned as PARTIAL.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory recall"
     )
