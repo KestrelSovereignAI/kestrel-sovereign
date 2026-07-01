@@ -36,6 +36,11 @@ cd kestrel-sovereign
 uv sync   # creates .venv and installs all dependencies
 ```
 
+> **Updating later:** this `uv sync` is only for the first install. To refresh Kestrel
+> afterward, use **`kestrel update`** — plain `uv sync` prunes installed feature packages
+> (`kestrel-feature-*`), while `kestrel update` pulls, installs, and restores them together.
+> Details in the [README update guide](README.md#pulling-in-upstream-changes-kestrel-update).
+
 ---
 
 ## Step 3 — Install Ollama (local LLM — no API key needed)
