@@ -58,6 +58,18 @@ def test_assert_feature_returns_tool_result_does_not_raise(feature_cls):
     assert_feature_returns_tool_result(feature)  # raises if dirty
 
 
+def test_mcp_external_feature_allowlisted_and_clean():
+    """The revived MCP feature (#1979) is on the allowlist and every one of its
+    13 ``mcp_*`` @tool methods returns ToolResult — so a backslide to a bare dict
+    hard-fails at @tool discovery. External package; skip if not installed."""
+    pytest.importorskip("kestrel_feature_mcp")
+    from kestrel_feature_mcp.feature import MCPAgent
+
+    assert MCPAgent.__module__ in MIGRATED_FEATURE_MODULES
+    feature = MCPAgent.__new__(MCPAgent)
+    assert find_violations(feature) == []
+
+
 # ---------------------------------------------------------------------------
 # Synthetic regression: a non-migrated module shipping a bad tool is OK
 # ---------------------------------------------------------------------------

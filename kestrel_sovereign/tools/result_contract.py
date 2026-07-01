@@ -91,6 +91,7 @@ MIGRATED_FEATURE_MODULES: frozenset[str] = frozenset({
     # Extracted external packages (agent self-service capability mgmt, #1979).
     "kestrel_feature_workflows.feature",
     "kestrel_feature_features.feature",
+    "kestrel_feature_mcp.feature",
 })
 
 
