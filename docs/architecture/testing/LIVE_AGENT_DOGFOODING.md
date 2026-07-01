@@ -1,3 +1,23 @@
+---
+type: Architecture Spec
+title: Live-Agent Dogfooding — driving a real test agent (Kite)
+description: How to stand up and drive an isolated live test agent ("Kite") to verify claimed-done
+  features on the live path — the HTTP invoke API, safe restart, PR-test-in-a-worktree, and the
+  discover → live-confirm → file → Talon-fix → re-verify loop.
+resource: /docs/architecture/testing/LIVE_AGENT_DOGFOODING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+- testing
+timestamp: '2026-07-01T00:00:00Z'
+status: active
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Live-Agent Dogfooding — driving a real test agent (a.k.a. "Kite")
 
 > **Why this exists:** *"shipped + has a unit/smoke test" is not the same as "works on the
