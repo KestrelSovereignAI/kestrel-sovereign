@@ -41,6 +41,12 @@ _STEP_REF_PATTERN = re.compile(r"\{\{(steps\.(\d+)\.(\w+)|prev\.(\w+))\}\}")
 # tokens.
 _TERMINAL_STATES = {"completed", "failed", "canceled"}
 
+# ``list_my_tasks`` filters ``task_type`` (a metadata field, no SQL column) in
+# Python. When that filter is active we over-fetch up to this cap so the
+# caller's ``limit`` bounds matching rows, not pre-filter rows. Bounded to keep
+# a large inbox from loading the whole table.
+_TASK_TYPE_FILTER_FETCH_CAP = 1000
+
 
 class TaskFeature(Feature):
     """
@@ -847,23 +853,33 @@ class TaskFeature(Feature):
                         "working, completed, failed, canceled"
                     )
 
+            # ``task_type`` is a metadata field with no SQL column, so it is
+            # filtered in Python below. When it is set, over-fetch (bounded)
+            # so ``limit`` bounds the count of MATCHING tasks rather than
+            # pre-filter rows — otherwise a page of non-matching tasks could
+            # hide matches just beyond it. The final truncation to ``limit_val``
+            # happens after the filter.
+            fetch_limit = limit_val if not task_type else _TASK_TYPE_FILTER_FETCH_CAP
+
             if task_state is not None:
                 # A status filter must query the full task table — get_pending_tasks
                 # only ever returns SUBMITTED rows, so any other state would come
                 # back empty in production (#1946). Route through the store-level
                 # list_tasks passthrough which filters by state in SQL.
                 tasks = await self.task_manager.list_tasks(
-                    status=task_state, limit=limit_val
+                    status=task_state, limit=fetch_limit
                 )
             else:
                 # No status filter — the inbox view (pending/submitted work).
-                tasks = await self.task_manager.get_pending_tasks(limit=limit_val)
+                tasks = await self.task_manager.get_pending_tasks(limit=fetch_limit)
 
             if task_type:
                 tasks = [
                     t for t in tasks
                     if t.metadata and t.metadata.get("task_type") == task_type
                 ]
+                # Truncate to the caller's limit AFTER the metadata filter.
+                tasks = tasks[:limit_val]
 
             task_list = []
             for task in tasks:
