@@ -143,21 +143,62 @@ class TestEffectiveModelParam:
 
 class TestMessageHelpers:
     def test_extract_system_prompt(self):
-        instructions, inputs = _extract_instructions_and_input([
+        instructions, inputs, dev = _extract_instructions_and_input([
             {"role": "system", "content": "You are helpful"},
             {"role": "user", "content": "Hello"},
         ])
         assert instructions == "You are helpful"
         assert len(inputs) == 1 and inputs[0]["role"] == "user"
+        assert dev is None
 
     def test_extract_structured_system_content(self):
-        instructions, _ = _extract_instructions_and_input([
+        instructions, _, _ = _extract_instructions_and_input([
             {"role": "system", "content": [
                 {"type": "text", "text": "Part 1"},
                 {"type": "text", "text": "Part 2"},
             ]},
         ])
         assert "Part 1" in instructions and "Part 2" in instructions
+
+    def test_trailing_system_ignored_without_keep_flag(self):
+        # Legacy behavior: a trailing operator system turn folds into
+        # ``instructions`` when the caller doesn't opt into inline delivery.
+        instructions, inputs, dev = _extract_instructions_and_input([
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Operator context: governance changed."},
+        ])
+        assert dev is None
+        assert instructions == "Operator context: governance changed."
+        assert [m["role"] for m in inputs] == ["user"]
+
+    def test_trailing_system_peeled_as_developer_instructions(self):
+        # With keep_trailing_system, the trailing operator turn is routed to
+        # the per-turn developer channel and the thread system prompt is
+        # preserved intact.
+        instructions, inputs, dev = _extract_instructions_and_input(
+            [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "Operator context: governance changed."},
+            ],
+            keep_trailing_system=True,
+        )
+        assert instructions == "You are helpful"
+        assert dev == "Operator context: governance changed."
+        assert [m["role"] for m in inputs] == ["user"]
+
+    def test_keep_flag_noop_when_last_message_not_system(self):
+        instructions, inputs, dev = _extract_instructions_and_input(
+            [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": "Hello"},
+            ],
+            keep_trailing_system=True,
+        )
+        assert instructions == "You are helpful"
+        assert dev is None
+        assert [m["role"] for m in inputs] == ["user"]
 
 
 class TestDynamicToolsSpec:
@@ -583,6 +624,101 @@ class TestAdapterTextPath:
             {"type": "input_text", "text": "Describe this image."},
             {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
         ]
+
+    @pytest.mark.asyncio
+    async def test_operator_signal_rides_collaboration_mode(self):
+        # A trailing operator ``system`` turn delivered inline
+        # (keep_trailing_system=True) is routed to the app-server's per-turn
+        # developer channel, NOT folded into the thread system prompt.
+        a = _adapter_with(_TEXT_TURN)
+        # Concrete serveable model — inline delivery requires a nameable slug
+        # for ``collaborationMode.settings.model``.
+        await a.get_response(
+            client="ignored", model="gpt-5.5",
+            messages=[
+                {"role": "system", "content": "You are Kestrel."},
+                {"role": "user", "content": "hi"},
+                {"role": "system",
+                 "content": "Operator context: governance changed."},
+            ],
+            session_id="opsig",
+            keep_trailing_system=True,
+        )
+        turn_params = [
+            params for method, params in a._client.requests
+            if method == "turn/start"
+        ][0]
+        assert turn_params["collaborationMode"] == {
+            "mode": "default",
+            "settings": {
+                "model": "gpt-5.5",
+                "reasoning_effort": None,
+                "developer_instructions": "Operator context: governance changed.",
+            },
+        }
+        # The operator turn must not leak into the visible user input.
+        assert "Operator context" not in json.dumps(turn_params["input"])
+        # Thread system prompt stays the real persona, not the operator turn.
+        thread_params = [
+            params for method, params in a._client.requests
+            if method == "thread/start"
+        ][0]
+        assert thread_params["developerInstructions"].endswith("You are Kestrel.")
+
+    def test_model_gate_rejects_auto_accepts_concrete(self):
+        a = CodexAdapter()
+        # ``auto``/``default`` carry no nameable slug → decline inline.
+        assert a._model_supports_inline_system("auto") is False
+        assert a._model_supports_inline_system("default") is False
+        assert a._model_supports_inline_system(None) is False
+        # A concrete model passes when the serveable cache can't refute it.
+        with patch.object(a, "_codex_serveable_slugs", return_value=set()):
+            assert a._model_supports_inline_system("gpt-5.5") is True
+        # A concrete-but-unserveable model is also declined (no valid slug).
+        with patch.object(a, "_codex_serveable_slugs", return_value={"gpt-5.4"}):
+            assert a._model_supports_inline_system("gpt-9.9") is False
+            assert a._model_supports_inline_system("gpt-5.4") is True
+
+    @pytest.mark.asyncio
+    async def test_auto_model_declines_inline_keeps_no_collaboration_mode(self):
+        # keep_trailing_system with an ``auto`` model: no nameable slug for
+        # settings.model, so collaborationMode is omitted rather than sent
+        # with a null model (which codex rejects).
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="ignored", model="auto",
+            messages=[
+                {"role": "system", "content": "You are Kestrel."},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Operator context: changed."},
+            ],
+            session_id="opsig-auto",
+            keep_trailing_system=True,
+        )
+        turn_params = [
+            params for method, params in a._client.requests
+            if method == "turn/start"
+        ][0]
+        assert "collaborationMode" not in turn_params
+
+    @pytest.mark.asyncio
+    async def test_no_collaboration_mode_on_ordinary_turn(self):
+        # Without an inline operator turn, no collaborationMode is sent, so
+        # codex keeps its built-in Default-mode preset.
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="ignored", model="auto",
+            messages=[
+                {"role": "system", "content": "You are Kestrel."},
+                {"role": "user", "content": "hi"},
+            ],
+            session_id="plain",
+        )
+        turn_params = [
+            params for method, params in a._client.requests
+            if method == "turn/start"
+        ][0]
+        assert "collaborationMode" not in turn_params
 
     @pytest.mark.asyncio
     async def test_session_thread_reused(self):

@@ -168,6 +168,15 @@ class OpenAIAdapter(LLMAdapter):
             supports_files=native,
             supports_prompt_cache=native,
             supports_raw_passthrough=native,
+            # Native OpenAI accepts a ``system``/``developer`` message in any
+            # position, so operator signals can be delivered as a
+            # mid-conversation ``system`` turn (which ``_normalize_messages``
+            # passes through untouched) rather than a user-visible
+            # ``<operator_notice>`` bubble. Gated on ``native`` — the
+            # OpenAI-*compatible* base_urls this adapter also serves
+            # (Kimi/DeepSeek/OpenRouter/…) are not guaranteed to honor a
+            # trailing system turn, so we don't over-claim for them.
+            supports_inline_system=native,
             structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
             tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,

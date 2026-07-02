@@ -81,22 +81,54 @@ ToolExecutor = Callable[
 ]
 
 
-def _extract_instructions_and_input(messages):
-    """Split messages into instructions (system prompt) and the rest."""
+def _system_content_text(content: Any) -> str:
+    """Flatten a ``system``-role message's content to plain text."""
+    if isinstance(content, list):
+        return " ".join(
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return content or ""
+
+
+def _extract_instructions_and_input(messages, *, keep_trailing_system: bool = False):
+    """Split messages into thread instructions, input, and a per-turn
+    developer-instructions string.
+
+    The leading ``system`` message is the durable thread system prompt →
+    ``instructions`` (consumed once at ``thread/start``).
+
+    When ``keep_trailing_system`` is set and the final message is a
+    mid-conversation ``system`` turn — the operator-signal inline delivery
+    (auto-mode / token-budget / governance) appended after the user turn —
+    it is peeled off and returned separately as ``turn_developer_instructions``.
+    The caller routes it to the app-server's per-turn
+    ``collaborationMode.settings.developer_instructions`` channel (the codex
+    equivalent of an OpenAI ``developer`` message) instead of letting it
+    overwrite the thread-level system prompt. Mirrors kestrel-claw's
+    ``buildTurnCollaborationMode`` (run-attempt.ts / thread-lifecycle.ts).
+
+    Returns ``(instructions, input_messages, turn_developer_instructions)``.
+    """
+    working = list(messages)
+    turn_developer_instructions: Optional[str] = None
+    if (
+        keep_trailing_system
+        and working
+        and working[-1].get("role") == "system"
+    ):
+        turn_developer_instructions = (
+            _system_content_text(working.pop().get("content", "")) or None
+        )
+
     instructions = None
     input_messages = []
-    for msg in messages:
+    for msg in working:
         if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    p.get("text", "") for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                )
-            instructions = content
+            instructions = _system_content_text(msg.get("content", ""))
         else:
             input_messages.append(msg)
-    return instructions, input_messages
+    return instructions, input_messages, turn_developer_instructions
 
 
 # Codex dynamicTool namespace for kestrel tools. The codex app-server
@@ -1027,6 +1059,12 @@ class CodexAdapter(LLMAdapter):
             supports_streaming=True,
             supports_vision=True,
             supports_structured_output=False,
+            # Mid-conversation operator signals ride the app-server's per-turn
+            # ``collaborationMode.settings.developer_instructions`` channel (the
+            # codex equivalent of an OpenAI ``developer`` message), so
+            # operator_signals delivers them inline instead of as a
+            # user-visible ``<operator_notice>`` bubble. See ``_run_turn``.
+            supports_inline_system=True,
             structured_output_mode=StructuredOutputMode.NONE,
             tool_streaming_mode=ToolStreamingMode.INLINE_EXECUTOR,
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
@@ -2273,6 +2311,7 @@ class CodexAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]], session_id: Optional[str],
         tool_executor: Optional[ToolExecutor],
         cancel_token: Optional[CancelToken] = None,
+        keep_trailing_system: bool = False,
     ) -> AsyncIterator[dict]:
         """Drive one turn; yield normalized events:
 
@@ -2282,7 +2321,11 @@ class CodexAdapter(LLMAdapter):
         app = self._app_server()
         raise_if_cancelled(cancel_token)
         await app.ensure_started()
-        instructions, input_messages = _extract_instructions_and_input(messages)
+        instructions, input_messages, turn_developer_instructions = (
+            _extract_instructions_and_input(
+                messages, keep_trailing_system=keep_trailing_system,
+            )
+        )
         # Nothing in the LLM pipeline calls contribute_system_prompt for
         # us — the adapter owns it (regresses the GPT-5 <persona_latch>
         # overlay otherwise).
@@ -2426,6 +2469,41 @@ class CodexAdapter(LLMAdapter):
             m_for_turn = self._effective_model_param(model)
             if m_for_turn:
                 turn_params["model"] = m_for_turn
+            # Deliver a mid-conversation operator signal (governance /
+            # auto-mode / token-budget) inline via the app-server's per-turn
+            # developer channel — the codex equivalent of an OpenAI
+            # ``developer`` message — so it reaches the model without
+            # surfacing as a user-visible ``<operator_notice>`` bubble. Only
+            # set on turns that actually carry a signal; when absent the
+            # param is omitted so codex keeps its built-in Default-mode
+            # preset (applied only when ``developer_instructions`` is null).
+            # Mirrors kestrel-claw's ``collaborationMode`` turn param, whose
+            # ``settings`` codex validates as ``{model, reasoning_effort,
+            # developer_instructions}`` — ``model`` is required, so we can
+            # only ride this channel when the turn has a concrete serveable
+            # model (``auto`` → subscription default carries no slug we can
+            # name). Without one, the signal stays the user-visible fallback
+            # notice the producer already prepared.
+            if turn_developer_instructions and m_for_turn:
+                turn_params["collaborationMode"] = {
+                    "mode": "default",
+                    "settings": {
+                        "model": m_for_turn,
+                        "reasoning_effort": None,
+                        "developer_instructions": turn_developer_instructions,
+                    },
+                }
+            elif turn_developer_instructions:
+                # Defensive: the producer gates inline delivery on
+                # ``_model_supports_inline_system`` (concrete serveable model)
+                # before peeling the trailing system turn, so this branch
+                # should be unreachable. Log loudly rather than silently drop
+                # trusted operator context if the gate is ever bypassed.
+                logger.warning(
+                    "codex: operator signal peeled for inline delivery but the "
+                    "turn has no nameable model for collaborationMode.settings; "
+                    "signal not delivered this turn (model=%r).", model,
+                )
             await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
@@ -2728,6 +2806,7 @@ class CodexAdapter(LLMAdapter):
         session_id: Optional[str],
         tool_executor: Optional[ToolExecutor],
         cancel_token: Optional[CancelToken] = None,
+        keep_trailing_system: bool = False,
     ) -> AsyncIterator[dict]:
         """One-shot retry around :meth:`_run_turn` for the narrow case
         of a transient codex/ChatGPT-Plus idle stall.
@@ -2778,6 +2857,7 @@ class CodexAdapter(LLMAdapter):
             async for ev in self._run_turn(
                 model, messages, tools, session_id, tool_executor,
                 cancel_token=cancel_token,
+                keep_trailing_system=keep_trailing_system,
             ):
                 yield ev
             return
@@ -2789,6 +2869,7 @@ class CodexAdapter(LLMAdapter):
                 async for ev in self._run_turn(
                     model, messages, None, session_id, None,
                     cancel_token=cancel_token,
+                    keep_trailing_system=keep_trailing_system,
                 ):
                     events_yielded += 1
                     yield ev
@@ -2861,6 +2942,7 @@ class CodexAdapter(LLMAdapter):
         session_id = kwargs.get("session_id")
         tool_executor = kwargs.get("tool_executor")
         cancel_token = kwargs.get("cancel_token")
+        keep_trailing_system = bool(kwargs.get("keep_trailing_system"))
         content: Optional[str] = None
         tool_calls: Optional[List[ToolCall]] = None
         usage: Dict[str, Optional[int]] = {}
@@ -2868,6 +2950,7 @@ class CodexAdapter(LLMAdapter):
         async for ev in self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
+            keep_trailing_system=keep_trailing_system,
         ):
             if "final" in ev:
                 content, tool_calls, usage = ev["final"]
@@ -2901,12 +2984,14 @@ class CodexAdapter(LLMAdapter):
     ) -> AsyncIterator[Union[str, ThinkingDelta]]:
         session_id = kwargs.get("session_id")
         cancel_token = kwargs.get("cancel_token")
+        keep_trailing_system = bool(kwargs.get("keep_trailing_system"))
         # Tools intentionally not passed: text-only streaming surface.
         # Uses ``_run_turn_with_retry`` so a transient codex idle stall
         # gets one chance to recover before the error surfaces. See #1411.
         async for ev in self._run_turn_with_retry(
             model, messages, None, session_id, None,
             cancel_token=cancel_token,
+            keep_trailing_system=keep_trailing_system,
         ):
             if "text" in ev:
                 yield ev["text"]
@@ -2925,10 +3010,12 @@ class CodexAdapter(LLMAdapter):
         session_id = kwargs.get("session_id")
         tool_executor = kwargs.get("tool_executor")
         cancel_token = kwargs.get("cancel_token")
+        keep_trailing_system = bool(kwargs.get("keep_trailing_system"))
         idx = 0
         async for ev in self._run_turn(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
+            keep_trailing_system=keep_trailing_system,
         ):
             if "text" in ev:
                 yield ev["text"]
@@ -3068,6 +3155,22 @@ class CodexAdapter(LLMAdapter):
             )
             return None
         return m
+
+    def _model_supports_inline_system(self, model: Optional[str]) -> bool:
+        """Whether an inline operator signal can ride this turn's model.
+
+        Inline delivery uses the per-turn
+        ``collaborationMode.settings.developer_instructions`` channel, and
+        codex validates ``settings`` with a required ``model`` field. An
+        ``auto``/``default`` route — or a model this account's codex cannot
+        serve — carries no nameable slug to put there, so those turns must
+        fall back to the user-visible ``<operator_notice>``. The operator-
+        signal producer consults this (``supports_inline_system_for_next_route``)
+        to decide delivery *before* peeling the trailing system turn, so a
+        signal is never silently dropped. Mirrors the Anthropic adapter's
+        model-gated ``_model_supports_inline_system``.
+        """
+        return self._effective_model_param(model) is not None
 
     def contribute_system_prompt(
         self, model_id: str, base: Optional[str]
