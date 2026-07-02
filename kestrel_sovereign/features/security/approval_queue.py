@@ -13,6 +13,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from .args_summary import summarize_args
+
 if TYPE_CHECKING:
     from kestrel_sovereign.security.auto_approve import AutoApprovePolicy
 
@@ -282,7 +284,7 @@ class ApprovalQueue:
                         tool_name=tool_name,
                         action="tool_execution",
                         decision="auto_denied",
-                        args_summary=self._summarize_args(tool_args),
+                        args_summary=summarize_args(tool_args),
                     )
                     logger.info(
                         "ApprovalQueue denied %s.%s from explicit policy",
@@ -300,7 +302,7 @@ class ApprovalQueue:
                         action="tool_execution",
                         decision="auto_mode_allowed",
                         user_choice="constitutional_honesty_unflagged",
-                        args_summary=self._summarize_args(tool_args),
+                        args_summary=summarize_args(tool_args),
                     )
                     logger.info(
                         "ApprovalQueue auto-mode approved %s.%s without prompting",
@@ -355,7 +357,7 @@ class ApprovalQueue:
                         action="tool_execution",
                         decision="auto_denied",
                         user_choice="canonical_deny",
-                        args_summary=self._summarize_args(tool_args),
+                        args_summary=summarize_args(tool_args),
                     )
                     logger.info(
                         "ApprovalQueue: canonical DENY blocks auto-approve "
@@ -388,7 +390,7 @@ class ApprovalQueue:
                         action="tool_execution",
                         decision="auto_approved",
                         user_choice=f"auto_approve:{match.rule.source}",
-                        args_summary=self._summarize_args(tool_args),
+                        args_summary=summarize_args(tool_args),
                     )
                     logger.info(
                         "ApprovalQueue auto-approved %s.%s for agent=%s "
@@ -621,7 +623,7 @@ class ApprovalQueue:
             else:
                 decision = "user_denied"
 
-            args_summary = self._summarize_args(tool_args)
+            args_summary = summarize_args(tool_args)
             await self._permission_store.log_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
@@ -641,22 +643,6 @@ class ApprovalQueue:
             )
             return str(e)
         return None
-
-    @staticmethod
-    def _summarize_args(args: Optional[Dict], max_chars: int = 500) -> Optional[str]:
-        """Truncate tool args for the audit log so secrets don't get logged
-        in full.  Mirrors :meth:`SecurityHook._summarize_args` so the audit
-        rows look the same regardless of which path produced them."""
-        if not args:
-            return None
-        try:
-            import json
-            text = json.dumps(args, default=str)
-        except (TypeError, ValueError):
-            text = repr(args)
-        if len(text) > max_chars:
-            return text[:max_chars] + "..."
-        return text
 
     async def submit_decision(
         self,
