@@ -173,7 +173,17 @@ def test_keys_endpoints_use_storage_contract_without_exposing_secrets():
     agent = MagicMock(storage=storage, agent_id="did:agent")
     service_key_storage = MagicMock()
     service_key_storage.list_keys = AsyncMock(return_value=[existing_key])
-    service_key_storage.store_key = AsyncMock(return_value="key-2")
+
+    # store_key is the single enforcement point (F196): insert-only, so a
+    # duplicate provider raises KeyStorageError which the endpoint maps to 409.
+    from kestrel_sovereign.security.exceptions import KeyStorageError
+
+    async def _store_key(*, provider_id, api_key, quota_limit=None):
+        if provider_id == "openai":
+            raise KeyStorageError("key for openai exists — use rotate_service_key")
+        return "key-2"
+
+    service_key_storage.store_key = AsyncMock(side_effect=_store_key)
 
     app, original = _prepare_app(agent)
     try:
@@ -199,7 +209,7 @@ def test_keys_endpoints_use_storage_contract_without_exposing_secrets():
         assert duplicate_response.status_code == 409
         assert create_response.status_code == 200
         assert create_response.json()["key_id"] == "key-2"
-        service_key_storage.store_key.assert_awaited_once_with(
+        service_key_storage.store_key.assert_any_await(
             provider_id="anthropic",
             api_key="sk-new",
             quota_limit=50,
