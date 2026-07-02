@@ -18,7 +18,18 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_agent_privacy_config,
+    resolve_feature_database,
+)
+from kestrel_sovereign.security.encryption import (
+    DecryptionError,
+    decrypt_string_fernet,
+    encrypt_string_fernet,
+    get_agent_fernet,
+    get_fernet,
+)
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -35,6 +46,13 @@ from kestrel_sovereign.signals.sources.channels import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Key version stamped into channel_messages metadata when a row is
+# encrypted at rest. Mirrors
+# ``async_conversation_store.CURRENT_KEY_VERSION`` (per-agent HKDF key)
+# so channel content matches the conversation_history encryption
+# guarantee (#2096 / F112).
+CHANNEL_KEY_VERSION = 1
 
 # SQL for the two tables managed by this feature.
 CHANNEL_TABLES_SQL = """
@@ -103,6 +121,16 @@ class ChannelFeature(Feature):
             or getattr(getattr(storage, "_storage", None), "agent_id", "")
         )
 
+        # Encryption-at-rest keys for channel_messages content. Same key
+        # hierarchy the conversation store uses (per-agent HKDF key with a
+        # global-key fallback); both are ``None`` when KESTREL_DATA_KEY is
+        # unset, in which case content is persisted in plaintext exactly as
+        # conversation_history would be (#2096 / F112).
+        self._agent_fernet = (
+            get_agent_fernet(self._agent_id) if self._agent_id else None
+        )
+        self._global_fernet = get_fernet()
+
         # Create the channel registry
         self.registry = ChannelRegistry()
         self._register_channel_signal_source()
@@ -150,14 +178,93 @@ class ChannelFeature(Feature):
     # Message logging helpers
     # ------------------------------------------------------------------
 
+    def _persistent_content_hidden(self) -> bool:
+        """True when the active privacy mode forbids persisting user content.
+
+        EPHEMERAL/ISOLATED promise "leave no trace" / session-only storage,
+        so raw inbound/outbound channel text must never reach the
+        persistent ``channel_messages`` table (#2096 / F112).
+        """
+        return hides_persisted_user_content(self.agent)
+
+    def _requires_anonymization(self) -> bool:
+        """True when the active privacy config mandates PII redaction."""
+        config = resolve_agent_privacy_config(self.agent)
+        if config is None:
+            return False
+        requires = getattr(config, "requires_anonymization", None)
+        return bool(callable(requires) and requires())
+
+    def _anonymize_channel_text(self, value: str) -> str:
+        """Redact PII from channel content using the shared detector path."""
+        from kestrel_sovereign.features.privacy.pii_detector import anonymize_text
+
+        return anonymize_text(value)
+
+    def _decrypt_content(self, content: str, meta: Optional[Dict]) -> str:
+        """Decrypt persisted channel content when it was encrypted at rest.
+
+        Rows written without a key (KESTREL_DATA_KEY unset) carry no ``enc``
+        flag and pass straight through. Mirrors the conversation store's
+        per-agent-first, global-key-fallback decryption.
+        """
+        if not meta or not meta.get("enc"):
+            return content
+        for fernet in (self._agent_fernet, self._global_fernet):
+            if fernet is None:
+                continue
+            try:
+                return decrypt_string_fernet(content, meta, fernet)
+            except DecryptionError:
+                continue
+        logger.error(
+            "Failed to decrypt channel_messages content for agent %s",
+            self._agent_id,
+        )
+        return content
+
     async def _log_message(
         self,
         message: ChannelMessage,
         status: str = "success",
     ) -> None:
-        """Persist a channel message to the database."""
+        """Persist a channel message to the database.
+
+        Privacy gating (#2096 / F112) — the same contract enforced for
+        conversation_history is applied here because this feature writes
+        user content via the raw DB:
+
+        - EPHEMERAL/ISOLATED: skip the persistent write entirely so nothing
+          survives the session (``channels_history`` can't surface it).
+        - ANONYMOUS: run the content through the PII anonymizer first.
+        - Always: encrypt content at rest with the same key hierarchy the
+          conversation store uses when a data key is configured.
+        """
         if not self._db:
             return
+
+        # EPHEMERAL/ISOLATED: never persist raw channel content.
+        if self._persistent_content_hidden():
+            logger.debug(
+                "Skipping channel_messages write for agent %s: privacy mode "
+                "hides persisted user content",
+                self._agent_id,
+            )
+            return
+
+        content = message.content
+        if self._requires_anonymization():
+            content = self._anonymize_channel_text(content)
+
+        # Encrypt at rest so channel_messages matches conversation_history.
+        fernet = self._agent_fernet or self._global_fernet
+        stored_content, was_encrypted = encrypt_string_fernet(content, fernet)
+
+        meta = dict(message.metadata) if message.metadata else {}
+        if was_encrypted:
+            meta["enc"] = True
+            meta["key_version"] = CHANNEL_KEY_VERSION
+
         try:
             await self._db.execute(
                 """INSERT INTO channel_messages
@@ -171,9 +278,9 @@ class ChannelFeature(Feature):
                     message.direction.value,
                     message.sender,
                     message.recipient,
-                    message.content,
+                    stored_content,
                     status,
-                    json.dumps(message.metadata) if message.metadata else None,
+                    json.dumps(meta) if meta else None,
                     message.timestamp.isoformat(),
                 ),
             )
@@ -335,6 +442,25 @@ class ChannelFeature(Feature):
             limit: Maximum number of messages to return (default 20)
             channel: Optional channel type filter (empty = all channels)
         """
+        # Privacy gating (#2096 / F112): EPHEMERAL/ISOLATED promise the
+        # session leaves no persisted trace. The write path already skips
+        # persisting channel content in these modes, but a row could still
+        # linger from a prior NORMAL stint or a privacy-layer leak — so the
+        # read path must refuse to surface persisted content too, mirroring
+        # the conversation store's ephemeral read guards. Return an empty
+        # success without touching the DB.
+        if self._persistent_content_hidden():
+            logger.debug(
+                "channels_history suppressed for agent %s: privacy mode hides "
+                "persisted user content",
+                self._agent_id,
+            )
+            scope = f" for channel '{channel}'" if channel else ""
+            return ToolResult.ok(
+                f"Returned 0 channel message(s){scope}.",
+                data={"messages": [], "count": 0, "channel": channel or None},
+            )
+
         if not self._db:
             return ToolResult.failed(error="Database not available")
 
@@ -342,7 +468,7 @@ class ChannelFeature(Feature):
             if channel:
                 rows = await self._db.fetchall(
                     """SELECT id, channel_type, direction, sender, recipient,
-                              content, status, created_at
+                              content, status, created_at, metadata
                        FROM channel_messages
                        WHERE agent_id = ? AND channel_type = ?
                        ORDER BY created_at DESC
@@ -352,7 +478,7 @@ class ChannelFeature(Feature):
             else:
                 rows = await self._db.fetchall(
                     """SELECT id, channel_type, direction, sender, recipient,
-                              content, status, created_at
+                              content, status, created_at, metadata
                        FROM channel_messages
                        WHERE agent_id = ?
                        ORDER BY created_at DESC
@@ -362,13 +488,19 @@ class ChannelFeature(Feature):
 
             messages = []
             for row in rows:
+                # metadata (row[8]) carries the at-rest ``enc`` flag; it's
+                # only used to decrypt content and is not surfaced to the
+                # caller. Defensive ``len(row) > 8`` tolerates legacy 8-col
+                # rows.
+                raw_meta = row[8] if len(row) > 8 else None
+                meta = json.loads(raw_meta) if raw_meta else None
                 messages.append({
                     "id": row[0],
                     "channel_type": row[1],
                     "direction": row[2],
                     "sender": row[3],
                     "recipient": row[4],
-                    "content": row[5],
+                    "content": self._decrypt_content(row[5], meta),
                     "status": row[6],
                     "created_at": row[7],
                 })

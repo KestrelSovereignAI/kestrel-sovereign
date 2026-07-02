@@ -44,7 +44,11 @@ async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path):
 
         result = await wrapper.purge_ephemeral_session(reason="test")
 
-        assert result == {"conversation_history": 0, "graph_nodes": 0}
+        assert result == {
+            "conversation_history": 0,
+            "graph_nodes": 0,
+            "channel_messages": 0,
+        }
 
 
 @pytest.mark.asyncio
@@ -157,6 +161,74 @@ async def test_purge_destroys_leaked_graph_nodes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_purge_destroys_leaked_channel_messages(tmp_path):
+    """A leaked channel_messages row (channels feature #2096 / F112) gets
+    the same scoped hard-delete treatment, reported in the breakdown, and
+    per-agent scoping is preserved.
+
+    The channels feature owns the table, so the test creates it directly
+    and seeds an in-window leak plus another agent's row that must survive.
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.db.execute_commit(
+            """CREATE TABLE IF NOT EXISTS channel_messages (
+                   id TEXT PRIMARY KEY,
+                   agent_id TEXT NOT NULL,
+                   channel_type TEXT NOT NULL,
+                   direction TEXT NOT NULL,
+                   sender TEXT NOT NULL,
+                   recipient TEXT NOT NULL,
+                   content TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'success',
+                   metadata TEXT,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        leak_ts = _now_iso_utc()
+
+        async def _insert(mid, agent, ts):
+            await storage.db.execute_commit(
+                "INSERT INTO channel_messages "
+                "(id, agent_id, channel_type, direction, sender, recipient, "
+                " content, status, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, agent, "telegram", "inbound", "alice", "bot",
+                 "leaked channel text", "received", None, ts),
+            )
+
+        await _insert("leak-msg-1", AGENT_ID, leak_ts)
+        await _insert("leak-msg-2", AGENT_ID, leak_ts)
+        await _insert("other-msg", OTHER_AGENT_ID, leak_ts)
+
+        result = await wrapper.purge_ephemeral_session(reason="test")
+
+        assert result["channel_messages"] == 2
+
+        rows = await storage.db.fetchall(
+            "SELECT id FROM channel_messages ORDER BY id"
+        )
+        surviving = {r[0] for r in rows}
+        # Only the other agent's row survives; per-agent scoping preserved.
+        assert surviving == {"other-msg"}
+
+
+@pytest.mark.asyncio
+async def test_purge_channel_messages_tolerates_missing_table(tmp_path):
+    """When the channels feature never loaded, its table doesn't exist —
+    the purge must report 0 rather than raising."""
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        await asyncio.sleep(1.05)
+        result = await wrapper.purge_ephemeral_session(reason="test")
+        assert result["channel_messages"] == 0
+
+
+@pytest.mark.asyncio
 async def test_purge_does_not_touch_other_agents_data(tmp_path):
     """Per-agent scoping check at the conversation_history layer.
 
@@ -250,4 +322,8 @@ async def test_purge_with_empty_agent_id_is_a_safe_noop(tmp_path):
         storage.agent_id = ""
 
         result = await wrapper.purge_ephemeral_session(reason="test")
-        assert result == {"conversation_history": 0, "graph_nodes": 0}
+        assert result == {
+            "conversation_history": 0,
+            "graph_nodes": 0,
+            "channel_messages": 0,
+        }

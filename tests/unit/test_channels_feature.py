@@ -95,8 +95,13 @@ def _make_db(fetchall_data=None, fetchone_data=None):
     return db
 
 
-def _make_agent(db=None, agent_id="test-agent"):
-    """Create a mock KestrelAgent."""
+def _make_agent(db=None, agent_id="test-agent", privacy_preset=None):
+    """Create a mock KestrelAgent.
+
+    ``privacy_preset`` optionally sets a real ``PrivacyConfig`` (via preset
+    name) on ``agent.privacy_config`` so the channels feature's privacy
+    gating (#2096 / F112) resolves an actual config instead of ``None``.
+    """
     agent = MagicMock()
     agent.agent_id = agent_id
 
@@ -106,7 +111,20 @@ def _make_agent(db=None, agent_id="test-agent"):
     agent.storage = storage
     agent._raw_storage = None
 
+    if privacy_preset is not None:
+        from kestrel_sovereign.privacy import get_privacy_preset
+        agent.privacy_config = get_privacy_preset(privacy_preset)
+
     return agent
+
+
+def _insert_calls(db):
+    """Return the INSERT-into-channel_messages calls recorded on a mock db."""
+    return [
+        call
+        for call in db.execute.call_args_list
+        if "INSERT INTO channel_messages" in str(call)
+    ]
 
 
 # ============================================================================
@@ -721,6 +739,167 @@ class TestChannelFeature:
         )
         # Should not raise
         await feature_no_db._log_message(msg)
+
+
+# ============================================================================
+# Privacy gating (#2096 / F112)
+# ============================================================================
+
+
+def _inbound(content="secret text", channel="telegram", sender="alice"):
+    return ChannelMessage(
+        channel_type=channel,
+        direction=MessageDirection.INBOUND,
+        sender=sender,
+        recipient="bot",
+        content=content,
+    )
+
+
+class TestChannelPrivacyGating:
+    """F112: channel_messages must honor the active privacy mode."""
+
+    async def _feature(self, privacy_preset=None, db=None):
+        db = db or _make_db()
+        agent = _make_agent(db=db, privacy_preset=privacy_preset)
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        return feat
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_inbound_not_persisted(self):
+        feat = await self._feature(privacy_preset="ephemeral")
+        feat.registry.register(StubAdapter(channel="telegram"))
+        await feat.handle_inbound(_inbound("do not store me"))
+        assert _insert_calls(feat._db) == []
+
+    @pytest.mark.asyncio
+    async def test_isolated_inbound_not_persisted(self):
+        feat = await self._feature(privacy_preset="isolated")
+        feat.registry.register(StubAdapter(channel="telegram"))
+        await feat.handle_inbound(_inbound("session only"))
+        assert _insert_calls(feat._db) == []
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_outbound_not_persisted(self):
+        feat = await self._feature(privacy_preset="ephemeral")
+        feat.registry.register(StubAdapter(channel="telegram"))
+        await feat.channels_send(
+            channel="telegram", to="user123", message="private reply"
+        )
+        assert _insert_calls(feat._db) == []
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_history_returns_nothing(self):
+        """A leaked row can't surface because ephemeral never persisted it."""
+        feat = await self._feature(privacy_preset="ephemeral")
+        feat.registry.register(StubAdapter(channel="telegram"))
+        await feat.handle_inbound(_inbound("leak?"))
+        # Nothing was written, so the store has nothing to return.
+        feat._db.fetchall = AsyncMock(return_value=[])
+        envelope = await feat.channels_history()
+        assert envelope.data["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_history_does_not_query_leaked_rows(self):
+        """A persisted row must not surface via history in EPHEMERAL, and the
+        read path must not even hit the DB (the privacy gate short-circuits)."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        # DB would return a leaked row if queried — assert it never is.
+        db = _make_db(fetchall_data=[(
+            "leaked-1", "telegram", "inbound", "alice", "bot",
+            "leaked persisted content", "received",
+            "2026-03-01T10:00:00", None,
+        )])
+        feat = await self._feature(privacy_preset="ephemeral", db=db)
+        envelope = await feat.channels_history()
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["count"] == 0
+        assert envelope.data["messages"] == []
+        feat._db.fetchall.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_isolated_history_does_not_query_leaked_rows(self):
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        db = _make_db(fetchall_data=[(
+            "leaked-2", "telegram", "outbound", "bot", "alice",
+            "isolated leak", "success", "2026-03-01T10:00:00", None,
+        )])
+        feat = await self._feature(privacy_preset="isolated", db=db)
+        envelope = await feat.channels_history()
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["count"] == 0
+        feat._db.fetchall.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_anonymous_content_is_redacted(self, monkeypatch):
+        # Isolate anonymization from at-rest encryption (which may be
+        # enabled by a data key in the test env) so we can assert on the
+        # redacted plaintext directly.
+        monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+        feat = await self._feature(privacy_preset="anonymous")
+        feat.registry.register(StubAdapter(channel="telegram"))
+        await feat.handle_inbound(
+            _inbound("reach me at alice@example.com please")
+        )
+        inserts = _insert_calls(feat._db)
+        assert len(inserts) == 1
+        stored_content = inserts[0].args[1][6]
+        assert "alice@example.com" not in stored_content
+        assert "[EMAIL_REDACTED]" in stored_content
+
+    @pytest.mark.asyncio
+    async def test_normal_content_is_persisted_plaintext(self, monkeypatch):
+        """Without a data key, NORMAL persists content verbatim."""
+        monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+        feat = await self._feature(privacy_preset="normal")
+        feat.registry.register(StubAdapter(channel="telegram"))
+        await feat.handle_inbound(_inbound("just a normal message"))
+        inserts = _insert_calls(feat._db)
+        assert len(inserts) == 1
+        assert inserts[0].args[1][6] == "just a normal message"
+
+    @pytest.mark.asyncio
+    async def test_no_privacy_config_still_persists(self):
+        """Legacy agents with no resolvable config default to persisting."""
+        feat = await self._feature(privacy_preset=None)
+        feat.registry.register(StubAdapter(channel="telegram"))
+        await feat.handle_inbound(_inbound("hi"))
+        assert len(_insert_calls(feat._db)) == 1
+
+    @pytest.mark.asyncio
+    async def test_at_rest_encryption_round_trips(self, monkeypatch):
+        """With a data key, content is encrypted at rest and decrypted on read."""
+        from cryptography.fernet import Fernet
+
+        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+
+        feat = await self._feature(privacy_preset="normal")
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        plaintext = "encrypt this channel content"
+        await feat.handle_inbound(_inbound(plaintext))
+
+        inserts = _insert_calls(feat._db)
+        assert len(inserts) == 1
+        params = inserts[0].args[1]
+        stored_content = params[6]
+        stored_meta = params[8]
+        # Ciphertext must not equal the plaintext, and the enc flag is set.
+        assert stored_content != plaintext
+        assert stored_meta is not None and '"enc": true' in stored_meta
+
+        # channels_history must transparently decrypt it back.
+        feat._db.fetchall = AsyncMock(
+            return_value=[(
+                params[0], "telegram", "inbound", "alice", "bot",
+                stored_content, "received", "2026-03-01T10:00:00", stored_meta,
+            )]
+        )
+        envelope = await feat.channels_history()
+        assert envelope.data["messages"][0]["content"] == plaintext
 
 
 # ============================================================================

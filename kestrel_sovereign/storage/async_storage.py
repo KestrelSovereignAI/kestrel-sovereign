@@ -422,6 +422,39 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.purge_all_since(since_iso, reason=reason)
 
+    async def purge_channel_messages_since(
+        self, since_iso: str, *, reason: str = "ephemeral-leak",
+    ) -> int:
+        """Scoped EPHEMERAL leak-purge for the channels feature table (#2096).
+
+        ``channel_messages`` is created by the channels feature, not core
+        storage, so this primitive tolerates the table being absent (the
+        feature was never loaded) and simply reports 0 rows purged. Like
+        :meth:`purge_conversations_since`, only rows whose
+        ``created_at >= since_iso`` are destroyed so a brief EPHEMERAL stint
+        never wipes preexisting NORMAL channel history.
+        """
+        if not since_iso:
+            return 0
+        if not self._initialized:
+            await self.initialize()
+        if not await self.db.table_exists("channel_messages"):
+            return 0
+        from .async_conversation_store import _rows_affected
+
+        affected = await self.db.execute_commit(
+            "DELETE FROM channel_messages "
+            "WHERE agent_id = ? AND created_at >= ?",
+            (self.agent_id, since_iso),
+        )
+        purged = _rows_affected(affected)
+        if purged:
+            logger.info(
+                "purge_channel_messages_since agent=%s since=%s reason=%s rows=%d",
+                self.agent_id, since_iso, reason, purged,
+            )
+        return purged
+
     async def purge_trash_older_than(
         self,
         cutoff_iso: str,
