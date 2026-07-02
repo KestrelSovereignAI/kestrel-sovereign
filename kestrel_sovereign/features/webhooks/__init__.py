@@ -6,13 +6,10 @@ configurable authentication (Bearer token, HMAC-SHA256, IP allowlist,
 or none). All webhook receives are logged for security audit.
 
 Usage:
-    The WebhookFeature is auto-discovered by the feature loader.
-    To mount the webhook router in server.py:
-
-        # In server.py lifespan or after agent init:
-        webhook_feature = get_feature_by_name(agent.features, "WebhookFeature")
-        if webhook_feature:
-            app.include_router(webhook_feature.get_webhook_router())
+    The WebhookFeature is auto-discovered by the feature loader, and its
+    receiver router is mounted automatically via the standard
+    ``Feature.get_router()`` contract — no manual wiring in server.py is
+    required.
 """
 
 from .feature import WebhookFeature
