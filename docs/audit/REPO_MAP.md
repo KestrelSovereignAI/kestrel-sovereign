@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-01
-**Scope:** 1885 tracked files (1231 `.py`, 322 `.md`, 332 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-02
+**Scope:** 1887 tracked files (1232 `.py`, 323 `.md`, 332 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -264,7 +264,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/endpoints/models.py** — Model, wallet, and IPFS status endpoints.
   - `class CreateAgentRequest`; `async def get_agents(request)`; `async def create_agent(request, body)`; `async def delete_agent(request, agent_name)`; `async def get_identity(request)`; `class UpdateIdentityRequest`; `class SetAvatarUrlRequest`; `class GenerateAvatarRequest`; `…`
 - **kestrel_sovereign/endpoints/observability.py** — Observability endpoint - query A2A observability events for debugging.
-  - `async def get_observability_events(request, agent_name, event_type, session_id, …)`; `async def get_observability_summary(request, minutes)`; `async def get_metric_summary(request, metric_name, minutes, agent_name)`
+  - `class ObservabilityEventIn`; `class ObservabilityIngestBatch`; `async def get_observability_events(request, agent_name, event_type, session_id, …)`; `async def post_observability_events(request, payload)`; `async def get_observability_summary(request, minutes)`; `async def get_metric_summary(request, metric_name, minutes, agent_name)`
 - **kestrel_sovereign/endpoints/rasa_shim.py** — Rasa-compatible webhook shim for Kestrel AI.
   - `class RasaWebhookRequest`; `class RasaWebhookResponse`; `async def rasa_webhook(request, payload)`
 - **kestrel_sovereign/endpoints/restart_events.py** — Restart status-event API — repaint the bubble trail on chat reload.
@@ -295,7 +295,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/feature_registry.py** — Feature Registry — catalog loader and status resolver.
   - `class FeatureStatus`; `class SkillInfo`; `class FeaturePackageInfo`; `class InstalledFeatureRuntime`; `def load_registry(path)`; `def discover_installed_feature_runtimes()`; `def get_installed_feature_runtime(feature_class_name)`; `def resolve_status(registry, enabled_class_names)`; `…`
 - **kestrel_sovereign/features/__init__.py** — Feature Discovery for Kestrel Agent.
-  - `def get_disabled_features()`; `def discover_feature_modules()`; `def find_feature_class(module)`; `def discover_entrypoint_feature_classes()`; `def discover_local_feature_class_names()`; `def discover_entrypoint_feature_dists()`; `def discover_feature_class_by_name(name)`; `def discover_features(agent, allowed_features)`; `…`
+  - `def get_disabled_features()`; `def discover_feature_modules()`; `def find_feature_class(module)`; `def discover_entrypoint_feature_classes()`; `def discover_local_feature_class_names()`; `def discover_entrypoint_feature_dists()`; `def discover_feature_class_by_name(name)`; `def resolve_feature_canonical_name(name)`; `…`
 - **kestrel_sovereign/features/attachments/__init__.py** — Chat attachments feature (#1662): a lazy ``read_attachment`` tool so an agent can read a file the user attached (non-inline) on demand.
 - **kestrel_sovereign/features/attachments/component.yaml** — (configuration)
 - **kestrel_sovereign/features/attachments/feature.py** — Lazy attachment reading (#1662 PR C).
@@ -1399,6 +1399,7 @@ Repo entry points and standard project files.
 - **docs/architecture/storage/SOVEREIGNTY_V2_TECHNICAL.md** — Convergent Sharding & Merkle Forests: Kestrel Storage V2 — **Technical Architecture Document**
 - **docs/architecture/storage/STORAGE_ARCHITECTURE.md** — Kestrel Storage Architecture — **Status:** Active implementation snapshot **Last updated:** 2026-05-31
 - **docs/architecture/subagent_isolation_audit.md** — Subagent Isolation Audit — **Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared state in feature dispatch](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/569) **Phase:** 1 (Audit Only -- No…
+- **docs/architecture/testing/LIVE_AGENT_DOGFOODING.md** — Live-Agent Dogfooding — driving a real test agent (a.k.a. "Kite") — > **Why this exists:** *"shipped + has a unit/smoke test" is not the same as "works on the live path."* Several features that were marked done were only proven broken by driving a real running agent…
 - **docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md** — LLM Router Enhancement - Comprehensive Testing Plan — ## Testing Philosophy - **REAL TESTS ONLY - NO MOCKS** - Tests use real Ollama (localhost:11434), real OpenAI API, real filesystem - Tests create and verify real data - Tests measure real performance…
 - **docs/architecture/testing/TESTING_GUIDE.md** — Kestrel Test Strategy Guide — A comprehensive guide to running and writing tests for Kestrel Sovereign.
 - **docs/architecture/testing/TEST_EVIDENCE_GATES.md** — Test Evidence Gates in the Agent/Talon Review Loop — > Where tests sit in the loop, and how their outcome is recorded as first-class evidence rather than an informal habit.
@@ -2091,7 +2092,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_check_policy_guard.py** — Reflection test for the LLMService._check_policy() guard.
   - `class TestPolicyGuardCoverage`; `class TestCheckPolicyBehavior`
 - **tests/unit/test_check_task_status_surfaces_request.py** — ``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must surface the SENDER'S request text — not just the (often empty) agent reply slot.
-  - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_get_task_result_includes_request_content_for_completed_task()`; `async def test_check_task_status_surfaces_sender_attached_artifacts()`
+  - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_list_my_tasks_status_filter_queries_full_table_not_pending()`; `async def test_list_my_tasks_invalid_status_rejected()`; `async def test_list_my_tasks_type_filter_overfetches_then_truncates()`; `async def test_get_task_result_includes_request_content_for_completed_task()`; `async def test_check_task_status_surfaces_sender_attached_artifacts()`
 - **tests/unit/test_clean_install_verify.py** — Unit tests for scripts/ci/clean_install_verify.py.
   - `def test_wizard_artifacts_passes_on_post_wizard_tree(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_env_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_data_key_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_route_priority_empty(tmp_path, monkeypatch, capsys)`; `def test_identity_passes_when_did_present(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_db_missing(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_no_agent_node(tmp_path, monkeypatch, capsys)`; `def test_constitution_passes_with_full_anchor(tmp_path, monkeypatch, capsys)`; `…`
 - **tests/unit/test_cleanup_models_dryrun.py** — Unit tests for cleanup_models dry-run safety (#1946).
@@ -2359,7 +2360,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_extracted_feature_boundary_contracts.py** — Contracts for optional/extracted feature boundaries in core.
   - `def test_feature_proof_matrix_marks_mcp_as_external_package_boundary()`; `def test_observability_feature_is_external_to_core()`; `def test_wallet_feature_is_external_to_core()`; `def test_github_feature_is_external_to_core()`; `def test_voice_feature_is_external_to_core()`; `def test_reflection_feature_is_external_to_core()`; `def test_council_feature_is_external_to_core()`
 - **tests/unit/test_feature_discovery.py** — Tests for the Feature Discovery module.
-  - `class TestGetDisabledFeatures`; `class TestDiscoverFeatureModules`; `class TestDiscoverFeatures`; `class TestGetFeatureByName`; `class TestFindFeatureClass`; `class TestFeatureProfiles`; `class TestEntryPointDiscovery`; `class TestEntrypointClassName`
+  - `class TestGetDisabledFeatures`; `class TestDiscoverFeatureModules`; `class TestResolveFeatureCanonicalName`; `class TestDiscoverFeatures`; `class TestGetFeatureByName`; `class TestFindFeatureClass`; `class TestFeatureProfiles`; `class TestEntryPointDiscovery`; `…`
 - **tests/unit/test_feature_doc_canonicality.py** — Guardrails for canonical feature-document structure.
   - `def test_canonical_feature_doc_declares_source_of_truth()`; `def test_canonical_feature_doc_distinguishes_core_and_package_features()`; `def test_canonical_feature_doc_lists_core_only_inventory()`; `def test_legacy_archive_is_marked_historical()`; `def test_generator_prompt_does_not_hardcode_stale_metrics()`; `def test_progress_review_script_uses_discovered_inventory_language()`; `def test_investor_generated_doc_does_not_invent_unverified_metrics()`
 - **tests/unit/test_feature_enablement_store.py** — Tests for the per-agent feature/MCP-server enablement delta store + the startup reconcile-union (bootstrap config ∪ DB deltas).
@@ -2550,6 +2551,8 @@ Repo entry points and standard project files.
   - `class TestNoViolation`; `class TestViolation`; `class TestLegacySuccessEdgeCases`; `class TestSummarizeForAudit`; `class TestVerdictShape`; `class TestMergeNarrationVerdicts`; `class TestEscalationAttributionNoViolation`; `class TestEscalationAttributionViolation`; `…`
 - **tests/unit/test_nellie_backend_smoke.py** — Nellie backend smoke-proof tests (issue #427, updated for epic #688).
   - `class TestNellieAnthropicPlan`; `class TestNellieOpenAIPlan`; `class TestNellieFailureModes`; `class TestNellieBackendSwitch`
+- **tests/unit/test_observability_ingest.py** — Tests for POST /api/observability/events ingest endpoint (#2062).
+  - `async def store(tmp_path)`; `def client(store)`; `def test_post_then_get_round_trip(client)`; `def test_post_batch(client)`; `def test_pushed_timestamp_is_preserved(client)`; `def test_pushed_timestamp_preserved_for_metric(client)`; `def test_malformed_timestamp_returns_422(client)`; `def test_unknown_event_type_returns_422(client)`; `…`
 - **tests/unit/test_observability_inline_dispatch.py** — Regression tests for inline-executed tool dispatch logging (#1458 follow-up).
   - `async def test_inline_executed_success_writes_dispatch_row(tmp_path)`; `async def test_inline_executed_failure_writes_error_row(tmp_path)`; `async def test_inline_executed_empty_list_writes_no_rows(tmp_path)`
 - **tests/unit/test_openai_plan_autocompact.py** — #1844 Stage 2: Kestrel-owned compaction for openai:plan.
@@ -2923,7 +2926,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_tool_honesty_prompt.py** — Tests for the tool-honesty system prompt addendum (issue #1042 Fix 1).
   - `class TestToolHonestyPromptConstant`; `class TestAppendSecurityAddendum`; `class TestProductionCallSites`
 - **tests/unit/test_tool_result_contract.py** — Tests for kestrel_sovereign.tools.result_contract.
-  - `def test_pilot_features_pass_contract(feature_cls)`; `def test_pilot_modules_are_in_allowlist(feature_cls)`; `def test_assert_feature_returns_tool_result_does_not_raise(feature_cls)`; `def test_non_migrated_module_is_not_validated()`; `def test_find_violations_catches_dict_return()`; `def test_find_violations_catches_missing_annotation()`; `def test_find_violations_rejects_optional_tool_result()`; `def test_assert_feature_returns_tool_result_raises_on_dirty()`; `…`
+  - `def test_pilot_features_pass_contract(feature_cls)`; `def test_pilot_modules_are_in_allowlist(feature_cls)`; `def test_assert_feature_returns_tool_result_does_not_raise(feature_cls)`; `def test_mcp_external_feature_allowlisted_and_clean()`; `def test_non_migrated_module_is_not_validated()`; `def test_find_violations_catches_dict_return()`; `def test_find_violations_catches_missing_annotation()`; `def test_find_violations_rejects_optional_tool_result()`; `…`
 - **tests/unit/test_tool_result_persistence.py** — Tests for large tool result persistence — preview with head+tail.
   - `class TestBuildPersistedPreview`
 - **tests/unit/test_tools_architecture_docs.py** — Guardrails for the current tools architecture docs.
