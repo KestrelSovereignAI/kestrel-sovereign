@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
+    resolve_agent_privacy_config,
     resolve_feature_database,
 )
 from kestrel_sdk.tools.base import ToolCategory
@@ -140,7 +141,9 @@ class MemoryAgencyFeature(Feature):
             return 0
         return (
             await db.fetchval(
-                "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NULL",
+                "SELECT COUNT(*) FROM memory_pins "
+                "WHERE agent_id = ? AND released_at IS NULL",
+                (self.agent_id,),
             )
             or 0
         )
@@ -152,7 +155,8 @@ class MemoryAgencyFeature(Feature):
             return 0.0
         total = (
             await db.fetchval(
-                "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+                "SELECT COUNT(*) FROM conversation_history "
+                "WHERE agent_id = ? AND deleted_at IS NULL",
                 (self.agent_id,),
             )
             or 0
@@ -179,6 +183,20 @@ class MemoryAgencyFeature(Feature):
 
     def _persistent_memory_hidden(self) -> bool:
         return hides_persisted_user_content(self.agent)
+
+    def _requires_anonymization(self) -> bool:
+        """True when the active privacy config mandates PII redaction before persistence."""
+        config = resolve_agent_privacy_config(self.agent)
+        if config is None:
+            return False
+        requires = getattr(config, "requires_anonymization", None)
+        return bool(callable(requires) and requires())
+
+    def _anonymize_fact_field(self, value: str) -> str:
+        """Anonymize a fact field using the same path the storage wrapper uses."""
+        from kestrel_sovereign.features.privacy.pii_detector import anonymize_text
+
+        return anonymize_text(value)
 
     def _privacy_unavailable_result(self) -> ToolResult:
         return ToolResult.failed(
@@ -228,8 +246,9 @@ class MemoryAgencyFeature(Feature):
         # Quota enforcement (idempotent re-pin doesn't count).
         try:
             existing = await db.fetchone(
-                "SELECT id FROM memory_pins WHERE message_id = ? AND released_at IS NULL",
-                (message_id_val,),
+                "SELECT id FROM memory_pins "
+                "WHERE message_id = ? AND agent_id = ? AND released_at IS NULL",
+                (message_id_val, self.agent_id),
             )
             current_pins = await self._active_pin_count()
         except Exception as e:
@@ -249,8 +268,9 @@ class MemoryAgencyFeature(Feature):
 
         try:
             row = await db.fetchone(
-                "SELECT id, content, metadata FROM conversation_history WHERE id = ?",
-                (message_id_val,),
+                "SELECT id, content, metadata FROM conversation_history "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (message_id_val, self.agent_id),
             )
         except Exception as e:
             logger.error(f"memory_pin fetch failed: {e}", exc_info=True)
@@ -268,8 +288,9 @@ class MemoryAgencyFeature(Feature):
 
         try:
             await db.execute(
-                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-                (json.dumps(metadata), msg_id),
+                "UPDATE conversation_history SET metadata = ? "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (json.dumps(metadata), msg_id, self.agent_id),
             )
 
             if not existing:
@@ -373,8 +394,9 @@ class MemoryAgencyFeature(Feature):
 
         try:
             row = await db.fetchone(
-                "SELECT id, metadata FROM conversation_history WHERE id = ?",
-                (message_id_val,),
+                "SELECT id, metadata FROM conversation_history "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (message_id_val, self.agent_id),
             )
         except Exception as e:
             logger.error(f"memory_release fetch failed: {e}", exc_info=True)
@@ -396,14 +418,16 @@ class MemoryAgencyFeature(Feature):
         # "released the pin" when there was no pin to release.
         try:
             await db.execute(
-                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-                (json.dumps(metadata), msg_id),
+                "UPDATE conversation_history SET metadata = ? "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (json.dumps(metadata), msg_id, self.agent_id),
             )
 
             now = datetime.now(timezone.utc).isoformat()
             await db.execute(
-                "UPDATE memory_pins SET released_at = ? WHERE message_id = ? AND released_at IS NULL",
-                (now, message_id_val),
+                "UPDATE memory_pins SET released_at = ? "
+                "WHERE message_id = ? AND agent_id = ? AND released_at IS NULL",
+                (now, message_id_val, self.agent_id),
             )
         except Exception as e:
             logger.error(f"memory_release write failed: {e}", exc_info=True)
@@ -457,7 +481,10 @@ class MemoryAgencyFeature(Feature):
                    FROM memory_pins mp
                    JOIN conversation_history ch ON ch.id = mp.message_id
                    WHERE mp.released_at IS NULL
+                     AND ch.agent_id = ?
+                     AND ch.deleted_at IS NULL
                    ORDER BY mp.pinned_at DESC""",
+                (self.agent_id,),
             )
         except Exception as e:
             logger.error(f"memory_pinned query failed: {e}", exc_info=True)
@@ -539,6 +566,7 @@ class MemoryAgencyFeature(Feature):
                 """UPDATE conversation_history
                    SET metadata = json_set(COALESCE(metadata, '{}'), '$.decay_protected', json('false'))
                    WHERE agent_id = ?
+                     AND deleted_at IS NULL
                      AND json_extract(metadata, '$.decay_protected') = 1""",
                 (agent_id,),
             )
@@ -569,7 +597,8 @@ class MemoryAgencyFeature(Feature):
             return
 
         row = await db.fetchone(
-            "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
+            "SELECT metadata FROM conversation_history "
+            "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
             (message_id, agent_id),
         )
         if not row:
@@ -581,7 +610,8 @@ class MemoryAgencyFeature(Feature):
         if metadata.get("decay_protected"):
             metadata["decay_protected"] = False
             await db.execute(
-                "UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ?",
+                "UPDATE conversation_history SET metadata = ? "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
                 (json.dumps(metadata), message_id, agent_id),
             )
 
@@ -606,22 +636,29 @@ class MemoryAgencyFeature(Feature):
 
         try:
             total_messages = await db.fetchval(
-                "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+                "SELECT COUNT(*) FROM conversation_history "
+                "WHERE agent_id = ? AND deleted_at IS NULL",
                 (self.agent_id,),
             ) or 0
 
             pinned_count = await db.fetchval(
-                "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NULL",
+                "SELECT COUNT(*) FROM memory_pins "
+                "WHERE agent_id = ? AND released_at IS NULL",
+                (self.agent_id,),
             ) or 0
 
             released_count = await db.fetchval(
-                "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NOT NULL",
+                "SELECT COUNT(*) FROM memory_pins "
+                "WHERE agent_id = ? AND released_at IS NOT NULL",
+                (self.agent_id,),
             ) or 0
 
             pin_ratio = round(pinned_count / total_messages, 4) if total_messages > 0 else 0.0
 
             oldest_pin_at = await db.fetchval(
-                "SELECT MIN(pinned_at) FROM memory_pins WHERE released_at IS NULL",
+                "SELECT MIN(pinned_at) FROM memory_pins "
+                "WHERE agent_id = ? AND released_at IS NULL",
+                (self.agent_id,),
             )
 
             now = datetime.now(timezone.utc)
@@ -636,7 +673,9 @@ class MemoryAgencyFeature(Feature):
                     pass
 
             all_pin_times = await db.fetchall(
-                "SELECT pinned_at FROM memory_pins WHERE released_at IS NULL",
+                "SELECT pinned_at FROM memory_pins "
+                "WHERE agent_id = ? AND released_at IS NULL",
+                (self.agent_id,),
             )
             if all_pin_times:
                 ages = []
@@ -720,6 +759,13 @@ class MemoryAgencyFeature(Feature):
         """
         from kestrel_sovereign.storage.async_graph_store import GraphNode
 
+        # Privacy gate: the knowledge graph is an ungated passthrough to the
+        # persistent on-disk store, so save_fact must re-check privacy per call
+        # exactly like the pin tools. In ISOLATED/EPHEMERAL nothing purges a
+        # persisted fact, so refuse before writing.
+        if self._persistent_memory_hidden():
+            return self._privacy_unavailable_result()
+
         try:
             confidence_val = float(confidence)
         except (TypeError, ValueError):
@@ -730,6 +776,14 @@ class MemoryAgencyFeature(Feature):
         graph = getattr(self.storage, "graph", None)
         if graph is None:
             return ToolResult.failed("Knowledge graph not available")
+
+        # Under ANONYMOUS (storage="pii_redacted") the wrapper redacts PII from
+        # conversation content before persistence; the graph store bypasses that
+        # wrapper, so anonymize the fact fields here on the same path.
+        if self._requires_anonymization():
+            subject = self._anonymize_fact_field(subject)
+            predicate = self._anonymize_fact_field(predicate)
+            value = self._anonymize_fact_field(value)
 
         # Honesty: confidence is silently clamped to [0, 1]. Pre-fix
         # this was hidden — the agent could pass 1.5 and the saved
@@ -823,7 +877,9 @@ class MemoryAgencyFeature(Feature):
 
         try:
             active_pins = await db.fetchall(
-                "SELECT message_id FROM memory_pins WHERE released_at IS NULL",
+                "SELECT message_id FROM memory_pins "
+                "WHERE agent_id = ? AND released_at IS NULL",
+                (self.agent_id,),
             )
         except Exception as e:
             logger.error(f"memory_admin_unpin_all query failed: {e}", exc_info=True)
@@ -837,8 +893,9 @@ class MemoryAgencyFeature(Feature):
 
         try:
             await db.execute(
-                "UPDATE memory_pins SET released_at = ? WHERE released_at IS NULL",
-                (now,),
+                "UPDATE memory_pins SET released_at = ? "
+                "WHERE agent_id = ? AND released_at IS NULL",
+                (now, self.agent_id),
             )
         except Exception as e:
             logger.error(f"memory_admin_unpin_all release failed: {e}", exc_info=True)
@@ -851,16 +908,18 @@ class MemoryAgencyFeature(Feature):
         for (message_id,) in active_pins:
             try:
                 row = await db.fetchone(
-                    "SELECT id, metadata FROM conversation_history WHERE id = ?",
-                    (message_id,),
+                    "SELECT id, metadata FROM conversation_history "
+                    "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                    (message_id, self.agent_id),
                 )
                 if row:
                     msg_id, raw_metadata = row
                     metadata = self._parse_metadata(raw_metadata)
                     metadata["decay_protected"] = False
                     await db.execute(
-                        "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-                        (json.dumps(metadata), msg_id),
+                        "UPDATE conversation_history SET metadata = ? "
+                        "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                        (json.dumps(metadata), msg_id, self.agent_id),
                     )
             except Exception as e:
                 metadata_failures.append({"message_id": message_id, "error": str(e)})
@@ -928,8 +987,9 @@ class MemoryAgencyFeature(Feature):
         try:
             oldest_pins = await db.fetchall(
                 "SELECT id, message_id FROM memory_pins "
-                "WHERE released_at IS NULL ORDER BY pinned_at ASC LIMIT ?",
-                (count_val,),
+                "WHERE agent_id = ? AND released_at IS NULL "
+                "ORDER BY pinned_at ASC LIMIT ?",
+                (self.agent_id, count_val),
             )
         except Exception as e:
             logger.error(f"memory_admin_unpin_oldest query failed: {e}", exc_info=True)
@@ -953,8 +1013,9 @@ class MemoryAgencyFeature(Feature):
         for pin_id, message_id in oldest_pins:
             try:
                 await db.execute(
-                    "UPDATE memory_pins SET released_at = ? WHERE id = ?",
-                    (now, pin_id),
+                    "UPDATE memory_pins SET released_at = ? "
+                    "WHERE id = ? AND agent_id = ?",
+                    (now, pin_id, self.agent_id),
                 )
             except Exception as e:
                 release_failures.append(
@@ -965,16 +1026,18 @@ class MemoryAgencyFeature(Feature):
 
             try:
                 row = await db.fetchone(
-                    "SELECT id, metadata FROM conversation_history WHERE id = ?",
-                    (message_id,),
+                    "SELECT id, metadata FROM conversation_history "
+                    "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                    (message_id, self.agent_id),
                 )
                 if row:
                     msg_id, raw_metadata = row
                     metadata = self._parse_metadata(raw_metadata)
                     metadata["decay_protected"] = False
                     await db.execute(
-                        "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-                        (json.dumps(metadata), msg_id),
+                        "UPDATE conversation_history SET metadata = ? "
+                        "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                        (json.dumps(metadata), msg_id, self.agent_id),
                     )
             except Exception as e:
                 metadata_failures.append({"message_id": message_id, "error": str(e)})
