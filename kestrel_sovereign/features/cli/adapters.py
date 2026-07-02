@@ -152,8 +152,11 @@ class GitCliAdapter(FeatureCliAdapter):
         self,
         *,
         repo_path: str = ".",
-        max_count: int | str = 20,
+        max_count: int = 20,
     ) -> dict[str, Any]:
+        # The @tool schema now advertises max_count as an integer (SDK 0.29
+        # annotation resolution), so the model sends an int; _validate_positive_int
+        # remains as the bounds guard (rejects < 1 / non-canonical values).
         count = _validate_positive_int(max_count, "max_count")
         result = await self._run_text(
             repo_path=repo_path,

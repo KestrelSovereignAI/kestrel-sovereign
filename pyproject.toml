@@ -50,7 +50,11 @@ dependencies = [
     # resolution. The previously-vendored in-tree kestrel_sdk overlay (which
     # carried USER_BYOK ahead of this release) is removed now that the published
     # SDK is the single source of truth (#1927).
-    "kestrel-sovereign-sdk>=0.27.0,<0.28",
+    # 0.29.0 floor: isolated-feature runtime hardening (sync-handler offload,
+    # read-loop recovery, stdout framing, restart event re-registration) and
+    # @tool annotation resolution (Optional/PEP 604/PEP 563 no longer degrade to
+    # "string"). The in-tree @tool decorator now re-exports the SDK's fixed copy.
+    "kestrel-sovereign-sdk>=0.29.0,<0.30",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -189,7 +193,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics]>=0.27.0,<0.28",
+    "kestrel-sovereign-sdk[metrics]>=0.29.0,<0.30",
 ]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the
