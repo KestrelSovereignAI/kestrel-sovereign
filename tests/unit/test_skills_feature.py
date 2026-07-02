@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -130,6 +131,12 @@ def _make_mock_agent(tmp_path: Path, db=None):
     agent.storage.add_node = AsyncMock()
     agent.storage.delete_node = AsyncMock()
     agent.storage.get_nodes_by_type = AsyncMock(return_value=[])
+    # skill_delete now fetches the node first and only deletes skill-typed
+    # nodes (F257). Default to a skill-typed node so the ordinary delete
+    # path exercises delete_node; individual tests override as needed.
+    agent.storage.get_node = AsyncMock(
+        return_value=SimpleNamespace(node_type=SKILL_NODE_TYPE)
+    )
 
     # Skills feature resolves agent data dir via bootstrap_service.
     agent.bootstrap_service = MagicMock()
@@ -409,6 +416,52 @@ class TestListShowDelete:
         feature.agent.storage.delete_node = AsyncMock(side_effect=Exception("no node"))
         envelope = await feature.skill_delete(skill_id="skill_nope")
         assert envelope.status is not ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_delete_refuses_non_skill_node(self, feature):
+        """F257: skill_id is LLM-controlled. A node that exists but is
+        NOT a skill (memory concept, identity node, channel_link, ...)
+        must never be deleted — the tool fetches it first and returns
+        not-found without touching delete_node.
+        """
+        feature.agent.storage.get_node = AsyncMock(
+            return_value=SimpleNamespace(node_type="identity")
+        )
+        feature.agent.storage.delete_node = AsyncMock()
+
+        envelope = await feature.skill_delete(skill_id="did:test:identity-node")
+
+        assert envelope.status is not ToolResultStatus.OK
+        assert envelope.data is None or not envelope.data.get("removed_node")
+        feature.agent.storage.delete_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_refuses_missing_node(self, feature):
+        """A graph id with no matching node deletes nothing and reports
+        not-found — get_node returns None (real semantics: no raise).
+        """
+        feature.agent.storage.get_node = AsyncMock(return_value=None)
+        feature.agent.storage.delete_node = AsyncMock()
+
+        envelope = await feature.skill_delete(skill_id="skill_absent")
+
+        assert envelope.status is not ToolResultStatus.OK
+        feature.agent.storage.delete_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_skill_node_checks_type_before_delete(self, feature):
+        """A genuine skill node is fetched, type-verified, then deleted."""
+        feature.agent.storage.get_node = AsyncMock(
+            return_value=SimpleNamespace(node_type=SKILL_NODE_TYPE)
+        )
+        feature.agent.storage.delete_node = AsyncMock(return_value=None)
+
+        envelope = await feature.skill_delete(skill_id="skill_real")
+
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["removed_node"] is True
+        feature.agent.storage.get_node.assert_awaited_once_with("skill_real")
+        feature.agent.storage.delete_node.assert_awaited_once_with("skill_real")
 
 
 # =============================================================================
@@ -856,6 +909,34 @@ class TestPartialFailures:
         assert envelope.data["removed_file"] is True
         assert envelope.data["removed_node"] is False
         assert "graph node" in envelope.error and "associative recall" in envelope.error
+
+    @pytest.mark.asyncio
+    async def test_delete_file_with_missing_graph_node_returns_ok(self, feature, tmp_path):
+        """F257 review: the markdown file is authoritative and the graph
+        node is best-effort. A valid file-backed skill whose graph node
+        is simply absent (real ``get_node`` returns ``None`` — no raise)
+        must return OK after the file is unlinked, NOT PARTIAL. A missing
+        best-effort node is not loss of the skill, so nothing survives to
+        surface in associative recall.
+        """
+        s = Skill(
+            id="skill_no_node",
+            title="No node",
+            trigger="t", steps=["x"], verification="v",
+        )
+        path = tmp_path / "skills" / f"{s.id}.md"
+        path.write_text(s.to_markdown(), encoding="utf-8")
+
+        feature.agent.storage.get_node = AsyncMock(return_value=None)
+        feature.agent.storage.delete_node = AsyncMock()
+
+        envelope = await feature.skill_delete(skill_id="skill_no_node")
+
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["removed_file"] is True
+        assert envelope.data["removed_node"] is False
+        assert not path.exists()
+        feature.agent.storage.delete_node.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_stale_graph_node_with_file_already_absent_returns_ok(self, feature, tmp_path):
