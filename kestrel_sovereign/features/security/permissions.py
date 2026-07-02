@@ -663,6 +663,8 @@ class PermissionStore:
         feature_name: str,
         tool_name: str,
         default_level: PermissionLevel = PermissionLevel.ASK,
+        *,
+        hardened: bool = False,
     ) -> None:
         """
         Register a tool with default permission (if not already registered).
@@ -673,8 +675,45 @@ class PermissionStore:
             feature_name: Name of the feature
             tool_name: Name of the tool
             default_level: Default permission level (default: ASK)
+            hardened: When True, ``default_level`` is a non-downgradeable hard
+                rail rather than a first-registration default. In addition to
+                the usual insert-if-missing, any *existing* row for this tool
+                (across every casing/alias variant) whose level ranks below
+                ``default_level`` is force-upgraded to it. A stricter operator
+                choice — a level ranking at or above ``default_level`` (e.g.
+                DENY over ALWAYS_ASK) — is preserved. This is what closes the
+                F203 upgrade gap (#2093): an agent that already persisted a
+                permissive ``ALLOW`` row for a destructive memory tool under
+                the old feature-level default would otherwise keep bypassing
+                approval forever, because plain registration is INSERT-OR-IGNORE
+                and ``get_permission`` returns persisted rows before defaults.
         """
         async with aiosqlite.connect(self.db_path) as db:
+            if hardened:
+                # Force-upgrade any pre-existing permissive rows (any casing /
+                # alias variant) to the hard rail. Rows that already rank at or
+                # above the hard rail (a stricter DENY, or an identical
+                # ALWAYS_ASK) are left untouched, so we never downgrade the
+                # operator's last word and never churn updated_at needlessly.
+                target_rank = _LEVEL_RANK.get(default_level, 0)
+                preserved = [
+                    level.value
+                    for level in PermissionLevel
+                    if _LEVEL_RANK.get(level, 0) >= target_rank
+                ]
+                names = sorted(self.feature_name_variants(feature_name))
+                name_placeholders = ",".join(["?"] * len(names))
+                preserved_placeholders = ",".join(["?"] * len(preserved))
+                await db.execute(
+                    f"""
+                    UPDATE security_permissions
+                    SET level = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE feature_name IN ({name_placeholders})
+                      AND tool_name = ?
+                      AND level NOT IN ({preserved_placeholders})
+                    """,
+                    (default_level.value, *names, tool_name, *preserved),
+                )
             await db.execute("""
                 INSERT OR IGNORE INTO security_permissions
                 (feature_name, tool_name, level)
