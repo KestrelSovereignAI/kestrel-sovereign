@@ -25,7 +25,7 @@ class FakeDB:
         self._next_id = 1
         self.create_table_calls = 0
 
-    def add_message(self, content, metadata=None, agent_id="test-agent"):
+    def add_message(self, content, metadata=None, agent_id="test-agent", deleted_at=None):
         """Add a fake message and return its ID."""
         msg_id = self._next_id
         self._next_id += 1
@@ -35,8 +35,13 @@ class FakeDB:
             "content": content,
             "metadata": meta_json,
             "agent_id": agent_id,
+            "deleted_at": deleted_at,
         }
         return msg_id
+
+    def trash_message(self, msg_id, when="2026-07-02T00:00:00+00:00"):
+        """Soft-delete a message (move it to Trash)."""
+        self.messages[msg_id]["deleted_at"] = when
 
     async def execute(self, sql, params=()):
         """Handle CREATE TABLE, UPDATE, and INSERT statements."""
@@ -47,17 +52,42 @@ class FakeDB:
             return 0
 
         if sql_lower.startswith("update conversation_history"):
-            # UPDATE conversation_history SET metadata = ? WHERE id = ?
-            meta_json, msg_id, *_ = params
-            if msg_id in self.messages:
-                self.messages[msg_id]["metadata"] = meta_json
+            # UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ? ...
+            meta_json, msg_id, *rest = params
+            agent_id = rest[0] if rest else None
+            msg = self.messages.get(msg_id)
+            if msg and (agent_id is None or msg["agent_id"] == agent_id):
+                msg["metadata"] = meta_json
             return 1
 
         if sql_lower.startswith("update memory_pins"):
-            # UPDATE memory_pins SET released_at = ? WHERE message_id = ? AND released_at IS NULL
-            released_at, message_id = params
+            # UPDATE memory_pins SET released_at = ? WHERE id = ? AND agent_id = ?
+            if "where id = ?" in sql_lower:
+                released_at, pin_id = params[0], params[1]
+                agent_id = params[2] if len(params) > 2 else None
+                pin = self.pins.get(pin_id)
+                if pin and (agent_id is None or pin["agent_id"] == agent_id):
+                    pin["released_at"] = released_at
+                return 1
+            # Bulk unpin-all: WHERE agent_id = ? AND released_at IS NULL (no message_id)
+            if "message_id" not in sql_lower:
+                released_at = params[0]
+                agent_id = params[1] if len(params) > 1 else None
+                for pin in self.pins.values():
+                    if pin["released_at"] is None and (
+                        agent_id is None or pin["agent_id"] == agent_id
+                    ):
+                        pin["released_at"] = released_at
+                return 1
+            # UPDATE ... WHERE message_id = ? AND agent_id = ? AND released_at IS NULL
+            released_at, message_id = params[0], params[1]
+            agent_id = params[2] if len(params) > 2 else None
             for pin in self.pins.values():
-                if pin["message_id"] == message_id and pin["released_at"] is None:
+                if (
+                    pin["message_id"] == message_id
+                    and pin["released_at"] is None
+                    and (agent_id is None or pin["agent_id"] == agent_id)
+                ):
                     pin["released_at"] = released_at
             return 1
 
@@ -127,6 +157,15 @@ class FakeDB:
             msg = self.messages.get(msg_id)
             if not msg:
                 return None
+            # Honor the trash predicate: a soft-deleted row is invisible to
+            # reads that filter `deleted_at IS NULL`.
+            if "deleted_at is null" in sql_lower and msg.get("deleted_at") is not None:
+                return None
+            # Honor agent scoping when present.
+            if "agent_id = ?" in sql_lower:
+                agent_id = params[1]
+                if msg["agent_id"] != agent_id:
+                    return None
             # Return columns based on SELECT clause
             if "content, metadata" in sql_lower and "id," in sql_lower:
                 return (msg["id"], msg["content"], msg["metadata"])
@@ -138,8 +177,13 @@ class FakeDB:
 
         if "from memory_pins" in sql_lower and "released_at is null" in sql_lower:
             message_id = params[0]
+            agent_id = params[1] if len(params) > 1 else None
             for pin in self.pins.values():
-                if pin["message_id"] == message_id and pin["released_at"] is None:
+                if (
+                    pin["message_id"] == message_id
+                    and pin["released_at"] is None
+                    and (agent_id is None or pin["agent_id"] == agent_id)
+                ):
                     return (pin["id"],)
             return None
 
@@ -150,12 +194,17 @@ class FakeDB:
         sql_lower = sql.strip().lower()
 
         if "from memory_pins" in sql_lower and "join conversation_history" in sql_lower:
+            agent_id = params[0] if params else None
             results = []
             for pin in self.pins.values():
                 if pin["released_at"] is not None:
                     continue
                 msg = self.messages.get(pin["message_id"])
-                if msg:
+                # JOIN excludes trashed rows (ch.deleted_at IS NULL).
+                if "deleted_at is null" in sql_lower and msg and msg.get("deleted_at") is not None:
+                    continue
+                # JOIN scopes to ch.agent_id = ?.
+                if msg and (agent_id is None or msg["agent_id"] == agent_id):
                     results.append((
                         pin["id"],
                         pin["message_id"],
@@ -165,15 +214,50 @@ class FakeDB:
                     ))
             return results
 
-        # SELECT pinned_at FROM memory_pins WHERE released_at IS NULL
+        # SELECT message_id FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
+        if (
+            "select message_id from memory_pins" in sql_lower
+            and "released_at is null" in sql_lower
+        ):
+            agent_id = params[0] if params else None
+            return [
+                (p["message_id"],)
+                for p in self.pins.values()
+                if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
+            ]
+
+        # SELECT id, message_id FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
+        # ORDER BY pinned_at ASC LIMIT ?
+        if (
+            "select id, message_id from memory_pins" in sql_lower
+            and "order by pinned_at asc" in sql_lower
+        ):
+            agent_id = params[0] if params else None
+            limit = params[1] if len(params) > 1 else None
+            active = sorted(
+                [
+                    p for p in self.pins.values()
+                    if p["released_at"] is None
+                    and (agent_id is None or p["agent_id"] == agent_id)
+                ],
+                key=lambda p: p["pinned_at"],
+            )
+            if limit is not None:
+                active = active[:limit]
+            return [(p["id"], p["message_id"]) for p in active]
+
+        # SELECT pinned_at FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
         if (
             "select pinned_at from memory_pins" in sql_lower
             and "released_at is null" in sql_lower
         ):
+            agent_id = params[0] if params else None
             return [
                 (p["pinned_at"],)
                 for p in self.pins.values()
                 if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
             ]
 
         return []
@@ -184,24 +268,41 @@ class FakeDB:
 
         if "count(*)" in sql_lower and "conversation_history" in sql_lower:
             agent_id = params[0] if params else None
+            filter_trash = "deleted_at is null" in sql_lower
             return sum(
                 1 for m in self.messages.values()
-                if agent_id is None or m["agent_id"] == agent_id
+                if (agent_id is None or m["agent_id"] == agent_id)
+                and not (filter_trash and m.get("deleted_at") is not None)
             )
 
         if "count(*)" in sql_lower and "memory_pins" in sql_lower:
+            agent_id = params[0] if params else None
+            scoped = [
+                p for p in self.pins.values()
+                if agent_id is None or p["agent_id"] == agent_id
+            ]
             if "released_at is null" in sql_lower:
-                return sum(1 for p in self.pins.values() if p["released_at"] is None)
+                return sum(1 for p in scoped if p["released_at"] is None)
             if "released_at is not null" in sql_lower:
-                return sum(1 for p in self.pins.values() if p["released_at"] is not None)
-            return len(self.pins)
+                return sum(1 for p in scoped if p["released_at"] is not None)
+            return len(scoped)
 
         if "min(pinned_at)" in sql_lower:
-            active = [p["pinned_at"] for p in self.pins.values() if p["released_at"] is None]
+            agent_id = params[0] if params else None
+            active = [
+                p["pinned_at"] for p in self.pins.values()
+                if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
+            ]
             return min(active) if active else None
 
         if "max(pinned_at)" in sql_lower:
-            active = [p["pinned_at"] for p in self.pins.values() if p["released_at"] is None]
+            agent_id = params[0] if params else None
+            active = [
+                p["pinned_at"] for p in self.pins.values()
+                if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
+            ]
             return max(active) if active else None
 
         return 0
@@ -643,3 +744,110 @@ async def test_save_fact_without_graph_returns_error():
 
     assert result.status is ToolResultStatus.ERROR
     assert "not available" in result.error
+
+
+# --------------------------------------------------------------------------
+# Privacy-gating regression tests (F212 re-pin trash, F213 save_fact gating)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repin_after_trash_is_refused():
+    """A soft-deleted (Trash) message cannot be re-pinned (F212)."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    db = FakeDB()
+    msg_id = db.add_message("Secret to be erased")
+    feature = _make_feature(db)
+
+    # Pin, then release, then trash the message (as the wrapper would on delete).
+    await feature.memory_pin(message_id=msg_id, reason="temp")
+    await feature.memory_release(message_id=msg_id)
+    db.trash_message(msg_id)
+
+    pins_before = dict(db.pins)
+
+    result = await feature.memory_pin(message_id=msg_id, reason="resurrect")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "not found" in result.error.lower()
+    # No new pin record created for the trashed message.
+    active = [
+        p for p in db.pins.values()
+        if p["message_id"] == msg_id and p["released_at"] is None
+    ]
+    assert active == []
+    # The released pin record from before is untouched (no resurrection).
+    assert db.pins == pins_before
+
+
+@pytest.mark.asyncio
+async def test_memory_pinned_excludes_trashed_pin():
+    """memory_pinned must never surface a trashed row's content (F212)."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    db = FakeDB()
+    live = db.add_message("Live memory")
+    doomed = db.add_message("Content that gets trashed")
+    feature = _make_feature(db)
+
+    await feature.memory_pin(message_id=live, reason="keep")
+    await feature.memory_pin(message_id=doomed, reason="keep")
+
+    # Message is soft-deleted after being pinned.
+    db.trash_message(doomed)
+
+    result = await feature.memory_pinned()
+
+    assert result.status is ToolResultStatus.OK
+    surfaced = {p["message_id"] for p in result.data["pins"]}
+    assert live in surfaced
+    assert doomed not in surfaced
+
+
+@pytest.mark.asyncio
+async def test_save_fact_blocked_in_isolated_privacy_mode():
+    """save_fact must not persist to the KG when persistent memory is hidden (F213)."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_sovereign.privacy import PrivacyConfig
+
+    db = FakeDB()
+    graph = FakeGraphStore()
+    feature = _make_feature(db, graph_store=graph)
+    # ISOLATED uses temporary session storage (storage="temp").
+    feature.agent.privacy_config = PrivacyConfig(storage="temp", llm_location="local")
+
+    result = await feature.save_fact(
+        subject="user", predicate="secret", value="do-not-persist"
+    )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "privacy mode" in result.error
+    # Nothing was written to the persistent graph store.
+    assert graph.nodes == {}
+    assert graph.edges == []
+
+
+@pytest.mark.asyncio
+async def test_save_fact_anonymized_under_anonymous_mode():
+    """Under ANONYMOUS, save_fact anonymizes fields before persisting (F213)."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_sovereign.privacy import PrivacyConfig
+
+    db = FakeDB()
+    graph = FakeGraphStore()
+    feature = _make_feature(db, graph_store=graph)
+    # ANONYMOUS redacts PII before persistence (storage="pii_redacted").
+    feature.agent.privacy_config = PrivacyConfig(
+        storage="pii_redacted", llm_location="local"
+    )
+
+    result = await feature.save_fact(
+        subject="user", predicate="email", value="jane@example.com"
+    )
+
+    assert result.status is ToolResultStatus.OK
+    fact_id = result.data["node_id"]
+    node = graph.nodes[fact_id]
+    # The raw email must not have been persisted.
+    assert "jane@example.com" not in node.properties["value"]
+    assert "[EMAIL_REDACTED]" in node.properties["value"]
+    assert "jane@example.com" not in result.data["value"]
