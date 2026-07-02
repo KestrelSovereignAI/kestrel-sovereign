@@ -80,6 +80,11 @@ class PrivacyTransitionResult:
     # no state holder changed and ``message`` is the warning explaining why.
     requires_confirmation: bool = False
     pending_mode: Optional[str] = None
+    # True only when this result reflects a mode actually applied to the state
+    # holders. False for a staged (requires_confirmation) result AND for a no-op
+    # confirm (nothing was pending) — so a confirm endpoint/caller can tell an
+    # applied transition from a no-op without parsing the message.
+    applied: bool = False
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -1860,6 +1865,7 @@ class KestrelAgent(
             model_switched=model_switched,
             voice_switched=voice_switched,
             biometric_warning=biometric_warning,
+            applied=True,
         )
 
     def _apply_privacy_model_transition(self, config) -> Optional[dict]:

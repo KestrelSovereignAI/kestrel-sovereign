@@ -149,6 +149,7 @@ async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically
     # Confirm applies atomically to all three holders.
     applied = await agent.confirm_privacy_transition()
     assert applied.requires_confirmation is False
+    assert applied.applied is True
     assert agent._privacy_mode == PrivacyMode.EPHEMERAL
     storage.set_privacy_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
     agent.privacy_agent.set_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
@@ -160,6 +161,7 @@ async def test_confirm_with_nothing_pending_is_a_safe_noop():
     agent, storage, _ = _make_agent(initial_mode=PrivacyMode.NORMAL)
     result = await agent.confirm_privacy_transition()
     assert result.requires_confirmation is False
+    assert result.applied is False  # no-op is distinguishable from an apply
     assert "No pending" in result.message
     storage.set_privacy_mode.assert_not_called()
 

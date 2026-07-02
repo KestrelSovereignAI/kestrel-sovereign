@@ -636,9 +636,13 @@ async def confirm_privacy_mode(request: Request):
         if not getattr(type(agent), "confirm_privacy_transition", None):
             raise HTTPException(status_code=400, detail="Agent does not support staged privacy transitions.")
         result = await agent.confirm_privacy_transition()
-        applied = not getattr(result, "requires_confirmation", False)
+        # applied is False for a no-op confirm (nothing was pending) as well as
+        # for a staged result — so a stale/double-click confirm reports success
+        # False instead of masquerading as an applied transition.
+        applied = getattr(result, "applied", False)
         return {
             "success": applied,
+            "applied": applied,
             "mode": agent.privacy_mode.value,
             "message": result.message,
             "allows_cloud_llm": result.allows_cloud_llm,
