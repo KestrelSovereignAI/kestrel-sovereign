@@ -330,6 +330,7 @@ class SkillsFeature(Feature):
         """
         removed_file = False
         removed_node = False
+        graph_delete_failed = False
         file_unlink_failed = False
         file_was_present = False
 
@@ -345,13 +346,25 @@ class SkillsFeature(Feature):
                     file_unlink_failed = True
 
         storage = getattr(self.agent, "storage", None)
-        graph_attempted = storage is not None and hasattr(storage, "delete_node")
+        graph_attempted = (
+            storage is not None
+            and hasattr(storage, "delete_node")
+            and hasattr(storage, "get_node")
+        )
         if graph_attempted:
             try:
-                await storage.delete_node(skill_id)
-                removed_node = True
+                # skill_id is an LLM-controlled parameter. Only delete the
+                # node if it actually exists AND is a skill node — never
+                # let a hallucinated/typo'd/malicious id blow away a memory
+                # concept, the agent identity node, or a channel_link node
+                # (delete_node cascades to every touching edge). See F257.
+                node = await storage.get_node(skill_id)
+                if node is not None and getattr(node, "node_type", None) == SKILL_NODE_TYPE:
+                    await storage.delete_node(skill_id)
+                    removed_node = True
             except Exception as e:
                 logger.warning("Could not remove skill node %s: %s", skill_id, e)
+                graph_delete_failed = True
 
         if not (removed_file or removed_node):
             return ToolResult.failed(error=f"Skill {skill_id} not found")
@@ -366,18 +379,23 @@ class SkillsFeature(Feature):
         # 1. File unlink genuinely failed (file existed, OSError) AND
         #    graph delete succeeded — the file will resurrect on the
         #    next list/save.
-        # 2. File deletion succeeded AND graph_attempted but the
-        #    delete_node call raised — the graph node may still
-        #    surface in associative recall. (We can't reliably tell
-        #    "raised because already absent" from "raised because
-        #    backend down" without backend-specific introspection,
-        #    so this caveat is conservatively spoken.)
+        # 2. File deletion succeeded AND a graph get_node/delete_node
+        #    call actually *raised* — the graph node may still surface
+        #    in associative recall. (We can't reliably tell "raised
+        #    because already absent" from "raised because backend down"
+        #    without backend-specific introspection, so this caveat is
+        #    conservatively spoken.)
         #
         # Cases that are NOT asymmetric and stay OK (codex round 2 of
         # #1130 caught these falsely showing as PARTIAL):
         # - file already absent + graph deleted (stale-node cleanup;
         #   nothing to resurrect).
         # - graph never attempted + file removed (single-layer agent).
+        # - file removed + graph node simply absent or foreign-typed
+        #   (get_node returned None / non-skill; nothing to clean up).
+        #   The module contract makes the file authoritative and the
+        #   graph node best-effort, so a missing best-effort node is
+        #   NOT a partial delete (F257 review).
         if file_unlink_failed and removed_node:
             # Case 1: real file-side failure.
             assert self._skills_dir is not None  # file_unlink_failed implies it
@@ -391,9 +409,9 @@ class SkillsFeature(Feature):
                 caveat,
                 data=data,
             )
-        if removed_file and graph_attempted and not removed_node:
-            # Case 2: file went, graph delete raised. Conservative
-            # PARTIAL — see comment above.
+        if removed_file and graph_delete_failed:
+            # Case 2: file went, graph get_node/delete_node raised.
+            # Conservative PARTIAL — see comment above.
             caveat = (
                 f"file removed but graph node {skill_id} could not be "
                 "deleted — it may still surface in associative recall "
