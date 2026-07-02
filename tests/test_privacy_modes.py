@@ -261,13 +261,24 @@ class TestPrivacyModeTransitions:
         assert "Normal message" in messages[0]["content"]
 
     @pytest.mark.asyncio
-    async def test_public_to_ephemeral_warning(self, temp_storage):
-        """Switching from PUBLIC to EPHEMERAL should show warning"""
+    async def test_public_to_ephemeral_requires_confirmation(self, temp_storage):
+        """PUBLIC→EPHEMERAL is data-destructive: evaluate_transition flags it for
+        confirmation WITHOUT mutating state, and set_mode applies unconditionally
+        (the decision now lives upstream, not as a set_mode early-return that left
+        state half-applied)."""
         privacy_agent = PrivacyAgent(temp_storage, PrivacyMode.PUBLIC)
 
-        result = privacy_agent.set_mode(PrivacyMode.EPHEMERAL)
-        assert "WARNING" in result
-        assert "confirm" in result.lower()
+        decision = privacy_agent.evaluate_transition(PrivacyMode.EPHEMERAL)
+        assert decision.requires_confirmation is True
+        assert decision.target == PrivacyMode.EPHEMERAL
+        assert "WARNING" in decision.warning
+        assert "confirm" in decision.warning.lower()
+        # evaluate_transition must not mutate — still PUBLIC afterward.
+        assert privacy_agent.privacy_mode == PrivacyMode.PUBLIC
+
+        # set_mode now applies unconditionally (no half-applied state / no gate).
+        privacy_agent.set_mode(PrivacyMode.EPHEMERAL)
+        assert privacy_agent.privacy_mode == PrivacyMode.EPHEMERAL
 
     @pytest.mark.asyncio
     async def test_isolated_session_save(self, temp_storage):

@@ -9,12 +9,19 @@ from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.features.model.feature import ModelAgent
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
 
 
 def _make_consent():
     consent = MagicMock()
     consent.request_consent = AsyncMock(return_value=None)
     return consent
+
+
+def _no_confirm_evaluate():
+    # Mock evaluate_transition for non-destructive transitions (never
+    # PUBLIC→EPHEMERAL), so the agent applies rather than staging pending.
+    return MagicMock(side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False))
 
 
 class TestPrivacyConsentCaller:
@@ -29,6 +36,7 @@ class TestPrivacyConsentCaller:
         agent.storage.set_privacy_mode = MagicMock()
         agent.privacy_agent = MagicMock()
         agent.privacy_agent.set_mode = MagicMock()
+        agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
         consent = _make_consent()
         agent.features = {"ConsentFeature": consent}
 

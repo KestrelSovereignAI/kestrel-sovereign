@@ -615,9 +615,16 @@ class StreamingMixin:
         })
 
         try:
-            transition_lock = self._get_privacy_transition_lock()
-            async with transition_lock:
-                async with self._turn_lifecycle():
+            # Lock order — CONVERSATION (via _turn_lifecycle) BEFORE the privacy
+            # transition lock — is the deadlock-freedom invariant. The in-turn
+            # `!privacy` path runs inside process_input, which already holds
+            # CONVERSATION and then acquires the transition lock; acquiring in the
+            # same order here means no two callers can take this pair in opposite
+            # directions (the AB-BA wedge this replaces, where streaming took the
+            # transition lock first and then blocked on CONVERSATION).
+            async with self._turn_lifecycle():
+                transition_lock = self._get_privacy_transition_lock()
+                async with transition_lock:
                     # #1914: bind a per-turn part buffer so tools/features can
                     # ``emit_part`` typed component bubbles; the orchestrator
                     # drains it into PART sentinels at the point each tool ran.

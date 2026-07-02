@@ -74,6 +74,17 @@ class PrivacyTransitionResult:
     model_switched: Optional[dict] = None
     voice_switched: Optional[dict] = None
     biometric_warning: Optional[str] = None
+    # True when the transition is data-destructive and was NOT applied — it is
+    # staged as pending and the caller must confirm via confirm_privacy_transition
+    # (surfaced to the user as the !confirm-privacy-mode affordance). When True,
+    # no state holder changed and ``message`` is the warning explaining why.
+    requires_confirmation: bool = False
+    pending_mode: Optional[str] = None
+    # True only when this result reflects a mode actually applied to the state
+    # holders. False for a staged (requires_confirmation) result AND for a no-op
+    # confirm (nothing was pending) — so a confirm endpoint/caller can tell an
+    # applied transition from a no-op without parsing the message.
+    applied: bool = False
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -449,6 +460,10 @@ class KestrelAgent(
         self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
         self._privacy_transition_lock = asyncio.Lock()
+        # A data-destructive privacy transition (e.g. PUBLIC → EPHEMERAL) staged
+        # awaiting explicit confirmation via confirm_privacy_transition. None when
+        # no transition is pending. Guarded by _privacy_transition_lock.
+        self._pending_privacy_transition: Optional[PrivacyMode] = None
 
         # Shared lock manager for the dispatcher (Phase 1) AND the turn
         # lifecycle (Phase 2). CONVERSATION is acquired by `_turn_lifecycle`
@@ -1760,8 +1775,56 @@ class KestrelAgent(
         async with self._get_privacy_transition_lock():
             return await self._set_privacy_mode_with_effects_locked(mode)
 
+    async def confirm_privacy_transition(self) -> PrivacyTransitionResult:
+        """Apply a privacy transition previously staged as pending confirmation.
+
+        The counterpart to a ``requires_confirmation`` result from
+        :meth:`set_privacy_mode_with_effects`. Acquires the transition lock
+        (same order as every other privacy path — CONVERSATION before the
+        transition lock, so no deadlock) and applies the staged mode atomically
+        across all three state holders. A no-op (with an explanatory message) if
+        nothing is pending.
+        """
+        async with self._get_privacy_transition_lock():
+            mode = getattr(self, "_pending_privacy_transition", None)
+            if mode is None:
+                return PrivacyTransitionResult(
+                    message="No pending privacy-mode change to confirm.",
+                    allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
+                )
+            self._pending_privacy_transition = None
+            return await self._apply_privacy_mode_locked(mode)
+
     async def _set_privacy_mode_with_effects_locked(self, mode: PrivacyMode) -> PrivacyTransitionResult:
-        """Apply a privacy-mode transition while holding the transition lock."""
+        """Evaluate a privacy-mode transition, then apply it (or stage it).
+
+        The privacy agent is the single decision point and is consulted BEFORE
+        any state holder changes. A data-destructive transition is staged as
+        pending and returned with ``requires_confirmation=True`` — nothing flips
+        until :meth:`confirm_privacy_transition`. Every other transition applies
+        atomically. This is what prevents the split-state bug where the agent /
+        wrapper flipped while the privacy agent stayed behind.
+        """
+        decision = self.privacy_agent.evaluate_transition(mode)
+        if decision.requires_confirmation:
+            self._pending_privacy_transition = mode
+            return PrivacyTransitionResult(
+                message=decision.warning,
+                allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
+                requires_confirmation=True,
+                pending_mode=mode.value,
+            )
+        # A non-destructive change supersedes any previously-staged pending one.
+        self._pending_privacy_transition = None
+        return await self._apply_privacy_mode_locked(mode)
+
+    async def _apply_privacy_mode_locked(self, mode: PrivacyMode) -> PrivacyTransitionResult:
+        """Atomically apply a privacy-mode transition to all state holders.
+
+        Caller holds the transition lock and has already cleared the
+        confirmation gate. Flips agent mode, storage wrapper, and privacy agent
+        together, then applies model/voice side effects.
+        """
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
         if consent:
@@ -1802,6 +1865,7 @@ class KestrelAgent(
             model_switched=model_switched,
             voice_switched=voice_switched,
             biometric_warning=biometric_warning,
+            applied=True,
         )
 
     def _apply_privacy_model_transition(self, config) -> Optional[dict]:
