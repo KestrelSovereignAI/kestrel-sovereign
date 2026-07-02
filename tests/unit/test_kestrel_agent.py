@@ -16,6 +16,13 @@ from decimal import Decimal
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
+
+
+def _no_confirm_evaluate():
+    # evaluate_transition mock for non-destructive transitions (never
+    # PUBLIC→EPHEMERAL): the agent applies rather than staging pending.
+    return MagicMock(side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False))
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
 
@@ -262,6 +269,7 @@ class TestPrivacyMode:
         agent.storage.set_privacy_mode = MagicMock()
         agent.privacy_agent = MagicMock()
         agent.privacy_agent.set_mode = MagicMock()
+        agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
 
         await agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
 
@@ -284,6 +292,7 @@ class TestPrivacyMode:
         # Mock privacy agent
         mock_privacy_agent = MagicMock()
         mock_privacy_agent.set_mode = MagicMock()
+        mock_privacy_agent.evaluate_transition = _no_confirm_evaluate()
         agent.privacy_agent = mock_privacy_agent
 
         await agent.set_privacy_mode(PrivacyMode.ISOLATED)
@@ -306,6 +315,7 @@ class TestPrivacyMode:
 
         mock_privacy_agent = MagicMock()
         mock_privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed from normal to isolated.")
+        mock_privacy_agent.evaluate_transition = _no_confirm_evaluate()
         agent.privacy_agent = mock_privacy_agent
 
         result = await agent.set_privacy_mode(PrivacyMode.ISOLATED)

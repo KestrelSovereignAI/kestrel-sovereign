@@ -79,6 +79,10 @@ def _make_agent_with_privacy_transition(llm_service):
     agent.features = {}
     agent.privacy_agent = MagicMock()
     agent.privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed from normal to isolated.")
+    from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
+    agent.privacy_agent.evaluate_transition = MagicMock(
+        side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False)
+    )
     return agent
 
 

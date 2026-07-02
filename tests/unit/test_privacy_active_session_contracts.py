@@ -40,6 +40,11 @@ class _PrivacyAgent:
     async def get_conversation_history(self, limit=50, session_id=None):
         return []
 
+    def evaluate_transition(self, mode):
+        from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
+        # This harness only exercises non-destructive transitions.
+        return PrivacyTransitionDecision(target=mode, requires_confirmation=False)
+
     def set_mode(self, mode):
         self.privacy_mode = mode
         self.privacy_config = _PrivacyConfig(allows_cloud=privacy_mode_to_config(mode).allows_cloud_llm())

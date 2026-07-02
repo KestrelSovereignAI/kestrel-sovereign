@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
 
 
 def _make_agent(*, initial_mode=PrivacyMode.EPHEMERAL, leak_breakdown=None):
@@ -43,6 +44,11 @@ def _make_agent(*, initial_mode=PrivacyMode.EPHEMERAL, leak_breakdown=None):
 
     privacy_agent = MagicMock()
     privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed.")
+    # New contract: the agent consults evaluate_transition before applying.
+    # These exits are all non-destructive (never PUBLIC→EPHEMERAL).
+    privacy_agent.evaluate_transition = MagicMock(
+        side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False)
+    )
     agent.privacy_agent = privacy_agent
 
     agent.features = {"Security": security_feature}
@@ -112,6 +118,50 @@ async def test_normal_to_ephemeral_does_not_purge():
 
     storage.purge_ephemeral_session.assert_not_awaited()
     permission_store.log_decision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically():
+    """PUBLIC→EPHEMERAL is data-destructive: the transition must be STAGED, not
+    applied, until confirmed — the split-state fix. Before confirm no state
+    holder changes (the bug flipped agent + wrapper while the privacy agent
+    stayed PUBLIC and kept persisting). After confirm all holders move together.
+    """
+    agent, storage, permission_store = _make_agent(initial_mode=PrivacyMode.PUBLIC)
+    # Simulate the real privacy agent flagging this specific transition.
+    agent.privacy_agent.evaluate_transition = MagicMock(
+        return_value=PrivacyTransitionDecision(
+            target=PrivacyMode.EPHEMERAL, requires_confirmation=True, warning="WARNING ... confirm"
+        )
+    )
+
+    staged = await agent._set_privacy_mode_with_effects_locked(PrivacyMode.EPHEMERAL)
+
+    # Staged, not applied: result flags confirmation and NOTHING flipped.
+    assert staged.requires_confirmation is True
+    assert staged.pending_mode == PrivacyMode.EPHEMERAL.value
+    assert agent._privacy_mode == PrivacyMode.PUBLIC
+    storage.set_privacy_mode.assert_not_called()
+    agent.privacy_agent.set_mode.assert_not_called()
+    storage.purge_ephemeral_session.assert_not_awaited()
+    assert agent._pending_privacy_transition == PrivacyMode.EPHEMERAL
+
+    # Confirm applies atomically to all three holders.
+    applied = await agent.confirm_privacy_transition()
+    assert applied.requires_confirmation is False
+    assert agent._privacy_mode == PrivacyMode.EPHEMERAL
+    storage.set_privacy_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
+    agent.privacy_agent.set_mode.assert_called_once_with(PrivacyMode.EPHEMERAL)
+    assert agent._pending_privacy_transition is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_with_nothing_pending_is_a_safe_noop():
+    agent, storage, _ = _make_agent(initial_mode=PrivacyMode.NORMAL)
+    result = await agent.confirm_privacy_transition()
+    assert result.requires_confirmation is False
+    assert "No pending" in result.message
+    storage.set_privacy_mode.assert_not_called()
 
 
 @pytest.mark.asyncio

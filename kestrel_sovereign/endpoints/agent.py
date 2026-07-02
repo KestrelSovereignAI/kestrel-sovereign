@@ -518,6 +518,19 @@ async def set_privacy_mode(request: Request):
         else:
             await agent.set_privacy_mode(new_mode)
 
+        # Data-destructive downgrade staged pending confirmation: nothing changed,
+        # so report the pending state (NOT success) with the warning. The client
+        # confirms via POST /privacy-mode/confirm (or the !confirm-privacy-mode
+        # command). Reporting success here is exactly the split-state bug.
+        if getattr(transition, "requires_confirmation", False):
+            return {
+                "success": False,
+                "requires_confirmation": True,
+                "pending_mode": transition.pending_mode,
+                "mode": agent.privacy_mode.value,
+                "message": transition.message,
+            }
+
         # If switching to a local-only mode, auto-switch model to a local provider
         # If switching back to cloud-allowed mode, restore the previous model
         config = privacy_mode_to_config(new_mode)
@@ -604,6 +617,40 @@ async def set_privacy_mode(request: Request):
     except Exception as e:
         logger.error(f"Error setting privacy mode: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting privacy mode.")
+
+
+@router.post(
+    "/privacy-mode/confirm",
+    dependencies=[Depends(enforce_destructive_op)],
+)
+async def confirm_privacy_mode(request: Request):
+    """Confirm a privacy-mode change that was staged pending confirmation.
+
+    The counterpart to a ``requires_confirmation`` response from
+    ``POST /privacy-mode``. Applies the staged (data-destructive) transition
+    atomically; a no-op with an explanatory message if nothing is pending.
+    Behind the same demo-isolation rail as the change it confirms.
+    """
+    try:
+        agent = get_agent(request)
+        if not getattr(type(agent), "confirm_privacy_transition", None):
+            raise HTTPException(status_code=400, detail="Agent does not support staged privacy transitions.")
+        result = await agent.confirm_privacy_transition()
+        applied = not getattr(result, "requires_confirmation", False)
+        return {
+            "success": applied,
+            "mode": agent.privacy_mode.value,
+            "message": result.message,
+            "allows_cloud_llm": result.allows_cloud_llm,
+            "model_switched": result.model_switched,
+            "voice_switched": result.voice_switched,
+            "biometric_warning": result.biometric_warning,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error confirming privacy mode: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error confirming privacy mode.")
 
 
 @router.get("/notifications")
