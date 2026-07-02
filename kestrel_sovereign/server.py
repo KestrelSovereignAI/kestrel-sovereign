@@ -220,12 +220,31 @@ def _mount_feature_routers(app: FastAPI) -> None:
     """
     routes_before = len(app.routes)
     mounted = []
+    # Webhook receivers are collected across every agent and served by ONE
+    # shared /webhooks/{name} dispatch router. Each WebhookFeature's own
+    # get_router() produces an identical /webhooks/{name} catch-all, so
+    # mounting them per-agent would let the first-mounted agent shadow all the
+    # others — every webhook owned by a later agent would 404 (issue #2089).
+    webhook_receivers = []
+
+    def _is_webhook_receiver(receiver) -> bool:
+        # Duck-typed so core server.py stays decoupled from the feature class.
+        return (
+            receiver is not None
+            and hasattr(receiver, "handle_webhook")
+            and hasattr(receiver, "webhooks")
+        )
 
     def _collect_routers_from_agent(agent) -> None:
         features = getattr(agent, "features", {})
         if not features:
             return
         for name, feature in features.items():
+            receiver = getattr(feature, "receiver", None)
+            if _is_webhook_receiver(receiver):
+                if receiver not in webhook_receivers:
+                    webhook_receivers.append(receiver)
+                continue
             try:
                 router = feature.get_router()
                 if router is not None:
@@ -246,6 +265,20 @@ def _mount_feature_routers(app: FastAPI) -> None:
             agent = manager.get_agent(agent_name)
             if agent is not None:
                 _collect_routers_from_agent(agent)
+
+    # Mount one cross-agent webhook dispatch router for all collected receivers.
+    if webhook_receivers:
+        try:
+            from kestrel_sovereign.features.webhooks.receiver import (
+                build_webhook_dispatch_router,
+            )
+
+            app.include_router(
+                build_webhook_dispatch_router(lambda: list(webhook_receivers))
+            )
+            mounted.append("webhooks")
+        except Exception as exc:
+            logger.warning("Failed to mount webhook dispatch router: %s", exc)
 
     # Record how many routes were added so shutdown can remove them
     app.state._feature_route_count = len(app.routes) - routes_before

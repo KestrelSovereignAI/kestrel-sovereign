@@ -16,12 +16,70 @@ import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from .auth import WebhookAuth, create_auth_handler
 from .models import WebhookAuthType, WebhookConfig, WebhookEvent
 
 logger = logging.getLogger(__name__)
+
+
+def build_webhook_dispatch_router(
+    receiver_provider: "Callable[[], Iterable['WebhookReceiver']]",
+):
+    """Build a single ``POST /webhooks/{name}`` router that dispatches across
+    many receivers.
+
+    ``receiver_provider()`` returns the current iterable of
+    :class:`WebhookReceiver` instances — one per agent in a multi-agent
+    process. Each request resolves ``{name}`` to the receiver that has that
+    webhook registered and dispatches there; an unregistered name is recorded
+    on the first receiver (so the 404 is still audited) or returns a bare 404
+    when no receiver exists.
+
+    This replaces mounting each agent's own ``/webhooks/{name}`` catch-all: two
+    identical routes would otherwise shadow each other (first-mounted wins),
+    silently returning ``404 Unknown webhook`` for every webhook owned by a
+    later-mounted agent (issue #2089 follow-up).
+    """
+    from fastapi import APIRouter, Request
+    from fastapi.responses import JSONResponse
+
+    router = APIRouter(tags=["webhooks"])
+
+    @router.post("/webhooks/{webhook_name}")
+    async def webhook_endpoint(webhook_name: str, request: Request):
+        body = await request.body()
+        # Normalise header keys to lower-case for consistent lookup.
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        source_ip = request.client.host if request.client else "unknown"
+
+        receivers = list(receiver_provider())
+        target = next(
+            (r for r in receivers if webhook_name in r.webhooks),
+            None,
+        )
+        if target is None:
+            # No agent owns this name. Route to the first receiver so the
+            # unknown-webhook 404 is still audited; fall back to a bare 404
+            # when there are no receivers at all.
+            if receivers:
+                result = await receivers[0].handle_webhook(
+                    webhook_name, headers=headers, body=body, source_ip=source_ip
+                )
+            else:
+                result = {
+                    "status_code": 404,
+                    "body": {"error": f"Unknown webhook: {webhook_name}"},
+                }
+        else:
+            result = await target.handle_webhook(
+                webhook_name, headers=headers, body=body, source_ip=source_ip
+            )
+
+        return JSONResponse(content=result["body"], status_code=result["status_code"])
+
+    return router
 
 
 class WebhookReceiver:
@@ -39,7 +97,15 @@ class WebhookReceiver:
     # Maximum events to keep in-memory (oldest are evicted).
     MAX_IN_MEMORY_LOG = 200
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_event: Optional[Callable[..., Awaitable[None]]] = None,
+    ) -> None:
+        # Optional async callback invoked for every received event so the
+        # owning Feature can persist it to the audit table. Every recording
+        # path funnels through ``_record_event``, so no code path can append
+        # to the ring buffer without also invoking this callback.
+        self._on_event = on_event
         self.webhooks: Dict[str, WebhookConfig] = {}
         self.auth_handlers: Dict[str, WebhookAuth] = {}
         self.event_log: deque[WebhookEvent] = deque(maxlen=self.MAX_IN_MEMORY_LOG)
@@ -122,7 +188,7 @@ class WebhookReceiver:
                 status_code=404,
                 body=body,
             )
-            self.event_log.append(event)
+            await self._record_event(event)
             return {"status_code": 404, "body": {"error": f"Unknown webhook: {name}"}}
 
         config = self.webhooks[name]
@@ -136,7 +202,7 @@ class WebhookReceiver:
                 status_code=503,
                 body=body,
             )
-            self.event_log.append(event)
+            await self._record_event(event)
             return {"status_code": 503, "body": {"error": "Webhook is disabled"}}
 
         # --- Rate limiting ---
@@ -148,7 +214,7 @@ class WebhookReceiver:
                 status_code=429,
                 body=body,
             )
-            self.event_log.append(event)
+            await self._record_event(event)
             return {"status_code": 429, "body": {"error": "Rate limit exceeded"}}
 
         # --- Authentication ---
@@ -173,7 +239,7 @@ class WebhookReceiver:
                 status_code=401,
                 body=body,
             )
-            self.event_log.append(event)
+            await self._record_event(event)
             return {"status_code": 401, "body": {"error": "Authentication failed"}}
 
         # --- Success ---
@@ -184,7 +250,7 @@ class WebhookReceiver:
             status_code=200,
             body=body,
         )
-        self.event_log.append(event)
+        await self._record_event(event)
 
         logger.info(
             "Webhook received: %s from %s (authenticated, %d bytes)",
@@ -214,34 +280,16 @@ class WebhookReceiver:
         authentication -- webhook auth is handled per-endpoint by the
         registered auth handler.
 
+        This is the single-agent router: dispatch resolves against this one
+        receiver. In multi-agent processes the server mounts a shared
+        :func:`build_webhook_dispatch_router` across every agent's receiver
+        instead, so their identical ``/webhooks/{name}`` paths don't shadow
+        one another.
+
         Returns:
             A ``fastapi.APIRouter`` instance.
         """
-        from fastapi import APIRouter, Request
-        from fastapi.responses import JSONResponse
-
-        router = APIRouter(tags=["webhooks"])
-
-        @router.post("/webhooks/{webhook_name}")
-        async def webhook_endpoint(webhook_name: str, request: Request):
-            body = await request.body()
-            # Normalise header keys to lower-case for consistent lookup.
-            headers = {k.lower(): v for k, v in request.headers.items()}
-            source_ip = request.client.host if request.client else "unknown"
-
-            result = await self.handle_webhook(
-                webhook_name,
-                headers=headers,
-                body=body,
-                source_ip=source_ip,
-            )
-
-            return JSONResponse(
-                content=result["body"],
-                status_code=result["status_code"],
-            )
-
-        return router
+        return build_webhook_dispatch_router(lambda: (self,))
 
     # ------------------------------------------------------------------
     # Queries
@@ -289,6 +337,29 @@ class WebhookReceiver:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _record_event(self, event: WebhookEvent) -> None:
+        """Record a webhook event to the ring buffer and the audit sink.
+
+        Single funnel for every recorded event: appends to the in-memory
+        ring buffer AND invokes the ``on_event`` callback (if any) so the
+        owning Feature can persist the event to ``webhook_log``. Every
+        recording site in ``handle_webhook`` routes through here, so no
+        outcome (404 / 503 / 429 / 401 / 200) can skip persistence.
+        """
+        self.event_log.append(event)
+        if self._on_event is None:
+            return
+        try:
+            await self._on_event(
+                webhook_name=event.webhook_name,
+                source_ip=event.source_ip,
+                authenticated=event.authenticated,
+                status_code=event.status_code,
+                payload_hash=event.payload_hash,
+            )
+        except Exception as exc:  # never let persistence failure break the response
+            logger.warning("WebhookReceiver: on_event callback failed: %s", exc)
 
     @staticmethod
     def _create_event(
