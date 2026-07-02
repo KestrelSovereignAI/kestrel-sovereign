@@ -540,10 +540,11 @@ class KeyManagementFeature(Feature):
                 approval_bypassed_reason = str(e)
 
         try:
-            # Store new key (replaces old one due to UNIQUE constraint on agent_did + provider_id)
+            # Rotation is the only path allowed to overwrite an existing key.
             key_id = await self._storage.store_key(
                 provider_id=provider,
                 api_key=new_api_key,
+                replace=True,
             )
         except Exception as e:
             logger.error(f"Failed to rotate service key: {e}")

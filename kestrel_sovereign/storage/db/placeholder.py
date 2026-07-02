@@ -116,6 +116,10 @@ def sqlite_to_postgres(query: str) -> Tuple[str, int]:
             #   (master_did, provider_id); `id` is a fresh UUID like host's.
             # user_byok service keys: the real UNIQUE is (agent_did,
             #   provider_id); `id` is a fresh UUID like agent_service_keys.
+            # agent_service_keys: the real UNIQUE is (agent_did, provider_id);
+            #   `id` is a fresh UUID per insert, so an approval-gated rotation
+            #   (store_key replace=True) must conflict on (agent_did,
+            #   provider_id) to actually replace the row (F196).
             # sponsor_beneficiaries: PRIMARY KEY is agent_did (not the first
             #   column), so re-enroll (repoint) must conflict on agent_did.
             known_pks = {
@@ -123,6 +127,7 @@ def sqlite_to_postgres(query: str) -> Tuple[str, int]:
                 'graph_edges': ['source_id', 'target_id', 'label'],
                 'agent_metadata': ['agent_id', 'key'],
                 'host_service_keys': ['provider_id'],
+                'agent_service_keys': ['agent_did', 'provider_id'],
                 'user_byok_service_keys': ['agent_did', 'provider_id'],
                 'user_master_service_keys': ['master_did', 'provider_id'],
                 'sponsor_master_service_keys': ['master_did', 'provider_id'],
