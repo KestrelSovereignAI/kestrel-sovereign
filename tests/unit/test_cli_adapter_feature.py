@@ -592,8 +592,11 @@ def test_cli_command_prefixes_parse_positional_args():
         "path": "src/app.py",
         "repo_path": ".",
     }
+    # max_count coerces to int now that the @tool schema advertises it as
+    # `integer` (SDK 0.29 annotation resolution — previously the PEP 563 string
+    # annotation degraded it to `string`, so this parsed to "5").
     assert tools["git_log"].parse_command_args("!git-log 5") == {
-        "max_count": "5",
+        "max_count": 5,
         "repo_path": ".",
     }
     assert tools["git_show_file"].parse_command_args(
