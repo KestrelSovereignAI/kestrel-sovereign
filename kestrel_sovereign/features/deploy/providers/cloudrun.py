@@ -17,6 +17,21 @@ from .base import DeployProvider
 logger = logging.getLogger(__name__)
 
 
+def _apply_managed_template(service: Any, container: Any, profile: DeploymentProfile) -> None:
+    """Write the revision-template fields Kestrel manages onto ``service``.
+
+    ONLY these fields are (re)written. On update the caller passes the fetched
+    existing service, so everything else — service_account, vpc_access, labels,
+    traffic split, annotations — is left intact rather than reset out-of-band
+    (F174).
+    """
+    service.template.containers = [container]
+    service.template.scaling.min_instance_count = profile.min_instances
+    service.template.scaling.max_instance_count = profile.max_instances
+    service.template.timeout = f"{profile.timeout}s"
+    service.template.max_instance_request_concurrency = profile.concurrency
+
+
 class CloudRunProvider(DeployProvider):
     """
     Provider that deploys to Google Cloud Run.
@@ -206,23 +221,23 @@ class CloudRunProvider(DeployProvider):
                 ),
             )
 
-            # Build service spec
-            service = Service()
-            service.template.containers = [container]
-            service.template.scaling.min_instance_count = profile.min_instances
-            service.template.scaling.max_instance_count = profile.max_instances
-            service.template.timeout = f"{profile.timeout}s"
-            service.template.max_instance_request_concurrency = profile.concurrency
-
             if is_update:
-                # Update existing service
+                # Read-modify-write: mutate the FETCHED service in place so the
+                # settings Kestrel does NOT manage — service_account, vpc_access,
+                # labels, traffic split, annotations, etc. — survive the update.
+                # Building a fresh Service() and replacing the whole spec (no
+                # update mask) silently reset all of them out-of-band (F174).
+                service = existing_service
                 service.name = service_path
+                _apply_managed_template(service, container, profile)
                 operation = await asyncio.to_thread(
                     client.update_service, service=service
                 )
             else:
-                # Create new service
+                # Create new service from a fresh spec.
+                service = Service()
                 service.name = service_name
+                _apply_managed_template(service, container, profile)
                 operation = await asyncio.to_thread(
                     client.create_service, parent=parent, service=service, service_id=service_name
                 )
