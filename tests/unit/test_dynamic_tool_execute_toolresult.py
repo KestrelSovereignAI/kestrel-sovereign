@@ -10,22 +10,23 @@ framework-level fix: ``DynamicTool.execute()`` itself converts a
 ``ToolResult`` return to its dict form, and reflects the inner
 status in the wrapper's transport-level ``success`` flag.
 
-Wire shape after the fix:
+Unified wire shape (#F025): the ToolResult envelope is spread TOP-LEVEL
+(matching the SDK wrapper), with a retained ``success`` back-compat flag:
 
   - @tool returns ``ToolResult.ok(...)`` → wrapper:
-    ``{"success": True, "result": {"status": "ok", ...}, "tool": "..."}``
+    ``{"status": "ok", "confirmation": ..., "data": ..., "tool": "...", "success": True}``
   - @tool returns ``ToolResult.failed(...)`` → wrapper:
-    ``{"success": False, "error": "...", "result": {"status": "error", ...}, "tool": "..."}``
+    ``{"status": "error", "error": "...", "data": ..., "tool": "...", "success": False}``
   - @tool returns ``ToolResult.partial(c, e)`` → wrapper:
-    ``{"success": True, "error": "...", "result": {"status": "partial", ...}, "tool": "..."}``
+    ``{"status": "partial", "confirmation": c, "error": e, "data": ..., "tool": "...", "success": True}``
   - @tool returns plain dict (pre-migration) → wrapper unchanged:
     ``{"success": True, "result": {dict}, "tool": "..."}``
 
-Honesty: ``success`` reflects the *semantic* outcome for migrated
-tools (`error` ⇒ False), not just whether the call raised. This
-fixes the !command honesty leak (`command_handler.py` branched on
-``task_result.get("success")`` and returned the inner ToolResult.failed
-as a successful command before this fix).
+Honesty: ``status`` is the canonical signal (top-level, so
+``summarize_tool_result_for_audit`` sees a PARTIAL — #F001), and
+``success`` reflects the *semantic* outcome for migrated tools
+(`error` ⇒ False), not just whether the call raised. command_handler
+renders every feature's ``!command`` from this one shape (#F002).
 """
 
 import json
@@ -34,7 +35,34 @@ import pytest
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.base import (
+    Feature,
+    is_flat_toolresult_envelope,
+    tool,
+)
+
+
+# ---------------------------------------------------------------------------
+# Flat-envelope discriminator: a real ToolResult.to_dict() vs a domain payload
+# ---------------------------------------------------------------------------
+
+
+def test_is_flat_toolresult_envelope_discriminates_real_envelope():
+    assert is_flat_toolresult_envelope(ToolResult.ok("done").to_dict()) is True
+    assert is_flat_toolresult_envelope(ToolResult.failed("boom").to_dict()) is True
+    assert is_flat_toolresult_envelope(
+        ToolResult.partial("half", "rest failed").to_dict()
+    ) is True
+
+
+def test_is_flat_toolresult_envelope_rejects_domain_payload_with_status():
+    # A legacy service payload whose ``status`` is a DOMAIN field, not a
+    # ToolResult status — must NOT be treated as an envelope (codex P2), so the
+    # isolated proxy keeps wrapping it and its payload isn't dropped.
+    assert is_flat_toolresult_envelope({"status": "ok", "items": [1, 2, 3]}) is False
+    assert is_flat_toolresult_envelope({"status": "error", "items": []}) is False
+    assert is_flat_toolresult_envelope({"status": "running"}) is False
+    assert is_flat_toolresult_envelope("not a dict") is False
 
 
 class _FixtureFeature(Feature):
@@ -96,12 +124,12 @@ async def test_ok_serializes_to_dict_and_keeps_success_true(feature):
     result = await _tool(feature, "returns_ok").execute()
     assert result["success"] is True
     assert result["tool"] == "returns_ok"
-    # Inner ToolResult is serialized
-    assert isinstance(result["result"], dict)
-    assert result["result"]["status"] == "ok"
-    assert result["result"]["confirmation"] == "done"
-    assert result["result"]["data"] == {"n": 1}
-    # No top-level error on a clean OK
+    # Envelope spread top-level (unified shape) — NOT nested under "result".
+    assert "result" not in result
+    assert result["status"] == "ok"
+    assert result["confirmation"] == "done"
+    assert result["data"] == {"n": 1}
+    # No error on a clean OK
     assert "error" not in result
 
 
@@ -127,9 +155,9 @@ async def test_failed_flips_wrapper_success_to_false(feature):
     assert result["success"] is False
     assert result["error"] == "boom"
     assert result["tool"] == "returns_failed"
-    # Inner envelope is preserved for callers that read it
-    assert result["result"]["status"] == "error"
-    assert result["result"]["error"] == "boom"
+    # Envelope spread top-level.
+    assert "result" not in result
+    assert result["status"] == "error"
 
 
 @pytest.mark.asyncio
@@ -153,16 +181,63 @@ async def test_partial_keeps_success_true_and_surfaces_error(feature):
     result = await _tool(feature, "returns_partial").execute()
     assert result["success"] is True
     assert result["error"] == "other half failed"
-    # Inner envelope has both confirmation and error
-    assert result["result"]["status"] == "partial"
-    assert result["result"]["confirmation"] == "half done"
-    assert result["result"]["error"] == "other half failed"
+    # Envelope spread top-level with BOTH confirmation and error, and
+    # status=partial visible top-level so the honesty layer flags it.
+    assert "result" not in result
+    assert result["status"] == "partial"
+    assert result["confirmation"] == "half done"
 
 
 @pytest.mark.asyncio
 async def test_partial_wire_payload_is_json_clean(feature):
     result = await _tool(feature, "returns_partial").execute()
     json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_partial_is_visible_to_honesty_layer(feature):
+    """#F001: a PARTIAL in-tree tool result must reach the constitutional
+    honesty layer as a failure, so a past-tense success claim over it is
+    flagged. Before unification the sovereign wrapper nested ``status`` under
+    ``result`` and exposed only a derived ``success=True`` top-level, so
+    ``summarize_tool_result_for_audit`` (which reads top-level ``status``) saw
+    ``success=True`` and let the false claim through. This is the exact path the
+    orchestrator runs (summarize → analyze_narration)."""
+    from kestrel_sovereign.security.narration_check import (
+        summarize_tool_result_for_audit,
+        _result_indicates_failure,
+        analyze_narration,
+    )
+
+    wrapper = await _tool(feature, "returns_partial").execute()
+    summary = summarize_tool_result_for_audit(wrapper)
+    assert summary.get("status") == "partial"
+    assert _result_indicates_failure(summary) is True
+
+    verdict = analyze_narration(
+        pre_tool_prose="Saved your note successfully.",
+        tool_results=[{"name": "returns_partial", "result": summary}],
+    )
+    assert verdict.risk_boost > 0
+
+
+@pytest.mark.asyncio
+async def test_ok_is_not_flagged_by_honesty_layer(feature):
+    """Complement: a clean OK must NOT be flagged, so a truthful past-tense
+    success claim passes (no spurious audit elevation)."""
+    from kestrel_sovereign.security.narration_check import (
+        summarize_tool_result_for_audit,
+        analyze_narration,
+    )
+
+    wrapper = await _tool(feature, "returns_ok").execute()
+    summary = summarize_tool_result_for_audit(wrapper)
+    assert summary.get("status") == "ok"
+    verdict = analyze_narration(
+        pre_tool_prose="Saved your note successfully.",
+        tool_results=[{"name": "returns_ok", "result": summary}],
+    )
+    assert verdict.risk_boost == 0
 
 
 # ---------------------------------------------------------------------------

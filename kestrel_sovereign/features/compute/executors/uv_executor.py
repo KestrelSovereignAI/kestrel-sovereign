@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from .base import BaseExecutor, ExecutionError, ExecutionTimeoutError
+from .base import BaseExecutor, ExecutionError, ExecutionTimeoutError, _SAFE_ENV_VARS
 from ..models import ComputeScript, ExecutionRecord
 from ..destructive_policy import DestructiveOperationPolicy
 
@@ -146,8 +146,16 @@ class UvExecutor(BaseExecutor):
                 req_path = Path(tmpdir) / "requirements.txt"
                 req_path.write_text("\n".join(script.requirements))
             
-            # Prepare environment
-            env = {**os.environ, **script.environment}
+            # Prepare environment - only pass safe variables, never leak
+            # host secrets (API keys, KESTREL_DATA_KEY, etc.) into the script.
+            env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_VARS}
+            # The allowlist strips host UV_CACHE_DIR/XDG_CACHE_HOME, so uv would
+            # otherwise fall back to a cache under HOME (~/.cache/uv) that can be
+            # unreadable in sandboxed/service environments. Point uv at a
+            # controlled per-execution cache inside the temp dir instead.
+            env["UV_CACHE_DIR"] = str(Path(tmpdir) / ".uv-cache")
+            # Script-supplied overrides win (matches LocalExecutor semantics).
+            env.update(script.environment)
             
             # Build uv command
             # Use --isolated to create a fresh environment

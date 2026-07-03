@@ -174,15 +174,38 @@ class IdentityFeature(Feature):
             tier_enum = tier_map[tier_key]
 
             if tier_enum != StorageTier.LOCAL_ONLY:
-                # Upload to IPFS/Filecoin
+                # F187: IPFS/Filecoin are PUBLIC content-addressed networks —
+                # anyone with the CID can fetch the bytes. Publishing the
+                # identity package (DID, memories, relationships, calibration
+                # examples) in plaintext leaks user-derived content forever.
+                # Require a data key and encrypt before upload; if no key is
+                # configured, FAIL rather than silently upload plaintext.
+                from kestrel_sovereign.security.encryption import (
+                    get_master_key_bytes,
+                )
+                if not get_master_key_bytes():
+                    return ToolResult.failed(
+                        "Non-local identity export requires an encryption key. "
+                        "Set KESTREL_DATA_KEY so the package is encrypted "
+                        f"before upload to the public {tier_key} network — "
+                        "the export was NOT uploaded in plaintext. The "
+                        "per-content key hash returned on a successful "
+                        "encrypted export must travel OUT-OF-BAND with the "
+                        "CID for the package to be restorable."
+                    )
+                # Upload to IPFS/Filecoin, encrypted. The adapter derives a
+                # per-content key from KESTREL_DATA_KEY and returns its
+                # encryption_key_hash on the StorageResult; retrieval needs
+                # that hash (passed to retrieve_content(key_hash=...)).
                 adapter = FilecoinAdapter()
                 result = await asyncio.to_thread(
                     adapter.store_content,
                     content=package_json.encode('utf-8'),
                     storage_tier=tier_enum,
-                    encrypt=False,  # Package is already structured
+                    encrypt=True,  # F187: never publish plaintext to a public CID
                     metadata={"type": "identity_package", "did": package.did}
                 )
+                encryption_key_hash = getattr(result, "encryption_key_hash", None)
                 # Honesty: FilecoinAdapter silently downgrades to
                 # LOCAL_ONLY when IPFS / Lotus isn't available — it
                 # mutates result.tier and leaves ipfs_cid as None.
@@ -262,9 +285,14 @@ class IdentityFeature(Feature):
                         f"{summary['episodes_count']} episodes, "
                         f"{summary['saved_items_count']} items, "
                         f"signed={summary['is_signed']}; "
-                        f"stored to tier={actual_tier.value if hasattr(actual_tier, 'value') else actual_tier} "
-                        f"(CID={ipfs_cid}). "
-                        f"Use `!identity import {restore_id}` to restore."
+                        f"stored ENCRYPTED to tier="
+                        f"{actual_tier.value if hasattr(actual_tier, 'value') else actual_tier} "
+                        f"(CID={ipfs_cid}, key_hash={encryption_key_hash}). "
+                        f"Use `!identity import {restore_id} true merge {encryption_key_hash}` "
+                        "to restore (positional args: source verify_signature "
+                        "merge_mode key_hash). The key_hash must travel "
+                        "OUT-OF-BAND with the CID — the CID alone cannot decrypt "
+                        "the package."
                     )
                 data = {
                     "did": package.did,
@@ -277,6 +305,8 @@ class IdentityFeature(Feature):
                     "tier_downgraded": tier_downgraded,
                     "ipfs_cid": ipfs_cid,
                     "content_hash": content_hash,
+                    "encrypted": True,
+                    "encryption_key_hash": encryption_key_hash,
                     "fallback_file_path": (
                         str(fallback_filepath) if fallback_filepath else None
                     ),
@@ -370,6 +400,7 @@ class IdentityFeature(Feature):
         source: str,
         verify_signature: bool = True,
         merge_mode: str = "merge",
+        key_hash: Optional[str] = None,
     ) -> ToolResult:
         """
         Import agent identity from a package.
@@ -378,6 +409,11 @@ class IdentityFeature(Feature):
             source: CID or file path of the identity package
             verify_signature: Whether to verify DID signature
             merge_mode: How to handle existing data ('replace', 'merge', 'skip_existing')
+            key_hash: Encryption key hash for an ENCRYPTED CID export (F187).
+                Required to decrypt a package uploaded to IPFS/Filecoin with
+                `!identity export tier=ipfs|filecoin`; it is returned by that
+                export and must travel out-of-band with the CID. Ignored for
+                local file sources.
         """
         if not isinstance(verify_signature, bool):
             return ToolResult.failed(
@@ -400,10 +436,13 @@ class IdentityFeature(Feature):
 
             # Load package
             if source.startswith("Qm") or source.startswith("bafy"):
-                # IPFS CID
+                # IPFS CID — decrypt with key_hash when the export was
+                # encrypted (F187). retrieve_content(key_hash=...) already
+                # applies decryption.
                 adapter = FilecoinAdapter()
                 content = await asyncio.to_thread(
-                    adapter.retrieve_content, source, ipfs_cid=source
+                    adapter.retrieve_content, source,
+                    ipfs_cid=source, key_hash=key_hash,
                 )
                 package_json = content.decode('utf-8')
             elif Path(source).exists():
@@ -513,12 +552,15 @@ class IdentityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!identity verify"
     )
-    async def verify_identity(self, source: str) -> ToolResult:
+    async def verify_identity(self, source: str, key_hash: Optional[str] = None) -> ToolResult:
         """
         Verify an identity package.
 
         Args:
             source: CID or file path of the identity package
+            key_hash: Encryption key hash for an ENCRYPTED CID export (F187),
+                required to decrypt a package uploaded to IPFS/Filecoin.
+                Ignored for local file sources.
         """
         try:
             from kestrel_sovereign.identity import (
@@ -531,7 +573,8 @@ class IdentityFeature(Feature):
             if source.startswith("Qm") or source.startswith("bafy"):
                 adapter = FilecoinAdapter()
                 content = await asyncio.to_thread(
-                    adapter.retrieve_content, source, ipfs_cid=source
+                    adapter.retrieve_content, source,
+                    ipfs_cid=source, key_hash=key_hash,
                 )
                 package_json = content.decode('utf-8')
             elif Path(source).exists():

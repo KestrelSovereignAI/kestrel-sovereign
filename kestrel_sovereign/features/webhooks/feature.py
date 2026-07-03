@@ -41,8 +41,9 @@ class WebhookFeature(Feature):
     and audit logging, loads any persisted webhooks, and makes the
     ``WebhookReceiver`` available for router mounting.
 
-    The receiver's FastAPI router can be obtained via ``get_webhook_router()``
-    and included in the application at mount time.
+    The receiver's FastAPI router is exposed via the standard
+    ``get_router()`` contract, so the agent auto-mounts the
+    ``/webhooks/{name}`` endpoints after features load.
     """
 
     @property
@@ -56,7 +57,10 @@ class WebhookFeature(Feature):
         """Initialise the feature: resolve DB, create tables, load persisted webhooks."""
         self._db = None
         self._agent_id = ""
-        self.receiver = WebhookReceiver()
+        # Wire the receiver's audit sink to log_webhook_event so every
+        # received webhook is persisted to webhook_log, not just held in
+        # the in-memory ring buffer (F333).
+        self.receiver = WebhookReceiver(on_event=self.log_webhook_event)
 
         self._db = resolve_feature_database(self.agent)
 
@@ -176,10 +180,13 @@ class WebhookFeature(Feature):
     # Public API
     # ------------------------------------------------------------------
 
-    def get_webhook_router(self):
-        """Return the FastAPI router for webhook endpoints.
+    def get_router(self):
+        """Return the FastAPI router for webhook endpoints (F332).
 
-        This router should be mounted in server.py (or equivalent).
+        Overrides ``Feature.get_router`` so the agent auto-mounts the
+        ``/webhooks/{name}`` receiver routes after features load — without
+        this, every registered webhook 404s in the live server.
+
         Routes do NOT go through the server-level API key middleware
         because webhook auth is handled per-endpoint.
 
@@ -187,6 +194,11 @@ class WebhookFeature(Feature):
             ``fastapi.APIRouter``
         """
         return self.receiver.get_router()
+
+    # Backward-compatible alias for callers that mounted the router manually.
+    def get_webhook_router(self):
+        """Deprecated alias for :meth:`get_router`."""
+        return self.get_router()
 
     # ------------------------------------------------------------------
     # Tools

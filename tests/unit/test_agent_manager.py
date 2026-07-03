@@ -268,6 +268,11 @@ class TestCreateAgent:
         mock_inception.assert_awaited_once()
         assert agent is mock_agent
         assert manager.get_agent("NewBot") is mock_agent
+        # Fleet-idleness (#F235): a dynamically-created/spawned agent must get
+        # the co-hosted-agents provider so its restart requests cannot bypass
+        # the whole-fleet idle gate. Resolves live to the manager's agents.
+        assert callable(agent._cohosted_agents_provider)
+        assert agent in agent._cohosted_agents_provider()
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)

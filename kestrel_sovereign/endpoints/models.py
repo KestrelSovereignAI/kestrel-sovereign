@@ -682,24 +682,23 @@ async def add_key(request: Request):
         db = _get_service_key_db(agent)
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
+        from kestrel_sovereign.security.exceptions import KeyStorageError
 
         key_storage = ServiceKeyStorage(db, agent.agent_id)
 
-        # Check if key already exists for this provider
-        existing_keys = await key_storage.list_keys()
-        for k in existing_keys:
-            if k.provider_id == provider:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Key already exists for provider '{provider}'. Delete it first to add a new one."
-                )
-
-        # Store the key
-        key_id = await key_storage.store_key(
-            provider_id=provider,
-            api_key=api_key,
-            quota_limit=quota_limit,
-        )
+        # Store the key. Insert-only enforcement lives in storage (store_key
+        # raises KeyStorageError over an existing key), so a duplicate — even
+        # one that slips past a preflight under concurrency — surfaces as 409
+        # here rather than a generic 500. Rotation is a separate approval-gated
+        # path (replace=True); the plain add API never overwrites (F196).
+        try:
+            key_id = await key_storage.store_key(
+                provider_id=provider,
+                api_key=api_key,
+                quota_limit=quota_limit,
+            )
+        except KeyStorageError as e:
+            raise HTTPException(status_code=409, detail=str(e))
 
         return {
             "success": True,

@@ -107,6 +107,96 @@ async def _make_feature(tmp_path, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Fleet idleness (#F235): a whole-host restart must defer while ANY co-hosted
+# agent is busy, not just the requester.
+# ---------------------------------------------------------------------------
+
+
+def _idle_sibling(did: str, busy: bool = False):
+    return SimpleNamespace(
+        did=did,
+        name=did,
+        dispatcher=SimpleNamespace(),
+        _active_request_ids={"r-active"} if busy else set(),
+        _background_tasks=set(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fleet_idle_defers_when_a_sibling_is_busy(tmp_path):
+    """The requester is idle, but a co-hosted sibling is mid-turn. A whole-host
+    restart would kill the sibling's turn, so idle_agents_only must defer."""
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent  # idle (empty active-request set)
+    busy_sibling = _idle_sibling("did:test:sibling", busy=True)
+    requester._cohosted_agents_provider = lambda: [requester, busy_sibling]
+
+    state = feat._fleet_idle(ignore_request_id="")
+    assert state["idle"] is False
+    assert "did:test:sibling" in state["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_idle_true_when_all_agents_idle(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent
+    idle_sibling = _idle_sibling("did:test:sibling", busy=False)
+    requester._cohosted_agents_provider = lambda: [requester, idle_sibling]
+
+    assert feat._fleet_idle(ignore_request_id="")["idle"] is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_idle_falls_back_to_self_without_provider(tmp_path):
+    """Single-agent host (no provider, no manager): behaviour-preserving — the
+    requester-only check is used."""
+    feat, _ = await _make_feature(tmp_path)
+    assert not hasattr(feat.agent, "_cohosted_agents_provider")
+    assert not hasattr(feat.agent, "_agent_manager")
+    # Requester idle → idle; requester busy → not idle (self check).
+    assert feat._fleet_idle(ignore_request_id="")["idle"] is True
+    feat.agent._active_request_ids = {"r-active"}
+    assert feat._fleet_idle(ignore_request_id="")["idle"] is False
+
+
+@pytest.mark.asyncio
+async def test_fleet_idle_resolves_via_manager_backref_when_no_provider(tmp_path):
+    """SpawnFeature registers the parent in a lightweight AgentManager outside
+    _load_one, so the parent lacks _cohosted_agents_provider but carries an
+    _agent_manager backref. The fleet gate must still see a busy spawned child
+    (codex round 2)."""
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent  # idle, no provider
+    busy_child = _idle_sibling("did:test:child", busy=True)
+    requester._agent_manager = SimpleNamespace(
+        list_agents=lambda: {"parent": requester, "child": busy_child}
+    )
+    assert not hasattr(requester, "_cohosted_agents_provider")
+
+    state = feat._fleet_idle(ignore_request_id="")
+    assert state["idle"] is False
+    assert "did:test:child" in state["reason"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_idle_excludes_only_requesters_own_marker(tmp_path):
+    """The requester's own turn (the one that filed the restart) is excluded on
+    the REQUESTING agent — but the same id on a sibling still defers."""
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent
+    requester._active_request_ids = {"req-turn"}
+    sibling = _idle_sibling("did:test:sibling", busy=False)
+    sibling._active_request_ids = {"req-turn"}  # same id, different agent
+    requester._cohosted_agents_provider = lambda: [requester, sibling]
+
+    state = feat._fleet_idle(ignore_request_id="req-turn")
+    # Requester's own marker excluded, but the sibling's identical id still
+    # counts (it is NOT the requester's turn).
+    assert state["idle"] is False
+    assert "did:test:sibling" in state["reason"]
+
+
+# ---------------------------------------------------------------------------
 # Store layer
 # ---------------------------------------------------------------------------
 

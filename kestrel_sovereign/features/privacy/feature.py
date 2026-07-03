@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 from typing import List, Dict, Optional, Union
 from datetime import datetime, timezone
 
@@ -13,6 +14,23 @@ from kestrel_sovereign.privacy import (
 from kestrel_sovereign.kestrel_types.storage_types import StorageProvider
 from kestrel_sovereign.ephemeral_session import EphemeralSession
 from .pii_detector import get_pii_detector, anonymize_text
+
+
+@dataclass(frozen=True)
+class PrivacyTransitionDecision:
+    """Outcome of evaluating a privacy-mode transition BEFORE any state flips.
+
+    ``requires_confirmation`` marks a transition that is data-destructive in a
+    way the user must explicitly acknowledge (today: PUBLIC → EPHEMERAL, where
+    previously-stored PUBLIC turns are purged on the next ephemeral exit). When
+    True the caller MUST NOT apply the transition to any state holder; it stashes
+    the target as pending and waits for an explicit confirm. ``warning`` is the
+    user-facing message describing why (empty when no confirmation is needed).
+    """
+
+    target: "PrivacyMode"
+    requires_confirmation: bool
+    warning: str = ""
 
 
 class PrivacyAgent:
@@ -57,14 +75,43 @@ class PrivacyAgent:
         """Get the current privacy configuration."""
         return self._privacy_config
 
-    def set_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> str:
-        """Sets the privacy mode/config for future conversations."""
+    def evaluate_transition(
+        self, mode: Union[PrivacyMode, PrivacyConfig, str]
+    ) -> PrivacyTransitionDecision:
+        """Decide whether a transition needs explicit confirmation — no mutation.
+
+        This is the single decision point (called by the agent BEFORE it flips
+        any state holder). A PUBLIC → EPHEMERAL change is data-destructive: the
+        agent stays able to serve, but leaving EPHEMERAL later purges the rows
+        stored while PUBLIC. Such a change requires an explicit
+        ``!confirm-privacy-mode`` so the three state holders never diverge (the
+        split-state / silent-persist bug this replaces).
+        """
         old_config = self._privacy_config
         new_config = self._to_config(mode)
-
-        # Handle transitions that require warnings
+        target = privacy_config_to_mode(new_config)
         if old_config.shareable and new_config.is_ephemeral():
-            return "WARNING: Switching from PUBLIC to EPHEMERAL will prevent storage of future messages. Previous PUBLIC messages remain stored. Use !confirm-privacy-mode ephemeral to confirm."
+            return PrivacyTransitionDecision(
+                target=target,
+                requires_confirmation=True,
+                warning=(
+                    "WARNING: Switching from PUBLIC to EPHEMERAL will prevent "
+                    "storage of future messages, and leaving EPHEMERAL later will "
+                    "PURGE the PUBLIC messages stored during this session. Use "
+                    "!confirm-privacy-mode ephemeral to confirm."
+                ),
+            )
+        return PrivacyTransitionDecision(target=target, requires_confirmation=False)
+
+    def set_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> str:
+        """Apply the privacy mode/config for future conversations.
+
+        Unconditional: the confirmation decision for data-destructive
+        transitions is made upstream via :meth:`evaluate_transition` before this
+        is ever reached, so there is no half-applied state here.
+        """
+        old_config = self._privacy_config
+        new_config = self._to_config(mode)
 
         # Handle ephemeral session lifecycle
         if new_config.is_ephemeral():

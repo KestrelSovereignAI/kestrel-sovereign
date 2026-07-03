@@ -25,11 +25,24 @@ from kestrel_sovereign.security.exceptions import (
     KeyNotConfiguredError,
     DecryptionError,
 )
+from kestrel_sovereign.storage.db.interface import QueryError
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def _is_unique_violation(err: Exception) -> bool:
+    """Return True if a wrapped DB error is a UNIQUE-constraint violation.
+
+    Backend-portable: the SQLite backend surfaces ``UNIQUE constraint failed``
+    and PostgreSQL (asyncpg) surfaces ``duplicate key value violates unique
+    constraint`` — both wrapped in ``QueryError``. We match on the substring
+    common to each rather than importing backend-specific driver exceptions.
+    """
+    message = str(err).lower()
+    return "unique constraint" in message or "duplicate key value" in message
 
 
 def _as_datetime(value: Any) -> datetime:
@@ -134,22 +147,50 @@ class ServiceKeyStorage:
             )
         )
 
+    async def _key_exists(self, provider_id: str) -> bool:
+        """Return True if any key row exists for this agent+provider.
+
+        Deliberately ignores ``is_active`` so an inactive/deactivated key still
+        counts as "exists" — a fresh ``store_key`` over a deactivated row would
+        otherwise silently replace it, bypassing rotation approval (F196).
+        """
+        rows = await self._db.fetchall(
+            """
+            SELECT 1 FROM agent_service_keys
+            WHERE agent_did = ? AND provider_id = ?
+            """,
+            (self._agent_did, provider_id)
+        )
+        return len(rows) > 0
+
     async def store_key(
         self,
         provider_id: str,
         api_key: str,
         quota_limit: Optional[int] = None,
+        replace: bool = False,
     ) -> str:
         """
         Store an encrypted API key for this agent.
+
+        Insert-only by default: if a key already exists for this agent+provider
+        (active OR inactive), this raises ``KeyStorageError`` unless ``replace``
+        is set. Only the approval-gated rotation path may pass ``replace=True``.
+        This makes storage the single enforcement point that prevents a plain
+        add from silently rotating a credential without constitutional approval
+        (F196).
 
         Args:
             provider_id: Service provider (openrouter, openai, etc.)
             api_key: The API key to store
             quota_limit: Optional usage limit
+            replace: Allow overwriting an existing key (rotation only)
 
         Returns:
             Key ID
+
+        Raises:
+            KeyStorageError: If a key already exists and ``replace`` is False.
         """
         await self._ensure_provider(provider_id)
 
@@ -162,23 +203,50 @@ class ServiceKeyStorage:
         key_id = str(uuid.uuid4())
         key_hash = self._hash_key(api_key)
 
-        # Upsert (replace if exists for same agent+provider)
-        await self._db.execute(
-            """
-            INSERT OR REPLACE INTO agent_service_keys
-            (id, agent_did, provider_id, encrypted_key, key_hash,
-             quota_limit, quota_used, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 1, CURRENT_TIMESTAMP)
-            """,
-            (
-                key_id,
-                self._agent_did,
-                provider_id,
-                encrypted_b64,
-                key_hash,
-                quota_limit,
-            )
+        params = (
+            key_id,
+            self._agent_did,
+            provider_id,
+            encrypted_b64,
+            key_hash,
+            quota_limit,
         )
+        columns = (
+            "(id, agent_did, provider_id, encrypted_key, key_hash, "
+            "quota_limit, quota_used, is_active, created_at)"
+        )
+        values = "VALUES (?, ?, ?, ?, ?, ?, 0, 1, CURRENT_TIMESTAMP)"
+
+        if replace:
+            # Approval-gated rotation: INSERT OR REPLACE upserts over the
+            # existing UNIQUE(agent_did, provider_id) row (only reachable
+            # via rotate_service_key).
+            await self._db.execute(
+                f"INSERT OR REPLACE INTO agent_service_keys {columns} {values}",
+                params,
+            )
+        else:
+            # Insert-only add. The preflight check gives a friendly error for
+            # the common serial case, but is NOT the enforcement point — two
+            # concurrent adds could both observe no row. Enforcement is the
+            # plain INSERT hitting UNIQUE(agent_did, provider_id): the loser of
+            # the race raises, which we translate to KeyStorageError. This
+            # closes the F196 approval bypass under real concurrency.
+            if await self._key_exists(provider_id):
+                raise KeyStorageError(
+                    f"key for {provider_id} exists — use rotate_service_key"
+                )
+            try:
+                await self._db.execute(
+                    f"INSERT INTO agent_service_keys {columns} {values}",
+                    params,
+                )
+            except QueryError as e:
+                if _is_unique_violation(e):
+                    raise KeyStorageError(
+                        f"key for {provider_id} exists — use rotate_service_key"
+                    ) from e
+                raise
 
         logger.info(f"Stored key for agent={self._agent_did[:30]}..., provider={provider_id}")
         return key_id

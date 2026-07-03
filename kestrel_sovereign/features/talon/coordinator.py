@@ -33,11 +33,13 @@ from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
 # PeersFeature, but called directly because coordinator dispatch
 # happens at the feature level (not from an LLM tool turn).
 from kestrel_sovereign.features.talon.runtime import (
+    TalonBatchExecution,
     TalonExecution,
     TalonPolicy,
     TalonPreference,
     TalonRuntimeError,
     TalonRuntimeRequest,
+    build_talon_batch_invocation,
     build_talon_invocation,
     load_talon_policy_preference,
     normalize_auth_lane,
@@ -45,6 +47,7 @@ from kestrel_sovereign.features.talon.runtime import (
     parse_talon_bool,
     resolve_runtime,
     sanitize_env_for_backend,
+    sanitize_untrusted_env,
     write_talon_preference,
 )
 from kestrel_sovereign.features.talon.verification import (
@@ -258,6 +261,18 @@ def _path_contains(parent: Path, child: Path) -> bool:
     if parent_r == child_r:
         return True
     return parent_r in child_r.parents
+
+
+class _VerifyCwdError(Exception):
+    """Raised when a verify cwd can't be resolved to a safe workspace.
+
+    Carries the structured ``data`` payload ``talon_verify`` returns so the
+    refusal (e.g. ``workspace_not_provisioned``) reaches the agent intact.
+    """
+
+    def __init__(self, message: str, data: Dict[str, Any]):
+        super().__init__(message)
+        self.data = data
 
 
 class TalonCoordinatorFeature(Feature):
@@ -1091,8 +1106,12 @@ class TalonCoordinatorFeature(Feature):
                 precisely.
             repo: ``owner/name`` (or ``self``) — used to locate the
                 workspace clone to run in when ``cwd`` is not given.
-            cwd: Working directory override. Defaults to the repo's
-                workspace clone if present, else the project directory.
+            cwd: Working directory override. Must be a sandboxed workspace
+                clone — never the running agent's source tree. Defaults to
+                the repo's provisioned workspace clone; if none exists the
+                call refuses with a structured
+                ``workspace_not_provisioned`` result pointing to
+                ``talon_setup_workspace(repo)``.
             ref: PR number / branch name / commit SHA to verify. When
                 given, the workspace clone is fetched and checked out to
                 that ref BEFORE any command runs, so a PR is verified
@@ -1125,10 +1144,8 @@ class TalonCoordinatorFeature(Feature):
 
         try:
             run_cwd = self._resolve_verify_cwd(repo, cwd)
-        except ValueError as e:
-            return ToolResult.failed(
-                str(e), data={"success": False, "overall_state": "not_run"}
-            )
+        except _VerifyCwdError as e:
+            return ToolResult.failed(str(e), data=e.data)
 
         requested_ref = (ref or "").strip()
         if requested_ref:
@@ -1208,23 +1225,69 @@ class TalonCoordinatorFeature(Feature):
     def _resolve_verify_cwd(self, repo: str, cwd: Optional[str]) -> Path:
         """Pick the directory to run verification commands in.
 
-        ``cwd`` wins when given. Otherwise prefer the repo's workspace
-        clone (the sandboxed checkout Talon worked in); fall back to the
-        project directory. Raises ``ValueError`` if the resolved path is
-        not a directory.
+        Verification executes untrusted checked-out code (conftest.py, PR
+        diffs), so the resolved directory must be a sandboxed workspace
+        clone — never the running agent's own source tree (F301). Both the
+        explicit ``cwd`` override and the workspace clone are run through
+        :meth:`_assert_workspace_safe`. When no ``cwd`` is given and no
+        workspace has been provisioned, this raises :class:`_VerifyCwdError`
+        with a structured ``workspace_not_provisioned`` refusal pointing to
+        ``talon_setup_workspace(repo)`` — there is deliberately no silent
+        ``project_dir()`` fallback.
         """
+        repo_resolved = self._resolve_repo(repo)
         if cwd:
             path = Path(cwd).expanduser().resolve()
             if not path.is_dir():
-                raise ValueError(f"talon_verify: cwd is not a directory: {path}")
+                raise _VerifyCwdError(
+                    f"talon_verify: cwd is not a directory: {path}",
+                    {"success": False, "overall_state": "not_run"},
+                )
+            unsafe_reason = self._assert_workspace_safe(path)
+            if unsafe_reason:
+                raise _VerifyCwdError(
+                    unsafe_reason,
+                    {
+                        "success": False,
+                        "overall_state": "not_run",
+                        "state": "unsafe_workspace",
+                        "error": unsafe_reason,
+                    },
+                )
             return path
-        repo_resolved = self._resolve_repo(repo)
+
         workspace = self._workspace_path_for(repo_resolved)
+        unsafe_reason = self._assert_workspace_safe(workspace)
+        if unsafe_reason:
+            raise _VerifyCwdError(
+                unsafe_reason,
+                {
+                    "success": False,
+                    "overall_state": "not_run",
+                    "state": "unsafe_workspace",
+                    "error": unsafe_reason,
+                },
+            )
         if (workspace / ".git").exists():
             return workspace
-        from kestrel_sovereign.paths import project_dir
 
-        return project_dir()
+        err_msg = (
+            f"No talon workspace exists for {repo_resolved} at {workspace}. "
+            "talon_verify will not run untrusted checked-out code in the "
+            "running agent's source tree. Call talon_setup_workspace(repo) "
+            "to provision a sandboxed clone, then retry."
+        )
+        raise _VerifyCwdError(
+            err_msg,
+            {
+                "success": False,
+                "overall_state": "not_run",
+                "state": "workspace_not_provisioned",
+                "error": err_msg,
+                "workspace": self._workspace_state(repo_resolved),
+                "next_step": f"talon_setup_workspace(repo='{repo_resolved}')",
+            },
+        )
 
     def _make_verify_executor(self, run_cwd: Path):
         """Build an async executor that runs a command in ``run_cwd``.
@@ -1242,7 +1305,11 @@ class TalonCoordinatorFeature(Feature):
             if not argv:
                 return CommandExecution(ran=False, error="empty command")
 
-            env = dict(os.environ)
+            # F302: the checked-out tree is untrusted (conftest.py runs at
+            # collection, PR diffs run under test). Strip every provider/LLM
+            # credential and the GitHub token so a malicious repo cannot
+            # exfiltrate secrets or act as the agent on GitHub.
+            env, _stripped = sanitize_untrusted_env()
             started = time.monotonic()
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -1937,16 +2004,17 @@ class TalonCoordinatorFeature(Feature):
     @tool(
         name="talon_batch",
         description=(
-            "Dispatch a batch of issues to Talon. Provide EXACTLY ONE of "
-            "``label`` or ``prd`` — if both are given, ``prd`` wins and "
-            "``label``/``repo`` are ignored; if neither is given the call "
-            "fails with 'Provide either label or prd'. ``label`` mode "
-            "claims all issues in ``repo`` carrying that GitHub label. "
-            "``prd`` is a path to a PRD JSON file resolved against the "
-            "Talon subprocess working directory ($KESTREL_TALON_CWD, else "
-            "the sibling-checkout project parent) — NOT repo- or "
-            "workspace-relative; pass an absolute path to be unambiguous. "
-            "Returns immediately with a job_id; poll talon_status."
+            "Dispatch a batch of issues to Talon from a PRD JSON file. "
+            "``prd`` is REQUIRED and must be an absolute path to an "
+            "existing PRD JSON file (there is no label/repo-scoped batch "
+            "mode — kestrel-talon's `batch` subcommand only accepts "
+            "`--prd`). Runs through the same policy layer as talon_claim: "
+            "``allow_background_jobs`` and ``allowed_backends`` are "
+            "enforced, the subprocess env is credential-sanitized, and a "
+            "sandbox workspace clone must already be provisioned for "
+            "``repo`` (call talon_setup_workspace first) — batch never "
+            "operates on the running agent's source tree. Returns "
+            "immediately with a job_id; poll talon_status."
         ),
         category=ToolCategory.UTILITY,
         command_prefix="!talon batch",
@@ -1954,21 +2022,20 @@ class TalonCoordinatorFeature(Feature):
     async def talon_batch(
         self,
         repo: str,
-        label: str = "",
         prd: str = "",
     ) -> ToolResult:
-        """Dispatch batch processing to Talon.
+        """Dispatch PRD batch processing to Talon.
 
-        Provide EXACTLY ONE of ``label`` or ``prd``. If both are set,
-        ``prd`` takes precedence and ``label``/``repo`` are ignored. If
-        neither is set, the call fails with ``"Provide either label or
-        prd"``. Like talon_claim, this launches in the background and
-        returns immediately.
+        Like talon_claim, this launches in the background and returns
+        immediately, and is guarded by the same Talon policy layer (F304):
+        it loads ``[talon.policy]``/``[talon.preference]``, enforces
+        ``allow_background_jobs``/``allowed_backends``, requires a
+        provisioned sandbox workspace for ``repo``, and passes that
+        workspace as ``--repo-dir`` plus a validated absolute PRD path.
 
         Args:
-            repo: GitHub repo in owner/name format (or ``self``). Used in ``label`` mode to scope the issue search; ignored in ``prd`` mode.
-            label: Claim every issue in ``repo`` carrying this GitHub label. Required when ``prd`` is not given.
-            prd: Path to a PRD JSON file for batch mode. Resolved against the Talon subprocess working directory (``$KESTREL_TALON_CWD`` if set, otherwise the sibling-checkout project parent) — NOT repo-relative or workspace-relative, so pass an absolute path when in doubt. Takes precedence over ``label`` when both are provided.
+            repo: GitHub repo in owner/name format (or ``self``). Selects the sandbox workspace clone Talon runs the batch in (passed as ``--repo-dir``); the workspace must already be provisioned via talon_setup_workspace.
+            prd: REQUIRED. Absolute path to an existing PRD JSON file. Relative paths and missing files are rejected before dispatch — pass an absolute path.
 
         Returns:
             ``{"dispatched": True, "job_id": ..., ...}`` on success — poll
@@ -1976,24 +2043,105 @@ class TalonCoordinatorFeature(Feature):
             ``talon_job_log``) to follow progress. Failure returns
             ``{"dispatched": False, "error": ...}``.
         """
-        if prd:
-            cli_result = await self._dispatch_via_cli_background(
-                ["batch", "--prd", prd],
-                label=f"batch:prd={prd}",
-                extra_meta={"prd": prd},
-            )
-        elif label:
-            repo_resolved = self._resolve_repo(repo)
-            cli_result = await self._dispatch_via_cli_background(
-                ["batch", "--repo", repo_resolved, "--label", label],
-                label=f"batch:{repo_resolved}:label={label}",
-                extra_meta={"repo": repo_resolved, "github_label": label},
-            )
-        else:
+        prd = (prd or "").strip()
+        if not prd:
             return ToolResult.failed(
-                "Provide either label or prd",
-                data={"dispatched": False, "error": "Provide either label or prd"},
+                "talon_batch requires an absolute prd path (PRD JSON file).",
+                data={
+                    "dispatched": False,
+                    "state": "invalid_talon_runtime",
+                    "error": "prd is required",
+                },
             )
+
+        try:
+            policy, preference = load_talon_policy_preference()
+        except TalonRuntimeError as e:
+            return ToolResult.failed(
+                str(e),
+                data={
+                    "dispatched": False,
+                    "state": "invalid_talon_runtime",
+                    "error": str(e),
+                },
+            )
+
+        repo_resolved = self._resolve_repo(repo)
+        workspace = self._workspace_path_for(repo_resolved)
+
+        unsafe_reason = (
+            self._assert_workspace_safe(workspace)
+            if policy.require_sandboxed_workspace
+            else None
+        )
+        if unsafe_reason:
+            return ToolResult.failed(
+                unsafe_reason,
+                data={
+                    "dispatched": False,
+                    "state": "unsafe_workspace",
+                    "error": unsafe_reason,
+                },
+            )
+
+        # Refuse rather than fall through to the running source tree —
+        # the same safeguard talon_claim uses.
+        state = self._workspace_state(repo_resolved)
+        if not state["exists"] or not state["is_git"]:
+            err_msg = (
+                "No talon workspace exists for "
+                f"{repo_resolved} at {workspace}. Batch will not operate "
+                "on the running agent's source tree. Call "
+                "talon_setup_workspace(repo) to provision a sandboxed "
+                "clone, then retry."
+            )
+            return ToolResult.failed(
+                err_msg,
+                data={
+                    "dispatched": False,
+                    "state": "workspace_not_provisioned",
+                    "error": err_msg,
+                    "workspace": state,
+                    "next_step": (
+                        f"talon_setup_workspace(repo='{repo_resolved}')"
+                    ),
+                },
+            )
+
+        prd_path = Path(prd).expanduser()
+        try:
+            execution = TalonBatchExecution(
+                repo=repo_resolved,
+                prd_path=prd_path,
+                repo_dir=workspace,
+            )
+            invocation = build_talon_batch_invocation(
+                TalonRuntimeRequest(),
+                execution,
+                policy=policy,
+                preference=preference,
+            )
+        except TalonRuntimeError as e:
+            return ToolResult.failed(
+                str(e),
+                data={
+                    "dispatched": False,
+                    "state": "talon_policy_rejected",
+                    "error": str(e),
+                },
+            )
+
+        cli_result = await self._dispatch_via_cli_background(
+            invocation.argv,
+            label=f"batch:{repo_resolved}:prd={prd_path.name}",
+            env=invocation.env,
+            extra_meta={
+                "repo": repo_resolved,
+                "prd": str(prd_path),
+                "workspace": str(workspace),
+                **invocation.metadata(),
+            },
+        )
 
         if cli_result.get("dispatched"):
             return ToolResult.ok(

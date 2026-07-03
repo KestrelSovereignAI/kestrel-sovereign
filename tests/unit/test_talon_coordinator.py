@@ -244,31 +244,77 @@ class TestTalonClaim:
             mock_bg.assert_not_called()
 
 
+def _ready_workspace_state(path):
+    return {
+        "repo": "org/repo",
+        "path": str(path),
+        "exists": True,
+        "is_git": True,
+        "head": "main",
+        "clean": True,
+        "last_fetch_at": None,
+        "safe": True,
+    }
+
+
 class TestTalonBatch:
     @pytest.mark.asyncio
-    async def test_batch_with_prd(self):
+    async def test_batch_with_prd(self, tmp_path, monkeypatch):
+        """F304: batch loads policy, requires a workspace, passes --repo-dir + abs prd."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        prd_file = tmp_path / "prd.json"
+        prd_file.write_text("{}")
         feature = TalonCoordinatorFeature(_make_agent())
-        with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
+        workspace = tmp_path / "org__repo"
+        with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=_ready_workspace_state(workspace)):
             mock_bg.return_value = {"dispatched": True, "method": "cli_background"}
-            result = await feature.talon_batch(repo="org/repo", prd="prd.json")
+            result = await feature.talon_batch(repo="org/repo", prd=str(prd_file))
             assert result.status is ToolResultStatus.OK
             assert result.data["dispatched"] is True
             mock_bg.assert_awaited_once()
             args = mock_bg.call_args[0][0]
             assert "batch" in args
-            assert "--prd" in args
+            assert args[args.index("--prd") + 1] == str(prd_file)
+            assert "--repo-dir" in args
+            assert str(tmp_path) in args[args.index("--repo-dir") + 1]
+            # env is credential-sanitized (still carries the GitHub token
+            # because batch, like claim, runs in a sandbox and needs it).
+            assert mock_bg.call_args.kwargs["env"]["GITHUB_TOKEN"] == "ghp_test"
+            assert "ANTHROPIC_API_KEY" not in mock_bg.call_args.kwargs["env"]
 
     @pytest.mark.asyncio
-    async def test_batch_with_label(self):
+    async def test_batch_rejects_relative_prd(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        workspace = tmp_path / "org__repo"
+        with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=_ready_workspace_state(workspace)):
+            result = await feature.talon_batch(repo="org/repo", prd="prd.json")
+            assert result.status is ToolResultStatus.ERROR
+            assert result.data["dispatched"] is False
+            mock_bg.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_batch_requires_provisioned_workspace(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        prd_file = tmp_path / "prd.json"
+        prd_file.write_text("{}")
         feature = TalonCoordinatorFeature(_make_agent())
         with patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
-            mock_bg.return_value = {"dispatched": True, "method": "cli_background"}
-            result = await feature.talon_batch(repo="org/repo", label="P0")
-            assert result.status is ToolResultStatus.OK
-            assert result.data["dispatched"] is True
-            args = mock_bg.call_args[0][0]
-            assert "--label" in args
-            assert "P0" in args
+            result = await feature.talon_batch(repo="org/repo", prd=str(prd_file))
+            assert result.status is ToolResultStatus.ERROR
+            assert result.data["state"] == "workspace_not_provisioned"
+            assert "talon_setup_workspace" in result.data["next_step"]
+            mock_bg.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_batch_no_args_errors(self):
@@ -354,20 +400,20 @@ class TestTalonToolDocumentation:
             p.name: (p.description or "")
             for p in self._schema(TalonCoordinatorFeature.talon_batch)["parameters"]
         }
-        # label kept its "required when prd not given" tail.
-        assert "Required when" in params["label"]
-        # prd kept its precedence + path-resolution tail.
-        assert "precedence" in params["prd"].lower()
-        assert "KESTREL_TALON_CWD" in params["prd"]
+        # There is no label mode anymore (F304); prd is required + absolute.
+        assert "label" not in params
+        assert "required" in params["prd"].lower()
+        assert "absolute" in params["prd"].lower()
 
-    def test_batch_documents_one_of_label_or_prd(self):
+    def test_batch_documents_prd_required_and_workspace(self):
         doc = self._full_doc(TalonCoordinatorFeature.talon_batch)
-        # Exactly-one-of contract surfaced in description.
         desc = self._schema(TalonCoordinatorFeature.talon_batch)["description"]
-        assert "label" in desc and "prd" in desc
-        assert "either label or prd" in desc.lower() or "one of" in desc.lower()
-        # prd-wins precedence and the resolve base path are documented.
-        assert "precedence" in doc.lower() or "wins" in doc.lower()
+        # prd is required and there is no label mode.
+        assert "prd" in desc.lower()
+        assert "required" in desc.lower()
+        # The sandbox-workspace guardrail (F304) is surfaced to the agent.
+        assert "workspace" in doc.lower()
+        assert "talon_setup_workspace" in doc
 
     def test_batch_documents_job_id_polling(self):
         doc = self._full_doc(TalonCoordinatorFeature.talon_batch)
@@ -712,6 +758,66 @@ class TestTalonVerify:
             commands="uv run pytest", cwd=str(tmp_path / "nope")
         )
         assert result.status is ToolResultStatus.ERROR
+
+    @pytest.mark.asyncio
+    async def test_verify_no_workspace_refuses_provisioned(self, tmp_path, monkeypatch):
+        """F301: with no cwd and no provisioned workspace, refuse structurally.
+
+        Never fall back to the running agent's source tree.
+        """
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path / "ws"))
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_make_verify_executor") as mock_exec:
+            result = await feature.talon_verify(
+                commands="uv run pytest tests/unit", repo="org/repo"
+            )
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["state"] == "workspace_not_provisioned"
+        assert "talon_setup_workspace" in result.data["next_step"]
+        # No executor was ever built — nothing ran in the source tree.
+        mock_exec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_verify_executor_sanitizes_untrusted_env(self, tmp_path, monkeypatch):
+        """F302: the verify subprocess gets no provider creds and no GH token."""
+        import asyncio as _asyncio
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-secret")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
+        monkeypatch.setenv("KESTREL_API_KEY", "kestrel-secret")
+        monkeypatch.setenv("KESTREL_DATA_KEY", "data-secret")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+        monkeypatch.setenv("GH_TOKEN", "ghp_secret2")
+        monkeypatch.setenv("GOOGLE_API_KEY", "google-secret")
+        monkeypatch.setenv("PATH_SHOULD_SURVIVE", "keep-me")
+
+        feature = TalonCoordinatorFeature(_make_agent())
+        executor = feature._make_verify_executor(tmp_path)
+
+        captured = {}
+
+        async def fake_create(*argv, **kwargs):
+            captured["env"] = kwargs["env"]
+            raise FileNotFoundError("stop after env is built")
+
+        with patch.object(_asyncio, "create_subprocess_exec", side_effect=fake_create):
+            await executor("pytest -q", timeout=5)
+
+        env = captured["env"]
+        for leaked in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "KESTREL_API_KEY",
+            "KESTREL_DATA_KEY",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GOOGLE_API_KEY",
+        ):
+            assert leaked not in env, f"{leaked} must be stripped from verify env"
+        # Non-secret vars are preserved so the command can still run.
+        assert env.get("PATH_SHOULD_SURVIVE") == "keep-me"
 
     @pytest.mark.asyncio
     async def test_verify_allowlisted_pass(self, tmp_path):

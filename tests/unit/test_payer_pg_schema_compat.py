@@ -85,3 +85,17 @@ def test_user_byok_keys_conflict_targets_agent_provider():
         "VALUES (?, ?, ?, ?, ?, ?, ?, 'PBKDF2-SHA256', ?, 1, CURRENT_TIMESTAMP)"
     )
     assert _on_conflict_target(q) == "agent_did, provider_id"
+
+
+def test_agent_service_keys_conflict_targets_agent_provider():
+    # Mirrors ServiceKeyStorage.store_key(replace=True) — the approval-gated
+    # rotation path (F196). `id` is a fresh UUID per insert, so on Postgres the
+    # rotation must conflict on the real UNIQUE (agent_did, provider_id) to
+    # actually replace the row rather than hitting the constraint.
+    q = (
+        "INSERT OR REPLACE INTO agent_service_keys "
+        "(id, agent_did, provider_id, encrypted_key, key_hash, "
+        "quota_limit, quota_used, is_active, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 1, CURRENT_TIMESTAMP)"
+    )
+    assert _on_conflict_target(q) == "agent_did, provider_id"

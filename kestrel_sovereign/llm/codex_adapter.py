@@ -551,13 +551,55 @@ def _result_to_codex_response(
         if success:
             data = getattr(result, "data", None)
             confirmation = getattr(result, "confirmation", None)
-            text = (
-                confirmation
-                if isinstance(confirmation, str) and confirmation
-                else data
-            )
+            # Read/list/search tools carry their payload in ``data`` — the model
+            # needs it to answer. Present BOTH confirmation and data when data is
+            # present (matching the pre-#F025 nested path, which returned the
+            # whole serialized envelope); collapse to the bare confirmation
+            # string for write-style tools whose data is absent.
+            if data is not None:
+                text = {"confirmation": confirmation, "data": data}
+            else:
+                text = confirmation
+        elif "partial" in status:
+            # PARTIAL: surface BOTH halves — the completed confirmation AND the
+            # caveat — so the next turn can honestly report what succeeded and
+            # what didn't (#1042). Non-success so it still routes through the
+            # classifier, but the confirmation is not discarded.
+            confirmation = getattr(result, "confirmation", None)
+            halves = [p for p in (confirmation, err) if isinstance(p, str) and p]
+            text = " — ".join(halves) if halves else str(result)
         else:
             text = err if isinstance(err, str) and err else str(result)
+    elif isinstance(result, dict) and _is_flat_toolresult(result):
+        # Unified flat ToolResult envelope (#F025) — same shape the object
+        # branch above handles, but already serialized to a dict. Mirror its
+        # semantics: OK is success (surface confirmation/data); ERROR/PARTIAL
+        # are non-success (surface the error) so they route through the failure
+        # classifier rather than being narrated as success. The strict
+        # discriminator avoids misreading a legacy payload that merely carries a
+        # ``status`` domain field (codex P2).
+        status = result.get("status")
+        success = status == "ok"
+        if success:
+            confirmation = result.get("confirmation")
+            data = result.get("data")
+            # Preserve the data payload for read/list/search tools (see the
+            # ToolResult-object branch above); bare confirmation for write-style.
+            if data is not None:
+                text = {"confirmation": confirmation, "data": data}
+            else:
+                text = confirmation
+        elif status == "partial":
+            # PARTIAL: surface BOTH the completed confirmation AND the caveat so
+            # the next turn can honestly narrate what succeeded and what didn't
+            # (#1042) — mirrors the ToolResult-object branch above.
+            confirmation = result.get("confirmation")
+            err = result.get("error")
+            halves = [p for p in (confirmation, err) if isinstance(p, str) and p]
+            text = " — ".join(halves) if halves else result
+        else:
+            err = result.get("error")
+            text = err if isinstance(err, str) and err else result
     elif isinstance(result, dict):
         success = bool(result.get("success", True))
         if success and "result" in result:
@@ -600,6 +642,28 @@ def _is_toolresult(obj: Any) -> bool:
         and hasattr(obj, "data")
         and hasattr(obj, "confirmation")
     )
+
+
+def _is_flat_toolresult(value: Any) -> bool:
+    """Serialized (flat) ToolResult envelope discriminator (#F025).
+
+    The dict counterpart of :func:`_is_toolresult`. Kept import-free at the
+    LLM-adapter layer for the same reason (mirrors
+    ``kestrel_sovereign.features.base.is_flat_toolresult_envelope``). A real
+    ``ToolResult.to_dict()`` satisfies the invariants — OK has ``confirmation``,
+    ERROR has ``error``, PARTIAL has both — so a legacy payload that merely
+    carries a ``status`` domain field is not misread as an envelope.
+    """
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    if status == "ok":
+        return "confirmation" in value
+    if status == "error":
+        return "error" in value
+    if status == "partial":
+        return "confirmation" in value and "error" in value
+    return False
 
 
 # Recovery hints per outcome — what the LLM should TRY NEXT for each
@@ -1759,7 +1823,17 @@ class CodexAdapter(LLMAdapter):
                 status = str(getattr(result, "status", "")).lower()
                 is_failure = "error" in status or "partial" in status
             elif isinstance(result, dict):
-                is_failure = not bool(result.get("success", True))
+                # Prefer the flat ToolResult ``status`` (unified shape #F025)
+                # over ``success`` — a serialized error/partial envelope may
+                # reach here before ``success`` is derived, and gating the audit
+                # slice on ``success`` alone would misclassify an audited
+                # user-denial as a sandbox/policy block (codex P2). Strict
+                # discriminator so a legacy ``status`` domain field isn't
+                # misread as an envelope.
+                if _is_flat_toolresult(result):
+                    is_failure = result.get("status") in ("error", "partial")
+                else:
+                    is_failure = not bool(result.get("success", True))
             return _result_to_codex_response(
                 result,
                 tool_name=name,
@@ -2022,6 +2096,7 @@ class CodexAdapter(LLMAdapter):
         try:
             from kestrel_sovereign.features.computer_use.policy import (
                 Decision,
+                evaluate_argv_paths,
             )
         except Exception:  # noqa: BLE001 - import path failure → fail closed
             return (Decision.DENY, "policy_module_import_failed")  # type: ignore[name-defined]
@@ -2047,6 +2122,25 @@ class CodexAdapter(LLMAdapter):
                 policy = getattr(cu, "_binary_policy", None)
                 if policy is None:
                     return (Decision.DENY, "no_binary_policy")
+                # F137: BinaryPolicy only vets ``argv[0]``. The native
+                # codex command surface is a second production path (the
+                # first is ``ComputerUseFeature.shell()``); without a
+                # PathPolicy pass here an auto-approved reader such as
+                # ``cat``/``rg`` would read a ``deny_paths`` file with no
+                # approval through the bridge. Fail closed if the path
+                # gate is absent — the fileChange branch already does the
+                # same, and initialization builds both policies together.
+                path_policy = getattr(cu, "_path_policy", None)
+                if path_policy is None:
+                    return (Decision.DENY, "no_path_policy")
+                # Resolve relative argv tokens the way codex would run
+                # them: request cwd → KESTREL_CODEX_CWD → process cwd
+                # (same fallback the fileChange branch uses below).
+                cmd_cwd = Path(
+                    params.get("cwd")
+                    or os.environ.get("KESTREL_CODEX_CWD")
+                    or str(Path.cwd())
+                )
                 # Codex's params shape evolved: legacy carried a flat
                 # ``command`` string; newer
                 # ``CommandExecutionRequestApprovalParams`` carries
@@ -2117,6 +2211,34 @@ class CodexAdapter(LLMAdapter):
                         aggregate_reason = rrule or f"no_match:{argv}"
                     # ALLOW: leave aggregate as-is (only downgrades to
                     # REQUIRE_APPROVAL if a later entry isn't allow-listed).
+                    # F137: BinaryPolicy stopped at ``argv[0]``. Vet the
+                    # argument paths too so an auto-approved reader can't
+                    # slip a ``deny_paths`` file (hard DENY) — and can't
+                    # bypass the queue for an existing, non-allow-listed
+                    # path (downgrade ALLOW → REQUIRE_APPROVAL). Per-argv
+                    # fail-closed to match the binary eval above.
+                    try:
+                        argv_path = evaluate_argv_paths(
+                            argv, path_policy, cwd=cmd_cwd
+                        )
+                    except Exception as path_exc:  # noqa: BLE001
+                        logger.warning(
+                            "codex_policy_precheck commandExecution: "
+                            "evaluate_argv_paths(%r) raised %s — "
+                            "declining (fail closed)",
+                            argv, path_exc,
+                        )
+                        return (
+                            Decision.DENY, f"path_eval_failed:{argv!r}",
+                        )
+                    if argv_path.decision is Decision.DENY:
+                        return (
+                            Decision.DENY,
+                            f"path:{argv_path.rule}:{argv_path.path}",
+                        )
+                    if argv_path.decision is Decision.REQUIRE_APPROVAL:
+                        aggregate = Decision.REQUIRE_APPROVAL
+                        aggregate_reason = f"path:{argv_path.rule}"
                 return (aggregate, aggregate_reason)
             elif kind == "fileChange":
                 policy = getattr(cu, "_path_policy", None)

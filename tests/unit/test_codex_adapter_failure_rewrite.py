@@ -202,6 +202,28 @@ def test_toolresult_partial_is_treated_as_failure():
     assert out["success"] is False
     text = out["contentItems"][0]["text"]
     assert "Outcome:" in text
+    # Both halves preserved so the next turn can honestly narrate what
+    # completed AND the caveat (#1042) — confirmation must not be dropped.
+    assert "mixed result" in text
+    assert "some step failed" in text
+
+
+def test_flat_partial_preserves_both_halves():
+    """The flat serialized PARTIAL envelope (#F025) must also surface both the
+    confirmation and the caveat, not just the error."""
+    out = _result_to_codex_response(
+        {
+            "status": "partial",
+            "confirmation": "saved 3 of 5",
+            "error": "2 records failed validation",
+            "tool": "x",
+        },
+        tool_name="x",
+    )
+    assert out["success"] is False
+    text = out["contentItems"][0]["text"]
+    assert "saved 3 of 5" in text
+    assert "2 records failed validation" in text
 
 
 @pytest.mark.asyncio
@@ -250,6 +272,86 @@ async def test_handler_passes_audit_for_toolresult_failures():
     # And get_audit_log was actually called (proof we crossed the
     # is_failure branch for a ToolResult).
     assert permission_store.get_audit_log.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_handler_passes_audit_for_flat_dict_error_without_success():
+    """#F025/#F018: a serialized flat ToolResult error envelope
+    (``{status: error, error, tool}``) can reach the handler WITHOUT a
+    derived ``success`` key. The is_failure gate must recognize the
+    top-level ``status`` — gating on ``success`` alone would fetch no audit
+    slice and misclassify an audited user-denial as a sandbox block (codex P2).
+    """
+    adapter = CodexAdapter()
+    agent = MagicMock()
+    security = MagicMock()
+    permission_store = MagicMock()
+    permission_store.get_audit_log = AsyncMock(return_value=[{
+        "feature": "shell", "tool": "bash",
+        "decision": "user_denied", "user_choice": "user_denied",
+    }])
+    security.permission_store = permission_store
+    agent.features = {"SecurityFeature": security}
+    adapter.attach_agent_for_audit(agent)
+
+    async def fake_executor(name, args):
+        # Flat envelope with NO ``success`` key — the isolated-proxy / direct
+        # serialized shape.
+        return {"status": "error", "error": "Rejected(\"rejected by user\")", "tool": "bash"}
+
+    handler = adapter._make_tool_call_handler(
+        executor=fake_executor,
+        thread_id="t1",
+        allowed_tools=frozenset({"bash"}),
+        executed_log=[],
+    )
+    result = await handler({
+        "threadId": "t1", "callId": "c1", "name": "bash", "arguments": "{}",
+    })
+    text = result["contentItems"][0]["text"]
+    assert "Outcome: user_denied" in text
+    assert permission_store.get_audit_log.await_count == 1
+
+
+def test_ok_with_data_preserves_payload_for_read_tools():
+    """#F025 regression: a successful ToolResult carrying a ``data`` payload
+    (read/list/search tools like list_models, recall) must send that data to
+    the model, not just the confirmation — otherwise the inline Codex path can't
+    answer the user. Covers both the object and flat-dict shapes."""
+    from kestrel_sdk.tools.result import ToolResult
+
+    obj = _result_to_codex_response(
+        ToolResult.ok("found 3 models", data={"models": ["a", "b", "c"]}),
+        tool_name="list_models",
+    )
+    obj_text = obj["contentItems"][0]["text"]
+    assert obj["success"] is True
+    assert "models" in obj_text and "a" in obj_text
+
+    flat = _result_to_codex_response(
+        {
+            "status": "ok",
+            "confirmation": "found 3 models",
+            "data": {"models": ["a", "b", "c"]},
+            "tool": "list_models",
+        },
+        tool_name="list_models",
+    )
+    flat_text = flat["contentItems"][0]["text"]
+    assert flat["success"] is True
+    assert "models" in flat_text and "a" in flat_text
+
+
+def test_flat_dict_ok_envelope_is_NOT_rewritten():
+    """A flat OK envelope passes through with its confirmation text; only
+    error/partial route through the classifier."""
+    out = _result_to_codex_response(
+        {"status": "ok", "confirmation": "all set", "tool": "x"}, tool_name="x",
+    )
+    assert out["success"] is True
+    text = out["contentItems"][0]["text"]
+    assert "Outcome:" not in text
+    assert "all set" in text
 
 
 def test_recovery_line_has_no_doubled_prefix():

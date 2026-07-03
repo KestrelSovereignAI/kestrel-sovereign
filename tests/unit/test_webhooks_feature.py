@@ -1119,6 +1119,288 @@ class TestWebhookAuditLogging:
 
 
 # ============================================================================
+# Router mounting + persistence wiring (F332 / F333)
+# ============================================================================
+
+
+class TestWebhookFeatureGetRouterContract:
+    """F332: the feature must expose the receiver router via the standard
+    ``Feature.get_router()`` contract so the agent auto-mounts the routes."""
+
+    @pytest.mark.asyncio
+    async def test_get_router_returns_receiver_router(self):
+        db = _make_db()
+        agent = _make_agent(db=db)
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+
+        router = feat.get_router()
+        assert router is not None
+        assert len(router.routes) >= 1
+        # Backward-compat alias returns the same routes.
+        assert feat.get_webhook_router() is not None
+
+    @pytest.mark.asyncio
+    async def test_get_router_overrides_base_none(self):
+        """The base Feature.get_router returns None; this feature must not."""
+        db = _make_db()
+        agent = _make_agent(db=db)
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        assert feat.get_router() is not None
+
+
+class TestWebhookReceivePersistsAudit:
+    """F333: every received webhook must funnel through the on_event callback
+    so it lands in webhook_log, not just the in-memory ring buffer."""
+
+    @pytest.mark.asyncio
+    async def test_receiver_wired_to_log_callback(self):
+        db = _make_db()
+        agent = _make_agent(db=db)
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        assert feat.receiver._on_event == feat.log_webhook_event
+
+    @pytest.mark.asyncio
+    async def test_successful_receive_persists_row(self):
+        db = _make_db()
+        agent = _make_agent(db=db)
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        await feat.webhooks_register(
+            name="stripe",
+            auth_type="bearer_token",
+            auth_config_json='{"token": "sekret"}',
+        )
+        db.execute.reset_mock()
+
+        result = await feat.receiver.handle_webhook(
+            "stripe",
+            headers={"authorization": "Bearer sekret"},
+            body=b'{"event": "payment"}',
+            source_ip="1.2.3.4",
+        )
+        assert result["status_code"] == 200
+
+        insert_calls = [
+            c for c in db.execute.call_args_list
+            if "INSERT INTO webhook_log" in str(c)
+        ]
+        assert len(insert_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_also_persists_row(self):
+        """A rejected (401) request must still be audited."""
+        db = _make_db()
+        agent = _make_agent(db=db)
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        await feat.webhooks_register(
+            name="stripe",
+            auth_type="bearer_token",
+            auth_config_json='{"token": "sekret"}',
+        )
+        db.execute.reset_mock()
+
+        result = await feat.receiver.handle_webhook(
+            "stripe",
+            headers={"authorization": "Bearer wrong"},
+            body=b"x",
+            source_ip="9.9.9.9",
+        )
+        assert result["status_code"] == 401
+
+        insert_calls = [
+            c for c in db.execute.call_args_list
+            if "INSERT INTO webhook_log" in str(c)
+        ]
+        assert len(insert_calls) == 1
+
+
+class TestWebhookLiveRouterIntegration:
+    """End-to-end: boot a FastAPI app with the mounted router, POST to
+    /webhooks/{name}, and confirm the request reaches handle_webhook and a
+    webhook_log row is persisted that survives a simulated restart."""
+
+    @pytest.mark.asyncio
+    async def test_post_reaches_handler_persists_and_survives_restart(self, tmp_path):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        db_path = str(tmp_path / "webhooks.db")
+        db = await AsyncDatabase.sqlite(db_path)
+        agent = _make_agent(db=db)
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+
+        # Register an authenticated webhook.
+        reg = await feat.webhooks_register(
+            name="stripe",
+            auth_type="bearer_token",
+            auth_config_json='{"token": "sekret"}',
+        )
+        assert reg.data["endpoint"] == "/webhooks/stripe"
+
+        # Boot the app with the feature's router mounted via get_router().
+        app = FastAPI()
+        app.include_router(feat.get_router())
+        client = TestClient(app)
+
+        # Valid auth path → reaches handle_webhook → 200.
+        resp = client.post(
+            "/webhooks/stripe",
+            headers={"authorization": "Bearer sekret"},
+            content=b'{"event": "payment_intent.succeeded"}',
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "received"
+
+        # A webhook_log row was persisted.
+        rows = await db.fetchall("SELECT webhook_name, authenticated, status_code FROM webhook_log")
+        assert len(rows) == 1
+        assert rows[0][0] == "stripe"
+        assert bool(rows[0][1]) is True
+        assert rows[0][2] == 200
+
+        # --- Simulated restart: fresh feature instance over the same DB file. ---
+        db2 = await AsyncDatabase.sqlite(db_path)
+        agent2 = _make_agent(db=db2)
+        feat2 = WebhookFeature(agent2)
+        await feat2.initialize()
+
+        history = await feat2.webhooks_history()
+        assert history.data["count"] == 1
+        assert history.data["events"][0]["webhook_name"] == "stripe"
+
+
+# ============================================================================
+# Multi-agent routing (F332 follow-up: no cross-agent shadowing)
+# ============================================================================
+
+
+class TestWebhookMultiAgentDispatch:
+    """A single cross-agent dispatch router must reach EVERY agent's webhooks.
+
+    Mounting each agent's own ``/webhooks/{name}`` catch-all lets the first
+    router shadow the rest, so a webhook registered on a later agent 404s. The
+    shared dispatch router resolves ``{name}`` to the owning receiver instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_agents_distinct_webhooks_both_reachable(self, tmp_path):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.features.webhooks.receiver import (
+            build_webhook_dispatch_router,
+        )
+
+        # Agent A owns "alpha"; agent B owns "beta" — each in its own DB.
+        db_a = await AsyncDatabase.sqlite(str(tmp_path / "a.db"))
+        feat_a = WebhookFeature(_make_agent(db=db_a, agent_id="did:test:agent-a"))
+        await feat_a.initialize()
+        await feat_a.webhooks_register(
+            name="alpha", auth_type="none", allow_unauthenticated=True
+        )
+
+        db_b = await AsyncDatabase.sqlite(str(tmp_path / "b.db"))
+        feat_b = WebhookFeature(_make_agent(db=db_b, agent_id="did:test:agent-b"))
+        await feat_b.initialize()
+        await feat_b.webhooks_register(
+            name="beta", auth_type="none", allow_unauthenticated=True
+        )
+
+        # One shared dispatch router across both receivers — the shape server.py
+        # mounts in multi-agent mode.
+        app = FastAPI()
+        app.include_router(
+            build_webhook_dispatch_router(lambda: [feat_a.receiver, feat_b.receiver])
+        )
+        client = TestClient(app)
+
+        # Both live paths reach their owning receiver — not just the first.
+        resp_a = client.post("/webhooks/alpha", content=b"{}")
+        assert resp_a.status_code == 200
+        assert resp_a.json()["webhook"] == "alpha"
+
+        resp_b = client.post("/webhooks/beta", content=b"{}")
+        assert resp_b.status_code == 200
+        assert resp_b.json()["webhook"] == "beta"
+
+        # Each event was audited in its OWN agent's DB (dispatch, not shadow).
+        rows_a = await db_a.fetchall("SELECT webhook_name FROM webhook_log")
+        rows_b = await db_b.fetchall("SELECT webhook_name FROM webhook_log")
+        assert [r[0] for r in rows_a] == ["alpha"]
+        assert [r[0] for r in rows_b] == ["beta"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_audited_on_first_receiver(self, tmp_path):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.features.webhooks.receiver import (
+            build_webhook_dispatch_router,
+        )
+
+        db_a = await AsyncDatabase.sqlite(str(tmp_path / "a.db"))
+        feat_a = WebhookFeature(_make_agent(db=db_a, agent_id="did:test:agent-a"))
+        await feat_a.initialize()
+
+        app = FastAPI()
+        app.include_router(build_webhook_dispatch_router(lambda: [feat_a.receiver]))
+        resp = TestClient(app).post("/webhooks/ghost", content=b"{}")
+        assert resp.status_code == 404
+
+        # The unknown-webhook attempt is still audited (on the first receiver).
+        rows = await db_a.fetchall(
+            "SELECT webhook_name, status_code FROM webhook_log"
+        )
+        assert rows[0][0] == "ghost"
+        assert rows[0][1] == 404
+
+
+# ============================================================================
+# Host generic webhook proxy (F332 follow-up: host serves /webhooks/{name})
+# ============================================================================
+
+
+class TestHostGenericWebhookProxy:
+    """The multi-agent host must forward ``/webhooks/{name}`` to a backing
+    agent; otherwise the public URL webhooks_register() advertises 404s in
+    host/subprocess deployments even though the feature router is fixed."""
+
+    @pytest.mark.asyncio
+    async def test_generic_webhook_proxies_to_first_agent(self, monkeypatch):
+        import kestrel_sovereign.host as host_mod
+
+        captured = {}
+
+        async def _fake_proxy(*, request, agent_id, path, config, client):
+            from fastapi.responses import JSONResponse
+            captured["agent_id"] = agent_id
+            captured["path"] = path
+            return JSONResponse({"ok": True})
+
+        monkeypatch.setattr(host_mod, "proxy_request_streaming", _fake_proxy)
+
+        # Minimal request stub with the app.state the handler reads.
+        config = MagicMock()
+        config.agents = {"emma": object(), "nellie": object()}
+        request = MagicMock()
+        request.app.state.multi_agent_config = config
+        request.app.state.http_client = MagicMock()
+
+        resp = await host_mod.generic_webhook_proxy(request, "stripe")
+
+        assert resp.status_code == 200
+        # Deterministic first-agent selection; path forwarded verbatim.
+        assert captured["agent_id"] == "emma"
+        assert captured["path"] == "webhooks/stripe"
+
+
+# ============================================================================
 # Run tests
 # ============================================================================
 

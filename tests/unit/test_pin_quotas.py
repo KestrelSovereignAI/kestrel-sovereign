@@ -51,24 +51,28 @@ class FakeDB:
         if sql_lower.startswith("create table"):
             return 0
 
-        # UPDATE conversation_history SET metadata = ? WHERE id = ?
+        # UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ? AND deleted_at IS NULL
         if sql_lower.startswith("update conversation_history"):
-            meta_json, msg_id = params
-            if msg_id in self.messages:
-                self.messages[msg_id]["metadata"] = meta_json
+            meta_json, msg_id = params[0], params[1]
+            agent_id = params[2] if len(params) > 2 else None
+            msg = self.messages.get(msg_id)
+            if msg and (agent_id is None or msg["agent_id"] == agent_id):
+                msg["metadata"] = meta_json
             return 1
 
-        # UPDATE memory_pins SET released_at = ? WHERE id = ?
+        # UPDATE memory_pins SET released_at = ? WHERE id = ? AND agent_id = ?
         if (
             sql_lower.startswith("update memory_pins")
             and "where id = ?" in sql_lower
         ):
-            released_at, pin_id = params
-            if pin_id in self.pins:
-                self.pins[pin_id]["released_at"] = released_at
+            released_at, pin_id = params[0], params[1]
+            agent_id = params[2] if len(params) > 2 else None
+            pin = self.pins.get(pin_id)
+            if pin and (agent_id is None or pin["agent_id"] == agent_id):
+                pin["released_at"] = released_at
             return 1
 
-        # UPDATE memory_pins SET released_at = ? WHERE released_at IS NULL
+        # UPDATE memory_pins SET released_at = ? WHERE agent_id = ? AND released_at IS NULL
         # (bulk unpin-all -- no message_id filter)
         if (
             sql_lower.startswith("update memory_pins")
@@ -76,19 +80,27 @@ class FakeDB:
             and "message_id" not in sql_lower
         ):
             released_at = params[0]
+            agent_id = params[1] if len(params) > 1 else None
             for pin in self.pins.values():
-                if pin["released_at"] is None:
+                if pin["released_at"] is None and (
+                    agent_id is None or pin["agent_id"] == agent_id
+                ):
                     pin["released_at"] = released_at
             return 1
 
-        # UPDATE memory_pins SET released_at = ? WHERE message_id = ? AND released_at IS NULL
+        # UPDATE memory_pins SET released_at = ? WHERE message_id = ? AND agent_id = ? AND released_at IS NULL
         if (
             sql_lower.startswith("update memory_pins")
             and "message_id" in sql_lower
         ):
-            released_at, message_id = params
+            released_at, message_id = params[0], params[1]
+            agent_id = params[2] if len(params) > 2 else None
             for pin in self.pins.values():
-                if pin["message_id"] == message_id and pin["released_at"] is None:
+                if (
+                    pin["message_id"] == message_id
+                    and pin["released_at"] is None
+                    and (agent_id is None or pin["agent_id"] == agent_id)
+                ):
                     pin["released_at"] = released_at
             return 1
 
@@ -112,11 +124,12 @@ class FakeDB:
     async def fetchone(self, sql, params=()):
         sql_lower = sql.strip().lower()
 
-        # SELECT ... FROM conversation_history WHERE id = ?
+        # SELECT ... FROM conversation_history WHERE id = ? AND agent_id = ? AND deleted_at IS NULL
         if "from conversation_history" in sql_lower and "where id = ?" in sql_lower:
             msg_id = params[0]
+            agent_id = params[1] if len(params) > 1 else None
             msg = self.messages.get(msg_id)
-            if not msg:
+            if not msg or (agent_id is not None and msg["agent_id"] != agent_id):
                 return None
             if "content, metadata" in sql_lower and "id," in sql_lower:
                 return (msg["id"], msg["content"], msg["metadata"])
@@ -124,11 +137,16 @@ class FakeDB:
                 return (msg["id"], msg["metadata"])
             return (msg["id"], msg["content"], msg["metadata"])
 
-        # SELECT id FROM memory_pins WHERE message_id = ? AND released_at IS NULL
+        # SELECT id FROM memory_pins WHERE message_id = ? AND agent_id = ? AND released_at IS NULL
         if "from memory_pins" in sql_lower and "released_at is null" in sql_lower:
             message_id = params[0]
+            agent_id = params[1] if len(params) > 1 else None
             for pin in self.pins.values():
-                if pin["message_id"] == message_id and pin["released_at"] is None:
+                if (
+                    pin["message_id"] == message_id
+                    and pin["released_at"] is None
+                    and (agent_id is None or pin["agent_id"] == agent_id)
+                ):
                     return (pin["id"],)
             return None
 
@@ -139,14 +157,15 @@ class FakeDB:
     async def fetchall(self, sql, params=()):
         sql_lower = sql.strip().lower()
 
-        # JOIN query for memory_pinned()
+        # JOIN query for memory_pinned() -- WHERE ch.agent_id = ? AND ch.deleted_at IS NULL
         if "from memory_pins" in sql_lower and "join conversation_history" in sql_lower:
+            agent_id = params[0] if params else None
             results = []
             for pin in self.pins.values():
                 if pin["released_at"] is not None:
                     continue
                 msg = self.messages.get(pin["message_id"])
-                if msg:
+                if msg and (agent_id is None or msg["agent_id"] == agent_id):
                     results.append((
                         pin["id"],
                         pin["message_id"],
@@ -156,44 +175,53 @@ class FakeDB:
                     ))
             return results
 
-        # SELECT message_id FROM memory_pins WHERE released_at IS NULL
+        # SELECT message_id FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
         # (used by admin_unpin_all)
         if (
             "select message_id from memory_pins" in sql_lower
             and "released_at is null" in sql_lower
         ):
+            agent_id = params[0] if params else None
             return [
                 (p["message_id"],)
                 for p in self.pins.values()
                 if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
             ]
 
-        # SELECT id, message_id FROM memory_pins WHERE released_at IS NULL
+        # SELECT id, message_id FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
         # ORDER BY pinned_at ASC LIMIT ?
         # (used by admin_unpin_oldest)
         if (
             "select id, message_id from memory_pins" in sql_lower
             and "order by pinned_at asc" in sql_lower
         ):
-            limit = params[0] if params else None
+            agent_id = params[0] if params else None
+            limit = params[1] if len(params) > 1 else None
             active = sorted(
-                [p for p in self.pins.values() if p["released_at"] is None],
+                [
+                    p for p in self.pins.values()
+                    if p["released_at"] is None
+                    and (agent_id is None or p["agent_id"] == agent_id)
+                ],
                 key=lambda p: p["pinned_at"],
             )
             if limit is not None:
                 active = active[:limit]
             return [(p["id"], p["message_id"]) for p in active]
 
-        # SELECT pinned_at FROM memory_pins WHERE released_at IS NULL
+        # SELECT pinned_at FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
         # (used by stats average pin age)
         if (
             "select pinned_at from memory_pins" in sql_lower
             and "released_at is null" in sql_lower
         ):
+            agent_id = params[0] if params else None
             return [
                 (p["pinned_at"],)
                 for p in self.pins.values()
                 if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
             ]
 
         return []
@@ -211,22 +239,37 @@ class FakeDB:
                 if agent_id is None or m["agent_id"] == agent_id
             )
 
-        # COUNT(*) on memory_pins
+        # COUNT(*) on memory_pins WHERE agent_id = ? AND released_at IS [NOT] NULL
         if "count(*)" in sql_lower and "memory_pins" in sql_lower:
+            agent_id = params[0] if params else None
+            scoped = [
+                p for p in self.pins.values()
+                if agent_id is None or p["agent_id"] == agent_id
+            ]
             if "released_at is null" in sql_lower:
-                return sum(1 for p in self.pins.values() if p["released_at"] is None)
+                return sum(1 for p in scoped if p["released_at"] is None)
             if "released_at is not null" in sql_lower:
-                return sum(1 for p in self.pins.values() if p["released_at"] is not None)
-            return len(self.pins)
+                return sum(1 for p in scoped if p["released_at"] is not None)
+            return len(scoped)
 
-        # MIN(pinned_at) FROM memory_pins WHERE released_at IS NULL
+        # MIN(pinned_at) FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
         if "min(pinned_at)" in sql_lower:
-            active = [p["pinned_at"] for p in self.pins.values() if p["released_at"] is None]
+            agent_id = params[0] if params else None
+            active = [
+                p["pinned_at"] for p in self.pins.values()
+                if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
+            ]
             return min(active) if active else None
 
-        # MAX(pinned_at) FROM memory_pins WHERE released_at IS NULL
+        # MAX(pinned_at) FROM memory_pins WHERE agent_id = ? AND released_at IS NULL
         if "max(pinned_at)" in sql_lower:
-            active = [p["pinned_at"] for p in self.pins.values() if p["released_at"] is None]
+            agent_id = params[0] if params else None
+            active = [
+                p["pinned_at"] for p in self.pins.values()
+                if p["released_at"] is None
+                and (agent_id is None or p["agent_id"] == agent_id)
+            ]
             return max(active) if active else None
 
         return 0
@@ -584,3 +627,97 @@ async def test_pin_stats_quota_remaining_floor_at_zero():
     assert stats.data["pinned"] == 10
     assert stats.data["quota"] == 5
     assert stats.data["quota_remaining"] == 0  # floor at zero, not negative
+
+
+# --------------------------------------------------------------------------
+# Multi-tenant isolation (shared DB, two agents) -- regression for #2085
+#
+# The pin table is shared across agents in a multi-agent deployment. Every
+# memory_pins read/write MUST be scoped to self.agent_id, or one agent's
+# quota, stats, and admin unpin bleed into another agent's pins.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_quota_is_per_agent_not_global():
+    """Agent A filling its quota must not block agent B on a shared DB."""
+    db = FakeDB()
+    feat_a = _make_feature(db, agent_id="agent-A", pin_quota=2)
+    feat_b = _make_feature(db, agent_id="agent-B", pin_quota=2)
+
+    # Extra unpinned messages keep the pin ratio below the warning threshold
+    # so the result stays OK (not PARTIAL) and the assertion targets quota.
+    for i in range(10):
+        db.add_message(f"A-extra-{i}", agent_id="agent-A")
+    a_msgs = [db.add_message(f"A{i}", agent_id="agent-A") for i in range(2)]
+    for mid in a_msgs:
+        res = await feat_a.memory_pin(message_id=mid)
+        assert res.status is ToolResultStatus.OK
+
+    # Agent A is now at quota; agent B must still be able to pin.
+    for i in range(10):
+        db.add_message(f"B-extra-{i}", agent_id="agent-B")
+    b_msg = db.add_message("B0", agent_id="agent-B")
+    res_b = await feat_b.memory_pin(message_id=b_msg)
+    assert res_b.status is ToolResultStatus.OK, (
+        "agent B blocked by agent A's pins -> quota not agent-scoped"
+    )
+    assert res_b.data["pinned"] is True
+
+
+@pytest.mark.asyncio
+async def test_pin_stats_counts_only_own_pins():
+    """memory_pin_stats must not count another agent's pins."""
+    db = FakeDB()
+    feat_a = _make_feature(db, agent_id="agent-A", pin_quota=100)
+    feat_b = _make_feature(db, agent_id="agent-B", pin_quota=100)
+
+    for i in range(3):
+        await feat_a.memory_pin(message_id=db.add_message(f"A{i}", agent_id="agent-A"))
+    await feat_b.memory_pin(message_id=db.add_message("B0", agent_id="agent-B"))
+
+    stats_b = await feat_b.memory_pin_stats()
+    assert stats_b.data["pinned"] == 1, "stats leaked agent A's pins into agent B"
+
+
+@pytest.mark.asyncio
+async def test_admin_unpin_all_only_releases_own_pins():
+    """memory_admin_unpin_all must leave other agents' pins active."""
+    db = FakeDB()
+    feat_a = _make_feature(db, agent_id="agent-A", pin_quota=100)
+    feat_b = _make_feature(db, agent_id="agent-B", pin_quota=100)
+
+    for i in range(2):
+        await feat_a.memory_pin(message_id=db.add_message(f"A{i}", agent_id="agent-A"))
+    b_msg = db.add_message("B0", agent_id="agent-B")
+    await feat_b.memory_pin(message_id=b_msg)
+
+    res = await feat_a.memory_admin_unpin_all()
+    assert res.status is ToolResultStatus.OK
+
+    # Agent B's pin must survive agent A's bulk unpin.
+    stats_b = await feat_b.memory_pin_stats()
+    assert stats_b.data["pinned"] == 1, "agent A's unpin-all released agent B's pins"
+
+
+@pytest.mark.asyncio
+async def test_admin_unpin_oldest_only_releases_own_pins():
+    """memory_admin_unpin_oldest must ignore other agents' older pins."""
+    db = FakeDB()
+    feat_a = _make_feature(db, agent_id="agent-A", pin_quota=100)
+    feat_b = _make_feature(db, agent_id="agent-B", pin_quota=100)
+
+    # Agent B pins first (oldest overall), then agent A pins.
+    b_msg = db.add_message("B0", agent_id="agent-B")
+    await feat_b.memory_pin(message_id=b_msg)
+    a_msg = db.add_message("A0", agent_id="agent-A")
+    await feat_a.memory_pin(message_id=a_msg)
+
+    # Agent A asks to unpin its 1 oldest -- must hit A's pin, not B's older one.
+    res = await feat_a.memory_admin_unpin_oldest(count=1)
+    assert res.status is ToolResultStatus.OK
+
+    stats_b = await feat_b.memory_pin_stats()
+    assert stats_b.data["pinned"] == 1, "unpin-oldest crossed into agent B's pins"
+    stats_a = await feat_a.memory_pin_stats()
+    assert stats_a.data["pinned"] == 0

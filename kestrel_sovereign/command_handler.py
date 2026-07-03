@@ -38,6 +38,7 @@ BUILTIN_COMMAND_SPECS = [
     # Privacy
     {"cmd": "!privacy", "handler": "_cmd_privacy", "description": "Get or set privacy mode", "args": "[mode]", "category": "Privacy"},
     {"cmd": "!set-privacy-mode", "handler": "_cmd_privacy", "description": "Set privacy mode", "args": "<mode>", "category": "Privacy"},
+    {"cmd": "!confirm-privacy-mode", "handler": "_cmd_confirm_privacy", "description": "Confirm a pending data-destructive privacy-mode change", "args": "[mode]", "category": "Privacy"},
     {"cmd": "!get-privacy-mode", "handler": "_cmd_get_privacy_mode", "description": "Get current privacy mode", "category": "Privacy"},
     {"cmd": "!privacy-status", "handler": "_cmd_privacy_status", "description": "Detailed privacy status", "category": "Privacy"},
     {"cmd": "!privacy-save", "handler": "_cmd_privacy_save", "description": "Save isolated session", "category": "Privacy"},
@@ -188,6 +189,20 @@ class CommandHandler:
                 # CLI prints the raw JSON envelope instead of the
                 # human-readable confirmation. Caught in #1078 codex
                 # round 4.
+                # Unified wire shape (#F025): the ToolResult envelope is spread
+                # at the TOP level for BOTH in-tree features (sovereign wrapper)
+                # and external SDK-based features (github, reflection). Render
+                # from it directly — this is what fixes SDK-based features'
+                # !commands printing "❌ Error: Unknown error" on success (#F002).
+                # Strict discriminator so a legacy command result that merely
+                # carries a ``status`` field isn't misread as an envelope.
+                from kestrel_sovereign.features.base import is_flat_toolresult_envelope
+                if is_flat_toolresult_envelope(task_result):
+                    return self._format_tool_result_envelope(task_result)
+
+                # Defensive: a legacy nested ``{result: {status: ...}}`` envelope
+                # (any transitional producer that still nests). Harmless once all
+                # producers emit the flat shape.
                 inner = task_result.get("result")
                 if isinstance(inner, dict) and inner.get("status") in (
                     "ok", "error", "partial",
@@ -458,6 +473,27 @@ class CommandHandler:
                 return f"Invalid privacy mode. Valid modes are: {valid_modes}"
         return self.agent.privacy_agent.get_status()
     
+    async def _cmd_confirm_privacy(self, user_input: str) -> str:
+        """Handle !confirm-privacy-mode — apply a staged data-destructive change.
+
+        Optional argument: the target mode named in the warning
+        (``!confirm-privacy-mode ephemeral``). If given, it must match the
+        pending transition, else the confirm is refused (guards against
+        confirming a different change than the one the user was warned about).
+        """
+        parts = user_input.split()
+        pending = getattr(self.agent, "_pending_privacy_transition", None)
+        if pending is None:
+            return "No pending privacy-mode change to confirm."
+        if len(parts) > 1 and parts[1].lower() != pending.value:
+            return (
+                f"Pending change is to {pending.value}, not {parts[1].lower()}. "
+                f"Use !confirm-privacy-mode {pending.value} to confirm, or "
+                f"!privacy {pending.value} is superseded by choosing another mode."
+            )
+        result = await self.agent.confirm_privacy_transition()
+        return result.message
+
     def _cmd_get_privacy_mode(self, user_input: str) -> str:
         """Handle !get-privacy-mode command. Delegates to PrivacyAgent."""
         return self.agent.privacy_agent.handle_get_privacy_mode()

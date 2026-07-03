@@ -27,7 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
-from .path_safety import match_allow_list
+from .path_safety import PathSafetyError, match_allow_list, resolve_realpath
 
 
 class Decision(str, Enum):
@@ -151,6 +151,72 @@ def split_command(cmd: str | Iterable[str]) -> list[str]:
     if isinstance(cmd, str):
         return shlex.split(cmd)
     return list(cmd)
+
+
+@dataclass(frozen=True)
+class ArgvPathResult:
+    """Aggregate outcome of vetting a command's argument paths (F137).
+
+    ``decision`` is the strictest across all argument tokens; ``rule``
+    and ``path`` identify the token that drove it (empty/``None`` when
+    no argument path changed the decision).
+    """
+
+    decision: Decision
+    rule: str
+    path: str | None = None
+
+
+def evaluate_argv_paths(
+    argv: list[str] | str,
+    path_policy: PathPolicy,
+    *,
+    cwd: str | Path | None = None,
+) -> ArgvPathResult:
+    """Vet a shell command's *arguments* against a :class:`PathPolicy` (F137).
+
+    :class:`BinaryPolicy` only inspects ``argv[0]``. Without this, an
+    auto-approved reader (``cat``/``rg``/``ls``) short-circuits to ALLOW
+    and its file argument is never checked against ``deny_paths`` — so
+    ``cat ~/.aws/credentials`` would read a host secret with no approval,
+    even though the ``fs_*`` tools honor the same deny-list. This unifies
+    the guarantee across ``fs_*``, the ``shell`` tool, and the codex
+    native-command bridge.
+
+    Every non-flag argument token (``argv[1:]``, skipping ``-``/``--``
+    flags) is resolved to its realpath (``~`` expanded; relatives joined
+    to ``cwd`` — process cwd when unset) and evaluated with read
+    semantics:
+
+    - a ``deny`` hit → ``DENY``, returned immediately (deny-wins; honored
+      even for a not-yet-existing path since deny patterns match by
+      prefix);
+    - an *existing*, non-allow-listed path → ``REQUIRE_APPROVAL``
+      (aggregated, so an auto-approved binary can't bypass the queue for
+      an unusual path);
+    - anything else has no effect.
+
+    Tokens that can't be resolved (traversal/NUL) are skipped. Returns
+    the strictest aggregate — ``ALLOW`` means no argument path changed
+    the binary's decision.
+    """
+    tokens = split_command(argv) if isinstance(argv, str) else list(argv)
+    aggregate = ArgvPathResult(Decision.ALLOW, "no_path_args")
+    for token in tokens[1:]:
+        if not token or token.startswith("-"):
+            continue
+        try:
+            candidate = resolve_realpath(token, base=cwd)
+        except PathSafetyError:
+            continue
+        result = path_policy.evaluate(candidate, write=False)
+        if result.decision is Decision.DENY:
+            return ArgvPathResult(Decision.DENY, result.rule, str(candidate))
+        if result.decision is Decision.REQUIRE_APPROVAL and candidate.exists():
+            aggregate = ArgvPathResult(
+                Decision.REQUIRE_APPROVAL, result.rule, str(candidate)
+            )
+    return aggregate
 
 
 # Shell metacharacters that compose a separate command (or substitute

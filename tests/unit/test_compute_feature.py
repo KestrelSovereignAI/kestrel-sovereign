@@ -1111,6 +1111,130 @@ class TestLocalExecutorEnvFiltering:
         assert record.exit_code == 0
 
 
+class TestUvExecutorEnvFiltering:
+    """UvExecutor must build its subprocess env from the shared allowlist (F129)."""
+
+    def test_safe_env_vars_shared_with_local(self):
+        """UvExecutor and LocalExecutor share ONE _SAFE_ENV_VARS allowlist."""
+        from kestrel_sovereign.features.compute.executors.uv_executor import _SAFE_ENV_VARS as uv_vars
+        from kestrel_sovereign.features.compute.executors.local_executor import _SAFE_ENV_VARS as local_vars
+        from kestrel_sovereign.features.compute.executors.base import _SAFE_ENV_VARS as base_vars
+
+        assert uv_vars is base_vars
+        assert local_vars is base_vars
+
+    @pytest.mark.asyncio
+    async def test_execute_filters_host_env(self):
+        """A script executed via uv cannot read host secrets."""
+        from kestrel_sovereign.features.compute.executors.uv_executor import UvExecutor
+
+        executor = UvExecutor()
+        if not executor.is_available:
+            pytest.skip("uv binary not available")
+
+        script = ComputeScript(
+            id="uv-env-filter",
+            name="env_check",
+            language="python",
+            content='import os; print(os.environ.get("KESTREL_DATA_KEY", "NOT_FOUND"))',
+            purpose="Verify env filtering",
+            state=ScriptState.SIGNED,
+        )
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": "SECRET-LEAKED", "ANTHROPIC_API_KEY": "sk-ant-LEAKED"}):
+            record = await executor.execute(script)
+
+        assert "SECRET-LEAKED" not in record.stdout
+        assert "sk-ant-LEAKED" not in record.stdout
+        assert "NOT_FOUND" in record.stdout
+
+    @pytest.mark.asyncio
+    async def test_script_env_overrides_still_apply(self):
+        """script.environment overrides survive the allowlist filtering."""
+        from kestrel_sovereign.features.compute.executors.uv_executor import UvExecutor
+
+        executor = UvExecutor()
+        if not executor.is_available:
+            pytest.skip("uv binary not available")
+
+        script = ComputeScript(
+            id="uv-env-override",
+            name="override_check",
+            language="python",
+            content='import os; print(os.environ.get("MY_CUSTOM_VAR", "MISSING"))',
+            purpose="Verify script env passed",
+            state=ScriptState.SIGNED,
+            environment={"MY_CUSTOM_VAR": "custom_value"},
+        )
+
+        record = await executor.execute(script)
+
+        assert "custom_value" in record.stdout
+
+
+class TestUnsignedScriptDenial:
+    """ComputeSecurityHook must DENY unsigned / null-signature scripts (F127)."""
+
+    async def _run_hook(self, store, signer, script):
+        from kestrel_sovereign.features.compute.security_hook import ComputeSecurityHook
+        from kestrel_sdk.hooks.base import HookInput, HookEvent
+
+        hook = ComputeSecurityHook(script_store=store, signer=signer)
+        input = HookInput(
+            session_id="test-session",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="run_script",
+            tool_input={"script_id": script.id},
+        )
+        return await hook.execute(input)
+
+    @pytest.mark.asyncio
+    async def test_hook_denies_unsigned_draft(self, temp_db, signer_with_ecdsa_keys):
+        """An unsigned DRAFT script is DENIED at the PRE_TOOL_USE hook."""
+        store = ScriptStore(temp_db)
+        await store.initialize()
+
+        script = ComputeScript(
+            id="unsigned-draft",
+            name="unsigned",
+            language="python",
+            content='print("hi")',
+            purpose="unsigned draft",
+            state=ScriptState.DRAFT,
+        )
+        assert not script.signature
+        await store.save(script)
+
+        output = await self._run_hook(store, signer_with_ecdsa_keys, script)
+
+        assert output.permission_decision.value == "deny"
+        refreshed = await store.get(script.id)
+        assert refreshed.state == ScriptState.REJECTED
+
+    @pytest.mark.asyncio
+    async def test_hook_denies_signed_with_null_signature(self, temp_db, signer_with_ecdsa_keys):
+        """A SIGNED row whose signature was nulled out is DENIED, not waved through."""
+        store = ScriptStore(temp_db)
+        await store.initialize()
+
+        script = ComputeScript(
+            id="signed-null-sig",
+            name="tampered",
+            language="python",
+            content='print("hi")',
+            purpose="null signature",
+            state=ScriptState.SIGNED,
+            signature=None,
+        )
+        await store.save(script)
+
+        output = await self._run_hook(store, signer_with_ecdsa_keys, script)
+
+        assert output.permission_decision.value == "deny"
+        refreshed = await store.get(script.id)
+        assert refreshed.state == ScriptState.REJECTED
+
+
 # =============================================================================
 # Integration Tests
 # =============================================================================

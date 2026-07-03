@@ -86,10 +86,18 @@ class FakeDB:
             return 1
 
         if sql_lower.startswith("update memory_pins"):
-            released_at, message_id = params
+            # Two forms:
+            # 1) "... WHERE message_id = ? AND released_at IS NULL"
+            # 2) "... WHERE message_id = ? AND agent_id = ? AND released_at IS NULL"
+            released_at = params[0]
+            message_id = params[1]
+            agent_id_param = params[2] if len(params) > 2 else None
             for pin in self.pins.values():
-                if pin["message_id"] == message_id and pin["released_at"] is None:
-                    pin["released_at"] = released_at
+                if pin["message_id"] != message_id or pin["released_at"] is not None:
+                    continue
+                if agent_id_param is not None and pin["agent_id"] != agent_id_param:
+                    continue
+                pin["released_at"] = released_at
             return 1
 
         if "insert into memory_pins" in sql_lower:

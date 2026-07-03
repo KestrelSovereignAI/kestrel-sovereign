@@ -50,18 +50,22 @@ class TestPersonalityAnalyzer:
     @pytest.mark.asyncio
     async def test_analyze_with_responses(self, analyzer, mock_db):
         """Test analysis with sample responses."""
-        # Mock responses that indicate formal, structured style
-        mock_responses = [
-            ("I will analyze this problem carefully. The solution involves:\n\n1. First step\n2. Second step\n\nPlease let me know if you need clarification.",),
-            ("Furthermore, I would like to add that the implementation requires careful consideration of all factors.",),
-            ("Here is the code solution:\n\n```python\ndef example():\n    pass\n```\n\nThis should work for your use case.",),
+        # Mock responses that indicate formal, structured style. F188:
+        # the analyzer now reads history through AsyncConversationStore, so
+        # rows carry the get_full_history_with_ids shape
+        # (id, role, content, metadata, created_at, deleted_at).
+        mock_texts = [
+            "I will analyze this problem carefully. The solution involves:\n\n1. First step\n2. Second step\n\nPlease let me know if you need clarification.",
+            "Furthermore, I would like to add that the implementation requires careful consideration of all factors.",
+            "Here is the code solution:\n\n```python\ndef example():\n    pass\n```\n\nThis should work for your use case.",
         ] * 10  # Repeat to get 30 samples
-
-        # First call returns responses, second returns empty for calibration
-        mock_db.fetchall.side_effect = [
-            mock_responses,
-            []  # No calibration examples
+        rows = [
+            (i + 1, "assistant", text, None, "2025-01-01T00:00:00Z", None)
+            for i, text in enumerate(mock_texts)
         ]
+        # Both _get_responses and _get_calibration_examples read the same
+        # (assistant-only) history; no user rows means no calibration pairs.
+        mock_db.fetchall.return_value = rows
 
         result = await analyzer.analyze()
 
@@ -225,6 +229,76 @@ class TestPersonalityAnalyzer:
 
         assert fp.communication_style == "warm"
         assert fp.empathy_level > 0.6
+
+
+class TestPersonalityAnalyzerDecryption:
+    """F188: analyzer must read PLAINTEXT even with encryption-at-rest."""
+
+    @pytest.mark.asyncio
+    async def test_analyzer_decrypts_encrypted_store(self, monkeypatch, tmp_path):
+        """With KESTREL_DATA_KEY set, conversation_history.content is stored
+        as ciphertext. The analyzer must decrypt it (via
+        AsyncConversationStore) before fingerprinting — never analyze raw
+        Fernet/AEAD ciphertext."""
+        import json as _json
+        from cryptography.fernet import Fernet
+
+        # Configure encryption-at-rest so per-agent keys derive from it.
+        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_conversation_store import (
+            CURRENT_KEY_VERSION,
+        )
+        from kestrel_sovereign.storage.encryption import (
+            get_agent_fernet,
+            encrypt_string,
+        )
+
+        agent_id = "did:test:enc-agent"
+        agent_fernet = get_agent_fernet(agent_id)
+        assert agent_fernet is not None, "encryption must be active for this test"
+
+        plaintext = (
+            "Furthermore, I shall provide a comprehensive analysis of "
+            "the matter, and I appreciate your patience throughout."
+        )
+        ciphertext, was_enc = encrypt_string(plaintext, agent_fernet)
+        assert was_enc and ciphertext != plaintext
+        meta = _json.dumps({"enc": True, "key_version": CURRENT_KEY_VERSION})
+
+        # AsyncDatabase.sqlite already migrates the conversation_history table;
+        # insert into it directly rather than redefining a divergent schema.
+        db = await AsyncDatabase.sqlite(str(tmp_path / "enc.db"))
+        try:
+            for _ in range(30):
+                await db.execute(
+                    "INSERT INTO conversation_history "
+                    "(agent_id, role, content, metadata, created_at) "
+                    "VALUES (?, 'assistant', ?, ?, '2025-01-01T00:00:00Z')",
+                    (agent_id, ciphertext, meta),
+                )
+            await db.commit()
+
+            # The raw column must be ciphertext (not the plaintext).
+            raw = await db.fetchall(
+                "SELECT content FROM conversation_history LIMIT 1"
+            )
+            assert raw[0][0] != plaintext
+
+            from kestrel_sovereign.identity import PersonalityAnalyzer
+
+            analyzer = PersonalityAnalyzer(db, agent_id, sample_limit=100)
+            responses = await analyzer._get_responses()
+            assert responses, "analyzer should recover decrypted responses"
+            # F188: decrypted plaintext, never ciphertext.
+            assert all(r == plaintext for r in responses)
+            assert all(r != raw[0][0] for r in responses)
+
+            result = await analyzer.analyze()
+            assert result.sample_size == 30
+        finally:
+            await db.close()
 
 
 class TestCalibrationPromptGenerator:

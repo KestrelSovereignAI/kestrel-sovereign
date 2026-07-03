@@ -39,7 +39,7 @@ from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.hooks import HooksManager
+from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.security.input_guardrails import (
@@ -74,6 +74,17 @@ class PrivacyTransitionResult:
     model_switched: Optional[dict] = None
     voice_switched: Optional[dict] = None
     biometric_warning: Optional[str] = None
+    # True when the transition is data-destructive and was NOT applied — it is
+    # staged as pending and the caller must confirm via confirm_privacy_transition
+    # (surfaced to the user as the !confirm-privacy-mode affordance). When True,
+    # no state holder changed and ``message`` is the warning explaining why.
+    requires_confirmation: bool = False
+    pending_mode: Optional[str] = None
+    # True only when this result reflects a mode actually applied to the state
+    # holders. False for a staged (requires_confirmation) result AND for a no-op
+    # confirm (nothing was pending) — so a confirm endpoint/caller can tell an
+    # applied transition from a no-op without parsing the message.
+    applied: bool = False
 
 
 async def _add_sovereign_ipfs_target_if_active(
@@ -449,6 +460,10 @@ class KestrelAgent(
         self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
         self._privacy_transition_lock = asyncio.Lock()
+        # A data-destructive privacy transition (e.g. PUBLIC → EPHEMERAL) staged
+        # awaiting explicit confirmation via confirm_privacy_transition. None when
+        # no transition is pending. Guarded by _privacy_transition_lock.
+        self._pending_privacy_transition: Optional[PrivacyMode] = None
 
         # Shared lock manager for the dispatcher (Phase 1) AND the turn
         # lifecycle (Phase 2). CONVERSATION is acquired by `_turn_lifecycle`
@@ -976,6 +991,30 @@ class KestrelAgent(
 
             # Expose observability store for orchestrator instrumentation
             self.observability_store = observability_store
+
+            # Privacy-gate the observability sink at the layer boundary (F076).
+            # Tool-call args and metadata are user content, so the sink must
+            # honour the agent's privacy mode: EPHEMERAL/ISOLATED elide the
+            # payload, ANONYMOUS anonymizes it. Bind the live privacy config by
+            # reference (same pattern as set_force_local_only_provider) so
+            # mid-session mode flips are picked up automatically.
+            if hasattr(observability_store, "set_privacy_config_provider"):
+                observability_store.set_privacy_config_provider(
+                    lambda pa=self.privacy_agent: pa.privacy_config
+                )
+            # Wire the EPHEMERAL safety-net sweep into the storage wrapper so
+            # purge_ephemeral_session also scrubs any observability rows
+            # authored during the ephemeral stint (F076). Tool-call args in
+            # a2a_observability use the agent DID as agent_name (see the
+            # log_tool_call callers), so scope by DID on both columns.
+            if hasattr(self.storage, "set_observability_purge"):
+                self.storage.set_observability_purge(
+                    lambda since, obs=observability_store, did=self.did: (
+                        obs.purge_observability_since(
+                            since, agent_did=did, agent_name=did
+                        )
+                    )
+                )
 
             # Per-agent enablement deltas (agent-driven feature/MCP-server
             # add/remove that must survive restart). Reuses the observability
@@ -1760,8 +1799,56 @@ class KestrelAgent(
         async with self._get_privacy_transition_lock():
             return await self._set_privacy_mode_with_effects_locked(mode)
 
+    async def confirm_privacy_transition(self) -> PrivacyTransitionResult:
+        """Apply a privacy transition previously staged as pending confirmation.
+
+        The counterpart to a ``requires_confirmation`` result from
+        :meth:`set_privacy_mode_with_effects`. Acquires the transition lock
+        (same order as every other privacy path — CONVERSATION before the
+        transition lock, so no deadlock) and applies the staged mode atomically
+        across all three state holders. A no-op (with an explanatory message) if
+        nothing is pending.
+        """
+        async with self._get_privacy_transition_lock():
+            mode = getattr(self, "_pending_privacy_transition", None)
+            if mode is None:
+                return PrivacyTransitionResult(
+                    message="No pending privacy-mode change to confirm.",
+                    allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
+                )
+            self._pending_privacy_transition = None
+            return await self._apply_privacy_mode_locked(mode)
+
     async def _set_privacy_mode_with_effects_locked(self, mode: PrivacyMode) -> PrivacyTransitionResult:
-        """Apply a privacy-mode transition while holding the transition lock."""
+        """Evaluate a privacy-mode transition, then apply it (or stage it).
+
+        The privacy agent is the single decision point and is consulted BEFORE
+        any state holder changes. A data-destructive transition is staged as
+        pending and returned with ``requires_confirmation=True`` — nothing flips
+        until :meth:`confirm_privacy_transition`. Every other transition applies
+        atomically. This is what prevents the split-state bug where the agent /
+        wrapper flipped while the privacy agent stayed behind.
+        """
+        decision = self.privacy_agent.evaluate_transition(mode)
+        if decision.requires_confirmation:
+            self._pending_privacy_transition = mode
+            return PrivacyTransitionResult(
+                message=decision.warning,
+                allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
+                requires_confirmation=True,
+                pending_mode=mode.value,
+            )
+        # A non-destructive change supersedes any previously-staged pending one.
+        self._pending_privacy_transition = None
+        return await self._apply_privacy_mode_locked(mode)
+
+    async def _apply_privacy_mode_locked(self, mode: PrivacyMode) -> PrivacyTransitionResult:
+        """Atomically apply a privacy-mode transition to all state holders.
+
+        Caller holds the transition lock and has already cleared the
+        confirmation gate. Flips agent mode, storage wrapper, and privacy agent
+        together, then applies model/voice side effects.
+        """
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
         if consent:
@@ -1802,6 +1889,7 @@ class KestrelAgent(
             model_switched=model_switched,
             voice_switched=voice_switched,
             biometric_warning=biometric_warning,
+            applied=True,
         )
 
     def _apply_privacy_model_transition(self, config) -> Optional[dict]:
@@ -1896,7 +1984,14 @@ class KestrelAgent(
             )
             return breakdown
 
-        leaked = sum(breakdown.values())
+        # A genuine privacy leak means data reached tables EPHEMERAL must never
+        # write (conversation_history / graph_nodes). The observability sink is
+        # allowed to hold content-free metric rows during an ephemeral stint
+        # (F076), so its swept counts are reported in the breakdown but do NOT
+        # trip the leak audit.
+        leaked = breakdown.get("conversation_history", 0) + breakdown.get(
+            "graph_nodes", 0
+        )
         if leaked > 0:
             await self._record_ephemeral_leak_audit(
                 reason=reason, breakdown=breakdown,
@@ -2867,8 +2962,12 @@ Expected Duration: {expected_duration}
             hook_output = await self.hooks_manager.execute_hooks(
                 HookEvent.USER_PROMPT_SUBMIT, hook_input
             )
-            if hook_output.permission_decision == PermissionDecision.DENY:
-                return f"[Input rejected: {hook_output.permission_reason}]"
+            # DENY and ASK both block the prompt (F038): an ASK on
+            # USER_PROMPT_SUBMIT gates the turn behind approval, so it
+            # must not fall through and run.
+            blocked = evaluate_blocking_decision(hook_output)
+            if blocked is not None:
+                return f"[Input rejected: {blocked.reason}]"
             # The manager applies updated_input to hook_input.tool_input;
             # check if hooks modified the user_message via that path.
             if hook_input.tool_input and "user_message" in hook_input.tool_input:

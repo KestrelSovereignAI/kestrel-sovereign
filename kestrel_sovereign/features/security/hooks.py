@@ -5,7 +5,6 @@ This module provides the SecurityHook that intercepts tool execution
 and enforces permission policies.
 """
 
-import json
 import logging
 from typing import Optional
 
@@ -14,6 +13,10 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel, Per
 from kestrel_sovereign.features.security.approval_queue import (
     ApprovalQueue,
     classify_denial,
+)
+from kestrel_sovereign.features.security.args_summary import (
+    mask_sensitive,
+    summarize_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -203,75 +206,21 @@ class SecurityHook(Hook):
         args: Optional[dict],
         max_length: int = 200,
     ) -> Optional[str]:
+        """Create a privacy-safe summary of tool arguments.
+
+        Thin wrapper over the shared
+        :func:`kestrel_sovereign.features.security.args_summary.summarize_args`
+        so this path and :class:`ApprovalQueue` produce identical masked rows.
         """
-        Create a privacy-safe summary of tool arguments.
-
-        Args:
-            args: Tool arguments dictionary
-            max_length: Maximum summary length
-
-        Returns:
-            Truncated JSON string or None
-        """
-        if not args:
-            return None
-
-        try:
-            # Mask potentially sensitive values
-            masked = self._mask_sensitive(args)
-            summary = json.dumps(masked, default=str)
-
-            if len(summary) > max_length:
-                return summary[: max_length - 3] + "..."
-            return summary
-
-        except (TypeError, ValueError) as e:
-            logger.debug(f"Failed to summarize args (type/value error): {e}")
-            return "(args could not be summarized)"
-        except Exception as e:
-            logger.debug(f"Failed to summarize args: {e}", exc_info=True)
-            return "(args could not be summarized)"
+        return summarize_args(args, max_length=max_length)
 
     def _mask_sensitive(self, data: dict) -> dict:
+        """Mask potentially sensitive values in arguments.
+
+        Delegates to the shared
+        :func:`kestrel_sovereign.features.security.args_summary.mask_sensitive`.
         """
-        Mask potentially sensitive values in arguments.
-
-        Args:
-            data: Dictionary to mask
-
-        Returns:
-            Dictionary with sensitive values masked
-        """
-        sensitive_keys = {
-            "password",
-            "secret",
-            "token",
-            "key",
-            "api_key",
-            "private_key",
-            "credit_card",
-            "ssn",
-            "social_security",
-        }
-
-        result = {}
-        for key, value in data.items():
-            key_lower = key.lower()
-
-            # Mask sensitive keys
-            if any(s in key_lower for s in sensitive_keys):
-                result[key] = "***MASKED***"
-            elif isinstance(value, dict):
-                result[key] = self._mask_sensitive(value)
-            elif isinstance(value, list):
-                result[key] = [
-                    self._mask_sensitive(item) if isinstance(item, dict) else item
-                    for item in value
-                ]
-            else:
-                result[key] = value
-
-        return result
+        return mask_sensitive(data)
 
     def __repr__(self) -> str:
         return f"SecurityHook(name={self.name}, priority={self.priority})"

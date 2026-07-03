@@ -494,6 +494,76 @@ class TestScheduleAdd:
         assert result.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
+    async def test_add_rejects_deny_listed_tool(self, feature):
+        """F245: a tool the SecurityFeature permission store has set to
+        DENY must be rejected at creation time — persisting it would just
+        guarantee the tick-path PRE_TOOL_USE gate blocks every fire. The
+        schedule row must NOT be inserted."""
+        from kestrel_sovereign.features.security.permissions import PermissionLevel
+
+        mock_tool = MagicMock()
+        mock_tool.name = "dangerous_op"
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+
+        # SecurityFeature exposing a permission_store that DENYs the tool.
+        security_feature = MagicMock()
+        security_feature.permission_store = MagicMock()
+        security_feature.permission_store.get_permission = AsyncMock(
+            return_value=PermissionLevel.DENY
+        )
+
+        feature.agent.features = {
+            "DangerFeature": mock_feature,
+            "SecurityFeature": security_feature,
+        }
+
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="dangerous_op",
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "deny" in result.error.lower()
+        assert result.data["denied_by_policy"] is True
+        # The permission store was consulted under the registered feature name.
+        security_feature.permission_store.get_permission.assert_awaited_once_with(
+            "DangerFeature", "dangerous_op"
+        )
+        # And nothing was inserted into the schedule.
+        feature._db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_allows_non_deny_tool_with_security_present(self, feature):
+        """An ASK/ALLOW-gated tool is still schedulable — only DENY is a
+        hard creation-time block. Guards against the DENY check
+        over-rejecting."""
+        from kestrel_sovereign.features.security.permissions import PermissionLevel
+
+        mock_tool = MagicMock()
+        mock_tool.name = "wellness_check"
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+
+        security_feature = MagicMock()
+        security_feature.permission_store = MagicMock()
+        security_feature.permission_store.get_permission = AsyncMock(
+            return_value=PermissionLevel.ASK
+        )
+
+        feature.agent.features = {
+            "WellnessFeature": mock_feature,
+            "SecurityFeature": security_feature,
+        }
+
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="wellness_check",
+        )
+        assert result.status is ToolResultStatus.OK
+        feature._db.execute.assert_called()
+
+    @pytest.mark.asyncio
     async def test_feature_get_tools_failure_is_logged_not_swallowed(
         self, feature, caplog
     ):
@@ -950,12 +1020,34 @@ class TestSchedulerInit:
 
 class TestTaskExecutor:
 
+    @staticmethod
+    def _passthrough_hooks_manager():
+        """A hooks_manager whose PRE_TOOL_USE hook allows the tool through
+        (no DENY/ASK): execute_hooks returns an output with no blocking
+        decision, execute_hooks_parallel is a no-op. Mirrors the real
+        HooksManager surface the tick-path executor (F245) now routes
+        through."""
+        from types import SimpleNamespace
+
+        hm = MagicMock()
+        hm.execute_hooks = AsyncMock(
+            return_value=SimpleNamespace(
+                permission_decision=None,
+                updated_input=None,
+                continue_execution=True,
+            )
+        )
+        hm.execute_hooks_parallel = AsyncMock(return_value=None)
+        return hm
+
     @pytest.mark.asyncio
     async def test_execute_known_task(self, feature):
         # Mock a feature with a matching tool. Phase 4 of #889 renamed
         # `_execute_scheduled_task` → `_lookup_and_run_tool` (the
         # tool-search body) when the dispatcher took over the executor
-        # role. The lookup behavior tested here is unchanged.
+        # role. Scheduled dispatch now routes through the PRE/POST_TOOL_USE
+        # hook gate (F245), so a passthrough hooks_manager stands in for the
+        # real one; the lookup + execute behavior is otherwise unchanged.
         mock_tool = MagicMock()
         mock_tool.name = "wellness_check"
         mock_tool.execute = AsyncMock(return_value={"success": True, "score": 0.85})
@@ -964,10 +1056,46 @@ class TestTaskExecutor:
         mock_feature.get_tools = MagicMock(return_value=[mock_tool])
 
         feature.agent.features = {"WellnessFeature": mock_feature}
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
         result = await feature._lookup_and_run_tool("wellness_check", {})
         parsed = json.loads(result)
         assert parsed["success"] is True
+        mock_tool.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_scheduled_deny_hook_blocks_tick(self, feature):
+        """F245: a PRE_TOOL_USE DENY on a scheduler tick must block the
+        tool — the tick executor raises so the runner records the fire as
+        failed, and the tool's execute() is never called."""
+        from types import SimpleNamespace
+
+        from kestrel_sdk.hooks.base import PermissionDecision
+
+        mock_tool = MagicMock()
+        mock_tool.name = "dangerous_op"
+        mock_tool.execute = AsyncMock(return_value={"success": True})
+
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+
+        feature.agent.features = {"DangerFeature": mock_feature}
+        hm = MagicMock()
+        hm.execute_hooks = AsyncMock(
+            return_value=SimpleNamespace(
+                permission_decision=PermissionDecision.DENY,
+                permission_reason="policy forbids it",
+                updated_input=None,
+                continue_execution=False,
+            )
+        )
+        hm.execute_hooks_parallel = AsyncMock(return_value=None)
+        feature.agent.hooks_manager = hm
+
+        with pytest.raises(PermissionError):
+            await feature._lookup_and_run_tool("dangerous_op", {})
+        # The tool never ran — the gate blocked it before execute().
+        mock_tool.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_execute_unknown_task_raises(self, feature):

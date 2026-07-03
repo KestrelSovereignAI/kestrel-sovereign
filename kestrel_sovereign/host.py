@@ -643,6 +643,40 @@ async def github_app_webhook_proxy(request: Request):
         raise
 
 
+# --- Generic Webhook Proxy ---
+# In host/subprocess mode the feature routers are NOT mounted in this process;
+# each backing agent serves its own /webhooks/{name} via its WebhookFeature
+# router. Without a host-side proxy, the /webhooks/{name} URL that
+# webhooks_register() advertises 404s at the host (issue #2089). Registered
+# AFTER the specific /webhooks/rest/webhook and /webhooks/github-app proxies so
+# those literal paths keep winning; the {webhook_name} placeholder only matches
+# a single trailing segment, so /webhooks/rest/webhook (two segments) can never
+# reach here.
+
+
+@app.post("/webhooks/{webhook_name}")
+async def generic_webhook_proxy(request: Request, webhook_name: str):
+    """Forward a generic ``/webhooks/{name}`` POST to a configured agent.
+
+    Uses deterministic first-agent selection, matching the existing
+    rasa/github-app webhook proxies — the host cannot know which subprocess
+    agent registered ``{name}`` without querying, and fanning the request out
+    would double-deliver a state-mutating webhook. Heterogeneous multi-agent
+    hosts that need per-agent webhooks should address the agent directly via
+    the ``/api/agents/{id}/webhooks/{name}`` proxy below.
+    """
+    config: MultiAgentConfig = request.app.state.multi_agent_config
+    client: httpx.AsyncClient = request.app.state.http_client
+    first_agent = next(iter(config.agents))
+    return await proxy_request_streaming(
+        request=request,
+        agent_id=first_agent,
+        path=f"webhooks/{webhook_name}",
+        config=config,
+        client=client,
+    )
+
+
 # --- Feature UI static-asset delivery (#2048) ---
 # In multi-agent host mode the per-agent manifest from /api/ui/contributions
 # lists module URLs like /features/{name}/static/spawn.js. The host serves only

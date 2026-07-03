@@ -7,6 +7,7 @@ import time
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.agent.parts import (
     PART_SENTINEL_PREFIX,
@@ -615,9 +616,16 @@ class StreamingMixin:
         })
 
         try:
-            transition_lock = self._get_privacy_transition_lock()
-            async with transition_lock:
-                async with self._turn_lifecycle():
+            # Lock order — CONVERSATION (via _turn_lifecycle) BEFORE the privacy
+            # transition lock — is the deadlock-freedom invariant. The in-turn
+            # `!privacy` path runs inside process_input, which already holds
+            # CONVERSATION and then acquires the transition lock; acquiring in the
+            # same order here means no two callers can take this pair in opposite
+            # directions (the AB-BA wedge this replaces, where streaming took the
+            # transition lock first and then blocked on CONVERSATION).
+            async with self._turn_lifecycle():
+                transition_lock = self._get_privacy_transition_lock()
+                async with transition_lock:
                     # #1914: bind a per-turn part buffer so tools/features can
                     # ``emit_part`` typed component bubbles; the orchestrator
                     # drains it into PART sentinels at the point each tool ran.
@@ -666,8 +674,12 @@ class StreamingMixin:
             hook_output = await self.hooks_manager.execute_hooks(
                 HookEvent.USER_PROMPT_SUBMIT, hook_input
             )
-            if hook_output.permission_decision == PermissionDecision.DENY:
-                yield f"[Input rejected: {hook_output.permission_reason}]"
+            # DENY and ASK both block the prompt (F038): an ASK on
+            # USER_PROMPT_SUBMIT gates the turn behind approval, so it
+            # must not fall through and run.
+            blocked = evaluate_blocking_decision(hook_output)
+            if blocked is not None:
+                yield f"[Input rejected: {blocked.reason}]"
                 return
             # The manager applies updated_input to hook_input.tool_input;
             # check if hooks modified the user_message via that path.
