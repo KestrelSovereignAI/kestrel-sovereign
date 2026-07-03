@@ -62,6 +62,11 @@ from kestrel_sovereign.features.security.permissions import (
     PermissionStore,
     ToolPermission,
     FeaturePermissions,
+    UnknownFeatureError,
+)
+from kestrel_sovereign.features.security.args_summary import (
+    mask_sensitive,
+    summarize_args,
 )
 from kestrel_sovereign.features.security.approval_queue import (
     ApprovalQueue,
@@ -266,6 +271,39 @@ class TestPermissionStore:
         assert await store.get_permission("WalletAgent", "get_history") == PermissionLevel.ALLOW
 
     @pytest.mark.asyncio
+    async def test_set_feature_permission_alias_resolves_and_writes_canonical(self, store):
+        """F253: an alias spelling (``task_feature``) must resolve to the
+        canonical tree group (``TaskFeature``) and write rows there — not
+        silently no-op while confirming success."""
+        await store.register_tool("TaskFeature", "run_task", PermissionLevel.ASK)
+        await store.register_tool("TaskFeature", "cancel_task", PermissionLevel.ASK)
+
+        # Snake-alias spelling — the read path resolves it, so the write path
+        # must too.
+        await store.set_feature_permission("task_feature", PermissionLevel.DENY)
+
+        # Rows are readable under BOTH the canonical name and the alias
+        # (the read path resolves variants), proving the write landed.
+        assert await store.get_permission("TaskFeature", "run_task") == PermissionLevel.DENY
+        assert await store.get_permission("TaskFeature", "cancel_task") == PermissionLevel.DENY
+        assert await store.get_permission("task_feature", "run_task") == PermissionLevel.DENY
+
+        # And the rows were written under the CANONICAL spelling, not the alias.
+        tree = await store.get_permission_tree()
+        names = {f.feature_name for f in tree}
+        assert "TaskFeature" in names
+        assert "task_feature" not in names
+
+    @pytest.mark.asyncio
+    async def test_set_feature_permission_unknown_raises(self, store):
+        """F253: a truly-unknown feature must raise rather than log a false
+        success and persist nothing."""
+        with pytest.raises(UnknownFeatureError):
+            await store.set_feature_permission(
+                "NoSuchFeatureXyz", PermissionLevel.DENY
+            )
+
+    @pytest.mark.asyncio
     async def test_get_permission_tree(self, store):
         # Register tools
         await store.register_tool("WalletAgent", "get_balance", PermissionLevel.ALLOW)
@@ -415,6 +453,39 @@ class TestApprovalQueue:
         # First decision wins; second/third are no-ops.
         assert approved is True
         assert scope == "once"
+
+    @pytest.mark.asyncio
+    async def test_approved_secret_arg_is_masked_in_audit_log(self, tmp_path):
+        """F252: the queue's decision-persistence path must mask secret args
+        before writing them to ``security_audit_log`` — the same masking the
+        hook path applies. Previously the queue wrote raw args at rest."""
+        store = track_store(PermissionStore(str(tmp_path / "perms.db")))
+        await store.initialize()
+        await store.register_tool("WalletAgent", "send_payment", PermissionLevel.ASK)
+        queue = ApprovalQueue(permission_store=store)
+
+        async def approve_later():
+            await asyncio.sleep(0.05)
+            pending = queue.pending_requests
+            assert len(pending) == 1
+            await queue.submit_decision(pending[0].id, True, "always")
+
+        asyncio.create_task(approve_later())
+
+        approved, _ = await queue.request_approval(
+            feature_name="WalletAgent",
+            tool_name="send_payment",
+            tool_args={"api_key": "sk-live-SECRET", "amount": 100},
+        )
+        assert approved is True
+
+        entries = await store.get_audit_log()
+        assert entries, "expected an audit row for the approved call"
+        summary = entries[0]["args_summary"]
+        assert "sk-live-SECRET" not in summary
+        assert "***MASKED***" in summary
+        # Non-sensitive fields survive for triage.
+        assert "100" in summary
 
     @pytest.mark.asyncio
     async def test_request_approval_timeout(self, queue):
@@ -1689,6 +1760,39 @@ class TestSetPermissionUnknownTarget:
 
         result = await feature.set_permission("WalletAgent", level="allow")
         assert result.status is ToolResultStatus.OK
+
+
+class TestArgsSummaryHelper:
+    """F252: the shared masking helper both write paths call."""
+
+    def test_mask_sensitive_nested_and_lists(self):
+        data = {
+            "password": "secret123",
+            "api_key": "sk-abc",
+            "user": "john",
+            "nested": {"token": "tok-xyz", "note": "ok"},
+            "items": [{"secret": "x"}, "plain"],
+        }
+        masked = mask_sensitive(data)
+        assert masked["password"] == "***MASKED***"
+        assert masked["api_key"] == "***MASKED***"
+        assert masked["user"] == "john"
+        assert masked["nested"]["token"] == "***MASKED***"
+        assert masked["nested"]["note"] == "ok"
+        assert masked["items"][0]["secret"] == "***MASKED***"
+        assert masked["items"][1] == "plain"
+
+    def test_summarize_args_masks_and_never_leaks_on_error(self):
+        assert summarize_args(None) is None
+        assert summarize_args({}) is None
+        out = summarize_args({"api_key": "sk-live-SECRET", "n": 1})
+        assert "sk-live-SECRET" not in out
+        assert "***MASKED***" in out
+
+    def test_summarize_args_truncates(self):
+        out = summarize_args({"note": "a" * 1000}, max_length=50)
+        assert len(out) == 50
+        assert out.endswith("...")
 
 
 # === Run tests ===

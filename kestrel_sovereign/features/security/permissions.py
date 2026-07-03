@@ -19,6 +19,16 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+class UnknownFeatureError(ValueError):
+    """Raised when a permission write targets a feature with no registered
+    permission-tree group under any casing/alias variant.
+
+    Surfacing this (instead of logging a false success) is what stops
+    ``set_feature_permission`` from silently no-oping on an alias spelling
+    that resolves to no tree group (F253).
+    """
+
+
 class PermissionLevel(Enum):
     """
     Permission levels for tools.
@@ -594,22 +604,43 @@ class PermissionStore:
             feature_name: Name of the feature
             level: Permission level to set for all tools
             reason: Optional reason for the permission change
+
+        Raises:
+            UnknownFeatureError: If no permission-tree group matches
+                ``feature_name`` under any casing/alias variant. Previously
+                this path silently no-oped on an alias spelling (e.g.
+                ``task_feature`` for ``TaskFeature``) yet still logged success,
+                leaving the operator's intended control absent (F253).
         """
-        # Get all tools for this feature
+        # Resolve the target group with the SAME casing/alias resolution the
+        # read path uses, so an alias spelling (``task_feature``) matches the
+        # canonical tree group (``TaskFeature``) instead of finding nothing.
+        variants = self.feature_name_variants(feature_name)
         tree = await self.get_permission_tree()
-        feature = next((f for f in tree if f.feature_name == feature_name), None)
+        feature = next((f for f in tree if f.feature_name in variants), None)
 
-        if feature:
-            for tool in feature.tools:
-                await self.set_permission(
-                    feature_name,
-                    tool.tool_name,
-                    level,
-                    scope="always",
-                    reason=reason
-                )
+        if feature is None:
+            # No group matched — refuse loudly rather than confirm a control
+            # that was never written.
+            raise UnknownFeatureError(
+                f"Unknown feature '{feature_name}': no registered permission "
+                "group matches under any casing/alias variant. Nothing was "
+                "persisted."
+            )
 
-        logger.info(f"Set feature permission: {feature_name} = {level.value}")
+        # Write rows under the CANONICAL spelling the tree exposes, not the
+        # (possibly aliased) spelling the caller passed.
+        canonical_name = feature.feature_name
+        for tool in feature.tools:
+            await self.set_permission(
+                canonical_name,
+                tool.tool_name,
+                level,
+                scope="always",
+                reason=reason
+            )
+
+        logger.info(f"Set feature permission: {canonical_name} = {level.value}")
 
     async def get_permission_tree(self) -> List[FeaturePermissions]:
         """
