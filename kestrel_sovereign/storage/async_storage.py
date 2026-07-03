@@ -926,23 +926,44 @@ class AsyncStorage:
                     ]
                     has_model = "model" in backup_cols
                     has_provider = "provider" in backup_cols
+                    has_deleted_at = "deleted_at" in backup_cols
+                    # Preserve the original created_at ORDER and select it +
+                    # deleted_at so the restore is FAITHFUL (#F265): rewriting
+                    # created_at to now() destroyed history ordering, and
+                    # dropping deleted_at resurrected trashed (soft-deleted)
+                    # messages. session_id rides inside ``metadata`` and is
+                    # carried verbatim.
                     cursor = await backup_conn.execute(
                         "SELECT role, content, metadata"
                         + (", model" if has_model else ", NULL AS model")
                         + (", provider" if has_provider else ", NULL AS provider")
+                        + ", created_at"
+                        + (", deleted_at" if has_deleted_at else ", NULL AS deleted_at")
                         + " FROM conversation_history"
+                        # Tie-break on the original row id: created_at is often
+                        # second-granularity, so same-second turns must keep
+                        # their original order — new ids are assigned in this
+                        # order and get_conversation_history() sorts by id, so a
+                        # tie here would swap user/assistant turns (codex P2).
+                        + " ORDER BY created_at, id"
                     )
                     conversations = await cursor.fetchall()
 
-                    for role, content, metadata_json, model, provider in conversations:
-                        # Insert directly into current database with agent_id
+                    for (
+                        role, content, metadata_json, model, provider,
+                        created_at, deleted_at,
+                    ) in conversations:
+                        # Insert into the current database under this agent_id,
+                        # PRESERVING created_at (ordering) and deleted_at (trash
+                        # stays trash — a restore must not un-delete rows).
                         await self.db.execute_commit(
-                            f"INSERT INTO conversation_history "
-                            f"(agent_id, role, content, model, provider, metadata, created_at) "
-                            f"VALUES (?, ?, ?, ?, ?, ?, {self._now_sql()})",
+                            "INSERT INTO conversation_history "
+                            "(agent_id, role, content, model, provider, metadata, "
+                            "created_at, deleted_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 self.agent_id, role, content, model, provider,
-                                metadata_json,
+                                metadata_json, created_at, deleted_at,
                             )
                         )
                         stats["messages_restored"] += 1
