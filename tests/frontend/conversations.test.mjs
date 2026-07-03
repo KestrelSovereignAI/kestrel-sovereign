@@ -292,3 +292,66 @@ test('buildConversationRow escapes user-supplied names (XSS posture)', () => {
     assert.equal(preview.textContent, '<img src=x onerror=alert(1)>', 'name preserved as text');
     assert.ok(row.dataset.sessionId === 'x');
 });
+
+// Codex P2-1 (PR #2151): a refresh that resolves AFTER a newer view switch
+// must be discarded, or active rows render under the Archived view with the
+// wrong actions.
+test('stale refresh: a slow active-list response never clobbers a newer view switch', async () => {
+    const container = makeContainer();
+    const api = stubApi();
+    let releaseActive;
+    const activeGate = new Promise((r) => { releaseActive = r; });
+    const baseGet = api.getConversations;
+    api.getConversations = async (decrypt, view) => {
+        if (view === 'active') {
+            await activeGate; // hold the active response until after the switch
+            api.calls.push({ name: 'getConversations', args: [decrypt, view] });
+            return {
+                conversations: [{
+                    session_id: 'stale-active', preview: 'stale row',
+                    started_at: '2026-06-23T12:00:00Z', message_count: 1,
+                }],
+            };
+        }
+        return baseGet(decrypt, view);
+    };
+
+    const handle = mountConversations(container, { api, autoLoad: false });
+    const slow = handle.refresh();      // active view — response held
+    handle.setView('archived');         // newer refresh wins
+    await new Promise((r) => setTimeout(r, 0));
+    releaseActive();                    // stale active response lands late
+    await slow;
+    await new Promise((r) => setTimeout(r, 0));
+
+    const ids = rowsIn(container).map((r) => r.dataset.sessionId);
+    assert.ok(!ids.includes('stale-active'), 'stale active rows must not render');
+    const labels = menuLabels(openKebab(rowsIn(container)[0]));
+    assert.ok(labels.includes('Unarchive'), 'view is still Archived after the stale response');
+    handle.destroy();
+});
+
+// Codex P2-2 (PR #2151): committing an inline rename with Enter must not
+// bubble into the row's Enter/select handler and load the conversation.
+test('rename Enter commits without triggering row onSelect', async () => {
+    const container = makeContainer();
+    const api = stubApi();
+    const selected = [];
+    const handle = mountConversations(container, {
+        api, autoLoad: false, onSelect: (c) => selected.push(c.session_id),
+    });
+    await handle.refresh();
+
+    const row = rowsIn(container)[0];
+    openKebab(row).find((i) => i.dataset.action === 'rename').click();
+    const input = row.querySelector('.conversation-rename-input');
+    input.value = 'Renamed via Enter';
+    input.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    input.dispatchEvent(new dom.window.Event('blur'));
+    await new Promise((r) => setTimeout(r, 0));
+
+    assert.ok(api.calls.some((c) => c.name === 'renameConversation'
+        && c.args[1] === 'Renamed via Enter'), 'rename committed');
+    assert.deepEqual(selected, [], 'Enter in the rename input must not select/load the row');
+    handle.destroy();
+});

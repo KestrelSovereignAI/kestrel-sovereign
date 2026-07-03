@@ -114,8 +114,11 @@ export function beginInlineRename(previewEl, conv, opts = {}) {
     }
 
     input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
-        else if (e.key === 'Escape') { e.preventDefault(); cancel(); previewEl.textContent = originalText; }
+        // stopPropagation: the row's own keydown handler selects/loads the
+        // conversation on Enter — committing a rename must not also trigger
+        // that (and Escape must not bubble into row/global handlers either).
+        if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); input.blur(); }
+        else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel(); previewEl.textContent = originalText; }
     });
     input.addEventListener('blur', () => { if (!finalized) commit(); });
 
@@ -310,6 +313,7 @@ export function mountConversations(containerEl, config = {}) {
     let searchTerm = '';
     let agentName = config.agentName;
     let lastConversations = [];
+    let refreshSeq = 0;
 
     containerEl.classList && containerEl.classList.add('conversations-component');
 
@@ -558,10 +562,19 @@ export function mountConversations(containerEl, config = {}) {
 
     async function refresh() {
         syncViewButtons();
+        // Sequence token: a view switch or agent retarget while a previous
+        // refresh is still in flight must win — otherwise the older response
+        // lands late and renders the wrong rows under the new view (e.g. active
+        // rows shown with Archived actions). Same guard identity.js's list had
+        // (conversationListRequestSeq, #1358).
+        const seq = ++refreshSeq;
         try {
-            lastConversations = await loadData();
+            const data = await loadData();
+            if (seq !== refreshSeq) return; // stale — a newer refresh owns the list
+            lastConversations = data;
             renderCurrent();
         } catch (e) {
+            if (seq !== refreshSeq) return;
             listEl.innerHTML = '';
             const err = document.createElement('p');
             err.className = 'conversations-error';
