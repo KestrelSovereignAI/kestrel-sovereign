@@ -589,6 +589,26 @@ class ComputeFeature(Feature):
                 script.state = ScriptState.APPROVED
                 script.review_notes = f"User approved with scope: {scope}"
                 await self.script_store.update(script)
+            else:
+                # Fail closed: approval is required (risk >= threshold, not a
+                # demo server) but there is no reachable approval queue to ask
+                # through. Do NOT fall through to execution — reject.
+                script.state = ScriptState.REJECTED
+                script.review_notes = (
+                    "Approval required but no approval queue is available "
+                    "(SecurityFeature not loaded)"
+                )
+                await self.script_store.update(script)
+                return ToolResult.failed(
+                    "Script execution blocked: approval required but no "
+                    "approval queue is available (SecurityFeature not loaded)",
+                    data={
+                        "script_id": script.id,
+                        "state": ScriptState.REJECTED.value,
+                        "approval_required": True,
+                        "approval_queue_available": False,
+                    },
+                )
         else:
             # Auto-approved due to low risk
             script.state = ScriptState.APPROVED
