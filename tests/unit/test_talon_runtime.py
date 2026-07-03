@@ -5,14 +5,17 @@ from pathlib import Path
 import pytest
 
 from kestrel_sovereign.features.talon.runtime import (
+    TalonBatchExecution,
     TalonExecution,
     TalonPolicy,
     TalonPreference,
     TalonRuntimeError,
     TalonRuntimeRequest,
+    build_talon_batch_invocation,
     build_talon_invocation,
     load_talon_policy_preference,
     sanitize_env_for_backend,
+    sanitize_untrusted_env,
     write_talon_preference,
 )
 
@@ -213,4 +216,131 @@ def test_invalid_string_bool_preference_rejected(tmp_path):
         write_talon_preference(
             {"skip_clarification": "definitely"},
             kestrel_toml_path=tmp_path / "kestrel.toml",
+        )
+
+
+def test_sanitize_untrusted_env_strips_all_provider_creds_and_gh_token():
+    """F302: verify runs untrusted code — no provider creds, no GitHub token."""
+    base = {
+        "ANTHROPIC_API_KEY": "sk-ant",
+        "ANTHROPIC_AUTH_TOKEN": "oauth",
+        "OPENAI_API_KEY": "sk-openai",
+        "GOOGLE_API_KEY": "google",
+        "GROQ_API_KEY": "groq",
+        "KESTREL_API_KEY": "kestrel",
+        "KESTREL_DATA_KEY": "fernet",
+        "GITHUB_TOKEN": "ghp_x",
+        "GH_TOKEN": "ghp_y",
+        "GITHUB_PAT": "ghp_z",
+        "PATH": "/usr/bin",
+        "HOME": "/home/agent",
+    }
+    env, stripped = sanitize_untrusted_env(base)
+    for leaked in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GROQ_API_KEY",
+        "KESTREL_API_KEY",
+        "KESTREL_DATA_KEY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_PAT",
+    ):
+        assert leaked not in env
+        assert leaked in stripped
+    # Non-secret operational vars survive.
+    assert env["PATH"] == "/usr/bin"
+    assert env["HOME"] == "/home/agent"
+
+
+def test_build_talon_batch_invocation_passes_repo_dir_and_abs_prd(tmp_path):
+    prd = tmp_path / "prd.json"
+    prd.write_text("{}")
+    workspace = tmp_path / "ws"
+    invocation = build_talon_batch_invocation(
+        TalonRuntimeRequest(),
+        TalonBatchExecution(repo="org/repo", prd_path=prd, repo_dir=workspace),
+        base_env=_env(),
+    )
+    assert invocation.argv[0] == "batch"
+    assert invocation.argv[invocation.argv.index("--prd") + 1] == str(prd)
+    assert invocation.argv[invocation.argv.index("--repo-dir") + 1] == str(workspace)
+    # The launched backend must be pinned so batch can't fall back to the
+    # parser default ($TALON_BACKEND or claude) and bypass policy (F304).
+    assert invocation.argv[invocation.argv.index("--backend") + 1] == "claude"
+    assert invocation.argv[invocation.argv.index("--model") + 1] == "opus"
+    # Batch runs in a sandbox and legitimately keeps the GitHub token,
+    # but provider creds unrelated to the backend are stripped.
+    assert invocation.env["GITHUB_TOKEN"] == "ghp_test"
+
+
+def test_build_talon_batch_invocation_pins_policy_resolved_backend(tmp_path):
+    prd = tmp_path / "prd.json"
+    prd.write_text("{}")
+    execution = TalonBatchExecution(repo="org/repo", prd_path=prd, repo_dir=tmp_path)
+
+    # Policy restricts to codex — the launched argv must say so, never claude.
+    by_policy = build_talon_batch_invocation(
+        TalonRuntimeRequest(),
+        execution,
+        policy=TalonPolicy(allowed_backends=("codex",)),
+        preference=TalonPreference(default_backend="codex", default_model="gpt-5.5"),
+        base_env=_env(),
+    )
+    assert by_policy.backend == "codex"
+    assert by_policy.argv[by_policy.argv.index("--backend") + 1] == "codex"
+    assert by_policy.argv[by_policy.argv.index("--codex-model") + 1] == "gpt-5.5"
+    assert "--model" not in by_policy.argv
+
+    # Preference alone (permissive policy) also pins codex.
+    by_preference = build_talon_batch_invocation(
+        TalonRuntimeRequest(),
+        execution,
+        preference=TalonPreference(default_backend="codex", default_model="gpt-5.5"),
+        base_env=_env(),
+    )
+    assert by_preference.argv[by_preference.argv.index("--backend") + 1] == "codex"
+
+
+def test_build_talon_batch_invocation_rejects_relative_prd(tmp_path):
+    with pytest.raises(TalonRuntimeError, match="absolute"):
+        build_talon_batch_invocation(
+            TalonRuntimeRequest(),
+            TalonBatchExecution(
+                repo="org/repo", prd_path=Path("prd.json"), repo_dir=tmp_path
+            ),
+            base_env=_env(),
+        )
+
+
+def test_build_talon_batch_invocation_rejects_missing_prd(tmp_path):
+    with pytest.raises(TalonRuntimeError, match="not found"):
+        build_talon_batch_invocation(
+            TalonRuntimeRequest(),
+            TalonBatchExecution(
+                repo="org/repo", prd_path=tmp_path / "nope.json", repo_dir=tmp_path
+            ),
+            base_env=_env(),
+        )
+
+
+def test_build_talon_batch_invocation_enforces_background_and_backend_policy(tmp_path):
+    prd = tmp_path / "prd.json"
+    prd.write_text("{}")
+    execution = TalonBatchExecution(repo="org/repo", prd_path=prd, repo_dir=tmp_path)
+    with pytest.raises(TalonRuntimeError, match="background jobs are disabled"):
+        build_talon_batch_invocation(
+            TalonRuntimeRequest(),
+            execution,
+            policy=TalonPolicy(allow_background_jobs=False),
+            base_env=_env(),
+        )
+    with pytest.raises(TalonRuntimeError, match="not allowed by policy"):
+        build_talon_batch_invocation(
+            TalonRuntimeRequest(backend="codex", auth_lane="oauth"),
+            execution,
+            policy=TalonPolicy(allowed_backends=("claude",)),
+            base_env=_env(),
         )
