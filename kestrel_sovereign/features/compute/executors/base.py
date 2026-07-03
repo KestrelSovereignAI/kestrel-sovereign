@@ -13,6 +13,16 @@ from ..models import ComputeScript, ExecutionRecord
 logger = logging.getLogger(__name__)
 
 
+# Allowlist of environment variables safe to pass to executed scripts.
+# Never pass API keys, tokens, encryption keys (e.g. KESTREL_DATA_KEY), or
+# other secrets. Shared by every executor that builds a subprocess env so the
+# host environment is never leaked into script code (F129).
+_SAFE_ENV_VARS = {
+    "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+    "TMPDIR", "TERM", "TZ", "PYTHONPATH", "VIRTUAL_ENV",
+}
+
+
 class ExecutionError(Exception):
     """Base exception for execution errors."""
     pass

@@ -430,13 +430,15 @@ class ComputeFeature(Feature):
         # sufficient; a host that bypasses or misregisters the hook chain
         # would otherwise trust a forgeable legacy 'hmac:' tag.
         #
-        # Gate on state, not on a truthy signature (#925). A manually
+        # Gate on state, not on a truthy signature (#925 / F127). A manually
         # corrupted DB row with state=SIGNED and signature=None/"" would
         # otherwise skip verify entirely and fall through to the state
         # check that accepts SIGNED. ``signer.verify()`` already rejects
         # null/empty signatures internally; we just have to actually call it.
+        # Cover EVERY state that can reach execution (SIGNED, APPROVED,
+        # PENDING_REVIEW) so nothing runs without a valid signature.
         if self.signer is not None and script.state in (
-            ScriptState.SIGNED, ScriptState.APPROVED,
+            ScriptState.SIGNED, ScriptState.APPROVED, ScriptState.PENDING_REVIEW,
         ):
             is_valid = await self.signer.verify(script)
             if not is_valid:

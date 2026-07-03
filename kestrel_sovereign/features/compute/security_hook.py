@@ -92,12 +92,18 @@ class ComputeSecurityHook(Hook):
         if not script:
             return HookOutput.deny(f"Script not found: {script_id}")
         
-        # Verify signature if signer available
-        if self.signer and script.signature:
+        # Verify signature whenever a signer is available. Gate on the signer,
+        # NOT on truthiness of script.signature (#925 / F127): an unsigned or
+        # null-signature script must be DENIED, not waved through. A DRAFT with
+        # no signature, or a corrupted SIGNED row with signature=None/"", would
+        # otherwise skip verify entirely and reach an executable state.
+        # ``signer.verify()`` already rejects null/empty signatures internally;
+        # we just have to call it unconditionally.
+        if self.signer is not None:
             is_valid = await self.signer.verify(script)
             if not is_valid:
                 script.state = ScriptState.REJECTED
-                script.review_notes = "Invalid signature - possible tampering"
+                script.review_notes = "Invalid or missing signature - possible tampering"
                 await self.script_store.update(script)
                 return HookOutput.deny("Invalid script signature - possible tampering")
         

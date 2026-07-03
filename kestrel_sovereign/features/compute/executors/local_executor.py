@@ -18,18 +18,17 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from .base import BaseExecutor, ExecutionError, ExecutionEnvironmentError, ExecutionTimeoutError
+from .base import (
+    BaseExecutor,
+    ExecutionError,
+    ExecutionEnvironmentError,
+    ExecutionTimeoutError,
+    _SAFE_ENV_VARS,
+)
 from ..models import ComputeScript, ExecutionRecord
 from ..destructive_policy import DestructiveOperationPolicy
 
 logger = logging.getLogger(__name__)
-
-# Allowlist of environment variables safe to pass to subprocesses.
-# Never pass API keys, tokens, encryption keys, or other secrets.
-_SAFE_ENV_VARS = {
-    "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
-    "TMPDIR", "TERM", "TZ", "PYTHONPATH", "VIRTUAL_ENV",
-}
 
 
 class LocalExecutor(BaseExecutor):
