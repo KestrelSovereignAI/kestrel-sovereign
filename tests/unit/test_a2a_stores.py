@@ -220,6 +220,51 @@ class TestTaskStore:
         assert all(t.status.state == TaskState.SUBMITTED for t in pending)
 
     @pytest.mark.asyncio
+    async def test_list_tasks_status_filter_each_of_five_states(self, db_path):
+        """``list_tasks(status=...)`` must filter by SQL status for every state.
+
+        Regression for #1946 / F309: ``list_my_tasks`` advertised a status
+        filter but the underlying fetch was hardwired to ``get_pending_tasks``
+        (SUBMITTED only), so any other status silently returned the wrong set.
+        The fix routes status filters through ``list_tasks``; this exercises
+        that passthrough against a REAL store instance for each of the five
+        user-facing TaskStates and asserts the right rows come back.
+        """
+        backend = SQLiteBackend(db_path)
+        await backend.connect()
+        store = track_store(TaskStore(backend))
+        await store.initialize()
+
+        five_states = [
+            TaskState.SUBMITTED,
+            TaskState.WORKING,
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.CANCELED,
+        ]
+        # One task per state so each filter must select exactly its own row.
+        for state in five_states:
+            await store.save(
+                Task(
+                    id=f"task-{state.value}",
+                    status=TaskStatus(state=state),
+                )
+            )
+
+        for state in five_states:
+            rows = await store.list_tasks(status=state)
+            assert len(rows) == 1, (
+                f"status={state.value} returned {len(rows)} rows, expected 1"
+            )
+            assert rows[0].id == f"task-{state.value}"
+            assert rows[0].status.state == state
+
+        # The worker drain path must remain submitted-only and unaffected.
+        pending = await store.get_pending_tasks()
+        assert len(pending) == 1
+        assert pending[0].status.state == TaskState.SUBMITTED
+
+    @pytest.mark.asyncio
     async def test_list_tasks_by_session(self, db_path):
         """Test listing tasks filtered by session."""
         backend = SQLiteBackend(db_path)
