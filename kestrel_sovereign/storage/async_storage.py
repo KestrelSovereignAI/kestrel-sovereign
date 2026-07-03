@@ -940,7 +940,12 @@ class AsyncStorage:
                         + ", created_at"
                         + (", deleted_at" if has_deleted_at else ", NULL AS deleted_at")
                         + " FROM conversation_history"
-                        + " ORDER BY created_at"
+                        # Tie-break on the original row id: created_at is often
+                        # second-granularity, so same-second turns must keep
+                        # their original order — new ids are assigned in this
+                        # order and get_conversation_history() sorts by id, so a
+                        # tie here would swap user/assistant turns (codex P2).
+                        + " ORDER BY created_at, id"
                     )
                     conversations = await cursor.fetchall()
 

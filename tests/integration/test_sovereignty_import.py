@@ -91,6 +91,37 @@ async def test_restore_preserves_created_at_and_trash(temp_db):
 
 
 @pytest.mark.asyncio
+async def test_restore_preserves_turn_order_for_same_second(temp_db):
+    """#F265 (codex P2): same-second messages must keep their original turn
+    order across a restore (new ids are assigned in the restore SELECT order,
+    and reads sort by id). Uses the plaintext ``role`` sequence as the
+    observable order (content may be encrypted at rest)."""
+    roles = ["user", "assistant", "user", "assistant"]
+    async with Storage(db_path=temp_db) as storage:
+        for i, role in enumerate(roles):
+            await storage.add_conversation(role, f"turn {i}", metadata={})
+        # Force every row to the SAME created_at (second-granularity collision).
+        await storage.db.execute_commit(
+            "UPDATE conversation_history SET created_at = ?",
+            ("2020-01-01T00:00:00+00:00",),
+        )
+        blob = await storage.create_backup_blob(include_db=True)
+
+    fd, target_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        async with Storage(db_path=target_path) as target:
+            await target.restore_from_backup_blob(blob)
+            rows = await target.db.fetchall(
+                "SELECT role FROM conversation_history ORDER BY id"
+            )
+            assert [r[0] for r in rows] == roles
+    finally:
+        if os.path.exists(target_path):
+            os.remove(target_path)
+
+
+@pytest.mark.asyncio
 async def test_export_import_roundtrip(temp_db):
     """
     Test the full export->import cycle.
