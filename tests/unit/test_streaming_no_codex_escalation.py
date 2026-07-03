@@ -487,13 +487,19 @@ def _build_configured_host(
     providers_spec,
     *,
     route_priority,
+    allow_paid_fallback=True,
 ):
     """Host whose ``config`` carries an operator ``route_priority``.
 
     ``providers_spec`` is a list of ``(name, "raise"|"ok", exc_or_none)``.
+    ``allow_paid_fallback`` defaults True (historical behavior); pass False to
+    exercise cost-over-availability strict mode (refuse plan->paid downgrade).
     """
     host = _RecordingHost([])
-    host.config = {"route_priority": list(route_priority)}
+    host.config = {
+        "route_priority": list(route_priority),
+        "allow_paid_fallback": allow_paid_fallback,
+    }
     built = []
     for name, kind, exc in providers_spec:
         if kind == "raise":
@@ -615,6 +621,70 @@ async def test_no_silent_swap_stream_with_tool_detection():
             pass
     assert host.attempted == ["openai:plan"], host.attempted
     assert "refusing to silently swap vendors" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# allow_paid_fallback = false (cost-over-availability): a plan/free route
+# failure (e.g. a 429 throttle) must NOT silently downgrade to a metered
+# :api route. It may still reach another plan/free route, or fail loudly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_refuses_plan_to_paid_downgrade():
+    """openai:plan fails; with allow_paid_fallback=False the same-vendor paid
+    route openai:api is refused (not billed) and the chain fails loudly."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", RuntimeError("429 rate limit exceeded")),
+            ("openai:api", "ok", None),
+        ],
+        route_priority=["openai:plan", "openai:api"],
+        allow_paid_fallback=False,
+    )
+    with pytest.raises(LLMStreamingError):
+        async for _ in host.get_streaming_response(system_prompt="s", user_prompt="hi"):
+            pass
+    assert host.attempted == ["openai:plan"], host.attempted
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_still_allows_plan_to_plan_fallback():
+    """Strict mode only refuses paid downgrades — a plan->plan fallback (both
+    subscription routes) is still allowed."""
+    host = _build_configured_host(
+        [
+            ("openai:plan", "raise", RuntimeError("429 rate limit exceeded")),
+            ("anthropic:plan", "ok", None),
+        ],
+        route_priority=["openai:plan", "anthropic:plan"],
+        allow_paid_fallback=False,
+    )
+    chunks = []
+    async for chunk in host.get_streaming_response(system_prompt="s", user_prompt="hi"):
+        chunks.append(chunk)
+    assert host.attempted == ["openai:plan", "anthropic:plan"], host.attempted
+    assert chunks == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_leaves_all_paid_config_unaffected():
+    """A deliberately metered config (no plan route) is unaffected — there is
+    no preferred plan/free route to downgrade away from, so paid->paid
+    fallback still works even with allow_paid_fallback=False."""
+    host = _build_configured_host(
+        [
+            ("openai:api", "raise", RuntimeError("500 server error")),
+            ("anthropic:api", "ok", None),
+        ],
+        route_priority=["openai:api", "anthropic:api"],
+        allow_paid_fallback=False,
+    )
+    chunks = []
+    async for chunk in host.get_streaming_response(system_prompt="s", user_prompt="hi"):
+        chunks.append(chunk)
+    assert host.attempted == ["openai:api", "anthropic:api"], host.attempted
+    assert chunks == ["ok"]
 
 
 # ---------------------------------------------------------------------------

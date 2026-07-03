@@ -37,10 +37,36 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
+from contextlib import asynccontextmanager
+
 from .retry import with_retry
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _anthropic_stream_with_retry(client, api_params):
+    """Open an Anthropic streaming response, retrying the OPEN on transient
+    errors — especially a 429 throttle on the plan/OAuth route.
+
+    The throttle fails at request time, before any chunk is yielded, so
+    retrying the open cannot duplicate output; and it stops a rate-limited
+    plan route from immediately falling through to the metered API route.
+    This streaming open was previously the one Anthropic provider call NOT
+    wrapped in ``with_retry`` (unlike non-streaming ``get_response`` and the
+    OpenAI adapter), which is why a plan throttle silently billed the API.
+    Mid-stream failures are not retried — partial text has already shipped.
+    """
+    async def _enter():
+        cm = client.messages.stream(**api_params)
+        return cm, await cm.__aenter__()
+
+    stream_cm, stream = await with_retry(_enter)
+    try:
+        yield stream
+    finally:
+        await stream_cm.__aexit__(None, None, None)
 
 
 # --------------------------------------------------------------------------
@@ -1105,7 +1131,7 @@ class AnthropicAdapter(LLMAdapter):
             await self._ensure_fresh_oauth_token(client)
             splitter = ThinkingContentSplitter(provider="anthropic")
 
-            async with client.messages.stream(**api_params) as stream:
+            async with _anthropic_stream_with_retry(client, api_params) as stream:
                 stream_iter = stream.__aiter__()
                 while True:
                     try:
@@ -1242,7 +1268,7 @@ class AnthropicAdapter(LLMAdapter):
             output_tokens = None
             splitter = ThinkingContentSplitter(provider="anthropic")
 
-            async with client.messages.stream(**api_params) as stream:
+            async with _anthropic_stream_with_retry(client, api_params) as stream:
                 stream_iter = stream.__aiter__()
                 while True:
                     try:
