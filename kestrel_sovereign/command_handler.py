@@ -194,7 +194,10 @@ class CommandHandler:
                 # and external SDK-based features (github, reflection). Render
                 # from it directly — this is what fixes SDK-based features'
                 # !commands printing "❌ Error: Unknown error" on success (#F002).
-                if task_result.get("status") in ("ok", "error", "partial"):
+                # Strict discriminator so a legacy command result that merely
+                # carries a ``status`` field isn't misread as an envelope.
+                from kestrel_sovereign.features.base import is_flat_toolresult_envelope
+                if is_flat_toolresult_envelope(task_result):
                     return self._format_tool_result_envelope(task_result)
 
                 # Defensive: a legacy nested ``{result: {status: ...}}`` envelope

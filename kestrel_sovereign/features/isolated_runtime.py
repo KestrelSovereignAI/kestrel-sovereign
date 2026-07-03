@@ -326,9 +326,8 @@ class ProxyFeature(Feature):
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         try:
             result = await _maybe_await(self._client.call_tool(name, args))
-            if isinstance(result, dict) and result.get("status") in (
-                "ok", "error", "partial",
-            ):
+            from kestrel_sovereign.features.base import is_flat_toolresult_envelope
+            if is_flat_toolresult_envelope(result):
                 # Service returned the flat ToolResult envelope. Pass it through
                 # TOP-LEVEL (unified shape #F025) rather than nesting it under
                 # ``result`` with a hardcoded ``success: True`` — that hid a

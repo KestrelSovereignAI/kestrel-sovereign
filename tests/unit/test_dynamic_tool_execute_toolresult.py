@@ -35,7 +35,34 @@ import pytest
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.base import (
+    Feature,
+    is_flat_toolresult_envelope,
+    tool,
+)
+
+
+# ---------------------------------------------------------------------------
+# Flat-envelope discriminator: a real ToolResult.to_dict() vs a domain payload
+# ---------------------------------------------------------------------------
+
+
+def test_is_flat_toolresult_envelope_discriminates_real_envelope():
+    assert is_flat_toolresult_envelope(ToolResult.ok("done").to_dict()) is True
+    assert is_flat_toolresult_envelope(ToolResult.failed("boom").to_dict()) is True
+    assert is_flat_toolresult_envelope(
+        ToolResult.partial("half", "rest failed").to_dict()
+    ) is True
+
+
+def test_is_flat_toolresult_envelope_rejects_domain_payload_with_status():
+    # A legacy service payload whose ``status`` is a DOMAIN field, not a
+    # ToolResult status — must NOT be treated as an envelope (codex P2), so the
+    # isolated proxy keeps wrapping it and its payload isn't dropped.
+    assert is_flat_toolresult_envelope({"status": "ok", "items": [1, 2, 3]}) is False
+    assert is_flat_toolresult_envelope({"status": "error", "items": []}) is False
+    assert is_flat_toolresult_envelope({"status": "running"}) is False
+    assert is_flat_toolresult_envelope("not a dict") is False
 
 
 class _FixtureFeature(Feature):

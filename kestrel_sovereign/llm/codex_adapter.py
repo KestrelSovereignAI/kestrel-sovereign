@@ -526,12 +526,14 @@ def _result_to_codex_response(
             )
         else:
             text = err if isinstance(err, str) and err else str(result)
-    elif isinstance(result, dict) and result.get("status") in ("ok", "error", "partial"):
+    elif isinstance(result, dict) and _is_flat_toolresult(result):
         # Unified flat ToolResult envelope (#F025) — same shape the object
         # branch above handles, but already serialized to a dict. Mirror its
         # semantics: OK is success (surface confirmation/data); ERROR/PARTIAL
         # are non-success (surface the error) so they route through the failure
-        # classifier rather than being narrated as success.
+        # classifier rather than being narrated as success. The strict
+        # discriminator avoids misreading a legacy payload that merely carries a
+        # ``status`` domain field (codex P2).
         status = result.get("status")
         success = status == "ok"
         if success:
@@ -586,6 +588,28 @@ def _is_toolresult(obj: Any) -> bool:
         and hasattr(obj, "data")
         and hasattr(obj, "confirmation")
     )
+
+
+def _is_flat_toolresult(value: Any) -> bool:
+    """Serialized (flat) ToolResult envelope discriminator (#F025).
+
+    The dict counterpart of :func:`_is_toolresult`. Kept import-free at the
+    LLM-adapter layer for the same reason (mirrors
+    ``kestrel_sovereign.features.base.is_flat_toolresult_envelope``). A real
+    ``ToolResult.to_dict()`` satisfies the invariants — OK has ``confirmation``,
+    ERROR has ``error``, PARTIAL has both — so a legacy payload that merely
+    carries a ``status`` domain field is not misread as an envelope.
+    """
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    if status == "ok":
+        return "confirmation" in value
+    if status == "error":
+        return "error" in value
+    if status == "partial":
+        return "confirmation" in value and "error" in value
+    return False
 
 
 # Recovery hints per outcome — what the LLM should TRY NEXT for each
@@ -1743,10 +1767,11 @@ class CodexAdapter(LLMAdapter):
                 # over ``success`` — a serialized error/partial envelope may
                 # reach here before ``success`` is derived, and gating the audit
                 # slice on ``success`` alone would misclassify an audited
-                # user-denial as a sandbox/policy block (codex P2).
-                status = result.get("status")
-                if status in ("ok", "error", "partial"):
-                    is_failure = status in ("error", "partial")
+                # user-denial as a sandbox/policy block (codex P2). Strict
+                # discriminator so a legacy ``status`` domain field isn't
+                # misread as an envelope.
+                if _is_flat_toolresult(result):
+                    is_failure = result.get("status") in ("error", "partial")
                 else:
                     is_failure = not bool(result.get("success", True))
             return _result_to_codex_response(

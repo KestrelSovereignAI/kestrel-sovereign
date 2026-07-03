@@ -63,6 +63,28 @@ Continue the same task now:
 - Do not describe a future tool call without making it."""
 
 
+def is_flat_toolresult_envelope(value: Any) -> bool:
+    """True if ``value`` is a serialized (flat) ToolResult envelope (#F025).
+
+    Discriminates a real ``ToolResult.to_dict()`` from an arbitrary dict that
+    merely has a ``status`` domain field. A genuine envelope satisfies the
+    ToolResult invariants (enforced in ``ToolResult.__post_init__``): OK carries
+    a ``confirmation``, ERROR carries an ``error``, PARTIAL carries both. A
+    legacy service payload like ``{"status": "ok", "items": [...]}`` therefore
+    does NOT match and keeps its raw shape.
+    """
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    if status == "ok":
+        return "confirmation" in value
+    if status == "error":
+        return "error" in value
+    if status == "partial":
+        return "confirmation" in value and "error" in value
+    return False
+
+
 def _serialize_tool_result(result: Any) -> Any:
     """Convert a tool result to a JSON-serializable format.
 
