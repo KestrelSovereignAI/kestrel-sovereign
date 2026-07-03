@@ -22,6 +22,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.audit_time import normalize_audit_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +117,16 @@ class AuditAnchorFeature(Feature):
             storage_failed_reason = str(e)
             # Fall back to hash-only anchor (no file storage ref)
 
-        # Determine entry time range
+        # Determine entry time range. Normalize every source timestamp to
+        # canonical UTC ISO-8601 first (F092) — otherwise min()/max() over a mix
+        # of space-separated CURRENT_TIMESTAMP strings and ISO stamps picks the
+        # wrong boundaries, and the range read back would miss entries.
         timestamps = [
-            e.get("created_at", e.get("timestamp", ""))
+            normalize_audit_timestamp(e.get("created_at") or e.get("timestamp"))
             for e in entries
             if e.get("created_at") or e.get("timestamp")
         ]
+        timestamps = [t for t in timestamps if t]
         first_entry_at = min(timestamps) if timestamps else None
         last_entry_at = max(timestamps) if timestamps else None
 
@@ -425,6 +430,11 @@ class AuditAnchorFeature(Feature):
         """
         entries = []
 
+        # Compare on NORMALIZED timestamps in Python (F092), not a SQL string
+        # range — rows may mix space/naive/offset formats. Raw created_at is kept
+        # so the anchor hash is unchanged.
+        since_norm = normalize_audit_timestamp(since)
+
         permission_store = self._get_permission_store()
         if permission_store is not None:
             import aiosqlite
@@ -432,28 +442,25 @@ class AuditAnchorFeature(Feature):
             try:
                 async with aiosqlite.connect(permission_store.db_path) as db:
                     db.row_factory = aiosqlite.Row
-                    if since:
-                        cursor = await db.execute(
-                            """SELECT id, feature_name, tool_name, action, decision,
-                                      user_choice, args_summary, created_at
-                               FROM security_audit_log
-                               WHERE created_at > ?
-                               ORDER BY created_at ASC""",
-                            (since,),
-                        )
-                    else:
-                        cursor = await db.execute(
-                            """SELECT id, feature_name, tool_name, action, decision,
-                                      user_choice, args_summary, created_at
-                               FROM security_audit_log
-                               ORDER BY created_at ASC"""
-                        )
+                    cursor = await db.execute(
+                        """SELECT id, feature_name, tool_name, action, decision,
+                                  user_choice, args_summary, created_at
+                           FROM security_audit_log
+                           ORDER BY id ASC"""
+                    )
                     rows = await cursor.fetchall()
-                    entries.extend(dict(row) for row in rows)
+                    for row in rows:
+                        if since_norm:
+                            ts = normalize_audit_timestamp(row["created_at"])
+                            if ts and ts <= since_norm:
+                                continue
+                        entries.append(dict(row))
             except Exception as e:
                 logger.warning(f"Could not read audit log entries: {e}")
 
-        entries.extend(await self._get_destructive_audit_entries_since(since))
+        entries.extend(
+            await self._get_destructive_audit_entries_since(since_norm or None)
+        )
         return entries
 
     async def _get_audit_entries_range(
@@ -471,35 +478,50 @@ class AuditAnchorFeature(Feature):
         """
         entries = []
 
+        # Boundary comparison happens in Python on NORMALIZED timestamps (F092),
+        # not via a SQL string range: security_audit_log rows can be a mix of
+        # space-separated CURRENT_TIMESTAMP, naive-ISO, and offset-bearing ISO,
+        # and a raw string ``WHERE created_at >= ?`` silently drops rows whose
+        # format differs from the boundary's. The row's RAW created_at is kept in
+        # the returned dict so the anchor hash stays byte-identical.
+        first_norm = normalize_audit_timestamp(first_at)
+        last_norm = normalize_audit_timestamp(last_at)
+
+        def _in_range(raw_ts) -> bool:
+            ts = normalize_audit_timestamp(raw_ts)
+            if not ts:
+                return not (first_norm or last_norm)
+            if first_norm and ts < first_norm:
+                return False
+            if last_norm and ts > last_norm:
+                return False
+            return True
+
         permission_store = self._get_permission_store()
         if permission_store is not None:
             import aiosqlite
             try:
                 async with aiosqlite.connect(permission_store.db_path) as db:
                     db.row_factory = aiosqlite.Row
-                    if first_at and last_at:
-                        cursor = await db.execute(
-                            """SELECT id, feature_name, tool_name, action, decision,
-                                      user_choice, args_summary, created_at
-                               FROM security_audit_log
-                               WHERE created_at >= ? AND created_at <= ?
-                               ORDER BY created_at ASC""",
-                            (first_at, last_at),
-                        )
-                    else:
-                        cursor = await db.execute(
-                            """SELECT id, feature_name, tool_name, action, decision,
-                                      user_choice, args_summary, created_at
-                               FROM security_audit_log
-                               ORDER BY created_at ASC"""
-                        )
+                    cursor = await db.execute(
+                        """SELECT id, feature_name, tool_name, action, decision,
+                                  user_choice, args_summary, created_at
+                           FROM security_audit_log
+                           ORDER BY id ASC"""
+                    )
                     rows = await cursor.fetchall()
-                    entries.extend(dict(row) for row in rows)
+                    entries.extend(
+                        dict(row) for row in rows if _in_range(row["created_at"])
+                    )
             except Exception as e:
                 logger.warning(f"Could not read audit log entries for range: {e}")
 
+        # Destructive rows are canonical ISO already; pass canonical boundaries
+        # so an old naive/space boundary still matches them.
         entries.extend(
-            await self._get_destructive_audit_entries_range(first_at, last_at)
+            await self._get_destructive_audit_entries_range(
+                first_norm or None, last_norm or None
+            )
         )
         return entries
 
