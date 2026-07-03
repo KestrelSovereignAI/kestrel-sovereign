@@ -17,6 +17,7 @@ from kestrel_sovereign.features.deploy.models import (
     DeployManagerError,
 )
 from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
+from google.cloud.run_v2.types import Condition
 
 
 @pytest.fixture
@@ -100,6 +101,12 @@ class TestCloudRunProviderDeploy:
         mock_result.latest_ready_revision = "kestrel-dev-00001-abc"
         mock_operation.result.return_value = mock_result
         mock_client.create_service.return_value = mock_operation
+
+        # get_iam_policy must return a real Policy so the follow-up
+        # SetIamPolicyRequest(policy=...) proto can be constructed.
+        from google.iam.v1 import policy_pb2
+
+        mock_client.get_iam_policy.return_value = policy_pb2.Policy()
 
         provider = CloudRunProvider(project_id="test-project")
         provider._services_client = mock_client
@@ -218,9 +225,9 @@ class TestCloudRunProviderStatus:
         mock_service.uri = "https://kestrel-dev-abc123.run.app"
         mock_service.latest_ready_revision = "kestrel-dev-00001-abc"
 
-        mock_condition = MagicMock()
-        mock_condition.type = "Ready"
-        mock_condition.state = "CONDITION_SUCCEEDED"
+        mock_condition = Condition(
+            type_="Ready", state=Condition.State.CONDITION_SUCCEEDED
+        )
         mock_service.conditions = [mock_condition]
 
         mock_client.list_services.return_value = [mock_service]
@@ -248,9 +255,9 @@ class TestCloudRunProviderStatus:
         mock_service.uri = "https://kestrel-dev-abc123.run.app"
         mock_service.latest_ready_revision = None
 
-        mock_condition = MagicMock()
-        mock_condition.type = "Ready"
-        mock_condition.state = "PENDING"
+        mock_condition = Condition(
+            type_="Ready", state=Condition.State.CONDITION_PENDING
+        )
         mock_service.conditions = [mock_condition]
 
         mock_client.list_services.return_value = [mock_service]
@@ -344,9 +351,9 @@ class TestCloudRunProviderList:
         mock_service1.uri = "https://kestrel-dev-abc123.run.app"
         mock_service1.create_time = datetime(2026, 2, 15, 12, 0, 0)
 
-        mock_condition1 = MagicMock()
-        mock_condition1.type = "Ready"
-        mock_condition1.state = "CONDITION_SUCCEEDED"
+        mock_condition1 = Condition(
+            type_="Ready", state=Condition.State.CONDITION_SUCCEEDED
+        )
         mock_service1.conditions = [mock_condition1]
 
         mock_service2 = MagicMock()
@@ -354,9 +361,9 @@ class TestCloudRunProviderList:
         mock_service2.uri = "https://kestrel-prod-xyz789.run.app"
         mock_service2.create_time = datetime(2026, 2, 14, 12, 0, 0)
 
-        mock_condition2 = MagicMock()
-        mock_condition2.type = "Ready"
-        mock_condition2.state = "CONDITION_SUCCEEDED"
+        mock_condition2 = Condition(
+            type_="Ready", state=Condition.State.CONDITION_SUCCEEDED
+        )
         mock_service2.conditions = [mock_condition2]
 
         # Non-kestrel service should be filtered out
