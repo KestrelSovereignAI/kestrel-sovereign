@@ -1034,6 +1034,111 @@ class TestRowToEntry:
 
 
 # =========================================================================
+# DeliveryQueue - in-flight reclamation on start (F163)
+# =========================================================================
+
+
+class TestQueueReclaimInFlight:
+    """A crash/restart leaves rows IN_FLIGHT forever; start() must reclaim them."""
+
+    @pytest_asyncio.fixture
+    async def real_queue(self, tmp_path):
+        """DeliveryQueue backed by a real (file) SQLite database."""
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "delivery.db"))
+        q = DeliveryQueue(database, "did:test:reclaim-agent")
+        await q._ensure_tables()
+        yield q
+        await q.stop()
+        await database.close()
+
+    async def _insert(self, q, entry_id, status, attempts):
+        now = datetime.now(timezone.utc).isoformat()
+        await q._db.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json, content_hash,
+                 status, attempts, max_retries, next_retry_at, last_error,
+                 created_at, delivered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 5, ?, NULL, ?, NULL)
+            """,
+            (entry_id, q._agent_id, "webhook", "https://example.com/hook",
+             '{"text": "hi"}', f"hash-{entry_id}", status, attempts, now, now),
+        )
+
+    async def _status_attempts(self, q, entry_id):
+        row = await q._db.fetchone(
+            "SELECT status, attempts FROM delivery_queue WHERE id = ?",
+            (entry_id,),
+        )
+        return row[0], row[1]
+
+    @pytest.mark.asyncio
+    async def test_in_flight_row_reclaimed_preserving_attempts(self, real_queue):
+        await self._insert(real_queue, "stuck", DeliveryStatus.IN_FLIGHT.value, 2)
+
+        reclaimed = await real_queue._reclaim_in_flight()
+
+        assert reclaimed == 1
+        status, attempts = await self._status_attempts(real_queue, "stuck")
+        assert status == DeliveryStatus.PENDING.value
+        assert attempts == 2  # attempts preserved
+
+    @pytest.mark.asyncio
+    async def test_start_reclaims_in_flight(self, real_queue):
+        await self._insert(real_queue, "stuck", DeliveryStatus.IN_FLIGHT.value, 1)
+
+        # start() launches the worker; it must reclaim before/at launch.
+        await real_queue.start()
+
+        status, attempts = await self._status_attempts(real_queue, "stuck")
+        assert status == DeliveryStatus.PENDING.value
+        assert attempts == 1
+
+    @pytest.mark.asyncio
+    async def test_reclaim_leaves_other_statuses_untouched(self, real_queue):
+        await self._insert(real_queue, "pend", DeliveryStatus.PENDING.value, 0)
+        await self._insert(real_queue, "done", DeliveryStatus.DELIVERED.value, 3)
+        await self._insert(real_queue, "flight", DeliveryStatus.IN_FLIGHT.value, 1)
+
+        reclaimed = await real_queue._reclaim_in_flight()
+
+        assert reclaimed == 1  # only the in_flight row
+        assert (await self._status_attempts(real_queue, "pend"))[0] == DeliveryStatus.PENDING.value
+        assert (await self._status_attempts(real_queue, "done"))[0] == DeliveryStatus.DELIVERED.value
+        assert (await self._status_attempts(real_queue, "flight"))[0] == DeliveryStatus.PENDING.value
+
+    @pytest.mark.asyncio
+    async def test_reclaim_scoped_to_agent(self, real_queue):
+        # A row owned by a different agent must not be touched.
+        await self._insert(real_queue, "mine", DeliveryStatus.IN_FLIGHT.value, 0)
+        now = datetime.now(timezone.utc).isoformat()
+        await real_queue._db.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json, content_hash,
+                 status, attempts, max_retries, next_retry_at, last_error,
+                 created_at, delivered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 5, ?, NULL, ?, NULL)
+            """,
+            ("theirs", "did:test:other-agent", "webhook", "https://example.com/hook",
+             '{"text": "hi"}', "hash-theirs", DeliveryStatus.IN_FLIGHT.value, now, now),
+        )
+
+        reclaimed = await real_queue._reclaim_in_flight()
+
+        assert reclaimed == 1
+        assert (await self._status_attempts(real_queue, "theirs"))[0] == DeliveryStatus.IN_FLIGHT.value
+
+    @pytest.mark.asyncio
+    async def test_reclaim_noop_when_nothing_in_flight(self, real_queue):
+        await self._insert(real_queue, "pend", DeliveryStatus.PENDING.value, 0)
+        reclaimed = await real_queue._reclaim_in_flight()
+        assert reclaimed == 0
+
+
+# =========================================================================
 # Run tests
 # =========================================================================
 
