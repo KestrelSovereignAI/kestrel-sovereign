@@ -14,6 +14,12 @@ import { reapplyActiveSelectorLock } from './voice/ui.js';
 import { UI } from './ui-ext/registry.js';
 import Panels from './ui-ext/panels.js';
 import { loadFeatureUIContributions } from './ui-ext/feature-loader.js';
+// #2145: core panels are ui-ext panel-registry contributions now. registerCorePanels
+// adopts their in-place index.html tabs/bodies and gates them through each panel's
+// `gate`; makePanelActivator / attachDelegatedNav are the shared activation code
+// path reused by the embeddable mountPanels host so there is a single activation
+// path (`Panels.activate`) for standalone and embed.
+import { registerCorePanels, makePanelActivator, attachDelegatedNav } from './ui-ext/mount-panels.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -59,111 +65,70 @@ export function setLazyLoaders(loaders) {
     loadApprovals = loaders.loadApprovals;
 }
 
-// Map data-panel values to the capability keys that gate them (#879).
-// A panel whose required caps are ALL explicitly false is removed from
-// the nav and its panel DOM is dropped — no hidden-but-present buttons.
-// A panel listed with multiple caps stays visible if ANY of them is on
-// (e.g. ``security`` is shown when either ``audit`` or ``permissions``
-// are enabled, with the disabled sub-section hidden by the panel's own
-// init guard).
-//
-// Standalone Kestrel ships with every capability defaulting to true,
-// so this map only kicks in when an embedding host opts out.
-// `storage` is a canonical capability key but the resources panel today
-// has no storage-stats section — only keys + wallet + usage live there.
-// Listing it on this panel would make a host that enables only `storage`
-// see a Resources tab whose every visible section is hidden.  When a real
-// storage section ships, add `storage` here AND wire a sub-section guard
-// into resources.js (mirroring the keys/wallet pattern).
-const PANEL_CAPABILITIES = {
-    identity: ['identity'],
-    chat: ['chat'],
-    constitution: ['constitution'],
-    memories: ['memory'],
-    tasks: ['tasks'],
-    sovereignty: ['sovereignty'],
-    resources: ['keys', 'wallet'],
-    metrics: ['metrics'],
-    features: ['featureStore'],
-    security: ['audit', 'permissions'],
-    approvals: ['permissions'],
-};
-
-function panelIsEnabled(panelId) {
-    const caps = PANEL_CAPABILITIES[panelId];
-    if (!caps || caps.length === 0) return true;
-    return caps.some((cap) => API.hasCapability(cap));
-}
+// #2145: core-panel gating now lives on each panel's `gate` in the ui-ext panel
+// registry (see core-panels.js / registerCorePanels). The old PANEL_CAPABILITIES
+// map + `panelIsEnabled` here were the SECOND gating mechanism for the same tabs;
+// keeping both would let them disagree, so gating flows through the registry
+// alone. `chat` is the one core tab NOT migrated (it has its own `mount()` in
+// chat.js and is not a registry panel), so it is gated inline in initNavigation.
 
 // Activate a nav panel: flip the active tab/panel classes, run the core lazy
-// loader (for panels still owned by index.html), then route through the panel
-// registry so contributed panels (#2048, e.g. the extracted Spawn panel) get
-// their body rendered on first show and a `panel:shown` event fires. Called from
-// the delegated nav click handler so tabs inserted later by `registerPanel`
-// (feature panels register AFTER initNavigation runs) activate identically.
-function activatePanel(panelId) {
-    if (!panelId) return;
+// loader (standalone owns loading through these state-guarded/per-activation
+// calls), then route through the panel registry so a contributed panel's body
+// renders on first show and `panel:shown` fires. Factored through
+// makePanelActivator (#2145) so the SAME activation path serves the standalone
+// console and the embeddable mountPanels host; the loader dispatch below is the
+// `beforeActivate` hook (standalone-only — an embedder wires loading via
+// core-panels-runtime instead, so there is no double-load).
+const activatePanel = makePanelActivator({
+    tabScope: document,
+    panelScope: document,
+    api: API,
+    beforeActivate(panelId) {
+        state.currentPanel = panelId;
 
-    document.querySelectorAll('.nav-tab').forEach(t => {
-        t.classList.toggle('active', t.dataset.panel === panelId);
-    });
-    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-    document.getElementById(`panel-${panelId}`)?.classList.add('active');
-
-    state.currentPanel = panelId;
-
-    if (panelId === 'constitution' && !state.constitution && loadConstitution) loadConstitution();
-    if (panelId === 'memories' && !state.memories && loadMemories) loadMemories();
-    if (panelId === 'sovereignty' && !state.exports && loadExports) loadExports();
-    if (panelId === 'tasks' && loadTasks) loadTasks();
-    if (panelId === 'resources' && loadResources) loadResources();
-    if (panelId === 'metrics' && loadMetrics) loadMetrics();
-    if (panelId === 'features' && loadFeatureStore) loadFeatureStore();
-    if (panelId === 'approvals' && loadApprovals) loadApprovals();
-
-    // Registry-driven activation (ticket 06): renders a contributed panel's body
-    // the first time it is shown and emits `panel:shown` (+ mounts panel-section
-    // contributions). Safe for core panels still declared in index.html — the
-    // body render is skipped and only the section/event path runs.
-    Panels.activate(panelId, { api: API });
-}
+        if (panelId === 'constitution' && !state.constitution && loadConstitution) loadConstitution();
+        if (panelId === 'memories' && !state.memories && loadMemories) loadMemories();
+        if (panelId === 'sovereignty' && !state.exports && loadExports) loadExports();
+        if (panelId === 'tasks' && loadTasks) loadTasks();
+        if (panelId === 'resources' && loadResources) loadResources();
+        if (panelId === 'metrics' && loadMetrics) loadMetrics();
+        if (panelId === 'features' && loadFeatureStore) loadFeatureStore();
+        if (panelId === 'approvals' && loadApprovals) loadApprovals();
+    },
+});
 
 export function initNavigation() {
     const navEl = document.querySelector('.nav-tabs');
     const hostEl = document.querySelector('.main-content');
 
-    // Pass 1: prune nav tabs and panel DOM for any panel whose backing
-    // capability is explicitly disabled.  Done before wiring click
-    // handlers so we don't leave dangling listeners on removed nodes.
-    // Registry-contributed panels (no PANEL_CAPABILITIES entry, and not yet
-    // registered at this point in boot) are gated by the panel registry's own
-    // `gate` instead — see Panels.renderNav / Panels.syncNav.
-    document.querySelectorAll('.nav-tab').forEach((tab) => {
-        const panelId = tab.dataset.panel;
-        if (!panelIsEnabled(panelId)) {
-            tab.remove();
-            const panel = document.getElementById(`panel-${panelId}`);
-            if (panel) panel.remove();
-        }
-    });
+    // `chat` is the one core tab NOT migrated onto the registry (it has its own
+    // mount() in chat.js). Gate its static tab/panel here on host opt-out (#879);
+    // every OTHER core panel is a registry contribution gated by its own `gate`.
+    if (!API.hasCapability('chat')) {
+        document.querySelector('.nav-tab[data-panel="chat"]')?.remove();
+        document.getElementById('panel-chat')?.remove();
+    }
+
+    // #2145: register the core panels onto the ui-ext panel registry BEFORE
+    // renderNav so the registry adopts their in-place index.html tabs/bodies and
+    // gates each through its own `gate` (derived from the retired
+    // PANEL_CAPABILITIES). A gated-off panel's tab is removed by renderNav below.
+    registerCorePanels({ api: API });
 
     // Bind the panel registry (ticket 06) to the live nav + panel host BEFORE
-    // wiring click handling. Feature panel modules load later in boot
+    // wiring click handling and sync (gates core panels, renders any already
+    // registered feature panels). Feature panel modules load later in boot
     // (loadFeatureUIContributions) and call registerPanel(); with the nav bound
     // here, those registrations insert their tab/container immediately.
     Panels.renderNav({ navEl, hostEl, ctx: { api: API } });
 
-    // Delegated click handling: a single listener on the nav container activates
-    // any `.nav-tab`, including ones inserted AFTER boot by registerPanel — a
-    // per-tab listener would miss those. This is what lets a feature-owned panel
-    // become clickable without a core edit.
-    if (navEl) {
-        navEl.addEventListener('click', (e) => {
-            const tab = e.target.closest && e.target.closest('.nav-tab');
-            if (!tab || !navEl.contains(tab)) return;
-            activatePanel(tab.dataset.panel);
-        });
-    }
+    // Delegated click handling (factored + shared with mountPanels, #2145): a
+    // single listener on the nav container activates any `.nav-tab`, including
+    // ones inserted AFTER boot by registerPanel — a per-tab listener would miss
+    // those. This is what lets a feature-owned panel become clickable without a
+    // core edit.
+    if (navEl) attachDelegatedNav(navEl, activatePanel);
 
     // If the default-active "chat" tab was removed because the host
     // opted out, promote the first surviving tab to active so the page
@@ -206,27 +171,13 @@ function promoteActiveTabIfNeeded() {
     state.currentPanel = panelId;
 }
 
-// #2041: non-destructive re-gate driven by the capabilities:changed event.
-// Toggles tab/panel visibility for panels still present in the DOM so a runtime
-// feature enable/disable flips the UI without a reload.
+// #2041/#2145: non-destructive re-gate driven by the capabilities:changed event.
+// Every core panel is registry-owned now (#2145), so gating flows entirely
+// through the registry: syncNav re-evaluates each panel's `gate` and adds/removes
+// its tab + container when a capability flips at runtime (a feature
+// enabled/disabled), no reload. `chat` is gated statically at boot (host opt-out
+// is authoritative and not runtime-toggled), so nothing per-tab remains here.
 export function reconcileNavigationCapabilities() {
-    document.querySelectorAll('.nav-tab').forEach((tab) => {
-        // Registry-owned tabs (e.g. the extracted Spawn panel, #2048) are gated
-        // by the panel registry below, not by PANEL_CAPABILITIES — skip them so
-        // this loop doesn't force a registry-gated tab visible.
-        if (tab.dataset.panelRegistry === 'true') return;
-        const panelId = tab.dataset.panel;
-        const on = panelIsEnabled(panelId);
-        tab.style.display = on ? '' : 'none';
-        const panel = document.getElementById(`panel-${panelId}`);
-        if (panel && !on) {
-            tab.classList.remove('active');
-            panel.classList.remove('active');
-        }
-    });
-    // Re-gate registry-contributed panels (#2048): the registry owns the gate
-    // for panels backed by a feature's enabled state. syncNav adds/removes their
-    // tab + container when the capability flips at runtime (no reload).
     Panels.syncNav();
     promoteActiveTabIfNeeded();
 }
