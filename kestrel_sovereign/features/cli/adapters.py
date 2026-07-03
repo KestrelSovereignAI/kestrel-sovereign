@@ -28,6 +28,20 @@ _GIT_ENV_KEYS = (
     "WINDIR",
 )
 
+# Command-line ``-c`` overrides take precedence over a repo-local ``.git/config``,
+# so prepend these to neutralize config that can execute arbitrary programs even
+# from the "read-only" git tools (F120): ``core.fsmonitor`` runs on
+# status/diff/log/etc., and ``core.hooksPath`` / ``core.sshCommand`` /
+# ``diff.external`` each spawn a program a hostile checkout could point at us.
+# ``--no-optional-locks`` (previously the sole global flag) is retained here.
+_GIT_HARDENING_ARGS = (
+    "-c", "core.fsmonitor=",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.sshCommand=",
+    "-c", "diff.external=",
+    "--no-optional-locks",
+)
+
 
 class CliAdapterError(RuntimeError):
     """Raised when a registered CLI adapter command fails."""
@@ -227,7 +241,7 @@ class GitCliAdapter(FeatureCliAdapter):
         safe_repo_path = _validate_local_repo_path(repo_path)
         result = await self.terminal.run(
             TerminalCommandRequest(
-                argv=["git", "--no-optional-locks", "-C", str(safe_repo_path), *argv],
+                argv=["git", *_GIT_HARDENING_ARGS, "-C", str(safe_repo_path), *argv],
                 env=_git_env(),
                 timeout=60,
                 risk=CliRisk.READ_ONLY,
