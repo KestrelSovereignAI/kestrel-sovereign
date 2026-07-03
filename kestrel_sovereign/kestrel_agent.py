@@ -992,6 +992,30 @@ class KestrelAgent(
             # Expose observability store for orchestrator instrumentation
             self.observability_store = observability_store
 
+            # Privacy-gate the observability sink at the layer boundary (F076).
+            # Tool-call args and metadata are user content, so the sink must
+            # honour the agent's privacy mode: EPHEMERAL/ISOLATED elide the
+            # payload, ANONYMOUS anonymizes it. Bind the live privacy config by
+            # reference (same pattern as set_force_local_only_provider) so
+            # mid-session mode flips are picked up automatically.
+            if hasattr(observability_store, "set_privacy_config_provider"):
+                observability_store.set_privacy_config_provider(
+                    lambda pa=self.privacy_agent: pa.privacy_config
+                )
+            # Wire the EPHEMERAL safety-net sweep into the storage wrapper so
+            # purge_ephemeral_session also scrubs any observability rows
+            # authored during the ephemeral stint (F076). Tool-call args in
+            # a2a_observability use the agent DID as agent_name (see the
+            # log_tool_call callers), so scope by DID on both columns.
+            if hasattr(self.storage, "set_observability_purge"):
+                self.storage.set_observability_purge(
+                    lambda since, obs=observability_store, did=self.did: (
+                        obs.purge_observability_since(
+                            since, agent_did=did, agent_name=did
+                        )
+                    )
+                )
+
             # Per-agent enablement deltas (agent-driven feature/MCP-server
             # add/remove that must survive restart). Reuses the observability
             # backend so it lands in the agent's own DB. Initialized BEFORE
@@ -1960,7 +1984,14 @@ class KestrelAgent(
             )
             return breakdown
 
-        leaked = sum(breakdown.values())
+        # A genuine privacy leak means data reached tables EPHEMERAL must never
+        # write (conversation_history / graph_nodes). The observability sink is
+        # allowed to hold content-free metric rows during an ephemeral stint
+        # (F076), so its swept counts are reported in the breakdown but do NOT
+        # trip the leak audit.
+        leaked = breakdown.get("conversation_history", 0) + breakdown.get(
+            "graph_nodes", 0
+        )
         if leaked > 0:
             await self._record_ephemeral_leak_audit(
                 reason=reason, breakdown=breakdown,

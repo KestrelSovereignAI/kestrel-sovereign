@@ -62,6 +62,11 @@ from kestrel_sovereign.features.security.permissions import (
     PermissionStore,
     ToolPermission,
     FeaturePermissions,
+    UnknownFeatureError,
+)
+from kestrel_sovereign.features.security.args_summary import (
+    mask_sensitive,
+    summarize_args,
 )
 from kestrel_sovereign.features.security.approval_queue import (
     ApprovalQueue,
@@ -266,6 +271,39 @@ class TestPermissionStore:
         assert await store.get_permission("WalletAgent", "get_history") == PermissionLevel.ALLOW
 
     @pytest.mark.asyncio
+    async def test_set_feature_permission_alias_resolves_and_writes_canonical(self, store):
+        """F253: an alias spelling (``task_feature``) must resolve to the
+        canonical tree group (``TaskFeature``) and write rows there — not
+        silently no-op while confirming success."""
+        await store.register_tool("TaskFeature", "run_task", PermissionLevel.ASK)
+        await store.register_tool("TaskFeature", "cancel_task", PermissionLevel.ASK)
+
+        # Snake-alias spelling — the read path resolves it, so the write path
+        # must too.
+        await store.set_feature_permission("task_feature", PermissionLevel.DENY)
+
+        # Rows are readable under BOTH the canonical name and the alias
+        # (the read path resolves variants), proving the write landed.
+        assert await store.get_permission("TaskFeature", "run_task") == PermissionLevel.DENY
+        assert await store.get_permission("TaskFeature", "cancel_task") == PermissionLevel.DENY
+        assert await store.get_permission("task_feature", "run_task") == PermissionLevel.DENY
+
+        # And the rows were written under the CANONICAL spelling, not the alias.
+        tree = await store.get_permission_tree()
+        names = {f.feature_name for f in tree}
+        assert "TaskFeature" in names
+        assert "task_feature" not in names
+
+    @pytest.mark.asyncio
+    async def test_set_feature_permission_unknown_raises(self, store):
+        """F253: a truly-unknown feature must raise rather than log a false
+        success and persist nothing."""
+        with pytest.raises(UnknownFeatureError):
+            await store.set_feature_permission(
+                "NoSuchFeatureXyz", PermissionLevel.DENY
+            )
+
+    @pytest.mark.asyncio
     async def test_get_permission_tree(self, store):
         # Register tools
         await store.register_tool("WalletAgent", "get_balance", PermissionLevel.ALLOW)
@@ -415,6 +453,39 @@ class TestApprovalQueue:
         # First decision wins; second/third are no-ops.
         assert approved is True
         assert scope == "once"
+
+    @pytest.mark.asyncio
+    async def test_approved_secret_arg_is_masked_in_audit_log(self, tmp_path):
+        """F252: the queue's decision-persistence path must mask secret args
+        before writing them to ``security_audit_log`` — the same masking the
+        hook path applies. Previously the queue wrote raw args at rest."""
+        store = track_store(PermissionStore(str(tmp_path / "perms.db")))
+        await store.initialize()
+        await store.register_tool("WalletAgent", "send_payment", PermissionLevel.ASK)
+        queue = ApprovalQueue(permission_store=store)
+
+        async def approve_later():
+            await asyncio.sleep(0.05)
+            pending = queue.pending_requests
+            assert len(pending) == 1
+            await queue.submit_decision(pending[0].id, True, "always")
+
+        asyncio.create_task(approve_later())
+
+        approved, _ = await queue.request_approval(
+            feature_name="WalletAgent",
+            tool_name="send_payment",
+            tool_args={"api_key": "sk-live-SECRET", "amount": 100},
+        )
+        assert approved is True
+
+        entries = await store.get_audit_log()
+        assert entries, "expected an audit row for the approved call"
+        summary = entries[0]["args_summary"]
+        assert "sk-live-SECRET" not in summary
+        assert "***MASKED***" in summary
+        # Non-sensitive fields survive for triage.
+        assert "100" in summary
 
     @pytest.mark.asyncio
     async def test_request_approval_timeout(self, queue):
@@ -821,6 +892,47 @@ class TestSecurityHook:
         )
 
         output = await hook.execute(input)
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_destructive_memory_tool_routes_to_approval_and_denies(
+        self, hook, permission_store, approval_queue
+    ):
+        """F203 (#2093): a destructive memory tool registered at ALWAYS_ASK
+        must be routed through the Sovereign approval queue and BLOCKED when
+        the Sovereign denies — not executed unconditionally."""
+        await permission_store.register_tool(
+            "MemoryFeature", "purge_conversation", PermissionLevel.ALWAYS_ASK
+        )
+
+        request_was_pending = False
+
+        async def deny_later():
+            nonlocal request_was_pending
+            await asyncio.sleep(0.05)
+            pending = approval_queue.pending_requests
+            request_was_pending = bool(pending)
+            if pending:
+                await approval_queue.submit_decision(
+                    pending[0].id, False, "user_denied"
+                )
+
+        asyncio.create_task(deny_later())
+
+        input = HookInput(
+            session_id="test",
+            hook_event_name="PreToolUse",
+            tool_name="purge_conversation",
+            feature_name="MemoryFeature",
+            tool_input={"session_id": "abc", "confirm": True},
+        )
+
+        output = await hook.execute(input)
+
+        assert request_was_pending is True, (
+            "purge_conversation must be routed to the approval queue"
+        )
         assert output.continue_execution is False
         assert output.permission_decision == PermissionDecision.DENY
 
@@ -1345,6 +1457,149 @@ class TestSecurityFeature:
             await feature.permission_store.get_permission("codex_native", "fileChange")
         ) == PermissionLevel.ALWAYS_ASK
 
+    @staticmethod
+    def _memory_feature_stub():
+        """A fake MemoryFeature exposing a read tool + the destructive tools.
+
+        Mirrors the shape ``_register_all_tools`` consumes: ``get_tools()``
+        yields objects with a ``.name``, and ``tool_name`` is the subagent
+        dispatch entry. (SimpleNamespace avoids MagicMock's special-casing of
+        the ``name`` attribute.)
+        """
+        from types import SimpleNamespace
+
+        tool_names = [
+            "search_memory",          # non-destructive read → stays ALLOW
+            "purge_conversation",
+            "purge_message_by_id",
+            "delete_messages",
+            "delete_conversation",
+            "delete_message_by_id",
+        ]
+        feature = MagicMock()
+        feature.get_tools.return_value = [
+            SimpleNamespace(name=n) for n in tool_names
+        ]
+        feature.tool_name = None
+        return feature
+
+    @pytest.mark.asyncio
+    async def test_destructive_memory_tools_register_as_always_ask(self, tmp_path):
+        """F203 (#2093): the destructive MemoryFeature tools must resolve to
+        ALWAYS_ASK via the permission path, while non-destructive reads keep
+        the feature-level ALLOW default."""
+        agent = MagicMock()
+        agent.features = {"MemoryFeature": self._memory_feature_stub()}
+        feature = SecurityFeature(agent)
+        feature.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feature.permission_store.initialize()
+
+        await feature._register_all_tools()
+
+        store = feature.permission_store
+        for destructive in (
+            "purge_conversation",
+            "purge_message_by_id",
+            "delete_messages",
+            "delete_conversation",
+            "delete_message_by_id",
+        ):
+            assert (
+                await store.get_permission("MemoryFeature", destructive)
+            ) == PermissionLevel.ALWAYS_ASK, destructive
+
+        # Non-destructive read stays on the per-feature ALLOW default.
+        assert (
+            await store.get_permission("MemoryFeature", "search_memory")
+        ) == PermissionLevel.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_demo_override_does_not_downgrade_destructive_memory_tools(
+        self, tmp_path, monkeypatch
+    ):
+        """Even on a demo server (which force-ALLOWs every other tool), the
+        destructive memory tools stay ALWAYS_ASK so a demo/governed agent can't
+        purge history — the exact hole F203 named."""
+        monkeypatch.setenv("KESTREL_DEMO_SERVER", "1")
+        agent = MagicMock()
+        agent.features = {"MemoryFeature": self._memory_feature_stub()}
+        feature = SecurityFeature(agent)
+        feature.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feature.permission_store.initialize()
+
+        await feature._register_all_tools()
+
+        store = feature.permission_store
+        # Demo override force-ALLOWs the read tool...
+        assert (
+            await store.get_permission("MemoryFeature", "search_memory")
+        ) == PermissionLevel.ALLOW
+        # ...but the destructive tools are excluded from that override.
+        for destructive in (
+            "purge_conversation",
+            "purge_message_by_id",
+            "delete_messages",
+            "delete_conversation",
+            "delete_message_by_id",
+        ):
+            assert (
+                await store.get_permission("MemoryFeature", destructive)
+            ) == PermissionLevel.ALWAYS_ASK, destructive
+
+    @pytest.mark.asyncio
+    async def test_register_upgrades_stale_allow_row_on_destructive_tool(
+        self, tmp_path
+    ):
+        """F203 upgrade gap (#2093): an already-running agent that persisted a
+        permissive ALLOW row for a destructive memory tool under the old
+        feature-level default must be force-upgraded to ALWAYS_ASK by
+        registration — INSERT-OR-IGNORE would otherwise leave the ALLOW row in
+        place and the tool would keep bypassing approval after upgrade."""
+        agent = MagicMock()
+        agent.features = {"MemoryFeature": self._memory_feature_stub()}
+        feature = SecurityFeature(agent)
+        feature.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feature.permission_store.initialize()
+        store = feature.permission_store
+
+        # Pre-seed the stale permissive row an old agent DB would carry.
+        await store.set_permission(
+            "MemoryFeature", "purge_conversation", PermissionLevel.ALLOW
+        )
+        assert (
+            await store.get_permission("MemoryFeature", "purge_conversation")
+        ) == PermissionLevel.ALLOW
+
+        await feature._register_all_tools()
+
+        assert (
+            await store.get_permission("MemoryFeature", "purge_conversation")
+        ) == PermissionLevel.ALWAYS_ASK
+
+    @pytest.mark.asyncio
+    async def test_register_preserves_stricter_deny_on_destructive_tool(
+        self, tmp_path
+    ):
+        """The hard-rail upgrade must never downgrade the operator's last
+        word: a persisted DENY (stricter than ALWAYS_ASK) survives
+        registration."""
+        agent = MagicMock()
+        agent.features = {"MemoryFeature": self._memory_feature_stub()}
+        feature = SecurityFeature(agent)
+        feature.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feature.permission_store.initialize()
+        store = feature.permission_store
+
+        await store.set_permission(
+            "MemoryFeature", "delete_conversation", PermissionLevel.DENY
+        )
+
+        await feature._register_all_tools()
+
+        assert (
+            await store.get_permission("MemoryFeature", "delete_conversation")
+        ) == PermissionLevel.DENY
+
     @pytest.mark.asyncio
     async def test_pending_approvals_uses_wall_clock_age(self):
         from kestrel_sdk.tools.result import ToolResultStatus
@@ -1689,6 +1944,39 @@ class TestSetPermissionUnknownTarget:
 
         result = await feature.set_permission("WalletAgent", level="allow")
         assert result.status is ToolResultStatus.OK
+
+
+class TestArgsSummaryHelper:
+    """F252: the shared masking helper both write paths call."""
+
+    def test_mask_sensitive_nested_and_lists(self):
+        data = {
+            "password": "secret123",
+            "api_key": "sk-abc",
+            "user": "john",
+            "nested": {"token": "tok-xyz", "note": "ok"},
+            "items": [{"secret": "x"}, "plain"],
+        }
+        masked = mask_sensitive(data)
+        assert masked["password"] == "***MASKED***"
+        assert masked["api_key"] == "***MASKED***"
+        assert masked["user"] == "john"
+        assert masked["nested"]["token"] == "***MASKED***"
+        assert masked["nested"]["note"] == "ok"
+        assert masked["items"][0]["secret"] == "***MASKED***"
+        assert masked["items"][1] == "plain"
+
+    def test_summarize_args_masks_and_never_leaks_on_error(self):
+        assert summarize_args(None) is None
+        assert summarize_args({}) is None
+        out = summarize_args({"api_key": "sk-live-SECRET", "n": 1})
+        assert "sk-live-SECRET" not in out
+        assert "***MASKED***" in out
+
+    def test_summarize_args_truncates(self):
+        out = summarize_args({"note": "a" * 1000}, max_length=50)
+        assert len(out) == 50
+        assert out.endswith("...")
 
 
 # === Run tests ===

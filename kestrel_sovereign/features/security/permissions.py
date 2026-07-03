@@ -19,6 +19,16 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+class UnknownFeatureError(ValueError):
+    """Raised when a permission write targets a feature with no registered
+    permission-tree group under any casing/alias variant.
+
+    Surfacing this (instead of logging a false success) is what stops
+    ``set_feature_permission`` from silently no-oping on an alias spelling
+    that resolves to no tree group (F253).
+    """
+
+
 class PermissionLevel(Enum):
     """
     Permission levels for tools.
@@ -594,22 +604,43 @@ class PermissionStore:
             feature_name: Name of the feature
             level: Permission level to set for all tools
             reason: Optional reason for the permission change
+
+        Raises:
+            UnknownFeatureError: If no permission-tree group matches
+                ``feature_name`` under any casing/alias variant. Previously
+                this path silently no-oped on an alias spelling (e.g.
+                ``task_feature`` for ``TaskFeature``) yet still logged success,
+                leaving the operator's intended control absent (F253).
         """
-        # Get all tools for this feature
+        # Resolve the target group with the SAME casing/alias resolution the
+        # read path uses, so an alias spelling (``task_feature``) matches the
+        # canonical tree group (``TaskFeature``) instead of finding nothing.
+        variants = self.feature_name_variants(feature_name)
         tree = await self.get_permission_tree()
-        feature = next((f for f in tree if f.feature_name == feature_name), None)
+        feature = next((f for f in tree if f.feature_name in variants), None)
 
-        if feature:
-            for tool in feature.tools:
-                await self.set_permission(
-                    feature_name,
-                    tool.tool_name,
-                    level,
-                    scope="always",
-                    reason=reason
-                )
+        if feature is None:
+            # No group matched — refuse loudly rather than confirm a control
+            # that was never written.
+            raise UnknownFeatureError(
+                f"Unknown feature '{feature_name}': no registered permission "
+                "group matches under any casing/alias variant. Nothing was "
+                "persisted."
+            )
 
-        logger.info(f"Set feature permission: {feature_name} = {level.value}")
+        # Write rows under the CANONICAL spelling the tree exposes, not the
+        # (possibly aliased) spelling the caller passed.
+        canonical_name = feature.feature_name
+        for tool in feature.tools:
+            await self.set_permission(
+                canonical_name,
+                tool.tool_name,
+                level,
+                scope="always",
+                reason=reason
+            )
+
+        logger.info(f"Set feature permission: {canonical_name} = {level.value}")
 
     async def get_permission_tree(self) -> List[FeaturePermissions]:
         """
@@ -663,6 +694,8 @@ class PermissionStore:
         feature_name: str,
         tool_name: str,
         default_level: PermissionLevel = PermissionLevel.ASK,
+        *,
+        hardened: bool = False,
     ) -> None:
         """
         Register a tool with default permission (if not already registered).
@@ -673,8 +706,45 @@ class PermissionStore:
             feature_name: Name of the feature
             tool_name: Name of the tool
             default_level: Default permission level (default: ASK)
+            hardened: When True, ``default_level`` is a non-downgradeable hard
+                rail rather than a first-registration default. In addition to
+                the usual insert-if-missing, any *existing* row for this tool
+                (across every casing/alias variant) whose level ranks below
+                ``default_level`` is force-upgraded to it. A stricter operator
+                choice — a level ranking at or above ``default_level`` (e.g.
+                DENY over ALWAYS_ASK) — is preserved. This is what closes the
+                F203 upgrade gap (#2093): an agent that already persisted a
+                permissive ``ALLOW`` row for a destructive memory tool under
+                the old feature-level default would otherwise keep bypassing
+                approval forever, because plain registration is INSERT-OR-IGNORE
+                and ``get_permission`` returns persisted rows before defaults.
         """
         async with aiosqlite.connect(self.db_path) as db:
+            if hardened:
+                # Force-upgrade any pre-existing permissive rows (any casing /
+                # alias variant) to the hard rail. Rows that already rank at or
+                # above the hard rail (a stricter DENY, or an identical
+                # ALWAYS_ASK) are left untouched, so we never downgrade the
+                # operator's last word and never churn updated_at needlessly.
+                target_rank = _LEVEL_RANK.get(default_level, 0)
+                preserved = [
+                    level.value
+                    for level in PermissionLevel
+                    if _LEVEL_RANK.get(level, 0) >= target_rank
+                ]
+                names = sorted(self.feature_name_variants(feature_name))
+                name_placeholders = ",".join(["?"] * len(names))
+                preserved_placeholders = ",".join(["?"] * len(preserved))
+                await db.execute(
+                    f"""
+                    UPDATE security_permissions
+                    SET level = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE feature_name IN ({name_placeholders})
+                      AND tool_name = ?
+                      AND level NOT IN ({preserved_placeholders})
+                    """,
+                    (default_level.value, *names, tool_name, *preserved),
+                )
             await db.execute("""
                 INSERT OR IGNORE INTO security_permissions
                 (feature_name, tool_name, level)

@@ -254,9 +254,13 @@ async def set_tool_permission(request: Request, data: SetPermissionRequest):
         )
         response = {"success": True, "message": f"Set {data.feature}.{data.tool} to {data.level}"}
     else:
-        await security.permission_store.set_feature_permission(
-            data.feature, level
-        )
+        from kestrel_sovereign.features.security.permissions import UnknownFeatureError
+        try:
+            await security.permission_store.set_feature_permission(
+                data.feature, level
+            )
+        except UnknownFeatureError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
         response = {"success": True, "message": f"Set all tools in {data.feature} to {data.level}"}
     if level == PermissionLevel.AUTO:
         response["warning"] = (
@@ -291,7 +295,11 @@ async def set_feature_permission(request: Request, data: SetFeaturePermissionReq
         from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
         await enforce_destructive_op(request)
 
-    await security.permission_store.set_feature_permission(data.feature, level)
+    from kestrel_sovereign.features.security.permissions import UnknownFeatureError
+    try:
+        await security.permission_store.set_feature_permission(data.feature, level)
+    except UnknownFeatureError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     response = {"success": True, "message": f"Set all tools in {data.feature} to {data.level}"}
     if level == PermissionLevel.AUTO:
         response["warning"] = (

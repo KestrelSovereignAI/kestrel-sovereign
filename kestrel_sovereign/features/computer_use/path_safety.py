@@ -44,16 +44,19 @@ def assert_no_traversal(candidate: str | os.PathLike) -> None:
         raise PathSafetyError(f"path contains traversal segment: {candidate!r}")
 
 
-def resolve_realpath(candidate: str | os.PathLike) -> Path:
+def resolve_realpath(
+    candidate: str | os.PathLike, base: str | os.PathLike | None = None
+) -> Path:
     """Canonicalize ``candidate`` to an absolute realpath.
 
     Steps:
 
     1. :func:`assert_no_traversal` — reject ``..`` segments and NUL bytes.
     2. Expand ``~`` to the user's home directory.
-    3. If relative, treat as relative to the current working directory
-       (the feature does not assume a workspace root here — that is a
-       policy concern).
+    3. If relative, treat as relative to ``base`` (defaults to the current
+       working directory). The codex bridge passes the request's ``cwd``
+       here so relative argv tokens resolve the way codex would run them;
+       the direct shell path leaves it unset and uses the process cwd.
     4. Walk symlinks with ``os.path.realpath`` so the returned path is
        what would actually be opened.
 
@@ -66,7 +69,7 @@ def resolve_realpath(candidate: str | os.PathLike) -> Path:
     assert_no_traversal(candidate)
     cand = Path(candidate).expanduser()
     if not cand.is_absolute():
-        cand = Path.cwd() / cand
+        cand = (Path(base) if base is not None else Path.cwd()) / cand
     return Path(_best_effort_realpath(cand))
 
 

@@ -1771,6 +1771,86 @@ class TestCodexApprovalBridge:
         )
 
     @pytest.mark.asyncio
+    async def test_f137_bridge_denies_auto_approved_reader_of_deny_path(
+        self, tmp_path,
+    ):
+        """F137 (native codex surface): an auto-approved reader whose
+        argument resolves under ``deny_paths`` must be hard-DENIED by the
+        bridge, not accepted. ``BinaryPolicy`` only vets ``argv[0]`` —
+        without the argv PathPolicy pass, ``cat <secret>`` would read a
+        host secret through the codex command surface with no approval,
+        the same bypass as ``ComputerUseFeature.shell()``.
+        """
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        secret = tmp_path / "secret.txt"
+        secret.write_text("token")
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["cat"], deny=[]),
+            _path_policy=PathPolicy(allow=[str(tmp_path)], deny=[str(secret)]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": f"cat {secret}"})
+        assert reply == {"decision": "decline"}
+        assert captured == [], "deny-path read must not reach the queue"
+
+    @pytest.mark.asyncio
+    async def test_f137_bridge_requires_approval_for_outside_allow_path(
+        self, tmp_path,
+    ):
+        """F137: an auto-approved reader of an *existing*, non-allow-listed
+        path must be downgraded ALLOW → REQUIRE_APPROVAL (reach the queue)
+        rather than auto-accepted — the argument isn't vouched for even
+        though the binary is."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        allow_dir = tmp_path / "allowed"
+        allow_dir.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_text("data")
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["cat"], deny=[]),
+            _path_policy=PathPolicy(allow=[str(allow_dir)], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": f"cat {outside}"})
+        assert reply == {"decision": "accept"}, "queue approved"
+        assert len(captured) == 1, (
+            "non-allow-listed path arg must route through the queue"
+        )
+
+    @pytest.mark.asyncio
+    async def test_f137_bridge_allows_auto_approved_reader_of_allow_path(
+        self, tmp_path,
+    ):
+        """F137: an auto-approved reader of an allow-listed path still
+        auto-accepts without queueing — the fix must not over-gate the
+        happy path."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        allowed = tmp_path / "ok.txt"
+        allowed.write_text("data")
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["cat"], deny=[]),
+            _path_policy=PathPolicy(allow=[str(tmp_path)], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": f"cat {allowed}"})
+        assert reply == {"decision": "accept"}
+        assert captured == [], (
+            "allow-listed path read must bypass the ApprovalQueue"
+        )
+
+    @pytest.mark.asyncio
     async def test_unlisted_binary_routes_through_queue(self):
         """#1694: a binary that is neither allow- nor deny-listed
         returns Decision.REQUIRE_APPROVAL → bridge reaches the
@@ -1916,12 +1996,13 @@ class TestCodexApprovalBridge:
         """
         from kestrel_sovereign.features.computer_use.policy import (
             BinaryPolicy,
+            PathPolicy,
         )
         a = CodexAdapter()
         agent, captured = self._agent_with_queue(approves=True)
         cu = SimpleNamespace(
             _binary_policy=BinaryPolicy(allow=["git", "ls"], deny=["rm"]),
-            _path_policy=None,
+            _path_policy=PathPolicy(),
         )
         agent.features["ComputerUseFeature"] = cu
 
@@ -1977,6 +2058,7 @@ class TestCodexApprovalBridge:
         """
         from kestrel_sovereign.features.computer_use.policy import (
             BinaryPolicy,
+            PathPolicy,
         )
         a = CodexAdapter()
 
@@ -1990,7 +2072,7 @@ class TestCodexApprovalBridge:
                 ),
                 "ComputerUseFeature": SimpleNamespace(
                     _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
-                    _path_policy=None,
+                    _path_policy=PathPolicy(),
                 ),
             },
             did="did:test:agent",
@@ -2168,12 +2250,13 @@ class TestCodexApprovalBridge:
         good sibling."""
         from kestrel_sovereign.features.computer_use.policy import (
             BinaryPolicy,
+            PathPolicy,
         )
         a = CodexAdapter()
         agent, captured = self._agent_with_queue(approves=True)
         agent.features["ComputerUseFeature"] = SimpleNamespace(
             _binary_policy=BinaryPolicy(allow=["gh"]),
-            _path_policy=None,
+            _path_policy=PathPolicy(),
         )
         handler = a._make_codex_approval_handler(agent, "commandExecution")
 
@@ -2226,6 +2309,9 @@ class TestCodexApprovalBridge:
         command (e.g. shlex split fails) must decline. Without this,
         the outer except would swallow the exception and pass through
         to auto-approval."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            PathPolicy,
+        )
         a = CodexAdapter()
         agent, captured = self._agent_with_queue(approves=True)
 
@@ -2235,7 +2321,7 @@ class TestCodexApprovalBridge:
 
         agent.features["ComputerUseFeature"] = SimpleNamespace(
             _binary_policy=_BoomBinaryPolicy(),
-            _path_policy=None,
+            _path_policy=PathPolicy(),
         )
         handler = a._make_codex_approval_handler(agent, "commandExecution")
         reply = await handler({"command": 'gh issue --"unclosed'})
