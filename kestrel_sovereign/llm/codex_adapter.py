@@ -1984,6 +1984,7 @@ class CodexAdapter(LLMAdapter):
         try:
             from kestrel_sovereign.features.computer_use.policy import (
                 Decision,
+                evaluate_argv_paths,
             )
         except Exception:  # noqa: BLE001 - import path failure → fail closed
             return (Decision.DENY, "policy_module_import_failed")  # type: ignore[name-defined]
@@ -2009,6 +2010,25 @@ class CodexAdapter(LLMAdapter):
                 policy = getattr(cu, "_binary_policy", None)
                 if policy is None:
                     return (Decision.DENY, "no_binary_policy")
+                # F137: BinaryPolicy only vets ``argv[0]``. The native
+                # codex command surface is a second production path (the
+                # first is ``ComputerUseFeature.shell()``); without a
+                # PathPolicy pass here an auto-approved reader such as
+                # ``cat``/``rg`` would read a ``deny_paths`` file with no
+                # approval through the bridge. Fail closed if the path
+                # gate is absent — the fileChange branch already does the
+                # same, and initialization builds both policies together.
+                path_policy = getattr(cu, "_path_policy", None)
+                if path_policy is None:
+                    return (Decision.DENY, "no_path_policy")
+                # Resolve relative argv tokens the way codex would run
+                # them: request cwd → KESTREL_CODEX_CWD → process cwd
+                # (same fallback the fileChange branch uses below).
+                cmd_cwd = Path(
+                    params.get("cwd")
+                    or os.environ.get("KESTREL_CODEX_CWD")
+                    or str(Path.cwd())
+                )
                 # Codex's params shape evolved: legacy carried a flat
                 # ``command`` string; newer
                 # ``CommandExecutionRequestApprovalParams`` carries
@@ -2079,6 +2099,34 @@ class CodexAdapter(LLMAdapter):
                         aggregate_reason = rrule or f"no_match:{argv}"
                     # ALLOW: leave aggregate as-is (only downgrades to
                     # REQUIRE_APPROVAL if a later entry isn't allow-listed).
+                    # F137: BinaryPolicy stopped at ``argv[0]``. Vet the
+                    # argument paths too so an auto-approved reader can't
+                    # slip a ``deny_paths`` file (hard DENY) — and can't
+                    # bypass the queue for an existing, non-allow-listed
+                    # path (downgrade ALLOW → REQUIRE_APPROVAL). Per-argv
+                    # fail-closed to match the binary eval above.
+                    try:
+                        argv_path = evaluate_argv_paths(
+                            argv, path_policy, cwd=cmd_cwd
+                        )
+                    except Exception as path_exc:  # noqa: BLE001
+                        logger.warning(
+                            "codex_policy_precheck commandExecution: "
+                            "evaluate_argv_paths(%r) raised %s — "
+                            "declining (fail closed)",
+                            argv, path_exc,
+                        )
+                        return (
+                            Decision.DENY, f"path_eval_failed:{argv!r}",
+                        )
+                    if argv_path.decision is Decision.DENY:
+                        return (
+                            Decision.DENY,
+                            f"path:{argv_path.rule}:{argv_path.path}",
+                        )
+                    if argv_path.decision is Decision.REQUIRE_APPROVAL:
+                        aggregate = Decision.REQUIRE_APPROVAL
+                        aggregate_reason = f"path:{argv_path.rule}"
                 return (aggregate, aggregate_reason)
             elif kind == "fileChange":
                 policy = getattr(cu, "_path_policy", None)

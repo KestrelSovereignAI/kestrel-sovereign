@@ -421,6 +421,148 @@ async def test_audit_log_records_denied_calls(workspace: Path):
     assert parsed["allowed_by"] == ["denied:privacy"]
 
 
+def _f137_config(root: Path) -> dict[str, Any]:
+    """Config for the F137 argv path-policy tests.
+
+    ``allow_root`` is a *subdirectory* of ``root`` so a file can exist
+    inside ``root`` but outside the allow-list (to exercise the
+    non-allow-listed REQUIRE_APPROVAL branch). ``cat`` is auto-approved
+    so the reader short-circuits to ALLOW on ``argv[0]`` — the argv path
+    policy is the only thing that can still gate the file argument.
+    """
+    return {
+        "enabled": True,
+        "backend": "local",
+        "allowed_paths": [str(root / "proj")],
+        "deny_paths": [str(root / "secret")],
+        "allowed_binaries": ["echo", "cat"],
+        "denied_binaries": ["rm"],
+        "auto_approve_read": True,
+        "audit_log_path": str(root / "audit.jsonl"),
+    }
+
+
+async def _make_f137_feature(root: Path, agent: FakeAgent) -> ComputerUseFeature:
+    feature = ComputerUseFeature(agent)
+    feature._cfg = _f137_config(root)
+    await feature.initialize()
+    return feature
+
+
+@pytest.mark.asyncio
+async def test_shell_deny_path_arg_hard_rejects_auto_approved_reader(tmp_path: Path):
+    """F137: an auto-approved reader (``cat``) reading a ``deny_paths``
+    file is DENIED even though ``argv[0]`` short-circuits to ALLOW."""
+    (tmp_path / "secret").mkdir()
+    (tmp_path / "secret" / "creds").write_text("aws keys")
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_f137_feature(tmp_path, agent)
+    envelope = await feature.shell(
+        command=f"cat {tmp_path / 'secret' / 'creds'}", timeout=5
+    )
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("path_policy:deny")
+    assert queue.calls == [], "deny-path arg must not reach the queue"
+
+
+@pytest.mark.asyncio
+async def test_shell_deny_path_arg_universal_even_for_approval_routed_binary(
+    tmp_path: Path,
+):
+    """F137/Q2: the deny_paths hit is universal — an approval-routed
+    (unlisted) binary reading a deny file is DENIED before the queue,
+    matching the ``fs_*`` 'never, even with approval' guarantee."""
+    (tmp_path / "secret").mkdir()
+    (tmp_path / "secret" / "creds").write_text("aws keys")
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_f137_feature(tmp_path, agent)
+    # ``grep`` is neither allow- nor deny-listed → would route to the
+    # queue on argv[0], but the deny-path arg must deny first.
+    envelope = await feature.shell(
+        command=f"grep secret {tmp_path / 'secret' / 'creds'}", timeout=5
+    )
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("path_policy:deny")
+    assert queue.calls == []
+
+
+@pytest.mark.asyncio
+async def test_shell_non_allow_listed_path_arg_requires_approval(tmp_path: Path):
+    """F137: an auto-approved reader reading an existing, non-allow-listed
+    path routes through the queue instead of silently running."""
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "outside.txt").write_text("data")
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_f137_feature(tmp_path, agent)
+    envelope = await feature.shell(
+        command=f"cat {tmp_path / 'outside.txt'}", timeout=5
+    )
+    assert envelope.status is ToolResultStatus.OK
+    assert len(queue.calls) == 1, (
+        "non-allow-listed path arg must reach the queue even for an "
+        "auto-approved reader"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_allow_listed_path_arg_still_runs(tmp_path: Path):
+    """F137: an auto-approved reader reading an allow-listed path still
+    bypasses the queue and runs."""
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "proj" / "ok.txt").write_text("hello world")
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_f137_feature(tmp_path, agent)
+    envelope = await feature.shell(
+        command=f"cat {tmp_path / 'proj' / 'ok.txt'}", timeout=5
+    )
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["returncode"] == 0
+    assert "hello world" in envelope.data["stdout"]
+    assert queue.calls == [], "allow-listed path arg must bypass the queue"
+
+
+@pytest.mark.asyncio
+async def test_shell_non_path_argv_token_ignored(tmp_path: Path):
+    """F137: a non-flag token that doesn't resolve to an existing path
+    (e.g. an ``rg``/``grep`` search pattern) is ignored — an
+    auto-approved binary with only such tokens still bypasses the queue."""
+    (tmp_path / "proj").mkdir()
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_f137_feature(tmp_path, agent)
+    # ``echo`` is auto-approved; ``some-nonexistent-pattern`` doesn't
+    # resolve to a file, so it must not force an approval prompt.
+    envelope = await feature.shell(
+        command="echo some-nonexistent-pattern", timeout=5
+    )
+    assert envelope.status is ToolResultStatus.OK
+    assert queue.calls == []
+
+
 @pytest.mark.asyncio
 async def test_local_backend_requires_both_shell_grants(workspace: Path):
     agent = FakeAgent(
