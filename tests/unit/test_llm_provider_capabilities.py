@@ -662,19 +662,22 @@ async def test_openai_adapter_embeddings_use_route_client():
 
 async def test_google_adapter_embeddings_normalize_plain_float_vector():
     adapter = GoogleAdapter()
-    client = SimpleNamespace(
-        embed_content_async=AsyncMock(
-            return_value={"embedding": {"values": [0.1, 0.2]}}
+    models = SimpleNamespace(
+        embed_content=AsyncMock(
+            return_value=SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[0.1, 0.2])]
+            )
         )
     )
+    client = SimpleNamespace(aio=SimpleNamespace(models=models))
 
     assert await adapter.aembed(client, "hello", model="text-embedding-004") == [
         0.1,
         0.2,
     ]
-    client.embed_content_async.assert_awaited_with(
-        model="models/text-embedding-004",
-        content="hello",
+    models.embed_content.assert_awaited_with(
+        model="text-embedding-004",
+        contents="hello",
     )
 
 
