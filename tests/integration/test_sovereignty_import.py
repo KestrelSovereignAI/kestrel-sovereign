@@ -41,6 +41,56 @@ async def llm_service():
 
 
 @pytest.mark.asyncio
+async def test_restore_preserves_created_at_and_trash(temp_db):
+    """#F265: the restore must be FAITHFUL — preserve created_at (history
+    ordering) instead of stamping now(), and preserve deleted_at so a
+    soft-deleted (trashed) message is NOT resurrected by a restore."""
+    async with Storage(db_path=temp_db) as storage:
+        # Content-agnostic (encryption-at-rest may cipher the content column):
+        # backdate one row and soft-delete the other, keyed by row id.
+        await storage.add_conversation("user", "kept-old", metadata={})
+        await storage.add_conversation("user", "trashed", metadata={})
+        ids = [
+            r[0]
+            for r in await storage.db.fetchall(
+                "SELECT id FROM conversation_history ORDER BY id"
+            )
+        ]
+        await storage.db.execute_commit(
+            "UPDATE conversation_history SET created_at = ? WHERE id = ?",
+            ("2020-01-01T00:00:00+00:00", ids[0]),
+        )
+        await storage.db.execute_commit(
+            "UPDATE conversation_history SET deleted_at = ? WHERE id = ?",
+            ("2020-06-01T00:00:00+00:00", ids[1]),
+        )
+        blob = await storage.create_backup_blob(include_db=True)
+
+    fd, target_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        async with Storage(db_path=target_path) as target:
+            stats = await target.restore_from_backup_blob(blob)
+            assert stats["messages_restored"] == 2
+
+            rows = await target.db.fetchall(
+                "SELECT created_at, deleted_at FROM conversation_history"
+            )
+            created_ats = [str(r[0]) for r in rows]
+            deleted_ats = [r[1] for r in rows]
+            # created_at PRESERVED (not all rewritten to a fresh now()).
+            assert any(c.startswith("2020-01-01") for c in created_ats)
+            # deleted_at PRESERVED — the trashed row stays trashed.
+            assert any(d is not None for d in deleted_ats)
+            # A trash-filtered read therefore returns only the live row.
+            live = await target.get_conversation_history()
+            assert len(live) == 1
+    finally:
+        if os.path.exists(target_path):
+            os.remove(target_path)
+
+
+@pytest.mark.asyncio
 async def test_export_import_roundtrip(temp_db):
     """
     Test the full export->import cycle.
@@ -209,7 +259,7 @@ async def test_agent_command_import(temp_db, llm_service, skip_bootstrap):
         import_result = await agent.process_input(f"!import-sovereignty {cid}")
         print(f"Import result: {import_result}")
 
-        assert "Sovereignty Import Complete" in import_result or "Import" in import_result, \
+        assert "Restored" in import_result and "conversation messages" in import_result, \
             f"Import failed: {import_result}"
 
         # Verify data restored - use underlying storage to avoid privacy wrapper

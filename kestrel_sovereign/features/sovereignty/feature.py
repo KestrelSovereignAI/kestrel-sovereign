@@ -314,17 +314,29 @@ class SovereigntyFeature(Feature):
 
     @tool(
         name="import_sovereignty",
-        description="Restore the agent's state from an IPFS CID.",
+        description=(
+            "Restore this agent's CONVERSATION HISTORY from a prior backup "
+            "(IPFS CID). Faithfully preserves message timestamps and trash "
+            "state. NOTE: this currently restores conversation history only — "
+            "NOT full agent state (memories, knowledge graph, saved items, "
+            "files, settings). Full-state restore is tracked separately."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!import-sovereignty"
     )
     async def import_sovereignty(self, cid: str) -> ToolResult:
         """
-        Import agent state from IPFS CID.
+        Restore conversation history from an IPFS CID backup.
 
         The CID should correspond to a backup artifact that was previously
         exported. If the backup was encrypted, the key will be looked up
         from the backup artifact record.
+
+        Scope (#F265): restores ``conversation_history`` faithfully —
+        ``created_at`` (ordering) and ``deleted_at`` (trash) are preserved, so
+        the restore neither reorders history nor un-deletes trashed messages.
+        Other agent state (memories, graph_nodes, saved_items, files, settings)
+        is NOT restored yet; full multi-table restore is a tracked follow-up.
         """
         try:
             adapter = FilecoinAdapter()
@@ -357,7 +369,9 @@ class SovereigntyFeature(Feature):
             messages_restored = stats.get("messages_restored", 0)
 
             return ToolResult.ok(
-                f"✅ Sovereignty Import Complete. Restored {messages_restored} messages.",
+                f"✅ Restored {messages_restored} conversation messages "
+                f"(conversation history only — other agent state is not "
+                f"restored yet).",
                 data={
                     "cid": cid,
                     "messages_restored": messages_restored,
