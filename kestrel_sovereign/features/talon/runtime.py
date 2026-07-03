@@ -46,6 +46,51 @@ CLAUDE_AGENT_KEYS_PREFIXES = (
     "CLAUDE_AGENT_SDK_",
 )
 
+# Credential env-var prefixes that must NEVER reach untrusted checked-out
+# code during verification (F302). ``talon_verify`` executes
+# attacker-controlled repository code (conftest.py, PR diffs), so its
+# subprocess env is stripped down to a safe baseline via
+# :func:`sanitize_untrusted_env`. Stripping by PREFIX is deliberate: a
+# newly-added provider key is stripped by default rather than leaking
+# until someone remembers to allowlist it.
+UNTRUSTED_ENV_STRIP_PREFIXES = (
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "CLAUDECODE",
+    "OPENAI_",
+    "AZURE_OPENAI_",
+    "AZURE_",
+    "GEMINI_",
+    "GOOGLE_",
+    "VERTEX_",
+    "GROQ_",
+    "XAI_",
+    "OPENROUTER_",
+    "MISTRAL_",
+    "COHERE_",
+    "DEEPSEEK_",
+    "TOGETHER_",
+    "FIREWORKS_",
+    "REPLICATE_",
+    "PERPLEXITY_",
+    "HUGGINGFACE_",
+    "HF_",
+    "AWS_",
+    "OLLAMA_",
+)
+# Explicit credential/secret keys that don't share a provider prefix.
+# The GitHub token is stripped ENTIRELY here (not merely scoped): verify
+# runs untrusted code and must not be able to act as the agent on GitHub.
+UNTRUSTED_ENV_STRIP_KEYS = (
+    "KESTREL_API_KEY",
+    "KESTREL_DATA_KEY",
+    "KESTREL_DB_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_PAT",
+    "GH_ENTERPRISE_TOKEN",
+)
+
 
 class TalonRuntimeError(ValueError):
     """Raised when a Talon runtime request violates policy or schema."""
@@ -98,6 +143,15 @@ class TalonExecution:
     skip_clarification: bool = True
     self_review: bool = True
     quality_checks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TalonBatchExecution:
+    """Batch execution options that become ``kestrel-talon batch`` flags."""
+
+    repo: str
+    prd_path: Path
+    repo_dir: Path
 
 
 @dataclass(frozen=True)
@@ -267,6 +321,86 @@ def sanitize_env_for_backend(
     return env, tuple(stripped)
 
 
+def sanitize_untrusted_env(
+    base_env: Mapping[str, str] | None = None,
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Env for a subprocess that runs UNTRUSTED checked-out code (F302).
+
+    ``talon_verify`` executes attacker-controlled repository code —
+    ``conftest.py`` runs at pytest collection, PR diffs run under test.
+    Unlike a Talon *claim* (which runs in a sandbox clone and legitimately
+    needs a GitHub token to push/open a PR), verification must treat the
+    checkout as hostile: this strips every LLM/provider credential AND the
+    GitHub token entirely, so a malicious ``conftest.py`` cannot exfiltrate
+    the agent's secrets or act as the agent on GitHub.
+
+    Returns ``(env, stripped_keys)`` where ``stripped_keys`` records what
+    was removed so callers can audit the sanitization.
+    """
+    env = dict(base_env if base_env is not None else os.environ)
+    stripped: list[str] = []
+    stripped.extend(_pop_prefixed(env, UNTRUSTED_ENV_STRIP_PREFIXES))
+    stripped.extend(_pop_keys(env, UNTRUSTED_ENV_STRIP_KEYS))
+    return env, tuple(stripped)
+
+
+def build_talon_batch_invocation(
+    request: TalonRuntimeRequest,
+    execution: "TalonBatchExecution",
+    policy: TalonPolicy | None = None,
+    preference: TalonPreference | None = None,
+    base_env: Mapping[str, str] | None = None,
+) -> TalonInvocation:
+    """Launch-ready ``kestrel-talon batch`` invocation, policy-enforced.
+
+    Routes ``talon_batch`` through the same guardrails as a claim (F304):
+    ``allow_background_jobs`` and ``allowed_backends`` are enforced, the
+    subprocess env is backend-sanitized, and the PRD path must be an
+    absolute, existing file. The workspace clone is passed via
+    ``--repo-dir`` so batch never operates on the running source tree.
+    """
+    policy = policy or TalonPolicy()
+    preference = preference or TalonPreference()
+
+    if not policy.allow_background_jobs:
+        raise TalonRuntimeError("Talon background jobs are disabled by policy")
+
+    # resolve_runtime enforces ``allowed_backends`` (and billing/auth-lane
+    # validity) — a disallowed backend raises before any subprocess launch.
+    backend, model, auth_lane = resolve_runtime(request, preference, policy)
+
+    prd_path = execution.prd_path
+    if not prd_path.is_absolute():
+        raise TalonRuntimeError(
+            f"Talon batch prd path must be absolute: {prd_path}"
+        )
+    if not prd_path.is_file():
+        raise TalonRuntimeError(f"Talon batch prd file not found: {prd_path}")
+
+    argv = [
+        "batch",
+        "--prd", str(prd_path),
+        "--repo-dir", str(execution.repo_dir),
+        "--backend", backend,
+    ]
+    # kestrel-talon's ``batch`` parser defaults ``--backend`` to
+    # ``$TALON_BACKEND`` or ``claude``. Without pinning it (and the matching
+    # model/auth flags) the coordinator could enforce one backend via policy
+    # and then launch another in production (F304). Emit the same
+    # backend-specific flags a claim would.
+    argv += _backend_model_flags(backend, model, auth_lane)
+    env, stripped = sanitize_env_for_backend(backend, auth_lane, base_env)
+    return TalonInvocation(
+        argv=argv,
+        env=env,
+        backend=backend,
+        model=model,
+        auth_lane=auth_lane,
+        redacted_argv=list(argv),
+        stripped_env_keys=stripped,
+    )
+
+
 def load_talon_policy_preference(
     kestrel_toml_path: Path | None = None,
 ) -> tuple[TalonPolicy, TalonPreference]:
@@ -325,17 +459,7 @@ def _build_claim_argv(
         "--max-iterations", str(execution.max_iterations),
         "--max-turns", str(execution.max_turns),
     ]
-    if backend == "claude":
-        if model:
-            argv += ["--model", model]
-        if auth_lane == "api_key":
-            argv.append("--use-api-key")
-    elif backend == "codex":
-        if model:
-            argv += ["--codex-model", model]
-    elif backend == "opencode":
-        if model:
-            argv += ["--opencode-model", model]
+    argv += _backend_model_flags(backend, model, auth_lane)
 
     if execution.worktree:
         argv += ["--worktree", "--worktree-base", str(execution.worktree_base)]
@@ -346,6 +470,33 @@ def _build_claim_argv(
     for check in execution.quality_checks:
         argv += ["--quality-check", check]
     return argv
+
+
+def _backend_model_flags(
+    backend: Backend,
+    model: str | None,
+    auth_lane: AuthLane,
+) -> list[str]:
+    """Backend-specific model/auth flags shared by claim and batch argv.
+
+    kestrel-talon's common args accept ``--model``/``--use-api-key`` for
+    claude, ``--codex-model`` for codex, and ``--opencode-model`` for
+    opencode. Emitting the same flags for both subcommands keeps the launched
+    backend consistent with the policy-resolved backend (F304).
+    """
+    flags: list[str] = []
+    if backend == "claude":
+        if model:
+            flags += ["--model", model]
+        if auth_lane == "api_key":
+            flags.append("--use-api-key")
+    elif backend == "codex":
+        if model:
+            flags += ["--codex-model", model]
+    elif backend == "opencode":
+        if model:
+            flags += ["--opencode-model", model]
+    return flags
 
 
 def _validate_model(backend: Backend, model: str | None) -> None:
