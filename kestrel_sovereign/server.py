@@ -420,6 +420,10 @@ async def lifespan(app: FastAPI):
                 install_a2a_did_resolver(manager, federated_fallback=federated)
             except Exception as exc:  # noqa: BLE001 - never block startup on this
                 logger.warning("Could not install A2A DID resolver: %s", exc)
+            # Fleet-idleness (#F235) is wired at the AgentManager's single agent
+            # registration point (agent_manager._load_one), so every agent —
+            # startup or spawned — gets the co-hosted-agents provider and no
+            # dynamically-added agent can bypass the whole-host-restart gate.
 
             # Lifecycle hardening (#377): surface per-agent init failures
             # — without this, a multi-agent host whose providers all failed

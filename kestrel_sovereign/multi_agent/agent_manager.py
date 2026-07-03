@@ -128,6 +128,13 @@ class AgentManager:
 
         self._agents[name] = agent
         self._agent_names[agent.agent_id] = name
+        # Fleet-idleness (#F235): give EVERY agent — including ones created or
+        # spawned after startup — a live view of all co-hosted agents, so
+        # RestartCoordinator can gate a whole-host restart on the whole fleet
+        # being idle. Installed here at the single registration point so a
+        # dynamically-added agent can never bypass the gate. Resolves live, so
+        # each agent sees agents registered after it.
+        agent._cohosted_agents_provider = lambda: list(self._agents.values())
         logger.info(f"Loaded agent '{name}' (DID: {agent_did[:30]}...)")
         return agent
 
