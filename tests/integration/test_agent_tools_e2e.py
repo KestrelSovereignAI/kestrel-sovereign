@@ -162,16 +162,13 @@ async def test_model_agent_list_models(model_agent, skip_if_no_ollama):
     assert list_tool is not None
     result = await list_tool.execute()
 
-    # ToolResult envelope format (PR #1061)
-    # execute() returns a wrapper with 'success', 'tool', 'result' keys
-    # The actual ToolResult is nested in result['result']
+    # Unified flat ToolResult wire shape (#F025): envelope spread TOP-LEVEL.
     assert result["success"] is True
-    tool_result = result["result"]
-    assert tool_result["status"] == "ok"
-    assert "data" in tool_result
-    assert "models" in tool_result["data"]
-    assert isinstance(tool_result["data"]["models"], list)
-    assert tool_result["data"]["count"] > 0
+    assert result["status"] == "ok"
+    assert "data" in result
+    assert "models" in result["data"]
+    assert isinstance(result["data"]["models"], list)
+    assert result["data"]["count"] > 0
 
 
 @pytest.mark.asyncio

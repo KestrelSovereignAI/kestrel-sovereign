@@ -90,14 +90,13 @@ async def test_sovereignty_feature_execution(kestrel_agent):
     assert tool is not None
     result = await tool.execute()
 
-    # check_sovereignty_status migrated to ToolResult in #1061 wave 22.
-    # DynamicTool.execute() wraps the envelope under result["result"]
-    # as ``{"status": "ok", "confirmation": "...", "data": {...}}``.
+    # check_sovereignty_status returns a ToolResult. Unified wire shape (#F025):
+    # the envelope is spread TOP-LEVEL as ``{"status": "ok", "confirmation":
+    # "...", "data": {...}, "tool": ..., "success": True}``.
     assert result["success"] is True
-    inner = result["result"]
-    assert inner["status"] == "ok"
-    assert "No sovereignty exports found" in inner["confirmation"]
-    assert inner["data"]["total_exports"] == 0
+    assert result["status"] == "ok"
+    assert "No sovereignty exports found" in result["confirmation"]
+    assert result["data"]["total_exports"] == 0
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not HAS_MCP, reason="kestrel-feature-mcp not installed")
@@ -144,10 +143,8 @@ async def test_model_feature_execution(kestrel_agent):
     result = await tool.execute()
 
     # DynamicTool wraps ToolResult envelopes (#1061 wave 10) — list_models
-    # now returns ToolResult.ok with data["models"] as a list. The wrapper
-    # serializes the envelope to a dict under result["result"].
+    # now returns ToolResult.ok with data["models"] as a list. Unified wire
+    # shape (#F025): the envelope is spread TOP-LEVEL.
     assert result["success"] is True
-    envelope = result["result"]
-    assert isinstance(envelope, dict)
-    assert envelope.get("status") == "ok"
-    assert isinstance(envelope.get("data", {}).get("models"), list)
+    assert result.get("status") == "ok"
+    assert isinstance(result.get("data", {}).get("models"), list)

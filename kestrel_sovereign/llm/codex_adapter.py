@@ -526,6 +526,24 @@ def _result_to_codex_response(
             )
         else:
             text = err if isinstance(err, str) and err else str(result)
+    elif isinstance(result, dict) and result.get("status") in ("ok", "error", "partial"):
+        # Unified flat ToolResult envelope (#F025) — same shape the object
+        # branch above handles, but already serialized to a dict. Mirror its
+        # semantics: OK is success (surface confirmation/data); ERROR/PARTIAL
+        # are non-success (surface the error) so they route through the failure
+        # classifier rather than being narrated as success.
+        status = result.get("status")
+        success = status == "ok"
+        if success:
+            confirmation = result.get("confirmation")
+            text = (
+                confirmation
+                if isinstance(confirmation, str) and confirmation
+                else result.get("data")
+            )
+        else:
+            err = result.get("error")
+            text = err if isinstance(err, str) and err else result
     elif isinstance(result, dict):
         success = bool(result.get("success", True))
         if success and "result" in result:

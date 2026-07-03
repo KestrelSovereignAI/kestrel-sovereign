@@ -326,6 +326,21 @@ class ProxyFeature(Feature):
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         try:
             result = await _maybe_await(self._client.call_tool(name, args))
+            if isinstance(result, dict) and result.get("status") in (
+                "ok", "error", "partial",
+            ):
+                # Service returned the flat ToolResult envelope. Pass it through
+                # TOP-LEVEL (unified shape #F025) rather than nesting it under
+                # ``result`` with a hardcoded ``success: True`` — that hid a
+                # service-side ``ToolResult.failed`` behind success and made the
+                # honesty layer read the isolated tool as always succeeding
+                # (#F018). Derive ``success`` from the service's status.
+                envelope = dict(result)
+                envelope["tool"] = name
+                envelope["success"] = result.get("status") != "error"
+                return envelope
+            # Non-envelope return (a raw value from a legacy service) — keep the
+            # wrapped legacy shape so existing readers still see it.
             return {
                 "success": True,
                 "result": result,
@@ -333,10 +348,13 @@ class ProxyFeature(Feature):
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning("Isolated feature tool %s.%s failed: %s", self.name, name, exc)
+            # Transport/RPC failure — emit the flat error envelope so callers
+            # and the honesty layer read a top-level ``status: error``.
             return {
-                "success": False,
+                "status": "error",
                 "error": str(exc),
                 "tool": name,
+                "success": False,
             }
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
@@ -697,16 +715,22 @@ def _send_outcome(envelope: Dict[str, Any], transport_ok: bool):
 def _delivery_receipt_from_result(channel_type: str, result: Dict[str, Any]):
     """Map a forwarded isolated-tool result onto a ``DeliveryReceipt``.
 
-    ``call_isolated_tool`` wraps the tool's own envelope as
-    ``{"success": bool, "result": <envelope>}``.
+    ``call_isolated_tool`` returns the tool's ToolResult envelope TOP-LEVEL
+    (unified shape #F025): ``{status, confirmation, error, data, tool, success}``.
+    The envelope IS the result; a legacy raw return still arrives wrapped as
+    ``{success, result}`` and is tolerated below.
     """
     import uuid as _uuid
 
     from kestrel_sdk.channels import DeliveryReceipt, DeliveryStatus
 
-    transport_ok = bool(result.get("success"))
-    envelope = result.get("result")
-    envelope = envelope if isinstance(envelope, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    transport_ok = bool(result.get("success", True))
+    # Flat envelope (status top-level) is the result itself; tolerate a legacy
+    # nested ``result`` payload for any un-migrated raw-return service.
+    envelope = result
+    if result.get("status") is None and isinstance(result.get("result"), dict):
+        envelope = result["result"]
     data = envelope.get("data")
     data = data if isinstance(data, dict) else {}
     receipt = data.get("receipt") if isinstance(data.get("receipt"), dict) else {}
