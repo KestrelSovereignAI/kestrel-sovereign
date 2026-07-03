@@ -154,31 +154,6 @@ class SpawnFeature(Feature):
         ),
         category=ToolCategory.AGENT_MANAGEMENT,
     )
-    async def _release_child_budget(self, child_name: str) -> None:
-        """Release a terminated child's delegated budget back to the parent.
-
-        Registered as the lifecycle ``on_terminate`` callback, so it runs on
-        every termination path (explicit terminate, TTL expiry, parent
-        shutdown). Credits any unspent hold back to the parent wallet.
-        Best-effort and idempotent (pops the entry).
-        """
-        entry = self._delegated_wallets.pop(child_name, None)
-        if entry is None:
-            return
-        dw, parent_wallet = entry
-        from kestrel_sovereign.spawn.delegated_wallet import (
-            release_delegated_wallet,
-        )
-
-        try:
-            returned = await release_delegated_wallet(dw, parent_wallet)
-            logger.info(
-                "Released child '%s' budget: spent=%s, returned=%s to parent",
-                child_name, dw.spent, returned,
-            )
-        except Exception as e:  # noqa: BLE001 - best-effort accounting
-            logger.error("Failed to release child '%s' budget: %s", child_name, e)
-
     async def spawn_agent(
         self,
         name: str,
@@ -350,14 +325,23 @@ class SpawnFeature(Feature):
                 except ValueError as e:
                     # Insufficient parent funds / invalid budget — tear down the
                     # child we just spawned so we never leave an unfunded
-                    # budgeted child running.
-                    await manager.terminate_child(self.agent.agent_id, name)
+                    # budgeted child running. Go through the lifecycle (not a
+                    # raw manager.terminate_child) so its tracking + TTL task are
+                    # cleaned up too; fall back to the manager if the child was
+                    # never lifecycle-registered.
+                    if isinstance(lifecycle, SpawnedAgentLifecycle):
+                        await lifecycle.terminate(name, reason="budget hold failed")
+                    else:
+                        await manager.terminate_child(self.agent.agent_id, name)
                     return ToolResult.failed(error=f"budget hold failed: {e}")
 
                 child._delegated_wallet = dw
                 self._delegated_wallets[name] = (dw, parent_wallet)
+                # Register this parent's release callback (idempotent). A shared
+                # lifecycle keeps a LIST of callbacks, so this never clobbers
+                # another parent's release.
                 if isinstance(lifecycle, SpawnedAgentLifecycle):
-                    lifecycle._on_terminate = self._release_child_budget
+                    lifecycle.add_terminate_callback(self._release_child_budget)
                 budget_held = str(dw.ceiling)
 
             data = {
@@ -378,6 +362,32 @@ class SpawnFeature(Feature):
         except Exception as e:
             logger.error(f"Failed to spawn child agent '{name}': {e}")
             return ToolResult.failed(error=str(e))
+
+    async def _release_child_budget(self, child_name: str) -> None:
+        """Release a terminated child's delegated budget back to the parent.
+
+        Registered as a lifecycle terminate callback (fires on explicit
+        terminate, TTL expiry, and parent shutdown). Credits any unspent hold
+        back to the parent wallet. Best-effort and idempotent: pops the entry,
+        and is a no-op for a child THIS parent doesn't own (the shared lifecycle
+        invokes every parent's callback).
+        """
+        entry = self._delegated_wallets.pop(child_name, None)
+        if entry is None:
+            return
+        dw, parent_wallet = entry
+        from kestrel_sovereign.spawn.delegated_wallet import (
+            release_delegated_wallet,
+        )
+
+        try:
+            returned = await release_delegated_wallet(dw, parent_wallet)
+            logger.info(
+                "Released child '%s' budget: spent=%s, returned=%s to parent",
+                child_name, dw.spent, returned,
+            )
+        except Exception as e:  # noqa: BLE001 - best-effort accounting
+            logger.error("Failed to release child '%s' budget: %s", child_name, e)
 
     @tool(
         name="list_children",

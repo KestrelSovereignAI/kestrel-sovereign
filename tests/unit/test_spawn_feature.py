@@ -300,13 +300,46 @@ class TestSpawnFeatureWithManager:
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
         await feature.spawn_agent(name="helper", purpose="x", budget=30.0, ttl=0)
         assert parent.wallet.get_balance() == Decimal("70")  # held
-        assert lifecycle._on_terminate is not None
+        assert feature._release_child_budget in lifecycle._on_terminate_callbacks
 
         # Simulate any termination path (all funnel through _terminate_and_cleanup).
         await lifecycle._terminate_and_cleanup("helper", SpawnStatus.TERMINATED)
         # Unspent 30 returned → back to 100; wallet entry released.
         assert parent.wallet.get_balance() == Decimal("100")
         assert "helper" not in feature._delegated_wallets
+
+    @pytest.mark.asyncio
+    async def test_budget_release_isolated_across_parents(self):
+        """#F278 codex P2: a SHARED lifecycle serves many parents. Terminating
+        one parent's child must not touch another parent's wallet map, and each
+        parent's held budget is released to ITS wallet."""
+        lifecycle_mgr = MagicMock()
+        lifecycle_mgr.terminate_child = AsyncMock()
+        lifecycle = SpawnedAgentLifecycle(lifecycle_mgr)
+        lifecycle_mgr._lifecycle = lifecycle
+
+        parent_a = _make_mock_agent("did:A")
+        parent_a.wallet = _FakeWallet(initial_balance=Decimal("100"))
+        parent_b = _make_mock_agent("did:B")
+        parent_b.wallet = _FakeWallet(initial_balance=Decimal("50"))
+        lifecycle_mgr.spawn_agent = AsyncMock(
+            side_effect=lambda **kw: _make_mock_agent("did:" + kw["name"])
+        )
+
+        feat_a = _make_spawn_feature(parent_agent=parent_a, manager=lifecycle_mgr)
+        feat_b = _make_spawn_feature(parent_agent=parent_b, manager=lifecycle_mgr)
+        await feat_a.spawn_agent(name="childA", purpose="x", budget=40.0, ttl=0)
+        await feat_b.spawn_agent(name="childB", purpose="x", budget=20.0, ttl=0)
+
+        # Both callbacks registered on the one shared lifecycle.
+        assert len(lifecycle._on_terminate_callbacks) == 2
+
+        # Terminate A's child: only A's wallet is credited back; B untouched.
+        await lifecycle._terminate_and_cleanup("childA", SpawnStatus.TERMINATED)
+        assert parent_a.wallet.get_balance() == Decimal("100")  # 40 returned
+        assert parent_b.wallet.get_balance() == Decimal("30")   # still held
+        assert "childA" not in feat_a._delegated_wallets
+        assert "childB" in feat_b._delegated_wallets
 
     @pytest.mark.asyncio
     async def test_delegate_task_not_our_child(self):
