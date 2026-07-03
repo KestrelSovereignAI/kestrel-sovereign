@@ -110,6 +110,7 @@ class DeliveryQueue:
     async def start(self):
         """Create DB tables and launch the background worker."""
         await self._ensure_tables()
+        await self._reclaim_in_flight()
         self._running = True
         self._task = asyncio.create_task(self._loop(), name="delivery-queue-worker")
         logger.info(
@@ -129,6 +130,47 @@ class DeliveryQueue:
             except asyncio.CancelledError:
                 pass
         logger.info("DeliveryQueue stopped")
+
+    async def _reclaim_in_flight(self) -> int:
+        """Requeue rows left IN_FLIGHT by a crash/restart.
+
+        DeliveryQueue is single-worker-per-agent, so any IN_FLIGHT row observed
+        at start() is by definition stale -- the previous worker died mid-flight
+        and will never resolve it. Move such rows back to PENDING (preserving
+        ``attempts``, resetting ``next_retry_at`` to now) so the worker retries
+        them. Providers already tolerate at-least-once redelivery via the
+        existing retry semantics, so requeue-on-startup is safe.
+
+        Returns:
+            Number of entries reclaimed.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ? AND status = ?",
+            (self._agent_id, DeliveryStatus.IN_FLIGHT.value),
+        )
+        count = row[0] if row else 0
+
+        if count > 0:
+            await self._db.execute(
+                """
+                UPDATE delivery_queue
+                SET status = ?, next_retry_at = ?
+                WHERE agent_id = ? AND status = ?
+                """,
+                (
+                    DeliveryStatus.PENDING.value,
+                    now_iso,
+                    self._agent_id,
+                    DeliveryStatus.IN_FLIGHT.value,
+                ),
+            )
+            logger.warning(
+                "Reclaimed %d stale in-flight delivery ent(ies) on start", count
+            )
+
+        return count
 
     # ------------------------------------------------------------------
     # Public API
