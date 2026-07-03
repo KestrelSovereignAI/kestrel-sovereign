@@ -149,7 +149,7 @@ def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview():
         assert older_session["preview"] == "ciphertext"
         assert older_session["preview_encrypted"] is True
         assert payload["encrypted_at_rest"] is True
-        storage.query_conversations.assert_awaited_once_with("did:agent", limit=200)
+        storage.query_conversations.assert_awaited_once_with("did:agent", limit=200, view="active")
     finally:
         _restore_app(app, original)
 
@@ -652,6 +652,85 @@ def test_new_conversation_delete_message_and_transcript_contracts():
         assert "**User**" in transcript
         assert "Type: context_summary" in transcript
         assert "Original messages: 1-2" in transcript
+    finally:
+        _restore_app(app, original)
+
+
+def test_archive_and_unarchive_endpoint_contracts():
+    """#2149: /archive and /unarchive delegate to storage and return the
+    documented success envelope; a zero rowcount 404s."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.archive_conversation_session = AsyncMock(return_value=3)
+    storage.unarchive_conversation_session = AsyncMock(return_value=3)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                archive_response = client.post(
+                    "/api/conversations/sess-9/archive", headers=_api_headers()
+                )
+                unarchive_response = client.post(
+                    "/api/conversations/sess-9/unarchive", headers=_api_headers()
+                )
+        assert archive_response.status_code == 200
+        assert archive_response.json() == {
+            "success": True,
+            "session_id": "sess-9",
+            "archived_count": 3,
+        }
+        storage.archive_conversation_session.assert_awaited_once_with(
+            "sess-9", "did:agent"
+        )
+        assert unarchive_response.status_code == 200
+        assert unarchive_response.json() == {
+            "success": True,
+            "session_id": "sess-9",
+            "unarchived_count": 3,
+        }
+        storage.unarchive_conversation_session.assert_awaited_once_with(
+            "sess-9", "did:agent"
+        )
+    finally:
+        _restore_app(app, original)
+
+
+def test_archive_endpoint_404s_on_zero_rows():
+    """Archiving a session with no live rows returns 404 (matches restore)."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.archive_conversation_session = AsyncMock(return_value=0)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/conversations/ghost/archive", headers=_api_headers()
+                )
+        assert response.status_code == 404
+    finally:
+        _restore_app(app, original)
+
+
+def test_list_conversations_passes_archived_view():
+    """view=archived is validated and forwarded to query_conversations."""
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversations = AsyncMock(return_value=[])
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/conversations?view=archived", headers=_api_headers()
+                )
+        assert response.status_code == 200
+        storage.query_conversations.assert_awaited_once_with(
+            "did:agent", limit=1000, view="archived"
+        )
     finally:
         _restore_app(app, original)
 

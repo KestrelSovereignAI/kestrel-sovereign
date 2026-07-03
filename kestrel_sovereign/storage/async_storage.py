@@ -383,6 +383,18 @@ class AsyncStorage:
             await self.initialize()
         return await self.conversation.restore_conversation_session(session_id)
 
+    async def archive_conversation_session(self, session_id: str) -> int:
+        """Archive an entire session — facade delegator (#2149)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.archive_conversation_session(session_id)
+
+    async def unarchive_conversation_session(self, session_id: str) -> int:
+        """Unarchive an entire session — facade delegator (#2149)."""
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.unarchive_conversation_session(session_id)
+
     async def purge_message(
         self, message_id: int, reason: str = "user-initiated"
     ) -> bool:

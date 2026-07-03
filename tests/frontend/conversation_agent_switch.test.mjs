@@ -44,6 +44,9 @@ function makeNode(tag = 'div') {
         scrollTop: 0,
         scrollHeight: 0,
         value: '',
+        _attrs: {},
+        setAttribute(name, value) { this._attrs[name] = String(value); },
+        getAttribute(name) { return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name] : null; },
         addEventListener(type, fn) {
             if (!listeners.has(type)) listeners.set(type, []);
             listeners.get(type).push(fn);

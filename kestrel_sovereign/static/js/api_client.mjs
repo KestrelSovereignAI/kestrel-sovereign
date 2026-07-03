@@ -477,7 +477,7 @@ export function createApiClient({
         importSovereignty: (cid) => client.request('/api/sovereignty/import', { method: 'POST', body: JSON.stringify({ cid }) }),
         getSovereigntyFiles: () => client.request('/api/sovereignty/files'),
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
-        getConversations: (decrypt = true) => client.request(`/api/conversations?decrypt=${decrypt}`),
+        getConversations: (decrypt = true, view = 'active') => client.request(`/api/conversations?decrypt=${decrypt}&view=${encodeURIComponent(view)}`),
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
         renameConversation: (sessionId, name) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, {
             method: 'PATCH',
@@ -506,6 +506,18 @@ export function createApiClient({
         // Trash, or hard-purge with an audit reason.  Purge is irreversible
         // and always carries the destructive header.
         listTrash: (limit = 200) => client.request(`/api/trash?limit=${encodeURIComponent(limit)}`),
+        // Archive sub-view surface (#2149) — non-destructive; archive/unarchive
+        // simply toggle a session between the active and archived lists. The
+        // archived list itself is served by getConversations(view='archived'),
+        // the single listing path shared with the active view.
+        archiveConversation: (sessionId) => client.request(
+            `/api/conversations/${encodeURIComponent(sessionId)}/archive`,
+            { method: 'POST' },
+        ),
+        unarchiveConversation: (sessionId) => client.request(
+            `/api/conversations/${encodeURIComponent(sessionId)}/unarchive`,
+            { method: 'POST' },
+        ),
         restoreConversation: (sessionId) => client.request(
             `/api/conversations/${encodeURIComponent(sessionId)}/restore`,
             { method: 'POST' },
