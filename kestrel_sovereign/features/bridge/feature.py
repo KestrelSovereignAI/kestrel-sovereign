@@ -50,6 +50,24 @@ class BridgeFeature(Feature):
             "view bridge status, list active sessions, and review invocation history"
         )
 
+    def get_router(self):
+        """Return the FastAPI router for bridge HTTP endpoints (F105).
+
+        Overrides ``Feature.get_router`` so the agent auto-mounts the
+        ``/api/bridge/*`` routes after features load. Without this, the
+        router built by ``router.get_router()`` is never mounted and every
+        bridge endpoint 404s.
+
+        Handlers resolve the agent request-scoped via ``get_agent(request)``,
+        so multi-agent mounting through ``_mount_feature_routers`` is safe.
+
+        Returns:
+            ``fastapi.APIRouter``
+        """
+        from .router import get_router as build_bridge_router
+
+        return build_bridge_router()
+
     async def initialize(self):
         """Initialize the bridge feature: resolve DB handle, create tables."""
         self._db = None
