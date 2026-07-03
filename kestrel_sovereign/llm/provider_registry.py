@@ -445,19 +445,21 @@ class ProviderRegistry:
             client = ollama.AsyncClient(host=host)
             return client, adapter_cls()
 
-        # --- Google Gemini (legacy generativeai SDK) ---
+        # --- Google Gemini (maintained google-genai SDK) ---
         if adapter_cls is GoogleAdapter:
             try:
-                import google.generativeai as genai
+                from google import genai as _genai
             except ImportError:
-                raise ImportError("google-generativeai package not installed.")
+                raise ImportError("google-genai package not installed.")
             api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key") \
                 or os.environ.get("GOOGLE_API_KEY")
             if not api_key:
                 raise ValueError(f"{vendor}:{route} requires GOOGLE_API_KEY")
-            genai.configure(api_key=api_key)
-            # Client is lazily constructed per call; adapter carries the model name.
-            return genai, adapter_cls()
+            # The direct Gemini route uses the same google-genai client surface
+            # as Vertex (client.aio.models.generate_content), just with an API
+            # key instead of a service account. See GoogleAdapter.get_response.
+            client = _genai.Client(api_key=api_key)
+            return client, adapter_cls()
 
         # --- Vertex AI (new google-genai SDK, api-key or service-account) ---
         if adapter_cls is VertexAIAdapter:
@@ -483,7 +485,7 @@ class ProviderRegistry:
                 raise ValueError(
                     f"{vendor}:{route} requires GOOGLE_API_KEY or GCP_PROJECT_ID"
                 )
-            client = _genai.Client(vendorai=True, project=project_id, location=location)
+            client = _genai.Client(vertexai=True, project=project_id, location=location)
             adapter = adapter_cls(project_id=project_id, location=location)
             return client, adapter
 

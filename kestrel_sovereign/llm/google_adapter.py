@@ -52,21 +52,24 @@ class GoogleAdapter(LLMAdapter):
         )
 
     @staticmethod
-    def _embedding_model_id(model: Optional[str]) -> str:
-        model_id = model or "text-embedding-004"
-        return model_id if model_id.startswith("models/") else f"models/{model_id}"
-
-    @staticmethod
-    def _embedding_from_google_response(response: Any) -> Optional[List[float]]:
-        if isinstance(response, dict):
-            embedding = response.get("embedding")
+    def _embedding_values(item: Any) -> Optional[List[float]]:
+        if isinstance(item, dict):
+            values = item.get("values")
         else:
-            embedding = getattr(response, "embedding", None)
-        if isinstance(embedding, dict):
-            values = embedding.get("values")
-        else:
-            values = getattr(embedding, "values", embedding)
+            values = getattr(item, "values", None)
         return list(values) if values is not None else None
+
+    @classmethod
+    def _embeddings_from_response(cls, response: Any, count: int) -> List[Optional[List[float]]]:
+        embeddings = getattr(response, "embeddings", None)
+        if embeddings is None and isinstance(response, dict):
+            embeddings = response.get("embeddings")
+        out: List[Optional[List[float]]] = [None] * count
+        for idx, item in enumerate(embeddings or []):
+            if idx >= count:
+                break
+            out[idx] = cls._embedding_values(item)
+        return out
 
     async def aembed(
         self,
@@ -76,11 +79,14 @@ class GoogleAdapter(LLMAdapter):
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
-        response = await client.embed_content_async(
-            model=self._embedding_model_id(model),
-            content=text,
+        # Use the maintained google-genai async client surface (mirrors
+        # VertexAIAdapter). The registry now hands GoogleAdapter a
+        # ``google.genai.Client``, not the deprecated module client.
+        response = await client.aio.models.embed_content(
+            model=model or "text-embedding-004",
+            contents=text,
         )
-        return self._embedding_from_google_response(response)
+        return self._embeddings_from_response(response, 1)[0]
 
     async def aembed_batch(
         self,
@@ -90,10 +96,13 @@ class GoogleAdapter(LLMAdapter):
         model: Optional[str] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
-        return [
-            await self.aembed(client, text, model=model, **kwargs)
-            for text in texts
-        ]
+        if not texts:
+            return []
+        response = await client.aio.models.embed_content(
+            model=model or "text-embedding-004",
+            contents=texts,
+        )
+        return self._embeddings_from_response(response, len(texts))
 
     def create_messages(
         self,
@@ -189,7 +198,7 @@ class GoogleAdapter(LLMAdapter):
         Get response from Google Gemini API.
 
         Args:
-            client: Google GenerativeModel instance
+            client: google-genai ``Client`` instance (``client.aio.models``)
             model: Model name (e.g., 'gemini-2.0-flash-exp')
             messages: List of message dicts in Gemini format
             format: Response format (ignored for Gemini)
@@ -200,25 +209,25 @@ class GoogleAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         try:
-            generation_config = {
+            config: Dict[str, Any] = {
                 "max_output_tokens": kwargs.get("max_tokens", 8192),
             }
 
             if "temperature" in kwargs:
-                generation_config["temperature"] = kwargs["temperature"]
+                config["temperature"] = kwargs["temperature"]
 
             # Prepare tool config
-            tools_config = None
             if tools:
-                tools_config = [{
+                config["tools"] = [{
                     "function_declarations": self._convert_tools_to_gemini_format(tools)
                 }]
 
-            # Generate content
-            response = await client.generate_content_async(
+            # Generate content via the maintained google-genai async client,
+            # honoring the routed model (mirrors VertexAIAdapter).
+            response = await client.aio.models.generate_content(
+                model=model,
                 contents=messages,
-                generation_config=generation_config,
-                tools=tools_config
+                config=config,
             )
 
             # Parse response
@@ -268,24 +277,27 @@ class GoogleAdapter(LLMAdapter):
             Text chunks as they arrive
         """
         try:
-            generation_config = {
+            config: Dict[str, Any] = {
                 "max_output_tokens": kwargs.get("max_tokens", 8192),
             }
 
-            tools_config = None
+            if "temperature" in kwargs:
+                config["temperature"] = kwargs["temperature"]
+
             if tools:
-                tools_config = [{
+                config["tools"] = [{
                     "function_declarations": self._convert_tools_to_gemini_format(tools)
                 }]
 
-            response = await client.generate_content_async(
+            # Stream via the maintained google-genai async client, honoring the
+            # routed model (mirrors VertexAIAdapter).
+            stream = await client.aio.models.generate_content_stream(
+                model=model,
                 contents=messages,
-                generation_config=generation_config,
-                tools=tools_config,
-                stream=True
+                config=config,
             )
 
-            async for chunk in response:
+            async for chunk in stream:
                 if chunk.text:
                     yield chunk.text
 
