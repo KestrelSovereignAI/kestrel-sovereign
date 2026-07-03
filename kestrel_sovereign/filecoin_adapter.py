@@ -185,7 +185,9 @@ class FilecoinAdapter:
         final_content = content
         encryption_key_hash = None
         if encrypt:
-            final_content, encryption_key_hash = self._encrypt_content(content)
+            final_content, encryption_key_hash = self._encrypt_content(
+                content, content_hash=content_hash
+            )
         
         # Compress content for efficiency
         compressed_content = zlib.compress(final_content, level=6)
@@ -343,29 +345,43 @@ class FilecoinAdapter:
     def _decrypt_content(self, encrypted_content: bytes, key_hash: str) -> bytes:
         """Decrypts content using the two-tiered key system.
 
+        Two content-key provenance paths are supported:
+
+        * **Portable (current, F187).** No key sidecar exists. The per-content
+          key is *derived deterministically* from the master key + the content
+          hash (``key_hash`` IS that content hash), so an encrypted CID
+          restores on any host that shares ``KESTREL_DATA_KEY`` — no
+          out-of-band sidecar file has to travel with the CID. This is what
+          makes ``!identity import <cid> ...`` portable across substrates.
+        * **Legacy sidecar.** Older content wrapped a *random* content key
+          with the master key and wrote it to ``storage_cache/key_<hash>.key``.
+          When that file is present we honour the old path so pre-existing
+          Filecoin-stored content stays decryptable.
+
         AEADCipher reads both v2 and legacy Fernet ciphertext, so existing
         Filecoin-stored content stays decryptable across the migration.
         """
         from kestrel_sdk.security.aead import AEADCipher
 
-        # 1. Read the encrypted content key from where it was stored
-        key_file = self.cache_dir / f"key_{key_hash}.key"
-        if not key_file.exists():
-            raise FileNotFoundError(f"Could not find key file for hash: {key_hash}")
-
-        with open(key_file, 'rb') as f:
-            encrypted_key = f.read()
-
-        # 2. Decrypt the content key with the master key
         master_key = self._get_master_key()
-        f_master = AEADCipher(master_key)
-        try:
-            content_key = f_master.decrypt(encrypted_key)
-        except Exception as e:
-            logging.error(f"Failed to decrypt content key with master key: {e}")
-            raise
 
-        # 3. Use the decrypted content key to decrypt the actual content
+        # Legacy path: a wrapped random content key was persisted as a local
+        # sidecar. Only reachable on the ORIGINAL host that stored it — kept
+        # for backward compatibility with content encrypted before F187.
+        key_file = self.cache_dir / f"key_{key_hash}.key"
+        if key_file.exists():
+            with open(key_file, 'rb') as f:
+                encrypted_key = f.read()
+            try:
+                content_key = AEADCipher(master_key).decrypt(encrypted_key)
+            except Exception as e:
+                logging.error(f"Failed to decrypt content key with master key: {e}")
+                raise
+        else:
+            # Portable path: re-derive the deterministic per-content key from
+            # the master key + content hash. No sidecar needed.
+            content_key = self._derive_content_key(master_key, key_hash)
+
         f_content = AEADCipher(content_key)
         try:
             decrypted_content = f_content.decrypt(encrypted_content)
@@ -392,32 +408,50 @@ class FilecoinAdapter:
             "Set it to a passphrase or a valid Fernet key."
         )
 
-    def _encrypt_content(self, content: bytes) -> Tuple[bytes, str]:
-        """Encrypt content with a derived key and secure the key.
+    def _derive_content_key(self, master_key: bytes, content_hash: str) -> bytes:
+        """Derive a portable per-content AES-256 key from the master key.
 
-        Both layers (content and key wrap) now use AES-256-GCM v2.
+        The derivation is deterministic in ``(master_key, content_hash)`` via
+        HKDF-SHA256, so the same key is reproducible on any host that holds the
+        same ``KESTREL_DATA_KEY`` — no key material has to be persisted to a
+        sidecar or shipped out-of-band with the CID (F187 portability). The
+        content hash is a stable, per-content salt so distinct packages get
+        distinct content keys even under one master key.
+        """
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,  # AES-256
+            salt=content_hash.encode("utf-8"),
+            info=b"kestrel-filecoin-content-key-v1",
+        )
+        return hkdf.derive(master_key)
+
+    def _encrypt_content(self, content: bytes,
+                         content_hash: Optional[str] = None) -> Tuple[bytes, str]:
+        """Encrypt content with a portable, deterministically-derived key.
+
+        The per-content key is derived from the master key + the content hash
+        (F187): retrieval re-derives the identical key from ``KESTREL_DATA_KEY``
+        + ``key_hash`` alone, so an encrypted CID is restorable on a different
+        host WITHOUT a local key sidecar. ``key_hash`` returned here IS the
+        content hash and is the only out-of-band material that must accompany
+        the CID.
         """
         from kestrel_sdk.security.aead import AEADCipher
 
-        # 1. Generate a new, unique key for this specific content
-        content_key = AEADCipher.generate_key()
-        f_content = AEADCipher(content_key)
-        encrypted_content = f_content.encrypt(content)
+        if content_hash is None:
+            content_hash = hashlib.sha256(content).hexdigest()
 
-        # 2. Encrypt the content key with a master key
         master_key = self._get_master_key()
-        f_master = AEADCipher(master_key)
-        encrypted_key = f_master.encrypt(content_key)
+        content_key = self._derive_content_key(master_key, content_hash)
+        encrypted_content = AEADCipher(content_key).encrypt(content)
 
-        # 3. Use the hash of the encrypted key as its identifier
-        key_hash = hashlib.sha256(encrypted_key).hexdigest()
-
-        # 4. Store the encrypted key
-        key_file = self.cache_dir / f"key_{key_hash}.key"
-        with open(key_file, 'wb') as f:
-            f.write(encrypted_key)
-
-        return encrypted_content, key_hash
+        # The content hash doubles as the key identifier. No sidecar is
+        # written — the key is reproducible from (master_key, content_hash).
+        return encrypted_content, content_hash
 
     def _find_suitable_miner(self, size_bytes: int = 0) -> Optional[str]:
         """

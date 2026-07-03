@@ -76,6 +76,22 @@ class IdentityImporter:
     a migration record for audit trail.
     """
 
+    # F186: node types the importer must NEVER overwrite. Package-supplied
+    # graph nodes (users, skills) are namespaced under the importing agent's
+    # id, but a defense-in-depth guard additionally refuses to clobber the
+    # agent's own identity node or any existing reserved-type node, so a
+    # crafted id can't hijack governance/identity/lineage rows.
+    RESERVED_NODE_TYPES = frozenset({
+        "agent",
+        "constitution",
+        "migration_record",
+        "lifecycle_event",
+        "retirement_event",
+        "audit_anchor",
+        "sovereignty_receipt",
+        "agent_identity_resource",
+    })
+
     def __init__(
         self,
         db: "AsyncDatabase",
@@ -220,27 +236,37 @@ class IdentityImporter:
                 )
                 return self._build_result(False, agent_id)
 
-        if verify_signature:
-            # Hybrid packages carry sigs only on package.signatures
-            # (the v2 array); the legacy package.signature field is
-            # empty by design for post-ceremony agents because that
-            # field can't be made byte-compatible with v1 readers
-            # over a v2 canonical hash. Treat either carrier as
-            # "signed" and let _verify_signature route by alg.
-            has_signature = bool(package.signature) or bool(package.signatures)
-            if has_signature:
+        # Hybrid packages carry sigs only on package.signatures
+        # (the v2 array); the legacy package.signature field is
+        # empty by design for post-ceremony agents because that
+        # field can't be made byte-compatible with v1 readers
+        # over a v2 canonical hash. Treat either carrier as
+        # "signed" and let _verify_signature route by alg.
+        has_signature = bool(package.signature) or bool(package.signatures)
+
+        # F185: the unsigned-package policy is enforced UNCONDITIONALLY,
+        # independent of verify_signature. ``verify_signature`` gates only
+        # the cryptographic validation of a *present* signature — it must
+        # never relax the requirement that a signature be present. Hoisting
+        # this out of the ``if verify_signature:`` block closes the bypass
+        # where a model-controlled ``verify_signature=False`` silently
+        # imported an unsigned package despite ``allow_unsigned=False``.
+        if not has_signature and not allow_unsigned:
+            self.errors.append(
+                "Package is not signed (unsigned). "
+                "Set allow_unsigned=True to import unsigned packages."
+            )
+            return self._build_result(False, agent_id)
+
+        if has_signature:
+            if verify_signature:
                 sig_valid = await self._verify_signature(package)
                 if not sig_valid:
                     self.errors.append("DID signature verification failed")
                     return self._build_result(False, agent_id)
-            elif not allow_unsigned:
-                self.errors.append(
-                    "Package is not signed (unsigned). "
-                    "Set allow_unsigned=True to import unsigned packages."
-                )
-                return self._build_result(False, agent_id)
-            else:
-                self.warnings.append("Importing unsigned package (allow_unsigned=True)")
+        else:
+            # Reached only when allow_unsigned=True (else we returned above).
+            self.warnings.append("Importing unsigned package (allow_unsigned=True)")
 
         # 2. Check merge mode
         if merge_mode == "skip_existing":
@@ -473,14 +499,58 @@ class IdentityImporter:
         self.stats["reflection_insights_imported"] = count
         logger.info(f"Imported {count} reflection insights")
 
+    def _namespace_node_id(self, agent_id: str, raw_id: str) -> str:
+        """Prefix a package-supplied node id with the importing agent's id.
+
+        F186: mirrors the ``agent_id[:20]_...`` prefixing that episodes /
+        saved_items already use, so package-supplied graph node ids can't
+        be written unnamespaced (and therefore can't collide with — and
+        overwrite — arbitrary existing ``graph_nodes`` rows).
+        """
+        return f"{agent_id[:20]}_{raw_id}"
+
+    async def _node_is_protected(self, agent_id: str, node_id: str) -> bool:
+        """True if ``node_id`` must not be overwritten by an import.
+
+        F186 defense-in-depth on top of namespacing: refuse to upsert any
+        node that IS the importing agent's identity node, or that collides
+        with an EXISTING node whose type is reserved (governance, identity,
+        lineage). Prevents a crafted package from clobbering those rows even
+        if the namespacing prefix were ever bypassed.
+        """
+        if node_id == agent_id:
+            return True
+        try:
+            row = await self.db.fetchone(
+                "SELECT node_type FROM graph_nodes WHERE node_id = ?",
+                (node_id,),
+            )
+        except Exception as e:
+            # Fail safe: if we can't determine the existing type, refuse the
+            # overwrite rather than risk clobbering a protected row.
+            logger.warning(f"Reserved-node check failed for {node_id}: {e}")
+            return True
+        return bool(row) and row[0] in self.RESERVED_NODE_TYPES
+
     async def _import_relationships(self, agent_id: str, relationships: List[Any]):
         """Import relationships as graph nodes and edges."""
         count = 0
         for rel in relationships:
             rel_dict = rel.to_dict() if hasattr(rel, 'to_dict') else rel
             try:
-                # Create user node
-                user_id = rel_dict.get("user_id")
+                # Create user node. F186: namespace the package-supplied id
+                # so it can't overwrite arbitrary graph_nodes rows.
+                raw_user_id = rel_dict.get("user_id")
+                if not raw_user_id:
+                    self.warnings.append("Skipping relationship with no user_id")
+                    continue
+                user_id = self._namespace_node_id(agent_id, raw_user_id)
+                if await self._node_is_protected(agent_id, user_id):
+                    self.warnings.append(
+                        f"Refused to import relationship: node id {user_id!r} "
+                        "collides with a reserved/identity node"
+                    )
+                    continue
                 properties = json.dumps({
                     "first_interaction": rel_dict.get("first_interaction"),
                     "last_interaction": rel_dict.get("last_interaction"),
@@ -494,7 +564,7 @@ class IdentityImporter:
                     """INSERT OR REPLACE INTO graph_nodes
                        (node_id, node_type, label, properties)
                        VALUES (?, 'user', ?, ?)""",
-                    (user_id, f"User {user_id[:8]}", properties)
+                    (user_id, f"User {str(raw_user_id)[:8]}", properties)
                 )
 
                 # Create edge
@@ -518,7 +588,19 @@ class IdentityImporter:
         for skill in skills:
             skill_dict = skill.to_dict() if hasattr(skill, 'to_dict') else skill
             try:
-                skill_id = skill_dict.get("skill_id")
+                # F186: namespace the package-supplied skill id so it can't
+                # overwrite arbitrary graph_nodes rows.
+                raw_skill_id = skill_dict.get("skill_id")
+                if not raw_skill_id:
+                    self.warnings.append("Skipping skill with no skill_id")
+                    continue
+                skill_id = self._namespace_node_id(agent_id, raw_skill_id)
+                if await self._node_is_protected(agent_id, skill_id):
+                    self.warnings.append(
+                        f"Refused to import skill: node id {skill_id!r} "
+                        "collides with a reserved/identity node"
+                    )
+                    continue
                 properties = json.dumps({
                     "type": skill_dict.get("skill_type"),
                     "proficiency": skill_dict.get("proficiency", 0.5),
