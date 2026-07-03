@@ -98,6 +98,25 @@ class CloudRunProvider(DeployProvider):
                 ) from e
         return self._services_client
 
+    @staticmethod
+    def _status_from_conditions(conditions) -> str:
+        """Derive a service status from its Ready condition.
+
+        ``condition.state`` is a proto ``Condition.State`` enum, so it must be
+        compared against the enum member — never the string
+        ``"CONDITION_SUCCEEDED"`` (which would never match, leaving every
+        service reporting ``deploying``).
+        """
+        from google.cloud.run_v2.types import Condition
+
+        for condition in conditions or []:
+            if (
+                condition.type == "Ready"
+                and condition.state != Condition.State.CONDITION_SUCCEEDED
+            ):
+                return "deploying"
+        return "active"
+
     def _get_logging_client(self):
         """Lazy-load the Cloud Logging client."""
         if self._logging_client is None:
@@ -304,12 +323,7 @@ class CloudRunProvider(DeployProvider):
             for service in services:
                 if service.name.endswith(f"/services/{service_name}"):
                     # Parse status
-                    conditions = service.conditions or []
-                    status = "active"
-                    for condition in conditions:
-                        if condition.type == "Ready" and condition.state != "CONDITION_SUCCEEDED":
-                            status = "deploying"
-                            break
+                    status = self._status_from_conditions(service.conditions)
 
                     return {
                         "status": status,
@@ -430,12 +444,7 @@ class CloudRunProvider(DeployProvider):
                 # Only include services matching kestrel-* pattern
                 service_name = service.name.split("/")[-1]
                 if service_name.startswith("kestrel-"):
-                    conditions = service.conditions or []
-                    status = "active"
-                    for condition in conditions:
-                        if condition.type == "Ready" and condition.state != "CONDITION_SUCCEEDED":
-                            status = "deploying"
-                            break
+                    status = self._status_from_conditions(service.conditions)
 
                     deployments.append({
                         "name": service_name,
