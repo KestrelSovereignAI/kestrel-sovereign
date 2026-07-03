@@ -6,6 +6,7 @@ Extracted from ContextManager to improve modularity and maintainability.
 """
 
 import logging
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 
@@ -75,6 +76,29 @@ class ConversationManager:
         except Exception as e:
             logger.error(f"Failed to get conversation history: {e}", exc_info=True)
             return []
+
+    @staticmethod
+    async def _resolve_marker_id_by_uuid(
+        conv_store: Any, uuid_key: str, marker_uuid: str
+    ) -> Optional[int]:
+        """Resolve a just-inserted marker row's id by a UUID unique to this call.
+
+        ``add_conversation`` returns nothing, so both compaction and summary
+        used to recover the marker id with ``ORDER BY id DESC LIMIT 1`` — which
+        returns whatever row was inserted LAST and races any concurrent
+        conversation writer, mislinking ``summarized_into`` to another
+        turn's/agent's row (F158). Embedding a per-call UUID in the marker
+        metadata and matching it makes the lookup race-free regardless of
+        concurrent writers (mirrors the salvage.py marker-by-uuid pattern).
+        """
+        if not hasattr(conv_store, "db"):
+            return None
+        row = await conv_store.db.fetchone(
+            "SELECT id FROM conversation_history "
+            "WHERE agent_id = ? AND metadata LIKE ?",
+            (conv_store.agent_id, f'%"{uuid_key}": "{marker_uuid}"%'),
+        )
+        return int(row[0]) if row and row[0] is not None else None
 
     async def compact_session(
         self,
@@ -211,11 +235,15 @@ SUMMARY:"""
             # Store the compaction in the database
             # Create a summary message that replaces the compacted portion
             # Note: Transcript reference is in metadata only, not in content (LLM context)
+            # UUID unique to this call, embedded in the marker metadata so the
+            # marker's id can be resolved race-free after insert (F158).
+            compaction_uuid = uuid.uuid4().hex
             compaction_marker = {
                 "role": "system",
                 "content": f"[COMPACTED CONTEXT - {len(messages_to_compact)} messages summarized]\n\n{summary_text}",
                 "metadata": {
                     "type": "compaction",
+                    "compaction_uuid": compaction_uuid,
                     "messages_compacted": len(messages_to_compact),
                     "tokens_before": tokens_before,
                     "tokens_after": tokens_after,
@@ -243,16 +271,11 @@ SUMMARY:"""
                     session_id=session_id,
                 )
 
-                # Get the ID of the compaction marker we just created
-                # We need this to populate summarized_into on original messages
-                # Query for just the last ID instead of full history (performance fix)
-                compaction_marker_id = None
-                if hasattr(conv_store, 'db'):
-                    row = await conv_store.db.fetchone(
-                        "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
-                        (conv_store.agent_id,)
-                    )
-                    compaction_marker_id = row[0] if row else None
+                # Recover the marker's id by its per-call UUID (race-free vs.
+                # ORDER BY id DESC, which mislinks under concurrent writes, F158).
+                compaction_marker_id = await self._resolve_marker_id_by_uuid(
+                    conv_store, "compaction_uuid", compaction_uuid
+                )
 
                 # Mark original messages as excluded and link to compaction marker
                 if compaction_marker_id and original_message_ids:
@@ -786,8 +809,11 @@ SUMMARY:"""
             # Create summary message with transcript reference
             # Note: Transcript reference is in metadata only, not in content (LLM context)
             now = datetime.now(timezone.utc).isoformat()
+            # UUID unique to this call → race-free marker-id recovery (F158).
+            summary_uuid = uuid.uuid4().hex
             summary_meta = {
                 "type": "context_summary",
+                "summary_uuid": summary_uuid,
                 "summarized_message_ids": original_message_ids,
                 "original_message_ids": original_message_ids,
                 "tokens_before": tokens_before,
@@ -806,15 +832,11 @@ SUMMARY:"""
                 metadata=summary_meta
             )
 
-            # Get the ID of the summary marker we just created
-            # Query for just the last ID instead of full history (performance fix)
-            summary_marker_id = None
-            if hasattr(conv_store, 'db'):
-                row = await conv_store.db.fetchone(
-                    "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
-                    (conv_store.agent_id,)
-                )
-                summary_marker_id = row[0] if row else None
+            # Recover the marker's id by its per-call UUID (race-free vs.
+            # ORDER BY id DESC, which mislinks under concurrent writes, F158).
+            summary_marker_id = await self._resolve_marker_id_by_uuid(
+                conv_store, "summary_uuid", summary_uuid
+            )
 
             # Mark original messages as summarized and link to summary marker
             summary_update = {

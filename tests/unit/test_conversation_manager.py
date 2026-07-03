@@ -944,3 +944,51 @@ async def test_get_conversation_store_hierarchical_fallback(mock_storage):
 
     assert conv_store is not None
     assert conv_store == mock_storage._storage.conversation
+
+
+@pytest.mark.asyncio
+async def test_resolve_marker_id_is_race_free():
+    """F158: the compaction/summary marker id must be recovered by the marker's
+    unique UUID, not ``ORDER BY id DESC`` — so a concurrent writer appending a
+    newer row after the marker can't mislink ``summarized_into``."""
+    store = MockConversationStore()
+
+    # Faithful fetchone: resolve the ``metadata LIKE '%"key": "uuid"%'`` query
+    # against the stored rows (NOT "the latest row").
+    async def fetchone(sql, params=()):
+        assert "metadata LIKE" in sql
+        like = params[1]
+        for msg in store.messages:
+            for k, v in (msg.get("metadata") or {}).items():
+                if isinstance(v, str) and f'"{k}": "{v}"' in like:
+                    return (msg["id"],)
+        return None
+
+    store.db.fetchone = fetchone
+
+    await store.add_conversation("system", "marker", {"compaction_uuid": "UNIQUEXYZ"})
+    marker_id = store.messages[-1]["id"]
+    # A concurrent writer appends a NEWER, unrelated row after the marker.
+    await store.add_conversation("user", "later turn from another writer", {})
+
+    resolved = await ConversationManager._resolve_marker_id_by_uuid(
+        store, "compaction_uuid", "UNIQUEXYZ"
+    )
+
+    assert resolved == marker_id
+    assert resolved != store.messages[-1]["id"]  # NOT the newest row
+
+
+@pytest.mark.asyncio
+async def test_resolve_marker_id_missing_returns_none():
+    """A UUID with no matching row resolves to None (caller skips the link)."""
+    store = MockConversationStore()
+
+    async def fetchone(sql, params=()):
+        return None
+
+    store.db.fetchone = fetchone
+    resolved = await ConversationManager._resolve_marker_id_by_uuid(
+        store, "compaction_uuid", "does-not-exist"
+    )
+    assert resolved is None
