@@ -174,11 +174,18 @@ export async function mountPanels(containerEl, config = {}) {
     // owns loading through identity.js; embed has no such boot, so a runtime
     // module subscribes each core panel's loader/init to `panel:shown`. Loaded
     // lazily + best-effort so a heavy import failure never breaks the mount.
+    // Capture its reset counterpart so destroy() tears the wiring down — the
+    // runtime's init/load guards are per-mount, so a later remount must re-wire
+    // against fresh DOM (else panels never re-init / bodies stay on "Loading…").
+    let resetRuntime = null;
     if (wireRuntime) {
         try {
             const runtime = await import('./core-panels-runtime.js');
             if (runtime && typeof runtime.wireCorePanelRuntime === 'function') {
                 runtime.wireCorePanelRuntime({ api });
+            }
+            if (runtime && typeof runtime.resetCorePanelRuntime === 'function') {
+                resetRuntime = runtime.resetCorePanelRuntime;
             }
         } catch (_) { /* embed data-loading is best-effort */ }
     }
@@ -194,6 +201,11 @@ export async function mountPanels(containerEl, config = {}) {
             detachNav();
             navEl.remove();
             hostEl.remove();
+            // Reset the embed runtime so a subsequent mountPanels re-wires +
+            // reloads against fresh DOM (best-effort — never let teardown throw).
+            if (resetRuntime) {
+                try { resetRuntime(); } catch (_) { /* best-effort */ }
+            }
         },
     };
 }

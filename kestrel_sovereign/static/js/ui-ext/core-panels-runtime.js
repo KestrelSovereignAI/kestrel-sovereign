@@ -18,7 +18,6 @@
 // ============================================================================
 
 import bus from './bus.js';
-import { state } from '../ui.js';
 import API from '../api.js';
 
 import { loadIdentity } from '../identity.js';
@@ -31,8 +30,18 @@ import { initFeatureStore, loadFeatureStore } from '../feature-store.js';
 import { initApprovals, loadApprovals } from '../approvals.js';
 import { Security } from '../security.js';
 
+// Mount-scoped wiring state (#2145 P2-2). These are reset by
+// `resetCorePanelRuntime` (called from `mountPanels().destroy()`), NOT keyed off
+// module lifetime — an embedder that destroys then remounts gets fresh DOM, so
+// the runtime must re-init the new panels and re-run their first-show loaders.
+// The "load once" set is deliberately module-local here rather than the shared
+// `state.*` flags the standalone console uses: `state.identity`/`state.exports`
+// persist across a remount, which would leave a fresh panel body stuck on its
+// "Loading…" placeholder because the guarded load was skipped.
 let _wired = false;
+let _off = null;
 const _inited = new Set();
+const _loaded = new Set();
 
 function _safe(fn) {
     try { if (typeof fn === 'function') fn(); } catch (err) {
@@ -46,9 +55,19 @@ function _initOnce(panelId, fn) {
     _safe(fn);
 }
 
+// Run a panel's data loader once per mount (mirrors the standalone console's
+// state-guarded "load once" semantics, but scoped to this mount so a remount
+// reloads the fresh DOM instead of skipping on a stale cache).
+function _loadOnce(panelId, fn) {
+    if (_loaded.has(panelId)) return;
+    _loaded.add(panelId);
+    _safe(fn);
+}
+
 /**
  * Wire core-panel init + data loading to `panel:shown`. Idempotent — subsequent
- * calls are no-ops so a second `mountPanels` does not double-subscribe.
+ * calls are no-ops so a second `mountPanels` does not double-subscribe. Pair with
+ * `resetCorePanelRuntime` on `destroy()` so a later remount re-wires + reloads.
  *
  * @param {{api?: object}} [opts]
  */
@@ -56,21 +75,21 @@ export function wireCorePanelRuntime({ api = API } = {}) {
     if (_wired) return;
     _wired = true;
 
-    bus.on('panel:shown', (payload) => {
+    const handler = (payload) => {
         const panelId = payload && payload.panelId;
         if (!panelId) return;
         switch (panelId) {
             case 'identity':
-                // Load once — identity has no per-activation refetch in the
-                // standalone console either.
-                if (!state.identity) _safe(loadIdentity);
+                // Load once per mount — identity has no per-activation refetch in
+                // the standalone console either.
+                _loadOnce('identity', loadIdentity);
                 break;
             case 'constitution':
-                if (!state.constitution) _safe(loadConstitution);
+                _loadOnce('constitution', loadConstitution);
                 break;
             case 'memories':
                 _initOnce('memories', initMemoryFilter);
-                if (!state.memories) _safe(loadMemories);
+                _loadOnce('memories', loadMemories);
                 break;
             case 'tasks':
                 _initOnce('tasks', initTasks);
@@ -78,7 +97,7 @@ export function wireCorePanelRuntime({ api = API } = {}) {
                 break;
             case 'sovereignty':
                 _initOnce('sovereignty', initSovereigntyButtons);
-                if (!state.exports) _safe(loadExports);
+                _loadOnce('sovereignty', loadExports);
                 break;
             case 'resources':
                 _safe(loadResources);
@@ -102,7 +121,22 @@ export function wireCorePanelRuntime({ api = API } = {}) {
             default:
                 break;
         }
-    });
+    };
+    bus.on('panel:shown', handler);
+    _off = () => bus.off('panel:shown', handler);
+}
+
+/**
+ * Tear down the runtime wiring so a later `mountPanels` re-wires against fresh
+ * DOM. Unsubscribes the `panel:shown` handler and clears the per-mount init +
+ * load state; without this a remount's fresh panels never re-init (controls
+ * unwired) and their loaders are skipped (bodies stuck on "Loading…").
+ */
+export function resetCorePanelRuntime() {
+    if (_off) { _safe(_off); _off = null; }
+    _wired = false;
+    _inited.clear();
+    _loaded.clear();
 }
 
 export default wireCorePanelRuntime;

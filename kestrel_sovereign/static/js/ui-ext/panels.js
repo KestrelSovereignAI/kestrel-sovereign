@@ -118,12 +118,26 @@ function _syncNav() {
     if (!_navEl) return;
     for (const def of _panels.values()) {
         const tab = _tabFor(def.panelId);
+        // #2145 (P2-1): adopt an in-place core panel body (declared in
+        // index.html, so NOT registry-created) as removable. Pre-#2145 the
+        // `panelIsEnabled` prune in initNavigation removed a gated-off core
+        // panel's tab AND its `#panel-<id>` body; once gating moved to the
+        // registry, only `registryOwned` bodies were dropped, stranding a
+        // gated-off core panel's in-place body in the DOM. Marking it here (on
+        // every sync, while the gate is still being evaluated) restores the
+        // contract: the gate-off branch below removes it, and a re-enable
+        // recreates + re-renders it from CORE_PANEL_DEFS via buildCorePanelBody.
+        const existing = document.getElementById(`panel-${def.panelId}`);
+        if (existing && existing.dataset.registryOwned !== 'true') {
+            existing.dataset.registryAdopted = 'true';
+        }
         if (!_gateOk(def)) {
             if (tab) tab.remove();
-            // Drop a registry-created panel body when the panel gates off at
-            // runtime (feature disabled), and forget its rendered state so a
-            // re-enable re-renders fresh. In-place core panels are left alone.
-            const panel = document.getElementById(`panel-${def.panelId}`);
+            // Drop the panel body when the panel gates off at runtime (feature
+            // disabled) or at boot (host opt-out), and forget its rendered state
+            // so a re-enable re-renders fresh. Both registry-created bodies and
+            // adopted in-place core bodies are removable.
+            const panel = existing;
             if (panel) {
                 // Run the panel's deactivation path BEFORE detaching/hiding it.
                 // Panel code keys teardown off losing the `active` class (e.g.
@@ -136,7 +150,10 @@ function _syncNav() {
                     panel.classList.remove('active');
                 }
                 bus.emit('panel:hidden', { panelId: def.panelId });
-                if (panel.dataset.registryOwned === 'true') panel.remove();
+                if (panel.dataset.registryOwned === 'true'
+                    || panel.dataset.registryAdopted === 'true') {
+                    panel.remove();
+                }
             }
             _rendered.delete(def.panelId);
             continue;
