@@ -19,8 +19,16 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.features import discover_feature_modules
-from kestrel_sovereign.features.cli.adapters import GitCliAdapter
+from kestrel_sovereign.features.cli.adapters import (
+    GitCliAdapter,
+    _GIT_HARDENING_ARGS,
+)
 from kestrel_sovereign.features.cli.feature import CliFeature, _approval_argv_summary
+
+
+def _git_prefix(tmp_path) -> list[str]:
+    """The fixed git argv prefix: hardening ``-c`` overrides + ``-C <repo>``."""
+    return ["git", *_GIT_HARDENING_ARGS, "-C", str(tmp_path.resolve())]
 from kestrel_sovereign.features.cli.terminal import (
     CliRisk,
     TerminalCommandRequest,
@@ -292,17 +300,42 @@ async def test_git_status_uses_registered_read_only_git_command(tmp_path, monkey
     request = terminal.requests[0]
     assert request.risk is CliRisk.READ_ONLY
     assert request.command_id == "git.status"
-    assert request.argv == [
-        "git",
-        "--no-optional-locks",
-        "-C",
-        str(tmp_path.resolve()),
+    assert request.argv == _git_prefix(tmp_path) + [
         "status",
         "--short",
         "--branch",
     ]
     assert request.env["GIT_OPTIONAL_LOCKS"] == "0"
     assert request.env["GIT_EXTERNAL_DIFF"] == ""
+
+
+@pytest.mark.asyncio
+async def test_git_argv_neutralizes_hostile_repo_config(tmp_path, monkeypatch):
+    """F120: every read-only git tool must prepend ``-c`` overrides that
+    neutralize repo-local config able to execute a program (core.fsmonitor,
+    core.hooksPath, core.sshCommand, diff.external), or a hostile checkout can
+    achieve RCE through the "read-only" tools."""
+    _allow_repo_root(monkeypatch, tmp_path)
+    terminal = FakeTerminal([_result(stdout="")])
+    adapter = GitCliAdapter(terminal)  # type: ignore[arg-type]
+
+    await adapter.status(repo_path=str(tmp_path))
+    argv = terminal.requests[0].argv
+
+    # The overrides must come before ``-C``/the subcommand so they win over
+    # repo-local config.
+    assert argv[0] == "git"
+    assert "-C" in argv
+    prefix = argv[: argv.index("-C")]
+    joined = " ".join(prefix)
+    for neutralized in (
+        "-c core.fsmonitor=",
+        "-c core.hooksPath=/dev/null",
+        "-c core.sshCommand=",
+        "-c diff.external=",
+    ):
+        assert neutralized in joined
+    assert "--no-optional-locks" in prefix
 
 
 @pytest.mark.asyncio
@@ -318,11 +351,7 @@ async def test_git_diff_validates_ref_and_path_before_argv(tmp_path, monkeypatch
     )
 
     assert parsed["diff"].startswith("diff --git")
-    assert terminal.requests[0].argv == [
-        "git",
-        "--no-optional-locks",
-        "-C",
-        str(tmp_path.resolve()),
+    assert terminal.requests[0].argv == _git_prefix(tmp_path) + [
         "diff",
         "--no-ext-diff",
         "--no-textconv",
@@ -365,19 +394,11 @@ async def test_git_show_file_and_merge_base_build_safe_argv(tmp_path, monkeypatc
 
     assert file_payload["content"] == "file content\n"
     assert merge_payload["merge_base"] == "abc123"
-    assert terminal.requests[0].argv == [
-        "git",
-        "--no-optional-locks",
-        "-C",
-        str(tmp_path.resolve()),
+    assert terminal.requests[0].argv == _git_prefix(tmp_path) + [
         "show",
         "HEAD:docs/readme.md",
     ]
-    assert terminal.requests[1].argv == [
-        "git",
-        "--no-optional-locks",
-        "-C",
-        str(tmp_path.resolve()),
+    assert terminal.requests[1].argv == _git_prefix(tmp_path) + [
         "merge-base",
         "main",
         "feature/test",
