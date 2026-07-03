@@ -19,15 +19,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pathlib import Path
+
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.strategic_memory import StrategicMemoryFeature
+from kestrel_sovereign.features.strategic_memory.feature import _SaveOutcome
 
 
 def _make_feature(data: dict | None = None) -> StrategicMemoryFeature:
     feat = StrategicMemoryFeature(agent=MagicMock())
     feat._data = data if data is not None else {}
-    feat._strategy_path = None
-    feat._save = MagicMock()
+    # A strategy path IS configured; ``_save`` is stubbed to report a
+    # successful persist so happy-path mutating tools return OK. Tests
+    # exercising the no-path / write-failure edges (F291) override these.
+    feat._strategy_path = Path("/tmp/kestrel-test/STRATEGY.yaml")
+    feat._save = MagicMock(return_value=_SaveOutcome(persisted=True))
     return feat
 
 
@@ -263,6 +269,100 @@ async def test_strategy_add_blocker_severity_normalized():
     result = await feat.strategy_add_blocker(issue="42", title="x", severity="HIGH")
     assert result.status is ToolResultStatus.OK
     assert feat._data["blockers"][-1]["severity"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# F291: mutating tools must not report OK when _save silently no-ops
+# ---------------------------------------------------------------------------
+
+
+def _mutating_calls(feat):
+    """Every mutating tool paired with a coroutine factory + happy label."""
+    return [
+        ("strategy_add_decision", lambda: feat.strategy_add_decision("d", "r")),
+        ("strategy_add_blocker", lambda: feat.strategy_add_blocker("42", "t")),
+        ("strategy_add_pattern", lambda: feat.strategy_add_pattern("p")),
+        (
+            "strategy_resolve_blocker",
+            lambda: feat.strategy_resolve_blocker("42"),
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mutating_tools_no_strategy_path_return_error():
+    """No strategy path configured -> feature is not active. Persisting is
+    impossible, so a mutating tool must ERROR, never report OK."""
+    for name, _ in _mutating_calls(None):
+        feat = _make_feature({"blockers": [{"issue": "42", "title": "x"}]})
+        # No path AND the real _save so it detects the no-path condition.
+        feat._strategy_path = None
+        del feat._save  # drop the stub; use the real method
+        call = dict(_mutating_calls(feat))[name]
+        result = await call()
+        assert result.status is ToolResultStatus.ERROR, name
+        assert result.data["persisted"] is False, name
+
+
+@pytest.mark.asyncio
+async def test_mutating_tools_write_failure_return_partial():
+    """When the write raises, the in-memory update stands but nothing was
+    persisted -> PARTIAL with the error surfaced, never OK."""
+    for name, _ in _mutating_calls(None):
+        feat = _make_feature({"blockers": [{"issue": "42", "title": "x"}]})
+        feat._save = MagicMock(
+            return_value=_SaveOutcome(persisted=False, error="disk full")
+        )
+        call = dict(_mutating_calls(feat))[name]
+        result = await call()
+        assert result.status is ToolResultStatus.PARTIAL, name
+        assert "disk full" in result.error, name
+        assert result.data["persisted"] is False, name
+
+
+@pytest.mark.asyncio
+async def test_mutating_tools_happy_path_return_ok():
+    """Path present + write succeeds -> OK, persisted flag true."""
+    for name, _ in _mutating_calls(None):
+        feat = _make_feature({"blockers": [{"issue": "42", "title": "x"}]})
+        call = dict(_mutating_calls(feat))[name]
+        result = await call()
+        assert result.status is ToolResultStatus.OK, name
+        assert result.data["persisted"] is True, name
+
+
+def test_save_no_path_reports_no_op():
+    """_save must return a truthful outcome, not silently no-op (F291)."""
+    feat = StrategicMemoryFeature(agent=MagicMock())
+    feat._data = {"decisions": []}
+    feat._strategy_path = None
+    outcome = feat._save()
+    assert outcome.persisted is False
+    assert outcome.no_path is True
+    assert outcome.error
+
+
+def test_save_write_error_is_reported(tmp_path):
+    """A write exception is surfaced in the outcome, not swallowed."""
+    feat = StrategicMemoryFeature(agent=MagicMock())
+    feat._data = {"decisions": []}
+    feat._strategy_path = tmp_path / "STRATEGY.yaml"
+    with patch.object(
+        Path, "write_text", side_effect=OSError("no space left on device")
+    ):
+        outcome = feat._save()
+    assert outcome.persisted is False
+    assert outcome.no_path is False
+    assert "no space left on device" in outcome.error
+
+
+def test_save_happy_path_persists(tmp_path):
+    feat = StrategicMemoryFeature(agent=MagicMock())
+    feat._data = {"decisions": [{"decision": "ship"}]}
+    feat._strategy_path = tmp_path / "STRATEGY.yaml"
+    outcome = feat._save()
+    assert outcome.persisted is True
+    assert feat._strategy_path.exists()
 
 
 # ---------------------------------------------------------------------------

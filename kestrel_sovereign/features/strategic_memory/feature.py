@@ -11,6 +11,7 @@ strategic context at runtime.
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -72,6 +73,21 @@ try:
     HAS_YAML = True
 except ImportError:
     HAS_YAML = False
+
+
+@dataclass
+class _SaveOutcome:
+    """Truthful result of a ``_save()`` attempt.
+
+    Distinguishes three states so mutating tools can report honestly
+    (F291): the write actually persisted, the feature is not active
+    (no strategy path — nothing could be saved), or the in-memory
+    update happened but the write itself failed.
+    """
+
+    persisted: bool
+    no_path: bool = False
+    error: Optional[str] = None
 
 
 def _load_yaml_simple(text: str) -> dict:
@@ -167,10 +183,25 @@ class StrategicMemoryFeature(Feature):
         except Exception as e:
             logger.error(f"Failed to load strategic memory: {e}")
 
-    def _save(self):
-        """Persist strategic memory back to STRATEGY.yaml."""
-        if not self._strategy_path or not self._data:
-            return
+    def _save(self) -> _SaveOutcome:
+        """Persist strategic memory back to STRATEGY.yaml.
+
+        Returns a :class:`_SaveOutcome` describing what actually
+        happened rather than swallowing failures. Callers must not
+        report success without checking it (F291): a missing strategy
+        path means the feature is not active and nothing can be saved,
+        and a write exception means the in-memory state diverged from
+        disk.
+        """
+        if not self._strategy_path:
+            return _SaveOutcome(
+                persisted=False,
+                no_path=True,
+                error=(
+                    "No strategy path configured -- strategic memory is not "
+                    "active, so nothing was persisted."
+                ),
+            )
         try:
             if HAS_YAML:
                 content = yaml.dump(
@@ -181,13 +212,48 @@ class StrategicMemoryFeature(Feature):
                     width=100,
                 )
             else:
-                # Without PyYAML we can't safely round-trip; skip save
-                logger.warning("PyYAML not installed -- cannot save strategic memory updates")
-                return
+                # Without PyYAML we can't safely round-trip.
+                msg = "PyYAML not installed -- cannot save strategic memory updates."
+                logger.warning(msg)
+                return _SaveOutcome(persisted=False, error=msg)
             self._strategy_path.write_text(content, encoding="utf-8")
             logger.info("Strategic memory saved")
+            return _SaveOutcome(persisted=True)
         except Exception as e:
             logger.error(f"Failed to save strategic memory: {e}")
+            return _SaveOutcome(
+                persisted=False,
+                error=f"Failed to save strategic memory: {e}",
+            )
+
+    def _persisted_result(self, confirmation: str, data: Dict[str, Any]) -> ToolResult:
+        """Turn a ``_save()`` outcome into an honest ToolResult (F291).
+
+        - No strategy path -> ERROR (nothing could be persisted).
+        - Write failed -> PARTIAL (in-memory state updated, not on disk).
+        - Persisted -> OK.
+        """
+        outcome = self._save()
+        if outcome.no_path:
+            return ToolResult.failed(
+                outcome.error
+                or "No strategy path configured; nothing was persisted.",
+                data={**data, "persisted": False},
+            )
+        if not outcome.persisted:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    outcome.error
+                    or "In-memory update applied but the write failed; "
+                    "changes were not persisted."
+                ),
+                data={**data, "persisted": False},
+            )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={**data, "persisted": True},
+        )
 
     # ------------------------------------------------------------------
     # Tools: Strategy CRUD
@@ -267,8 +333,7 @@ class StrategicMemoryFeature(Feature):
             "impact": impact,
         }
         self._data["decisions"].append(entry)
-        self._save()
-        return ToolResult.ok(
+        return self._persisted_result(
             confirmation=f"Decision recorded: {decision}",
             data={"recorded": True, "decision": entry},
         )
@@ -311,8 +376,7 @@ class StrategicMemoryFeature(Feature):
             "notes": notes,
         }
         self._data["blockers"].append(entry)
-        self._save()
-        return ToolResult.ok(
+        return self._persisted_result(
             confirmation=f"Blocker recorded: {title}",
             data={"recorded": True, "blocker": entry},
         )
@@ -340,8 +404,7 @@ class StrategicMemoryFeature(Feature):
             "implication": implication,
         }
         self._data["patterns_learned"].append(entry)
-        self._save()
-        return ToolResult.ok(
+        return self._persisted_result(
             confirmation=f"Pattern recorded: {pattern}",
             data={"recorded": True, "pattern": entry},
         )
@@ -364,8 +427,7 @@ class StrategicMemoryFeature(Feature):
         removed = original_count - len(self._data["blockers"])
 
         if removed > 0:
-            self._save()
-            return ToolResult.ok(
+            return self._persisted_result(
                 confirmation=f"Blocker {issue} resolved and removed.",
                 data={"resolved": True, "issue": issue, "removed_count": removed},
             )

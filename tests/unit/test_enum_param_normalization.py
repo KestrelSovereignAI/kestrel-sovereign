@@ -44,12 +44,15 @@ class TestSaveItemType:
 # value here is ``medium``, NOT todo's ``normal`` — proves per-domain maps)
 # ---------------------------------------------------------------------------
 def _make_strategic():
+    from pathlib import Path
+
     from kestrel_sovereign.features.strategic_memory import StrategicMemoryFeature
+    from kestrel_sovereign.features.strategic_memory.feature import _SaveOutcome
 
     feat = StrategicMemoryFeature(agent=MagicMock())
     feat._data = {}
-    feat._strategy_path = None
-    feat._save = MagicMock()
+    feat._strategy_path = Path("/tmp/kestrel-test/STRATEGY.yaml")
+    feat._save = MagicMock(return_value=_SaveOutcome(persisted=True))
     return feat
 
 
