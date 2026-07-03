@@ -93,6 +93,54 @@ def default_permission_for_feature(
     explicitly ASK, update ``_DEFAULT_PERMISSION_BY_FEATURE`` above.
     """
     return _DEFAULT_PERMISSION_BY_FEATURE.get(feature_name, fallback)
+
+
+# Per-TOOL default-permission overrides (#2093, F203).
+#
+# The per-feature map above is all-or-nothing: a feature is either ALLOW or
+# ASK for *every* tool it exposes. That fails for features that mix cheap
+# reads with irreversible destruction — the same reason ``KeyManagementFeature``
+# stays feature-level ASK (see its comment above). ``MemoryFeature`` is the
+# inverse case: it MUST be feature-level ALLOW so a fresh agent can search and
+# recall without an approval-modal loop (#406), yet a handful of its tools
+# hard-delete conversation history with no recovery. Feature-level ALLOW let
+# any loaded agent — including a demo/governed one — call
+# ``purge_conversation`` and wipe every live and trashed row in a session with
+# no authorization check, while the tool description promised a Sovereign gate
+# that did not exist (F203).
+#
+# This map overrides the per-feature default for specific ``(feature, tool)``
+# pairs, keyed by the registered ``Feature.name`` mapping to a ``{tool_name:
+# level}`` dict. The destructive memory tools register at ALWAYS_ASK so
+# ``SecurityHook`` routes them through the Sovereign approval queue and — being
+# ALWAYS_ASK, not ASK — they stay a hard rail that global auto-mode cannot
+# promote to AUTO, matching the ``codex_native`` commandExecution/fileChange
+# precedent below. They are also excluded from the demo-server ALLOW override
+# (see ``_register_all_tools``) so a demo/governed agent cannot purge either.
+_DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
+    "MemoryFeature": {
+        "purge_conversation": PermissionLevel.ALWAYS_ASK,
+        "purge_message_by_id": PermissionLevel.ALWAYS_ASK,
+        "delete_messages": PermissionLevel.ALWAYS_ASK,
+        "delete_conversation": PermissionLevel.ALWAYS_ASK,
+        "delete_message_by_id": PermissionLevel.ALWAYS_ASK,
+    },
+}
+
+
+def default_permission_for_tool(
+    feature_name: str,
+    tool_name: str,
+) -> Optional[PermissionLevel]:
+    """Return a per-tool default-permission override, or ``None``.
+
+    ``None`` means "no override" — the caller should fall back to the
+    per-feature default (including the demo-server ALLOW override). A non-None
+    result is authoritative and MUST win over both the per-feature default and
+    the demo-server override (that is the whole point: destructive tools stay
+    gated even on a demo agent). See ``_DEFAULT_PERMISSION_BY_TOOL``.
+    """
+    return _DEFAULT_PERMISSION_BY_TOOL.get(feature_name, {}).get(tool_name)
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sdk.hooks.base import Hook
@@ -364,12 +412,25 @@ class SecurityFeature(Feature):
             else:
                 feature_default = default_permission_for_feature(feature_name)
 
-            # Register the inner @tool methods.
+            # Register the inner @tool methods. A per-tool override (#2093)
+            # wins over BOTH the per-feature default AND the demo-server ALLOW
+            # override — that is how the destructive memory tools stay
+            # approval-gated even on a demo/governed agent, closing F203.
             for tool_obj in feature.get_tools():
+                tool_override = default_permission_for_tool(
+                    feature_name, tool_obj.name
+                )
+                # A per-tool override is a non-downgradeable hard rail: pass
+                # ``hardened=True`` so register_tool force-upgrades any stale
+                # permissive row an already-running agent persisted under the
+                # old feature-level default (INSERT-OR-IGNORE would leave that
+                # ALLOW row in place and the destructive tool would keep
+                # bypassing approval — the F203 upgrade gap, #2093).
                 await self.permission_store.register_tool(
                     feature_name=feature_name,
                     tool_name=tool_obj.name,
-                    default_level=feature_default,
+                    default_level=tool_override or feature_default,
+                    hardened=tool_override is not None,
                 )
 
             # Also register the feature-as-subagent dispatch entry. The
