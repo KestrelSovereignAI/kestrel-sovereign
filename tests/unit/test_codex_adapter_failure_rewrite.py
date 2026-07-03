@@ -252,6 +252,57 @@ async def test_handler_passes_audit_for_toolresult_failures():
     assert permission_store.get_audit_log.await_count == 1
 
 
+@pytest.mark.asyncio
+async def test_handler_passes_audit_for_flat_dict_error_without_success():
+    """#F025/#F018: a serialized flat ToolResult error envelope
+    (``{status: error, error, tool}``) can reach the handler WITHOUT a
+    derived ``success`` key. The is_failure gate must recognize the
+    top-level ``status`` — gating on ``success`` alone would fetch no audit
+    slice and misclassify an audited user-denial as a sandbox block (codex P2).
+    """
+    adapter = CodexAdapter()
+    agent = MagicMock()
+    security = MagicMock()
+    permission_store = MagicMock()
+    permission_store.get_audit_log = AsyncMock(return_value=[{
+        "feature": "shell", "tool": "bash",
+        "decision": "user_denied", "user_choice": "user_denied",
+    }])
+    security.permission_store = permission_store
+    agent.features = {"SecurityFeature": security}
+    adapter.attach_agent_for_audit(agent)
+
+    async def fake_executor(name, args):
+        # Flat envelope with NO ``success`` key — the isolated-proxy / direct
+        # serialized shape.
+        return {"status": "error", "error": "Rejected(\"rejected by user\")", "tool": "bash"}
+
+    handler = adapter._make_tool_call_handler(
+        executor=fake_executor,
+        thread_id="t1",
+        allowed_tools=frozenset({"bash"}),
+        executed_log=[],
+    )
+    result = await handler({
+        "threadId": "t1", "callId": "c1", "name": "bash", "arguments": "{}",
+    })
+    text = result["contentItems"][0]["text"]
+    assert "Outcome: user_denied" in text
+    assert permission_store.get_audit_log.await_count == 1
+
+
+def test_flat_dict_ok_envelope_is_NOT_rewritten():
+    """A flat OK envelope passes through with its confirmation text; only
+    error/partial route through the classifier."""
+    out = _result_to_codex_response(
+        {"status": "ok", "confirmation": "all set", "tool": "x"}, tool_name="x",
+    )
+    assert out["success"] is True
+    text = out["contentItems"][0]["text"]
+    assert "Outcome:" not in text
+    assert "all set" in text
+
+
 def test_recovery_line_has_no_doubled_prefix():
     """Cosmetic regression: the rendered Recovery line must NOT
     contain ``"Recovery: Recovery: ..."``. The renderer prepends

@@ -1739,7 +1739,16 @@ class CodexAdapter(LLMAdapter):
                 status = str(getattr(result, "status", "")).lower()
                 is_failure = "error" in status or "partial" in status
             elif isinstance(result, dict):
-                is_failure = not bool(result.get("success", True))
+                # Prefer the flat ToolResult ``status`` (unified shape #F025)
+                # over ``success`` — a serialized error/partial envelope may
+                # reach here before ``success`` is derived, and gating the audit
+                # slice on ``success`` alone would misclassify an audited
+                # user-denial as a sandbox/policy block (codex P2).
+                status = result.get("status")
+                if status in ("ok", "error", "partial"):
+                    is_failure = status in ("error", "partial")
+                else:
+                    is_failure = not bool(result.get("success", True))
             return _result_to_codex_response(
                 result,
                 tool_name=name,
