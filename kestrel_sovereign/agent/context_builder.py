@@ -129,6 +129,8 @@ class ContextBuilder:
         consolidator: Optional["MemoryConsolidator"] = None,
         agent_data_path: Optional[str] = None,
         llm_service=None,
+        db=None,
+        agent_id: Optional[str] = None,
     ):
         """
         Initialize the context builder.
@@ -139,6 +141,12 @@ class ContextBuilder:
             consolidator: Optional MemoryConsolidator for episode retrieval
             agent_data_path: Path to agent data directory (for SOUL.md, etc.)
             llm_service: LLMService instance for resolved model identity
+            db: Optional async database handle. When provided together with
+                ``agent_id`` the ``BootstrapLoader`` can read/write the
+                ``bootstrap_config`` table so ``bootstrap_add`` /
+                ``bootstrap_remove`` entries persist and are reloaded via
+                :meth:`load_bootstrap_db_config` (#2135, F099).
+            agent_id: Agent DID, required alongside ``db`` for persistence.
         """
         self.storage = storage
         self._llm_service = llm_service
@@ -164,14 +172,37 @@ class ContextBuilder:
         except Exception:
             pass  # Use defaults
 
-        # Create the BootstrapLoader -- single source of truth for file loading
+        # Create the BootstrapLoader -- single source of truth for file loading.
+        # When a db handle + agent_id are supplied the loader can persist and
+        # reload DB-backed bootstrap config (#2135, F099); the actual
+        # ``load_db_config`` read is driven by ``load_bootstrap_db_config``
+        # during agent initialization, after storage is up and before the
+        # first system-prompt assembly.
         self._bootstrap_loader = BootstrapLoader(
             agent_data_path=str(agent_data_path) if agent_data_path else None,
             max_chars_per_file=max_chars_per_file,
             max_total_chars=max_total_chars,
+            db=db,
+            agent_id=agent_id,
         )
 
         # Load all bootstrap files (includes SOUL.md)
+        self._bootstrap_loader.load()
+
+    async def load_bootstrap_db_config(self) -> None:
+        """Merge DB-backed bootstrap config into the loader (#2135, F099).
+
+        Reads the ``bootstrap_config`` table via the loader's db handle and
+        folds persisted ``bootstrap_add`` / ``bootstrap_remove`` entries into
+        the file order, then re-reads files so the next system prompt reflects
+        them. No-ops when the loader was constructed without a ``db`` /
+        ``agent_id`` (the legacy path). Call once during agent init, before
+        the first prompt assembly, so there is no first-prompt ordering
+        regression.
+        """
+        await self._bootstrap_loader.load_db_config()
+        # load_db_config() invalidates the cache; re-read now so the first
+        # system-prompt assembly sees the merged file set.
         self._bootstrap_loader.load()
 
     @property
