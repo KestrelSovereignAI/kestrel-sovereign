@@ -283,15 +283,11 @@ class MemoryAgencyFeature(Feature):
             )
 
         msg_id, content, raw_metadata = row
-        metadata = self._parse_metadata(raw_metadata)
-        metadata["decay_protected"] = True
 
         try:
-            await db.execute(
-                "UPDATE conversation_history SET metadata = ? "
-                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-                (json.dumps(metadata), msg_id, self.agent_id),
-            )
+            # Atomic single-flag set (F217): never read-modify-write the whole
+            # metadata JSON, which would race a concurrent writer to another flag.
+            await self._set_decay_protected(db, msg_id, self.agent_id, True)
 
             if not existing:
                 pin_id = uuid.uuid4().hex[:12]
@@ -411,17 +407,13 @@ class MemoryAgencyFeature(Feature):
         msg_id, raw_metadata = row
         metadata = self._parse_metadata(raw_metadata)
         was_pinned = bool(metadata.get("decay_protected"))
-        metadata["decay_protected"] = False
 
         # Honesty: if the message wasn't pinned, the release is a
         # no-op. Tell the LLM that explicitly so it can't say
         # "released the pin" when there was no pin to release.
         try:
-            await db.execute(
-                "UPDATE conversation_history SET metadata = ? "
-                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-                (json.dumps(metadata), msg_id, self.agent_id),
-            )
+            # Atomic single-flag clear (F217) — no whole-JSON overwrite race.
+            await self._set_decay_protected(db, msg_id, self.agent_id, False)
 
             now = datetime.now(timezone.utc).isoformat()
             await db.execute(
@@ -579,6 +571,47 @@ class MemoryAgencyFeature(Feature):
             )
             return count
 
+    async def _set_decay_protected(
+        self, db: Any, message_id: int, agent_id: str, value: bool
+    ) -> None:
+        """Atomically set ``$.decay_protected`` on one conversation row.
+
+        A single ``json_set`` / ``jsonb_set`` UPDATE — NOT a whole-metadata
+        read-modify-write — so a concurrent writer touching a *different*
+        metadata flag (e.g. the consolidator's access counters) can't silently
+        drop this pin/unpin under last-writer-wins, and vice versa (F217).
+        Dual-dialect, mirroring ``atomic_increment_metadata_counter``.
+        """
+        if getattr(db, "backend_type", "sqlite") == "postgres":
+            # PG: metadata is TEXT; cast to jsonb for the patch, mirroring the
+            # conversation store's COALESCE(metadata::jsonb, '{}') pattern
+            # (NULL-tolerant; a malformed non-null value is the same codebase-
+            # wide limitation the other atomic-json paths carry).
+            await db.execute(
+                "UPDATE conversation_history SET metadata = "
+                "  jsonb_set(COALESCE(metadata::jsonb, '{}'::jsonb), "
+                "            ARRAY['decay_protected'::text], to_jsonb(?::boolean)) "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                (value, message_id, agent_id),
+            )
+        else:
+            # SQLite: the CASE coerces non-object metadata (NULL / empty /
+            # malformed / a non-object JSON scalar) to '{}' before patching, so
+            # legacy/imported rows with bad metadata still get the flag set
+            # rather than erroring or no-opping — matching the old
+            # ``_parse_metadata`` normalization (codex P2).
+            await db.execute(
+                "UPDATE conversation_history SET metadata = "
+                "  json_set("
+                "    CASE WHEN json_valid(metadata) = 1 "
+                "         THEN (CASE WHEN json_type(metadata) = 'object' "
+                "                    THEN metadata ELSE '{}' END) "
+                "         ELSE '{}' END, "
+                "    '$.decay_protected', json(?)) "
+                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+                ("true" if value else "false", message_id, agent_id),
+            )
+
     async def _clear_decay_protected(
         self,
         message_id: int,
@@ -608,12 +641,8 @@ class MemoryAgencyFeature(Feature):
         metadata = self._parse_metadata(raw_metadata)
 
         if metadata.get("decay_protected"):
-            metadata["decay_protected"] = False
-            await db.execute(
-                "UPDATE conversation_history SET metadata = ? "
-                "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-                (json.dumps(metadata), message_id, agent_id),
-            )
+            # Atomic single-flag clear (F217) — no whole-JSON overwrite race.
+            await self._set_decay_protected(db, message_id, agent_id, False)
 
     @tool(
         name="memory_pin_stats",
@@ -913,14 +942,10 @@ class MemoryAgencyFeature(Feature):
                     (message_id, self.agent_id),
                 )
                 if row:
-                    msg_id, raw_metadata = row
-                    metadata = self._parse_metadata(raw_metadata)
-                    metadata["decay_protected"] = False
-                    await db.execute(
-                        "UPDATE conversation_history SET metadata = ? "
-                        "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-                        (json.dumps(metadata), msg_id, self.agent_id),
-                    )
+                    msg_id = row[0]
+                    # Atomic single-flag clear (F217) — no whole-JSON overwrite
+                    # race with a concurrent metadata writer.
+                    await self._set_decay_protected(db, msg_id, self.agent_id, False)
             except Exception as e:
                 metadata_failures.append({"message_id": message_id, "error": str(e)})
 
@@ -1031,14 +1056,10 @@ class MemoryAgencyFeature(Feature):
                     (message_id, self.agent_id),
                 )
                 if row:
-                    msg_id, raw_metadata = row
-                    metadata = self._parse_metadata(raw_metadata)
-                    metadata["decay_protected"] = False
-                    await db.execute(
-                        "UPDATE conversation_history SET metadata = ? "
-                        "WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
-                        (json.dumps(metadata), msg_id, self.agent_id),
-                    )
+                    msg_id = row[0]
+                    # Atomic single-flag clear (F217) — no whole-JSON overwrite
+                    # race with a concurrent metadata writer.
+                    await self._set_decay_protected(db, msg_id, self.agent_id, False)
             except Exception as e:
                 metadata_failures.append({"message_id": message_id, "error": str(e)})
 

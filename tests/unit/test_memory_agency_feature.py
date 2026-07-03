@@ -52,7 +52,24 @@ class FakeDB:
             return 0
 
         if sql_lower.startswith("update conversation_history"):
-            # UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ? ...
+            if "json_set" in sql_lower or "jsonb_set" in sql_lower:
+                # Atomic single-flag set of $.decay_protected (F217): merge the
+                # flag into the EXISTING metadata, preserving other keys — the
+                # whole point of the fix (no read-modify-write clobber).
+                flag_val, msg_id, *rest = params
+                agent_id = rest[0] if rest else None
+                msg = self.messages.get(msg_id)
+                if msg and (agent_id is None or msg["agent_id"] == agent_id):
+                    raw = msg.get("metadata")
+                    meta = json.loads(raw) if raw else {}
+                    if isinstance(flag_val, str):
+                        flag_bool = flag_val.lower() == "true"
+                    else:
+                        flag_bool = bool(flag_val)
+                    meta["decay_protected"] = flag_bool
+                    msg["metadata"] = json.dumps(meta)
+                return 1
+            # Legacy whole-JSON overwrite (kept for any remaining callers).
             meta_json, msg_id, *rest = params
             agent_id = rest[0] if rest else None
             msg = self.messages.get(msg_id)
@@ -464,9 +481,42 @@ async def test_pin_memory_sets_decay_protected():
     assert result.data["message_id"] == msg_id
     assert "Remember this" in result.data["preview"]
 
-    # Verify metadata was updated
+    # Verify metadata was updated AND the pre-existing flag was preserved
+    # (F217 — atomic json_set, not a whole-JSON overwrite).
     stored_meta = json.loads(db.messages[msg_id]["metadata"])
     assert stored_meta["decay_protected"] is True
+    assert stored_meta["importance"] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_pin_does_not_clobber_concurrent_metadata_writer():
+    """F217: setting decay_protected must not drop a flag another writer added
+    concurrently. With the atomic single-flag json_set, a flag written to the
+    row after the pin's read still survives the pin's write."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    db = FakeDB()
+    msg_id = db.add_message("Concurrent note", {"importance": 0.5})
+    feature = _make_feature(db)
+
+    # Simulate a concurrent writer (e.g. the consolidator) landing a DIFFERENT
+    # flag on the row before the pin's write commits.
+    original_set = feature._set_decay_protected
+
+    async def _racing_set(dbarg, message_id, agent_id, value):
+        meta = json.loads(db.messages[message_id]["metadata"])
+        meta["access_count"] = 7  # a concurrent, unrelated metadata write
+        db.messages[message_id]["metadata"] = json.dumps(meta)
+        return await original_set(dbarg, message_id, agent_id, value)
+
+    feature._set_decay_protected = _racing_set
+
+    result = await feature.memory_pin(message_id=msg_id, reason="milestone")
+    assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+
+    stored_meta = json.loads(db.messages[msg_id]["metadata"])
+    assert stored_meta["decay_protected"] is True
+    assert stored_meta["access_count"] == 7  # concurrent write NOT clobbered
+    assert stored_meta["importance"] == 0.5
 
 
 @pytest.mark.asyncio

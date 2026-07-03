@@ -66,6 +66,20 @@ class FakeDB:
             # 2) "... WHERE id = ? AND agent_id = ?"
             # 3) json_set bulk update: "... WHERE agent_id = ? AND json_extract..."
             if "json_set" in sql_lower:
+                if "where id = ?" in sql_lower:
+                    # Per-message atomic single-flag set (F217): params are
+                    # (flag_val, msg_id, agent_id). Merge into existing metadata.
+                    flag_val, msg_id = params[0], params[1]
+                    aid = params[2] if len(params) > 2 else None
+                    msg = self.messages.get(msg_id)
+                    if msg and (aid is None or msg["agent_id"] == aid):
+                        meta = json.loads(msg["metadata"]) if msg["metadata"] else {}
+                        meta["decay_protected"] = (
+                            flag_val.lower() == "true"
+                            if isinstance(flag_val, str) else bool(flag_val)
+                        )
+                        msg["metadata"] = json.dumps(meta)
+                    return 1
                 # Bulk clear: set decay_protected = false for matching agent_id
                 aid = params[0]
                 for msg in self.messages.values():
@@ -76,7 +90,7 @@ class FakeDB:
                         meta["decay_protected"] = False
                         msg["metadata"] = json.dumps(meta)
                 return 0
-            # Single message update
+            # Single message update (legacy whole-JSON overwrite)
             meta_json = params[0]
             msg_id = params[1]
             agent_id_param = params[2] if len(params) > 2 else None
