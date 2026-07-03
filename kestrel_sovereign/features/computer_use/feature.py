@@ -59,6 +59,7 @@ from .policy import (
     PathPolicy,
     PolicyResult,
     command_contains_unquoted_shell_control,
+    evaluate_argv_paths,
     split_command,
 )
 
@@ -473,6 +474,39 @@ class ComputerUseFeature(Feature):
             # shell control chars and the rule reads
             # ``compound_command:allow:<bin>``.
             require_approval = decision.decision is Decision.REQUIRE_APPROVAL
+
+            # F137: BinaryPolicy only vets ``argv[0]``. Without this, an
+            # auto-approved reader (``cat``/``rg``/``ls``) short-circuits
+            # to ALLOW and its file argument is never checked against
+            # ``deny_paths`` — so ``cat ~/.aws/credentials`` would read a
+            # host secret with no approval, even though the ``fs_*`` tools
+            # honor the same deny-list. ``evaluate_argv_paths`` resolves
+            # every non-flag argv token to its realpath and runs
+            # ``PathPolicy`` so the guarantee is unified across ``fs_*``,
+            # the ``shell`` tool, and the codex native-command bridge:
+            #   - a ``deny_paths`` hit forces DENY for ALL commands
+            #     (universal — the "never, even with approval" contract
+            #     the deny-list already has for paths), even approval-
+            #     routed binaries like ``vim ~/.aws/credentials``;
+            #   - an existing, non-allow-listed path forces
+            #     REQUIRE_APPROVAL so an auto-approved binary can't bypass
+            #     the queue for an unusual path.
+            # Tokens that don't resolve to an existing path (e.g. an ``rg``
+            # search pattern) are ignored to avoid spurious prompts; a
+            # deny hit is honored regardless of existence since deny
+            # patterns match by prefix.
+            argv_path = evaluate_argv_paths(argv, self._path_policy)
+            if argv_path.decision is Decision.DENY:
+                payload["rule"] = argv_path.rule
+                payload["denied_path"] = argv_path.path
+                await self._audit_denied(
+                    tool_name, payload, allowed_by + ["denied:path_policy"]
+                )
+                return _GateOutcome(
+                    False, allowed_by, f"path_policy:{argv_path.rule}"
+                )
+            if argv_path.decision is Decision.REQUIRE_APPROVAL:
+                require_approval = True
         else:
             require_approval = False
 

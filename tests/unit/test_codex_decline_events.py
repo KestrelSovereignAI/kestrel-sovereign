@@ -125,6 +125,7 @@ async def test_bridge_policy_deny_records_event(tmp_path):
     """
     from kestrel_sovereign.features.computer_use.policy import (
         BinaryPolicy,
+        PathPolicy,
     )
     db = await _backend(tmp_path)
     agent = _agent_with_db(db)
@@ -136,7 +137,7 @@ async def test_bridge_policy_deny_records_event(tmp_path):
         ),
         "ComputerUseFeature": SimpleNamespace(
             _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
-            _path_policy=None,
+            _path_policy=PathPolicy(),
         ),
     }
     adapter = CodexAdapter()
@@ -160,6 +161,7 @@ async def test_bridge_policy_allow_records_auto_approve(tmp_path):
     codex_decline_events table for review."""
     from kestrel_sovereign.features.computer_use.policy import (
         BinaryPolicy,
+        PathPolicy,
     )
     db = await _backend(tmp_path)
     agent = _agent_with_db(db)
@@ -170,7 +172,7 @@ async def test_bridge_policy_allow_records_auto_approve(tmp_path):
         ),
         "ComputerUseFeature": SimpleNamespace(
             _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
-            _path_policy=None,
+            _path_policy=PathPolicy(),
         ),
     }
     adapter = CodexAdapter()
@@ -195,6 +197,7 @@ async def test_bridge_queue_denial_records_event(tmp_path):
     """
     from kestrel_sovereign.features.computer_use.policy import (
         BinaryPolicy,
+        PathPolicy,
     )
     db = await _backend(tmp_path)
     agent = _agent_with_db(db)
@@ -206,7 +209,7 @@ async def test_bridge_queue_denial_records_event(tmp_path):
         ),
         "ComputerUseFeature": SimpleNamespace(
             _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
-            _path_policy=None,
+            _path_policy=PathPolicy(),
         ),
     }
     adapter = CodexAdapter()
@@ -227,13 +230,16 @@ async def test_bridge_no_queue_records_event(tmp_path):
     binaries, so the test must use an unlisted binary so the policy
     falls through to the queue check (which is then absent).
     """
-    from kestrel_sovereign.features.computer_use.policy import BinaryPolicy
+    from kestrel_sovereign.features.computer_use.policy import (
+        BinaryPolicy,
+        PathPolicy,
+    )
     db = await _backend(tmp_path)
     agent = _agent_with_db(db)
     agent.features = {
         "ComputerUseFeature": SimpleNamespace(
             _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
-            _path_policy=None,
+            _path_policy=PathPolicy(),
         ),
     }
     adapter = CodexAdapter()
