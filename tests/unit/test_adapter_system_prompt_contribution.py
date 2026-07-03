@@ -166,7 +166,7 @@ class TestCodexInstructionsAugmentation:
         )
 
         adapter = CodexAdapter()
-        instructions, _ = _extract_instructions_and_input(
+        instructions, _, _ = _extract_instructions_and_input(
             [{"role": "system", "content": "You are Kestrel."},
              {"role": "user", "content": "hi"}]
         )
@@ -184,7 +184,7 @@ class TestCodexInstructionsAugmentation:
         )
 
         adapter = CodexAdapter()
-        instructions, _ = _extract_instructions_and_input(
+        instructions, _, _ = _extract_instructions_and_input(
             [{"role": "system", "content": "You are Kestrel."},
              {"role": "user", "content": "hi"}]
         )

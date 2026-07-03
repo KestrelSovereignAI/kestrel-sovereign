@@ -86,7 +86,7 @@ async def test_retry_succeeds_after_first_idle_timeout_under_cap():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise _transport_error()
@@ -285,7 +285,7 @@ async def test_no_retry_when_tools_are_present():
     received_tools = []
     received_tool_executor = []
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
         call_count["n"] += 1
         received_tools.append(tools)
         received_tool_executor.append(tool_executor)
@@ -325,7 +325,7 @@ async def test_retry_invalidates_cached_thread_for_session():
     call_count = {"n": 0}
     cache_at_start_of_attempt: List[dict] = []
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
         call_count["n"] += 1
         # Snapshot the cache as seen at the start of each attempt — the
         # wrapper's invariant is "cache popped between attempts."
@@ -438,7 +438,7 @@ async def test_retry_fires_with_empty_tool_list():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise _transport_error()
