@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
@@ -1324,6 +1324,62 @@ function beginRenameConversation(previewEl, conv) {
 }
 
 
+// #2081: render an assistant turn that emitted typed component parts (#1914)
+// as interleaved bubbles — prose runs and the component cards between them —
+// into ``container`` (the owning agent's pane element, which carries
+// ``dataset.agent`` so ``appendMessagePart`` pins each card to the RIGHT
+// agent). This sidebar/auto-load loader is otherwise a flat markdown renderer;
+// without this path a persisted ``channel_link`` card (and any other part)
+// would be silently dropped on a hard refresh or sidebar conversation load.
+// Mirrors ``history.js::renderAssistantWithParts`` at this loader's simpler
+// altitude (no tool-card interleaving): the first rendered bubble anchors the
+// message id + delete control + model footer so they aren't duplicated.
+function renderAssistantMessageWithParts(msg, container) {
+    const renderMd = window.SharedMarkdown?.renderMarkdown;
+    const segments = splitContentByParts(msg.content, msg.metadata?.parts);
+    let anchored = false;
+    const anchor = (node) => {
+        if (!node) return;
+        if (msg.id) node.dataset.messageId = msg.id;
+        if (anchored) return;
+        anchored = true;
+        if (msg.id) {
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'msg-delete-btn';
+            deleteBtn.title = 'Delete message';
+            deleteBtn.textContent = '✕';
+            deleteBtn.onclick = (e) => {
+                e.stopPropagation();
+                if (typeof window.deleteMessage === 'function') {
+                    window.deleteMessage(msg.id, node);
+                }
+            };
+            node.appendChild(deleteBtn);
+        }
+        const footer = renderModelFooterHtml({ model: msg.model, provider: msg.provider });
+        if (footer) node.insertAdjacentHTML('beforeend', footer);
+    };
+    for (const seg of segments) {
+        if (seg.kind === 'part') {
+            const pnode = appendMessagePart(seg.part.type, seg.part.data, container);
+            anchor(pnode);
+            continue;
+        }
+        // Skip an empty prose run (e.g. the gap between two adjacent parts, or a
+        // part-only message) so no blank bubble appears.
+        if (!String(seg.text || '').trim()) continue;
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message agent-message';
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content';
+        if (renderMd) contentDiv.innerHTML = renderMd(seg.text);
+        else contentDiv.textContent = seg.text;
+        messageDiv.appendChild(contentDiv);
+        container.appendChild(messageDiv);
+        anchor(messageDiv);
+    }
+}
+
 window.loadConversation = async function(sessionId, options = {}) {
     // Stale-load guard: when a row load was queued for one agent and the
     // operator has since selectAgent'd to a different host, the queued
@@ -1401,6 +1457,15 @@ window.loadConversation = async function(sessionId, options = {}) {
         const renderMd = window.SharedMarkdown?.renderMarkdown;
 
         for (const msg of messages) {
+            // #2081/#1914: an assistant turn carrying typed component parts
+            // re-renders as interleaved prose + component bubbles so a persisted
+            // card (e.g. the WhatsApp channel_link QR) survives this load path.
+            const parts = msg.metadata?.parts;
+            if (msg.role === 'assistant' && Array.isArray(parts) && parts.length) {
+                renderAssistantMessageWithParts(msg, chatContainer);
+                continue;
+            }
+
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${msg.role === 'user' ? 'user-message' : 'agent-message'}`;
 

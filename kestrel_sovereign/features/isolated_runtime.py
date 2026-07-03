@@ -130,6 +130,13 @@ class ProxyFeature(Feature):
         self._bin_path: Optional[Path] = None
         self._host_config: Dict[str, Any] = {}
         self._channel_adapter: Optional["ProxyChannelAdapter"] = None
+        # Channel-link plumbing (#2081): the bridged channel type and the name of
+        # its pairing tool. When that tool runs on the streaming turn, the host
+        # emits a persisted ``channel_link`` typed part so the pairing card rides
+        # the conversation that asked for it (survives refresh) instead of
+        # orphaning as a live SSE bubble.
+        self._channel_type: Optional[str] = None
+        self._link_tool: Optional[str] = None
 
     @property
     def tool_description(self) -> str:
@@ -280,6 +287,13 @@ class ProxyFeature(Feature):
         )
         registry.register(adapter)
         self._channel_adapter = adapter
+        # Remember the pairing tool so ``call_isolated_tool`` can emit the
+        # persisted ``channel_link`` part when it runs (#2081). Prefer an
+        # explicitly advertised ``link_tool``; otherwise fall back to the
+        # ``<channel_type>_link`` naming convention (e.g. ``whatsapp_link``).
+        self._channel_type = str(channel_type)
+        link_tool = channel.get("link_tool")
+        self._link_tool = str(link_tool) if link_tool else f"{channel_type}_link"
         logger.info(
             "Bridged isolated feature %s into ChannelFeature.registry as channel '%s'",
             self.name,
@@ -337,9 +351,12 @@ class ProxyFeature(Feature):
                 envelope = dict(result)
                 envelope["tool"] = name
                 envelope["success"] = result.get("status") != "error"
+                if envelope["success"]:
+                    self._maybe_emit_channel_link_part(name)
                 return envelope
             # Non-envelope return (a raw value from a legacy service) — keep the
             # wrapped legacy shape so existing readers still see it.
+            self._maybe_emit_channel_link_part(name)
             return {
                 "success": True,
                 "result": result,
@@ -355,6 +372,27 @@ class ProxyFeature(Feature):
                 "tool": name,
                 "success": False,
             }
+
+    def _maybe_emit_channel_link_part(self, tool_name: str) -> None:
+        """Emit a persisted ``channel_link`` typed part when the bridged
+        channel's pairing tool ran on the active streaming turn (#2081).
+
+        The part carries only a reference (``{channel_type}``), not the QR
+        bytes: the chat card resolves the current QR state live from
+        ``/api/agent/channels/<type>/link-qr.png``. Emitting here — inside the
+        tool's host-side execution, which runs within the turn's part-collector
+        contextvar — makes the card ride the message that requested the link so
+        it persists in that conversation and survives a refresh. ``emit_part``
+        is a no-op off a streaming turn, so this is safe on any call path.
+        """
+        if not self._link_tool or tool_name != self._link_tool or not self._channel_type:
+            return
+        try:
+            from kestrel_sovereign.agent.parts import emit_part
+
+            emit_part("channel_link", {"channel_type": self._channel_type})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("channel_link emit_part failed for %s: %s", self.name, exc)
 
     def resolve_runtime_paths(self) -> tuple[Path, Optional[Path]]:
         bin_override = os.environ.get(_env_key(self.name, "BIN"))
@@ -576,18 +614,15 @@ class ProxyFeature(Feature):
     async def _route_link_cleared(self, payload: Any) -> None:
         """Retract a channel pairing QR once the channel is linked.
 
-        Clears the sticky current-state event (so new chats stop showing it),
-        removes the persisted PNG, and emits ``channel_link_cleared`` so any
-        live chat drops the bubble.
+        Removes the persisted PNG so the ``channel_link`` card (#2081) resolves
+        to "expired or already linked" on its next fetch. No sticky/SSE state to
+        clear anymore — the card is a persisted typed part, not a live bubble.
         """
         if not isinstance(payload, dict):
             return
         channel_type = str(payload.get("channel_type") or "").strip().lower()
         if not channel_type or not re.fullmatch(r"[a-z0-9_]{1,32}", channel_type):
             return
-        clearer = getattr(self.agent, "clear_sticky_event", None)
-        if callable(clearer):
-            clearer(f"channel_link_qr:{channel_type}")
         png = (
             _agent_data_dir(self.agent)
             / "channel_link_artifacts"
@@ -597,20 +632,17 @@ class ProxyFeature(Feature):
             png.unlink(missing_ok=True)
         except OSError:
             pass
-        emit = getattr(self.agent, "emit_event", None)
-        if callable(emit):
-            await _maybe_await(emit("channel_link_cleared", {"channel_type": channel_type}))
 
     async def _route_link_qr(self, payload: Any) -> None:
-        """Persist a channel pairing-QR PNG and push it to the chat over SSE.
+        """Persist the latest channel pairing-QR PNG under the agent data dir.
 
         Isolated channel features emit ``channel.link_qr`` with the QR rendered
-        as a PNG (base64) when a pairing code is produced. The host writes it
-        under the agent data dir (served by ``/api/agent/channels/{type}/
-        link-qr.png``) and emits a ``channel_link_qr`` event so the chat paints
-        a scannable image bubble — independent of whatever the LLM says in its
-        prose (an LLM reliably paraphrases a QR away). The browser appends an
-        api_key + the ``ts`` to the path to cache-bust the rotated QR.
+        as a PNG (base64) each time a pairing code is produced (it rotates
+        ~20s). The host writes the latest under the agent data dir, served by
+        ``/api/agent/channels/{type}/link-qr.png``. The chat's persisted
+        ``channel_link`` card (#2081) fetches that endpoint on render/refresh —
+        so the QR is no longer pushed as a live SSE bubble (which orphaned on
+        refresh, #1918); the PNG is simply the current state the card resolves.
         """
         if not isinstance(payload, dict):
             return
@@ -642,24 +674,6 @@ class ProxyFeature(Feature):
         except OSError as exc:
             logger.warning("Failed to persist channel.link_qr PNG for %s: %s", self.name, exc)
             return
-
-        import time
-
-        event_data = {
-            "channel_type": channel_type,
-            "path": f"/api/agent/channels/{channel_type}/link-qr.png",
-            "ts": int(time.time() * 1000),
-            "caption": payload.get("caption") or "",
-        }
-        # Sticky current-state: a pairing QR must render in ANY chat session
-        # opened while the channel is unlinked, not only for the client connected
-        # when it was produced (emit_event's pending buffer is drain-once).
-        setter = getattr(self.agent, "set_sticky_event", None)
-        if callable(setter):
-            setter(f"channel_link_qr:{channel_type}", "channel_link_qr", event_data)
-        emit = getattr(self.agent, "emit_event", None)
-        if callable(emit):
-            await _maybe_await(emit("channel_link_qr", event_data))
 
     async def _route_inbound(self, payload: Any) -> None:
         channel = self._channel_feature()

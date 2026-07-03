@@ -51,6 +51,25 @@ function makeNode(tag = 'div') {
             return null;
         },
         querySelectorAll() { return []; },
+        closest(selector) {
+            // Minimal ancestor match for `.class` / tag selectors. Real DOM
+            // syncs className↔classList; the mock doesn't, so check both the
+            // classList set and the raw className string.
+            let n = this;
+            while (n) {
+                if (selector.startsWith('.')) {
+                    const cls = selector.slice(1);
+                    const inList = n.classList && n.classList.contains(cls);
+                    const inStr = typeof n.className === 'string'
+                        && n.className.split(/\s+/).includes(cls);
+                    if (inList || inStr) return n;
+                } else if (n.tagName === selector.toUpperCase()) {
+                    return n;
+                }
+                n = n.parentNode;
+            }
+            return null;
+        },
         appendChild(child) {
             child.parentNode = this;
             this.children.push(child);
@@ -206,4 +225,131 @@ test('appendMessagePart for an unregistered part type degrades to escaped text',
     const div = api.appendMessagePart('totally-unknown-type', 'plain payload');
     // No renderer → safe escaped text fallback.
     assert.equal(div.children[0].textContent, 'plain payload');
+});
+
+// --------------------------------------------------------------------------
+// #2081: persisted channel_link pairing card (renderer resolves live QR state)
+// --------------------------------------------------------------------------
+
+function makeChannelChatContainer() {
+    const container = makeNode('section');
+    for (const id of [
+        'chat-container', 'message-input', 'send-button',
+        'model-selector', 'thinking-indicator', 'composer-mode-toggle',
+    ]) {
+        const node = makeNode(id === 'message-input' ? 'textarea' : 'div');
+        node.id = id;
+        container.appendChild(node);
+    }
+    return chatModule.mount(container, {
+        deps: {
+            api: {
+                hasCapability: () => true,
+                getHostAgent: () => 'wa-agent',
+                buildAgentUrl: (p) => `/api/agents/Emma${p}`,
+                getApiKey: () => 'secret-key',
+            },
+            kicon: () => '',
+            escapeHtml: (s) => String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+        },
+    });
+}
+
+test('channel_link part renders a card that fetches the link-qr.png endpoint', () => {
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    // The card carries the QR <img>; its src resolves the current QR from the
+    // host endpoint (multi-agent routed + api_key + cache-bust ts).
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    assert.ok(img, 'card must contain the QR image');
+    assert.match(img.src, /\/api\/agents\/Emma\/api\/agent\/channels\/whatsapp\/link-qr\.png/);
+    assert.match(img.src, /api_key=secret-key/);
+    assert.match(img.src, /ts=/);
+});
+
+test('channel_link part retries a first-load 404 instead of giving up (fresh-link race)', () => {
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    // A FRESH link's QR PNG can land a beat after the card renders (#2081): a
+    // first-load 404 must NOT permanently kill the card, or the QR that arrives
+    // milliseconds later is lost. One error → retry, no note yet, img retained.
+    img.onerror();
+    const note = card.children.find((c) => c.className === 'channel-link-note');
+    assert.ok(!note, 'a single first-load 404 must not show the expired note');
+    assert.ok(card.children.includes(img), 'the QR image must be retained for retry');
+});
+
+test('channel_link part shows expired/linked note after a loaded QR 404s', () => {
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    // Once a real QR has painted (onload), a later 404 is a genuine expiry/link
+    // — the honest note replaces it immediately, no grace window.
+    img.onload();
+    img.onerror();
+    const note = card.children.find((c) => c.className === 'channel-link-note');
+    assert.ok(note, 'a note must replace the dead image');
+    assert.match(note.textContent, /expired or Whatsapp already linked/i);
+});
+
+test('channel_link part gives up after the bounded fresh-link retry window', () => {
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    // Exhaust the bounded retry budget (never loaded) — the card finally
+    // resolves to the expired/linked note rather than retrying forever.
+    for (let i = 0; i < 20; i += 1) img.onerror();
+    const note = card.children.find((c) => c.className === 'channel-link-note');
+    assert.ok(note, 'the bounded retry window must terminate in the expired note');
+});
+
+test('channel_link card pins the QR URL to the pane-owning agent, not the selection', () => {
+    // The card must resolve the QR from the agent that OWNS its pane (#2081),
+    // even when a different host agent is currently selected — a live stream can
+    // keep painting into a detached pane after the user switches, and a history
+    // replay can render while the selection has changed. The pane element
+    // carries ``dataset.agent``; ``buildAgentUrlFor`` pins to it.
+    const container = makeNode('section');
+    for (const id of [
+        'chat-container', 'message-input', 'send-button',
+        'model-selector', 'thinking-indicator', 'composer-mode-toggle',
+    ]) {
+        const node = makeNode(id === 'message-input' ? 'textarea' : 'div');
+        node.id = id;
+        container.appendChild(node);
+    }
+    // Owner (mounted) agent is 'Emma'; the "selected" agent buildAgentUrl would
+    // use is 'Nellie' — the card must ignore the latter.
+    const api = chatModule.mount(container, {
+        deps: {
+            api: {
+                hasCapability: () => true,
+                getHostAgent: () => 'Emma',
+                buildAgentUrl: (p) => `/api/agents/Nellie${p}`,
+                buildAgentUrlFor: (p, agent) => `/api/agents/${agent}${p}`,
+                getApiKey: () => 'k',
+            },
+            kicon: () => '',
+            escapeHtml: (s) => String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+        },
+    });
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    assert.ok(img, 'card must contain the QR image');
+    assert.match(img.src, /\/api\/agents\/Emma\/api\/agent\/channels\/whatsapp\/link-qr\.png/);
+    assert.ok(!img.src.includes('/Nellie/'), 'must NOT use the selected agent');
+});
+
+test('channel_link part rejects an invalid channel_type', () => {
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: '../etc' });
+    const card = div.children[0].children[0];
+    assert.equal(card.children.length, 0);
+    assert.match(card.textContent, /unavailable/i);
 });

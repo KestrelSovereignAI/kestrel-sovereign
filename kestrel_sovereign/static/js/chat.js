@@ -268,6 +268,138 @@ function noticePartRenderer(data) {
     return `<div class="part-notice part-notice-${level}">${titleHtml}${bodyHtml}</div>`;
 }
 
+// #2081: a persisted, reference-based channel pairing card. The part carries
+// only ``{channel_type}`` (NOT the QR bytes), so it rides the turn that asked
+// for the link and persists in that conversation — surviving a hard refresh
+// instead of orphaning as a live SSE bubble (#1918). It resolves the CURRENT
+// state on the fly from the host: ``GET /api/agent/channels/<type>/link-qr.png``
+// → 200 paints the scannable QR (in-chat sanitizer strips ``data:`` URIs, so it
+// must load over http); 404 → the QR expired or the channel is already linked,
+// so we show a "say 'link <channel>' for a fresh code" note. Because the QR
+// rotates (~20s) and eventually expires, an active card refreshes the image
+// periodically (bounded) so a live pairing session shows the current code.
+function channelLinkPartRenderer(data, context) {
+    const esc = deps().escapeHtml;
+    const d = (data && typeof data === 'object') ? data : {};
+    const channelType = String(d.channel_type || '').trim().toLowerCase();
+    const ownerAgent = context && context.ownerAgent != null ? context.ownerAgent : null;
+
+    const card = document.createElement('div');
+    card.className = 'message agent-message channel-link-card';
+    // Same guard as the serving endpoint (also a path-traversal guard).
+    if (!/^[a-z0-9_]{1,32}$/.test(channelType)) {
+        card.textContent = 'Channel link unavailable.';
+        return card;
+    }
+    card.dataset.channelType = channelType;
+    const label = channelType.charAt(0).toUpperCase() + channelType.slice(1);
+
+    const attribution = document.createElement('div');
+    attribution.className = 'channel-link-attribution';
+    const icon = typeof deps().kicon === 'function' ? deps().kicon('bird') : '';
+    attribution.innerHTML = `${icon} <span>${esc(label)} pairing</span>`;
+    card.appendChild(attribution);
+
+    const api = deps().api || {};
+    // Pin the QR URL to the agent that OWNS this card's pane (#2081), not the
+    // currently-selected host agent: a live stream can keep painting into a
+    // detached pane after the user switches agents, and a history replay can
+    // render a persisted card while the selection has changed. Falls back to
+    // ``buildAgentUrl`` (selected agent) only when no owner/`buildAgentUrlFor`.
+    const buildUrl = (ownerAgent && typeof api.buildAgentUrlFor === 'function')
+        ? (p) => api.buildAgentUrlFor(p, ownerAgent)
+        : (typeof api.buildAgentUrl === 'function'
+            ? api.buildAgentUrl.bind(api)
+            : (p) => p);
+    const getKey = typeof api.getApiKey === 'function' ? api.getApiKey.bind(api) : () => '';
+    const path = `/api/agent/channels/${channelType}/link-qr.png`;
+    const qrUrl = () => {
+        const base = buildUrl(path);
+        const sep = base.includes('?') ? '&' : '?';
+        // ``ts`` defeats the endpoint's ``no-store`` so a rotated QR reloads.
+        let url = `${base}${sep}ts=${Date.now()}`;
+        const key = getKey();
+        if (key) url += `&api_key=${encodeURIComponent(key)}`;
+        return url;
+    };
+
+    const img = document.createElement('img');
+    img.className = 'channel-link-qr-image';
+    img.alt = `${channelType} pairing QR`;
+    img.style.maxWidth = '320px';
+    img.style.width = '100%';
+    img.style.imageRendering = 'pixelated';
+    img.style.background = '#fff';
+    img.style.padding = '12px';
+    img.style.borderRadius = '8px';
+    card.appendChild(img);
+
+    let refreshTimer = null;
+    let retryTimer = null;
+    let errorRetries = 0;
+    let loadedOnce = false;
+    // A FRESH link's QR PNG can land a beat AFTER this card renders: the pairing
+    // tool returns (emitting the part on the turn) while the QR itself arrives
+    // over a separate ``channel.link_qr`` event the host persists
+    // asynchronously (#2081). So a first-load 404 is usually that race, not an
+    // expired code — retry over a bounded window before declaring the code dead,
+    // or a QR that lands milliseconds later would be lost forever (the image's
+    // onerror would otherwise stop refresh permanently).
+    const FRESH_LINK_RETRY_MS = 1500;
+    const FRESH_LINK_MAX_RETRIES = 8;  // ~12s bounded grace for the PNG to land
+    const stopRefresh = () => {
+        if (refreshTimer) {
+            clearInterval(refreshTimer);
+            refreshTimer = null;
+        }
+        if (retryTimer) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+        }
+    };
+    const showExpiredNote = () => {
+        stopRefresh();
+        img.remove();
+        if (!card.querySelector('.channel-link-note')) {
+            const note = document.createElement('div');
+            note.className = 'channel-link-note';
+            note.textContent =
+                `QR expired or ${label} already linked — say "link ${label}" for a fresh code.`;
+            card.appendChild(note);
+        }
+    };
+    // Once a real QR has ever painted, a subsequent 404 IS a genuine
+    // expiry/link (linking clears the PNG) — show the honest note immediately,
+    // no grace window.
+    img.onload = () => { loadedOnce = true; };
+    img.onerror = () => {
+        if (!loadedOnce && errorRetries < FRESH_LINK_MAX_RETRIES) {
+            errorRetries += 1;
+            if (retryTimer) clearTimeout(retryTimer);
+            retryTimer = setTimeout(() => { img.src = qrUrl(); }, FRESH_LINK_RETRY_MS);
+            if (retryTimer && typeof retryTimer.unref === 'function') retryTimer.unref();
+            return;
+        }
+        showExpiredNote();
+    };
+    img.src = qrUrl();
+
+    let ticks = 0;
+    refreshTimer = setInterval(() => {
+        ticks += 1;
+        if (ticks > 30) {
+            stopRefresh();
+            return;
+        }
+        img.src = qrUrl();
+    }, 15000);
+    // Don't hold the event loop open (browser setInterval has no unref; Node
+    // timers do — keeps unit tests from hanging on the pending interval).
+    if (refreshTimer && typeof refreshTimer.unref === 'function') refreshTimer.unref();
+
+    return card;
+}
+
 /**
  * Register the console's built-in core part renderers (#1914). Called from
  * ``initChat`` so the standalone sovereign console — not just Frinz-style
@@ -276,6 +408,7 @@ function noticePartRenderer(data) {
  */
 export function registerCoreParts() {
     registerPartRenderer('notice', noticePartRenderer);
+    registerPartRenderer('channel_link', channelLinkPartRenderer);
 }
 
 // ============================================================================
@@ -1428,35 +1561,11 @@ export function connectNotifications() {
             }
         });
 
-        // #1825: an isolated channel feature (e.g. WhatsApp) pushes its pairing
-        // QR to the host, which emits `channel_link_qr`. Paint it as a scannable
-        // image bubble here so linking works regardless of the LLM's prose.
-        notificationEventSource.addEventListener('channel_link_qr', (e) => {
-            try {
-                handleChannelLinkQr(JSON.parse(e.data));
-            } catch (err) {
-                console.error('Failed to handle channel_link_qr event:', err);
-            }
-        });
-
-        // Channel linked — retract the pairing QR bubble.
-        notificationEventSource.addEventListener('channel_link_cleared', (e) => {
-            try {
-                const { channel_type } = JSON.parse(e.data);
-                const ct = String(channel_type || '').trim().toLowerCase();
-                if (!ct) return;
-                // Scope to the notification stream's pane (same target the QR
-                // render path uses) so we don't retract another agent's QR
-                // bubble after a pane switch (codex #1825).
-                const pane = notificationPaneElement();
-                if (!pane) return;
-                pane
-                    .querySelectorAll(`.channel-qr-message[data-channel-type="${cssAttrEscape(ct)}"]`)
-                    .forEach((el) => el.remove());
-            } catch (err) {
-                console.error('Failed to handle channel_link_cleared event:', err);
-            }
-        });
+        // #2081: the pairing QR is no longer a live SSE bubble. It rides the
+        // turn as a persisted ``channel_link`` typed part (registerCoreParts →
+        // channelLinkPartRenderer) that resolves the current QR state on the
+        // fly, so it survives refresh in the conversation that asked for it
+        // instead of orphaning into an empty pane on SSE reconnect.
 
         notificationEventSource.addEventListener('ping', () => {
             // Keepalive - no action needed
@@ -1820,80 +1929,6 @@ export function handleRestartStatus(payload, targetEl = null) {
     if (c) c.scrollTop = c.scrollHeight;
 }
 
-/**
- * Render a channel pairing QR as a chat-visible image bubble (#1825).
- *
- * Isolated channel features (e.g. WhatsApp) push their pairing QR to the
- * host, which serves it as a PNG and emits a `channel_link_qr` SSE event.
- * Painting the QR from the event — not from the agent's prose — means the
- * scannable code reaches the chat regardless of how the LLM summarizes the
- * tool result (it reliably paraphrases a QR away). The QR rotates (~20s), so
- * a fresh event for the same channel updates the existing bubble in place
- * (cache-busted via `ts`) rather than stacking duplicates.
- */
-export function handleChannelLinkQr(payload, targetEl = null) {
-    if (!payload || typeof payload !== 'object') return;
-    const channelType = String(payload.channel_type || '').trim().toLowerCase();
-    const path = String(payload.path || '');
-    if (!channelType || !path.startsWith('/api/')) return;
-
-    const target = targetEl || notificationPaneElement();
-    if (!target) return;
-
-    // Build an authed, cache-busted image URL: multi-agent routing prefix via
-    // buildAgentUrlFor, api_key for standalone hosts, ts to defeat no-store
-    // reuse. Pin the prefix to the notification stream's agent (NOT the current
-    // selection): a late event handled after an agent switch must still fetch
-    // the QR from the agent whose pane the bubble lands in (codex #1825).
-    const base = (deps().api.buildAgentUrlFor || deps().api.buildAgentUrl).call(
-        deps().api,
-        path,
-        notificationAgent,
-    );
-    const apiKey = deps().api.getApiKey();
-    const ts = payload.ts || 0;
-    const sep = base.includes('?') ? '&' : '?';
-    let url = `${base}${sep}ts=${encodeURIComponent(ts)}`;
-    if (apiKey) url += `&api_key=${encodeURIComponent(apiKey)}`;
-
-    const caption = String(payload.caption || 'Scan this QR with your phone to link.');
-
-    let div = target.querySelector(
-        `.channel-qr-message[data-channel-type="${cssAttrEscape(channelType)}"]`,
-    );
-    if (div) {
-        // Rotated QR — swap the image in place, keep the bubble.
-        const img = div.querySelector('img.channel-qr-image');
-        if (img) img.src = url;
-        return;
-    }
-
-    div = document.createElement('div');
-    div.className = 'message agent-message channel-qr-message';
-    div.dataset.channelType = channelType;
-
-    const attribution = document.createElement('div');
-    attribution.className = 'channel-qr-attribution';
-    attribution.innerHTML =
-        `${deps().kicon('bird')} <span>${deps().escapeHtml(caption)}</span>`;
-    div.appendChild(attribution);
-
-    const img = document.createElement('img');
-    img.className = 'channel-qr-image';
-    img.alt = `${channelType} pairing QR`;
-    img.src = url;
-    img.style.maxWidth = '320px';
-    img.style.width = '100%';
-    img.style.imageRendering = 'pixelated';
-    img.style.background = '#fff';
-    img.style.padding = '12px';
-    img.style.borderRadius = '8px';
-    div.appendChild(img);
-
-    target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
-}
 
 
 /**
@@ -3706,6 +3741,19 @@ export function appendMessagePart(type, data, paneElement = null) {
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
 
+    // Owner-agent context (#2081): a part belongs to the agent whose pane it
+    // lands in — NOT whatever host agent is selected when the renderer runs.
+    // The pane element carries ``dataset.agent`` (see getOrCreateChatPane), so
+    // a live stream painting into a detached pane, or a history replay while
+    // the selection has since changed, still resolves the RIGHT agent's state
+    // (e.g. a ``channel_link`` QR URL). Absent (standalone null-key pane) →
+    // ``undefined``, and ``buildAgentUrlFor`` falls back to the selection.
+    const paneRoot = target && typeof target.closest === 'function'
+        ? target.closest('.chat-container-pane')
+        : null;
+    const ownerAgent = paneRoot && paneRoot.dataset ? paneRoot.dataset.agent : undefined;
+    const partContext = { ownerAgent, paneElement: target };
+
     const renderer = _partRenderers[type];
     // Two distinct trust levels (#2038 ticket 06), kept distinct:
     //   1. HOST/embedder part (registerPartRenderer): host-trusted markup, host
@@ -3718,7 +3766,7 @@ export function appendMessagePart(type, data, paneElement = null) {
     const featureRenderer = renderer ? null : findContentTypeRenderer(type, { type });
     if (renderer) {
         try {
-            const out = renderer(data);
+            const out = renderer(data, partContext);
             // Duck-type the Node check (nodeType) so it's realm-safe — a part
             // built in another window/iframe still appends — rather than
             // `instanceof Node` (consistent with registerHeaderAction, #1650).
