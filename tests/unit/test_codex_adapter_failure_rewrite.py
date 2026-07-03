@@ -313,6 +313,35 @@ async def test_handler_passes_audit_for_flat_dict_error_without_success():
     assert permission_store.get_audit_log.await_count == 1
 
 
+def test_ok_with_data_preserves_payload_for_read_tools():
+    """#F025 regression: a successful ToolResult carrying a ``data`` payload
+    (read/list/search tools like list_models, recall) must send that data to
+    the model, not just the confirmation — otherwise the inline Codex path can't
+    answer the user. Covers both the object and flat-dict shapes."""
+    from kestrel_sdk.tools.result import ToolResult
+
+    obj = _result_to_codex_response(
+        ToolResult.ok("found 3 models", data={"models": ["a", "b", "c"]}),
+        tool_name="list_models",
+    )
+    obj_text = obj["contentItems"][0]["text"]
+    assert obj["success"] is True
+    assert "models" in obj_text and "a" in obj_text
+
+    flat = _result_to_codex_response(
+        {
+            "status": "ok",
+            "confirmation": "found 3 models",
+            "data": {"models": ["a", "b", "c"]},
+            "tool": "list_models",
+        },
+        tool_name="list_models",
+    )
+    flat_text = flat["contentItems"][0]["text"]
+    assert flat["success"] is True
+    assert "models" in flat_text and "a" in flat_text
+
+
 def test_flat_dict_ok_envelope_is_NOT_rewritten():
     """A flat OK envelope passes through with its confirmation text; only
     error/partial route through the classifier."""

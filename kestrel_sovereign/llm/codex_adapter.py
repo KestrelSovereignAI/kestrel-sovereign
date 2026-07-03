@@ -519,11 +519,15 @@ def _result_to_codex_response(
         if success:
             data = getattr(result, "data", None)
             confirmation = getattr(result, "confirmation", None)
-            text = (
-                confirmation
-                if isinstance(confirmation, str) and confirmation
-                else data
-            )
+            # Read/list/search tools carry their payload in ``data`` — the model
+            # needs it to answer. Present BOTH confirmation and data when data is
+            # present (matching the pre-#F025 nested path, which returned the
+            # whole serialized envelope); collapse to the bare confirmation
+            # string for write-style tools whose data is absent.
+            if data is not None:
+                text = {"confirmation": confirmation, "data": data}
+            else:
+                text = confirmation
         elif "partial" in status:
             # PARTIAL: surface BOTH halves — the completed confirmation AND the
             # caveat — so the next turn can honestly report what succeeded and
@@ -546,11 +550,13 @@ def _result_to_codex_response(
         success = status == "ok"
         if success:
             confirmation = result.get("confirmation")
-            text = (
-                confirmation
-                if isinstance(confirmation, str) and confirmation
-                else result.get("data")
-            )
+            data = result.get("data")
+            # Preserve the data payload for read/list/search tools (see the
+            # ToolResult-object branch above); bare confirmation for write-style.
+            if data is not None:
+                text = {"confirmation": confirmation, "data": data}
+            else:
+                text = confirmation
         elif status == "partial":
             # PARTIAL: surface BOTH the completed confirmation AND the caveat so
             # the next turn can honestly narrate what succeeded and what didn't
