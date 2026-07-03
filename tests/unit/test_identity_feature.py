@@ -231,6 +231,7 @@ async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
     fake_result.ipfs_cid = None
     fake_result.cid = None
     fake_result.content_hash = "abc123def456"
+    fake_result.encryption_key_hash = "keyhash123"  # F187: encrypted upload
 
     fake_adapter = MM()
     fake_adapter.store_content = MM(return_value=fake_result)
@@ -239,6 +240,10 @@ async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
         lambda *a, **kw: fake_adapter,
     )
 
+    # F187: non-local export requires an encryption key to be configured
+    # (else it fails cleanly rather than uploading plaintext).
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path))
     result = await feat.export_identity(storage_tier="ipfs", sign=False)
 

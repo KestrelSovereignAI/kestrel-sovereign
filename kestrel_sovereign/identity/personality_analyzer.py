@@ -162,17 +162,37 @@ class PersonalityAnalyzer:
             ]
         )
 
-    async def _get_responses(self) -> List[str]:
-        """Get agent responses from conversation history."""
-        rows = await self.db.fetchall(
-            """SELECT content FROM conversation_history
-               WHERE agent_id = ? AND role = 'assistant'
-               AND content IS NOT NULL AND content != ''
-               AND deleted_at IS NULL
-               ORDER BY id DESC LIMIT ?""",
-            (self.agent_id, self.sample_limit)
+    async def _load_history(self) -> List[Dict[str, Any]]:
+        """Load decrypted conversation history via the conversation store.
+
+        F188: reading ``conversation_history.content`` with a raw db handle
+        returns Fernet/AEAD ciphertext when encryption-at-rest is enabled, so
+        the analyzer would fingerprint ciphertext. ``AsyncConversationStore``
+        applies ``_decrypt_with_fallback`` per row (per-agent key first, then
+        global) and hands back plaintext. Excluded / stashed rows are kept so
+        the sample matches the pre-fix raw query; soft-deleted rows stay
+        filtered.
+        """
+        from kestrel_sovereign.storage.async_conversation_store import (
+            AsyncConversationStore,
         )
-        return [row[0] for row in rows if row[0]]
+
+        store = AsyncConversationStore(self.db, self.agent_id)
+        return await store.get_full_history_with_ids(
+            include_excluded=True, include_stashed=True
+        )
+
+    async def _get_responses(self) -> List[str]:
+        """Get agent responses (plaintext) from conversation history."""
+        history = await self._load_history()
+        responses = [
+            entry["content"]
+            for entry in history
+            if entry.get("role") == "assistant" and entry.get("content")
+        ]
+        # Preserve the original ``ORDER BY id DESC LIMIT sample_limit``:
+        # history is ASC, so take the most-recent tail and reverse to DESC.
+        return list(reversed(responses[-self.sample_limit:]))
 
     def _analyze_structure(self, responses: List[str]) -> Dict[str, Any]:
         """Analyze structural patterns in responses."""
@@ -421,20 +441,30 @@ class PersonalityAnalyzer:
 
         Selects diverse examples that showcase the agent's personality.
         """
-        # Get conversation pairs
-        rows = await self.db.fetchall(
-            """SELECT ch1.content as user_content, ch2.content as assistant_content
-               FROM conversation_history ch1
-               JOIN conversation_history ch2 ON ch2.id = ch1.id + 1
-               WHERE ch1.agent_id = ? AND ch1.role = 'user'
-               AND ch2.agent_id = ? AND ch2.role = 'assistant'
-               AND ch1.content IS NOT NULL AND ch2.content IS NOT NULL
-               AND ch1.deleted_at IS NULL AND ch2.deleted_at IS NULL
-               AND length(ch1.content) > 20 AND length(ch2.content) > 50
-               ORDER BY ch1.id DESC
-               LIMIT 50""",
-            (self.agent_id, self.agent_id)
-        )
+        # F188: build user→assistant pairs from decrypted history rather than
+        # a raw SQL self-join over ciphertext. Reconstruct the original
+        # ``ch2.id = ch1.id + 1`` adjacency using the message ids, apply the
+        # same plaintext length filters, and keep DESC order + LIMIT 50.
+        history = await self._load_history()
+        by_id = {entry["id"]: entry for entry in history}
+
+        rows: List[Tuple[str, str]] = []
+        for entry in history:
+            if entry.get("role") != "user":
+                continue
+            nxt = by_id.get(entry["id"] + 1)
+            if not nxt or nxt.get("role") != "assistant":
+                continue
+            user_content = entry.get("content")
+            assistant_content = nxt.get("content")
+            if not user_content or not assistant_content:
+                continue
+            if len(user_content) <= 20 or len(assistant_content) <= 50:
+                continue
+            rows.append((user_content, assistant_content))
+
+        # DESC by id (most-recent first) then LIMIT 50, matching the query.
+        rows = list(reversed(rows))[:50]
 
         if not rows:
             return []

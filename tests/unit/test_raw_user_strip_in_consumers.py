@@ -37,12 +37,20 @@ async def test_personality_calibration_strips_sent_form_from_user_input():
 
     analyzer = PersonalityAnalyzer.__new__(PersonalityAnalyzer)
     analyzer.agent_id = "test-agent"
+    analyzer.sample_limit = 100
     analyzer.db = MagicMock()
-    analyzer.db.fetchall = AsyncMock(return_value=[
-        # Two pairs. Both user-side rows are sent-form; the export
-        # must show only the raw user text.
-        (SENT_FORM, "I see, here's my response."),
-        (SENT_FORM, "Another reply that's long enough to count."),
+    # F188: _get_calibration_examples now sources decrypted rows via
+    # _load_history (AsyncConversationStore applies decryption), then rebuilds
+    # user→assistant adjacency by id. Mock that seam. Two adjacent pairs; both
+    # user rows are sent-form, and each assistant reply clears the >50-char
+    # pairing filter so the pair survives.
+    analyzer._load_history = AsyncMock(return_value=[
+        {"id": 1, "role": "user", "content": SENT_FORM},
+        {"id": 2, "role": "assistant",
+         "content": "I see, here's my response and it is long enough to count."},
+        {"id": 3, "role": "user", "content": SENT_FORM},
+        {"id": 4, "role": "assistant",
+         "content": "Another reply that's certainly long enough to count here."},
     ])
 
     examples = await analyzer._get_calibration_examples(num_examples=10)

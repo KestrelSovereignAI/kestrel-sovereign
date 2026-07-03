@@ -363,7 +363,7 @@ class TestIdentityImporter:
     async def test_import_basic(self, test_db, sample_package):
         """Test basic import functionality."""
         importer = IdentityImporter(test_db)
-        result = await importer.import_package(sample_package, verify_signature=False)
+        result = await importer.import_package(sample_package, verify_signature=False, allow_unsigned=True)
 
         assert result.success is True
         assert result.agent_id == sample_package.did
@@ -373,7 +373,7 @@ class TestIdentityImporter:
     async def test_import_episodes(self, test_db, sample_package):
         """Test that episodes are imported."""
         importer = IdentityImporter(test_db)
-        result = await importer.import_package(sample_package, verify_signature=False)
+        result = await importer.import_package(sample_package, verify_signature=False, allow_unsigned=True)
 
         assert result.stats.get("episodes_imported") == 1
 
@@ -390,7 +390,7 @@ class TestIdentityImporter:
     async def test_import_saved_items(self, test_db, sample_package):
         """Test that saved items are imported."""
         importer = IdentityImporter(test_db)
-        result = await importer.import_package(sample_package, verify_signature=False)
+        result = await importer.import_package(sample_package, verify_signature=False, allow_unsigned=True)
 
         assert result.stats.get("saved_items_imported") == 1
 
@@ -407,7 +407,7 @@ class TestIdentityImporter:
     async def test_import_temporal_patterns(self, test_db, sample_package):
         """Test that temporal patterns are imported."""
         importer = IdentityImporter(test_db)
-        result = await importer.import_package(sample_package, verify_signature=False)
+        result = await importer.import_package(sample_package, verify_signature=False, allow_unsigned=True)
 
         assert result.stats.get("temporal_patterns_imported") == 1
 
@@ -415,7 +415,7 @@ class TestIdentityImporter:
     async def test_import_records_migration(self, test_db, sample_package):
         """Test that migration is recorded in graph."""
         importer = IdentityImporter(test_db, target_substrate="openai:gpt")
-        result = await importer.import_package(sample_package, verify_signature=False)
+        result = await importer.import_package(sample_package, verify_signature=False, allow_unsigned=True)
 
         # Check migration record was created
         row = await test_db.fetchone(
@@ -432,7 +432,7 @@ class TestIdentityImporter:
         """Test import with replace mode clears existing data."""
         # First import
         importer = IdentityImporter(test_db)
-        await importer.import_package(sample_package, verify_signature=False)
+        await importer.import_package(sample_package, verify_signature=False, allow_unsigned=True)
 
         # Second import with replace mode
         sample_package.episodes[0]["title"] = "Updated Episode"
@@ -440,6 +440,7 @@ class TestIdentityImporter:
         result = await importer2.import_package(
             sample_package,
             verify_signature=False,
+            allow_unsigned=True,
             merge_mode="replace"
         )
 
@@ -454,7 +455,7 @@ class TestIdentityImporter:
     @pytest.mark.asyncio
     async def test_import_convenience_function(self, test_db, sample_package):
         """Test the import_identity convenience function."""
-        result = await import_identity(test_db, sample_package, verify_signature=False)
+        result = await import_identity(test_db, sample_package, verify_signature=False, allow_unsigned=True)
 
         assert result.success is True
         assert result.agent_id == sample_package.did
@@ -484,6 +485,7 @@ class TestExportImportRoundTrip:
             package,
             target_agent_id=target_agent_id,
             verify_signature=False,
+            allow_unsigned=True,
         )
 
         assert result.success is True
@@ -512,6 +514,7 @@ class TestExportImportRoundTrip:
             restored_package,
             target_agent_id=target_agent_id,
             verify_signature=False,
+            allow_unsigned=True,
         )
 
         assert result.success is True
