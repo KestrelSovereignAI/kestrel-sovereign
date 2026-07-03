@@ -148,14 +148,34 @@ async def test_fleet_idle_true_when_all_agents_idle(tmp_path):
 
 @pytest.mark.asyncio
 async def test_fleet_idle_falls_back_to_self_without_provider(tmp_path):
-    """Single-agent host (no provider installed): behaviour-preserving — the
+    """Single-agent host (no provider, no manager): behaviour-preserving — the
     requester-only check is used."""
     feat, _ = await _make_feature(tmp_path)
     assert not hasattr(feat.agent, "_cohosted_agents_provider")
+    assert not hasattr(feat.agent, "_agent_manager")
     # Requester idle → idle; requester busy → not idle (self check).
     assert feat._fleet_idle(ignore_request_id="")["idle"] is True
     feat.agent._active_request_ids = {"r-active"}
     assert feat._fleet_idle(ignore_request_id="")["idle"] is False
+
+
+@pytest.mark.asyncio
+async def test_fleet_idle_resolves_via_manager_backref_when_no_provider(tmp_path):
+    """SpawnFeature registers the parent in a lightweight AgentManager outside
+    _load_one, so the parent lacks _cohosted_agents_provider but carries an
+    _agent_manager backref. The fleet gate must still see a busy spawned child
+    (codex round 2)."""
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent  # idle, no provider
+    busy_child = _idle_sibling("did:test:child", busy=True)
+    requester._agent_manager = SimpleNamespace(
+        list_agents=lambda: {"parent": requester, "child": busy_child}
+    )
+    assert not hasattr(requester, "_cohosted_agents_provider")
+
+    state = feat._fleet_idle(ignore_request_id="")
+    assert state["idle"] is False
+    assert "did:test:child" in state["reason"]
 
 
 @pytest.mark.asyncio

@@ -950,6 +950,32 @@ class RestartCoordinatorFeature(Feature):
             "reason": f"agent busy ({idle['reason']})",
         }
 
+    def _resolve_cohosted_agents(self) -> Optional[List[Any]]:
+        """Every agent sharing this host process, or None for a single-agent host.
+
+        Primary source is ``_cohosted_agents_provider`` (installed by
+        AgentManager at registration). As a backstop, resolve the agent's
+        attached ``_agent_manager``/``agent_manager`` — an agent registered
+        outside ``AgentManager._load_one`` (e.g. the SpawnFeature
+        lightweight-manager path) may lack the provider but still carry a
+        manager backref, and its spawned children must still gate a whole-host
+        restart (#F235).
+        """
+        provider = getattr(self.agent, "_cohosted_agents_provider", None)
+        if provider is not None:
+            try:
+                return list(provider() or [self.agent])
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("restart_coordinator: fleet provider failed: %s", e)
+        for attr in ("_agent_manager", "agent_manager"):
+            mgr = getattr(self.agent, attr, None)
+            if mgr is not None and hasattr(mgr, "list_agents"):
+                try:
+                    return list(mgr.list_agents().values()) or [self.agent]
+                except Exception:  # pragma: no cover - defensive
+                    continue
+        return None
+
     def _fleet_idle(self, ignore_request_id: str = "") -> Dict[str, Any]:
         """Idleness across ALL agents co-hosted in this process (#F235).
 
@@ -965,16 +991,11 @@ class RestartCoordinatorFeature(Feature):
         REQUESTING agent excludes its own requester marker; a sibling defers
         the restart on ANY active request.
         """
-        provider = getattr(self.agent, "_cohosted_agents_provider", None)
-        if provider is None:
+        agents = self._resolve_cohosted_agents()
+        if agents is None:
+            # No fleet view — genuine single-agent host. Requester-only check
+            # (behaviour-preserving).
             return self._agent_appears_idle(ignore_request_id=ignore_request_id)
-        try:
-            agents = list(provider() or [])
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("restart_coordinator: fleet provider failed: %s", e)
-            return self._agent_appears_idle(ignore_request_id=ignore_request_id)
-        if not agents:
-            agents = [self.agent]
         for other in agents:
             excl = ignore_request_id if other is self.agent else ""
             state = self._agent_appears_idle(ignore_request_id=excl, agent=other)
