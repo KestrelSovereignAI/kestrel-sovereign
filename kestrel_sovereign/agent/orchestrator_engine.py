@@ -34,7 +34,12 @@ from kestrel_sdk.llm import ToolCallStarted
 # applies uniformly to first-level AND multi-iteration tool calls
 # (codex P1 on PR #1346: follow-up pre-tool prose was streamed without
 # the honesty-layer clear).
-from kestrel_sovereign.agent.parts import build_part_sentinel, drain_parts
+from kestrel_sovereign.agent.parts import (
+    bind_part_collector,
+    build_part_sentinel,
+    current_part_collector,
+    drain_parts,
+)
 from kestrel_sovereign.agent.streaming import (
     _build_revise_sentinel,
     _build_tool_sentinel,
@@ -605,6 +610,18 @@ class OrchestratorEngineMixin:
         dispatch. Adapters that don't run an inline tool loop ignore
         the callable.
         """
+        # Capture the OWNING turn's #1914 part collector at closure-creation
+        # time — this method is called inside ``process_input_streaming``'s
+        # ``part_collector()`` scope, on the turn's asyncio task. The codex
+        # app-server dispatches each ``item/tool/call`` on its own reader-spawned
+        # task, which inherits a frozen copy of the reader's context (turn-1's,
+        # captured once at ``ensure_started``) — NOT the current turn's. Without
+        # re-binding, ``emit_part`` calls made by an inline tool would land on a
+        # stale/abandoned collector and be silently dropped on every turn after
+        # the first. Binding per closure (per turn) keeps concurrent turns —
+        # multiplexed by threadId over one long-lived app-server — routing to
+        # their own buffers; a process-global "current collector" would clobber.
+        turn_part_collector = current_part_collector()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -612,10 +629,11 @@ class OrchestratorEngineMixin:
             # redactors stay applied in audit/UI/STOP-hook
             # surfaces — pre-hook args would leak redacted values).
             capture: Dict[str, Any] = {}
-            result = await self.execute_named_tool(
-                name, args, session_id=session_id, source="codex_app_server",
-                _capture=capture,
-            )
+            with bind_part_collector(turn_part_collector):
+                result = await self.execute_named_tool(
+                    name, args, session_id=session_id, source="codex_app_server",
+                    _capture=capture,
+                )
             return capture.get("effective_args", args), result
 
         return _exec

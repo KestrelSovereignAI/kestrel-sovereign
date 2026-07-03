@@ -72,6 +72,39 @@ def part_collector():
         _part_collector.reset(token)
 
 
+def current_part_collector() -> Optional[List[dict]]:
+    """Return the active turn's part collector list, or ``None`` off a turn.
+
+    The turn task binds a fresh collector via :func:`part_collector`. Transports
+    that dispatch a tool on a *different* asyncio task than the turn's (the codex
+    app-server reader loop spawns each ``item/tool/call`` handler in its own
+    task, which inherits a frozen copy of the reader's context — not the turn's)
+    must capture this list *inside* the turn task and re-enter it around the tool
+    execution via :func:`bind_part_collector`, so ``emit_part`` lands on the
+    owning turn's buffer rather than a stale one. See
+    ``OrchestratorEngineMixin._make_inline_tool_executor``.
+    """
+    return _part_collector.get()
+
+
+@contextlib.contextmanager
+def bind_part_collector(collector: Optional[List[dict]]):
+    """Re-enter a previously captured turn collector on the current task.
+
+    Companion to :func:`current_part_collector`: an inline-tool executor built
+    inside a turn captures that turn's collector, then wraps the actual tool call
+    in ``with bind_part_collector(captured):`` so ``emit_part`` calls made on a
+    foreign dispatch task (the codex reader's per-request task) route to the
+    owning turn's buffer. Binding ``None`` is a no-op-preserving reset (still no
+    active collector), keeping the "off a turn ⇒ emit_part no-op" invariant.
+    """
+    token = _part_collector.set(collector)
+    try:
+        yield
+    finally:
+        _part_collector.reset(token)
+
+
 def _sanitize_type(part_type: Any) -> Optional[str]:
     """Return a clean renderer key, or ``None`` if ``part_type`` is unusable."""
     if not isinstance(part_type, str):
