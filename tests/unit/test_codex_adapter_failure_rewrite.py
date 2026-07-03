@@ -202,6 +202,28 @@ def test_toolresult_partial_is_treated_as_failure():
     assert out["success"] is False
     text = out["contentItems"][0]["text"]
     assert "Outcome:" in text
+    # Both halves preserved so the next turn can honestly narrate what
+    # completed AND the caveat (#1042) — confirmation must not be dropped.
+    assert "mixed result" in text
+    assert "some step failed" in text
+
+
+def test_flat_partial_preserves_both_halves():
+    """The flat serialized PARTIAL envelope (#F025) must also surface both the
+    confirmation and the caveat, not just the error."""
+    out = _result_to_codex_response(
+        {
+            "status": "partial",
+            "confirmation": "saved 3 of 5",
+            "error": "2 records failed validation",
+            "tool": "x",
+        },
+        tool_name="x",
+    )
+    assert out["success"] is False
+    text = out["contentItems"][0]["text"]
+    assert "saved 3 of 5" in text
+    assert "2 records failed validation" in text
 
 
 @pytest.mark.asyncio

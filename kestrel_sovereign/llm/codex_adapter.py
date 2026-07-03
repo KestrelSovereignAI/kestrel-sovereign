@@ -524,6 +524,14 @@ def _result_to_codex_response(
                 if isinstance(confirmation, str) and confirmation
                 else data
             )
+        elif "partial" in status:
+            # PARTIAL: surface BOTH halves — the completed confirmation AND the
+            # caveat — so the next turn can honestly report what succeeded and
+            # what didn't (#1042). Non-success so it still routes through the
+            # classifier, but the confirmation is not discarded.
+            confirmation = getattr(result, "confirmation", None)
+            halves = [p for p in (confirmation, err) if isinstance(p, str) and p]
+            text = " — ".join(halves) if halves else str(result)
         else:
             text = err if isinstance(err, str) and err else str(result)
     elif isinstance(result, dict) and _is_flat_toolresult(result):
@@ -543,6 +551,14 @@ def _result_to_codex_response(
                 if isinstance(confirmation, str) and confirmation
                 else result.get("data")
             )
+        elif status == "partial":
+            # PARTIAL: surface BOTH the completed confirmation AND the caveat so
+            # the next turn can honestly narrate what succeeded and what didn't
+            # (#1042) — mirrors the ToolResult-object branch above.
+            confirmation = result.get("confirmation")
+            err = result.get("error")
+            halves = [p for p in (confirmation, err) if isinstance(p, str) and p]
+            text = " — ".join(halves) if halves else result
         else:
             err = result.get("error")
             text = err if isinstance(err, str) and err else result
