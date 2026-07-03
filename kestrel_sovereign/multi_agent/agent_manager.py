@@ -220,6 +220,7 @@ class AgentManager:
         name: str,
         parent_did: str = None,
         features: Optional[List[str]] = None,
+        mandate: Optional[SpawnMandate] = None,
     ) -> KestrelAgent:
         """Create a new agent via inception and load it.
 
@@ -235,6 +236,11 @@ class AgentManager:
                 (mandatory features are always loaded regardless). Threaded
                 into the agent's ``LocalAgentConfig`` so the restriction
                 actually reaches ``load_agent`` / ``discover_features`` (#1946).
+            mandate: Optional SpawnMandate authorizing a spawned child. When
+                present it is forwarded to inception so the delegation edge
+                records the mandate (purpose/ttl/max_child_depth) — without this
+                the mandate never reaches ``create_kestrel_identity_async`` and
+                the child is created as if unconstrained (F277).
 
         Returns:
             The newly created and initialized KestrelAgent.
@@ -255,6 +261,7 @@ class AgentManager:
                 output_dir=str(agent_dir),
                 agent_name=name,
                 parent_did=parent_did,
+                spawn_mandate=mandate,
             )
         except Exception as e:
             raise ValueError(f"Inception failed for '{name}': {e}")
@@ -267,6 +274,41 @@ class AgentManager:
             features=features,
         )
         return await self.load_agent(name, config)
+
+    def _parent_feature_names(self, parent_agent: KestrelAgent) -> set[str]:
+        """Feature class names available to the parent — the ceiling a child's
+        ``features_allowed`` may not exceed."""
+        features = getattr(parent_agent, "features", None) or {}
+        try:
+            return {
+                type(feat).__name__ if not isinstance(key, str) else key
+                for key, feat in features.items()
+            }
+        except AttributeError:
+            return set()
+
+    def _validate_mandate_subset(
+        self, parent_agent: KestrelAgent, mandate: SpawnMandate
+    ) -> None:
+        """Refuse a mandate that grants the child MORE than the parent (F277).
+
+        Uses the shared ``ScopedConstitution`` narrowing rules so this consumer
+        cannot drift from the spawn-constraint contract: a child's
+        ``features_allowed`` must be a subset of the parent's features, and its
+        ``additional_constraints`` must be restrictions (never
+        ``grant_features`` / ``override_constitution`` / ``remove_restrictions``).
+        """
+        from kestrel_sovereign.spawn.scoped_constitution import ScopedConstitution
+
+        scoped = ScopedConstitution(
+            base_constitution="",
+            additional_constraints=getattr(mandate, "additional_constraints", {}) or {},
+            features_allowed=list(getattr(mandate, "features_allowed", []) or []),
+            parent_features=self._parent_feature_names(parent_agent),
+        )
+        ok, msg = scoped.validate_constraints()
+        if not ok:
+            raise ValueError(f"Spawn refused: {msg}")
 
     async def spawn_agent(
         self,
@@ -290,6 +332,13 @@ class AgentManager:
         Raises:
             ValueError: If an agent with this name already exists or inception fails.
         """
+        # Subset-of-parent validation (F277): a mandate must only ever RESTRICT
+        # the child relative to the parent — it may never grant features the
+        # parent lacks or add constitution-weakening constraints. Enforce this
+        # before any inception work, so an over-broad mandate is refused rather
+        # than silently producing a child with more authority than its parent.
+        self._validate_mandate_subset(parent_agent, mandate)
+
         # Spawn caps (#1729): bound runaway spawning. The check + reservation run
         # under the manager lock so concurrent spawn_agent calls can't all read
         # the same count and blow past the cap (codex r2). ``_pending_spawns``
@@ -352,11 +401,20 @@ class AgentManager:
         # features regardless of what the mandate permitted (#1946). An empty
         # list is a real (empty) allowlist; only ``None`` means "load all".
         features_allowed = getattr(mandate, "features_allowed", None)
-        child_features = features_allowed if features_allowed else None
+        if features_allowed:
+            child_features = list(features_allowed)
+        else:
+            # No explicit allowlist ⇒ inherit the PARENT's feature ceiling, NOT
+            # "load all discovered features" (F277 / codex P1). Otherwise a
+            # restricted parent could spawn a broader-than-itself child simply by
+            # omitting features_allowed. A parent with no resolvable feature set
+            # (degenerate/test doubles) falls back to None (load all).
+            child_features = sorted(self._parent_feature_names(parent_agent)) or None
         child = await self.create_agent(
             name,
             parent_did=parent_agent.agent_id,
             features=child_features,
+            mandate=mandate,
         )
 
         # Fill in child DID on the mandate
