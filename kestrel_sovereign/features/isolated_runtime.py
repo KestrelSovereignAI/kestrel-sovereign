@@ -16,21 +16,80 @@ mistaken for a pip target or a `python -m` module.
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from kestrel_sdk.channels import ChannelAdapter
-from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
+from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on a single supervision health probe. A wedged child that never
+# answers health() must not silently kill supervision forever (F013) — treat a
+# probe that exceeds this as unhealthy and fall through to the restart path.
+_HEALTH_PROBE_TIMEOUT = 5.0
+
+
+def _host_sdk_version() -> str:
+    """The kestrel-sdk version resolved in the *host* process, used as the
+    provisioning stamp for isolated venvs so a host SDK upgrade forces the
+    per-agent venv to reprovision instead of pinning a stale wire contract.
+
+    The ``kestrel_sdk`` import package is shipped by the ``kestrel-sovereign-sdk``
+    distribution, so resolve the distribution from the import name rather than
+    guessing — a hardcoded wrong name would silently stamp ``unknown`` forever
+    and defeat stale detection.
+    """
+    try:
+        candidates = importlib_metadata.packages_distributions().get("kestrel_sdk")
+    except Exception:  # noqa: BLE001
+        candidates = None
+    for dist in list(candidates or []) + ["kestrel-sovereign-sdk", "kestrel-sdk"]:
+        try:
+            return importlib_metadata.version(dist)
+        except Exception:  # noqa: BLE001
+            continue
+    return "unknown"
+
+
+# Probe run *inside* a feature venv to report the kestrel-sdk version actually
+# installed there — mirrors _host_sdk_version's distribution resolution.
+_CHILD_SDK_PROBE = (
+    "from importlib import metadata as m\n"
+    "def v():\n"
+    "    try: c = m.packages_distributions().get('kestrel_sdk')\n"
+    "    except Exception: c = None\n"
+    "    for d in list(c or []) + ['kestrel-sovereign-sdk', 'kestrel-sdk']:\n"
+    "        try: return m.version(d)\n"
+    "        except Exception: continue\n"
+    "    return 'unknown'\n"
+    "print(v())\n"
+)
+
+
+def _venv_sdk_version(python_path: Path) -> str:
+    """The kestrel-sdk version resolved *inside* the feature venv (may differ
+    from the host when the feature pins the dependency)."""
+    try:
+        res = subprocess.run(
+            [str(python_path), "-c", _CHILD_SDK_PROBE],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return res.stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def _env_key(feature_name: str, suffix: str) -> str:
@@ -73,6 +132,46 @@ def _meta_get(metadata: Any, key: str, default: Any = None) -> Any:
     return getattr(metadata, key, default)
 
 
+def _input_schema_to_parameters(input_schema: Any) -> List[ToolParameter]:
+    """Convert an isolated service's advertised JSON-Schema ``input_schema``
+    (the SDK wire contract, ``ToolMetadata.input_schema``) into the
+    ``List[ToolParameter]`` a host ``ToolSchema`` expects.
+
+    Without this the proxied tool reaches the LLM with an empty parameter list,
+    so the model cannot supply arguments (F004). Passing the raw dict through is
+    also wrong: ``ToolSchema.to_openai_format`` iterates ``ToolParameter``
+    objects and would crash on a dict/string.
+    """
+    if not isinstance(input_schema, dict):
+        return []
+    properties = input_schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+    raw_required = input_schema.get("required")
+    required = set(raw_required) if isinstance(raw_required, (list, tuple, set)) else set()
+
+    params: List[ToolParameter] = []
+    for pname, pdef in properties.items():
+        pdef = pdef if isinstance(pdef, dict) else {}
+        ptype = pdef.get("type")
+        if isinstance(ptype, (list, tuple)):
+            # JSON-Schema union, e.g. ["string", "null"] for an Optional — take
+            # the first non-null member.
+            ptype = next((t for t in ptype if t != "null"), None)
+        params.append(
+            ToolParameter(
+                name=str(pname),
+                type=str(ptype or "string"),
+                description=str(pdef.get("description", "")),
+                required=pname in required,
+                default=pdef.get("default"),
+                enum=pdef.get("enum"),
+                items=pdef.get("items"),
+            )
+        )
+    return params
+
+
 def _maybe_await(value: Any) -> Awaitable[Any]:
     if inspect.isawaitable(value):
         return value
@@ -96,11 +195,15 @@ class IsolatedFeatureTool(AgentTool):
 
     @property
     def schema(self) -> ToolSchema:
+        input_schema = _meta_get(self._metadata, "input_schema", None)
+        if input_schema is None:
+            # camelCase spelling tolerated on the wire (see protocol.from_dict)
+            input_schema = _meta_get(self._metadata, "inputSchema", None)
         return ToolSchema(
             name=self.name,
             description=str(_meta_get(self._metadata, "description", "")),
             category=_coerce_category(_meta_get(self._metadata, "category")),
-            parameters=_meta_get(self._metadata, "parameters", {}) or {},
+            parameters=_input_schema_to_parameters(input_schema),
             command_prefix=_meta_get(self._metadata, "command_prefix"),
         )
 
@@ -373,16 +476,55 @@ class ProxyFeature(Feature):
     def _default_venv_path(self) -> Path:
         return _agent_data_dir(self.agent) / "feature_venvs" / self.name / ".venv"
 
+    def _provision_manifest_path(self) -> Path:
+        # Inside the venv dir, not its parent: explicit venv overrides can share
+        # a parent directory, and a parent-scoped manifest would let sibling
+        # features clobber each other's stamp and reinstall on every startup.
+        assert self._venv_path is not None
+        return self._venv_path / ".kestrel_provision.json"
+
+    def _read_provision_manifest(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self._provision_manifest_path().read_text())
+        except Exception:  # noqa: BLE001 — missing/corrupt manifest ⇒ reprovision
+            return {}
+
+    def _write_provision_manifest(
+        self, install_target: str, host_sdk: str, child_sdk: str
+    ) -> None:
+        path = self._provision_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "install_target": install_target,
+                    # The host SDK we provisioned AGAINST — staleness keys on a
+                    # change here, so a genuinely SDK-pinned feature reinstalls
+                    # once per host bump, not on every startup.
+                    "provisioned_against_host_sdk": host_sdk,
+                    # The SDK version that actually landed in the venv (may lag
+                    # host_sdk if the feature pins it); recorded for diagnosis.
+                    "child_sdk_version": child_sdk,
+                },
+                indent=2,
+            )
+        )
+
+    def _provision_is_stale(self, install_target: str) -> bool:
+        """A provisioned venv is stale if the install target changed or the host
+        has upgraded kestrel-sdk since we last provisioned against it (F019: a
+        stale wire contract — e.g. pre-0.28 serial dispatch — must not silently
+        survive a host update)."""
+        manifest = self._read_provision_manifest()
+        if manifest.get("install_target") != install_target:
+            return True
+        if manifest.get("provisioned_against_host_sdk") != _host_sdk_version():
+            return True
+        return False
+
     def ensure_venv(self) -> None:
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
-        created = False
-        if not python_path.exists():
-            self._run(["uv", "venv", str(self._venv_path)])
-            created = True
-
-        if not created:
-            return
 
         # Install the PROJECT (path/dist), never the `service` runnable — the
         # latter is a console-script name or "module:func", not a pip target.
@@ -391,7 +533,39 @@ class ProxyFeature(Feature):
             raise RuntimeError(
                 f"Isolated feature {self.name} has no project/distribution to install"
             )
-        self._run(["uv", "pip", "install", "--python", str(python_path), install_target])
+
+        exists = python_path.exists()
+        if not exists:
+            self._run(["uv", "venv", str(self._venv_path)])
+        elif not self._provision_is_stale(install_target):
+            return
+
+        # Fresh venv, changed install target, or host SDK upgraded since the
+        # venv was provisioned. On an existing venv, upgrade in place so a stale
+        # kestrel-sdk is replaced; then stamp the manifest so the next startup
+        # can tell whether another reprovision is due.
+        cmd = ["uv", "pip", "install", "--python", str(python_path)]
+        if exists:
+            cmd.append("--upgrade")
+        cmd.append(install_target)
+        self._run(cmd)
+
+        # Verify what actually landed: a feature that pins an older SDK can
+        # install "successfully" while keeping the stale wire contract. Surface
+        # that rather than silently stamping the venv as fresh (See Something
+        # Say Something) — staleness still keys on the host transition so we
+        # don't thrash reinstalling a genuinely pinned feature every startup.
+        host_sdk = _host_sdk_version()
+        child_sdk = _venv_sdk_version(python_path)
+        if child_sdk != host_sdk and "unknown" not in (child_sdk, host_sdk):
+            logger.warning(
+                "Isolated feature %s venv resolved kestrel-sdk %s but host is %s — "
+                "the feature may pin an incompatible wire contract",
+                self.name,
+                child_sdk,
+                host_sdk,
+            )
+        self._write_provision_manifest(install_target, host_sdk, child_sdk)
 
     def _run(self, cmd: List[str]) -> None:
         if shutil.which(cmd[0]) is None:
@@ -523,13 +697,23 @@ class ProxyFeature(Feature):
             while not self._stopping:
                 await asyncio.sleep(backoff)
                 try:
-                    health = await _maybe_await(self._client.health())
+                    health = await asyncio.wait_for(
+                        _maybe_await(self._client.health()),
+                        timeout=_HEALTH_PROBE_TIMEOUT,
+                    )
                     healthy = bool(health)
                     if isinstance(health, dict):
                         healthy = bool(health.get("ok", health.get("healthy", True)))
                     if healthy:
                         backoff = 1.0
                         continue
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Isolated feature %s health probe exceeded %ss — treating as "
+                        "wedged and restarting",
+                        self.name,
+                        _HEALTH_PROBE_TIMEOUT,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Isolated feature %s health check failed: %s", self.name, exc)
 
