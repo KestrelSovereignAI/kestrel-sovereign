@@ -27,12 +27,24 @@ class FakeIsolatedClient:
         return True
 
     async def list_tools(self):
+        # Real wire contract: services advertise a JSON-Schema ``input_schema``
+        # (kestrel_sdk.isolated_feature.protocol.ToolMetadata), NOT a bare
+        # ``parameters`` dict. The host must convert it into ToolParameters.
         return [
             {
                 "name": "ping",
                 "description": "Ping the isolated service",
                 "category": "utility",
-                "parameters": {"message": {"type": "string"}},
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "text to echo",
+                        }
+                    },
+                    "required": ["message"],
+                },
                 "command_prefix": "!ping",
             }
         ]
@@ -76,6 +88,17 @@ async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_p
     assert len(tools) == 1
     assert tools[0].name == "ping"
     assert tools[0].schema.command_prefix == "!ping"
+    # F004: the advertised input_schema is converted into real ToolParameters,
+    # so the tool reaches the LLM with usable arguments (not an empty list).
+    params = tools[0].schema.parameters
+    assert [p.name for p in params] == ["message"]
+    assert params[0].type == "string"
+    assert params[0].required is True
+    assert params[0].description == "text to echo"
+    # And the schema survives OpenAI conversion (crashes if params are dicts).
+    openai = tools[0].schema.to_openai_format()
+    props = openai["function"]["parameters"]["properties"]
+    assert props["message"]["type"] == "string"
 
     result = await tools[0].execute(message="hello")
     assert result["success"] is True
@@ -453,3 +476,141 @@ def test_proxy_feature_resolves_default_per_agent_venv(tmp_path):
         == Path(agent.storage_path).parent / "feature_venvs" / "VoiceFeature" / ".venv"
     )
     assert bin_path is None
+
+
+@pytest.mark.asyncio
+async def test_supervision_restarts_child_on_wedged_health_probe(tmp_path):
+    """F013: a health() that never returns must not wedge supervision forever —
+    the probe is bounded and a timeout drops through to stop()/start()."""
+    import asyncio
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    class WedgedThenHealthyClient(FakeIsolatedClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.health_calls = 0
+            self.starts = 0
+
+        async def start(self):
+            self.starts += 1
+            await super().start()
+
+        async def health(self):
+            self.health_calls += 1
+            if self.health_calls == 1:
+                # First probe hangs past the bound → treated as wedged.
+                await asyncio.sleep(3600)
+            return True
+
+    runtime = InstalledFeatureRuntime(
+        class_name="WedgeFeature",
+        entry_point="w.feature:WedgeFeature",
+        distribution="w-pkg",
+        runtime="isolated-venv",
+        service="w",
+    )
+    client_holder = {}
+
+    def factory(**kw):
+        client_holder["c"] = WedgedThenHealthyClient(**kw)
+        return client_holder["c"]
+
+    feature = ProxyFeature(Mock(storage_path=str(tmp_path / "a" / "db.db"), features={}),
+                           runtime, client_factory=factory)
+    import os
+    os.environ["KESTREL_FEATURE_WEDGEFEATURE_BIN"] = str(tmp_path / "w-bin")
+    # Shrink the probe bound and backoff so the test is fast.
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(ir, "_HEALTH_PROBE_TIMEOUT", 0.05)
+    try:
+        await feature.initialize()
+        client = client_holder["c"]
+        # Wait for: first (hanging) probe to time out, then the restart path.
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if client.starts >= 2:
+                break
+        assert client.stopped is True
+        assert client.starts >= 2  # child was restarted after the wedged probe
+    finally:
+        feature._stopping = True
+        if feature._supervision_task:
+            feature._supervision_task.cancel()
+            try:
+                await feature._supervision_task
+            except asyncio.CancelledError:
+                pass
+        monkey.undo()
+        os.environ.pop("KESTREL_FEATURE_WEDGEFEATURE_BIN", None)
+
+
+def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
+    """F019: a provisioned venv whose stamped host SDK version no longer matches
+    the running host is reinstalled (--upgrade), not silently reused."""
+    import json
+
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    runtime = InstalledFeatureRuntime(
+        class_name="StampFeature",
+        entry_point="s.feature:StampFeature",
+        distribution="stamp-pkg",
+        runtime="isolated-venv",
+        service="s",
+        project="stamp-pkg",
+    )
+    feature = ProxyFeature(Mock(storage_path=str(tmp_path / "a" / "db.db")),
+                           runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        # Materialize the venv python so the "exists" branch is taken next time.
+        py = feature._venv_path / "bin" / "python"
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.touch()
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    # Child venv python is a stub (empty file) — report a concrete SDK version
+    # rather than shelling out to it.
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
+
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
+    feature.ensure_venv()  # fresh: uv venv + uv pip install (no --upgrade)
+    assert any(c[:3] == ["uv", "venv"] or c[0] == "uv" and "venv" in c for c in runs)
+    install_cmds = [c for c in runs if "pip" in c and "install" in c]
+    assert install_cmds and "--upgrade" not in install_cmds[-1]
+    manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
+    assert manifest["provisioned_against_host_sdk"] == "0.28.0"
+    assert manifest["child_sdk_version"] == "0.28.0"
+
+    runs.clear()
+    # Same host SDK → no reprovision.
+    feature.ensure_venv()
+    assert runs == []
+
+    # Host upgraded → reprovision with --upgrade, stamped against the new host.
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.29.0")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.29.0")
+    feature.ensure_venv()
+    upgrades = [c for c in runs if "pip" in c and "install" in c]
+    assert upgrades and "--upgrade" in upgrades[-1]
+    manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
+    assert manifest["provisioned_against_host_sdk"] == "0.29.0"
+
+    runs.clear()
+    # A feature that pins an OLD sdk installs "successfully" but the child stays
+    # behind: we still stamp against the new host so we don't reinstall every
+    # startup, but the mismatch is recorded (and warned) rather than hidden.
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.30.0")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
+    feature.ensure_venv()
+    manifest = json.loads((feature._venv_path / ".kestrel_provision.json").read_text())
+    assert manifest["provisioned_against_host_sdk"] == "0.30.0"
+    assert manifest["child_sdk_version"] == "0.28.0"
+    runs.clear()
+    feature.ensure_venv()  # not stale now (host unchanged) → no thrash
+    assert runs == []
