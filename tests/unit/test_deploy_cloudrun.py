@@ -181,6 +181,56 @@ class TestCloudRunProviderDeploy:
         assert not mock_client.create_service.called
 
     @pytest.mark.asyncio
+    async def test_deploy_update_preserves_out_of_band_settings(
+        self, mock_services_client, deployment_profile
+    ):
+        """F174: updating an existing service must read-modify-write the FETCHED
+        service so fields Kestrel doesn't manage (service_account, labels, …)
+        aren't reset by a full-spec replace."""
+        from google.cloud.run_v2 import Service
+        from google.iam.v1 import policy_pb2
+
+        mock_client = MagicMock()
+        mock_services_client.return_value = mock_client
+
+        existing = Service()
+        existing.template.service_account = (
+            "custom-sa@test-project.iam.gserviceaccount.com"
+        )
+        existing.labels["team"] = "platform"
+        mock_client.get_service.return_value = existing
+
+        mock_operation = MagicMock()
+        mock_result = MagicMock()
+        mock_result.uri = "https://kestrel-dev-xyz789.run.app"
+        mock_result.latest_ready_revision = "kestrel-dev-00002-xyz"
+        mock_operation.result.return_value = mock_result
+        mock_client.update_service.return_value = mock_operation
+        mock_client.get_iam_policy.return_value = policy_pb2.Policy()
+
+        provider = CloudRunProvider(project_id="test-project")
+        provider._services_client = mock_client
+
+        await provider.deploy(
+            image="gcr.io/test-project/kestrel:latest",
+            service_name="kestrel-dev",
+            profile=deployment_profile,
+        )
+
+        sent = mock_client.update_service.call_args.kwargs["service"]
+        # Mutated the fetched service in place (read-modify-write), preserving
+        # out-of-band settings.
+        assert sent is existing
+        assert sent.template.service_account == (
+            "custom-sa@test-project.iam.gserviceaccount.com"
+        )
+        assert sent.labels["team"] == "platform"
+        # And the fields Kestrel manages were (re)applied.
+        assert sent.template.containers[0].image == (
+            "gcr.io/test-project/kestrel:latest"
+        )
+
+    @pytest.mark.asyncio
     async def test_deploy_with_custom_env_vars(self, mock_services_client, deployment_profile):
         """Test deployment with additional environment variables."""
         # Setup mocks
