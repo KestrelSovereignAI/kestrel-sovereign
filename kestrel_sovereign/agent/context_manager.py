@@ -1139,6 +1139,21 @@ class ContextManager:
         )
 
     # Delegate to ConversationManager
+    def _get_conversation_store(self):
+        """Resolve the conversation store via the ConversationManager.
+
+        Mirrors the internal delegation pattern already used for the
+        salvage worker (see start_salvage_worker) so callers that hold a
+        ContextManager can reach the same store the ConversationManager
+        uses. Returns None when no store is available.
+        """
+        getter = getattr(
+            self.conversation_manager, "_get_conversation_store", None
+        )
+        if getter is None:
+            return None
+        return getter()
+
     async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.compact_session(
