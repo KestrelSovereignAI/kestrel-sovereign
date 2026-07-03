@@ -84,16 +84,24 @@ async def test_read_attachment_returns_text_document():
 
 
 @pytest.mark.asyncio
-async def test_read_attachment_truncates_long_text():
-    from kestrel_sovereign.features.attachments.feature import _MAX_TEXT_CHARS
+async def test_read_attachment_paginates_long_text():
+    import json
+    from kestrel_sovereign.kestrel_agent import MAX_TOOL_RESULT_CHARS
+    from kestrel_sovereign.features.base import _serialize_tool_result
     h = "c" * 64
+    total = MAX_TOOL_RESULT_CHARS * 2 + 500
     feat, _ = _make(
         {"hash": h, "kind": "document", "mime": "text/plain", "name": "big.txt"},
-        bytes_=b"x" * (_MAX_TEXT_CHARS + 500))
+        bytes_=b"x" * total)
     res = await feat.read_attachment(h)
     assert res.status == "ok"
+    # A long document is paginated, not silently truncated: more remains and
+    # the model is handed the offset to continue from.
     assert res.data["truncated"] is True
-    assert len(res.data["content"]) == _MAX_TEXT_CHARS
+    assert res.data["total"] == total
+    assert res.data["next_offset"] == res.data["length"]
+    # The serialized result stays under the orchestrator cap (F086).
+    assert len(json.dumps(_serialize_tool_result(res))) <= MAX_TOOL_RESULT_CHARS
 
 
 # --- PDF --------------------------------------------------------------------
