@@ -48,6 +48,10 @@ class SpawnFeature(Feature):
         self._lifecycle = None
         self._child_results: dict[str, Any] = {}  # child_name -> latest result
         self._child_tasks: dict[str, asyncio.Task] = {}  # child_name -> running task
+        # child_name -> (DelegatedWallet, parent_wallet) for a budgeted child.
+        # The wallet is released back to the parent on any termination path via
+        # the lifecycle on_terminate callback (#F278).
+        self._delegated_wallets: dict[str, Any] = {}
 
     def get_router(self):
         """Return the Spawn panel router for dynamic mounting.
@@ -150,6 +154,31 @@ class SpawnFeature(Feature):
         ),
         category=ToolCategory.AGENT_MANAGEMENT,
     )
+    async def _release_child_budget(self, child_name: str) -> None:
+        """Release a terminated child's delegated budget back to the parent.
+
+        Registered as the lifecycle ``on_terminate`` callback, so it runs on
+        every termination path (explicit terminate, TTL expiry, parent
+        shutdown). Credits any unspent hold back to the parent wallet.
+        Best-effort and idempotent (pops the entry).
+        """
+        entry = self._delegated_wallets.pop(child_name, None)
+        if entry is None:
+            return
+        dw, parent_wallet = entry
+        from kestrel_sovereign.spawn.delegated_wallet import (
+            release_delegated_wallet,
+        )
+
+        try:
+            returned = await release_delegated_wallet(dw, parent_wallet)
+            logger.info(
+                "Released child '%s' budget: spent=%s, returned=%s to parent",
+                child_name, dw.spent, returned,
+            )
+        except Exception as e:  # noqa: BLE001 - best-effort accounting
+            logger.error("Failed to release child '%s' budget: %s", child_name, e)
+
     async def spawn_agent(
         self,
         name: str,
@@ -165,7 +194,13 @@ class SpawnFeature(Feature):
         Args:
             name: Unique name for the child agent
             purpose: What the child agent is for (stored in mandate)
-            budget: Budget allocation for the child (default 0)
+            budget: Budget to RESERVE from the parent's wallet for the child
+                 (default 0). A positive budget holds that amount from your
+                 wallet and funds the child's delegated wallet, which enforces
+                 the ceiling on spends routed through it; the unspent balance is
+                 returned to you when the child terminates. Requires a funded
+                 wallet — a positive budget with no wallet is rejected rather
+                 than silently ignored.
             ttl: Time-to-live in seconds (default 3600). A value <= 0 makes
                  the child PERSISTENT (registered with SpawnMode.PERSISTENT,
                  no automatic TTL expiry) rather than ephemeral.
@@ -189,6 +224,25 @@ class SpawnFeature(Feature):
             return ToolResult.failed(
                 error="No AgentManager available — agent is not running in a multi_agent"
             )
+
+        # Budget requires a funded parent wallet to HOLD against (#F278).
+        # Resolve it up-front and fail clearly rather than silently accepting a
+        # budget the child never has to honour (the previous no-op that reported
+        # the budget as allocated while enforcing nothing).
+        parent_wallet = None
+        if budget and budget > 0:
+            parent_wallet = (
+                getattr(self.agent, "wallet", None)
+                or getattr(self.agent, "wallet_agent", None)
+            )
+            if parent_wallet is None:
+                return ToolResult.failed(
+                    error=(
+                        "budget requires a funded wallet on the parent, but the "
+                        "wallet feature is not loaded/initialized. Spawn without "
+                        "a budget, or enable the wallet feature."
+                    )
+                )
 
         # Parse comma-separated strings into lists
         constraint_dict = {}
@@ -274,15 +328,52 @@ class SpawnFeature(Feature):
                     purpose=purpose,
                     mode=SpawnMode.EPHEMERAL if ttl > 0 else SpawnMode.PERSISTENT,
                 )
+
+            # Budget hold (#F278): debit the parent and fund the child's
+            # DelegatedWallet, which enforces the ceiling on any spend routed
+            # through it. Released back to the parent on any termination path
+            # via the lifecycle on_terminate callback.
+            budget_held = None
+            if parent_wallet is not None:
+                from decimal import Decimal
+                from kestrel_sovereign.spawn.delegated_wallet import (
+                    create_delegated_wallet,
+                )
+
+                try:
+                    dw = await create_delegated_wallet(
+                        parent_wallet=parent_wallet,
+                        parent_did=self.agent.agent_id,
+                        child_did=child.agent_id,
+                        budget=Decimal(str(budget)),
+                    )
+                except ValueError as e:
+                    # Insufficient parent funds / invalid budget — tear down the
+                    # child we just spawned so we never leave an unfunded
+                    # budgeted child running.
+                    await manager.terminate_child(self.agent.agent_id, name)
+                    return ToolResult.failed(error=f"budget hold failed: {e}")
+
+                child._delegated_wallet = dw
+                self._delegated_wallets[name] = (dw, parent_wallet)
+                if isinstance(lifecycle, SpawnedAgentLifecycle):
+                    lifecycle._on_terminate = self._release_child_budget
+                budget_held = str(dw.ceiling)
+
+            data = {
+                "spawned": True,
+                "child_name": name,
+                "child_did": child.agent_id,
+                "purpose": purpose,
+                "ttl": ttl,
+            }
+            if budget_held is not None:
+                data["budget_held"] = budget_held
             return ToolResult.ok(
-                f"Spawned child '{name}' (did={child.agent_id}, ttl={ttl}s).",
-                data={
-                    "spawned": True,
-                    "child_name": name,
-                    "child_did": child.agent_id,
-                    "purpose": purpose,
-                    "ttl": ttl,
-                },
+                f"Spawned child '{name}' (did={child.agent_id}, ttl={ttl}s"
+                + (f", budget_held={budget_held}" if budget_held else "")
+                + ").",
+                data=data,
             )
         except Exception as e:
             logger.error(f"Failed to spawn child agent '{name}': {e}")
@@ -381,9 +472,17 @@ class SpawnFeature(Feature):
                 error=f"Agent '{child_name}' is not a child of this agent"
             )
 
-        # Run the task asynchronously via the child agent's chat method
+        # Run the task asynchronously via the child agent's chat method.
+        #
+        # A completed task records its result in ``_child_results`` but must NOT
+        # finalize/terminate the child (#F279). ``lifecycle.report_result``
+        # cancels the TTL timer and runs ``_terminate_and_cleanup`` — calling it
+        # per task killed the child after ONE delegate, breaking the documented
+        # spawn → delegate → get_child_result → delegate-again flow (and making
+        # a second delegate_task/terminate_child fail with "not found"). The
+        # child persists until its TTL expires, an explicit terminate_child, or
+        # parent shutdown — the paths that legitimately finalize it.
         async def _run_child_task():
-            lifecycle = self._get_lifecycle(manager)
             try:
                 result = await child_agent.process_input(task)
                 self._child_results[child_name] = {
@@ -391,11 +490,6 @@ class SpawnFeature(Feature):
                     "result": result,
                     "completed_at": time.time(),
                 }
-                if lifecycle is not None:
-                    await lifecycle.report_result(
-                        child_name=child_name,
-                        output_artifacts={"result": result},
-                    )
             except Exception as e:
                 logger.error(f"Child '{child_name}' task failed: {e}")
                 self._child_results[child_name] = {
@@ -403,13 +497,6 @@ class SpawnFeature(Feature):
                     "error": str(e),
                     "completed_at": time.time(),
                 }
-                if lifecycle is not None:
-                    from kestrel_sovereign.spawn.lifecycle import SpawnStatus
-                    await lifecycle.report_result(
-                        child_name=child_name,
-                        output_artifacts={"error": str(e)},
-                        status=SpawnStatus.FAILED,
-                    )
 
         # Cancel any existing task for this child
         if child_name in self._child_tasks and not self._child_tasks[child_name].done():

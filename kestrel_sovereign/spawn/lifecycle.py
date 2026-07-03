@@ -123,6 +123,12 @@ class SpawnedAgentLifecycle:
         self._tracked: Dict[str, _TrackedChild] = {}
         self._results: Dict[str, SpawnResult] = {}
         self._lock = asyncio.Lock()
+        # Optional async callback invoked with the child_name on EVERY
+        # termination path (report_result finalize, explicit terminate, TTL
+        # expiry, parent shutdown), since all funnel through
+        # ``_terminate_and_cleanup``. SpawnFeature registers it to release a
+        # child's delegated budget wallet back to the parent (#F278).
+        self._on_terminate: Optional[Any] = None
 
     def create_ephemeral_dir(self) -> str:
         """Create a temporary directory for an ephemeral child agent.
@@ -367,6 +373,18 @@ class SpawnedAgentLifecycle:
         tracked = self._tracked.get(child_name)
         if tracked is None:
             return
+
+        # Release the child's delegated budget wallet (#F278) BEFORE the agent
+        # is torn down, crediting any unspent hold back to the parent. Runs on
+        # every termination path (this is the single funnel). Best-effort:
+        # a release failure must not block termination/cleanup.
+        if self._on_terminate is not None:
+            try:
+                await self._on_terminate(child_name)
+            except Exception as e:  # noqa: BLE001 - never block cleanup
+                logger.error(
+                    "on_terminate callback failed for '%s': %s", child_name, e,
+                )
 
         # Terminate via AgentManager (handles cascading grandchildren)
         try:
