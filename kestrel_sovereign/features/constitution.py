@@ -198,6 +198,7 @@ class ConstitutionFeature(Feature):
             specific_not_found_prefixes = (
                 "Book '", "No book",
                 "Amendment '", "No amendment",
+                "Article '",
                 "Section '",
             )
             empty_search_prefix = "No constitutional sections found"
@@ -216,8 +217,10 @@ class ConstitutionFeature(Feature):
             elif article_lower == "amendment" and search:
                 return _wrap(self._get_amendment(search), kind="amendment")
             elif article_lower == "article" and search:
-                article = search
-                search = None
+                # Resolve the article DIRECTLY — do not fall into the generic
+                # book→amendment→article cascade below, where an amendment of
+                # the same id (e.g. Amendment V) shadows the requested Article V.
+                return _wrap(self._get_article(search), kind="article")
             elif article_lower == "search" and search:
                 article = None
 
@@ -287,3 +290,12 @@ class ConstitutionFeature(Feature):
         if content:
             return content
         return f"Amendment '{identifier}' not found."
+
+    def _get_article(self, identifier: str) -> str:
+        """Look up an article by number or roman numeral."""
+        content = self.articles.get(str(identifier))
+        if not content:
+            content = self.articles.get(f"Article {identifier}")
+        if content:
+            return content
+        return f"Article '{identifier}' not found."
