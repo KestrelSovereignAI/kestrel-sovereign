@@ -53,14 +53,14 @@ class TestPersonalityAnalyzer:
         # Mock responses that indicate formal, structured style. F188:
         # the analyzer now reads history through AsyncConversationStore, so
         # rows carry the get_full_history_with_ids shape
-        # (id, role, content, metadata, created_at, deleted_at).
+        # (id, role, content, metadata, created_at, deleted_at, archived_at).
         mock_texts = [
             "I will analyze this problem carefully. The solution involves:\n\n1. First step\n2. Second step\n\nPlease let me know if you need clarification.",
             "Furthermore, I would like to add that the implementation requires careful consideration of all factors.",
             "Here is the code solution:\n\n```python\ndef example():\n    pass\n```\n\nThis should work for your use case.",
         ] * 10  # Repeat to get 30 samples
         rows = [
-            (i + 1, "assistant", text, None, "2025-01-01T00:00:00Z", None)
+            (i + 1, "assistant", text, None, "2025-01-01T00:00:00Z", None, None)
             for i, text in enumerate(mock_texts)
         ]
         # Both _get_responses and _get_calibration_examples read the same

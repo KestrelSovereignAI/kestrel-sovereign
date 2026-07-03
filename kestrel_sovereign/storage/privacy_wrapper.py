@@ -750,7 +750,7 @@ class PrivacyEnforcingStorage:
     # Use these instead of accessing .db, .conversation, or .files directly.
 
     async def query_conversations(
-        self, agent_id: str, limit: int = 50
+        self, agent_id: str, limit: int = 50, view: str = "active"
     ) -> List[Tuple]:
         """
         Query conversation history rows respecting privacy mode.
@@ -759,16 +759,27 @@ class PrivacyEnforcingStorage:
         In ISOLATED mode, returns session-local conversations as tuple rows.
         In other modes, queries the persistent database.
 
+        Args:
+            view: ``active`` (default) returns live, non-archived rows;
+                ``archived`` returns live rows with ``archived_at`` set
+                (#2149). Any other value falls back to ``active``.
+
         Returns rows as tuples:
         (id, role, content, metadata, created_at, model, provider)
         """
         bounded_limit = max(1, min(int(limit), 1000))
+        if view not in ("active", "archived"):
+            view = "active"
 
         if self._privacy_config.is_ephemeral():
             logger.debug("query_conversations blocked: ephemeral mode returns no data")
             return []
 
         if self._policy.use_session_storage:
+            # In-memory session storage has no archive concept: the archived
+            # view is always empty, the active view returns the buffer.
+            if view == "archived":
+                return []
             # Return session conversations formatted as tuple rows. Surface the
             # resolved session_id in the metadata (real id, else the sentinel)
             # so the /api/conversations grouping labels each session with an id
@@ -792,10 +803,15 @@ class PrivacyEnforcingStorage:
                 ))
             return rows
 
-        return await self._storage.db.fetchall("""
+        if view == "archived":
+            archive_clause = "archived_at IS NOT NULL"
+        else:
+            archive_clause = "archived_at IS NULL"
+
+        return await self._storage.db.fetchall(f"""
             SELECT id, role, content, metadata, created_at, model, provider
             FROM conversation_history
-            WHERE agent_id = ? AND deleted_at IS NULL
+            WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause}
             ORDER BY created_at DESC
             LIMIT ?
         """, (agent_id, bounded_limit))
@@ -1120,6 +1136,43 @@ class PrivacyEnforcingStorage:
 
         await self._check_write_permission("restore_conversation_session")
         return await self._storage.restore_conversation_session(session_id)
+
+    async def archive_conversation_session(
+        self, session_id: str, agent_id: str
+    ) -> int:
+        """Stamp archived_at on every live message in a session (#2149).
+
+        EPHEMERAL raises (no persistent data). ISOLATED returns 0 (the
+        in-memory list has no archive distinction). Otherwise delegates to
+        the conversation store.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot archive conversations in ephemeral mode (no persistent data)."
+            )
+        if self._policy.use_session_storage:
+            return 0
+
+        await self._check_write_permission("archive_conversation_session")
+        return await self._storage.archive_conversation_session(session_id)
+
+    async def unarchive_conversation_session(
+        self, session_id: str, agent_id: str
+    ) -> int:
+        """Clear archived_at on every archived message in a session (#2149).
+
+        EPHEMERAL raises (no persistent data). ISOLATED returns 0. Otherwise
+        delegates to the conversation store.
+        """
+        if self._privacy_config.is_ephemeral():
+            raise PrivacyViolationError(
+                "Cannot unarchive conversations in ephemeral mode (no persistent data)."
+            )
+        if self._policy.use_session_storage:
+            return 0
+
+        await self._check_write_permission("unarchive_conversation_session")
+        return await self._storage.unarchive_conversation_session(session_id)
 
     async def purge_conversation_message(
         self, message_id: int, agent_id: str, reason: str = "user-initiated"
@@ -1479,6 +1532,36 @@ class PrivacyEnforcingStorage:
             if (m.get("metadata") or {}).get("type") != "session_marker"
         ]
         history.sort(key=lambda m: m.get("deleted_at") or "", reverse=True)
+        return history[:limit]
+
+    async def list_archived_conversations(
+        self, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """List archived messages for the Archive UI (#2149).
+
+        Mirror image of ``list_trashed_conversations``: returns rows where
+        ``archived_at IS NOT NULL`` (and not soft-deleted) for this agent,
+        sorted most-recently-archived first. EPHEMERAL and ISOLATED modes
+        return an empty list — neither has a persistent archive store.
+
+        Structural ``session_marker`` rows are excluded, matching the Trash
+        listing — the marker is not a displayable message.
+        """
+        if self._privacy_config.is_ephemeral():
+            return []
+        if self._policy.use_session_storage:
+            return []
+
+        history = await self._storage.conversation.get_full_history_with_ids(
+            include_excluded=True,
+            include_stashed=True,
+            only_archived=True,
+        )
+        history = [
+            m for m in history
+            if (m.get("metadata") or {}).get("type") != "session_marker"
+        ]
+        history.sort(key=lambda m: m.get("archived_at") or "", reverse=True)
         return history[:limit]
 
     async def set_conversation_name(

@@ -64,9 +64,16 @@ async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
 
 
 @router.get("/conversations")
-async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=500), decrypt: bool = True):
-    """List conversation sessions grouped by date/time."""
+async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=500), decrypt: bool = True, view: str = Query("active")):
+    """List conversation sessions grouped by date/time.
+
+    ``view=active`` (default) lists live, non-archived sessions;
+    ``view=archived`` lists archived sessions (#2149). Any other value
+    falls back to ``active``.
+    """
     try:
+        if view not in ("active", "archived"):
+            view = "active"
         agent = get_agent(request)
         storage = agent.storage
 
@@ -82,7 +89,7 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
         row_limit = min(limit * SESSION_GAP_OVERSAMPLE, MAX_CONVERSATION_LIST_ROWS)
 
         # Use privacy-aware query method instead of direct storage.db access.
-        rows = await storage.query_conversations(agent_id, limit=row_limit)
+        rows = await storage.query_conversations(agent_id, limit=row_limit, view=view)
 
         if not rows:
             return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
@@ -519,6 +526,91 @@ async def restore_conversation(request: Request, session_id: str):
         )
         raise HTTPException(
             status_code=500, detail="Error restoring conversation."
+        )
+
+
+@router.post("/conversations/{session_id}/archive")
+@limiter.limit("30/minute")
+async def archive_conversation(request: Request, session_id: str):
+    """Archive a conversation (#2149).
+
+    Stamps ``archived_at`` on every live message that belongs to the
+    session, moving it out of the active list into the archived view.
+    Non-destructive — rows stay intact and reversible via ``/unarchive``.
+
+    Returns:
+        200 with {"success": true, "session_id": ..., "archived_count": N}
+        404 when the session has no live rows to archive.
+    """
+    try:
+        agent = get_agent(request)
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '')
+
+        archived = await storage.archive_conversation_session(
+            session_id, agent_id
+        )
+        if archived == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No messages found to archive for this session.",
+            )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "archived_count": archived,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error archiving conversation {session_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error archiving conversation."
+        )
+
+
+@router.post("/conversations/{session_id}/unarchive")
+@limiter.limit("30/minute")
+async def unarchive_conversation(request: Request, session_id: str):
+    """Unarchive a conversation (#2149).
+
+    Clears ``archived_at`` on every archived message belonging to the
+    session, making it visible in the active list again.
+
+    Returns:
+        200 with {"success": true, "session_id": ..., "unarchived_count": N}
+        404 when the session has no archived rows to unarchive.
+    """
+    try:
+        agent = get_agent(request)
+        storage = agent.storage
+        agent_id = getattr(storage, 'agent_id', '')
+
+        unarchived = await storage.unarchive_conversation_session(
+            session_id, agent_id
+        )
+        if unarchived == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No archived messages found for this session.",
+            )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "unarchived_count": unarchived,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error unarchiving conversation {session_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error unarchiving conversation."
         )
 
 

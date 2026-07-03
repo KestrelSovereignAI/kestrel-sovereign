@@ -8,6 +8,10 @@ import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
+// #2149: the sidebar renders rows through the shared conversation-list
+// component so its row markup, kebab menu, and inline rename are the SAME as
+// the history slideout and any embedded mount — zero duplicated list logic.
+import { buildConversationRow, beginInlineRename } from './conversations.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
@@ -1074,70 +1078,49 @@ export async function loadConversations(_agentName) {
 
         container.innerHTML = '';
         for (const conv of conversations) {
-            const date = new Date(conv.started_at);
-            const timeStr = date.toLocaleString();
-
-            const item = document.createElement('div');
-            item.className = `conversation-item ${activeConversationId === conv.session_id ? 'active' : ''}`;
-            item.dataset.sessionId = conv.session_id;
-            item.dataset.agentKey = requestAgentKey;
-            item.addEventListener('click', () => {
-                if (item.dataset.agentKey !== conversationAgentKey(API.getHostAgent())) {
-                    return;
-                }
-                window.loadConversation(conv.session_id, { expectedAgent: requestAgent });
+            // Build the row through the shared component so the kebab menu,
+            // inline rename, and markup match every other conversation surface
+            // (#2149). The sidebar keeps its own agent-pinning: the row carries
+            // ``data-agent-key`` and the click is gated so a stale row can't
+            // dispatch under a switched host (#1358 — enforced by the
+            // conversation_agent_switch test). Menu actions route through the
+            // pane-aware window.* handlers below, which own the chat-state
+            // coordination (fresh-session on delete, etc.).
+            const item = buildConversationRow(conv, {
+                api: API,
+                active: activeConversationId === conv.session_id,
+                agentKey: requestAgentKey,
+                onSelect: (c, rowEl) => {
+                    if (rowEl.dataset.agentKey !== conversationAgentKey(API.getHostAgent())) {
+                        return;
+                    }
+                    window.loadConversation(c.session_id, { expectedAgent: requestAgent });
+                },
+                buildMenuItems: (c, rowEl) => [
+                    {
+                        label: 'Rename', labelKey: 'conv_menu_rename', action: 'rename',
+                        onSelect: () => {
+                            const previewEl = rowEl.querySelector
+                                ? rowEl.querySelector('.conversation-preview')
+                                : null;
+                            if (previewEl) beginInlineRename(previewEl, c, { api: API });
+                        },
+                    },
+                    {
+                        label: 'Archive', labelKey: 'conv_menu_archive', action: 'archive',
+                        onSelect: () => window.archiveConversation(c.session_id, rowEl),
+                    },
+                    {
+                        label: 'Move to Trash', labelKey: 'conv_menu_trash', action: 'trash',
+                        onSelect: () => window.deleteConversation(c.session_id, rowEl),
+                    },
+                    {
+                        label: 'Delete Permanently', labelKey: 'conv_menu_delete_permanent',
+                        action: 'purge', danger: true, separatorBefore: true,
+                        onSelect: () => window.purgeConversation(c.session_id, rowEl),
+                    },
+                ],
             });
-
-            // Display name: user-assigned name wins over the computed
-            // preview (issue #716).  Fallback chain keeps the sidebar
-            // readable for conversations that were never renamed and for
-            // ones renamed then cleared.
-            const preview = document.createElement('div');
-            preview.className = 'conversation-preview';
-            const displayName = conv.name || conv.preview || 'New conversation';
-            preview.textContent = displayName;
-            preview.title = 'Double-click to rename';
-            // Double-click begins an inline rename (issue #716).  Click
-            // alone still loads the conversation; dblclick is a clear
-            // discoverability affordance matching tooltip text.
-            preview.addEventListener('dblclick', (e) => {
-                e.stopPropagation();
-                beginRenameConversation(preview, conv);
-            });
-
-            const time = document.createElement('div');
-            time.className = 'conversation-time';
-            time.textContent = timeStr;
-
-            // Hover-reveal soft-delete control for the whole session
-            // (issue #715, now soft per #763 — moves to Trash, recoverable).
-            const deleteBtn = document.createElement('button');
-            deleteBtn.className = 'conv-delete-btn';
-            deleteBtn.title = 'Move to trash';
-            deleteBtn.textContent = '✕';
-            deleteBtn.addEventListener('click', (e) => {
-                // Prevent the click from bubbling to the row (which would
-                // load the conversation we're trying to delete).
-                e.stopPropagation();
-                window.deleteConversation(conv.session_id, item);
-            });
-
-            // Second hover-reveal button: permanent delete (#765). Sits to
-            // the left of the soft-delete ✕ so the user has to slow down to
-            // hit it intentionally. Same hover-reveal lifecycle.
-            const purgeBtn = document.createElement('button');
-            purgeBtn.className = 'conv-purge-btn';
-            purgeBtn.title = 'Delete permanently (cannot be restored)';
-            purgeBtn.textContent = '⊘';
-            purgeBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                window.purgeConversation(conv.session_id, item);
-            });
-
-            item.appendChild(preview);
-            item.appendChild(time);
-            item.appendChild(deleteBtn);
-            item.appendChild(purgeBtn);
             container.appendChild(item);
         }
 
@@ -1200,79 +1183,47 @@ export async function loadConversations(_agentName) {
 }
 
 
-function beginRenameConversation(previewEl, conv) {
-    // Swap the preview text for an inline input seeded with the current
-    // display name.  Commit on Enter / blur; cancel on Escape.  All
-    // state is captured in this closure — no module-level globals.
-    // Issue #716.
-    const originalText = previewEl.textContent;
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'conversation-rename-input';
-    input.value = conv.name || '';
-    input.placeholder = originalText || 'Conversation name';
-    input.maxLength = 120;
-    // The input lives inside a row that has a click → loadConversation
-    // listener.  Don't let keystrokes / clicks bubble and fire it while
-    // the user is typing.
-    input.addEventListener('click', (e) => e.stopPropagation());
-
-    let finalized = false;
-
-    async function commit() {
-        if (finalized) return;
-        finalized = true;
-        const newName = input.value;
-        const storedName = conv.name || '';
-        // No-op commit: typed exactly what's already stored.  Skip the
-        // network round-trip and just restore the preview.
-        if (newName.trim() === storedName.trim()) {
-            previewEl.textContent = originalText;
-            return;
+// #2149: archive/unarchive a whole session. Archive is a first-class
+// tidy-away state distinct from Trash: an archived conversation is hidden
+// from the default (active) list but is NOT staged for deletion. These are
+// the pane-aware sidebar handlers; the shared component's kebab menu routes
+// here so the chat-state coordination (below) is single-sourced.
+window.archiveConversation = async function(sessionId, rowEl) {
+    try {
+        const result = await API.archiveConversation(sessionId);
+        const count = result?.archived_count;
+        if (rowEl) {
+            rowEl.style.transition = 'opacity 0.2s, transform 0.2s';
+            rowEl.style.opacity = '0';
+            rowEl.style.transform = 'scale(0.97)';
+            setTimeout(() => rowEl.remove(), 200);
         }
-        try {
-            const result = await API.renameConversation(conv.session_id, newName);
-            const applied = result?.name;
-            conv.name = applied || null;
-            previewEl.textContent = applied || conv.preview || 'New conversation';
-            Toast.info(
-                applied
-                    ? 'Conversation renamed'
-                    : 'Conversation name cleared',
-            );
-        } catch (e) {
-            previewEl.textContent = originalText;
-            Toast.error(`Rename failed: ${e.message}`);
-        }
+        Toast.info(
+            typeof count === 'number'
+                ? `Conversation archived (${count} messages)`
+                : 'Conversation archived',
+        );
+    } catch (e) {
+        Toast.error(`Failed to archive conversation: ${e.message}`);
     }
+};
 
-    function cancel() {
-        if (finalized) return;
-        finalized = true;
-        previewEl.textContent = originalText;
-    }
-
-    input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            input.blur();  // blur handler commits
-        } else if (e.key === 'Escape') {
-            e.preventDefault();
-            cancel();
-            // Rebuild preview text; removing the input is implicit
-            // because cancel already overwrote previewEl.textContent.
-            previewEl.textContent = originalText;
+window.unarchiveConversation = async function(sessionId, rowEl) {
+    try {
+        await API.unarchiveConversation(sessionId);
+        if (rowEl) {
+            rowEl.style.transition = 'opacity 0.2s';
+            rowEl.style.opacity = '0';
+            setTimeout(() => rowEl.remove(), 200);
         }
-    });
-    input.addEventListener('blur', () => {
-        if (!finalized) commit();
-    });
-
-    previewEl.textContent = '';
-    previewEl.appendChild(input);
-    input.focus();
-    input.select();
-}
+        Toast.success('Conversation unarchived');
+        if (typeof loadConversations === 'function') {
+            try { await loadConversations(selectedAgentName); } catch (_) { /* noop */ }
+        }
+    } catch (e) {
+        Toast.error(`Failed to unarchive conversation: ${e.message}`);
+    }
+};
 
 
 // #2081: render an assistant turn that emitted typed component parts (#1914)

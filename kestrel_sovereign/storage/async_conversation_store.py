@@ -1907,6 +1907,77 @@ class AsyncConversationStore:
         )
         return _rows_affected(affected)
 
+    async def archive_conversation_session(self, session_id: str) -> int:
+        """Archive every live message in the given session (#2149).
+
+        Mirror image of ``delete_conversation_session`` but stamps
+        ``archived_at`` instead of ``deleted_at``. Resolves the session's
+        LIVE messages (deleted_filter='live') and stamps them, leaving the
+        rows fully intact and un-trashed — archiving simply moves a session
+        out of the active list into the archived view. Use
+        ``unarchive_conversation_session`` to reverse.
+
+        Returns:
+            Number of live messages stamped. Returns 0 if the session
+            doesn't exist, isn't owned by this agent, or is already
+            archived / soft-deleted.
+        """
+        # include_markers=True so archiving a session also stamps its
+        # new_session marker, keeping the marker in lock-step with content
+        # (mirrors the delete path, #2027).
+        rows = await self._get_session_messages(
+            session_id, limit=10_000, deleted_filter="live", include_markers=True
+        )
+        if not rows:
+            return 0
+
+        ids = [row[0] for row in rows]
+        if not ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ids)
+        params = [*ids, self.agent_id]
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history "
+            f"SET archived_at = {self._now_sql()} "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND deleted_at IS NULL AND archived_at IS NULL",
+            tuple(params),
+        )
+        return _rows_affected(affected)
+
+    async def unarchive_conversation_session(self, session_id: str) -> int:
+        """Clear archived_at on every archived message in a session (#2149).
+
+        Mirror image of ``restore_conversation_session``. Resolves the
+        session's live messages (archived rows are still live — they were
+        never soft-deleted) and clears ``archived_at`` so the session
+        reappears in the active list.
+
+        Returns:
+            Number of rows unarchived. Zero if the session has no archived
+            rows or doesn't exist.
+        """
+        rows = await self._get_session_messages(
+            session_id, limit=10_000, deleted_filter="live", include_markers=True
+        )
+        if not rows:
+            return 0
+
+        ids = [row[0] for row in rows]
+        if not ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ids)
+        params = [*ids, self.agent_id]
+        affected = await self.db.execute_commit(
+            f"UPDATE conversation_history SET archived_at = NULL "
+            f"WHERE id IN ({placeholders}) AND agent_id = ? "
+            f"AND archived_at IS NOT NULL",
+            tuple(params),
+        )
+        return _rows_affected(affected)
+
     # ------------------------------------------------------------------
     # Restore primitives (#763 / #765)
     # ------------------------------------------------------------------
@@ -2375,6 +2446,7 @@ class AsyncConversationStore:
         include_stashed: bool = False,
         include_deleted: bool = False,
         only_deleted: bool = False,
+        only_archived: bool = False,
     ) -> List[Dict[str, Any]]:
         """Get complete conversation history with message IDs.
 
@@ -2385,12 +2457,17 @@ class AsyncConversationStore:
                 live rows. Default False — Trash stays hidden.
             only_deleted: If True, return ONLY soft-deleted rows. Used by
                 the Trash UI (#765). Implies ``include_deleted``.
+            only_archived: If True, return ONLY archived rows that are not
+                soft-deleted. Used by the Archive UI (#2149).
 
         Returns:
             List of message dicts with 'id', 'role', 'content', 'metadata',
-            'created_at', and 'deleted_at' (None for live rows).
+            'created_at', 'deleted_at' (None for live rows), and
+            'archived_at' (None for non-archived rows).
         """
-        if only_deleted:
+        if only_archived:
+            del_clause = " AND archived_at IS NOT NULL AND deleted_at IS NULL"
+        elif only_deleted:
             del_clause = " AND deleted_at IS NOT NULL"
         elif include_deleted:
             del_clause = ""
@@ -2398,7 +2475,7 @@ class AsyncConversationStore:
             del_clause = " AND deleted_at IS NULL"
 
         rows = await self.db.fetchall(
-            f"SELECT id, role, content, metadata, created_at, deleted_at "
+            f"SELECT id, role, content, metadata, created_at, deleted_at, archived_at "
             f"FROM conversation_history "
             f"WHERE agent_id = ?{del_clause} ORDER BY id ASC",
             (self.agent_id,)
@@ -2435,6 +2512,7 @@ class AsyncConversationStore:
                 'metadata': cleaned_meta if cleaned_meta else {},
                 'created_at': row[4],
                 'deleted_at': row[5],
+                'archived_at': row[6],
             }
             history.append(entry)
         return history

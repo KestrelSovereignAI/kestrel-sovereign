@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     provider TEXT DEFAULT NULL,
     metadata TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP DEFAULT NULL
+    deleted_at TIMESTAMP DEFAULT NULL,
+    archived_at TIMESTAMP DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_id ON conversation_history(agent_id);
@@ -705,6 +706,13 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "conversation_history", "deleted_at", "TIMESTAMP DEFAULT NULL"
         )
+        # Archive state (#2149): add archived_at to conversation_history,
+        # mirroring the soft-delete deleted_at column. Idempotent — no-op on
+        # fresh databases (column already in CREATE TABLE). The dependent
+        # index is created below only after verifying the column is present.
+        await self._migrate_add_column(
+            "conversation_history", "archived_at", "TIMESTAMP DEFAULT NULL"
+        )
         # Canonical/transport split (#1402): add rendered_content to hold the
         # byte-stable replay form (memories + RAG baked in) separately from
         # the canonical raw user turn in `content`. Legacy rows have a NULL
@@ -769,6 +777,17 @@ class AsyncDatabase:
         else:
             logger.error(
                 "Skipping idx_conversation_deleted_at: column missing after "
+                "migration. This indicates a migration failure — see "
+                "preceding logs."
+            )
+        if await self._column_exists("conversation_history", "archived_at"):
+            await self._backend.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversation_archived_at "
+                "ON conversation_history(agent_id, archived_at)"
+            )
+        else:
+            logger.error(
+                "Skipping idx_conversation_archived_at: column missing after "
                 "migration. This indicates a migration failure — see "
                 "preceding logs."
             )

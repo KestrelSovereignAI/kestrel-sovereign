@@ -660,9 +660,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `DELETE /api/conversations/{session_id}`
   - `GET /api/conversations/{session_id}`
   - `PATCH /api/conversations/{session_id}`
+  - `POST /api/conversations/{session_id}/archive`
   - `POST /api/conversations/{session_id}/purge`
   - `POST /api/conversations/{session_id}/restore`
   - `GET /api/conversations/{session_id}/transcript`
+  - `POST /api/conversations/{session_id}/unarchive`
   - `GET /api/sessions`
   - `GET /api/trash`
 - [`kestrel_sovereign/endpoints/database.py`](kestrel_sovereign/endpoints/database.py)

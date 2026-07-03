@@ -1,10 +1,17 @@
 /**
  * Kestrel Sovereign Console - History Module
  * Chat History Browser
+ *
+ * #2149: the conversation-LIST render + rename that used to live here has been
+ * consolidated into the shared ``conversations.js`` component. This module now
+ * mounts that component into the history slideout (`#history-container`) and
+ * keeps only the message-level chat rendering (loading a conversation's
+ * messages into the chat pane, restart-status repaint, typed-part interleave).
  */
 
 import API from './api.js';
 import { state, Toast, escapeHtml } from './ui.js';
+import { mountConversations } from './conversations.js';
 import {
     updateContextStatus,
     wipeAgentChatPane,
@@ -32,12 +39,6 @@ const LEGACY_TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S
 // complete" would be mistaken for tool markers.
 const LEGACY_TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
 
-// Parse a pre-cutover assistant message's inline emoji markers into
-// { clean, events }: the prose with ONLY the markers removed, and the tool
-// events with their positions into that prose. Nothing else is mutated, so
-// the positions stay exact — the shared renderer (buildToolSegmentsByPos)
-// already strips the `---` wire delimiter and leading blanks PER SEGMENT, so
-// doing it here too would shift every later card's position (codex review).
 // Parse a stored timestamp into an epoch-ms sort key for interleaving the
 // conversation timeline (#1816). DB timestamps are UTC, but conversation rows
 // serialize naive (no tz suffix) while restart_status_events carry an explicit
@@ -95,242 +96,39 @@ function legacyToolEventsFromText(content) {
 }
 
 // ============================================================================
-// Chat History Browser
+// Chat History Browser — mounts the shared conversation-list component (#2149)
 // ============================================================================
 
 state.conversations = null;
 state.currentSessionId = null;
 state.historyVisible = false;
 
+// The single mounted instance of the shared conversation-list component in the
+// history slideout. Created lazily on first show, refreshed thereafter.
+let historyMount = null;
+
+function refreshHistoryList() {
+    if (historyMount) historyMount.refresh();
+}
+
 export async function loadConversationHistory() {
-    try {
-        const data = await API.getConversations(state.showDecrypted);
-        state.conversations = data.conversations;
-        renderConversationHistory(data);
-    } catch (e) {
-        const container = document.getElementById('history-container');
-        if (container) {
-            container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load history: ${e.message}</p>`;
-        }
-    }
-}
-
-function formatDateLabel(dateStr) {
-    const date = new Date(dateStr);
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-
-    if (date.toDateString() === today.toDateString()) {
-        return 'Today';
-    } else if (date.toDateString() === yesterday.toDateString()) {
-        return 'Yesterday';
-    } else {
-        return dateStr;
-    }
-}
-
-function renderConversationHistory(data) {
     const container = document.getElementById('history-container');
     if (!container) return;
-
-    if (data.encrypted_at_rest !== undefined) {
-        state.encryptedAtRest = data.encrypted_at_rest;
-    }
-
-    if (!data.conversations || data.conversations.length === 0) {
-        container.innerHTML = `
-            <p style="color: var(--text-secondary); text-align: center; padding: 2rem;">
-                No conversation history found. Start chatting to create some!
-            </p>
-        `;
-        return;
-    }
-
-    const groupedByDate = {};
-    data.conversations.forEach(conv => {
-        const date = new Date(conv.started_at);
-        const dateKey = date.toLocaleDateString();
-        if (!groupedByDate[dateKey]) {
-            groupedByDate[dateKey] = [];
-        }
-        groupedByDate[dateKey].push(conv);
-    });
-
-    container.innerHTML = `
-        ${state.encryptedAtRest ? `
-        <button id="encryption-toggle" onclick="toggleEncryptionView()" style="
-            width: 100%;
-            padding: 0.5rem 0.75rem;
-            margin-bottom: 1rem;
-            background: ${state.showDecrypted ? 'var(--bg-tertiary)' : '#22c55e'};
-            color: ${state.showDecrypted ? 'var(--text-secondary)' : 'white'};
-            border: 1px solid ${state.showDecrypted ? 'var(--border-color)' : '#22c55e'};
-            border-radius: 8px;
-            font-size: 0.75rem;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-            transition: all 0.2s;
-        ">
-            ${state.showDecrypted ? '\u{1F513} Viewing Decrypted' : '\u{1F510} Viewing Encrypted'}
-            <span style="
-                font-size: 0.65rem;
-                opacity: 0.8;
-            ">(click to toggle)</span>
-        </button>
-        ` : ''}
-
-        <div style="
-            display: grid;
-            grid-template-columns: ${state.encryptedAtRest ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)'};
-            gap: 0.75rem;
-            margin-bottom: 1rem;
-        ">
-            <div style="
-                background: var(--bg-tertiary);
-                padding: 0.75rem;
-                border-radius: 8px;
-                text-align: center;
-            ">
-                <div style="font-size: 1.25rem; font-weight: 600;">${data.conversations.length}</div>
-                <div style="font-size: 0.7rem; color: var(--text-secondary);">Sessions</div>
-            </div>
-            <div style="
-                background: var(--bg-tertiary);
-                padding: 0.75rem;
-                border-radius: 8px;
-                text-align: center;
-            ">
-                <div style="font-size: 1.25rem; font-weight: 600;">${data.conversations.reduce((sum, c) => sum + c.message_count, 0)}</div>
-                <div style="font-size: 0.7rem; color: var(--text-secondary);">Messages</div>
-            </div>
-            ${state.encryptedAtRest ? `
-            <div style="
-                background: var(--bg-tertiary);
-                padding: 0.75rem;
-                border-radius: 8px;
-                text-align: center;
-            ">
-                <div style="font-size: 1.25rem;">\u{1F512}</div>
-                <div style="font-size: 0.7rem; color: var(--text-secondary);">Encrypted</div>
-            </div>
-            ` : ''}
-        </div>
-
-        <div id="history-list" style="display: flex; flex-direction: column; gap: 0.75rem; max-height: 450px; overflow-y: auto;">
-            ${Object.entries(groupedByDate).map(([dateKey, convs]) => `
-                <div class="date-group">
-                    <div style="
-                        font-size: 0.7rem;
-                        font-weight: 600;
-                        color: var(--text-tertiary);
-                        text-transform: uppercase;
-                        margin-bottom: 0.5rem;
-                        padding-left: 0.25rem;
-                    ">${formatDateLabel(dateKey)}</div>
-                    ${convs.map(conv => renderConversationItem(conv)).join('')}
-                </div>
-            `).join('')}
-        </div>
-    `;
-}
-
-function renderConversationItem(conv) {
-    const isActive = state.currentSessionId === conv.session_id;
-    const time = new Date(conv.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const preview = conv.preview || 'Empty conversation';
-    const displayName = (conv.name || '').trim();
-    const displayText = displayName || preview;
-    const isEncryptedPreview = conv.preview_encrypted;
-    const sessionIdJs = escapeHtml(JSON.stringify(conv.session_id));
-    const title = displayName
-        ? `${displayName} — ${conv.preview || 'Empty conversation'}`
-        : (conv.preview || '');
-    const editIcon = typeof kicon === 'function' ? kicon('pencil') : '✎';
-
-    const previewStyle = isEncryptedPreview
-        ? `font-family: 'Monaco', 'Menlo', 'Courier New', monospace; color: #22c55e;`
-        : '';
-    const borderColor = isEncryptedPreview && !isActive ? '#22c55e' : (isActive ? 'var(--accent-color)' : 'var(--border-color)');
-
-    return `
-        <div class="conversation-item ${isActive ? 'active' : ''}"
-             data-session-id="${escapeHtml(conv.session_id)}"
-             onclick="loadConversation(${sessionIdJs})"
-             style="
-                background: ${isActive ? 'var(--accent-color)' : (isEncryptedPreview ? 'linear-gradient(135deg, #1a1a2e, #16213e)' : 'var(--bg-secondary)')};
-                color: ${isActive ? 'white' : 'var(--text-primary)'};
-                border: 1px solid ${borderColor};
-                border-radius: 8px;
-                padding: 0.75rem;
-                cursor: pointer;
-                transition: all 0.2s;
-             "
-             onmouseover="if(!this.classList.contains('active')) this.style.borderColor='var(--accent-color)'"
-             onmouseout="if(!this.classList.contains('active')) this.style.borderColor='${borderColor}'">
-            <div class="conversation-meta-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.375rem;">
-                <span style="font-size: 0.75rem; opacity: ${isActive ? '0.9' : '0.7'};">
-                    ${isEncryptedPreview ? '\u{1F510} ' : ''}${time}
-                </span>
-                <span style="
-                    font-size: 0.65rem;
-                    background: ${isActive ? 'rgba(255,255,255,0.2)' : 'var(--bg-tertiary)'};
-                    padding: 0.125rem 0.5rem;
-                    border-radius: 10px;
-                ">${conv.message_count} msgs</span>
-                <button type="button"
-                    class="conv-rename-btn"
-                    title="Rename conversation"
-                    aria-label="Rename conversation"
-                    onclick="renameConversation(${sessionIdJs}, event)">
-                    ${editIcon}
-                </button>
-            </div>
-            <div class="conversation-preview" style="
-                font-size: 0.8rem;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                opacity: ${isActive ? '1' : '0.9'};
-                ${previewStyle}
-            " title="${escapeHtml(title)}">${escapeHtml(displayText)}</div>
-        </div>
-    `;
-}
-
-window.renameConversation = async function(sessionId, event) {
-    if (event) {
-        event.preventDefault();
-        event.stopPropagation();
-    }
-
-    const conv = (state.conversations || []).find(c => c.session_id === sessionId);
-    if (!conv) return;
-
-    const currentName = conv.name || '';
-    const nextName = prompt('Rename conversation', currentName);
-    if (nextName === null) return;
-
-    try {
-        const result = await API.renameConversation(sessionId, nextName);
-        const finalName = result.name || null;
-        if (finalName) {
-            conv.name = finalName;
-        } else {
-            delete conv.name;
-        }
-        renderConversationHistory({
-            conversations: state.conversations,
-            encrypted_at_rest: state.encryptedAtRest,
+    if (!historyMount) {
+        historyMount = mountConversations(container, {
+            // Selecting a row loads that conversation into the chat pane via the
+            // canonical loader (identity.js owns window.loadConversation).
+            onSelect: (conv) => {
+                if (typeof window.loadConversation === 'function') {
+                    window.loadConversation(conv.session_id);
+                }
+            },
+            getActiveSessionId: () => state.currentSessionId,
         });
-        Toast.success(finalName ? 'Conversation renamed' : 'Conversation name cleared');
-    } catch (e) {
-        Toast.error(`Failed to rename conversation: ${e.message}`);
+    } else {
+        historyMount.refresh();
     }
-};
+}
 
 window.loadConversation = async function(sessionId) {
     // Don't reload the conversation we're already viewing — preserves in-flight content
@@ -461,7 +259,7 @@ window.loadConversation = async function(sessionId) {
                         legacy.clean, { toolEvents: legacy.events },
                     );
                 } else if (toolEvents && toolEvents.length) {
-                    // Old metadata with neither pos nor inline markers \u2014 no
+                    // Old metadata with neither pos nor inline markers — no
                     // placement survives; render cards at the top rather than
                     // dropping them.
                     bodyHtml = renderAgentContentHtml(content, { toolEvents });
@@ -484,7 +282,7 @@ window.loadConversation = async function(sessionId) {
             );
         });
 
-        renderConversationHistory({ conversations: state.conversations, encrypted_at_rest: state.encryptedAtRest });
+        refreshHistoryList();
 
         if (viewport) {
             viewport.scrollTop = viewport.scrollHeight;
@@ -557,9 +355,7 @@ window.toggleHistorySidebar = function() {
     if (state.historyVisible) {
         sidebar.style.display = 'block';
         toggleBtn.innerHTML = '\u{1F4DC} Hide History';
-        if (!state.conversations) {
-            loadConversationHistory();
-        }
+        loadConversationHistory();
     } else {
         sidebar.style.display = 'none';
         toggleBtn.innerHTML = '\u{1F4DC} Show History';
@@ -770,7 +566,7 @@ function addMessageToChat(
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'msg-delete-btn';
         deleteBtn.title = 'Move to trash';
-        deleteBtn.textContent = '\u2715';
+        deleteBtn.textContent = '✕';
         deleteBtn.onclick = (e) => {
             e.stopPropagation();
             window.deleteMessage(messageId, messageDiv);
