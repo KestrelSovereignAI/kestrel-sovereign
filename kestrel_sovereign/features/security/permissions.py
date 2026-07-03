@@ -16,6 +16,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
 
+from kestrel_sovereign.audit_time import utc_now_iso
+
 logger = logging.getLogger(__name__)
 
 
@@ -273,6 +275,13 @@ class PermissionStore:
                 CREATE INDEX IF NOT EXISTS idx_security_audit_created
                 ON security_audit_log(created_at DESC)
             """)
+            # NOTE (F092): legacy rows written by the old CURRENT_TIMESTAMP
+            # default are deliberately NOT rewritten. AuditHasher hashes each
+            # row's RAW created_at, so mutating those bytes would make every
+            # pre-existing cryptographic anchor covering them fail verification.
+            # Correctness is instead achieved without mutation: new rows are
+            # written canonical (log_decision), and the audit_anchor reader
+            # normalizes timestamps for comparison while preserving raw bytes.
 
             # Sovereign-curated auto-approve allowlist (the "Approve-and-
             # remember" store). Operator-seeded rules live in kestrel.toml;
@@ -773,11 +782,16 @@ class PermissionStore:
             args_summary: Summary of tool arguments (truncated for privacy)
         """
         async with aiosqlite.connect(self.db_path) as db:
+            # Write an explicit canonical UTC ISO-8601 stamp rather than relying
+            # on the column's CURRENT_TIMESTAMP default (which is space-separated,
+            # offset-less, and sorts incorrectly against the ISO timestamps other
+            # audit sources emit — F092).
             await db.execute("""
                 INSERT INTO security_audit_log
-                (feature_name, tool_name, action, decision, user_choice, args_summary)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (feature_name, tool_name, action, decision, user_choice, args_summary))
+                (feature_name, tool_name, action, decision, user_choice, args_summary, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (feature_name, tool_name, action, decision, user_choice,
+                  args_summary, utc_now_iso()))
             await db.commit()
 
     async def get_audit_log(self, limit: int = 50) -> List[Dict]:
@@ -792,11 +806,15 @@ class PermissionStore:
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+            # Order by the autoincrement id (insertion order ≈ chronological)
+            # rather than created_at: legacy rows may carry a space-separated
+            # timestamp that sorts incorrectly against ISO rows (F092), and id
+            # ordering is format-agnostic and stable.
             cursor = await db.execute("""
                 SELECT feature_name, tool_name, action, decision,
                        user_choice, args_summary, created_at
                 FROM security_audit_log
-                ORDER BY created_at DESC
+                ORDER BY id DESC
                 LIMIT ?
             """, (limit,))
             rows = await cursor.fetchall()
