@@ -229,9 +229,11 @@ def _isolated_runtime():
 
 
 @pytest.mark.asyncio
-async def test_route_link_qr_persists_png_and_emits_sse(tmp_path):
-    """A channel.link_qr event is written to the agent data dir as a PNG and an
-    SSE channel_link_qr event is emitted pointing at the serving endpoint."""
+async def test_route_link_qr_persists_png_only(tmp_path):
+    """A channel.link_qr event is written to the agent data dir as the latest
+    PNG (served by the endpoint the persisted channel_link card fetches). It is
+    NO LONGER pushed as a live SSE bubble / sticky event (#2081) — that path
+    orphaned on refresh."""
     import base64
 
     agent = Mock()
@@ -259,20 +261,35 @@ async def test_route_link_qr_persists_png_and_emits_sse(tmp_path):
     assert out.exists()
     assert out.read_bytes() == png
 
-    assert len(emitted) == 1
-    event_type, data = emitted[0]
-    assert event_type == "channel_link_qr"
-    assert data["channel_type"] == "whatsapp"
-    assert data["path"] == "/api/agent/channels/whatsapp/link-qr.png"
-    assert data["caption"] == "Scan me"
-    assert isinstance(data["ts"], int) and data["ts"] > 0
+    # No SSE emit and no sticky replay — the card is a persisted typed part now.
+    assert emitted == []
+    agent.set_sticky_event.assert_not_called()
 
-    # Also recorded as sticky current-state so every new SSE client (not just
-    # the one connected now) replays it.
-    agent.set_sticky_event.assert_called_once()
-    sticky_args = agent.set_sticky_event.call_args.args
-    assert sticky_args[0] == "channel_link_qr:whatsapp"
-    assert sticky_args[1] == "channel_link_qr"
+
+@pytest.mark.asyncio
+async def test_route_link_cleared_removes_png(tmp_path):
+    """Linking clears the persisted PNG so the channel_link card resolves to
+    'expired or already linked'. No sticky/SSE state to retract (#2081)."""
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    emitted = []
+
+    async def emit_event(event_type, data):
+        emitted.append((event_type, data))
+
+    agent.emit_event = emit_event
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+
+    art = tmp_path / "agent" / "channel_link_artifacts"
+    art.mkdir(parents=True)
+    (art / "whatsapp_link_qr.png").write_bytes(b"\x89PNG\r\n\x1a\nqr")
+
+    await feature._route_link_cleared({"channel_type": "whatsapp"})
+
+    assert not (art / "whatsapp_link_qr.png").exists()
+    assert emitted == []
+    agent.clear_sticky_event.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -298,6 +315,52 @@ async def test_route_link_qr_rejects_malformed_payloads(tmp_path):
 
     assert emitted == []
     assert not (tmp_path / "agent" / "channel_link_artifacts").exists()
+
+
+@pytest.mark.asyncio
+async def test_channel_link_tool_emits_persisted_part(monkeypatch, tmp_path):
+    """When the bridged channel's pairing tool runs on the streaming turn, the
+    host emits a persisted ``channel_link`` typed part (a reference, not the QR
+    bytes) so the pairing card rides the conversation that asked for it (#2081)."""
+    from kestrel_sovereign.agent import parts as parts_mod
+
+    channel_feature = FakeChannelFeature()
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {"ChannelFeature": channel_feature}
+
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
+
+    class ChannelClient(FakeIsolatedClient):
+        capabilities = {
+            "channel": {"channel_type": "whatsapp", "send_tool": "whatsapp_send"}
+        }
+
+        async def list_tools(self):
+            return [
+                {"name": "whatsapp_link", "description": "Link WhatsApp", "category": "utility"},
+                {"name": "whatsapp_send", "description": "Send", "category": "utility"},
+            ]
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=ChannelClient)
+    await feature.initialize()
+
+    # Convention fallback: <channel_type>_link is the pairing tool.
+    assert feature._link_tool == "whatsapp_link"
+
+    # The pairing tool, run inside a streaming turn's part collector, emits the
+    # persisted channel_link part.
+    with parts_mod.part_collector():
+        await feature.call_isolated_tool("whatsapp_link", {})
+        drained = parts_mod.drain_parts()
+    assert drained == [{"type": "channel_link", "data": {"channel_type": "whatsapp"}}]
+
+    # A non-link tool (e.g. send) emits nothing.
+    with parts_mod.part_collector():
+        await feature.call_isolated_tool("whatsapp_send", {"to": "x", "message": "y"})
+        assert parts_mod.drain_parts() == []
+
+    await feature.shutdown()
 
 
 @pytest.mark.asyncio

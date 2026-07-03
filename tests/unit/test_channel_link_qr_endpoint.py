@@ -1,9 +1,10 @@
 """``GET /api/agent/channels/{channel_type}/link-qr.png`` — serves the pairing
 QR PNG that an isolated channel feature (e.g. WhatsApp) pushed to the host.
 
-The chat renders this over http (``handleChannelLinkQr`` in chat.js) because the
-in-chat sanitizer strips ``data:`` image URIs. These tests drive the handler
-against a stub agent whose ``storage_path`` points at a temp data dir.
+The chat's persisted ``channel_link`` card (#2081, ``channelLinkPartRenderer`` in
+chat.js) fetches this over http because the in-chat sanitizer strips ``data:``
+image URIs. These tests drive the handler against a stub agent whose
+``storage_path`` points at a temp data dir.
 """
 
 from __future__ import annotations

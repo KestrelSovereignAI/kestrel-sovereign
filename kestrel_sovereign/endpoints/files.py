@@ -38,10 +38,11 @@ def channel_artifact_path(agent, channel_type: str, name: str) -> Path | None:
 async def serve_channel_link_qr(channel_type: str, request: Request):
     """Serve the current pairing QR PNG for an isolated channel feature.
 
-    The image is rendered into the chat by ``handleChannelLinkQr`` (chat.js)
-    off a ``channel_link_qr`` SSE event; an http(s) ``<img>`` survives the
-    DOMPurify sanitizer where an inline ``data:`` URI would be stripped.
-    Served ``no-store`` because the QR rotates (~20s) and is single-use.
+    The image is fetched by the persisted ``channel_link`` card
+    (``channelLinkPartRenderer`` in chat.js, #2081), which resolves the current
+    QR state live on render/refresh; an http(s) ``<img>`` survives the DOMPurify
+    sanitizer where an inline ``data:`` URI would be stripped. Served
+    ``no-store`` because the QR rotates (~20s) and is single-use.
     """
     if not _CHANNEL_TYPE_RE.match(channel_type):
         raise HTTPException(status_code=400, detail="Invalid channel type")
