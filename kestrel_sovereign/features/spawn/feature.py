@@ -165,7 +165,9 @@ class SpawnFeature(Feature):
         Args:
             name: Unique name for the child agent
             purpose: What the child agent is for (stored in mandate)
-            budget: Budget allocation for the child (default 0)
+            budget: Reserved for a future per-child spend ceiling. NOT YET
+                 ENFORCED — pass 0 (default). A positive value is rejected
+                 rather than silently accepted as a control that does nothing.
             ttl: Time-to-live in seconds (default 3600). A value <= 0 makes
                  the child PERSISTENT (registered with SpawnMode.PERSISTENT,
                  no automatic TTL expiry) rather than ephemeral.
@@ -188,6 +190,21 @@ class SpawnFeature(Feature):
         if manager is None:
             return ToolResult.failed(
                 error="No AgentManager available — agent is not running in a multi_agent"
+            )
+
+        # A per-child budget CEILING is not yet enforced (#F278): the
+        # DelegatedWallet machinery exists but the child's spend paths are not
+        # routed through it, so a budget would be an advertised-but-nonexistent
+        # control. Reject a positive budget clearly rather than silently
+        # accepting one that enforces nothing (the previous no-op). Tracked as a
+        # follow-up feature (delegated-wallet spend routing + release).
+        if budget and budget > 0:
+            return ToolResult.failed(
+                error=(
+                    "per-child budget enforcement is not yet implemented — a "
+                    "budget here would not actually cap the child's spend. Spawn "
+                    "without a budget for now."
+                )
             )
 
         # Parse comma-separated strings into lists
@@ -381,9 +398,17 @@ class SpawnFeature(Feature):
                 error=f"Agent '{child_name}' is not a child of this agent"
             )
 
-        # Run the task asynchronously via the child agent's chat method
+        # Run the task asynchronously via the child agent's chat method.
+        #
+        # A completed task records its result in ``_child_results`` but must NOT
+        # finalize/terminate the child (#F279). ``lifecycle.report_result``
+        # cancels the TTL timer and runs ``_terminate_and_cleanup`` — calling it
+        # per task killed the child after ONE delegate, breaking the documented
+        # spawn → delegate → get_child_result → delegate-again flow (and making
+        # a second delegate_task/terminate_child fail with "not found"). The
+        # child persists until its TTL expires, an explicit terminate_child, or
+        # parent shutdown — the paths that legitimately finalize it.
         async def _run_child_task():
-            lifecycle = self._get_lifecycle(manager)
             try:
                 result = await child_agent.process_input(task)
                 self._child_results[child_name] = {
@@ -391,11 +416,6 @@ class SpawnFeature(Feature):
                     "result": result,
                     "completed_at": time.time(),
                 }
-                if lifecycle is not None:
-                    await lifecycle.report_result(
-                        child_name=child_name,
-                        output_artifacts={"result": result},
-                    )
             except Exception as e:
                 logger.error(f"Child '{child_name}' task failed: {e}")
                 self._child_results[child_name] = {
@@ -403,13 +423,6 @@ class SpawnFeature(Feature):
                     "error": str(e),
                     "completed_at": time.time(),
                 }
-                if lifecycle is not None:
-                    from kestrel_sovereign.spawn.lifecycle import SpawnStatus
-                    await lifecycle.report_result(
-                        child_name=child_name,
-                        output_artifacts={"error": str(e)},
-                        status=SpawnStatus.FAILED,
-                    )
 
         # Cancel any existing task for this child
         if child_name in self._child_tasks and not self._child_tasks[child_name].done():

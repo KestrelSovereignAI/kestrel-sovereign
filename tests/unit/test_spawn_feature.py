@@ -127,7 +127,6 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.spawn_agent(
             name="helper",
             purpose="assist with research",
-            budget=10.0,
             ttl=1800,
             constraints="max_tokens=1000,no_web",
             features="memory,web_search",
@@ -142,7 +141,6 @@ class TestSpawnFeatureWithManager:
         mandate = call_args.kwargs["mandate"]
         assert mandate.parent_did == "did:parent"
         assert mandate.purpose == "assist with research"
-        assert mandate.budget_allocation == 10.0
         assert mandate.ttl_seconds == 1800
         assert mandate.additional_constraints == {"max_tokens": "1000", "no_web": "true"}
         # Shorthand feature names are canonicalized to their class names so the
@@ -195,10 +193,55 @@ class TestSpawnFeatureWithManager:
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["child_name"] == "helper"
 
-        # Wait briefly for the async task to start
+        # Wait for the async task to finish
         await asyncio.sleep(0.1)
         assert "helper" in feature._child_tasks
-        manager._lifecycle.report_result.assert_awaited()
+        # #F279: completing a delegated task records the result but must NOT
+        # finalize/terminate the child. report_result (which runs
+        # _terminate_and_cleanup) is NOT called per task, so the child stays
+        # alive for the next delegate_task / get_child_result.
+        manager._lifecycle.report_result.assert_not_awaited()
+        assert feature._child_results["helper"]["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_delegate_twice_keeps_child_alive(self):
+        """#F279: the documented spawn → delegate → get_result → delegate-again
+        flow. A second delegate must succeed (first task didn't kill the child)."""
+        parent = _make_mock_agent("did:parent")
+        child = _make_mock_agent("did:child")
+        manager = MagicMock()
+        manager.get_agent = MagicMock(return_value=child)
+        manager.get_children = MagicMock(return_value=["helper"])
+        manager._lifecycle = SpawnedAgentLifecycle(manager)
+        manager._lifecycle.report_result = AsyncMock()
+        manager.terminate_child = AsyncMock()
+
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        first = await feature.delegate_task(child_name="helper", task="task 1")
+        await asyncio.sleep(0.05)
+        second = await feature.delegate_task(child_name="helper", task="task 2")
+        await asyncio.sleep(0.05)
+
+        assert first.status is ToolResultStatus.OK
+        assert second.status is ToolResultStatus.OK  # child still alive
+        manager._lifecycle.report_result.assert_not_awaited()
+        manager.terminate_child.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_spawn_positive_budget_is_rejected(self):
+        """#F278: a per-child budget CEILING is not yet enforced, so a positive
+        budget is rejected clearly rather than silently accepted as a no-op
+        control."""
+        parent = _make_mock_agent("did:parent")
+        manager = MagicMock()
+        manager.spawn_agent = AsyncMock(return_value=_make_mock_agent("did:child"))
+
+        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
+        envelope = await feature.spawn_agent(name="helper", purpose="x", budget=5.0)
+
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "budget" in envelope.error.lower()
+        manager.spawn_agent.assert_not_awaited()  # rejected before spawning
 
     @pytest.mark.asyncio
     async def test_delegate_task_not_our_child(self):
