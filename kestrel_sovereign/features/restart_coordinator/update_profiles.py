@@ -16,6 +16,7 @@ select a profile, never compose one.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -86,11 +87,23 @@ class UpdateProfile:
         return self._build(repo_path, target_ref, allow_migrations)
 
 
+def _host_feature_manifest() -> Optional[Path]:
+    """The host's out-of-tree feature manifest, if present.
+
+    ``kestrel feature sync`` reads ``.kestrel-host-features.toml`` from the host
+    process cwd (the launch/data root). The profile is built in that same
+    process, so resolve it here and pass an ABSOLUTE path to the step so manifest
+    discovery does not depend on the step's own cwd.
+    """
+    manifest = (Path.cwd() / ".kestrel-host-features.toml").resolve()
+    return manifest if manifest.exists() else None
+
+
 def _sovereign_local_uv_sync(
     repo_path: str, target_ref: str, allow_migrations: bool,
 ) -> List[UpdateStep]:
     git = ["git", "-C", repo_path]
-    return [
+    steps = [
         # Fetch the *specific* requested ref so FETCH_HEAD points at the
         # commit we want to land on (``--tags`` keeps tag refs current for
         # tag targets, ``--prune`` drops deleted upstream refs).
@@ -108,12 +121,39 @@ def _sovereign_local_uv_sync(
         # branch, tag, or sha.
         UpdateStep("checkout", git + ["checkout", "--detach", "FETCH_HEAD"]),
         UpdateStep("install", ["uv", "sync"], cwd=repo_path),
-        # Always capture the actual landed commit so the post-restart
-        # completion signal can prove which ref we booted into.
-        UpdateStep(
-            "resolve_ref", git + ["rev-parse", "HEAD"], read_only=True,
-        ),
     ]
+
+    # Restore out-of-tree feature packages that bare ``uv sync`` prunes (F234).
+    # ``kestrel update`` runs ``kestrel feature sync`` immediately after its
+    # sync for exactly this reason; ``update_then_restart`` must not diverge, or
+    # a host restarts with its isolated/entry-point feature packages missing.
+    # Only add the step when a manifest actually exists (feature sync exits 1 on
+    # a missing manifest); a host with no out-of-tree features has nothing to
+    # prune and needs no restore.
+    manifest = _host_feature_manifest()
+    if manifest is not None:
+        # Invoke via the RUNNING interpreter (``sys.executable -m ...``), never a
+        # bare ``kestrel`` PATH lookup: a host launched from a venv by absolute
+        # path (systemd/cron) may not have ``kestrel`` on PATH, and a machine
+        # with multiple installs could resolve it to the wrong interpreter and
+        # restore features into a venv the host isn't running (codex P1).
+        steps.append(
+            UpdateStep(
+                "feature_sync",
+                [
+                    sys.executable, "-m", "kestrel_sovereign.cli",
+                    "feature", "sync", "--manifest", str(manifest),
+                ],
+                cwd=repo_path,
+            )
+        )
+
+    # Always capture the actual landed commit LAST so the post-restart
+    # completion signal can prove which ref we booted into.
+    steps.append(
+        UpdateStep("resolve_ref", git + ["rev-parse", "HEAD"], read_only=True)
+    )
+    return steps
 
 
 SOVEREIGN_LOCAL_UV_SYNC = UpdateProfile(
