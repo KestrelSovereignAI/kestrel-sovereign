@@ -172,27 +172,6 @@ def _is_infra_background_task(task) -> bool:
     return name.startswith(_INFRA_TASK_PREFIXES)
 
 
-def install_fleet_idle_provider(manager) -> None:
-    """Wire every co-hosted agent so RestartCoordinator can gate a whole-host
-    restart on the WHOLE fleet's idleness (#F235).
-
-    A whole-host restart kills every agent in the process, so an
-    ``idle_agents_only`` request must defer while ANY co-hosted agent is mid
-    turn — not just the requester. Each agent gets ``_cohosted_agents_provider``,
-    a callable returning every agent in the manager (resolved live, so agents
-    registered later are seen). Single-agent hosts never call this, so those
-    agents keep the requester-only check. Idempotent.
-    """
-    def provider():
-        return list(manager.list_agents().values())
-
-    for agent in manager.list_agents().values():
-        try:
-            agent._cohosted_agents_provider = provider
-        except Exception:  # pragma: no cover - defensive (read-only proxy, etc.)
-            continue
-
-
 class RestartCoordinatorFeature(Feature):
     """Durable restart-request surface for agents (#1512)."""
 
