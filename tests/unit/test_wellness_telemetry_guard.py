@@ -362,7 +362,8 @@ class TestWellnessToolsAreReadOnly:
     @pytest.mark.asyncio
     async def test_wellness_tools_execute_as_tool_responses(self, feature):
         """Verify that wellness tools, when executed via get_tools(), return
-        data wrapped in tool response format (success + result).
+        the unified flat ToolResult envelope (status/confirmation/data at top
+        level, plus a back-compat success flag).
 
         Tool responses go to the tool result channel, NOT the system prompt.
         """
@@ -373,16 +374,13 @@ class TestWellnessToolsAreReadOnly:
         check_tool = tool_by_name["wellness_check"]
         result = await check_tool.execute()
 
-        # Tool framework wraps in {"success": True, "result": <ToolResult.to_dict()>, "tool": ...}
+        # Unified wire shape (#F025): envelope spread TOP-LEVEL, not nested.
         assert result["success"] is True
-        assert "result" in result
         assert result["tool"] == "wellness_check"
-
-        # The inner wire form is the ToolResult envelope; payload lives under .data
-        inner = result["result"]
-        assert inner["status"] == "ok"
-        assert "overall_score" in inner["data"]
-        assert "dimensions" in inner["data"]
+        assert "result" not in result
+        assert result["status"] == "ok"
+        assert "overall_score" in result["data"]
+        assert "dimensions" in result["data"]
 
 
 # ============================================================================
@@ -455,15 +453,13 @@ class TestWellnessExportDoesNotInject:
         export_tool = tool_by_name["wellness_export"]
         result = await export_tool.execute()
 
-        # Wrapped in tool response format
+        # Unified flat wire shape (#F025): envelope spread TOP-LEVEL.
         assert result["success"] is True
         assert result["tool"] == "wellness_export"
-
-        # The inner wire form is the ToolResult envelope; payload lives under .data
-        inner = result["result"]
-        assert inner["status"] == "ok"
-        assert "checkpoints" in inner["data"]
-        assert inner["data"]["export_format"] == "v1"
+        assert "result" not in result
+        assert result["status"] == "ok"
+        assert "checkpoints" in result["data"]
+        assert result["data"]["export_format"] == "v1"
 
     @pytest.mark.asyncio
     async def test_wellness_export_does_not_inject_into_context_builder(self, feature):

@@ -63,6 +63,28 @@ Continue the same task now:
 - Do not describe a future tool call without making it."""
 
 
+def is_flat_toolresult_envelope(value: Any) -> bool:
+    """True if ``value`` is a serialized (flat) ToolResult envelope (#F025).
+
+    Discriminates a real ``ToolResult.to_dict()`` from an arbitrary dict that
+    merely has a ``status`` domain field. A genuine envelope satisfies the
+    ToolResult invariants (enforced in ``ToolResult.__post_init__``): OK carries
+    a ``confirmation``, ERROR carries an ``error``, PARTIAL carries both. A
+    legacy service payload like ``{"status": "ok", "items": [...]}`` therefore
+    does NOT match and keeps its raw shape.
+    """
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    if status == "ok":
+        return "confirmation" in value
+    if status == "error":
+        return "error" in value
+    if status == "partial":
+        return "confirmation" in value and "error" in value
+    return False
+
+
 def _serialize_tool_result(result: Any) -> Any:
     """Convert a tool result to a JSON-serializable format.
 
@@ -1143,24 +1165,29 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         #   - ERROR → success=False, error copied
                         #     into the wrapper's top-level error
                         if isinstance(result, ToolResult):
-                            wire = result.to_dict()
-                            response: Dict[str, Any] = {
-                                "result": wire,
-                                "tool": self.name,
-                            }
-                            status = result.status
-                            if status is ToolResultStatus.ERROR:
-                                response["success"] = False
-                                response["error"] = result.error
-                            else:
-                                # OK and PARTIAL both ran the action.
-                                response["success"] = True
-                                if status is ToolResultStatus.PARTIAL:
-                                    # Surface the partial caveat at
-                                    # the wrapper level so legacy
-                                    # callers that only read ``error``
-                                    # don't miss it.
-                                    response["error"] = result.error
+                            # Unified wire shape (#F025): spread the ToolResult
+                            # envelope at the TOP level — matching the SDK
+                            # wrapper (kestrel_sdk.features.base.DynamicTool) so
+                            # in-tree and external features serialize
+                            # identically. ``status``/``confirmation``/
+                            # ``error``/``data`` now sit top-level, so the
+                            # honesty layer (summarize_tool_result_for_audit
+                            # reads top-level ``status``) sees a PARTIAL instead
+                            # of it being hidden under a nested ``result`` where
+                            # only a derived ``success`` was visible (#F001), and
+                            # command_handler renders every feature's
+                            # ``!command`` from the same shape (#F002).
+                            #
+                            # ``success`` is retained (derived from status:
+                            # OK/PARTIAL → True, ERROR → False) purely as a
+                            # back-compat courtesy for the many existing readers
+                            # that branch on it; ``status`` is the canonical
+                            # signal going forward.
+                            response: Dict[str, Any] = result.to_dict()
+                            response["tool"] = self.name
+                            response["success"] = (
+                                result.status is not ToolResultStatus.ERROR
+                            )
                             return response
 
                         # Pre-migration return shape (Dict[str, Any]
