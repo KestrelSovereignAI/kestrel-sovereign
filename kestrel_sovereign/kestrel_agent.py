@@ -1583,8 +1583,15 @@ class KestrelAgent(
                 self.storage,
                 llm_service=self.llm_service,
                 consolidator=self.memory_consolidator,
-                agent_data_path=agent_data_dir
+                agent_data_path=agent_data_dir,
+                db=self._raw_storage.db,
+                agent_id=self.agent_id,
             )
+            # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
+            # persistence) into the loader before the first system-prompt
+            # assembly (#2135, F099). Storage is up here and no prompt has been
+            # built yet, so there is no first-prompt ordering regression.
+            await self.context_builder.load_bootstrap_db_config()
             await self._load_or_promote_soul_resource(agent_data_dir)
 
             # Initialize unified context manager (orchestrates all context sources).
