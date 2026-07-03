@@ -1,5 +1,6 @@
 """Tests for isolated feature runtime proxy behavior."""
 
+import os
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -677,3 +678,54 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     runs.clear()
     feature.ensure_venv()  # not stale now (host unchanged) → no thrash
     assert runs == []
+
+
+# --- F023: isolated service launch env must not inherit interpreter shadowing --
+
+
+def test_isolated_child_env_strips_shadowing_vars(monkeypatch, tmp_path):
+    """The launch env must drop host PYTHONPATH/PYTHONHOME/PYTHONSTARTUP/
+    VIRTUAL_ENV so the host interpreter can't shadow the isolated venv (F023)."""
+    from kestrel_sovereign.features.isolated_runtime import (
+        _isolated_child_env,
+        _venv_bin_dir,
+    )
+
+    monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
+    monkeypatch.setenv("PYTHONHOME", "/host/python")
+    monkeypatch.setenv("PYTHONSTARTUP", "/host/startup.py")
+    monkeypatch.setenv("VIRTUAL_ENV", "/host/venv")
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_TOKEN", "keep-me")
+
+    venv = tmp_path / "svc-venv"
+    env = _isolated_child_env(venv)
+
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
+    assert "PYTHONSTARTUP" not in env
+    # Feature config/secrets still pass through (documented config channel).
+    assert env["KESTREL_FEATURE_WHATSAPPFEATURE_TOKEN"] == "keep-me"
+    # VIRTUAL_ENV re-points at the isolated venv and its bin leads PATH.
+    assert env["VIRTUAL_ENV"] == str(venv)
+    assert env["PATH"].split(os.pathsep)[0] == str(_venv_bin_dir(venv))
+
+
+def test_build_client_passes_stripped_env(monkeypatch, tmp_path):
+    """``_build_client`` must hand the stripped env to the client factory."""
+    monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    agent = Mock()
+    agent.features = {}
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=client_factory)
+    feature._venv_path = tmp_path / "svc-venv"
+    feature._bin_path = None
+
+    feature._build_client()
+
+    assert "env" in captured
+    assert "PYTHONPATH" not in captured["env"]

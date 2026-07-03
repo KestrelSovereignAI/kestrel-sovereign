@@ -114,6 +114,36 @@ def _venv_python(venv_path: Path) -> Path:
     return venv_path / "bin" / "python"
 
 
+# Interpreter-behavior env vars that would let the HOST Python installation
+# shadow the isolated venv's packages, defeating the isolation the runtime
+# exists for (F023). Feature config/secrets ride through the general environment
+# intentionally (KESTREL_FEATURE_* is the documented config channel), so we STRIP
+# these specific interpreter vars rather than allowlisting the whole environment.
+_SHADOWING_ENV_VARS = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV")
+
+
+def _isolated_child_env(venv_path: Optional[Path]) -> Dict[str, str]:
+    """Build the launch environment for the isolated service subprocess.
+
+    Inherits the host environment (so feature config/secrets pass through) but
+    strips the interpreter-behavior vars in ``_SHADOWING_ENV_VARS`` so a stray
+    host ``PYTHONPATH``/``VIRTUAL_ENV`` can't resolve the service's imports
+    against host site-packages. When a venv is used, re-point ``VIRTUAL_ENV`` at
+    it and prepend its bin dir to ``PATH`` so child processes bind to the
+    isolated venv.
+    """
+    env = dict(os.environ)
+    for var in _SHADOWING_ENV_VARS:
+        env.pop(var, None)
+    if venv_path is not None:
+        env["VIRTUAL_ENV"] = str(venv_path)
+        bin_dir = str(_venv_bin_dir(venv_path))
+        env["PATH"] = os.pathsep.join(
+            [bin_dir, env.get("PATH", "")]
+        ).rstrip(os.pathsep)
+    return env
+
+
 def _coerce_category(value: Any) -> ToolCategory:
     if isinstance(value, ToolCategory):
         return value
@@ -626,6 +656,9 @@ class ProxyFeature(Feature):
             "event_handler": self._handle_event,
             "notification_handler": self._handle_event,
             "config": self._host_config or None,
+            # Launch env with interpreter-shadowing vars stripped (F023) so the
+            # host PYTHONPATH/VIRTUAL_ENV can't defeat the venv isolation.
+            "env": _isolated_child_env(self._venv_path),
         }
         kwargs = {key: value for key, value in kwargs.items() if value}
 
