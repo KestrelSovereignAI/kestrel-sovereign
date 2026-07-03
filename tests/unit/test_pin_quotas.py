@@ -51,8 +51,23 @@ class FakeDB:
         if sql_lower.startswith("create table"):
             return 0
 
-        # UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ? AND deleted_at IS NULL
+        # UPDATE conversation_history SET metadata = ... WHERE id = ? AND agent_id = ? ...
         if sql_lower.startswith("update conversation_history"):
+            if "json_set" in sql_lower or "jsonb_set" in sql_lower:
+                # Atomic single-flag set of $.decay_protected (F217): merge into
+                # existing metadata, preserving other keys.
+                flag_val, msg_id = params[0], params[1]
+                agent_id = params[2] if len(params) > 2 else None
+                msg = self.messages.get(msg_id)
+                if msg and (agent_id is None or msg["agent_id"] == agent_id):
+                    raw = msg.get("metadata")
+                    meta = json.loads(raw) if raw else {}
+                    meta["decay_protected"] = (
+                        flag_val.lower() == "true"
+                        if isinstance(flag_val, str) else bool(flag_val)
+                    )
+                    msg["metadata"] = json.dumps(meta)
+                return 1
             meta_json, msg_id = params[0], params[1]
             agent_id = params[2] if len(params) > 2 else None
             msg = self.messages.get(msg_id)
