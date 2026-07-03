@@ -821,12 +821,17 @@ class TestHierarchicalCompaction:
         storage.conversation = conv_store
 
         # Mock 20 messages to compact (with longer content to create multiple chunks)
+        # id-bearing, read from the exclusion-filtered get_conversation_history
+        # (F153) — not get_full_history.
         history = [
-            {"role": "user", "content": f"Message {i}: " + "x" * 500}
-            for i in range(20)
+            {"id": i, "role": "user", "content": f"Message {i}: " + "x" * 500}
+            for i in range(1, 21)
         ]
-        conv_store.get_full_history.return_value = history
+        conv_store.get_conversation_history.return_value = history
         conv_store.add_conversation = AsyncMock()
+        conv_store.update_messages_metadata = AsyncMock(return_value=15)
+        conv_store.agent_id = "test"
+        conv_store.db.fetchone = AsyncMock(return_value=(777,))
 
         # Mock LLM service
         llm_service = AsyncMock()
@@ -851,6 +856,49 @@ class TestHierarchicalCompaction:
         assert result["tokens_saved"] > 0
         assert "summary_preview" in result
         llm_service.generate.assert_called()
+        # F153 contract: originals excluded and linked to the marker.
+        marker_meta = conv_store.add_conversation.await_args.kwargs["metadata"]
+        assert marker_meta["original_message_ids"] == list(range(1, 16))
+        excluded_ids, excl_meta = conv_store.update_messages_metadata.await_args.args
+        assert excluded_ids == list(range(1, 16))
+        assert excl_meta["summarized_into"] == "777"
+
+    @pytest.mark.asyncio
+    async def test_hierarchical_compact_skips_stashed_messages(self):
+        """Stashed rows must NOT be compacted/excluded — stash_pop only clears
+        `stashed`, so excluding them here would hide them permanently (codex P2)."""
+        storage = MagicMock()
+        conv_store = AsyncMock()
+        storage.conversation = conv_store
+
+        history = [
+            {"id": i, "role": "user", "content": f"Message {i}: " + "x" * 500}
+            for i in range(1, 21)
+        ]
+        # Mark a few as stashed — these must be left alone.
+        for m in history[:3]:
+            m["metadata"] = {"stashed": True, "stash_id": "abc"}
+        conv_store.get_conversation_history.return_value = history
+        conv_store.add_conversation = AsyncMock()
+        conv_store.update_messages_metadata = AsyncMock(return_value=12)
+        conv_store.agent_id = "test"
+        conv_store.db.fetchone = AsyncMock(return_value=(555,))
+
+        llm_service = AsyncMock()
+        llm_service.generate.return_value = "summary"
+        counter = MagicMock()
+        counter.count.side_effect = lambda x: len(x) // 4
+
+        mm = MemoryManager(storage)
+        result = await mm.hierarchical_compact(
+            llm_service=llm_service, counter=counter,
+            chunk_size=1000, preserve_recent=5, max_depth=3,
+        )
+
+        assert result["success"] is True
+        excluded_ids, _ = conv_store.update_messages_metadata.await_args.args
+        # The 3 stashed ids (1,2,3) are never excluded.
+        assert not ({1, 2, 3} & set(excluded_ids))
 
     @pytest.mark.asyncio
     async def test_hierarchical_compact_not_enough_messages(self):
@@ -860,8 +908,8 @@ class TestHierarchicalCompaction:
         storage.conversation = conv_store
 
         # Only 5 messages total
-        history = [{"role": "user", "content": f"msg{i}"} for i in range(5)]
-        conv_store.get_full_history.return_value = history
+        history = [{"id": i, "role": "user", "content": f"msg{i}"} for i in range(1, 6)]
+        conv_store.get_conversation_history.return_value = history
 
         llm_service = AsyncMock()
         counter = MagicMock()
