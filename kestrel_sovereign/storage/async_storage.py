@@ -7,6 +7,7 @@ all storage components (files, graph, conversation, RAG).
 Supports both SQLite (local) and PostgreSQL (cloud) backends via
 environment variable KESTREL_DB_BACKEND.
 """
+import asyncio
 import io
 import os
 import logging
@@ -841,36 +842,52 @@ class AsyncStorage:
         Creates a gzipped tar archive of selected artifacts and returns its bytes.
         Currently includes only the SQLite DB when include_db is True.
 
-        Note: This temporarily closes the database connection to ensure
-        a consistent backup, then reopens it.
-
-        IMPORTANT: SQLite WAL mode stores data in a separate -wal file until checkpoint.
-        We must checkpoint before copying the main DB file to ensure all data is included.
+        The live database connection is never closed. We produce a consistent
+        snapshot of the running DB with SQLite's online backup API and archive
+        *that copy*, so concurrent reads/writes keep working and there is no
+        close/re-init window. The (potentially large) tar+gzip runs off the
+        event loop via ``asyncio.to_thread``.
         """
         if self.db_path == ":memory:":
             raise ValueError("Cannot backup an in-memory database")
 
-        # Checkpoint WAL before closing - this ensures all data is written to main DB file
-        # Without this, the backup would be missing any uncommitted WAL data.
-        # Use fetchone so aiosqlite consumes the cursor fully — execute() then
-        # auto-commit would raise "cannot commit transaction - SQL statements
-        # in progress" because the PRAGMA's result cursor is still open.
-        was_initialized = self._initialized
-        if was_initialized and self.db:
-            await self.db.fetchone("PRAGMA wal_checkpoint(TRUNCATE)")
-            await self.close()
-        
+        if not include_db:
+            # Nothing to include yet — return an empty gzipped tar off-loop.
+            return await asyncio.to_thread(self._tar_gzip_paths, [])
+
+        if not self._initialized or not self.db:
+            await self.initialize()
+
+        if self.backend_type != "sqlite":
+            # The online-backup snapshot path (backup_to) is a SQLite-only
+            # facility; PostgreSQL has no equivalent on the backend contract.
+            raise NotImplementedError(
+                "create_backup_blob currently supports SQLite only "
+                f"(backend_type={self.backend_type!r})"
+            )
+
+        # Snapshot the live DB into a temp file via the online backup API.
+        # The shared connection stays open the whole time.
+        tmp_dir = tempfile.mkdtemp(prefix="kestrel-backup-")
+        snapshot_path = os.path.join(tmp_dir, "kestrel.db")
         try:
-            buffer = io.BytesIO()
-            with tarfile.open(fileobj=buffer, mode='w:gz') as tar:
-                if include_db:
-                    tar.add(self.db_path, arcname='kestrel.db')
-            buffer.seek(0)
-            return buffer.read()
+            await self.db.backend.backup_to(snapshot_path)
+            # Archive the consistent copy off the event loop.
+            return await asyncio.to_thread(
+                self._tar_gzip_paths, [(snapshot_path, "kestrel.db")]
+            )
         finally:
-            # Reopen if it was open
-            if was_initialized:
-                await self.initialize()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _tar_gzip_paths(members: List[tuple]) -> bytes:
+        """Build a gzipped tar of ``(path, arcname)`` members and return its bytes."""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w:gz') as tar:
+            for path, arcname in members:
+                tar.add(path, arcname=arcname)
+        buffer.seek(0)
+        return buffer.read()
     
     async def restore_from_backup_blob(self, backup_blob: bytes) -> Dict[str, Any]:
         """

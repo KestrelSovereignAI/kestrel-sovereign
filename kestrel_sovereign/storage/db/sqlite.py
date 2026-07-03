@@ -111,6 +111,25 @@ class SQLiteBackend(DatabaseBackend):
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._connection
 
+    async def backup_to(self, dest_path: str) -> None:
+        """Copy the live database to ``dest_path`` using SQLite's online backup API.
+
+        Produces a transactionally-consistent snapshot of the running database
+        without ever closing the shared connection, so concurrent reads/writes
+        keep working. The copy runs in aiosqlite's background thread (not on the
+        event loop). We hold the write lock so the snapshot is taken between
+        atomic write units rather than mid-write.
+        """
+        if self.db_path == ":memory:":
+            raise ValueError("Cannot back up an in-memory database")
+        conn = self._ensure_connected()
+        async with self._write_guard():
+            dest = await aiosqlite.connect(dest_path, timeout=30)
+            try:
+                await conn.backup(dest)
+            finally:
+                await dest.close()
+
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
         conn = await aiosqlite.connect(self.db_path, timeout=30)
