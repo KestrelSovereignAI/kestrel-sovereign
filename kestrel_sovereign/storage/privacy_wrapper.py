@@ -197,7 +197,24 @@ class PrivacyEnforcingStorage:
         self._entered_ephemeral_at: Optional[str] = None
         if self._privacy_config.is_ephemeral():
             self._entered_ephemeral_at = self._now_iso()
+        # Optional safety-net sweep for the A2A observability sink (F076). The
+        # observability store lives in the TaskManager, not the storage facade,
+        # so the agent binds it after construction via
+        # ``set_observability_purge``. It receives the entered-ephemeral
+        # watermark and returns ``{table: rows_deleted}`` which is merged into
+        # the purge breakdown. ``None`` = not wired (no observability sweep).
+        self._observability_purge = None
         logger.info(f"PrivacyEnforcingStorage initialized with config: storage={self._privacy_config.storage}, llm={self._privacy_config.llm_location}")
+
+    def set_observability_purge(self, purge_callable) -> None:
+        """Bind the observability safety-net sweep (F076).
+
+        ``purge_callable`` is an async callable ``(since_iso) -> dict`` that
+        deletes ``a2a_tool_dispatches`` / ``a2a_observability`` rows authored
+        since the watermark. Wired by the agent once its observability store
+        exists; called from :meth:`purge_ephemeral_session`.
+        """
+        self._observability_purge = purge_callable
 
     @staticmethod
     def _now_iso() -> str:
@@ -356,7 +373,29 @@ class PrivacyEnforcingStorage:
             nodes = 0
         result["graph_nodes"] = nodes
 
-        leaked = sum(result.values())
+        # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /
+        # a2a_observability) for rows authored during the EPHEMERAL stint
+        # (F076). Content-free counts that were metered are acceptable losses;
+        # the contract is "leave no trace" of user content, and tool-call args
+        # are user content.
+        if self._observability_purge is not None:
+            try:
+                obs_counts = await self._observability_purge(since)
+            except Exception as e:
+                logger.warning(
+                    "purge_ephemeral_session: observability sweep failed: %s", e
+                )
+                obs_counts = {}
+            for table, count in (obs_counts or {}).items():
+                result[table] = int(count or 0)
+
+        # Leak accounting is scoped to the tables EPHEMERAL should NEVER write
+        # to (conversation_history / graph_nodes). The observability sink is
+        # *expected* to hold content-free metric rows during an EPHEMERAL stint
+        # (F076 permits counts/latency to remain), so sweeping those is routine
+        # hygiene, not a privacy-layer leak — counting them would fire a
+        # spurious security audit on every ephemeral session that ran a tool.
+        leaked = result.get("conversation_history", 0) + result.get("graph_nodes", 0)
         if leaked > 0:
             logger.warning(
                 "[privacy] WARNING: EPHEMERAL session leaked %d row(s) "

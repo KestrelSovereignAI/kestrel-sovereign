@@ -13,8 +13,8 @@ Works with both SQLite and PostgreSQL backends.
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel
 
@@ -40,6 +40,26 @@ _SECRET_KEYS = {
     "secret",
     "token",
 }
+
+# Placeholder written into content-bearing JSON columns (args/metadata) when
+# the active privacy config forbids persisting user content (EPHEMERAL /
+# ISOLATED). The row itself still persists so counts/latency/status keep
+# metering — only the payload is elided (F076).
+_CONTENT_GATED_MARKER = "_privacy_gated"
+
+# Lazy import of the PII redactor to avoid importing the privacy feature at
+# module load time (mirrors storage.privacy_wrapper.get_anonymize_text).
+_anonymize_text = None
+
+
+def _get_anonymize_text():
+    """Lazy-load the anonymize_text function to avoid circular imports."""
+    global _anonymize_text
+    if _anonymize_text is None:
+        from kestrel_sovereign.features.privacy.pii_detector import anonymize_text
+
+        _anonymize_text = anonymize_text
+    return _anonymize_text
 
 
 class ObservabilityEvent(BaseModel):
@@ -116,6 +136,113 @@ class ObservabilityStore(UnifiedStoreBase):
             backend: DatabaseBackend instance (SQLite or PostgreSQL)
         """
         super().__init__(backend)
+        # Privacy gate for content-bearing payloads (F076). The agent binds a
+        # callable returning the live ``PrivacyConfig`` via
+        # :meth:`set_privacy_config_provider`; captured by reference so
+        # mid-session privacy-mode flips are picked up automatically. ``None``
+        # (tests, standalone use) means "no gating" — payloads persist as-is,
+        # preserving the legacy behaviour.
+        self._privacy_config_provider: Optional[Callable[[], Any]] = None
+
+    def set_privacy_config_provider(
+        self, provider: Optional[Callable[[], Any]]
+    ) -> None:
+        """Bind a callable returning the live ``PrivacyConfig`` (F076).
+
+        Mirrors ``LLMService.set_force_local_only_provider`` (#1492): the
+        observability sink is a layer boundary that persists tool-call
+        arguments and metadata, so it must honour the agent's privacy mode
+        just like ``PrivacyEnforcingStorage`` does for conversation content.
+        """
+        self._privacy_config_provider = provider
+
+    def _current_privacy_config(self) -> Optional[Any]:
+        """Read the live privacy config, tolerating a missing/faulty provider."""
+        if self._privacy_config_provider is None:
+            return None
+        try:
+            return self._privacy_config_provider()
+        except Exception as exc:  # noqa: BLE001 - never break logging on this
+            logger.debug("privacy_config_provider raised %s; treating as ungated", exc)
+            return None
+
+    def _privacy_gate_args_json(self, args: Any) -> str:
+        """Serialize tool-call args for storage, honouring privacy mode (F076).
+
+        - EPHEMERAL / ISOLATED: elide the payload entirely (no user content
+          persists); the row still records counts/latency/status.
+        - ANONYMOUS (``pii_redacted``): anonymize string content before the
+          usual secret-key redaction + size cap.
+        - NORMAL / PUBLIC / no provider: legacy redact-and-cap behaviour.
+        """
+        config = self._current_privacy_config()
+        if config is not None:
+            try:
+                if config.is_ephemeral() or config.uses_temp_storage():
+                    return json_dumps({_CONTENT_GATED_MARKER: config.storage})
+                if config.requires_anonymization():
+                    return redact_tool_args_json(
+                        _anonymize_deep(args, _get_anonymize_text())
+                    )
+            except Exception as exc:  # noqa: BLE001 - fail closed to gated
+                logger.debug(
+                    "privacy gate for tool args failed (%s); eliding payload", exc
+                )
+                return json_dumps({_CONTENT_GATED_MARKER: "error"})
+        return redact_tool_args_json(args)
+
+    def _privacy_gate_metadata(
+        self, metadata: Optional[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Gate a content-bearing metadata dict, honouring privacy mode (F076).
+
+        Same policy as :meth:`_privacy_gate_args_json` but returns a dict for
+        the ``metadata`` JSON columns. Operational keys the caller injects for
+        forensics (e.g. ``metric_name``) are added by the caller *after* this
+        gate, so they are never elided.
+        """
+        meta = metadata or {}
+        config = self._current_privacy_config()
+        if config is None:
+            return meta
+        try:
+            if config.is_ephemeral() or config.uses_temp_storage():
+                return {_CONTENT_GATED_MARKER: config.storage}
+            if config.requires_anonymization():
+                return _anonymize_deep(meta, _get_anonymize_text())
+        except Exception as exc:  # noqa: BLE001 - fail closed to gated
+            logger.debug(
+                "privacy gate for metadata failed (%s); eliding payload", exc
+            )
+            return {_CONTENT_GATED_MARKER: "error"}
+        return meta
+
+    def _privacy_gate_text(self, text: Optional[str]) -> Optional[str]:
+        """Gate a free-form text field (e.g. ``error_message``) by privacy mode.
+
+        Error/response text can echo user or tool input verbatim, so it is
+        content-bearing just like args/metadata (F076):
+
+        - EPHEMERAL / ISOLATED: elide to the gated marker (the row still
+          records status/latency so metering and the honesty-layer's read of
+          ``result_status`` are unaffected).
+        - ANONYMOUS (``pii_redacted``): anonymize the text in place.
+        - NORMAL / PUBLIC / no provider: pass through unchanged.
+        """
+        if text is None:
+            return None
+        config = self._current_privacy_config()
+        if config is None:
+            return text
+        try:
+            if config.is_ephemeral() or config.uses_temp_storage():
+                return _CONTENT_GATED_MARKER
+            if config.requires_anonymization():
+                return _anonymize_deep(text, _get_anonymize_text())
+        except Exception as exc:  # noqa: BLE001 - fail closed to gated
+            logger.debug("privacy gate for text failed (%s); eliding payload", exc)
+            return _CONTENT_GATED_MARKER
+        return text
 
     async def initialize(self) -> None:
         """Create tables if not exists."""
@@ -251,10 +378,13 @@ class ObservabilityStore(UnifiedStoreBase):
                     self.now_utc_param(),
                     entry.tool_name,
                     entry.adapter,
-                    redact_tool_args_json(entry.args_redacted),
+                    self._privacy_gate_args_json(entry.args_redacted),
                     entry.result_status,
                     entry.error_class,
-                    _cap_text(entry.error_message, MAX_TOOL_ERROR_MESSAGE_CHARS),
+                    _cap_text(
+                        self._privacy_gate_text(entry.error_message),
+                        MAX_TOOL_ERROR_MESSAGE_CHARS,
+                    ),
                     int(entry.latency_ms),
                     entry.result_size_bytes,
                 ),
@@ -376,6 +506,82 @@ class ObservabilityStore(UnifiedStoreBase):
             for row in rows
         ]
 
+    async def purge_observability_since(
+        self,
+        since_iso: str,
+        *,
+        agent_did: Optional[str] = None,
+        agent_name: Optional[str] = None,
+    ) -> dict[str, int]:
+        """Safety-net sweep for the EPHEMERAL leak-purge (F076).
+
+        Deletes ``a2a_tool_dispatches`` and ``a2a_observability`` rows authored
+        on/after ``since_iso`` — the watermark recorded when the agent entered
+        EPHEMERAL. This is the inverse of the privacy gate above: the gate stops
+        content-bearing payloads from landing during the stint; this sweep
+        scrubs any that slipped through (or predated the gate being wired up).
+
+        The watermark from ``PrivacyEnforcingStorage`` uses SQLite's
+        ``datetime('now')`` shape (space separator, no offset), but the store
+        writes ISO-8601 timestamps (``T`` separator, offset). A raw
+        lexicographic ``>=`` between the two would mis-order at the separator
+        (space ``0x20`` vs ``T`` ``0x54``) and over-delete — the same class of
+        bug #867 documents. So we normalize the watermark to the store's own
+        timestamp form before comparing.
+
+        Scoped by ``agent_did`` (tool dispatches) / ``agent_name``
+        (observability) when provided so a shared PostgreSQL backend never
+        reaches across tenants. Returns ``{table: rows_deleted}``.
+        """
+        since_param = self._normalize_since_param(since_iso)
+        result: dict[str, int] = {}
+
+        dispatch_where = "ts >= ?"
+        dispatch_params: list[Any] = [since_param]
+        if agent_did:
+            dispatch_where += " AND agent_did = ?"
+            dispatch_params.append(agent_did)
+        try:
+            result["a2a_tool_dispatches"] = await self._backend.execute(
+                f"DELETE FROM a2a_tool_dispatches WHERE {dispatch_where}",
+                tuple(dispatch_params),
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort safety net
+            logger.warning("purge_observability_since: tool-dispatch sweep failed: %s", exc)
+            result["a2a_tool_dispatches"] = 0
+
+        obs_where = "timestamp >= ?"
+        obs_params: list[Any] = [since_param]
+        if agent_name:
+            obs_where += " AND agent_name = ?"
+            obs_params.append(agent_name)
+        try:
+            result["a2a_observability"] = await self._backend.execute(
+                f"DELETE FROM a2a_observability WHERE {obs_where}",
+                tuple(obs_params),
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort safety net
+            logger.warning("purge_observability_since: observability sweep failed: %s", exc)
+            result["a2a_observability"] = 0
+
+        return result
+
+    def _normalize_since_param(self, since_iso: str) -> Any:
+        """Coerce a watermark string into the store's timestamp parameter form.
+
+        Accepts both the ``YYYY-MM-DD HH:MM:SS`` watermark shape and a full
+        ISO-8601 string; returns a value comparable against the rows this store
+        writes (``datetime`` for PostgreSQL, ISO string for SQLite).
+        """
+        raw = str(since_iso).strip()
+        try:
+            dt = datetime.fromisoformat(raw.replace(" ", "T"))
+        except ValueError:
+            return since_iso
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return self.to_timestamp_param(dt)
+
     async def log_tool_call(
         self,
         agent_name: str,
@@ -404,7 +610,7 @@ class ObservabilityStore(UnifiedStoreBase):
                 agent_name,
                 session_id,
                 tool_name,
-                json_dumps(metadata or {}),
+                json_dumps(self._privacy_gate_metadata(metadata)),
             ),
         )
 
@@ -425,7 +631,12 @@ class ObservabilityStore(UnifiedStoreBase):
                 event_type = 'tool_response'
             WHERE id = ?
             """,
-            (self.to_bool_param(success), duration_ms, error_message, event_id),
+            (
+                self.to_bool_param(success),
+                duration_ms,
+                self._privacy_gate_text(error_message),
+                event_id,
+            ),
         )
 
     async def log_agent_response(
@@ -458,7 +669,7 @@ class ObservabilityStore(UnifiedStoreBase):
                 session_id,
                 duration_ms,
                 self.to_bool_param(success),
-                json_dumps(metadata or {}),
+                json_dumps(self._privacy_gate_metadata(metadata)),
             ),
         )
 
@@ -479,7 +690,9 @@ class ObservabilityStore(UnifiedStoreBase):
         defaults to now.
         """
         event_id = generate_id()
-        meta = metadata or {}
+        # Gate the caller's content-bearing metadata, THEN stamp the
+        # operational key so it always survives the gate (F076).
+        meta = self._privacy_gate_metadata(metadata)
         meta["error_type"] = error_type
         now = self.to_timestamp_param(timestamp) if timestamp else self.now_utc_param()
 
@@ -495,7 +708,7 @@ class ObservabilityStore(UnifiedStoreBase):
                 agent_name,
                 session_id,
                 self.to_bool_param(False),
-                error_message,
+                self._privacy_gate_text(error_message),
                 json_dumps(meta),
             ),
         )
@@ -517,7 +730,9 @@ class ObservabilityStore(UnifiedStoreBase):
         defaults to now.
         """
         event_id = generate_id()
-        meta = metadata or {}
+        # Gate the caller's content-bearing metadata, THEN stamp the
+        # operational keys so name/value always survive the gate (F076).
+        meta = self._privacy_gate_metadata(metadata)
         meta["metric_name"] = metric_name
         meta["metric_value"] = metric_value
         now = self.to_timestamp_param(timestamp) if timestamp else self.now_utc_param()
@@ -1029,6 +1244,27 @@ def redact_tool_args_json(value: Any) -> str:
     budget = MAX_TOOL_ARGS_JSON_BYTES - 128
     preview = encoded[: max(0, budget)].decode("utf-8", errors="ignore")
     return json_dumps({"_truncated": True, "preview": preview})
+
+
+def _anonymize_deep(value: Any, anonymize: Callable[[str], str], depth: int = 0) -> Any:
+    """Apply PII anonymization to every string leaf of a nested structure (F076).
+
+    Structure (dict/list nesting) is preserved so downstream redaction and size
+    capping still see a normal payload; only the human-readable string content
+    is scrubbed. Secret-key redaction runs afterwards in ``redact_tool_args_json``.
+    """
+    if depth > 8:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _anonymize_deep(v, anonymize, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_anonymize_deep(item, anonymize, depth + 1) for item in value]
+    if isinstance(value, str):
+        try:
+            return anonymize(value)
+        except Exception:  # noqa: BLE001 - never break logging on anonymizer error
+            return value
+    return value
 
 
 def infer_tool_result_status(result: Any, status_hint: Optional[str] = None) -> str:
