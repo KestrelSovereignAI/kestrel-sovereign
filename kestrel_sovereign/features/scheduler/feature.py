@@ -477,18 +477,100 @@ class SchedulerFeature(Feature):
     # Source-registration handlers
     # ------------------------------------------------------------------
 
+    async def _run_tool_hook_gated(
+        self, feature_name: str, agent_tool: Any, args: dict
+    ) -> Any:
+        """Run a feature tool on a scheduler tick through the SAME
+        PRE_TOOL_USE / POST_TOOL_USE hook envelope the chat and subagent
+        dispatch paths use (F245).
+
+        Before this, scheduled feature-tool execution called
+        ``agent_tool.execute(**args)`` directly, so ``SecurityHook``
+        DENY/ASK policy and MODIFY redaction never fired — a DENY/ASK-
+        gated tool executed unchecked on every tick. Now the security
+        gate applies on every tick: a DENY or ASK decision raises (so the
+        runner records the tick as ``status='failed'`` rather than
+        silently executing), and a MODIFY hook's redacted args are the
+        ones actually passed to the tool.
+        """
+        hooks_manager = getattr(self.agent, "hooks_manager", None)
+        effective_args = args
+        if hooks_manager is not None:
+            from kestrel_sdk.hooks.base import HookEvent, HookInput
+            from kestrel_sovereign.hooks.decision_gate import (
+                evaluate_blocking_decision,
+            )
+
+            pre_input = HookInput(
+                session_id="scheduler",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name=agent_tool.name,
+                tool_input=args,
+                feature_name=feature_name,
+            )
+            pre_output = await hooks_manager.execute_hooks(
+                HookEvent.PRE_TOOL_USE, pre_input,
+            )
+            # Resolve post-hook (redacted) args first — a MODIFY hook may
+            # run before a later DENY hook; the effective args must be the
+            # redacted form even on the block path.
+            mutated = getattr(pre_input, "tool_input", None)
+            if isinstance(mutated, dict):
+                effective_args = mutated
+            updated = getattr(pre_output, "updated_input", None)
+            if isinstance(updated, dict):
+                effective_args = updated
+
+            # DENY and ASK both block the scheduled run. Treat ASK as a
+            # FAILED run, not silent execution — the scheduler has no
+            # interactive approver, so a gated tool simply does not run on
+            # tick. Raise so the runner logs status='failed'.
+            blocked = evaluate_blocking_decision(pre_output)
+            if blocked is not None:
+                logger.warning(
+                    "Scheduler: tool %r blocked (%s) on tick: %s",
+                    agent_tool.name, blocked.decision.value, blocked.reason,
+                )
+                raise PermissionError(blocked.error)
+
+            result = await agent_tool.execute(**effective_args)
+
+            post_input = HookInput(
+                session_id="scheduler",
+                hook_event_name=HookEvent.POST_TOOL_USE.value,
+                tool_name=agent_tool.name,
+                tool_input=effective_args,
+                feature_name=feature_name,
+                tool_response=(
+                    result if isinstance(result, dict) else {"result": str(result)}
+                ),
+            )
+            await hooks_manager.execute_hooks_parallel(
+                HookEvent.POST_TOOL_USE, post_input,
+            )
+            return result
+
+        # No hooks manager (bare test host) — execute directly.
+        return await agent_tool.execute(**effective_args)
+
     async def _lookup_and_run_tool(self, task_name: str, args: dict) -> str:
         """Tool-lookup body shared by every cron source handler that
         delegates to a feature tool. This is the existing executor's
         tool-search logic, lifted out so the source registrations can
-        invoke it without re-entering the dispatcher (which would loop)."""
+        invoke it without re-entering the dispatcher (which would loop).
+
+        Every resolved tool runs through ``_run_tool_hook_gated`` so the
+        PRE_TOOL_USE/POST_TOOL_USE hooks and the SecurityHook DENY/ASK
+        gate fire on each tick (F245)."""
         features = getattr(self.agent, "features", {})
         for feature in features.values():
             if not hasattr(feature, "get_tools"):
                 continue
             for agent_tool in feature.get_tools():
                 if agent_tool.name == task_name:
-                    result = await agent_tool.execute(**args)
+                    result = await self._run_tool_hook_gated(
+                        type(feature).__name__, agent_tool, args,
+                    )
                     # Preserve the legacy JSON-encode contract for
                     # downstream consumers (task_execution_log.result_text,
                     # endpoints/agent.py history view).
@@ -500,7 +582,9 @@ class SchedulerFeature(Feature):
         # commands but they're not typically scheduled themselves).
         for agent_tool in self.get_tools():
             if agent_tool.name == task_name:
-                result = await agent_tool.execute(**args)
+                result = await self._run_tool_hook_gated(
+                    type(self).__name__, agent_tool, args,
+                )
                 if isinstance(result, str):
                     return result
                 return json.dumps(result, default=str)
@@ -577,6 +661,54 @@ class SchedulerFeature(Feature):
             names.add(agent_tool.name)
 
         return names
+
+    async def _scheduled_task_denied(self, task_name: str) -> bool:
+        """Return True if ``task_name`` resolves to a feature tool the
+        SecurityFeature permission store has set to ``DENY``.
+
+        ``schedule_add`` uses this to reject a DENY-listed tool at creation
+        time (F245) instead of persisting it and having the tick-path hook
+        gate (``_run_tool_hook_gated``) fail every single tick. Resolution
+        mirrors that executor: the owning feature is looked up by the same
+        ``agent.features`` key SecurityFeature registered its permissions
+        under, and the tool name is the ``@tool`` name.
+
+        Built-in cron sources (``CRON_TASKS``) have no permission row and
+        are never treated as denied here — they are operator-level scheduler
+        primitives, not agent tools. On any lookup failure or a missing
+        SecurityFeature this returns ``False`` (fail-open only for the
+        *creation-time* check; the tick-path gate still fires at runtime).
+        """
+        features = getattr(self.agent, "features", {}) or {}
+        security_feature = features.get("SecurityFeature")
+        if security_feature is None:
+            return False
+        store = getattr(security_feature, "permission_store", None)
+        if not store or not callable(getattr(store, "get_permission", None)):
+            return False
+
+        from kestrel_sovereign.features.security.permissions import PermissionLevel
+
+        # Resolve the owning feature the SAME way SecurityFeature registered
+        # its permissions: keyed by the agent.features name (feature.name).
+        for feature_name, feature in features.items():
+            if not hasattr(feature, "get_tools"):
+                continue
+            try:
+                tools = feature.get_tools()
+            except Exception:
+                # A misbehaving feature must not block creation validation.
+                continue
+            for agent_tool in tools:
+                if agent_tool.name == task_name:
+                    try:
+                        level = await store.get_permission(
+                            feature_name, agent_tool.name
+                        )
+                    except Exception:
+                        return False
+                    return level == PermissionLevel.DENY
+        return False
 
     async def _handle_backup_snapshot(self, args: dict) -> str:
         """ACTION handler for the `backup_snapshot` cron source. Hits
@@ -1172,6 +1304,24 @@ class SchedulerFeature(Feature):
                     "success": False,
                     "task_name": task_name,
                     "valid_task_names": sorted(valid_names),
+                },
+            )
+
+        # Reject DENY-listed tools at creation time (F245). The tick-path
+        # executor (_run_tool_hook_gated) already blocks a DENY/ASK tool on
+        # every tick, but a DENY tool is *statically* forbidden — persisting
+        # it would just guarantee a failed run on every fire. Refuse up front
+        # with a clear policy error instead of a silent perpetual failure.
+        if await self._scheduled_task_denied(task_name):
+            return ToolResult.failed(
+                f"Scheduled task '{task_name}' is DENY-listed by security "
+                f"policy and cannot be scheduled — every tick would be "
+                f"blocked by the PRE_TOOL_USE gate. Grant it a non-DENY "
+                f"permission (or choose a different task) to schedule it.",
+                data={
+                    "success": False,
+                    "task_name": task_name,
+                    "denied_by_policy": True,
                 },
             )
 

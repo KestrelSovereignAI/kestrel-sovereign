@@ -39,7 +39,7 @@ from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
-from kestrel_sovereign.hooks import HooksManager
+from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.security.input_guardrails import (
@@ -2962,8 +2962,12 @@ Expected Duration: {expected_duration}
             hook_output = await self.hooks_manager.execute_hooks(
                 HookEvent.USER_PROMPT_SUBMIT, hook_input
             )
-            if hook_output.permission_decision == PermissionDecision.DENY:
-                return f"[Input rejected: {hook_output.permission_reason}]"
+            # DENY and ASK both block the prompt (F038): an ASK on
+            # USER_PROMPT_SUBMIT gates the turn behind approval, so it
+            # must not fall through and run.
+            blocked = evaluate_blocking_decision(hook_output)
+            if blocked is not None:
+                return f"[Input rejected: {blocked.reason}]"
             # The manager applies updated_input to hook_input.tool_input;
             # check if hooks modified the user_message via that path.
             if hook_input.tool_input and "user_message" in hook_input.tool_input:

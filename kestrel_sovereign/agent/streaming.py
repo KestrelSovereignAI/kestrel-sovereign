@@ -7,6 +7,7 @@ import time
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.agent.parts import (
     PART_SENTINEL_PREFIX,
@@ -673,8 +674,12 @@ class StreamingMixin:
             hook_output = await self.hooks_manager.execute_hooks(
                 HookEvent.USER_PROMPT_SUBMIT, hook_input
             )
-            if hook_output.permission_decision == PermissionDecision.DENY:
-                yield f"[Input rejected: {hook_output.permission_reason}]"
+            # DENY and ASK both block the prompt (F038): an ASK on
+            # USER_PROMPT_SUBMIT gates the turn behind approval, so it
+            # must not fall through and run.
+            blocked = evaluate_blocking_decision(hook_output)
+            if blocked is not None:
+                yield f"[Input rejected: {blocked.reason}]"
                 return
             # The manager applies updated_input to hook_input.tool_input;
             # check if hooks modified the user_message via that path.

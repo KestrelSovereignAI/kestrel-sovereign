@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
     ToolDispatchEntry,
     infer_tool_result_status,
@@ -545,10 +546,17 @@ class OrchestratorEngineMixin:
             hook_input,
         )
 
-        if hook_output.permission_decision == PermissionDecision.DENY:
-            reason = hook_output.permission_reason or "Blocked by security policy"
-            logging.info(f"[HOOKS] Tool denied: {feature_name}.{tool_name} - {reason}")
-            return {"success": False, "error": f"Permission denied: {reason}"}
+        # DENY and ASK are BOTH blocking (F038): an ASK routes the call
+        # to the approval queue and the tool MUST NOT run until approval
+        # lands. The shared gate keeps this contract identical to
+        # ``execute_named_tool`` and the subagent/scheduler paths.
+        blocked = evaluate_blocking_decision(hook_output)
+        if blocked is not None:
+            logging.info(
+                "[HOOKS] Tool blocked (%s): %s.%s - %s",
+                blocked.decision.value, feature_name, tool_name, blocked.reason,
+            )
+            return blocked.envelope
 
         args = (
             hook_output.updated_input
@@ -905,21 +913,15 @@ class OrchestratorEngineMixin:
         # routing the call to an approval queue and the tool MUST NOT
         # run until that approval lands.  Surfaced to the caller as a
         # tool-shaped error so the realtime model can self-correct
-        # rather than wedge the session waiting on a side channel.
-        if pre_output.permission_decision == PermissionDecision.DENY:
-            reason = pre_output.permission_reason or "Blocked by security policy"
+        # rather than wedge the session waiting on a side channel. The
+        # shared gate keeps this identical across every dispatch surface.
+        blocked = evaluate_blocking_decision(pre_output)
+        if blocked is not None:
             logging.info(
-                "[GOVERNED-DISPATCH] denied source=%s tool=%s reason=%s",
-                source, tool_name, reason,
+                "[GOVERNED-DISPATCH] blocked (%s) source=%s tool=%s reason=%s",
+                blocked.decision.value, source, tool_name, blocked.reason,
             )
-            return {"success": False, "error": f"Permission denied: {reason}"}
-        if pre_output.permission_decision == PermissionDecision.ASK:
-            reason = pre_output.permission_reason or "Requires approval"
-            logging.info(
-                "[GOVERNED-DISPATCH] approval_required source=%s tool=%s reason=%s",
-                source, tool_name, reason,
-            )
-            return {"success": False, "error": f"Approval required: {reason}"}
+            return blocked.envelope
 
         # Honor hook-rewritten args at execution time.  Use explicit
         # ``is not None`` checks rather than truthiness — a hook may
@@ -1078,16 +1080,13 @@ class OrchestratorEngineMixin:
         if _capture is not None:
             _capture["effective_args"] = post_hook_args
 
-        if pre_output.permission_decision == PermissionDecision.DENY:
-            reason = pre_output.permission_reason or "Blocked by security policy"
+        blocked = evaluate_blocking_decision(pre_output)
+        if blocked is not None:
             logging.info(
-                "[GOVERNED-DISPATCH] subagent denied source=%s feature=%s reason=%s",
-                source, feature_name, reason,
+                "[GOVERNED-DISPATCH] subagent blocked (%s) source=%s feature=%s reason=%s",
+                blocked.decision.value, source, feature_name, blocked.reason,
             )
-            return {"success": False, "error": f"Permission denied: {reason}"}
-        if pre_output.permission_decision == PermissionDecision.ASK:
-            reason = pre_output.permission_reason or "Requires approval"
-            return {"success": False, "error": f"Approval required: {reason}"}
+            return blocked.envelope
 
         effective_args = post_hook_args if isinstance(post_hook_args, dict) else args
         task = effective_args.get("task", "")
@@ -1121,24 +1120,15 @@ class OrchestratorEngineMixin:
         # PRE_TOOL_USE can also DENY/ASK (e.g. SecurityHook enforcing
         # a deny-list per-tool); honor that even though the outer
         # PRE_SUBAGENT_CALL already passed.
-        if inner_pre_output.permission_decision == PermissionDecision.DENY:
-            reason = inner_pre_output.permission_reason or "Blocked by security policy"
+        inner_blocked = evaluate_blocking_decision(inner_pre_output)
+        if inner_blocked is not None:
             await self._fire_post_subagent_hook(
                 session_id=session_id, tool_name=tool_name,
                 feature_name=feature_name, effective_args=effective_args,
-                result={"success": False, "error": f"Permission denied: {reason}"},
+                result=inner_blocked.envelope,
                 exec_duration_ms=0,
             )
-            return {"success": False, "error": f"Permission denied: {reason}"}
-        if inner_pre_output.permission_decision == PermissionDecision.ASK:
-            reason = inner_pre_output.permission_reason or "Requires approval"
-            await self._fire_post_subagent_hook(
-                session_id=session_id, tool_name=tool_name,
-                feature_name=feature_name, effective_args=effective_args,
-                result={"success": False, "error": f"Approval required: {reason}"},
-                exec_duration_ms=0,
-            )
-            return {"success": False, "error": f"Approval required: {reason}"}
+            return inner_blocked.envelope
         # Honor inner-MODIFY rewrites for the same reason the outer
         # hook does — a PRE_TOOL_USE redactor on subagent args must
         # apply to the call that actually runs.
@@ -1617,14 +1607,27 @@ class OrchestratorEngineMixin:
         subagent_hook_output = await self.hooks_manager.execute_hooks(
             HookEvent.PRE_SUBAGENT_CALL, subagent_hook_input
         )
-        if subagent_hook_output.permission_decision == PermissionDecision.DENY:
-            reason = subagent_hook_output.permission_reason or "Subagent call blocked by policy"
-            logging.warning(f"[HOOKS] Subagent denied: {hook_feature_name}.{tool_name} - {reason}")
-            result = {"success": False, "error": f"Permission denied: {reason}"}
+        # DENY and ASK both block the subagent dispatch (F038). An ASK
+        # routes to the approval queue; the subagent must NOT run now.
+        blocked = evaluate_blocking_decision(
+            subagent_hook_output,
+            deny_reason_default="Subagent call blocked by policy",
+        )
+        if blocked is not None:
+            reason = blocked.reason
+            logging.warning(
+                "[HOOKS] Subagent blocked (%s): %s.%s - %s",
+                blocked.decision.value, hook_feature_name, tool_name, reason,
+            )
+            result = blocked.envelope
             if dispatch_meta is not None:
                 dispatch_meta.update({
-                    "status": "policy_denied",
-                    "error_class": "PermissionDenied",
+                    "status": (
+                        "approval_required" if blocked.is_ask else "policy_denied"
+                    ),
+                    "error_class": (
+                        "ApprovalRequired" if blocked.is_ask else "PermissionDenied"
+                    ),
                     "error_message": reason,
                 })
 

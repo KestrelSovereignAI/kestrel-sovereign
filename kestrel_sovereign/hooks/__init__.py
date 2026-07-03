@@ -25,6 +25,10 @@ Usage:
     manager.register(MyHook(name="my_hook", events=[HookEvent.PRE_TOOL_USE]))
 """
 
+from kestrel_sovereign.hooks.decision_gate import (
+    BlockedDecision,
+    evaluate_blocking_decision,
+)
 from kestrel_sovereign.hooks.manager import HooksManager
 
-__all__ = ["HooksManager"]
+__all__ = ["HooksManager", "BlockedDecision", "evaluate_blocking_decision"]
