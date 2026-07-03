@@ -145,6 +145,12 @@ function _syncNav() {
             const built = _buildTab(def);
             const ref = def.before ? _tabFor(def.before) : null;
             _navEl.insertBefore(built, ref || null);
+        } else {
+            // Adopt an in-place tab (a core panel still declared in index.html):
+            // mark it registry-owned so core's PANEL_CAPABILITIES re-gate
+            // (reconcileNavigationCapabilities) leaves gating to this registry's
+            // own `gate` — a single gating mechanism per tab (#2145).
+            tab.dataset.panelRegistry = 'true';
         }
         _ensurePanelContainer(def);
     }

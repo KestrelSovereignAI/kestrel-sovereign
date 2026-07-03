@@ -296,14 +296,13 @@ function buildMockDocument(panelIds, { activePanel = null } = {}) {
     };
 }
 
-// Lightweight reconstruction of the gating logic for unit-style coverage.
-// Mirrors the PANEL_CAPABILITIES map in identity.js so the test asserts the
-// public contract (which panel-IDs map to which caps) without having to
-// import the whole identity.js module — that pulls in chat.js, ui.js, and
-// the identicon canvas wrapper, none of which are testable under bare
-// node:test.  When PANEL_CAPABILITIES changes in identity.js, this map
-// must change too — keeping them in lockstep is the contract this test
-// guards.
+// #2145: core-panel gating migrated off the static PANEL_CAPABILITIES map in
+// identity.js onto per-panel `gate` predicates in the ui-ext panel registry
+// (core-panels.js). This mirror reconstructs the SAME contract (which panel-IDs
+// gate on which caps) so the historical gating assertions below still hold, and
+// the drift detector now reads the live gate predicates out of core-panels.js.
+// `chat` is NOT a registry panel — it keeps a small inline gate in
+// initNavigation (`API.hasCapability('chat')`) because it has its own mount().
 const PANEL_CAPABILITIES_FOR_TEST = {
     identity: ['identity'],
     chat: ['chat'],
@@ -311,14 +310,12 @@ const PANEL_CAPABILITIES_FOR_TEST = {
     memories: ['memory'],
     tasks: ['tasks'],
     sovereignty: ['sovereignty'],
-    // `storage` is intentionally absent here — see the comment above
-    // PANEL_CAPABILITIES in identity.js.  When a real storage-stats section
-    // lands, add it here AND in identity.js together.
+    // `storage` is intentionally absent — the resources panel has no
+    // storage-stats section today; only keys + wallet gate it.
     resources: ['keys', 'wallet'],
     metrics: ['metrics'],
-    // `spawn` was extracted into the spawn feature package (#2048): its panel is
-    // registry-contributed and gated by the feature's enabled state, no longer
-    // a static PANEL_CAPABILITIES entry. Kept out of this mirror to match.
+    // `spawn` is a feature-package registry panel gated by the feature's enabled
+    // state, never a core gate entry — kept out of this mirror to match.
     features: ['featureStore'],
     security: ['audit', 'permissions'],
     approvals: ['permissions'],
@@ -330,21 +327,55 @@ function panelIsEnabled(client, panelId) {
     return caps.some((cap) => client.hasCapability(cap));
 }
 
-test('PANEL_CAPABILITIES_FOR_TEST mirrors PANEL_CAPABILITIES in identity.js', async () => {
-    // Drift detector — read the live map out of identity.js source (without
-    // executing it) and compare.  If identity.js ships a new panel and we
-    // forget to update the test mirror, this fails loudly.
+test('core panel gates evaluate exactly like the PANEL_CAPABILITIES contract', async () => {
+    // Drift detector — evaluate each live `gate` from core-panels.js against a
+    // stub API and compare to the historical PANEL_CAPABILITIES semantics. If a
+    // panel's gate diverges (or a core panel is added/removed) this fails loudly.
+    const { CORE_PANEL_DEFS } = await import(
+        '../../kestrel_sovereign/static/js/ui-ext/core-panels.js'
+    );
+
+    // Registry-owned core panels are every entry in the mirror EXCEPT chat
+    // (chat is gated inline in initNavigation, not the registry).
+    const expectedIds = Object.keys(PANEL_CAPABILITIES_FOR_TEST)
+        .filter((id) => id !== 'chat')
+        .sort();
+    assert.deepEqual(
+        CORE_PANEL_DEFS.map((d) => d.panelId).sort(),
+        expectedIds,
+        'core-panels.js drifted from the PANEL_CAPABILITIES mirror — update both',
+    );
+
+    // Build a capabilities-driven stub API and check gate === "any listed cap on".
+    const combos = [
+        {},
+        { keys: false, wallet: false },
+        { audit: false },
+        { permissions: false },
+        { audit: false, permissions: false },
+        { keys: false },
+        { wallet: false },
+    ];
+    for (const caps of combos) {
+        const api = { hasCapability: (k) => caps[k] !== false };
+        for (const def of CORE_PANEL_DEFS) {
+            const expected = panelIsEnabled(api, def.panelId);
+            assert.equal(
+                !!def.gate(api),
+                expected,
+                `gate for ${def.panelId} disagrees with PANEL_CAPABILITIES for caps=${JSON.stringify(caps)}`,
+            );
+        }
+    }
+
+    // identity.js gates chat inline (not via the registry).
     const fs = await import('node:fs');
     const url = new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url);
     const src = fs.readFileSync(url, 'utf-8');
-    const match = src.match(/const PANEL_CAPABILITIES = (\{[\s\S]*?^\};)/m);
-    assert.ok(match, 'PANEL_CAPABILITIES const not found in identity.js');
-    // Crude parse: look at every key listed in the literal.
-    const keys = [...match[1].matchAll(/^\s+(\w+):\s*\[/gm)].map((m) => m[1]);
-    assert.deepEqual(
-        keys.sort(),
-        Object.keys(PANEL_CAPABILITIES_FOR_TEST).sort(),
-        'identity.js PANEL_CAPABILITIES drifted from the test mirror — update both',
+    assert.match(
+        src,
+        /hasCapability\('chat'\)/,
+        'chat must retain an inline capability gate in identity.js',
     );
 });
 
