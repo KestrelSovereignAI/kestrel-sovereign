@@ -421,6 +421,21 @@ async def lifespan(app: FastAPI):
             except Exception as exc:  # noqa: BLE001 - never block startup on this
                 logger.warning("Could not install A2A DID resolver: %s", exc)
 
+            # Fleet-idleness (#F235): a whole-host restart kills every agent in
+            # this process, so RestartCoordinator's idle_agents_only gate must
+            # require the WHOLE fleet idle. Give each co-hosted agent a provider
+            # that returns every agent so the gate can check siblings, not just
+            # the requester. Single-agent hosts never reach here and keep the
+            # requester-only check.
+            try:
+                from kestrel_sovereign.features.restart_coordinator.feature import (
+                    install_fleet_idle_provider,
+                )
+
+                install_fleet_idle_provider(manager)
+            except Exception as exc:  # noqa: BLE001 - never block startup on this
+                logger.warning("Could not install fleet-idle provider: %s", exc)
+
             # Lifecycle hardening (#377): surface per-agent init failures
             # — without this, a multi-agent host whose providers all failed
             # would report healthy startup while every agent was mute.

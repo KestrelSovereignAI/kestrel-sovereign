@@ -172,6 +172,27 @@ def _is_infra_background_task(task) -> bool:
     return name.startswith(_INFRA_TASK_PREFIXES)
 
 
+def install_fleet_idle_provider(manager) -> None:
+    """Wire every co-hosted agent so RestartCoordinator can gate a whole-host
+    restart on the WHOLE fleet's idleness (#F235).
+
+    A whole-host restart kills every agent in the process, so an
+    ``idle_agents_only`` request must defer while ANY co-hosted agent is mid
+    turn — not just the requester. Each agent gets ``_cohosted_agents_provider``,
+    a callable returning every agent in the manager (resolved live, so agents
+    registered later are seen). Single-agent hosts never call this, so those
+    agents keep the requester-only check. Idempotent.
+    """
+    def provider():
+        return list(manager.list_agents().values())
+
+    for agent in manager.list_agents().values():
+        try:
+            agent._cohosted_agents_provider = provider
+        except Exception:  # pragma: no cover - defensive (read-only proxy, etc.)
+            continue
+
+
 class RestartCoordinatorFeature(Feature):
     """Durable restart-request surface for agents (#1512)."""
 
@@ -921,7 +942,7 @@ class RestartCoordinatorFeature(Feature):
         # it is the only thing in flight — ignore the requester's own
         # marker for this specific row (#1561). Other active requests are
         # still respected so a busy agent stays protected.
-        idle = self._agent_appears_idle(
+        idle = self._fleet_idle(
             ignore_request_id=getattr(req, "requester_request_id", "") or "",
         )
         if idle["idle"]:
@@ -950,10 +971,50 @@ class RestartCoordinatorFeature(Feature):
             "reason": f"agent busy ({idle['reason']})",
         }
 
+    def _fleet_idle(self, ignore_request_id: str = "") -> Dict[str, Any]:
+        """Idleness across ALL agents co-hosted in this process (#F235).
+
+        A whole-host restart kills every agent in the process, so
+        ``idle_agents_only`` must require the WHOLE FLEET idle — not just the
+        requester. Previously it checked only ``self.agent``, so a sibling
+        agent mid-turn was silently killed with its partial output lost.
+
+        The multi-agent host installs ``agent._cohosted_agents_provider`` (a
+        callable returning every co-hosted agent) at load time. When absent
+        (single-agent host, or unwired), this degrades to the requester-only
+        check — behaviour-preserving for the single-agent case. Only the
+        REQUESTING agent excludes its own requester marker; a sibling defers
+        the restart on ANY active request.
+        """
+        provider = getattr(self.agent, "_cohosted_agents_provider", None)
+        if provider is None:
+            return self._agent_appears_idle(ignore_request_id=ignore_request_id)
+        try:
+            agents = list(provider() or [])
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("restart_coordinator: fleet provider failed: %s", e)
+            return self._agent_appears_idle(ignore_request_id=ignore_request_id)
+        if not agents:
+            agents = [self.agent]
+        for other in agents:
+            excl = ignore_request_id if other is self.agent else ""
+            state = self._agent_appears_idle(ignore_request_id=excl, agent=other)
+            if not state["idle"]:
+                name = getattr(other, "name", None) or getattr(other, "did", "?")
+                return {
+                    "idle": False,
+                    "reason": f"co-hosted agent {name} busy ({state['reason']})",
+                }
+        return {"idle": True, "reason": ""}
+
     def _agent_appears_idle(
-        self, ignore_request_id: str = "",
+        self, ignore_request_id: str = "", agent: Any = None,
     ) -> Dict[str, Any]:
-        """Idle check against the agent's own in-flight surface.
+        """Idle check against an agent's in-flight surface.
+
+        ``agent`` defaults to ``self.agent`` (the requesting agent). Passing a
+        co-hosted sibling agent lets the fleet-idleness gate (#F235) evaluate
+        every agent sharing this host process, not just the requester.
 
         The default ``KestrelAgent`` exposes ``_active_request_ids``
         (set of in-flight cognition request IDs) and
@@ -976,8 +1037,10 @@ class RestartCoordinatorFeature(Feature):
         gate (codex P1 on PR #1512 round 1). Hosts that want eager
         restarts can use ``allow_busy_after_timeout``.
         """
+        if agent is None:
+            agent = self.agent
         any_surface_seen = False
-        dispatcher = getattr(self.agent, "dispatcher", None)
+        dispatcher = getattr(agent, "dispatcher", None)
         if dispatcher is not None:
             for attr in ("in_flight_signals", "active_count"):
                 if hasattr(dispatcher, attr):
@@ -997,7 +1060,7 @@ class RestartCoordinatorFeature(Feature):
                         # handles it.
                         continue
 
-        active_ids = getattr(self.agent, "_active_request_ids", None)
+        active_ids = getattr(agent, "_active_request_ids", None)
         if active_ids is not None:
             any_surface_seen = True
             # A finished/abandoned stream should have been cleared by the
@@ -1006,7 +1069,7 @@ class RestartCoordinatorFeature(Feature):
             # registered forever, permanently blocking `idle_agents_only`
             # restarts (#1558). Sweep ids older than the staleness window
             # before counting so a stale marker can never deadlock us.
-            pruner = getattr(self.agent, "prune_stale_active_requests", None)
+            pruner = getattr(agent, "prune_stale_active_requests", None)
             if callable(pruner):
                 try:
                     pruned = pruner(STALE_ACTIVE_REQUEST_SECONDS)
@@ -1038,11 +1101,11 @@ class RestartCoordinatorFeature(Feature):
                     "idle": False,
                     "reason": (
                         f"{n} active request id(s)"
-                        f"{self._active_request_age_suffix(ignore_request_id)}"
+                        f"{self._active_request_age_suffix(ignore_request_id, agent=agent)}"
                     ),
                 }
 
-        bg_tasks = getattr(self.agent, "_background_tasks", None)
+        bg_tasks = getattr(agent, "_background_tasks", None)
         if bg_tasks is not None:
             any_surface_seen = True
             try:
@@ -1074,7 +1137,9 @@ class RestartCoordinatorFeature(Feature):
             }
         return {"idle": True, "reason": ""}
 
-    def _active_request_age_suffix(self, ignore_request_id: str = "") -> str:
+    def _active_request_age_suffix(
+        self, ignore_request_id: str = "", agent: Any = None,
+    ) -> str:
         """Append the oldest active-request age to a busy deferral reason.
 
         Observability for #1558: when a restart defers on ``agent busy``,
@@ -1084,7 +1149,9 @@ class RestartCoordinatorFeature(Feature):
         so the reported age reflects only the requests still blocking the
         restart (#1561).
         """
-        ages_fn = getattr(self.agent, "active_request_ages", None)
+        if agent is None:
+            agent = self.agent
+        ages_fn = getattr(agent, "active_request_ages", None)
         if not callable(ages_fn):
             return ""
         try:
