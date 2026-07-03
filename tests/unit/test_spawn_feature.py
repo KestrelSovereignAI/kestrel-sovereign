@@ -2,7 +2,6 @@
 
 import asyncio
 import pytest
-from decimal import Decimal
 from kestrel_sdk.tools.result import ToolResultStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,45 +9,14 @@ from pathlib import Path
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
-from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle, SpawnStatus
+from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
-class _FakeWallet:
-    """Minimal WalletAgent stand-in for the delegated-wallet contract
-    (can_afford / transfer / deposit / _balances, reconstructable via type())."""
-
-    def __init__(self, agent_id="w", initial_balance=Decimal("100"), initial_currency="FIL"):
-        self.agent_id = agent_id
-        self._balances = {initial_currency: {"main": Decimal(str(initial_balance))}}
-        self._currency = initial_currency
-
-    async def initialize(self):
-        pass
-
-    def can_afford(self, amount, currency=None):
-        cur = currency or self._currency
-        return self._balances.get(cur, {}).get("main", Decimal("0")) >= amount
-
-    def get_balance(self, currency=None, balance_type="main"):
-        return self._balances.get(currency or self._currency, {}).get(balance_type, Decimal("0"))
-
-    async def transfer(self, amount, memo="", currency=None):
-        self._balances[currency or self._currency]["main"] -= amount
-        return True
-
-    async def deposit(self, amount, currency=None, to_audit=False, memo=""):
-        cur = currency or self._currency
-        self._balances.setdefault(cur, {"main": Decimal("0")})["main"] += amount
-        return True
-
-
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
-    """Create a mock KestrelAgent (no wallet by default; tests opt in)."""
+    """Create a mock KestrelAgent."""
     agent = MagicMock()
     agent.agent_id = agent_id
-    agent.wallet = None
-    agent.wallet_agent = None
     agent.initialize = AsyncMock()
     agent.shutdown = AsyncMock()
     agent.process_input = AsyncMock(return_value="task completed")
@@ -71,7 +39,6 @@ def _make_spawn_feature(parent_agent=None, manager=None):
     feature._agent_manager = manager
     feature._child_results = {}
     feature._child_tasks = {}
-    feature._delegated_wallets = {}
     return feature
 
 
@@ -151,7 +118,6 @@ class TestSpawnFeatureWithManager:
     @pytest.mark.asyncio
     async def test_spawn_agent_success(self):
         parent = _make_mock_agent("did:parent")
-        parent.wallet = _FakeWallet(initial_balance=Decimal("100"))  # fund the hold
         child = _make_mock_agent("did:child")
 
         manager = MagicMock()
@@ -161,7 +127,6 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.spawn_agent(
             name="helper",
             purpose="assist with research",
-            budget=10.0,
             ttl=1800,
             constraints="max_tokens=1000,no_web",
             features="memory,web_search",
@@ -170,19 +135,12 @@ class TestSpawnFeatureWithManager:
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["child_name"] == "helper"
         assert envelope.data["child_did"] == "did:child"
-        # #F278: the budget was HELD (parent debited, child delegated wallet
-        # funded) — not a silent no-op.
-        assert envelope.data["budget_held"] == "10.0"
-        assert parent.wallet.get_balance() == Decimal("90")
-        assert getattr(child, "_delegated_wallet", None) is not None
-        assert "helper" in feature._delegated_wallets
 
         # Verify mandate was constructed correctly
         call_args = manager.spawn_agent.call_args
         mandate = call_args.kwargs["mandate"]
         assert mandate.parent_did == "did:parent"
         assert mandate.purpose == "assist with research"
-        assert mandate.budget_allocation == 10.0
         assert mandate.ttl_seconds == 1800
         assert mandate.additional_constraints == {"max_tokens": "1000", "no_web": "true"}
         # Shorthand feature names are canonicalized to their class names so the
@@ -239,16 +197,16 @@ class TestSpawnFeatureWithManager:
         await asyncio.sleep(0.1)
         assert "helper" in feature._child_tasks
         # #F279: completing a delegated task records the result but must NOT
-        # finalize/terminate the child — report_result (which runs
+        # finalize/terminate the child. report_result (which runs
         # _terminate_and_cleanup) is NOT called per task, so the child stays
         # alive for the next delegate_task / get_child_result.
         manager._lifecycle.report_result.assert_not_awaited()
         assert feature._child_results["helper"]["success"] is True
 
     @pytest.mark.asyncio
-    async def test_delegate_twice_to_same_child_keeps_it_alive(self):
+    async def test_delegate_twice_keeps_child_alive(self):
         """#F279: the documented spawn → delegate → get_result → delegate-again
-        flow. A second delegate must succeed (child not killed by the first)."""
+        flow. A second delegate must succeed (first task didn't kill the child)."""
         parent = _make_mock_agent("did:parent")
         child = _make_mock_agent("did:child")
         manager = MagicMock()
@@ -270,10 +228,11 @@ class TestSpawnFeatureWithManager:
         manager.terminate_child.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_spawn_budget_without_wallet_is_rejected(self):
-        """#F278: a positive budget with no parent wallet must FAIL clearly, not
-        be silently accepted and never enforced."""
-        parent = _make_mock_agent("did:parent")  # no wallet by default
+    async def test_spawn_positive_budget_is_rejected(self):
+        """#F278: a per-child budget CEILING is not yet enforced, so a positive
+        budget is rejected clearly rather than silently accepted as a no-op
+        control."""
+        parent = _make_mock_agent("did:parent")
         manager = MagicMock()
         manager.spawn_agent = AsyncMock(return_value=_make_mock_agent("did:child"))
 
@@ -281,65 +240,8 @@ class TestSpawnFeatureWithManager:
         envelope = await feature.spawn_agent(name="helper", purpose="x", budget=5.0)
 
         assert envelope.status is ToolResultStatus.ERROR
-        assert "wallet" in envelope.error.lower()
+        assert "budget" in envelope.error.lower()
         manager.spawn_agent.assert_not_awaited()  # rejected before spawning
-
-    @pytest.mark.asyncio
-    async def test_child_budget_released_on_terminate(self):
-        """#F278: terminating a budgeted child credits the unspent hold back to
-        the parent via the lifecycle on_terminate callback."""
-        parent = _make_mock_agent("did:parent")
-        parent.wallet = _FakeWallet(initial_balance=Decimal("100"))
-        child = _make_mock_agent("did:child")
-        manager = MagicMock()
-        manager.spawn_agent = AsyncMock(return_value=child)
-        manager.terminate_child = AsyncMock()
-        lifecycle = SpawnedAgentLifecycle(manager)
-        manager._lifecycle = lifecycle
-
-        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        await feature.spawn_agent(name="helper", purpose="x", budget=30.0, ttl=0)
-        assert parent.wallet.get_balance() == Decimal("70")  # held
-        assert feature._release_child_budget in lifecycle._on_terminate_callbacks
-
-        # Simulate any termination path (all funnel through _terminate_and_cleanup).
-        await lifecycle._terminate_and_cleanup("helper", SpawnStatus.TERMINATED)
-        # Unspent 30 returned → back to 100; wallet entry released.
-        assert parent.wallet.get_balance() == Decimal("100")
-        assert "helper" not in feature._delegated_wallets
-
-    @pytest.mark.asyncio
-    async def test_budget_release_isolated_across_parents(self):
-        """#F278 codex P2: a SHARED lifecycle serves many parents. Terminating
-        one parent's child must not touch another parent's wallet map, and each
-        parent's held budget is released to ITS wallet."""
-        lifecycle_mgr = MagicMock()
-        lifecycle_mgr.terminate_child = AsyncMock()
-        lifecycle = SpawnedAgentLifecycle(lifecycle_mgr)
-        lifecycle_mgr._lifecycle = lifecycle
-
-        parent_a = _make_mock_agent("did:A")
-        parent_a.wallet = _FakeWallet(initial_balance=Decimal("100"))
-        parent_b = _make_mock_agent("did:B")
-        parent_b.wallet = _FakeWallet(initial_balance=Decimal("50"))
-        lifecycle_mgr.spawn_agent = AsyncMock(
-            side_effect=lambda **kw: _make_mock_agent("did:" + kw["name"])
-        )
-
-        feat_a = _make_spawn_feature(parent_agent=parent_a, manager=lifecycle_mgr)
-        feat_b = _make_spawn_feature(parent_agent=parent_b, manager=lifecycle_mgr)
-        await feat_a.spawn_agent(name="childA", purpose="x", budget=40.0, ttl=0)
-        await feat_b.spawn_agent(name="childB", purpose="x", budget=20.0, ttl=0)
-
-        # Both callbacks registered on the one shared lifecycle.
-        assert len(lifecycle._on_terminate_callbacks) == 2
-
-        # Terminate A's child: only A's wallet is credited back; B untouched.
-        await lifecycle._terminate_and_cleanup("childA", SpawnStatus.TERMINATED)
-        assert parent_a.wallet.get_balance() == Decimal("100")  # 40 returned
-        assert parent_b.wallet.get_balance() == Decimal("30")   # still held
-        assert "childA" not in feat_a._delegated_wallets
-        assert "childB" in feat_b._delegated_wallets
 
     @pytest.mark.asyncio
     async def test_delegate_task_not_our_child(self):

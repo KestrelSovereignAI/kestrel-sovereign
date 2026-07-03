@@ -123,23 +123,6 @@ class SpawnedAgentLifecycle:
         self._tracked: Dict[str, _TrackedChild] = {}
         self._results: Dict[str, SpawnResult] = {}
         self._lock = asyncio.Lock()
-        # Async callbacks invoked with the child_name on EVERY termination path
-        # (report_result finalize, explicit terminate, TTL expiry, parent
-        # shutdown), since all funnel through ``_terminate_and_cleanup``. A
-        # SHARED lifecycle serves many parents, each with its own SpawnFeature;
-        # every SpawnFeature registers its ``_release_child_budget`` here, and
-        # each releases ONLY the children it owns (no-op otherwise), so one
-        # parent's callback can't clobber another's (#F278).
-        self._on_terminate_callbacks: list = []
-
-    def add_terminate_callback(self, callback: Any) -> None:
-        """Register an async ``callback(child_name)`` fired on any termination.
-
-        Idempotent: the same callable is registered at most once, so repeated
-        spawns by the same parent don't stack duplicate releases.
-        """
-        if callback not in self._on_terminate_callbacks:
-            self._on_terminate_callbacks.append(callback)
 
     def create_ephemeral_dir(self) -> str:
         """Create a temporary directory for an ephemeral child agent.
@@ -384,19 +367,6 @@ class SpawnedAgentLifecycle:
         tracked = self._tracked.get(child_name)
         if tracked is None:
             return
-
-        # Release the child's delegated budget wallet (#F278) BEFORE the agent
-        # is torn down, crediting any unspent hold back to the parent. Runs on
-        # every termination path (this is the single funnel). Best-effort: a
-        # release failure must not block termination/cleanup. Every registered
-        # parent callback is invoked; each releases only its own children.
-        for cb in list(self._on_terminate_callbacks):
-            try:
-                await cb(child_name)
-            except Exception as e:  # noqa: BLE001 - never block cleanup
-                logger.error(
-                    "on_terminate callback failed for '%s': %s", child_name, e,
-                )
 
         # Terminate via AgentManager (handles cascading grandchildren)
         try:
