@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Effectively-unbounded read ceiling for whole-transcript scans (hierarchical
+# compaction). Matches the prior no-limit get_full_history() scope while still
+# bounding a pathological read.
+_COMPACT_HISTORY_LIMIT = 1_000_000
+
 
 class MemoryManager:
     """
@@ -817,10 +822,30 @@ class MemoryManager:
             Result dict with compaction stats
         """
         # Get conversation history
+        # Read the SAME source compact_session uses (not get_full_history):
+        # id-bearing (so originals can be EXCLUDED, not merely have a summary
+        # appended — appending grew context instead of compacting, F153),
+        # exclusion-filtered (already-compacted/stashed rows are skipped so
+        # repeated runs don't re-summarize a prior marker), and canonical/
+        # transport-resolved. High limit captures the whole history.
         history = []
         conv_store = self._get_conversation_store()
         if conv_store:
-            history = await conv_store.get_full_history()
+            # Effectively unbounded: the prior get_full_history() scan had no
+            # limit, and hierarchical compaction exists precisely to handle very
+            # long transcripts — a smaller cap would leave the oldest rows out of
+            # both the marker and the preserved tail (codex P2). The high ceiling
+            # still guards against a pathological unbounded read.
+            history = await conv_store.get_conversation_history(limit=_COMPACT_HISTORY_LIMIT)
+
+        # Never compact STASHED rows. get_conversation_history filters
+        # excluded_from_context but not `stashed`, and stash_pop/stash_apply
+        # clear only the `stashed` flag — if compaction marked a stashed row
+        # excluded_from_context, popping it would leave it permanently hidden
+        # from context (codex P2). Stashed messages are managed by stash/pop.
+        history = [
+            m for m in history if not (m.get("metadata") or {}).get("stashed")
+        ]
 
         message_count = len(history)
 
@@ -870,11 +895,34 @@ class MemoryManager:
                 max_depth=max_depth
             )
 
+            final_summary = (final_summary or "").strip()
+            # An empty summary would exclude real history behind nothing —
+            # refuse rather than destroy context (mirrors compact_session).
+            if not final_summary:
+                return {
+                    "success": False,
+                    "reason": "Summarizer returned empty text",
+                    "message_count": message_count,
+                }
+
             tokens_after = counter.count(final_summary)
             tokens_saved = tokens_before - tokens_after
 
-            # Store compaction result
+            # Collect the ids of the messages this summary replaces so the
+            # marker can (a) record what it covers and (b) exclude them from
+            # context. Without this the summary is merely APPENDED and the
+            # window grows (F153).
+            original_message_ids = [m.get("id") for m in to_compact if m.get("id")]
+            first_id = original_message_ids[0] if original_message_ids else None
+            last_id = original_message_ids[-1] if original_message_ids else None
+
+            # Store compaction result. A unique token lets us resolve the
+            # marker's row id WITHOUT an ``ORDER BY id DESC LIMIT 1`` guess, which
+            # would race a concurrent turn writing between the insert and the
+            # lookup and attach the originals to the wrong row (codex P2).
+            import uuid
             from datetime import datetime, timezone
+            marker_token = uuid.uuid4().hex
             compaction_marker = {
                 "role": "system",
                 "content": f"[HIERARCHICAL COMPACTION - {len(to_compact)} messages, {len(chunks)} chunks]\n\n{final_summary}",
@@ -884,17 +932,47 @@ class MemoryManager:
                     "chunks_processed": len(chunks),
                     "tokens_before": tokens_before,
                     "tokens_after": tokens_after,
-                    "compacted_at": datetime.now(timezone.utc).isoformat()
+                    "compacted_at": datetime.now(timezone.utc).isoformat(),
+                    # recursive_query('compacted:<marker_id>') resolves these.
+                    "original_message_ids": original_message_ids,
+                    "message_range": {"first": first_id, "last": last_id},
+                    "compaction_token": marker_token,
                 }
             }
 
-            # Store via conversation store
+            # Store the marker, then EXCLUDE the originals and link them to it
+            # (the compaction contract compact_session established).
             if conv_store:
                 await conv_store.add_conversation(
                     role="system",
                     content=compaction_marker["content"],
-                    metadata=compaction_marker["metadata"]
+                    metadata=compaction_marker["metadata"],
                 )
+
+                # Resolve the marker's id by its unique token (metadata is stored
+                # as plaintext JSON), so a concurrent insert can't be mistaken
+                # for the marker.
+                compaction_marker_id = None
+                if hasattr(conv_store, "db"):
+                    row = await conv_store.db.fetchone(
+                        "SELECT id FROM conversation_history "
+                        "WHERE agent_id = ? AND metadata LIKE ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (conv_store.agent_id, f"%{marker_token}%"),
+                    )
+                    compaction_marker_id = row[0] if row else None
+
+                if compaction_marker_id and original_message_ids:
+                    now = datetime.now(timezone.utc).isoformat()
+                    await conv_store.update_messages_metadata(
+                        original_message_ids,
+                        {
+                            "excluded_from_context": True,
+                            "excluded_at": now,
+                            "excluded_reason": "Replaced by hierarchical compaction",
+                            "summarized_into": str(compaction_marker_id),
+                        },
+                    )
 
             logger.info(
                 f"Hierarchical compaction complete: {len(to_compact)} messages → summary, "

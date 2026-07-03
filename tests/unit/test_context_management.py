@@ -1455,13 +1455,19 @@ class TestRLMInspiredFeatures:
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         storage, conv_store = mock_storage_with_conv
-        # Create enough messages for hierarchical compaction
+        # id-bearing (ids ≥ 1, as autoincrement produces), read from the
+        # exclusion-filtered/canonical get_conversation_history — the source the
+        # fix reads (F153), NOT get_full_history.
         messages = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"Message {i} with content " * 50}
-            for i in range(30)
+            {"id": i, "role": "user" if i % 2 else "assistant",
+             "content": f"Message {i} with content " * 50}
+            for i in range(1, 31)
         ]
-        conv_store.get_full_history = AsyncMock(return_value=messages)
+        conv_store.get_conversation_history = AsyncMock(return_value=messages)
         conv_store.add_conversation = AsyncMock()
+        conv_store.update_messages_metadata = AsyncMock(return_value=25)
+        conv_store.agent_id = "test"
+        conv_store.db.fetchone = AsyncMock(return_value=(999,))  # marker row id
 
         manager = ContextManager(storage=storage, model="gpt-4", agent_id="test")
         result = await manager.hierarchical_compact(
@@ -1476,15 +1482,32 @@ class TestRLMInspiredFeatures:
         assert result["chunks_processed"] > 1  # Multiple chunks
         assert "tokens_saved" in result
 
+        # F153 contract: the marker records what it covers, and the originals
+        # are EXCLUDED and linked back to the marker (so context shrinks, not
+        # grows, and recursive_query('compacted:<id>') can resolve them).
+        marker_meta = conv_store.add_conversation.await_args.kwargs["metadata"]
+        assert marker_meta["original_message_ids"] == list(range(1, 26))
+        assert marker_meta["message_range"] == {"first": 1, "last": 25}
+        # Marker resolved race-free by a unique token, not ORDER BY id DESC.
+        assert "compaction_token" in marker_meta
+        fetch_call = conv_store.db.fetchone.await_args
+        assert "LIKE" in fetch_call.args[0]
+        assert marker_meta["compaction_token"] in fetch_call.args[1][1]
+        conv_store.update_messages_metadata.assert_awaited_once()
+        excluded_ids, excl_meta = conv_store.update_messages_metadata.await_args.args
+        assert excluded_ids == list(range(1, 26))
+        assert excl_meta["excluded_from_context"] is True
+        assert excl_meta["summarized_into"] == "999"
+
     @pytest.mark.asyncio
     async def test_hierarchical_compact_not_enough_messages(self, mock_storage_with_conv, mock_llm_service):
         """Test hierarchical compaction fails with too few messages."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         storage, conv_store = mock_storage_with_conv
-        conv_store.get_full_history = AsyncMock(return_value=[
-            {"role": "user", "content": "Short"},
-            {"role": "assistant", "content": "Reply"},
+        conv_store.get_conversation_history = AsyncMock(return_value=[
+            {"id": 1, "role": "user", "content": "Short"},
+            {"id": 2, "role": "assistant", "content": "Reply"},
         ])
 
         manager = ContextManager(storage=storage, model="gpt-4", agent_id="test")
@@ -1599,6 +1622,53 @@ class TestContextFeature:
         assert result.status is ToolResultStatus.OK
         assert "answer" in result.data
         mock_agent.context_manager.stash_peek.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_recursive_query_resolves_hierarchical_marker(self, mock_agent):
+        """F153: a hierarchical-compaction marker now carries
+        original_message_ids, so recursive_query('compacted:<id>') resolves the
+        originals instead of failing 'No original message IDs found'."""
+        from kestrel_sovereign.features.context import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        marker = {
+            "id": 999,
+            "role": "system",
+            "content": "[HIERARCHICAL COMPACTION - 3 messages, 2 chunks]\n\nsummary",
+            "metadata": {
+                "type": "hierarchical_compaction",
+                "original_message_ids": [11, 12, 13],
+                "message_range": {"first": 11, "last": 13},
+            },
+        }
+        originals = [
+            {"id": 11, "role": "user", "content": "first"},
+            {"id": 12, "role": "assistant", "content": "second"},
+            {"id": 13, "role": "user", "content": "third"},
+        ]
+
+        conv_store = AsyncMock()
+        conv_store.get_messages_by_ids = AsyncMock(
+            side_effect=[[marker], originals]
+        )
+        mock_agent.context_manager._get_conversation_store = MagicMock(
+            return_value=conv_store
+        )
+        mock_agent.llm_service.generate = AsyncMock(return_value="It covered X, Y, Z.")
+        mock_agent.llm_service.get_cheap_model = MagicMock(return_value="haiku")
+
+        feature = ContextFeature(mock_agent)
+        await feature.initialize()
+        result = await feature.recursive_query(
+            context_source="compacted:999",
+            query="What did this cover?",
+        )
+
+        assert result.status is ToolResultStatus.OK
+        assert "answer" in result.data
+        # Resolved the marker, then its originals.
+        assert conv_store.get_messages_by_ids.await_args_list[0].args[0] == [999]
+        assert conv_store.get_messages_by_ids.await_args_list[1].args[0] == [11, 12, 13]
 
     @pytest.mark.asyncio
     async def test_hierarchical_compact_tool(self, mock_agent):
