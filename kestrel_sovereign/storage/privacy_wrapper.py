@@ -294,9 +294,10 @@ class PrivacyEnforcingStorage:
 
         EPHEMERAL is the strongest privacy guarantee Kestrel offers —
         the contract is "leave no trace." If a write somehow reached
-        ``conversation_history`` or ``graph_nodes`` despite the privacy
-        layer rejecting persistent writes, this method is the safety
-        net that scrubs it.
+        ``conversation_history``, ``graph_nodes``, or the channels
+        feature's ``channel_messages`` table despite the privacy layer
+        rejecting persistent writes, this method is the safety net that
+        scrubs it.
 
         Soft-delete (#763) is for *user delete intent* on data the user
         knew was being persisted. EPHEMERAL is the inverse — the user
@@ -323,7 +324,11 @@ class PrivacyEnforcingStorage:
         agent_id = self.agent_id
         if not agent_id:
             logger.debug("purge_ephemeral_session: no agent_id, skipping")
-            return {"conversation_history": 0, "graph_nodes": 0}
+            return {
+                "conversation_history": 0,
+                "graph_nodes": 0,
+                "channel_messages": 0,
+            }
 
         result: Dict[str, int] = {}
 
@@ -349,7 +354,11 @@ class PrivacyEnforcingStorage:
                 "wipe-on-shutdown bug fixed in #867",
                 agent_id, reason,
             )
-            return {"conversation_history": 0, "graph_nodes": 0}
+            return {
+                "conversation_history": 0,
+                "graph_nodes": 0,
+                "channel_messages": 0,
+            }
 
         try:
             convs = await self._storage.purge_conversations_since(
@@ -373,6 +382,21 @@ class PrivacyEnforcingStorage:
             nodes = 0
         result["graph_nodes"] = nodes
 
+        # Defense-in-depth for the channels feature (#2096 / F112): a
+        # leaked channel_messages row must be swept on EPHEMERAL exit,
+        # scoped to the same watermark. Tolerates the table being absent
+        # when the channels feature was never loaded.
+        try:
+            channel_msgs = await self._storage.purge_channel_messages_since(
+                since, reason=reason,
+            )
+        except Exception as e:
+            logger.warning(
+                "purge_ephemeral_session: channel_messages purge failed: %s", e
+            )
+            channel_msgs = 0
+        result["channel_messages"] = channel_msgs
+
         # Safety net: sweep the A2A observability sink (a2a_tool_dispatches /
         # a2a_observability) for rows authored during the EPHEMERAL stint
         # (F076). Content-free counts that were metered are acceptable losses;
@@ -390,12 +414,17 @@ class PrivacyEnforcingStorage:
                 result[table] = int(count or 0)
 
         # Leak accounting is scoped to the tables EPHEMERAL should NEVER write
-        # to (conversation_history / graph_nodes). The observability sink is
+        # user content to — conversation_history, graph_nodes, and channel_messages
+        # (all three hold user text and are real leaks). The observability sink is
         # *expected* to hold content-free metric rows during an EPHEMERAL stint
         # (F076 permits counts/latency to remain), so sweeping those is routine
-        # hygiene, not a privacy-layer leak — counting them would fire a
-        # spurious security audit on every ephemeral session that ran a tool.
-        leaked = result.get("conversation_history", 0) + result.get("graph_nodes", 0)
+        # hygiene, not a privacy-layer leak — counting them would fire a spurious
+        # security audit on every ephemeral session that ran a tool.
+        leaked = (
+            result.get("conversation_history", 0)
+            + result.get("graph_nodes", 0)
+            + result.get("channel_messages", 0)
+        )
         if leaked > 0:
             logger.warning(
                 "[privacy] WARNING: EPHEMERAL session leaked %d row(s) "

@@ -55,7 +55,11 @@ async def test_no_writes_during_ephemeral_destroys_nothing(tmp_path):
 
         result = await wrapper.purge_ephemeral_session(reason="test-no-writes")
 
-    assert result == {"conversation_history": 0, "graph_nodes": 0}, (
+    assert result == {
+        "conversation_history": 0,
+        "graph_nodes": 0,
+        "channel_messages": 0,
+    }, (
         "Scoped purge must not touch rows authored before EPHEMERAL entry"
     )
 
@@ -134,7 +138,11 @@ async def test_purge_without_watermark_refuses(tmp_path):
             reason="test-missing-watermark"
         )
 
-    assert result == {"conversation_history": 0, "graph_nodes": 0}, (
+    assert result == {
+        "conversation_history": 0,
+        "graph_nodes": 0,
+        "channel_messages": 0,
+    }, (
         "Missing watermark must not trigger an unbounded DELETE"
     )
 
