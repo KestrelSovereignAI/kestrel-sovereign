@@ -67,6 +67,14 @@ API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 security = HTTPBearer(auto_error=False)
 
+# Auth-exempt feature UI static assets, matched precisely to the mount shape
+# (/features/{slug}/static/…). Anchored + single-segment so a feature *API*
+# route that merely contains a later "static" segment (e.g.
+# /features/foo/api/static/secret) stays protected. Mirrors the host-side
+# FEATURE_STATIC_ASSET_RE (host.py), minus the /api/agents/{id} prefix the host
+# strips before proxying to the agent.
+FEATURE_STATIC_ASSET_RE = re.compile(r"^/features/[^/]+/static/")
+
 # Paths where API key query parameter auth is allowed
 # (EventSource/SSE can't send headers, so these endpoints need query param auth).
 # Both the canonical /api/agent/* paths and the deprecated /agent/* paths are
@@ -312,9 +320,14 @@ def _mount_feature_ui_assets(app: FastAPI) -> None:
     Mounted BEFORE ``_mount_feature_routers`` so the feature routers remain the
     trailing block its index-based ``_unmount`` deletes; these mounts are removed
     by object identity in ``_unmount_feature_ui_assets``.
+
+    NOT gated on ``SERVE_UI`` (unlike the core ``/static`` SPA mount): a feature's
+    assets are served by the agent that owns them even in multi-agent host mode,
+    where the agent runs with ``KESTREL_SERVE_UI=false`` and the host proxies the
+    browser's pinned ``/api/agents/{id}/features/{slug}/static/...`` import to it.
+    Gating the mount on ``SERVE_UI`` would 404 that import on every host agent —
+    the auth exemption alone (see ``auth_middleware``) is not enough (#2048).
     """
-    if not SERVE_UI:
-        return
     from kestrel_sovereign.ui_contributions import feature_static_mounts
 
     seen: set = set()
@@ -829,11 +842,15 @@ async def auth_middleware(request: Request, call_next):
     # that can't attach the X-API-Key header. Bypass auth for those static mounts,
     # matched narrowly as /features/{slug}/static/ so /features/ API routes (if any)
     # stay protected.
-    if (
-        SERVE_UI
-        and request.url.path.startswith("/features/")
-        and "/static/" in request.url.path
-    ):
+    #
+    # NOT gated on SERVE_UI (unlike the core /static exemption above): the feature
+    # asset mounts are installed unconditionally by _mount_feature_ui_assets(), so
+    # they exist even on a host-managed agent (which runs with KESTREL_SERVE_UI=
+    # false). In multi-agent host mode the browser's pinned import() reaches the
+    # agent via the host's /api/agents/{id}/... proxy; the host bypasses its own
+    # auth for these paths (FEATURE_STATIC_ASSET_RE) and forwards no key, so a
+    # SERVE_UI gate here would 401 the header-less import() on every host agent.
+    if FEATURE_STATIC_ASSET_RE.match(request.url.path):
         return await call_next(request)
 
     try:
