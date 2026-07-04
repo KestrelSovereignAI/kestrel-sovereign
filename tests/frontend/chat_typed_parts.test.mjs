@@ -246,6 +246,10 @@ test('appendMessagePart for an unregistered part type degrades to escaped text',
 
 function makeChannelChatContainer() {
     const container = makeNode('section');
+    // Model a LIVE chat root so cards mounted under it report isConnected=true
+    // (the QR refresh pauses fetches for off-screen cards; a connected card must
+    // actually fetch on its interval).
+    container._connectedRoot = true;
     for (const id of [
         'chat-container', 'message-input', 'send-button',
         'model-selector', 'thinking-indicator', 'composer-mode-toggle',
@@ -433,15 +437,19 @@ test('channel_link refresh survives a temporary pane detach and resumes on remou
     assert.equal(card.parentNode !== null, true, 'card stays inside its detached pane');
     assert.equal(card.isConnected, false, 'card is disconnected while the pane is detached');
 
+    // While detached the card is OFF-SCREEN: it must PAUSE (not poll the
+    // endpoint) — same as a wipeAgentChatPane innerHTML clear, which likewise
+    // leaves parentNode set but flips isConnected false. But the interval is NOT
+    // torn down (parentNode still set), so it can resume on remount.
     t.mock.timers.tick(15000);
-    const whileHidden = img.src;
-    assert.notEqual(whileHidden, first, 'a detached-but-alive card keeps refreshing the QR');
+    assert.equal(img.src, first, 'a detached (off-screen) card does not poll link-qr.png');
 
-    // Switch back: pane remounts. The refresh never died, so a fresh code paints.
+    // Switch back: pane remounts, card reconnects, and the next tick resumes the
+    // refresh with a fresh code — the interval was paused, never torn down.
     paneHost.appendChild(paneSubtree);
     assert.equal(card.isConnected, true, 'card is reconnected after remount');
     t.mock.timers.tick(15000);
-    assert.notEqual(img.src, whileHidden, 'the card resumes with a fresh ts after remount');
+    assert.notEqual(img.src, first, 'the card resumes fetching a fresh ts after remount');
 });
 
 test('channel_link refresh stops once the QR clears (link-cleared → 404 note)', (t) => {

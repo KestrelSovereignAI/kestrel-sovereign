@@ -387,20 +387,28 @@ function channelLinkPartRenderer(data, context) {
     let ticks = 0;
     refreshTimer = setInterval(() => {
         ticks += 1;
-        // Tear down only when the card is GENUINELY gone — spliced out of its
-        // own parent (conversation switch, history reload, pane wipe) → its
-        // ``parentNode`` is null. Deliberately NOT ``isConnected``: a plain
+        // PERMANENT teardown only when the card is GENUINELY gone — spliced out
+        // of its own parent (history reload, direct removal) → ``parentNode`` is
+        // null — or the safety cap. Deliberately NOT ``isConnected``: a plain
         // agent switch detaches the whole pane subtree from #chat-container
         // while keeping the card inside its (now-disconnected) pane for later
-        // remount (mountChatPane, chat.js). ``isConnected`` would be false
-        // there and permanently kill the refresh, so the QR would be stale
-        // when the user switches back (#2170). ``parentNode`` stays set across
-        // that detach, so the refresh keeps the code current and resumes
-        // painting the instant the pane is remounted.
+        // remount (mountChatPane), so ``isConnected`` would be false there and
+        // permanently kill the refresh — the QR would be stale on switch-back.
+        // ``parentNode`` stays set across that detach.
         if (card.parentNode === null || ticks > 30) {
             stopRefresh();
             return;
         }
+        // PAUSE (don't fetch) whenever the card isn't in the live document —
+        // whether the pane was detached for a remountable agent switch OR
+        // discarded by ``wipeAgentChatPane`` (pane.innerHTML = '', which orphans
+        // the message subtree while ``card.parentNode`` still points at its
+        // detached ``.message-content``). Either way an off-screen card must not
+        // poll ``link-qr.png``. A retained card resumes fetching the next tick
+        // after it reconnects; a discarded one keeps idling harmlessly until the
+        // MutationObserver below or the cap clears it — no endpoint traffic
+        // either way.
+        if (card.isConnected === false) return;
         img.src = qrUrl();
     }, 15000);
     // Don't hold the event loop open (browser setInterval has no unref; Node
