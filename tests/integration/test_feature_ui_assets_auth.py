@@ -181,3 +181,98 @@ def test_host_agent_serves_feature_asset_without_key_end_to_end(tmp_path, monkey
     resp = client.get("/features/spawnfeature/static/spawn.js")
     assert resp.status_code == 200, resp.status_code
     assert "export const x" in resp.text
+
+
+# --- Multi-agent server:app path: the /api/agents/{id}/... prefixed URL --------
+
+class _FakeAgentManager:
+    def __init__(self, agents):
+        self._agents = agents
+
+    def get_agent(self, name):
+        return self._agents.get(name)
+
+    def list_agents(self):
+        return list(self._agents)
+
+
+def test_regex_matches_prefixed_and_bare_static_but_not_api():
+    """The exemption must match BOTH URL shapes and stay narrow to /static/.
+
+    - bare  /features/{slug}/static/...              (separate-subprocess agent)
+    - prefixed /api/agents/{id}/features/{slug}/static/...  (multi-agent server:app)
+    and must NOT match a feature API route that merely has a later 'static'
+    segment, in either shape.
+    """
+    from kestrel_sovereign.server import FEATURE_STATIC_ASSET_RE as R
+
+    assert R.match("/features/spawnfeature/static/spawn.js")
+    assert R.match("/api/agents/Meridian/features/spawnfeature/static/spawn.js")
+    assert not R.match("/features/spawnfeature/api/static/secret")
+    assert not R.match("/api/agents/Meridian/features/spawnfeature/api/static/secret")
+    assert not R.match("/api/agents/Meridian/api/conversations")
+
+
+def test_multi_agent_prefixed_feature_asset_loads_without_key_end_to_end(
+    tmp_path, monkeypatch
+):
+    """Reproduce the live :8888 multi-agent scenario end-to-end.
+
+    In multi-agent host mode server:app itself owns the agents; the browser loads
+    /api/agents/{id}/features/{slug}/static/spawn.js. auth_middleware runs BEFORE
+    MultiAgentAgentRoutingMiddleware strips the /api/agents/{id} prefix, so the
+    exemption must match the PREFIXED path — the bug that survived #2162's
+    anchored ^/features/ regex. Wires the REAL auth_middleware + REAL routing
+    middleware + REAL mount so the header-less import resolves with no key.
+    """
+    from kestrel_sovereign.features.base import UIContributions
+    import kestrel_sovereign.server as server
+
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    monkeypatch.setattr(server, "SERVE_UI", True, raising=False)
+
+    static_dir = tmp_path / "spawn_static"
+    static_dir.mkdir()
+    (static_dir / "spawn.js").write_text("export const x = 1;\n")
+
+    agent = _FakeAgent(
+        {
+            "SpawnFeature": _FakeFeature(
+                UIContributions(
+                    modules=["spawn.js"],
+                    static_dir=str(static_dir),
+                    capability="spawn",
+                )
+            )
+        }
+    )
+    manager = _FakeAgentManager({"Meridian": agent})
+
+    # MultiAgentAgentRoutingMiddleware reads the MODULE-level server.app.state.
+    monkeypatch.setattr(server.app.state, "agent_manager", manager, raising=False)
+
+    app = FastAPI()
+    # Add the strip middleware FIRST so auth_middleware (added last) is OUTERMOST —
+    # matching real server.py, where auth sees the un-stripped prefixed path.
+    app.add_middleware(server.MultiAgentAgentRoutingMiddleware)
+    app.middleware("http")(server.auth_middleware)
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key="test-session-secret",
+        session_cookie="kestrel_session",
+    )
+    app.state.agent_manager = manager
+    server._mount_feature_ui_assets(app)
+
+    client = TestClient(app)
+
+    # The header-less import of the agent-prefixed URL must resolve with no key.
+    resp = client.get("/api/agents/Meridian/features/spawnfeature/static/spawn.js")
+    assert resp.status_code == 200, resp.status_code
+    assert "export const x" in resp.text
+
+    # A prefixed feature API route stays protected.
+    assert (
+        client.get("/api/agents/Meridian/features/spawnfeature/api/secret").status_code
+        == 401
+    )
