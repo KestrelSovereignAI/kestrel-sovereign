@@ -83,6 +83,19 @@ function makeNode(tag = 'div') {
             this.parentNode = null;
         },
         get firstChild() { return this.children[0] || null; },
+        // Faithful proxy for the real DOM property: a node is connected only if
+        // walking its ancestors reaches a live root. Crucially this is FALSE
+        // when an ANCESTOR is detached even though the node's own ``parentNode``
+        // is still set — the exact case an agent switch produces (the pane
+        // subtree is removed from #chat-container but the card stays inside it).
+        // The channel_link refresh must survive that detach (#2170), so it keys
+        // teardown on ``parentNode``, not this — and this mock now models the
+        // gap so a regression back to ``isConnected`` would fail the tests.
+        get isConnected() {
+            let n = this;
+            while (n.parentNode) n = n.parentNode;
+            return n === documentRoot || n._connectedRoot === true;
+        },
     };
     return node;
 }
@@ -344,6 +357,110 @@ test('channel_link card pins the QR URL to the pane-owning agent, not the select
     assert.ok(img, 'card must contain the QR image');
     assert.match(img.src, /\/api\/agents\/Emma\/api\/agent\/channels\/whatsapp\/link-qr\.png/);
     assert.ok(!img.src.includes('/Nellie/'), 'must NOT use the selected agent');
+});
+
+test('channel_link card re-fetches link-qr.png (distinct ts) on an interval while unlinked', (t) => {
+    t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    const first = img.src;
+    assert.match(first, /ts=/);
+    // The QR rotates (~60s) while unlinked; the card must re-fetch a cache-busted
+    // PNG so a still-open card never shows an expired code (#2170).
+    t.mock.timers.tick(15000);
+    const second = img.src;
+    assert.notEqual(second, first, 'a tick must re-issue the fetch with a fresh ts');
+    assert.match(second, /ts=/);
+});
+
+test('channel_link refresh interval is cleared when the card is removed (no runaway timer)', (t) => {
+    t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    t.mock.timers.tick(15000);
+    const beforeRemove = img.src;
+    // Remove the card (conversation switch / history reload / pane teardown) —
+    // the interval must stop so a detached card can't keep hitting the endpoint.
+    card.remove();
+    t.mock.timers.tick(15000);
+    assert.equal(img.src, beforeRemove, 'a removed card must not keep re-fetching');
+});
+
+test('channel_link refresh survives a temporary pane detach and resumes on remount (#2170)', (t) => {
+    t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+    // Build the chat under a live root so real ``isConnected`` semantics apply:
+    // a node detaches (isConnected → false) the moment an ANCESTOR leaves the
+    // tree, even while its own parentNode stays set.
+    const container = makeNode('section');
+    container._connectedRoot = true;
+    for (const id of [
+        'chat-container', 'message-input', 'send-button',
+        'model-selector', 'thinking-indicator', 'composer-mode-toggle',
+    ]) {
+        const node = makeNode(id === 'message-input' ? 'textarea' : 'div');
+        node.id = id;
+        container.appendChild(node);
+    }
+    const api = chatModule.mount(container, {
+        deps: {
+            api: {
+                hasCapability: () => true,
+                getHostAgent: () => 'wa-agent',
+                buildAgentUrl: (p) => `/api/agents/Emma${p}`,
+                getApiKey: () => 'secret-key',
+            },
+            kicon: () => '',
+            escapeHtml: (s) => String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+        },
+    });
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    const first = img.src;
+    assert.equal(card.isConnected, true, 'card starts connected to the live root');
+
+    // Agent switch: mountChatPane detaches the pane subtree from #chat-container
+    // but keeps it (and the card) alive for remount (chat.js). The card's OWN
+    // parentNode stays set; only an ancestor left the tree, so isConnected flips
+    // false. A guard keyed on isConnected would permanently kill the refresh.
+    const paneSubtree = div.parentNode;
+    const paneHost = paneSubtree.parentNode;
+    paneSubtree.remove();
+    assert.equal(card.parentNode !== null, true, 'card stays inside its detached pane');
+    assert.equal(card.isConnected, false, 'card is disconnected while the pane is detached');
+
+    t.mock.timers.tick(15000);
+    const whileHidden = img.src;
+    assert.notEqual(whileHidden, first, 'a detached-but-alive card keeps refreshing the QR');
+
+    // Switch back: pane remounts. The refresh never died, so a fresh code paints.
+    paneHost.appendChild(paneSubtree);
+    assert.equal(card.isConnected, true, 'card is reconnected after remount');
+    t.mock.timers.tick(15000);
+    assert.notEqual(img.src, whileHidden, 'the card resumes with a fresh ts after remount');
+});
+
+test('channel_link refresh stops once the QR clears (link-cleared → 404 note)', (t) => {
+    t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'] });
+    const api = makeChannelChatContainer();
+    const div = api.appendMessagePart('channel_link', { channel_type: 'whatsapp' });
+    const card = div.children[0].children[0];
+    const img = card.children.find((c) => c.tagName === 'IMG');
+    // Simulate a linked channel: a QR painted, then the host cleared the PNG
+    // (channel.link_cleared removes it) so the next fetch 404s.
+    img.onload();
+    img.onerror();
+    const noteBefore = card.children.find((c) => c.className === 'channel-link-note');
+    assert.ok(noteBefore, 'a genuine 404 after load shows the expired/linked note');
+    // The refresh interval must be dead — the image was removed with the note,
+    // and a further tick must not resurrect a fetch.
+    t.mock.timers.tick(15000);
+    const stillHasImg = card.children.some((c) => c.tagName === 'IMG');
+    assert.ok(!stillHasImg, 'the QR image was removed with the note (nothing to refetch)');
 });
 
 test('channel_link part rejects an invalid channel_type', () => {

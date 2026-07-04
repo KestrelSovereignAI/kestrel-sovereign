@@ -387,7 +387,17 @@ function channelLinkPartRenderer(data, context) {
     let ticks = 0;
     refreshTimer = setInterval(() => {
         ticks += 1;
-        if (ticks > 30) {
+        // Tear down only when the card is GENUINELY gone — spliced out of its
+        // own parent (conversation switch, history reload, pane wipe) → its
+        // ``parentNode`` is null. Deliberately NOT ``isConnected``: a plain
+        // agent switch detaches the whole pane subtree from #chat-container
+        // while keeping the card inside its (now-disconnected) pane for later
+        // remount (mountChatPane, chat.js). ``isConnected`` would be false
+        // there and permanently kill the refresh, so the QR would be stale
+        // when the user switches back (#2170). ``parentNode`` stays set across
+        // that detach, so the refresh keeps the code current and resumes
+        // painting the instant the pane is remounted.
+        if (card.parentNode === null || ticks > 30) {
             stopRefresh();
             return;
         }
@@ -396,6 +406,35 @@ function channelLinkPartRenderer(data, context) {
     // Don't hold the event loop open (browser setInterval has no unref; Node
     // timers do — keeps unit tests from hanging on the pending interval).
     if (refreshTimer && typeof refreshTimer.unref === 'function') refreshTimer.unref();
+
+    // Also cut the interval the instant the card leaves the DOM, rather than
+    // waiting for the next tick to notice it was removed — a removed card must
+    // never keep hammering the endpoint (#2170). A MutationObserver scoped to
+    // the card's parent (browser only; the mocked DOM in unit tests has no
+    // observer) tears the refresh down on removal. It watches the card's OWN
+    // parent, so an ancestor pane detaching (agent switch) never trips it —
+    // only the card being spliced out of that parent does (``parentNode``
+    // flips to null), matching the interval's teardown condition above.
+    const MO = (typeof window !== 'undefined' && window.MutationObserver) || null;
+    if (MO) {
+        // Defer until the caller has appended the card, so ``parentNode`` exists.
+        const startObserving = () => {
+            const parent = card.parentNode;
+            if (!parent) return;
+            const observer = new MO(() => {
+                if (card.parentNode === null) {
+                    stopRefresh();
+                    observer.disconnect();
+                }
+            });
+            observer.observe(parent, { childList: true });
+        };
+        if (typeof queueMicrotask === 'function') {
+            queueMicrotask(startObserving);
+        } else {
+            Promise.resolve().then(startObserving);
+        }
+    }
 
     return card;
 }
