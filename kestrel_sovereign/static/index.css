@@ -473,6 +473,223 @@ nav {
     color: rgba(255, 255, 255, 0.8);
 }
 
+/* ============================================================================
+   Conversation-list component (#2149 / #2159).
+   Styles for the classes emitted by conversations.js + kebab_menu.js. These
+   MUST live in index.css (not a separate sheet) so embedding hosts like Frinz,
+   which generate their scoped @scope sheet from index.css at request time, pick
+   them up with zero host change. All colors ride theme vars; new shadow/blur
+   values carry inline fallbacks so they survive the @scope embed path.
+   ============================================================================ */
+.conversations-root {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.conversations-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+/* View bar: segmented Active / Archived / Trash buttons. Matches the
+   .nav-tab idiom — quiet by default, accent fill when active. */
+.conversations-view-bar {
+    display: flex;
+    gap: 0.25rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.2rem;
+}
+
+.conversations-view-btn {
+    flex: 1;
+    padding: 0.35rem 0.6rem;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+}
+
+.conversations-view-btn:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+}
+
+.conversations-view-btn.active {
+    background: var(--accent-color);
+    color: white;
+}
+
+/* Search input. */
+.conversations-search {
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    font-size: 0.85rem;
+    font-family: inherit;
+}
+
+.conversations-search:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+/* Stats line under the controls. */
+.conversations-stats {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    padding: 0 0.25rem;
+}
+
+.conversations-list-body {
+    display: flex;
+    flex-direction: column;
+}
+
+/* Date groups: a muted section header above each day's rows. */
+.date-group {
+    margin-bottom: 0.5rem;
+}
+
+.date-group-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+    padding: 0.5rem 0.25rem 0.25rem;
+}
+
+/* Meta row: time + message count on the left, kebab pinned right. */
+.conversation-item .conversation-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+}
+
+.conversation-msg-count {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.conversation-item.active .conversation-msg-count {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+/* Kebab (⋯) button: a quiet icon button. Hover-reveal on row hover, but
+   always focusable (keyboard) — matching the old conv-delete-btn pattern.
+   Sits at the right end of the meta row via margin-left:auto. */
+.kebab-btn {
+    margin-left: auto;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.6rem;
+    height: 1.6rem;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s, background-color 0.15s;
+}
+
+.conversation-item:hover .kebab-btn,
+.kebab-btn:focus,
+.kebab-btn:focus-visible {
+    opacity: 1;
+}
+
+.kebab-btn:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+.conversation-item.active .kebab-btn {
+    color: rgba(255, 255, 255, 0.85);
+    opacity: 1;
+}
+
+.conversation-item.active .kebab-btn:hover {
+    background: rgba(255, 255, 255, 0.16);
+    color: white;
+}
+
+/* Kebab menu popover. The JS positions it fixed and sets a few inline styles;
+   these give it a themed surface even if those are stripped by the embed. */
+.kebab-menu {
+    position: fixed;
+    min-width: 180px;
+    max-height: 60vh;
+    overflow-y: auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: var(--card-shadow, 0 4px 12px rgba(0, 0, 0, 0.15));
+    padding: 0.25rem;
+    z-index: 2000;
+}
+
+.kebab-menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-family: inherit;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.kebab-menu-item:hover,
+.kebab-menu-item:focus,
+.kebab-menu-item:focus-visible {
+    background: var(--bg-tertiary);
+    outline: none;
+}
+
+.kebab-menu-item-danger {
+    color: var(--error, #ef4444);
+}
+
+.kebab-menu-item-danger:hover,
+.kebab-menu-item-danger:focus,
+.kebab-menu-item-danger:focus-visible {
+    background: rgba(239, 68, 68, 0.12);
+    color: var(--error, #ef4444);
+}
+
+.kebab-menu-separator {
+    height: 1px;
+    margin: 0.25rem 0;
+    background: var(--border-color);
+}
+
+/* Error state parity with .empty-state. */
+.conversations-error {
+    color: var(--error, #ef4444);
+    padding: 1rem;
+    text-align: center;
+}
+
 /* Trash sub-view (#765). Same shell as conversations but uses
    a softer affordance set: permanent-delete sits next to a
    Restore button, both visible by default (the user is
