@@ -134,6 +134,50 @@ class TestLighthouseSelfWalletMint:
         mock_instance.create_api_key.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_reprovisions_over_inactive_key_tombstone(
+        self, db: AsyncDatabase, monkeypatch
+    ) -> None:
+        """#2092 regression: a DEACTIVATED (removed) lighthouse key leaves an
+        inactive tombstone row. has_key() (active-only) is False so the resolver
+        mints a fresh remote key — the local store must succeed (replace over the
+        tombstone), not raise KeyStorageError and orphan the just-minted key."""
+        agent_did = "did:test:agent-lighthouse-reprovision"
+        storage = ServiceKeyStorage(db, agent_did)
+        await storage.store_key("lighthouse", "lh-old")
+        await storage.deactivate_key("lighthouse")  # inactive tombstone remains
+        assert await storage.has_key("lighthouse") is False
+
+        mock_class, mock_instance = _mock_lighthouse_client()
+        monkeypatch.setattr(
+            FoundationPayerResolver,
+            "_evm_address_from_private_key",
+            lambda _self: "0x1234567890abcdef1234567890abcdef12345678",
+        )
+        monkeypatch.setattr(
+            FoundationPayerResolver,
+            "_sign_eth_message",
+            lambda _self, message: f"0xsigned-{message}",
+        )
+
+        with patch(
+            "kestrel_sovereign.storage.providers.lighthouse_rest."
+            "LighthouseRestClient",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(
+                _self_wallet_storage_policy(),
+                db=db,
+                wallet_private_key="11" * 32,
+            )
+            result = await resolver.resolve_for(agent_did, ResourceClass.STORAGE)
+
+        assert result.enabled is True
+        # Fresh remote key was minted AND persisted (reactivated over tombstone).
+        mock_instance.create_api_key.assert_awaited_once()
+        assert await storage.has_key("lighthouse") is True
+        assert await storage.get_key("lighthouse") == "lh-agent-key"
+
+    @pytest.mark.asyncio
     async def test_missing_wallet_private_key_fails_closed(
         self, db: AsyncDatabase
     ) -> None:
