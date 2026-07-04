@@ -37,6 +37,35 @@ def test_subset_ok_when_features_are_a_subset():
     )  # must not raise
 
 
+def test_spawn_tool_max_tokens_constraint_validates():
+    """#2138 regression: the spawn tool parses `max_tokens=1000` and the mandate
+    must pass _validate_mandate_subset. Before the coercion fix the value was the
+    string "1000", which validate_constraints (type-checks int/float) refused —
+    so every documented spawn with a max_tokens constraint failed."""
+    from kestrel_sovereign.features.spawn.feature import _coerce_constraint_value
+
+    # The tool coerces numeric constraint values to their natural type.
+    assert _coerce_constraint_value("1000") == 1000
+    assert isinstance(_coerce_constraint_value("1000"), int)
+    assert _coerce_constraint_value("true") == "true"  # flags stay strings
+    assert _coerce_constraint_value("nan") == "nan"     # non-finite kept as str
+
+    mgr = AgentManager()
+    parent = _parent({"MemoryFeature", "SpawnFeature"})
+    # Exactly what SpawnFeature.spawn_agent builds from
+    # constraints="max_tokens=1000,no_web" — must not raise.
+    mgr._validate_mandate_subset(
+        parent,
+        _mandate(
+            features_allowed=["MemoryFeature"],
+            additional_constraints={
+                "max_tokens": _coerce_constraint_value("1000"),
+                "no_web": "true",
+            },
+        ),
+    )
+
+
 def test_refuses_features_not_available_to_parent():
     mgr = AgentManager()
     parent = _parent({"WebSearchFeature"})

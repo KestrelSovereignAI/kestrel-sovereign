@@ -29,6 +29,34 @@ from kestrel_sdk.tools.result import ToolResult
 logger = logging.getLogger(__name__)
 
 
+def _coerce_constraint_value(value: str):
+    """Coerce a spawn-constraint string value to its natural type.
+
+    The spawn tool takes constraints as a comma-separated ``key=value`` string,
+    so every value arrives as ``str``. ScopedConstitution.validate_constraints
+    type-checks numeric constraints (e.g. ``max_tokens``) as ``(int, float)``, so
+    a raw ``"1000"`` would be rejected. Coerce an integer-looking value to
+    ``int`` and a float-looking value to ``float``; leave everything else as the
+    original string (flags, tool names, behavioral text). Booleans are left as
+    strings — the flag path already stores ``"true"`` and validation keys off
+    presence, not a bool type.
+    """
+    import math
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return value
+    # Reject non-finite: float("nan") would break verify_integrity's exact-dict
+    # equality (nan != nan), and inf is not a meaningful constraint bound. Keep
+    # such values as their original string.
+    return f if math.isfinite(f) else value
+
+
 class SpawnFeature(Feature):
     """Runtime agent spawning — create, delegate to, and manage child agents."""
 
@@ -207,14 +235,20 @@ class SpawnFeature(Feature):
                 )
             )
 
-        # Parse comma-separated strings into lists
+        # Parse comma-separated 'key=value' / bare-flag items into the mandate's
+        # additional_constraints dict. Values are coerced to their natural type:
+        # a numeric string (e.g. max_tokens=1000) becomes an int/float so it
+        # satisfies ScopedConstitution.validate_constraints, which type-checks
+        # numeric constraints like max_tokens as (int, float) — a raw "1000"
+        # string would be rejected and every documented spawn would fail (#2138).
+        # Non-numeric values stay strings; a bare flag becomes "true".
         constraint_dict = {}
         if constraints:
             for item in constraints.split(","):
                 item = item.strip()
                 if "=" in item:
                     k, v = item.split("=", 1)
-                    constraint_dict[k.strip()] = v.strip()
+                    constraint_dict[k.strip()] = _coerce_constraint_value(v.strip())
                 elif item:
                     constraint_dict[item] = "true"
 
