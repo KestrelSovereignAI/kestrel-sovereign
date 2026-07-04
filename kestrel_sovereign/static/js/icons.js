@@ -119,6 +119,7 @@
         'webhook': '<path d="M18 16.98h-5.99c-1.1 0-1.95.94-2.48 1.9A4 4 0 0 1 2 17c.01-.7.2-1.4.57-2" /><path d="m6 17 3.13-5.78c.53-.97.1-2.18-.5-3.1a4 4 0 1 1 6.89-4.06" /><path d="m12 6 3.13 5.73C15.66 12.7 16.9 13 18 13a4 4 0 0 1 0 8" />',
         // --- UI controls (de-emoji) ---
         'plus': '<path d="M5 12h14" /><path d="M12 5v14" />',
+        'ellipsis-vertical': '<circle cx="12" cy="12" r="1" /><circle cx="12" cy="5" r="1" /><circle cx="12" cy="19" r="1" />',
         'chevron-left': '<path d="m15 18-6-6 6-6" />',
         'chevron-right': '<path d="m9 18 6-6-6-6" />',
         'chevron-down': '<path d="m6 9 6 6 6-6" />',
