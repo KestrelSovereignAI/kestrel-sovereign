@@ -660,10 +660,16 @@ nav {
 }
 
 .kebab-menu-item:hover,
-.kebab-menu-item:focus,
-.kebab-menu-item:focus-visible {
+.kebab-menu-item:focus {
     background: var(--bg-tertiary);
-    outline: none;
+}
+
+/* The background highlight above loses to kebab_menu.js's inline
+ * `background: none`, so it cannot be the focus indicator. Keep a real
+ * outline for keyboard users — inline styles can't override it. */
+.kebab-menu-item:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
 }
 
 .kebab-menu-item-danger {
