@@ -142,7 +142,9 @@ class TestSpawnFeatureWithManager:
         assert mandate.parent_did == "did:parent"
         assert mandate.purpose == "assist with research"
         assert mandate.ttl_seconds == 1800
-        assert mandate.additional_constraints == {"max_tokens": "1000", "no_web": "true"}
+        # max_tokens is coerced to int so ScopedConstitution.validate_constraints
+        # (which type-checks it as int/float) accepts it (#2138); flags stay str.
+        assert mandate.additional_constraints == {"max_tokens": 1000, "no_web": "true"}
         # Shorthand feature names are canonicalized to their class names so the
         # child's feature loader (which filters by cls.__name__) can match them
         # (#1946).
