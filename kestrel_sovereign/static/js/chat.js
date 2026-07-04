@@ -338,6 +338,11 @@ function channelLinkPartRenderer(data, context) {
     let retryTimer = null;
     let errorRetries = 0;
     let loadedOnce = false;
+    // Observers (browser only) that keep the QR live: one tears the refresh down
+    // when the card is removed, one forces an immediate fresh fetch the instant
+    // the card becomes visible again after an agent-switch detach.
+    let removalObserver = null;
+    let visibilityObserver = null;
     // A FRESH link's QR PNG can land a beat AFTER this card renders: the pairing
     // tool returns (emitting the part on the turn) while the QR itself arrives
     // over a separate ``channel.link_qr`` event the host persists
@@ -356,6 +361,8 @@ function channelLinkPartRenderer(data, context) {
             clearTimeout(retryTimer);
             retryTimer = null;
         }
+        if (removalObserver) { removalObserver.disconnect(); removalObserver = null; }
+        if (visibilityObserver) { visibilityObserver.disconnect(); visibilityObserver = null; }
     };
     const showExpiredNote = () => {
         stopRefresh();
@@ -424,18 +431,33 @@ function channelLinkPartRenderer(data, context) {
     // only the card being spliced out of that parent does (``parentNode``
     // flips to null), matching the interval's teardown condition above.
     const MO = (typeof window !== 'undefined' && window.MutationObserver) || null;
-    if (MO) {
+    const IO = (typeof window !== 'undefined' && window.IntersectionObserver) || null;
+    if (MO || IO) {
         // Defer until the caller has appended the card, so ``parentNode`` exists.
         const startObserving = () => {
             const parent = card.parentNode;
             if (!parent) return;
-            const observer = new MO(() => {
-                if (card.parentNode === null) {
-                    stopRefresh();
-                    observer.disconnect();
-                }
-            });
-            observer.observe(parent, { childList: true });
+            if (MO) {
+                removalObserver = new MO(() => {
+                    if (card.parentNode === null) stopRefresh();  // disconnects both
+                });
+                removalObserver.observe(parent, { childList: true });
+            }
+            // The interval PAUSES fetching while the card is off-screen (agent
+            // switch), so a code that rotated during the absence would stay
+            // stale for up to one interval after switch-back. An
+            // IntersectionObserver forces a fresh fetch the instant the card
+            // becomes visible again — no wait, no stale QR (#2170). Only fetches
+            // while a live QR image is still mounted (not after the expired note
+            // replaced it).
+            if (IO) {
+                visibilityObserver = new IO((entries) => {
+                    for (const e of entries) {
+                        if (e.isIntersecting && card.contains(img)) img.src = qrUrl();
+                    }
+                });
+                visibilityObserver.observe(card);
+            }
         };
         if (typeof queueMicrotask === 'function') {
             queueMicrotask(startObserving);
