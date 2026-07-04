@@ -21,6 +21,14 @@ from kestrel_sovereign.features.security.args_summary import (
 
 logger = logging.getLogger(__name__)
 
+# Session ids that identify a NON-INTERACTIVE hook invocation — a background
+# context with no human attached to the approval queue. An ASK-gated tool in
+# one of these contexts must resolve to a non-blocking no_approver denial rather
+# than queue-and-wait forever (which would wedge the background loop, #2111).
+# The scheduler tags every tick with session_id="scheduler"
+# (features/scheduler/feature.py); test_scheduler_ask_gate pins that agreement.
+NON_INTERACTIVE_SESSION_IDS = frozenset({"scheduler"})
+
 
 class SecurityHook(Hook):
     """
@@ -147,10 +155,15 @@ class SecurityHook(Hook):
             # caller benefits.
             logger.info(f"Requesting approval: {feature_name}.{tool_name}")
 
+            # A non-interactive caller (e.g. a scheduler tick) has no human to
+            # answer the queue; ask the queue not to block-and-wait forever but
+            # to return a non-blocking no_approver denial instead (#2111).
+            allow_blocking = input.session_id not in NON_INTERACTIVE_SESSION_IDS
             approved, scope = await self.approval_queue.request_approval(
                 feature_name=feature_name,
                 tool_name=tool_name,
                 tool_args=input.tool_input or {},
+                allow_blocking=allow_blocking,
             )
 
             if not approved:

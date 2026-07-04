@@ -564,6 +564,38 @@ class TestApprovalQueue:
         assert scope == "once"
 
     @pytest.mark.asyncio
+    async def test_non_interactive_caller_returns_no_approver_on_production_agent(
+        self, tmp_path
+    ):
+        """#2111: a non-interactive caller (allow_blocking=False) must NOT block
+        even on a PRODUCTION agent (is_test_instance falsy). A scheduler tick has
+        no human to answer the queue, so an ASK-gated tool short-circuits to a
+        non-blocking (False, "no_approver") instead of wedging the loop forever.
+        """
+        store = track_store(PermissionStore(str(tmp_path / "perms.db")))
+        await store.initialize()
+        await store.register_tool("SpawnFeature", "spawn_agent", PermissionLevel.ASK)
+
+        agent = MagicMock()
+        agent.is_test_instance = False  # production/sovereign agent
+        queue = ApprovalQueue(permission_store=store, agent=agent)
+
+        # Must return promptly with NO human decision and NOTHING queued.
+        approved, scope = await asyncio.wait_for(
+            queue.request_approval(
+                feature_name="SpawnFeature",
+                tool_name="spawn_agent",
+                tool_args={"name": "child", "purpose": "x"},
+                allow_blocking=False,
+            ),
+            timeout=1.0,
+        )
+
+        assert approved is False
+        assert scope == "no_approver"
+        assert queue.pending_requests == []
+
+    @pytest.mark.asyncio
     async def test_cancel_request(self, queue):
         # Start a request
         request_task = asyncio.create_task(
@@ -799,6 +831,48 @@ class TestSecurityHook:
             "hook manager doesn't impose a timeout on a human "
             "response."
         )
+
+    @pytest.mark.asyncio
+    async def test_scheduler_session_ask_denies_without_blocking(
+        self, hook, permission_store, approval_queue
+    ):
+        """#2111: an ASK-gated tool invoked on a scheduler tick (non-interactive
+        session) must resolve to a non-blocking deny, not queue-and-wait forever.
+        The fixture queue has no test-instance agent, so pre-fix this would hang
+        on the production queue-and-wait path — the exact scheduler wedge."""
+        await permission_store.register_tool(
+            "SpawnFeature", "spawn_agent", PermissionLevel.ASK
+        )
+        input = HookInput(
+            session_id="scheduler",  # matches SchedulerFeature's tick session
+            hook_event_name="PreToolUse",
+            tool_name="spawn_agent",
+            feature_name="SpawnFeature",
+            tool_input={"name": "child"},
+        )
+
+        output = await asyncio.wait_for(hook.execute(input), timeout=1.0)
+
+        assert output.continue_execution is False  # blocked (deny)
+        assert output.permission_decision == PermissionDecision.DENY
+        # Nothing left queued — the scheduler loop is not wedged.
+        assert approval_queue.pending_requests == []
+
+    def test_scheduler_session_id_pinned_to_non_interactive_set(self):
+        """Drift guard: the SchedulerFeature tags ticks with a session id that
+        MUST be in NON_INTERACTIVE_SESSION_IDS, or the #2111 wedge returns. Pins
+        both ends so renaming one without the other fails here, not in prod."""
+        from pathlib import Path
+        import kestrel_sovereign.features.scheduler.feature as sched
+        from kestrel_sovereign.features.security.hooks import (
+            NON_INTERACTIVE_SESSION_IDS,
+        )
+        src = Path(sched.__file__).read_text()
+        assert 'session_id="scheduler"' in src, (
+            "SchedulerFeature no longer tags ticks session_id='scheduler'; "
+            "update NON_INTERACTIVE_SESSION_IDS to match."
+        )
+        assert "scheduler" in NON_INTERACTIVE_SESSION_IDS
 
     @pytest.mark.asyncio
     async def test_auto_allow(self, hook, permission_store):

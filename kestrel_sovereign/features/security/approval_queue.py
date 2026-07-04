@@ -236,6 +236,8 @@ class ApprovalQueue:
         tool_name: str,
         tool_args: Dict,
         timeout: Optional[float] = None,
+        *,
+        allow_blocking: bool = True,
     ) -> tuple[bool, str]:
         """
         Queue a request and wait for user decision.
@@ -253,6 +255,15 @@ class ApprovalQueue:
                 requests that are clearly abandoned. Pass a finite
                 value only for batch/automation callers that need a
                 deterministic abandon point.
+            allow_blocking: When ``False``, a request that would otherwise
+                queue-and-wait for an interactive approver instead returns a
+                non-blocking ``(False, "no_approver")`` immediately. This is for
+                background/non-interactive callers (e.g. a scheduler tick, #2111)
+                that have no human attached to the approval queue and must not
+                wedge their loop waiting forever — the same guarantee the #2029
+                headless-test guard gives, generalized to any non-interactive
+                caller regardless of ``is_test_instance``. The AUTO fast-path and
+                policy ALLOW/DENY still resolve normally before this applies.
 
         Returns:
             Tuple of (approved: bool, scope: str)
@@ -423,8 +434,13 @@ class ApprovalQueue:
         # ``no_approver`` result instead of queuing forever. Production /
         # sovereign agents (``is_test_instance`` falsy) are unaffected — their
         # Sovereign answers asynchronously via the Mews approval panel, so a
-        # pending request legitimately stays open for them.
-        if bool(getattr(self._agent, "is_test_instance", False)):
+        # pending request legitimately stays open for them — UNLESS the caller
+        # is non-interactive (``allow_blocking=False``, e.g. a scheduler tick,
+        # #2111): there is no request/response cycle a Sovereign would answer in
+        # that context, and blocking would wedge the background loop forever.
+        non_interactive = not allow_blocking
+        headless_test = bool(getattr(self._agent, "is_test_instance", False))
+        if non_interactive or headless_test:
             await self._persist_decision(
                 feature_name=feature_name,
                 tool_name=tool_name,
@@ -434,12 +450,13 @@ class ApprovalQueue:
             )
             logger.warning(
                 "ApprovalQueue: %s.%s requires approval but no interactive "
-                "approver is attached (headless test instance); returning "
-                "non-blocking 'no_approver' instead of queuing. Set "
-                "KESTREL_TEST_AUTO_APPROVE=1 to auto-approve ASK-level tools "
-                "on this test instance.",
+                "approver is available (%s); returning non-blocking "
+                "'no_approver' instead of queuing.",
                 feature_name,
                 tool_name,
+                "non-interactive caller" if non_interactive else
+                "headless test instance — set KESTREL_TEST_AUTO_APPROVE=1 to "
+                "auto-approve ASK-level tools",
             )
             return (False, "no_approver")
 
