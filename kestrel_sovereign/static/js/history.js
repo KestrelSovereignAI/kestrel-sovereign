@@ -3,15 +3,18 @@
  * Chat History Browser
  *
  * #2149: the conversation-LIST render + rename that used to live here has been
- * consolidated into the shared ``conversations.js`` component. This module now
- * mounts that component into the history slideout (`#history-container`) and
- * keeps only the message-level chat rendering (loading a conversation's
- * messages into the chat pane, restart-status repaint, typed-part interleave).
+ * consolidated into the shared ``conversations.js`` component.
+ *
+ * #2171: the standalone console collapsed to a SINGLE conversation surface —
+ * the ``#conversations-pane`` sidebar (owned by identity.js ``loadConversations``).
+ * The history slideout this module used to mount the shared component into is
+ * gone. This module now keeps only the message-level chat rendering (loading a
+ * conversation's messages into the chat pane, restart-status repaint, typed-part
+ * interleave) plus the new-conversation flow.
  */
 
 import API from './api.js';
 import { state, Toast, escapeHtml } from './ui.js';
-import { mountConversations } from './conversations.js';
 import {
     updateContextStatus,
     wipeAgentChatPane,
@@ -96,38 +99,20 @@ function legacyToolEventsFromText(content) {
 }
 
 // ============================================================================
-// Chat History Browser — mounts the shared conversation-list component (#2149)
+// Chat History — conversation-message rendering (#2149 / #2171)
 // ============================================================================
 
 state.conversations = null;
 state.currentSessionId = null;
-state.historyVisible = false;
 
-// The single mounted instance of the shared conversation-list component in the
-// history slideout. Created lazily on first show, refreshed thereafter.
-let historyMount = null;
-
-function refreshHistoryList() {
-    if (historyMount) historyMount.refresh();
-}
-
+// #2171: the conversation LIST now lives solely in the ``#conversations-pane``
+// sidebar, rendered by identity.js ``loadConversations``. This function is kept
+// (panels.js still re-exports it) as the single "the list is stale, refresh it"
+// entry point for the message-level flows in this module (new conversation,
+// encryption-view toggle). It signals the sidebar owner via the shared stale
+// event rather than mounting a second surface of its own.
 export async function loadConversationHistory() {
-    const container = document.getElementById('history-container');
-    if (!container) return;
-    if (!historyMount) {
-        historyMount = mountConversations(container, {
-            // Selecting a row loads that conversation into the chat pane via the
-            // canonical loader (identity.js owns window.loadConversation).
-            onSelect: (conv) => {
-                if (typeof window.loadConversation === 'function') {
-                    window.loadConversation(conv.session_id);
-                }
-            },
-            getActiveSessionId: () => state.currentSessionId,
-        });
-    } else {
-        historyMount.refresh();
-    }
+    window.dispatchEvent(new CustomEvent('kestrel:conversations-stale'));
 }
 
 window.loadConversation = async function(sessionId) {
@@ -282,18 +267,12 @@ window.loadConversation = async function(sessionId) {
             );
         });
 
-        refreshHistoryList();
-
         if (viewport) {
             viewport.scrollTop = viewport.scrollHeight;
         }
 
         const statusText = state.showDecrypted ? '' : ' (encrypted view)';
         Toast.success(`Loaded conversation with ${data.message_count} messages${statusText}`);
-
-        if (window.innerWidth < 768) {
-            toggleHistorySidebar();
-        }
 
         // Update context status for the new session
         updateContextStatus();
@@ -341,24 +320,6 @@ window.startNewConversation = async function() {
         Toast.success('New conversation started');
     } catch (e) {
         Toast.error(`Failed to start new conversation: ${e.message}`);
-    }
-};
-
-window.toggleHistorySidebar = function() {
-    const sidebar = document.getElementById('history-sidebar');
-    const toggleBtn = document.getElementById('toggle-history-btn');
-
-    if (!sidebar || !toggleBtn) return;
-
-    state.historyVisible = !state.historyVisible;
-
-    if (state.historyVisible) {
-        sidebar.style.display = 'block';
-        toggleBtn.innerHTML = '\u{1F4DC} Hide History';
-        loadConversationHistory();
-    } else {
-        sidebar.style.display = 'none';
-        toggleBtn.innerHTML = '\u{1F4DC} Show History';
     }
 };
 

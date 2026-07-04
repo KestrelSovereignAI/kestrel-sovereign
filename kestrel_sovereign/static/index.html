@@ -118,39 +118,6 @@
         <!-- Chat Panel -->
         <div class="panel active" id="panel-chat">
             <div style="display: flex; height: 100%; gap: 0;">
-                <!-- Chat History Sidebar (Session 4) -->
-                <div id="history-sidebar" style="
-                    width: 280px;
-                    min-width: 280px;
-                    background: var(--bg-secondary);
-                    border-right: 1px solid var(--border-color);
-                    padding: 1rem;
-                    display: none;
-                    flex-direction: column;
-                    overflow: hidden;
-                ">
-                    <div class="row-between mb-2">
-                        <h3 style="margin: 0; font-size: 1rem;" data-label-key="chat_history_title">History</h3>
-                        <button onclick="toggleHistorySidebar()" style="
-                            background: none;
-                            border: none;
-                            font-size: 1rem;
-                            cursor: pointer;
-                            color: var(--text-secondary);
-                            padding: 0.25rem;
-                        " data-label-attr-title="btn_close_sidebar" title="Close sidebar">&times;</button>
-                    </div>
-                    <button id="new-conversation-btn" onclick="startNewConversation()" class="btn btn-primary" style="
-                        width: 100%;
-                        margin-bottom: 0.75rem;
-                        padding: 0.5rem;
-                        font-size: 0.85rem;
-                    " data-label-key="btn_new_conversation_long">+ New Conversation</button>
-                    <div id="history-container" style="flex: 1; overflow-y: auto;">
-                        <div class="loading" data-label-key="loading_history">Loading history...</div>
-                    </div>
-                </div>
-
                 <!-- Main Chat Area -->
                 <div style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
                     <!-- Chat Header with History, New Chat, Model Selector, and Privacy -->
@@ -165,7 +132,6 @@
                     ">
                         <!-- Left: Navigation buttons -->
                         <div style="display: flex; gap: 0.5rem; align-items: center;">
-                            <button id="toggle-history-btn" onclick="toggleHistorySidebar()" class="btn btn-secondary" data-label-attr-title="btn_chat_history" title="Chat History" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-scroll"></span></button>
                             <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" data-label-attr-title="btn_new_chat" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
                         </div>
 
