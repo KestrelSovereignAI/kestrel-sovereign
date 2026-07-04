@@ -34,7 +34,7 @@ let confirmReturn = true;
 globalThis.confirm = () => confirmReturn;
 globalThis.window.confirm = globalThis.confirm;
 
-const { mountConversations, buildConversationRow, beginInlineRename } = await import(
+const { mountConversations, buildConversationRow, beginInlineRename, formatConversationTime } = await import(
     '../../kestrel_sovereign/static/js/conversations.js'
 );
 
@@ -103,6 +103,62 @@ function openKebab(row) {
 function menuLabels(items) {
     return items.map((i) => i.textContent.trim());
 }
+
+// #2165: compact meta-row time. Same-day → time only; this year → "Mon D";
+// older → "M/D/YY". The full timestamp always rides the title attribute.
+test('formatConversationTime: same-day renders time only', () => {
+    const now = new Date();
+    const iso = now.toISOString();
+    const { text, title } = formatConversationTime(iso);
+    // Time-only: has a colon (H:MM) and no month/day separators.
+    assert.match(text, /\d{1,2}:\d{2}/, 'same-day shows H:MM time');
+    assert.doesNotMatch(text, /\//, 'same-day carries no date slashes');
+    // Full timestamp preserved for hover.
+    assert.equal(title, new Date(iso).toLocaleString());
+});
+
+test('formatConversationTime: this-year renders month + day (no year)', () => {
+    const now = new Date();
+    // Pick a day in this year that is not today (Jan 1 unless today is Jan 1).
+    const isToday = now.getMonth() === 0 && now.getDate() === 1;
+    const month = isToday ? 5 : 0; // June vs January
+    const d = new Date(Date.UTC(now.getFullYear(), month, isToday ? 15 : 1, 12, 0, 0));
+    const { text, title } = formatConversationTime(d.toISOString());
+    assert.match(text, /[A-Za-z]{3}\s+\d{1,2}/, 'this-year shows "Mon D"');
+    assert.doesNotMatch(text, /\d{4}/, 'this-year omits the year');
+    assert.equal(title, new Date(d.toISOString()).toLocaleString());
+});
+
+test('formatConversationTime: older renders a compact 2-digit-year date', () => {
+    const now = new Date();
+    const d = new Date(Date.UTC(now.getFullYear() - 2, 6, 4, 12, 0, 0));
+    const { text, title } = formatConversationTime(d.toISOString());
+    assert.match(text, /\d{1,2}\/\d{1,2}\/\d{2}/, 'older shows M/D/YY');
+    assert.doesNotMatch(text, /\d{4}/, 'older uses a 2-digit year');
+    assert.equal(title, new Date(d.toISOString()).toLocaleString());
+});
+
+test('formatConversationTime: empty input yields empty text and title', () => {
+    assert.deepEqual(formatConversationTime(''), { text: '', title: '' });
+    assert.deepEqual(formatConversationTime(null), { text: '', title: '' });
+});
+
+test('buildConversationRow: meta-row time carries the full timestamp as title', () => {
+    const row = buildConversationRow(
+        { session_id: 'z', preview: 'p', started_at: '2024-07-04T11:05:05Z' },
+        {},
+    );
+    const time = row.querySelector('.conversation-time');
+    assert.ok(time, 'row carries a time span');
+    assert.equal(time.title, new Date(require_ts('2024-07-04T11:05:05Z')).toLocaleString());
+    // Older date → compact M/D/YY, no seconds, no 4-digit year.
+    assert.doesNotMatch(time.textContent, /\d{4}/);
+    assert.doesNotMatch(time.textContent, /:\d{2}:\d{2}/, 'no seconds in the compact label');
+});
+
+// Helper: parse a tz-marked ISO string to ms (mirrors timelineTs for a
+// tz-suffixed string — Date.parse handles the 'Z' directly).
+function require_ts(iso) { return Date.parse(iso); }
 
 test('mount renders timeline-grouped rows each with a kebab button', async () => {
     const container = makeContainer();

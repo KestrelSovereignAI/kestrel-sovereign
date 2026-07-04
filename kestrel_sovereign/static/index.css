@@ -467,6 +467,10 @@ nav {
 .conversation-time {
     font-size: 0.75rem;
     color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
 }
 
 .conversation-item.active .conversation-time {
@@ -569,9 +573,12 @@ nav {
     padding: 0.5rem 0.25rem 0.25rem;
 }
 
-/* Meta row: time + message count on the left, kebab pinned right. */
+/* Meta row: time + message count on the left, kebab pinned right. Never wraps
+   (#2165) — at ~220px the compact time truncates with an ellipsis while the
+   count and kebab hold their size and the kebab stays pinned right. */
 .conversation-item .conversation-meta-row {
     display: flex;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 0.5rem;
     margin-bottom: 0.25rem;
@@ -580,6 +587,8 @@ nav {
 .conversation-msg-count {
     font-size: 0.75rem;
     color: var(--text-secondary);
+    flex-shrink: 0;
+    white-space: nowrap;
 }
 
 .conversation-item.active .conversation-msg-count {
