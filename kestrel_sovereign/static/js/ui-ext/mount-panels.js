@@ -137,6 +137,15 @@ export function attachDelegatedNav(navEl, activate) {
  *                                           render (default true)
  * @param {boolean} [config.wireRuntime]  - wire embed-side data loading/init via
  *                                           core-panels-runtime (default true)
+ * @param {Array<{panelId: string, label?: string, labelKey?: string, icon?: string, element: HTMLElement, before?: string}>} [config.hostTabs]
+ *        - host-provided tabs (e.g. Frinz's own Chat surface). Each entry
+ *          registers a normal registry tab whose body ADOPTS the host's live
+ *          `element` (moved in on first activation, shown/hidden via the panel
+ *          `active` class — never cloned or detached, so active SSE/event
+ *          listeners survive tab switches). `destroy()` returns each element to
+ *          its original parent/position. Ordering follows `before` (as in
+ *          registerPanel); a host tab with no `before` registered first lands
+ *          before the core panels (Chat-first).
  * @returns {Promise<{activate(panelId: string): void, destroy(): void}>}
  */
 export async function mountPanels(containerEl, config = {}) {
@@ -145,6 +154,7 @@ export async function mountPanels(containerEl, config = {}) {
     const loadFeatures = config.loadFeatures !== false;
     const activateFirst = config.activateFirst !== false;
     const wireRuntime = config.wireRuntime !== false;
+    const hostTabs = Array.isArray(config.hostTabs) ? config.hostTabs : [];
 
     const navEl = document.createElement('div');
     navEl.className = 'nav-tabs';
@@ -157,6 +167,52 @@ export async function mountPanels(containerEl, config = {}) {
     // the first sync, gated by the live capabilities.
     registerCorePanels({ api });
 
+    // Register host-provided tabs AFTER core so an explicit `before` anchoring a
+    // core tab resolves (that tab already exists at sync time). A host tab with
+    // no `before` should lead the strip (Chat-first for Frinz); multiple such
+    // tabs keep their registration order. We do NOT anchor a no-`before` host tab
+    // on a fixed core `panelId` — that core panel may be capability-gated off by
+    // the embedder (e.g. Frinz opts out of `identity`), and `insertBefore` with a
+    // missing anchor APPENDS, silently dropping Chat to the end. Instead we track
+    // the no-`before` host ids in `_leadingHostIds` and explicitly move them to
+    // the front of the nav AFTER render, regardless of which core panels survive
+    // gating. Each host tab is an ordinary registry contribution (always gated
+    // on) whose lazy `render` ADOPTS the host's live element — moved into the
+    // registry-created body once and thereafter only shown/hidden via the panel
+    // `active` class. We record the element's original placement so destroy() can
+    // return it verbatim; the element is never cloned or detached, so its live
+    // listeners persist across tab switches and remounts.
+    const _adopted = [];
+    const _leadingHostIds = [];
+    for (const ht of hostTabs) {
+        if (!ht || typeof ht.panelId !== 'string') continue;
+        const element = ht.element || null;
+        if (!ht.before) _leadingHostIds.push(ht.panelId);
+        _adopted.push({
+            panelId: ht.panelId,
+            element,
+            parent: element ? element.parentNode : null,
+            nextSibling: element ? element.nextSibling : null,
+            display: element ? element.style.display : '',
+        });
+        Panels.registerPanel({
+            panelId: ht.panelId,
+            label: ht.label,
+            labelKey: ht.labelKey,
+            icon: ht.icon,
+            before: ht.before,
+            gate: () => true,
+            render: (bodyEl) => {
+                // Move the host element in (same node — no clone). If it is
+                // already here (a prior render), appendChild is a safe no-op.
+                if (element && bodyEl) {
+                    element.style.display = '';
+                    bodyEl.appendChild(element);
+                }
+            },
+        });
+    }
+
     // Import out-of-tree feature UI contributions so feature panels (Spawn, …)
     // register their tabs alongside core. Best-effort: a manifest fetch failure
     // (e.g. no server in a test) must not abort the mount.
@@ -166,6 +222,15 @@ export async function mountPanels(containerEl, config = {}) {
 
     // Render the gated nav + panel containers into the mounted elements.
     Panels.renderNav({ navEl, hostEl, ctx: { api } });
+
+    // Host tabs with no explicit `before` must LEAD the strip regardless of which
+    // core panels the embedder gated off (else Chat falls to the end when the
+    // first core panel — e.g. identity — is capability-disabled). Move them to
+    // the front in registration order (reverse-iterate so the first stays first).
+    for (let i = _leadingHostIds.length - 1; i >= 0; i--) {
+        const tab = navEl.querySelector(`.nav-tab[data-panel="${_cssEscape(_leadingHostIds[i])}"]`);
+        if (tab) navEl.insertBefore(tab, navEl.firstChild);
+    }
 
     const activate = makePanelActivator({ tabScope: navEl, panelScope: hostEl, api });
     const detachNav = attachDelegatedNav(navEl, activate);
@@ -199,6 +264,28 @@ export async function mountPanels(containerEl, config = {}) {
         activate,
         destroy() {
             detachNav();
+            // Return each adopted host element to its original parent/position
+            // and display BEFORE the panel host is removed, so the host keeps a
+            // live element (same node, listeners intact) to use outside the
+            // mount. Unregister the host tab so the registry drops no stale
+            // reference.
+            for (const rec of _adopted) {
+                Panels.unregisterPanel(rec.panelId);
+                const el = rec.element;
+                if (!el) continue;
+                el.style.display = rec.display;
+                if (rec.parent) {
+                    if (rec.nextSibling && rec.nextSibling.parentNode === rec.parent) {
+                        rec.parent.insertBefore(el, rec.nextSibling);
+                    } else {
+                        rec.parent.appendChild(el);
+                    }
+                } else if (el.parentNode) {
+                    // Had no original parent (freshly created, detached) — just
+                    // detach it from our host so removing hostEl doesn't take it.
+                    el.parentNode.removeChild(el);
+                }
+            }
             navEl.remove();
             hostEl.remove();
             // Reset the embed runtime so a subsequent mountPanels re-wires +
