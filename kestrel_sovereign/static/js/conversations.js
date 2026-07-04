@@ -47,6 +47,34 @@ export function timelineTs(value) {
     return Number.isNaN(t) ? 0 : t;
 }
 
+// #2165: compact meta-row time. In narrow sidebars (~250px) the verbose
+// `toLocaleString()` timestamp ("7/4/2026, 11:05:05 AM") wrapped onto two
+// lines and shoved the msg-count/kebab out of place. Collapse it:
+//   - same day  → time only ("11:05 AM")
+//   - this year → "Jul 4"
+//   - older     → "7/4/25"
+// Reuses timelineTs's #1816 UTC pinning so naive (tz-less) DB strings parse as
+// UTC, not local. Returns { text, title } — the full timestamp rides the title
+// attribute for hover.
+export function formatConversationTime(value) {
+    const s = String(value || '');
+    if (!s) return { text: '', title: '' };
+    const ms = timelineTs(s);
+    if (!ms) return { text: '', title: s };
+    const date = new Date(ms);
+    const now = new Date();
+    const full = date.toLocaleString();
+    let text;
+    if (date.toDateString() === now.toDateString()) {
+        text = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    } else if (date.getFullYear() === now.getFullYear()) {
+        text = date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    } else {
+        text = date.toLocaleDateString([], { year: '2-digit', month: 'numeric', day: 'numeric' });
+    }
+    return { text, title: full };
+}
+
 function formatDateLabel(dateStr) {
     const date = new Date(dateStr);
     const today = new Date();
@@ -164,7 +192,9 @@ export function buildConversationRow(conv, opts = {}) {
     time.className = 'conversation-time';
     const startedRaw = conv.started_at || conv.last_message_at || conv.deleted_at
         || conv.archived_at;
-    time.textContent = startedRaw ? new Date(startedRaw).toLocaleString() : '';
+    const started = formatConversationTime(startedRaw);
+    time.textContent = started.text;
+    if (started.title) time.title = started.title;
     metaRow.appendChild(time);
 
     if (typeof conv.message_count === 'number') {
