@@ -217,6 +217,137 @@ async def test_purge_destroys_leaked_channel_messages(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_purge_channel_messages_preserves_same_day_preephemeral_row(tmp_path):
+    """Regression (#2102 follow-up): the watermark is space-format
+    (``datetime('now')`` → ``YYYY-MM-DD HH:MM:SS``) but the channels feature
+    writes ``created_at`` as ``message.timestamp.isoformat()`` (``T`` separator,
+    microseconds, offset). A raw lexical ``created_at >= since`` treats ANY
+    same-UTC-day ISO row as ``>=`` the watermark (``'T'`` 0x54 > ``' '`` 0x20),
+    so a NORMAL channel message authored hours BEFORE the brief EPHEMERAL stint
+    was wrongly purged — silent data loss.
+
+    Seeds the real production timestamp shapes around a controlled watermark and
+    asserts the pre-watermark NORMAL row survives while the in-window leaks (in
+    BOTH formats) are destroyed.
+    """
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.db.execute_commit(
+            """CREATE TABLE IF NOT EXISTS channel_messages (
+                   id TEXT PRIMARY KEY,
+                   agent_id TEXT NOT NULL,
+                   channel_type TEXT NOT NULL,
+                   direction TEXT NOT NULL,
+                   sender TEXT NOT NULL,
+                   recipient TEXT NOT NULL,
+                   content TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'success',
+                   metadata TEXT,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+
+        async def _insert(mid, ts):
+            await storage.db.execute_commit(
+                "INSERT INTO channel_messages "
+                "(id, agent_id, channel_type, direction, sender, recipient, "
+                " content, status, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, AGENT_ID, "telegram", "inbound", "alice", "bot",
+                 "text", "received", None, ts),
+            )
+
+        # NORMAL history authored at 09:30 (ISO-T shape, as the channels
+        # feature really writes it) — hours before the ephemeral stint.
+        await _insert("normal-0930", "2026-07-01T09:30:00.123456+00:00")
+        # In-window leaks at 13:15 (ISO-T) and 14:00 (space form) — both purge.
+        await _insert("leak-iso-1315", "2026-07-01T13:15:00.000000+00:00")
+        await _insert("leak-space-1400", "2026-07-01 14:00:00")
+
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        # Control the watermark: entered EPHEMERAL at 12:00 (space form, the
+        # real _now_iso() shape). 09:30 is BEFORE it; 13:15/14:00 are after.
+        wrapper._entered_ephemeral_at = "2026-07-01 12:00:00"
+
+        result = await wrapper.purge_ephemeral_session(reason="test")
+
+        assert result["channel_messages"] == 2  # only the two leaks
+        rows = await storage.db.fetchall(
+            "SELECT id FROM channel_messages ORDER BY id"
+        )
+        assert {r[0] for r in rows} == {"normal-0930"}
+
+
+@pytest.mark.asyncio
+async def test_purge_channel_messages_purges_unparseable_timestamp_failsafe(tmp_path):
+    """A leaked row with a malformed created_at must NOT survive the privacy
+    sweep — parse failure fail-safes to purge, not keep."""
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.db.execute_commit(
+            """CREATE TABLE IF NOT EXISTS channel_messages (
+                   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                   channel_type TEXT NOT NULL, direction TEXT NOT NULL,
+                   sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                   content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'success',
+                   metadata TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        for mid, ts in [
+            ("normal-early", "2026-07-01T09:30:00.000000+00:00"),
+            ("leak-malformed", "0000-00-00 00:00:00"),
+            ("leak-garbage", "not-a-timestamp"),
+        ]:
+            await storage.db.execute_commit(
+                "INSERT INTO channel_messages (id, agent_id, channel_type, "
+                "direction, sender, recipient, content, status, metadata, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, AGENT_ID, "telegram", "inbound", "a", "b", "x",
+                 "received", None, ts),
+            )
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        wrapper._entered_ephemeral_at = "2026-07-01 12:00:00"
+        result = await wrapper.purge_ephemeral_session(reason="test")
+        # Both malformed leaks purged; the parseable pre-watermark row survives.
+        assert result["channel_messages"] == 2
+        rows = await storage.db.fetchall("SELECT id FROM channel_messages")
+        assert {r[0] for r in rows} == {"normal-early"}
+
+
+@pytest.mark.asyncio
+async def test_purge_channel_messages_batches_beyond_bind_limit(tmp_path):
+    """A high-volume leak (> SQLite's 999 bind-param ceiling) must fully purge —
+    the DELETE is batched so it never raises on placeholder count and gets
+    swallowed as channel_messages: 0."""
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.db.execute_commit(
+            """CREATE TABLE IF NOT EXISTS channel_messages (
+                   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                   channel_type TEXT NOT NULL, direction TEXT NOT NULL,
+                   sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                   content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'success',
+                   metadata TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+        n = 1500  # exceeds the 999 default and the _DELETE_ID_BATCH of 500
+        for i in range(n):
+            await storage.db.execute_commit(
+                "INSERT INTO channel_messages (id, agent_id, channel_type, "
+                "direction, sender, recipient, content, status, metadata, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"leak-{i:05d}", AGENT_ID, "telegram", "inbound", "a", "b",
+                 "x", "received", None, "2026-07-01T13:00:00.000000+00:00"),
+            )
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
+        wrapper._entered_ephemeral_at = "2026-07-01 12:00:00"
+        result = await wrapper.purge_ephemeral_session(reason="test")
+        assert result["channel_messages"] == n
+        rows = await storage.db.fetchall("SELECT COUNT(*) FROM channel_messages")
+        assert rows[0][0] == 0
+
+
+@pytest.mark.asyncio
 async def test_purge_channel_messages_tolerates_missing_table(tmp_path):
     """When the channels feature never loaded, its table doesn't exist —
     the purge must report 0 rather than raising."""

@@ -32,6 +32,48 @@ from .db import DatabaseBackend, SQLiteBackend, create_backend
 
 logger = logging.getLogger(__name__)
 
+# Bind-parameter ceiling for a single ``id IN (...)`` DELETE. SQLite's default
+# SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds; stay well under it (and it
+# is safe for Postgres' far larger limit) so a high-volume EPHEMERAL purge never
+# raises on the placeholder count and silently leaves leaked rows behind.
+_DELETE_ID_BATCH = 500
+
+# Timestamp formats written by SQLite ``datetime('now')`` / ``CURRENT_TIMESTAMP``
+# (space separator). ISO-8601 (``T`` separator, optional offset/microseconds) is
+# handled by ``datetime.fromisoformat`` directly.
+_SQLITE_TS_FORMATS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S")
+
+
+def _parse_utc_datetime(value) -> Optional[datetime]:
+    """Parse a stored timestamp (SQLite space-form or ISO-8601) to aware UTC.
+
+    Returns ``None`` when the value is empty or unparseable so callers can make
+    an explicit fail-safe decision rather than silently mis-sorting a raw string.
+    """
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        dt = None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            for fmt in _SQLITE_TS_FORMATS:
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+        if dt is None:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
 
 def get_default_agent_data_dir() -> str:
     """Get the default agent data directory."""
@@ -446,6 +488,23 @@ class AsyncStorage:
         :meth:`purge_conversations_since`, only rows whose
         ``created_at >= since_iso`` are destroyed so a brief EPHEMERAL stint
         never wipes preexisting NORMAL channel history.
+
+        Timestamp-shape safety (regression fix): the ``since_iso`` watermark is
+        SQLite ``datetime('now')`` shape (``YYYY-MM-DD HH:MM:SS``, space
+        separator), but ``channel_messages.created_at`` is written by the
+        channels feature as ``message.timestamp.isoformat()`` (``T`` separator,
+        microseconds, offset). A raw SQL ``created_at >= since_iso`` compares
+        lexically, and ``'T'`` (0x54) > ``' '`` (0x20), so a same-UTC-day row
+        authored BEFORE the watermark still sorts ``>=`` it and would be wiped —
+        destroying preexisting NORMAL history. To be shape- and backend-agnostic
+        (and to correctly handle rows already on disk in either format), we parse
+        both the watermark and each row's timestamp to aware UTC datetimes and
+        compare those, deleting only the ids that truly fall on/after the
+        watermark. A row whose timestamp can't be parsed is purged (fail-safe:
+        this is a privacy sweep, so an unparseable leaked row must not survive).
+        The doomed ids are deleted in bounded batches so a high-volume session
+        never trips the backend's bind-parameter ceiling and raises (which the
+        caller would swallow, leaving the whole leak behind).
         """
         if not since_iso:
             return 0
@@ -455,12 +514,43 @@ class AsyncStorage:
             return 0
         from .async_conversation_store import _rows_affected
 
-        affected = await self.db.execute_commit(
-            "DELETE FROM channel_messages "
-            "WHERE agent_id = ? AND created_at >= ?",
-            (self.agent_id, since_iso),
+        since_dt = _parse_utc_datetime(since_iso)
+        if since_dt is None:
+            # Watermark itself is unparseable — we cannot scope the purge, and
+            # deleting everything would destroy preexisting NORMAL history. Refuse
+            # (mirrors the empty-watermark guard) rather than over-delete.
+            logger.warning(
+                "purge_channel_messages_since: unparseable watermark %r — "
+                "refusing to purge (agent=%s, reason=%s)",
+                since_iso, self.agent_id, reason,
+            )
+            return 0
+
+        rows = await self.db.fetchall(
+            "SELECT id, created_at FROM channel_messages WHERE agent_id = ?",
+            (self.agent_id,),
         )
-        purged = _rows_affected(affected)
+        doomed_ids = []
+        for row in rows or []:
+            created_dt = _parse_utc_datetime(row[1])
+            # None => unparseable/empty: purge (fail-safe for a privacy sweep).
+            if created_dt is None or created_dt >= since_dt:
+                doomed_ids.append(row[0])
+
+        if not doomed_ids:
+            return 0
+
+        purged = 0
+        for start in range(0, len(doomed_ids), _DELETE_ID_BATCH):
+            batch = doomed_ids[start:start + _DELETE_ID_BATCH]
+            placeholders = ", ".join(["?"] * len(batch))
+            affected = await self.db.execute_commit(
+                f"DELETE FROM channel_messages "
+                f"WHERE agent_id = ? AND id IN ({placeholders})",
+                (self.agent_id, *batch),
+            )
+            purged += _rows_affected(affected)
+
         if purged:
             logger.info(
                 "purge_channel_messages_since agent=%s since=%s reason=%s rows=%d",
