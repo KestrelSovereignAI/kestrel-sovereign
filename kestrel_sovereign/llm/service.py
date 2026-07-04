@@ -2252,6 +2252,21 @@ No other text or formatting.
 
         errors = {}
         for provider_index, provider in enumerate(available_providers):
+            if not explicit_selection and self._skip_paid_fallback(
+                provider, available_providers, provider_index
+            ):
+                logger.warning(
+                    "Refusing silent plan->paid downgrade to %s in get_response "
+                    "(a plan/free route was preferred; set "
+                    "llm.allow_paid_fallback=true to permit). Not billing the "
+                    "metered API on a plan failure.",
+                    provider.get("name"),
+                )
+                errors[provider["name"]] = LLMServiceError(
+                    f"Route {provider['name']} skipped: refusing silent "
+                    f"plan->paid downgrade (llm.allow_paid_fallback=false)"
+                )
+                continue
             if not explicit_selection and self._skip_unconfigured_route(
                 provider, configured_vendors
             ):
@@ -2772,6 +2787,17 @@ No other text or formatting.
         last_error = None
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
+            if not explicit_selection and self._skip_paid_fallback(
+                provider, providers, provider_index
+            ):
+                logger.warning(
+                    "Refusing silent plan->paid downgrade to %s in "
+                    "generate_with_messages (a plan/free route was preferred; "
+                    "set llm.allow_paid_fallback=true to permit). Not billing "
+                    "the metered API on a plan failure.",
+                    provider.get("name"),
+                )
+                continue
             if not explicit_selection and self._skip_unconfigured_route(
                 provider, configured_vendors
             ):

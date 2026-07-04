@@ -471,6 +471,102 @@ class TestCoreGeneration:
                 user_prompt="Test prompt",
             )
 
+    @staticmethod
+    def _plan_paid_pair():
+        """Build a [openai:plan(raises 429), openai:api(records+ok)] provider
+        list in the internal dict format, so a strict-mode test can assert the
+        paid :api route is never attempted after a plan throttle."""
+        attempted: list[str] = []
+
+        def _adapter(name, *, raise_exc=None):
+            ad = Mock()
+            ad.create_messages = Mock(return_value=[{"role": "user", "content": "hi"}])
+
+            async def _get_response(*a, **k):
+                attempted.append(name)
+                if raise_exc is not None:
+                    raise raise_exc
+                return LLMResponse(content="ok", input_tokens=1, output_tokens=1,
+                                   total_tokens=2)
+            ad.get_response = _get_response
+            return ad
+
+        def _prov(name, route, adapter):
+            vendor = name.split(":", 1)[0]
+            return {
+                "name": name, "vendor": vendor, "route": route,
+                "client": AsyncMock(), "adapter": adapter, "model": "m",
+                "is_cloud": True, "is_local": False, "base_url": None,
+            }
+
+        plan = _prov("openai:plan", "plan",
+                     _adapter("openai:plan",
+                              raise_exc=LLMProviderError("openai", "429 rate limit")))
+        api = _prov("openai:api", "api", _adapter("openai:api"))
+        return [plan, api], attempted
+
+    @pytest.mark.asyncio
+    async def test_generate_with_messages_refuses_plan_to_paid_downgrade(
+        self, llm_service
+    ):
+        """#2074 regression: with allow_paid_fallback=False, a plan throttle in
+        the NON-streaming agentic loop (generate_with_messages) must NOT silently
+        fall through to the metered :api route. Before the fix this loop only had
+        _skip_unconfigured_route (same-vendor :api passes) so it billed the API."""
+        providers, attempted = self._plan_paid_pair()
+        llm_service.providers = providers
+        llm_service.config = {
+            "route_priority": ["openai:plan", "openai:api"],
+            "allow_paid_fallback": False,
+        }
+        llm_service.mandate_config = {"defaults": {}}
+
+        with pytest.raises(Exception):
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        # plan was tried and raised; the paid :api route was refused, not billed.
+        assert attempted == ["openai:plan"], attempted
+
+    @pytest.mark.asyncio
+    async def test_get_response_refuses_plan_to_paid_downgrade(self, llm_service):
+        """#2074 regression, sibling loop: get_response must likewise refuse the
+        silent plan->paid downgrade under allow_paid_fallback=False."""
+        providers, attempted = self._plan_paid_pair()
+        llm_service.providers = providers
+        llm_service.config = {
+            "route_priority": ["openai:plan", "openai:api"],
+            "allow_paid_fallback": False,
+        }
+        llm_service.mandate_config = {"defaults": {}}
+
+        with pytest.raises(Exception):
+            await llm_service.get_response(
+                system_prompt="s", user_prompt="hi",
+            )
+        assert attempted == ["openai:plan"], attempted
+
+    @pytest.mark.asyncio
+    async def test_generate_with_messages_allows_plan_to_paid_when_permitted(
+        self, llm_service
+    ):
+        """Control: with allow_paid_fallback=True (default), the same plan
+        throttle DOES fall through to :api — the guard is opt-in, not a behavior
+        change for existing deployments."""
+        providers, attempted = self._plan_paid_pair()
+        llm_service.providers = providers
+        llm_service.config = {
+            "route_priority": ["openai:plan", "openai:api"],
+            "allow_paid_fallback": True,
+        }
+        llm_service.mandate_config = {"defaults": {}}
+
+        result = await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert attempted == ["openai:plan", "openai:api"], attempted
+        assert result is not None
+
     @pytest.mark.asyncio
     async def test_get_response_with_model_override(self, llm_service):
         """Test get_response with explicit model override."""
