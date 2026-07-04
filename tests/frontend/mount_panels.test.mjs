@@ -448,3 +448,26 @@ test('registerCorePanels is idempotent (re-registration replaces in place)', () 
     assert.deepEqual(second, first, 'no duplicate registrations after a second call');
     assert.equal(second.filter((id) => id === 'identity').length, 1);
 });
+
+// Codex P2 on #2164: adopting a host element must PRESERVE its inline layout
+// display (e.g. an embedder's `display:flex` chat mount) — visibility is the
+// panel container's job, not the element's own display.
+test('hostTabs: adopted element keeps its inline display (flex) while active', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const chatEl = document.createElement('div');
+    chatEl.style.display = 'flex';
+    document.body.appendChild(chatEl);
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: chatEl }],
+    });
+    handle.activate('chat');
+    assert.equal(chatEl.style.display, 'flex', 'inline flex layout preserved while mounted');
+    handle.destroy();
+    assert.equal(chatEl.style.display, 'flex', 'restored after destroy');
+});

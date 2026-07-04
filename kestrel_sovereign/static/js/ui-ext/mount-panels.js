@@ -205,8 +205,17 @@ export async function mountPanels(containerEl, config = {}) {
             render: (bodyEl) => {
                 // Move the host element in (same node — no clone). If it is
                 // already here (a prior render), appendChild is a safe no-op.
+                // Preserve the host's inline layout display (e.g. Frinz's
+                // chat mount is inline `display:flex`) — tab visibility is
+                // governed by the panel container's `active` class, so
+                // clearing the element's own display would break host
+                // layouts while mounted (codex P2 on #2164). Only a captured
+                // `none` is cleared, so a host-hidden element still shows
+                // inside its tab.
                 if (element && bodyEl) {
-                    element.style.display = '';
+                    const orig = _adopted.find((a) => a.element === element);
+                    const d = orig ? orig.display : '';
+                    element.style.display = d && d !== 'none' ? d : '';
                     bodyEl.appendChild(element);
                 }
             },
