@@ -232,6 +232,213 @@ test('a core tab toggled off→on at runtime re-inserts at its original position
     container.remove();
 });
 
+// --- (d) host-provided tabs (embed parity — Chat-first) ---------------------
+
+test('hostTabs renders a host-element tab first and adopts the live element on activation', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    // The host owns a live chat element parked elsewhere in its own DOM.
+    const hostHome = document.createElement('div');
+    document.body.appendChild(hostHome);
+    const chatEl = document.createElement('div');
+    chatEl.id = 'host-chat';
+    chatEl.__liveMarker = Symbol('sse-listeners'); // survives ⇒ same node identity
+    hostHome.appendChild(chatEl);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: chatEl }],
+    });
+
+    const nav = container.querySelector('.nav-tabs');
+    const host = container.querySelector('.main-content');
+    const tabIds = [...nav.querySelectorAll('.nav-tab')].map((t) => t.dataset.panel);
+    assert.equal(tabIds[0], 'chat', 'host tab (no `before`, registered first) lands first');
+    assert.deepEqual(tabIds, ['chat', ...CORE_PANEL_DEFS.map((d) => d.panelId)]);
+
+    // Not adopted until activated (lazy render, same as core panels).
+    assert.equal(chatEl.parentNode, hostHome, 'host element stays home until its tab is shown');
+
+    handle.activate('chat');
+    const chatPanel = host.querySelector('#panel-chat');
+    assert.ok(chatPanel, 'registry created the #panel-chat container');
+    assert.ok(chatPanel.classList.contains('active'), 'chat panel active');
+    const adopted = host.querySelector('#panel-chat #host-chat');
+    assert.equal(adopted, chatEl, 'SAME node moved into the panel body (no clone)');
+    assert.equal(adopted.__liveMarker, chatEl.__liveMarker, 'live listeners/state intact');
+
+    handle.destroy();
+    container.remove();
+    hostHome.remove();
+});
+
+test('switching to/from a host tab preserves node identity (no detach/reattach, no clone)', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const chatEl = document.createElement('div');
+    chatEl.id = 'host-chat';
+    const marker = Symbol('live');
+    chatEl.__liveMarker = marker;
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: chatEl }],
+    });
+    const host = container.querySelector('.main-content');
+
+    handle.activate('chat');
+    const afterFirst = host.querySelector('#panel-chat #host-chat');
+    handle.activate('metrics');
+    // Switching away hides the panel but does NOT detach the element.
+    assert.equal(host.querySelector('#panel-chat').classList.contains('active'), false,
+        'chat panel hidden (display toggle via active class)');
+    assert.equal(host.querySelector('#panel-chat #host-chat'), afterFirst,
+        'element remains inside its panel while hidden (not detached)');
+    handle.activate('chat');
+    const afterSecond = host.querySelector('#panel-chat #host-chat');
+    assert.equal(afterSecond, afterFirst, 'same node across switches (never re-created)');
+    assert.equal(afterSecond.__liveMarker, marker, 'listeners/state survive tab switches');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('destroy() returns each host element to its original parent/position', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    const hostHome = document.createElement('div');
+    document.body.appendChild(hostHome);
+    const before = document.createElement('span');
+    const chatEl = document.createElement('div');
+    chatEl.id = 'host-chat';
+    const after = document.createElement('span');
+    hostHome.append(before, chatEl, after); // chatEl sits between two siblings
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: chatEl }],
+    });
+    handle.activate('chat'); // adopt it into the mount
+    assert.notEqual(chatEl.parentNode, hostHome, 'element was adopted into the mount');
+
+    handle.destroy();
+    assert.equal(chatEl.parentNode, hostHome, 'element returned to its original parent');
+    assert.equal(chatEl.previousSibling, before, 'restored before its original nextSibling');
+    assert.equal(chatEl.nextSibling, after, 'restored in its original position');
+
+    container.remove();
+    hostHome.remove();
+});
+
+test('a no-`before` host tab still leads when the first core panel is gated off', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const chatEl = document.createElement('div');
+    chatEl.id = 'host-chat';
+
+    // The embedder (a companion platform) opts OUT of `identity` —
+    // CORE_PANEL_DEFS[0], the anchor a naive "first" default would rely on.
+    // Chat must STILL land first, not fall to the end.
+    const handle = await mountPanels(container, {
+        api: stubApi({ identity: false }),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: chatEl }],
+    });
+
+    const nav = container.querySelector('.nav-tabs');
+    const tabIds = [...nav.querySelectorAll('.nav-tab')].map((t) => t.dataset.panel);
+    assert.ok(!tabIds.includes('identity'), 'identity gated off by the embedder');
+    assert.equal(tabIds[0], 'chat', 'host tab still leads the strip (Chat-first preserved)');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('multiple no-`before` host tabs lead the strip in registration order', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const chatEl = document.createElement('div');
+    const notesEl = document.createElement('div');
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [
+            { panelId: 'chat', label: 'Chat', element: chatEl },
+            { panelId: 'notes', label: 'Notes', element: notesEl },
+        ],
+    });
+
+    const nav = container.querySelector('.nav-tabs');
+    const tabIds = [...nav.querySelectorAll('.nav-tab')].map((t) => t.dataset.panel);
+    assert.deepEqual(tabIds.slice(0, 2), ['chat', 'notes'],
+        'no-`before` host tabs lead in registration order');
+    assert.deepEqual(tabIds, ['chat', 'notes', ...CORE_PANEL_DEFS.map((d) => d.panelId)]);
+
+    handle.destroy();
+    container.remove();
+});
+
+test('a host tab honors `before` ordering like registerPanel', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const chatEl = document.createElement('div');
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: chatEl, before: 'metrics' }],
+    });
+    const nav = container.querySelector('.nav-tabs');
+    const tabIds = [...nav.querySelectorAll('.nav-tab')].map((t) => t.dataset.panel);
+    const metricsIdx = tabIds.indexOf('metrics');
+    assert.equal(tabIds[metricsIdx - 1], 'chat', 'host tab inserted immediately before `metrics`');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('standalone console mount is unaffected when no hostTabs are passed', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+    });
+    const nav = container.querySelector('.nav-tabs');
+    const tabIds = [...nav.querySelectorAll('.nav-tab')].map((t) => t.dataset.panel);
+    assert.deepEqual(tabIds, CORE_PANEL_DEFS.map((d) => d.panelId),
+        'exactly the core panel tabs, no host tabs injected');
+    handle.destroy();
+    container.remove();
+});
+
 test('registerCorePanels is idempotent (re-registration replaces in place)', () => {
     Panels._reset();
     registerCorePanels({ api: stubApi() });
@@ -240,4 +447,27 @@ test('registerCorePanels is idempotent (re-registration replaces in place)', () 
     const second = Panels.panels().map((p) => p.panelId);
     assert.deepEqual(second, first, 'no duplicate registrations after a second call');
     assert.equal(second.filter((id) => id === 'identity').length, 1);
+});
+
+// Codex P2 on #2164: adopting a host element must PRESERVE its inline layout
+// display (e.g. an embedder's `display:flex` chat mount) — visibility is the
+// panel container's job, not the element's own display.
+test('hostTabs: adopted element keeps its inline display (flex) while active', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const chatEl = document.createElement('div');
+    chatEl.style.display = 'flex';
+    document.body.appendChild(chatEl);
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        activateFirst: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: chatEl }],
+    });
+    handle.activate('chat');
+    assert.equal(chatEl.style.display, 'flex', 'inline flex layout preserved while mounted');
+    handle.destroy();
+    assert.equal(chatEl.style.display, 'flex', 'restored after destroy');
 });
