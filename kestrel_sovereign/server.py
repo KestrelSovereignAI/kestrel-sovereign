@@ -70,10 +70,18 @@ security = HTTPBearer(auto_error=False)
 # Auth-exempt feature UI static assets, matched precisely to the mount shape
 # (/features/{slug}/static/…). Anchored + single-segment so a feature *API*
 # route that merely contains a later "static" segment (e.g.
-# /features/foo/api/static/secret) stays protected. Mirrors the host-side
-# FEATURE_STATIC_ASSET_RE (host.py), minus the /api/agents/{id} prefix the host
-# strips before proxying to the agent.
-FEATURE_STATIC_ASSET_RE = re.compile(r"^/features/[^/]+/static/")
+# /features/foo/api/static/secret) stays protected.
+#
+# The optional /api/agents/{id} prefix matters: in multi-agent host mode
+# server:app itself owns the agents (app.state.agent_manager) and the browser
+# hits /api/agents/{id}/features/{slug}/static/…. auth_middleware runs BEFORE
+# MultiAgentAgentRoutingMiddleware strips that prefix (the strip middleware is
+# innermost — added earliest — so it runs LAST), so auth sees the UN-stripped
+# path here and the exemption must match it. In the separate-subprocess host.py
+# topology the host strips the prefix and forwards /features/… to the agent, so
+# the un-prefixed form is matched instead. This regex is identical to host.py's
+# FEATURE_STATIC_ASSET_RE and covers both.
+FEATURE_STATIC_ASSET_RE = re.compile(r"^(?:/api/agents/[^/]+)?/features/[^/]+/static/")
 
 # Paths where API key query parameter auth is allowed
 # (EventSource/SSE can't send headers, so these endpoints need query param auth).
