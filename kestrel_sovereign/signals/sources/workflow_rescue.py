@@ -25,7 +25,11 @@ fields verbatim before making any claim, and the dispatch/close stages refuse to
 infer merged/shipped/resolved state without upstream evidence in the payload:
 
     - ``a2a_repair_dispatch`` records work as *dispatched*, never *merged*/*shipped*,
-      and fails closed when no repair targets are supplied.
+      and fails closed unless **explicit** repair targets (``repairs`` /
+      ``repair_targets``) are supplied. It deliberately does NOT dispatch the
+      raw ``stalled_items`` a survey observed — turning "detected" straight into
+      "dispatched" would let a recurring loop auto-dispatch without per-run
+      approval (#2200).
     - ``evidence_verify`` returns OK only on real evidence; missing evidence raises.
     - ``close_resolved_todos`` refuses to close a todo that carries no resolution
       evidence.
@@ -37,8 +41,9 @@ whole point when required evidence is absent.
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.signals import (
     RateLimit,
@@ -116,22 +121,66 @@ def _as_list(value: Any) -> List[Any]:
 # --------------------------------------------------------------------------
 
 
-async def fleet_stalled_sweep_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Detect stalled/blocking work. Read-only observation.
+async def _fleet_stalled_sweep(
+    payload: Dict[str, Any], discover: Optional[Any]
+) -> Dict[str, Any]:
+    """Shared body for the fleet-stalled-sweep handler.
 
-    Pure observation: it reports the stalled items handed to it (or observed by
-    an upstream survey) and never claims any of them are resolved. Observing
-    zero stalled items is a valid OK result, so this never fails closed.
+    Pure observation: it reports the stalled items handed to it, or — when none
+    are pre-seeded and a live ``discover`` callable is bound — surveys the real
+    fleet for stalled work. It never claims any item is resolved. Observing zero
+    stalled items is a valid OK result, so this never fails closed; a discovery
+    error degrades to "observed nothing" rather than aborting the loop.
     """
     stale_days = payload.get("stale_days", 3)
     items = _as_list(payload.get("stalled_items") or payload.get("candidates"))
+    discovered = False
+    if not items and discover is not None:
+        try:
+            surveyed = await discover(stale_days)
+        except Exception as exc:  # noqa: BLE001 - observation degrades, never aborts
+            logger.warning("fleet_stalled_sweep live discovery failed: %s", exc)
+            surveyed = None
+        items = _as_list(surveyed)
+        discovered = bool(items)
     return {
         "source": FLEET_STALLED_SWEEP,
         "stale_days": stale_days,
         "stalled_items": items,
         "stalled_count": len(items),
+        # True when these candidates came from a live survey (not pre-seeded),
+        # so a reader can tell a recurring tick actually observed real work.
+        "discovered": discovered,
         "observation": _quote(FLEET_STALLED_SWEEP, "stalled_count", len(items)),
     }
+
+
+async def fleet_stalled_sweep_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Detect stalled/blocking work. Read-only observation (echo-only).
+
+    The default, discovery-less handler: it reports the stalled items handed to
+    it and never claims any of them are resolved. A host that can enumerate live
+    stalled work binds a ``discover`` callable via
+    :func:`build_fleet_stalled_sweep_registration` so a recurring tick observes
+    real candidates instead of relying on pre-seeded ones (#2200).
+    """
+    return await _fleet_stalled_sweep(payload, discover=None)
+
+
+def _make_fleet_stalled_sweep_handler(discover: Optional[Any]) -> Any:
+    """Return a fleet-stalled-sweep handler bound to an optional ``discover``.
+
+    ``discover`` is an ``async def discover(stale_days) -> list`` that surveys
+    the live fleet for stalled work. When ``None``, the returned handler is the
+    plain echo-only :func:`fleet_stalled_sweep_handler`.
+    """
+    if discover is None:
+        return fleet_stalled_sweep_handler
+
+    async def handler(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await _fleet_stalled_sweep(payload, discover=discover)
+
+    return handler
 
 
 async def governance_review_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -164,20 +213,25 @@ async def governance_review_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
 async def a2a_repair_dispatch_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Route repairs to specialist agents via A2A. Irreversible side effect.
 
-    Fails closed when no repair targets are supplied — dispatching "nothing"
-    would masquerade as a completed rescue. Records work strictly as
+    Requires **explicit** repair targets (``repairs`` / ``repair_targets``) and
+    fails closed otherwise — dispatching "nothing" would masquerade as a
+    completed rescue. It deliberately does NOT fall back to the survey's
+    ``stalled_items``: a recurring loop that forwards the observation stage's
+    output must not let *detected* work become a *dispatched* target without
+    fresh per-run approval selecting it (#2200). Records work strictly as
     *dispatched*; it must never infer ``merged``/``shipped`` state. That is what
     the downstream ``evidence_verify`` stage exists to establish.
     """
     targets = _as_list(
         payload.get("repairs")
         or payload.get("repair_targets")
-        or payload.get("stalled_items")
     )
     if not targets:
         raise ValueError(
-            "a2a_repair_dispatch: no repair targets supplied; refusing to "
-            "dispatch (fail closed)"
+            "a2a_repair_dispatch: no explicit repair targets supplied "
+            "(repairs/repair_targets); refusing to dispatch. Detected "
+            "stalled_items are not auto-dispatched — repair targets are "
+            "selected per-run with fresh approval (fail closed)"
         )
     return {
         "source": A2A_REPAIR_DISPATCH,
@@ -301,8 +355,18 @@ def _action_registration(name: str, handler: Any) -> SourceRegistration:
     )
 
 
-def build_fleet_stalled_sweep_registration() -> SourceRegistration:
-    return _action_registration(FLEET_STALLED_SWEEP, fleet_stalled_sweep_handler)
+def build_fleet_stalled_sweep_registration(
+    discover: Optional[Any] = None,
+) -> SourceRegistration:
+    """Build the ``fleet_stalled_sweep`` source.
+
+    ``discover`` is an optional ``async def discover(stale_days) -> list`` the
+    host binds so a recurring tick surveys real stalled work instead of relying
+    on pre-seeded ``stalled_items`` (#2200). Omit it for echo-only behavior.
+    """
+    return _action_registration(
+        FLEET_STALLED_SWEEP, _make_fleet_stalled_sweep_handler(discover)
+    )
 
 
 def build_governance_review_registration() -> SourceRegistration:
@@ -325,10 +389,17 @@ def build_reopen_resolved_todos_registration() -> SourceRegistration:
     return _action_registration(REOPEN_RESOLVED_TODOS, reopen_resolved_todos_handler)
 
 
-def build_workflow_rescue_registrations() -> List[SourceRegistration]:
-    """Every source the built-in ``stalled_work_rescue`` workflow references."""
+def build_workflow_rescue_registrations(
+    *, fleet_stalled_discover: Optional[Any] = None
+) -> List[SourceRegistration]:
+    """Every source the built-in ``stalled_work_rescue`` workflow references.
+
+    ``fleet_stalled_discover`` is threaded to the ``fleet_stalled_sweep`` source
+    so a host can bind live stalled-work discovery (#2200); the other sources
+    are pure functions of their payload.
+    """
     return [
-        build_fleet_stalled_sweep_registration(),
+        build_fleet_stalled_sweep_registration(fleet_stalled_discover),
         build_governance_review_registration(),
         build_a2a_repair_dispatch_registration(),
         build_evidence_verify_registration(),
@@ -337,8 +408,14 @@ def build_workflow_rescue_registrations() -> List[SourceRegistration]:
     ]
 
 
-def register_workflow_rescue_sources(registry: Any) -> List[str]:
+def register_workflow_rescue_sources(
+    registry: Any, *, fleet_stalled_discover: Optional[Any] = None
+) -> List[str]:
     """Register the rescue sources on ``registry``, idempotently.
+
+    ``fleet_stalled_discover`` (optional ``async def(stale_days) -> list``) binds
+    live stalled-work discovery onto ``fleet_stalled_sweep`` so a recurring tick
+    observes real candidates rather than pre-seeded ones (#2200).
 
     Returns the names newly registered (already-present sources are skipped so a
     second call — or a host that registered a richer implementation — is safe).
@@ -348,7 +425,9 @@ def register_workflow_rescue_sources(registry: Any) -> List[str]:
     if registry is None or not hasattr(registry, "register"):
         return registered
     has_get = hasattr(registry, "get")
-    for registration in build_workflow_rescue_registrations():
+    for registration in build_workflow_rescue_registrations(
+        fleet_stalled_discover=fleet_stalled_discover
+    ):
         if has_get and registry.get(registration.name) is not None:
             continue
         try:
@@ -361,3 +440,126 @@ def register_workflow_rescue_sources(registry: Any) -> List[str]:
                 exc,
             )
     return registered
+
+
+# --------------------------------------------------------------------------
+# Safe recurring scheduling (#2200).
+#
+# ``stalled_work_rescue`` can complete a fully-evidenced control run, but
+# scheduling the *all-stage* workflow as a recurring loop is only safe if the
+# irreversible/evidence-gated stages (``dispatch_repairs``, ``close_resolved``)
+# never fire off a blanket schedule. They must run per-run with fresh approval
+# and fresh evidence.
+#
+# The recurring configuration below schedules the workflows feature's
+# ``workflow_run`` tool against the built-in ``stalled_work_rescue`` definition
+# with *observation-only* params: each tick detects stalled work and requests
+# fresh consent at the ``govern_intent`` gate; dispatch/close only proceed once
+# that per-run approval is granted and the evidence-gated handlers pass. The
+# builder fails closed if a caller tries to pre-seed repair targets, resolution
+# evidence, or a blanket approval marker into the recurring params.
+# --------------------------------------------------------------------------
+
+# The built-in workflow name and the schedulable feature-tool task that runs it.
+RECURRING_WORKFLOW_NAME = "stalled_work_rescue"
+RECURRING_SCHEDULE_TASK_NAME = "workflow_run"
+# The built-in's own CRON trigger cadence (feature ``library.py``): every 6h.
+RECURRING_DEFAULT_CRON = "0 */6 * * *"
+# Consent scope the ``govern_intent`` stage gates on (must match the built-in).
+RECURRING_CONSENT_SCOPE = "proactive_work_rescue"
+
+# Params that must NEVER be baked into a recurring schedule: pre-seeding any of
+# these pre-targets the irreversible/evidence-gated stages, turning an
+# unattended recurring run into an auto-dispatch / auto-close. Repair targets
+# and resolution evidence are supplied per-run, alongside fresh approval.
+_PRESEEDED_ACTION_PARAM_KEYS = frozenset(
+    {
+        "repairs",  # a2a_repair_dispatch targets
+        "repair_targets",  # a2a_repair_dispatch targets (alias)
+        "resolved_todos",  # close_resolved_todos targets
+        "evidence",  # evidence_verify / close_resolved evidence
+    }
+)
+# Blanket approval markers a recurring schedule must never carry — consent is
+# collected fresh per run by the workflow's ``consent_collect`` gate (#2198).
+_BLANKET_APPROVAL_PARAM_KEYS = CONSENT_MARKER_FIELDS
+
+
+class UnsafeRecurringScheduleError(ValueError):
+    """Recurring-schedule params would enable an irreversible stage without
+    fresh, per-run approval and evidence (fail closed)."""
+
+
+def assert_safe_recurring_params(params: Any) -> Dict[str, Any]:
+    """Fail closed unless ``params`` are safe to schedule as a recurring loop.
+
+    Rejects params that pre-seed the irreversible/evidence-gated stages
+    (repair targets, resolution evidence) or that carry a blanket approval
+    marker — both must be supplied per-run with fresh consent, never baked into
+    a recurring schedule. Returns the params unchanged when safe.
+    """
+    if params is None:
+        return {}
+    if not isinstance(params, dict):
+        raise UnsafeRecurringScheduleError(
+            f"recurring params must be a dict, got {type(params).__name__}"
+        )
+    preseeded = sorted(k for k in _PRESEEDED_ACTION_PARAM_KEYS if params.get(k))
+    if preseeded:
+        raise UnsafeRecurringScheduleError(
+            "recurring stalled_work_rescue schedule must not pre-seed "
+            f"irreversible-stage targets {preseeded}; repair targets and "
+            "resolution evidence are supplied per-run with fresh approval "
+            "(fail closed)"
+        )
+    approvals = sorted(k for k in _BLANKET_APPROVAL_PARAM_KEYS if params.get(k))
+    if approvals:
+        raise UnsafeRecurringScheduleError(
+            "recurring stalled_work_rescue schedule must not carry a blanket "
+            f"approval marker {approvals}; consent is collected fresh per run "
+            "by the govern_intent gate (fail closed)"
+        )
+    return params
+
+
+def is_safe_recurring_params(params: Any) -> bool:
+    """``True`` when :func:`assert_safe_recurring_params` accepts ``params``."""
+    try:
+        assert_safe_recurring_params(params)
+    except UnsafeRecurringScheduleError:
+        return False
+    return True
+
+
+def build_recurring_schedule_request(
+    *,
+    cron: Optional[str] = None,
+    stale_days: int = 3,
+    notify: Any = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the exact ``schedule_add`` invocation for a *safe* recurring loop.
+
+    The returned dict maps 1:1 onto ``SchedulerFeature.schedule_add`` kwargs
+    (``cron_expression``, ``task_name``, ``args_json``). The scheduled task is
+    the workflows feature's ``workflow_run`` tool, started against the built-in
+    ``stalled_work_rescue`` definition with observation-only params: it detects
+    stalled work and requests fresh consent, so the irreversible dispatch/close
+    stages only proceed once that per-run approval (and its evidence) is granted.
+
+    Fails closed via :func:`assert_safe_recurring_params` if ``extra_params``
+    tries to pre-seed repair targets, resolution evidence, or a blanket
+    approval marker.
+    """
+    params: Dict[str, Any] = {"stale_days": int(stale_days), "recurring": True}
+    if extra_params:
+        params.update(extra_params)
+    assert_safe_recurring_params(params)
+    args: Dict[str, Any] = {"name": RECURRING_WORKFLOW_NAME, "params": params}
+    if notify is not None:
+        args["notify"] = notify
+    return {
+        "cron_expression": cron or RECURRING_DEFAULT_CRON,
+        "task_name": RECURRING_SCHEDULE_TASK_NAME,
+        "args_json": json.dumps(args, sort_keys=True),
+    }

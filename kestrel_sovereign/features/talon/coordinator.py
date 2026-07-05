@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -339,7 +339,13 @@ class TalonCoordinatorFeature(Feature):
             from kestrel_sovereign.signals.sources.workflow_rescue import (
                 register_workflow_rescue_sources,
             )
-            registered = register_workflow_rescue_sources(registry)
+            # Bind live discovery so a recurring fleet_stalled_sweep tick
+            # surveys real stalled Talon jobs instead of relying on pre-seeded
+            # candidates (#2200). Read-only: it only observes, never dispatches.
+            registered = register_workflow_rescue_sources(
+                registry,
+                fleet_stalled_discover=self._survey_stalled_talon_jobs,
+            )
             if registered:
                 logger.info(
                     "TalonCoordinatorFeature registered workflow-rescue "
@@ -1611,6 +1617,81 @@ class TalonCoordinatorFeature(Feature):
         if ref == "HEAD":  # detached
             ref = _run(["rev-parse", "--short", "HEAD"])
         return {"ref": ref, "head_sha": head_sha}
+
+    @tool(
+        name="talon_schedule_work_rescue",
+        description=(
+            "Schedule the stalled_work_rescue workflow as a SAFE recurring "
+            "loop. Each tick detects stalled fleet work and requests fresh "
+            "per-run consent; the irreversible dispatch/close stages never "
+            "auto-run off the schedule. Refuses to bake in repair targets, "
+            "resolution evidence, or a blanket approval marker."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!talon schedule-rescue",
+    )
+    async def talon_schedule_work_rescue(
+        self,
+        cron: Optional[str] = None,
+        stale_days: int = 3,
+    ) -> ToolResult:
+        """Install a safe recurring ``stalled_work_rescue`` schedule (#2200).
+
+        The scheduled task is the workflows feature's ``workflow_run`` tool,
+        started against the built-in ``stalled_work_rescue`` definition with
+        observation-only params. Detect and govern recur; dispatch and close
+        only execute with explicit per-run approval and evidence, so the loop is
+        safe to run unattended.
+
+        Args:
+            cron: Cron expression (5 fields) or alias. Defaults to the built-in
+                cadence of every 6 hours.
+            stale_days: How many idle days mark work as stalled (default 3).
+        """
+        from kestrel_sovereign.signals.sources.workflow_rescue import (
+            UnsafeRecurringScheduleError,
+            build_recurring_schedule_request,
+        )
+
+        try:
+            request = build_recurring_schedule_request(
+                cron=cron, stale_days=stale_days
+            )
+        except UnsafeRecurringScheduleError as exc:
+            return ToolResult.failed(str(exc))
+
+        agent = getattr(self, "agent", None)
+        scheduler = (
+            agent.get_feature("SchedulerFeature")
+            if agent is not None and hasattr(agent, "get_feature")
+            else None
+        )
+        if scheduler is None or not hasattr(scheduler, "schedule_add"):
+            # No scheduler loaded — return the ready-to-use invocation so an
+            # operator can install it by hand rather than silently no-op.
+            return ToolResult.failed(
+                "SchedulerFeature is not available; enable it to schedule the "
+                "recurring rescue loop. Ready-to-use schedule_add args are in "
+                "data['schedule_request'].",
+                data={"schedule_request": request},
+            )
+
+        result = await scheduler.schedule_add(
+            cron_expression=request["cron_expression"],
+            task_name=request["task_name"],
+            args_json=request["args_json"],
+        )
+        # Surface the request shape alongside whatever the scheduler returned.
+        data = dict(getattr(result, "data", None) or {})
+        data["schedule_request"] = request
+        if getattr(result, "error", None):
+            return ToolResult.failed(result.error, data=data)
+        return ToolResult.ok(
+            "Scheduled a safe recurring stalled_work_rescue loop "
+            f"({request['cron_expression']}); dispatch/close still require "
+            "fresh per-run approval and evidence.",
+            data=data,
+        )
 
     @tool(
         name="talon_workspace_status",
@@ -2925,6 +3006,57 @@ class TalonCoordinatorFeature(Feature):
             # Reloaded jobs have no live process handle.
             info.pop("process", None)
             self._jobs[jid] = info
+
+    async def _survey_stalled_talon_jobs(
+        self, stale_days: Any = 3,
+    ) -> List[Dict[str, Any]]:
+        """Discover live stalled Talon jobs for ``fleet_stalled_sweep`` (#2200).
+
+        A job is *stalled* when it is still ``dispatched``/``running`` and its
+        ``started_at`` is older than ``stale_days`` (a missing/unparseable
+        timestamp is treated as stalled — surfacing it for review is safe).
+        Read-only observation: it returns descriptor dicts and never dispatches,
+        closes, or mutates anything. The irreversible ``a2a_repair_dispatch``
+        stage will still refuse to act on these without explicit per-run repair
+        targets and fresh approval.
+        """
+        try:
+            self._reload_persisted_jobs()
+        except Exception as exc:  # noqa: BLE001 - survey degrades, never aborts
+            logger.debug("stalled-work survey could not reload jobs: %s", exc)
+        try:
+            days = max(0.0, float(stale_days))
+        except (TypeError, ValueError):
+            days = 3.0
+        threshold = datetime.now(timezone.utc) - timedelta(days=days)
+
+        stalled: List[Dict[str, Any]] = []
+        for jid, info in list(self._jobs.items()):
+            if not isinstance(info, dict):
+                continue
+            if info.get("status") not in ("dispatched", "running"):
+                continue
+            started_raw = info.get("started_at")
+            started = None
+            if isinstance(started_raw, str):
+                try:
+                    started = datetime.fromisoformat(started_raw)
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    started = None
+            if started is not None and started > threshold:
+                continue  # recent activity — not stalled yet
+            stalled.append({
+                "id": jid,
+                "kind": "talon_job",
+                "label": info.get("label"),
+                "repo": info.get("repo"),
+                "issue": info.get("issue"),
+                "status": info.get("status"),
+                "started_at": started_raw,
+            })
+        return stalled
 
     async def _dispatch_via_cli_background(
         self,
