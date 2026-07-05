@@ -379,18 +379,32 @@ class StreamingMixin:
 
     @staticmethod
     def _route_is_paid(provider: dict) -> bool:
-        """True when ``provider`` is a metered API-key route (``vendor:api``),
-        as opposed to a subscription ``:plan`` route or a free ``:local`` one.
+        """True when ``provider`` is a per-token METERED route (bills the operator
+        for usage), as opposed to a subscription ``:plan`` route (flat-rate Claude
+        Max / ChatGPT plan) or a free ``:local`` one.
 
-        Derives the route from the explicit ``route`` field, falling back to
-        the ``vendor:route`` name so it works on the minimal provider dicts
-        the loop carries.
+        A ``route == "api"`` name is the canonical metered route, but NOT the only
+        one: a cloud route under any other name (e.g. ``google:vertex``, which
+        bills GCP per token) is also metered. Classifying only ``:api`` as paid
+        let strict-mode (``allow_paid_fallback=false``) silently fall through to
+        such routes — the exact silent billing the flag refuses (#2074/P2). So
+        treat a route as paid when it is an explicit ``:api`` route OR a cloud
+        (non-local) route that is not a flat-rate subscription plan. ``is_cloud``/
+        ``is_local`` ride on every provider dict via _convert_providers_format.
+
+        Derives the route from the explicit ``route`` field, falling back to the
+        ``vendor:route`` name so it works on the minimal provider dicts the loop
+        carries.
         """
         route = provider.get("route")
         if not route:
             name = provider.get("name", "") or ""
             route = name.rsplit(":", 1)[-1] if ":" in name else ""
-        return route == "api"
+        # Subscription plans and local routes are never per-token metered.
+        if route in ("plan", "local") or provider.get("is_local"):
+            return False
+        # Explicit metered route, or any other cloud route (vertex, gemini, …).
+        return route == "api" or bool(provider.get("is_cloud"))
 
     def _skip_paid_fallback(self, provider: dict, providers: list, index: int) -> bool:
         """True when the loop must NOT silently fall to a metered ``:api`` route
