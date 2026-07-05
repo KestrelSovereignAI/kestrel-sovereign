@@ -85,6 +85,18 @@ FEATURE_STATIC_ASSET_RE = re.compile(
     r"^(?:/api/agents/[^/]+)?/features/[^/]+/static/"
 )
 
+# Webhook dispatch paths that bypass the host API-key auth. Webhooks
+# authenticate themselves (HMAC signature / bearer token) — an external caller
+# (Stripe, GitHub, …) has no host API key. The bare ``/webhooks/{name}`` proxy
+# routes to the first agent, but a heterogeneous multi-agent host must be able to
+# address a SPECIFIC agent's webhook — the documented per-agent path
+# ``/api/agents/{id}/webhooks/{name}``. Without matching that agent-prefixed form
+# here, external callers 401 at the host and the documented escape hatch is
+# unusable (#2091/P3). Matching ``/webhooks/`` (bare OR agent-prefixed) exempts
+# only webhook dispatch — webhook management is command-only (``!webhooks``), so
+# no HTTP admin route is opened.
+WEBHOOK_PATH_RE = re.compile(r"^(?:/api/agents/[^/]+)?/webhooks/")
+
 # Paths (suffixes) where API key query parameter auth is allowed.
 # EventSource/SSE connections cannot send custom headers, so these endpoints
 # need query param auth. Restricted to avoid leaking keys in URL logs.
@@ -275,8 +287,11 @@ async def auth_middleware(request: Request, call_next):
     # feature *API* routes stay protected. See FEATURE_STATIC_ASSET_RE (#2048).
     if FEATURE_STATIC_ASSET_RE.match(request.url.path):
         return await call_next(request)
-    # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth
-    if request.url.path.startswith("/webhooks/"):
+    # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth.
+    # Matches the bare /webhooks/{name} AND the per-agent
+    # /api/agents/{id}/webhooks/{name} form so an external caller can reach a
+    # specific agent's webhook on a heterogeneous host (#2091/P3).
+    if WEBHOOK_PATH_RE.match(request.url.path):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
@@ -662,8 +677,11 @@ async def generic_webhook_proxy(request: Request, webhook_name: str):
     rasa/github-app webhook proxies — the host cannot know which subprocess
     agent registered ``{name}`` without querying, and fanning the request out
     would double-deliver a state-mutating webhook. Heterogeneous multi-agent
-    hosts that need per-agent webhooks should address the agent directly via
-    the ``/api/agents/{id}/webhooks/{name}`` proxy below.
+    hosts that need per-agent webhooks address the agent directly via the
+    ``/api/agents/{id}/webhooks/{name}`` proxy below, which the auth middleware
+    now exempts (WEBHOOK_PATH_RE) so an external, keyless caller can reach it
+    (#2091/P3). (A host-side name→agent registry that routes the bare path to
+    the owning agent is a larger follow-up.)
     """
     config: MultiAgentConfig = request.app.state.multi_agent_config
     client: httpx.AsyncClient = request.app.state.http_client
