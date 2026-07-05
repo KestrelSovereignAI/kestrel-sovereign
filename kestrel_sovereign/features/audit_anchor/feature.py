@@ -465,10 +465,17 @@ class AuditAnchorFeature(Feature):
                     )
                     rows = await cursor.fetchall()
                     for row in rows:
-                        if since_norm:
-                            ts = normalize_audit_timestamp(row["created_at"])
-                            if ts and ts <= since_norm:
-                                continue
+                        ts = normalize_audit_timestamp(row["created_at"])
+                        # Skip a row with no orderable timestamp (NULL/empty
+                        # created_at). It can't be range-verified: verify's
+                        # _in_range excludes an empty-ts row whenever the anchor
+                        # has boundaries, so anchoring (hashing) it here would
+                        # produce a set verify can never reproduce → a false
+                        # integrity failure (P9). Exclude it from BOTH sides.
+                        if not ts:
+                            continue
+                        if since_norm and ts <= since_norm:
+                            continue
                         entries.append(dict(row))
             except Exception as e:
                 logger.warning(f"Could not read audit log entries: {e}")
