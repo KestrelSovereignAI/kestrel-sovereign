@@ -234,23 +234,33 @@ class GoogleAdapter(LLMAdapter):
             content = None
             parsed_tool_calls = None
 
-            # Check for function calls
+            # Guard the candidate/content/parts chain: on a safety-blocked prompt
+            # or a MAX_TOKENS-empty candidate the google-genai response has
+            # candidate.content is None (or content.parts is None), so iterating
+            # it unguarded raises AttributeError/TypeError instead of returning a
+            # documented LLMResponse. Mirror VertexAIAdapter's guard.
             candidate = response.candidates[0] if response.candidates else None
-            if candidate:
-                for part in candidate.content.parts:
-                    if hasattr(part, 'text') and part.text:
-                        content = part.text
-                    elif hasattr(part, 'function_call'):
-                        if parsed_tool_calls is None:
-                            parsed_tool_calls = []
-                        fc = part.function_call
-                        # Gemini function_call has name and args
-                        args = dict(fc.args) if hasattr(fc, 'args') else {}
-                        parsed_tool_calls.append(ToolCall(
-                            id=f"gemini_call_{len(parsed_tool_calls)}",
-                            name=fc.name,
-                            arguments=args
-                        ))
+            parts = None
+            if candidate is not None and getattr(candidate, "content", None) is not None:
+                parts = getattr(candidate.content, "parts", None)
+            for part in parts or []:
+                if getattr(part, "text", None):
+                    content = part.text
+                # google-genai Part ALWAYS carries a `function_call` attribute
+                # (defaults to None), so `hasattr` is always True — check the
+                # value, or a plain text/thought part (function_call=None) would
+                # enter this branch and crash on fc.name / dict(fc.args).
+                elif getattr(part, "function_call", None) is not None:
+                    if parsed_tool_calls is None:
+                        parsed_tool_calls = []
+                    fc = part.function_call
+                    # Gemini function_call has name and args
+                    args = dict(fc.args) if getattr(fc, "args", None) else {}
+                    parsed_tool_calls.append(ToolCall(
+                        id=f"gemini_call_{len(parsed_tool_calls)}",
+                        name=fc.name,
+                        arguments=args
+                    ))
 
             return LLMResponse(
                 content=content,
