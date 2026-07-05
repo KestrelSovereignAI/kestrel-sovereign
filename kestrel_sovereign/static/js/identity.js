@@ -13,7 +13,7 @@ import { generateIdenticon } from './identicon.js';
 // keeps NO bespoke conversation fetching or request-sequencing; it only wires
 // the sidebar-specific hooks (agent pinning, #714 auto-load, chat-state
 // coordination on delete) through the component's config.
-import { mountConversations } from './conversations.js';
+import { mountConversationsPane } from './conversations.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
@@ -1112,20 +1112,27 @@ async function handleSidebarConversationMutation(action, conv) {
     if (typeof updateContextStatus === 'function') updateContextStatus();
 }
 
-// Mount the shared conversation-list component into the sidebar pane exactly
-// once, then reuse the handle. The sidebar drives its Active↔Trash toggle from
-// the header `#trash-toggle-btn` (so the component's own view bar is hidden),
-// and pins selection / auto-load to the loaded agent through the hooks above.
+// Mount the shared conversation PANE unit into the sidebar exactly once, then
+// reuse the handle. #2199: the standalone console consumes the SAME
+// `mountConversationsPane` export as any embedder — one pane implementation
+// owns the list plus the collapse rail, drag-resize (min/max + localStorage),
+// and the search/view-bar/stats disclosure. identity.js provides only the
+// container (`#conversations-pane`, whose static chrome the export adopts) and
+// the sidebar-specific hooks: agent pinning, #714 auto-load, and chat-state
+// coordination on delete. The header `#trash-toggle-btn` still drives the
+// Active↔Trash view (the component's own view bar stays hidden), and the built
+// search + stats blocks ride the pane's disclosure toggle.
 function ensureConversationsMount() {
     if (conversationsHandle) return conversationsHandle;
-    const container = document.getElementById('conversations-list');
+    const container = document.getElementById('conversations-pane');
     if (!container) return null;
-    conversationsHandle = mountConversations(container, {
+    conversationsHandle = mountConversationsPane(container, {
         api: API,
+        storageKey: 'kestrel:conversations-pane',
         autoLoad: false,
         showViewBar: false,
-        showSearch: false,
-        showStats: false,
+        showSearch: true,
+        showStats: true,
         agentName: API.getHostAgent(),
         getActiveSessionId: () => activeConversationId,
         onSelect: (conv, ctx) => {
@@ -1464,6 +1471,25 @@ function initPaneResize(handleId, paneId) {
     });
 }
 
+// #2199: the chat-header `ki-history` trigger (icon-only, tooltip + aria) opens
+// or collapses the conversations pane. It drives the SAME mount handle the
+// sidebar uses — ensureConversationsMount() so the toggle works even before the
+// first agent-select has revealed the pane.
+window.toggleConversationsPane = function() {
+    const pane = document.getElementById('conversations-pane');
+    // Reveal the pane the first time the trigger is used (loadAgents also
+    // reveals it on agent-select; either path is fine). When revealing from
+    // hidden, force it OPEN rather than toggle — a fresh mount with no persisted
+    // collapse state starts expanded, so a toggle would immediately collapse the
+    // just-revealed pane (and the outcome would flip depending on persisted
+    // state). open() no-ops if already expanded, so this is safe.
+    const wasHidden = pane && pane.style.display === 'none';
+    if (wasHidden) pane.style.display = 'flex';
+    const handle = ensureConversationsMount();
+    if (handle) { wasHidden ? handle.open() : handle.toggle(); }
+    else if (pane) pane.classList.toggle('collapsed');
+};
+
 // Setup collapse buttons and resize handles
 document.addEventListener('DOMContentLoaded', () => {
     const collapseAgentsBtn = document.getElementById('collapse-agents-btn');
@@ -1471,9 +1497,15 @@ document.addEventListener('DOMContentLoaded', () => {
         collapseAgentsBtn.addEventListener('click', () => togglePane('agents-pane'));
     }
 
-    const collapseConversationsBtn = document.getElementById('collapse-conversations-btn');
-    if (collapseConversationsBtn) {
-        collapseConversationsBtn.addEventListener('click', () => togglePane('conversations-pane'));
+    // #2199: the conversations pane's collapse chevron + drag-resize handle are
+    // owned by the `mountConversationsPane` export (it adopts the static
+    // `.collapse-btn` / `.resize-handle` inside `#conversations-pane` when it
+    // mounts), so identity.js no longer wires them here — that would double-bind.
+
+    // Wire the chat-header history trigger (#2199).
+    const historyTriggerBtn = document.getElementById('conversations-toggle-btn');
+    if (historyTriggerBtn) {
+        historyTriggerBtn.addEventListener('click', () => window.toggleConversationsPane());
     }
 
     // A realtime/pipeline voice session persists its turns server-side as a
@@ -1506,9 +1538,10 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Initialize resize handles
+    // Initialize resize handles. The conversations pane's resize is owned by
+    // the mountConversationsPane export (#2199); only the agents pane keeps the
+    // bespoke handler here.
     initPaneResize('resize-agents', 'agents-pane');
-    initPaneResize('resize-conversations', 'conversations-pane');
     // Wire the Trash toggle in the conversations pane header (#765).
     initTrashToggle();
 });

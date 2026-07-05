@@ -159,6 +159,48 @@ test('the pinned expectedAgent makes window.loadConversation drop a stale row un
     assert.deepEqual(fetched, ['991'], 'a stale Emma row must not fetch under Meridian routing');
 });
 
+test('standalone console consumes mountConversationsPane: chrome built + window.toggleConversationsPane drives collapse (#2199)', async () => {
+    API.getConversations = async () => ({ conversations: [] });
+    API.setHostAgent('Emma');
+    refreshConversationsPane();
+    await new Promise((r) => setTimeout(r, 0));
+
+    const pane = document.getElementById('conversations-pane');
+    // The pane consumed the shared export, which tagged the container and built
+    // (or adopted) the collapse rail + resize handle — NOT a bare list mount.
+    assert.ok(pane.classList.contains('conversations-pane'), 'export tagged the pane');
+    assert.ok(pane.querySelector('.collapse-btn'), 'collapse rail present');
+    assert.ok(pane.querySelector('.resize-handle'), 'resize handle present');
+
+    // The chat-header ki-history trigger drives the pane through the export API.
+    assert.equal(pane.classList.contains('collapsed'), false, 'starts expanded');
+    window.toggleConversationsPane();
+    assert.ok(pane.classList.contains('collapsed'), 'toolbar trigger collapsed the pane');
+    window.toggleConversationsPane();
+    assert.equal(pane.classList.contains('collapsed'), false, 'toolbar trigger expands it again');
+});
+
+test('first toggle from a hidden pane REVEALS it expanded, never collapses the just-revealed pane (#2199 cold start)', async () => {
+    // Cold-start / multi-agent-before-select case: the pane is display:none and
+    // (with no persisted collapse state) a fresh mount starts expanded. The
+    // history trigger must OPEN it, not toggle it collapsed on the first click.
+    API.getConversations = async () => ({ conversations: [] });
+    API.setHostAgent('Emma');
+
+    const pane = document.getElementById('conversations-pane');
+    pane.style.display = 'none';
+    pane.classList.remove('collapsed');
+
+    window.toggleConversationsPane();
+    await new Promise((r) => setTimeout(r, 0));
+
+    assert.equal(pane.style.display, 'flex', 'hidden pane is revealed');
+    assert.equal(
+        pane.classList.contains('collapsed'), false,
+        'the first click from hidden leaves the pane EXPANDED (open), not collapsed',
+    );
+});
+
 test('a stale row clicked DURING the retarget fetch window stays pinned to the old agent (#2199 render-time snapshot)', async () => {
     // Emma's list resolves synchronously so her rows render pinned to Emma.
     API.getConversations = async () => {

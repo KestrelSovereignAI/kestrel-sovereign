@@ -560,6 +560,31 @@ nav {
     flex-direction: column;
 }
 
+/* #2199: pane chrome added by mountConversationsPane. The body is a plain
+   scroll region (when the export builds its own, absent an adopted
+   #conversations-list); the filters disclosure toggle in the header dims when
+   its controls are hidden. */
+.conversations-pane-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.5rem;
+}
+
+.conversations-filters-toggle {
+    opacity: 0.65;
+    transition: opacity 0.15s;
+}
+
+.conversations-filters-toggle.active {
+    opacity: 1;
+}
+
+/* Collapsing the pane hides the disclosure toggle alongside the other
+   header controls (matches .pane-sidebar.collapsed .btn-icon). */
+.pane-sidebar.collapsed .conversations-filters-toggle {
+    display: none;
+}
+
 /* Date groups: a muted section header above each day's rows. */
 .date-group {
     margin-bottom: 0.5rem;

@@ -132,6 +132,10 @@
                     ">
                         <!-- Left: Navigation buttons -->
                         <div style="display: flex; gap: 0.5rem; align-items: center;">
+                            <!-- #2199: icon-only conversations-pane trigger (rollback-clock
+                                 ki-history glyph, NOT ki-scroll, no "History" text). Toggles
+                                 the standalone conversations pane. -->
+                            <button id="conversations-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_toggle_conversations" title="Conversations" aria-label="Toggle conversations pane" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-history"></span></button>
                             <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" data-label-attr-title="btn_new_chat" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
                         </div>
 
