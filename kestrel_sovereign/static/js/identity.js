@@ -5,7 +5,7 @@
 
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts, renderSignalWakeChip } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
 // #2149: the sidebar renders rows through the shared conversation-list
@@ -1407,6 +1407,15 @@ window.loadConversation = async function(sessionId, options = {}) {
             const parts = msg.metadata?.parts;
             if (msg.role === 'assistant' && Array.isArray(parts) && parts.length) {
                 renderAssistantMessageWithParts(msg, chatContainer);
+                continue;
+            }
+
+            // A persisted COGNITION signal wake collapses to a compact
+            // "Autonomous wake" chip rather than surfacing the raw internal
+            // instruction template as a user message. Shared with history.js
+            // so both conversation loaders render it identically.
+            if (msg.role === 'user' && msg.metadata && msg.metadata.signal_wake) {
+                renderSignalWakeChip(msg, chatContainer);
                 continue;
             }
 

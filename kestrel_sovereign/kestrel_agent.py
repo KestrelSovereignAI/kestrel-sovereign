@@ -2565,7 +2565,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -2686,6 +2686,7 @@ Expected Duration: {expected_duration}
                     system_prompt_addendum=system_prompt_addendum,
                     system_prompt_budget_bytes=system_prompt_budget_bytes,
                     anchored_doctrine=anchored_doctrine,
+                    signal_wake=signal_wake,
                 )
 
     def _assemble_post_build_system_prompt(
@@ -2962,6 +2963,7 @@ Expected Duration: {expected_duration}
         system_prompt_addendum: Optional[str] = None,
         system_prompt_budget_bytes: Optional[int] = None,
         anchored_doctrine=None,
+        signal_wake: Optional[dict] = None,
     ) -> str:
         """Inner process_input logic wrapped in an OTEL span.
 
@@ -3184,10 +3186,21 @@ Expected Duration: {expected_duration}
         # cache_control marker at messages[-2] still compounds across
         # turns, while every other consumer (search, audit, UI, memory
         # ingestion) reads clean user speech from ``content``.
+        # A COGNITION signal wake (e.g. the restart.completed post-restart
+        # verification) arrives here with its rendered instruction template in
+        # the user-prompt position, so it persists as a ``user`` turn. Tag it
+        # with ``signal_wake`` so the transcript renderer collapses it to a
+        # compact "Autonomous wake" chip on reload instead of printing the raw
+        # internal instruction block — matching the live path, which shows only
+        # the wake's response bubble and never the prompt. rendered_content is
+        # untouched, so LLM replay + cache stability are unaffected.
+        user_meta = {"sent_form": True}
+        if signal_wake:
+            user_meta["signal_wake"] = signal_wake
         try:
             await self.privacy_agent.add_conversation(
                 "user", wrapped_user,
-                metadata={"sent_form": True},
+                metadata=user_meta,
                 session_id=session_id,
                 rendered_content=prompt,
             )

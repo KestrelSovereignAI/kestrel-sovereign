@@ -1104,6 +1104,16 @@ class SignalDispatcher:
         ):
             process_input_kwargs["session_id"] = signal.session_id
 
+        # Tag the persisted wake turn so the transcript renderer collapses this
+        # internal COGNITION prompt to an "Autonomous wake" chip on reload
+        # instead of surfacing the raw instruction template as a user message.
+        # Guarded by signature inspection like the other optional kwargs.
+        if _agent_accepts_kwarg(self._agent.process_input, "signal_wake"):
+            process_input_kwargs["signal_wake"] = {
+                "source": signal.source,
+                "mode": signal.mode.value,
+            }
+
         try:
             if process_input_kwargs:
                 result = await self._agent.process_input(
