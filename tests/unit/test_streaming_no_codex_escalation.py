@@ -687,6 +687,41 @@ async def test_strict_mode_leaves_all_paid_config_unaffected():
     assert chunks == ["ok"]
 
 
+def test_route_is_paid_classifies_metered_cloud_routes():
+    """#2074/P2: _route_is_paid must treat a metered cloud route like
+    google:vertex as PAID (bills GCP per token), not only literal ':api'. Plan
+    (subscription) and local routes stay non-paid."""
+    from kestrel_sovereign.llm.streaming import StreamingMixin as S
+    # Metered cloud routes.
+    assert S._route_is_paid({"route": "api", "is_cloud": True}) is True
+    assert S._route_is_paid({"route": "vertex", "is_cloud": True}) is True
+    assert S._route_is_paid({"name": "google:vertex", "is_cloud": True}) is True
+    # Subscription plan and local — never per-token metered.
+    assert S._route_is_paid({"route": "plan", "is_cloud": True}) is False
+    assert S._route_is_paid({"route": "local", "is_local": True}) is False
+    assert S._route_is_paid({"name": "ollama:local", "is_local": True}) is False
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_refuses_plan_to_vertex_downgrade():
+    """#2074/P2: with allow_paid_fallback=False, a plan throttle must NOT
+    silently fall through to the GCP-metered google:vertex route (route name
+    'vertex', not 'api') — it's refused, and the chain fails loudly."""
+    host = _build_configured_host(
+        [
+            ("anthropic:plan", "raise", RuntimeError("429 rate limit exceeded")),
+            ("google:vertex", "ok", None),
+        ],
+        route_priority=["anthropic:plan", "google:vertex"],
+        allow_paid_fallback=False,
+    )
+    with pytest.raises(LLMStreamingError):
+        async for _ in host.get_streaming_response(system_prompt="s", user_prompt="hi"):
+            pass
+    # vertex was never billed — the plan throttle didn't downgrade to metered.
+    assert host.attempted == ["anthropic:plan"], host.attempted
+
+
 # ---------------------------------------------------------------------------
 # Codex P2 regression: an UNCONFIGURED vendor positioned BEFORE a later
 # CONFIGURED route in the chain. The old "no configured route remains" guard
