@@ -51,6 +51,23 @@ def _escape_like_session_value(session_id: str) -> str:
     )
 
 
+def _metadata_like_forms(key: str, value_literal: str) -> tuple[str, str]:
+    """Return the two ``metadata LIKE`` patterns for a ``"key": value`` fragment.
+
+    Metadata JSON is written two ways with DIFFERENT spacing, so a single
+    space-form ``LIKE`` silently misses half the rows:
+      * Python ``json.dumps`` emits ``"key": value`` (space after the colon).
+      * SQLite ``json_set()`` / ``json()`` (used by the atomic single-flag
+        metadata updates, e.g. ``decay_protected`` #2158) re-emit the WHOLE
+        object MINIFIED — ``"key":value`` (no space). Any row ever touched by a
+        json_set update is therefore stored minified.
+    Match both. ``value_literal`` is the already-JSON-rendered value, e.g.
+    ``"true"`` for a bool flag or ``'"abc"'`` for a string. Callers OR the two:
+    ``AND (metadata LIKE ? OR metadata LIKE ?)``.
+    """
+    return (f'%"{key}": {value_literal}%', f'%"{key}":{value_literal}%')
+
+
 def _serialize_embedding(embedding: Sequence[float]) -> bytes:
     """Pack a Python embedding list to little-endian float32 bytes.
 
@@ -2791,12 +2808,15 @@ class AsyncConversationStore:
         Returns:
             List of excluded messages with their metadata
         """
+        excl_spaced, excl_packed = _metadata_like_forms(
+            "excluded_from_context", "true"
+        )
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata, created_at FROM conversation_history "
             "WHERE agent_id = ? AND deleted_at IS NULL "
-            "AND metadata LIKE '%\"excluded_from_context\": true%' "
+            "AND (metadata LIKE ? OR metadata LIKE ?) "
             "ORDER BY id DESC LIMIT ?",
-            (self.agent_id, limit)
+            (self.agent_id, excl_spaced, excl_packed, limit)
         )
 
         results = []
@@ -2834,20 +2854,25 @@ class AsyncConversationStore:
         """
         if stash_id:
             # Get specific stash
-            rows = await self.db.fetchall(
-                "SELECT id, role, content, metadata, created_at FROM conversation_history "
-                "WHERE agent_id = ? AND deleted_at IS NULL AND metadata LIKE ? "
-                "ORDER BY id ASC LIMIT ?",
-                (self.agent_id, f'%"stash_id": "{stash_id}"%', limit)
+            sid_spaced, sid_packed = _metadata_like_forms(
+                "stash_id", f'"{stash_id}"'
             )
-        else:
-            # Get all stashed messages
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, created_at FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL "
-                "AND metadata LIKE '%\"stashed\": true%' "
+                "AND (metadata LIKE ? OR metadata LIKE ?) "
+                "ORDER BY id ASC LIMIT ?",
+                (self.agent_id, sid_spaced, sid_packed, limit)
+            )
+        else:
+            # Get all stashed messages
+            stashed_spaced, stashed_packed = _metadata_like_forms("stashed", "true")
+            rows = await self.db.fetchall(
+                "SELECT id, role, content, metadata, created_at FROM conversation_history "
+                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "AND (metadata LIKE ? OR metadata LIKE ?) "
                 "ORDER BY id DESC LIMIT ?",
-                (self.agent_id, limit)
+                (self.agent_id, stashed_spaced, stashed_packed, limit)
             )
 
         results = []
@@ -2876,11 +2901,12 @@ class AsyncConversationStore:
             List of stash summaries with id, name, message_count, stashed_at
         """
         # Get all stashed messages
+        stashed_spaced, stashed_packed = _metadata_like_forms("stashed", "true")
         rows = await self.db.fetchall(
             "SELECT metadata FROM conversation_history "
             "WHERE agent_id = ? AND deleted_at IS NULL "
-            "AND metadata LIKE '%\"stashed\": true%'",
-            (self.agent_id,)
+            "AND (metadata LIKE ? OR metadata LIKE ?)",
+            (self.agent_id, stashed_spaced, stashed_packed)
         )
 
         # Group by stash_id
@@ -2912,11 +2938,12 @@ class AsyncConversationStore:
         Retrieves all conversation entries that are marked as audit failures.
         Automatically decrypts content if encryption was enabled.
         """
+        af_spaced, af_packed = _metadata_like_forms("audit_failure", "true")
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata FROM conversation_history "
             "WHERE agent_id = ? AND deleted_at IS NULL "
-            "AND metadata LIKE '%\"audit_failure\": true%'",
-            (self.agent_id,)
+            "AND (metadata LIKE ? OR metadata LIKE ?)",
+            (self.agent_id, af_spaced, af_packed)
         )
         results = []
         for row in rows:
