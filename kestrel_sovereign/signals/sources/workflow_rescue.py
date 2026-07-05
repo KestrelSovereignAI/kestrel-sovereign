@@ -69,6 +69,20 @@ SOURCE_NAMES = (
     REOPEN_RESOLVED_TODOS,
 )
 
+CONSENT_MARKER_FIELDS = frozenset(
+    {
+        "approved",
+        "consent",
+        "accepted",
+        "decision",
+        "status",
+        "state",
+        "outcome",
+        "approval_id",
+        "approved_by",
+    }
+)
+
 
 def _passthrough_schema(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Accept any dict payload; reject non-dicts so the audit row is stable."""
@@ -134,13 +148,17 @@ async def governance_review_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
         if stalled_count is not None
         else _quote(GOVERNANCE_REVIEW, "scope", scope)
     )
-    return {
+    result = {
         "source": GOVERNANCE_REVIEW,
         "scope": scope,
         "intent": "request_consent",
         "authorized": False,  # authorization is the consent gate's job, not ours
         "observation": observation,
     }
+    for field in CONSENT_MARKER_FIELDS:
+        if field in payload:
+            result[field] = payload[field]
+    return result
 
 
 async def a2a_repair_dispatch_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
