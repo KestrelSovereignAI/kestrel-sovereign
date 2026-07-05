@@ -541,6 +541,16 @@ class ProxyFeature(Feature):
 
         return self._default_venv_path(), None
 
+    def _venv_is_overridden(self) -> bool:
+        """True when the venv path was supplied by the operator (KESTREL_FEATURE_
+        <NAME>_VENV env or the pyproject ``venv =``) rather than provisioned by
+        the host at the default path. An operator-supplied venv is NOT ours to
+        mutate — see ensure_venv."""
+        return bool(
+            os.environ.get(_env_key(self.name, "VENV"))
+            or self.runtime.venv
+        )
+
     def _default_venv_path(self) -> Path:
         return _agent_data_dir(self.agent) / "feature_venvs" / self.name / ".venv"
 
@@ -603,6 +613,33 @@ class ProxyFeature(Feature):
             )
 
         exists = python_path.exists()
+
+        # A PREBUILT operator-supplied (override) venv is NOT ours to mutate:
+        # running `uv pip install --upgrade` into it would rewrite a prebuilt/
+        # pinned environment the operator deliberately provided (and hard-fail
+        # the whole feature at startup if the index is unreachable). We recognize
+        # a prebuilt override as one that exists at an override path AND carries
+        # no provision manifest of ours — i.e. we did not create it. Verify SDK
+        # compatibility and warn on a mismatch (See Something Say Something), but
+        # leave it untouched and stamp nothing. An override venv WE created
+        # earlier (our manifest present) keeps the full reprovision lifecycle, as
+        # do host-owned default venvs — both fall through below.
+        if (
+            exists
+            and self._venv_is_overridden()
+            and not self._provision_manifest_path().exists()
+        ):
+            self._warn_on_sdk_mismatch(python_path)
+            return
+
+        # An operator-supplied (override) venv that already exists is NOT ours to
+        # mutate: running `uv pip install --upgrade` into it would rewrite a
+        # prebuilt/pinned environment the operator deliberately provided (and
+        # hard-fail the whole feature at startup if the index is unreachable).
+        # Verify SDK compatibility and warn on a mismatch (See Something Say
+        # Something), but leave the venv untouched and do not stamp a manifest we
+        # don't own. Host-owned default venvs (and a not-yet-created override
+        # path we bootstrap below) keep the full reprovision lifecycle.
         if not exists:
             self._run(["uv", "venv", str(self._venv_path)])
         elif not self._provision_is_stale(install_target):
@@ -625,6 +662,14 @@ class ProxyFeature(Feature):
         # don't thrash reinstalling a genuinely pinned feature every startup.
         host_sdk = _host_sdk_version()
         child_sdk = _venv_sdk_version(python_path)
+        self._warn_on_sdk_mismatch(python_path, host_sdk=host_sdk, child_sdk=child_sdk)
+        self._write_provision_manifest(install_target, host_sdk, child_sdk)
+
+    def _warn_on_sdk_mismatch(
+        self, python_path: Path, *, host_sdk: str = None, child_sdk: str = None
+    ) -> None:
+        host_sdk = host_sdk if host_sdk is not None else _host_sdk_version()
+        child_sdk = child_sdk if child_sdk is not None else _venv_sdk_version(python_path)
         if child_sdk != host_sdk and "unknown" not in (child_sdk, host_sdk):
             logger.warning(
                 "Isolated feature %s venv resolved kestrel-sdk %s but host is %s — "
@@ -633,7 +678,6 @@ class ProxyFeature(Feature):
                 child_sdk,
                 host_sdk,
             )
-        self._write_provision_manifest(install_target, host_sdk, child_sdk)
 
     def _run(self, cmd: List[str]) -> None:
         if shutil.which(cmd[0]) is None:
