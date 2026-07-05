@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-04
-**Scope:** 1917 tracked files (1254 `.py`, 323 `.md`, 340 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-05
+**Scope:** 1919 tracked files (1254 `.py`, 323 `.md`, 342 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1712,12 +1712,14 @@ Repo entry points and standard project files.
 - **tests/frontend/context_status_model_identity.test.mjs** — (mjs asset)
 - **tests/frontend/conversation_agent_switch.test.mjs** — (mjs asset)
 - **tests/frontend/conversations.test.mjs** — (mjs asset)
+- **tests/frontend/conversations_css_coverage.test.mjs** — (mjs asset)
 - **tests/frontend/core_panels_regressions.test.mjs** — (mjs asset)
 - **tests/frontend/demo_reset_guard.test.mjs** — (mjs asset)
 - **tests/frontend/dynamic_thinking_status.test.mjs** — (mjs asset)
 - **tests/frontend/effective_session_id.test.mjs** — (mjs asset)
 - **tests/frontend/feature_ui_contributions_loader.test.mjs** — (mjs asset)
 - **tests/frontend/history_rename.test.mjs** — (mjs asset)
+- **tests/frontend/icons_ellipsis_vertical.test.mjs** — (mjs asset)
 - **tests/frontend/initial_pane_migration.test.mjs** — (mjs asset)
 - **tests/frontend/interrupt_turn_boundary.test.mjs** — (mjs asset)
 - **tests/frontend/katex_math.test.mjs** — (mjs asset)
@@ -1833,7 +1835,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_ensemble_removal_e2e.py** — Regression tests proving ensemble mode (CW-005) stays gone.
   - `def test_no_ensemble_symbols_in_package_source()`; `def temp_db()`; `async def real_llm_agent(temp_db)`; `async def test_kestrel_agent_has_no_ensemble_attributes(real_llm_agent)`; `async def test_no_ensemble_metadata_in_conversation(real_llm_agent)`
 - **tests/integration/test_ephemeral_hard_purge.py** — Integration tests for the EPHEMERAL hard-purge defense-in-depth (#767).
-  - `async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path)`; `async def test_purge_destroys_conversation_history_leak(tmp_path)`; `async def test_purge_destroys_soft_deleted_leak_too(tmp_path)`; `async def test_purge_destroys_leaked_graph_nodes(tmp_path)`; `async def test_purge_destroys_leaked_channel_messages(tmp_path)`; `async def test_purge_channel_messages_tolerates_missing_table(tmp_path)`; `async def test_purge_does_not_touch_other_agents_data(tmp_path)`; `async def test_purge_warns_and_returns_breakdown_on_leak(tmp_path, caplog)`; `…`
+  - `async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path)`; `async def test_purge_destroys_conversation_history_leak(tmp_path)`; `async def test_purge_destroys_soft_deleted_leak_too(tmp_path)`; `async def test_purge_destroys_leaked_graph_nodes(tmp_path)`; `async def test_purge_destroys_leaked_channel_messages(tmp_path)`; `async def test_purge_channel_messages_preserves_same_day_preephemeral_row(tmp_path)`; `async def test_purge_channel_messages_purges_unparseable_timestamp_failsafe(tmp_path)`; `async def test_purge_channel_messages_batches_beyond_bind_limit(tmp_path)`; `…`
 - **tests/integration/test_ephemeral_purge_scoped.py** — Integration tests for the scoped EPHEMERAL leak-purge (#867).
   - `async def test_no_writes_during_ephemeral_destroys_nothing(tmp_path)`; `async def test_only_in_window_rows_are_purged(tmp_path)`; `async def test_purge_without_watermark_refuses(tmp_path)`; `async def test_watermark_refreshes_on_re_entry(tmp_path)`; `async def test_graph_nodes_with_iso_timestamps_are_scoped_correctly(tmp_path)`; `async def test_graph_nodes_without_created_at_are_skipped_with_warning(tmp_path, caplog)`; `async def test_other_agents_data_untouched(tmp_path)`
 - **tests/integration/test_episode_recall.py** — Relevance-based episode recall + access tracking (#1674 P2).
@@ -1843,7 +1845,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_feature_lifecycle_e2e.py** — E2E tests for feature lifecycle: enable/disable/remove cycle with hook management.
   - `class TransactionSecurityHookStub`; `class AuditLogHookStub`; `class LifecycleTestFeature`; `def hooks_manager()`; `def mock_agent(hooks_manager)`; `def lifecycle_feature(mock_agent)`; `class TestFeatureLifecycleE2E`; `class TestHookRegistrationGuarantees`; `…`
 - **tests/integration/test_feature_ui_assets_auth.py** — Integration test: out-of-tree feature UI assets bypass auth (#2043).
-  - `def client(tmp_path, monkeypatch)`; `def test_feature_static_js_loads_without_api_key(client)`; `def test_feature_static_css_loads_without_api_key(client)`; `def test_protected_api_still_requires_key(client)`; `def test_feature_non_static_route_still_requires_key(client)`
+  - `def client(tmp_path, monkeypatch, request)`; `def test_feature_static_js_loads_without_api_key(client)`; `def test_feature_static_css_loads_without_api_key(client)`; `def test_protected_api_still_requires_key(client)`; `def test_feature_non_static_route_still_requires_key(client)`; `def test_feature_api_path_with_static_segment_still_requires_key(client)`; `def test_host_agent_serves_feature_asset_without_key_end_to_end(tmp_path, monkeypatch)`; `def test_regex_matches_prefixed_and_bare_static_but_not_api()`; `…`
 - **tests/integration/test_feature_ui_runtime_enable.py** — Runtime-enable serves a disabled feature's UI asset (#2048).
   - `def test_disabled_feature_asset_served_so_runtime_enable_works(tmp_path, monkeypatch)`
 - **tests/integration/test_genesis_audit_e2e.py** — Integration tests for genesis audit (CW-001 fix).
@@ -2874,7 +2876,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_spawn_mandate_hybrid.py** — sign_mandate / verify_mandate hybrid-format tests.
   - `def kestrel_data_key(monkeypatch)`; `def hybrid_parent(tmp_path, kestrel_data_key)`; `def test_legacy_mandate_signs_bare_hex()`; `def test_legacy_tamper_detected()`; `def test_hybrid_mandate_uses_prefix(hybrid_parent)`; `def test_hybrid_mandate_round_trip_verifies(hybrid_parent)`; `def test_hybrid_mandate_tamper_detected(hybrid_parent)`; `def test_hybrid_mandate_strip_pq_half_rejected(hybrid_parent)`; `…`
 - **tests/unit/test_spawn_mandate_subset_enforcement.py** — F277: a SpawnMandate must only RESTRICT the child relative to the parent.
-  - `def test_subset_ok_when_features_are_a_subset()`; `def test_refuses_features_not_available_to_parent()`; `def test_refuses_capability_granting_constraint()`; `async def test_create_agent_forwards_mandate_to_inception(monkeypatch, tmp_path)`; `async def test_omitted_allowlist_inherits_parent_ceiling_not_all(monkeypatch, tmp_path)`
+  - `def test_subset_ok_when_features_are_a_subset()`; `def test_spawn_tool_max_tokens_constraint_validates()`; `def test_refuses_features_not_available_to_parent()`; `def test_refuses_capability_granting_constraint()`; `async def test_create_agent_forwards_mandate_to_inception(monkeypatch, tmp_path)`; `async def test_omitted_allowlist_inherits_parent_ceiling_not_all(monkeypatch, tmp_path)`
 - **tests/unit/test_sql_utils.py** — Tests for kestrel_sovereign.sql_utils — SQL identifier validation.
   - `class TestSafeTableName`; `class TestSafeColumnName`
 - **tests/unit/test_sse_approval_events.py** — Tests that the /agent/notifications/sse endpoint forwards events from the agent's event bus (e.g.
