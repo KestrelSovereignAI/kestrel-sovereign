@@ -31,8 +31,17 @@ from kestrel_sovereign.signals import (
     SourceRegistry,
 )
 from kestrel_sovereign.signals.sources.workflow_rescue import (
+    RECURRING_CONSENT_SCOPE,
+    RECURRING_DEFAULT_CRON,
+    RECURRING_SCHEDULE_TASK_NAME,
+    RECURRING_WORKFLOW_NAME,
     SOURCE_NAMES,
+    UnsafeRecurringScheduleError,
+    assert_safe_recurring_params,
+    build_fleet_stalled_sweep_registration,
+    build_recurring_schedule_request,
     build_workflow_rescue_registrations,
+    is_safe_recurring_params,
     register_workflow_rescue_sources,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
@@ -202,6 +211,17 @@ async def test_a2a_repair_dispatch_fails_closed_without_targets(dispatcher):
     assert result.status == Status.FAILED
 
 
+async def test_a2a_repair_dispatch_fails_closed_with_only_stalled_items(dispatcher):
+    # Detected stalled_items must NOT auto-become dispatch targets: a recurring
+    # loop that forwards the observation stage's output cannot dispatch A2A
+    # repairs without explicit per-run repair targets + fresh approval (#2200,
+    # acceptance criterion 2).
+    result = await dispatcher.dispatch_signal(
+        _signal("a2a_repair_dispatch", {"stalled_items": ["#1", "#2"]})
+    )
+    assert result.status == Status.FAILED
+
+
 async def test_a2a_repair_dispatch_records_dispatched_not_merged(dispatcher):
     result = await dispatcher.dispatch_signal(
         _signal("a2a_repair_dispatch", {"repairs": ["#1", "#2"]})
@@ -259,6 +279,139 @@ async def test_reopen_is_idempotent_noop(dispatcher):
     )
     assert result.status == Status.OK
     assert result.action_result["reopened"] == [7, 8]
+
+
+# ---------------------------------------------------------------------------
+# Safe recurring scheduling (#2200)
+# ---------------------------------------------------------------------------
+
+
+import json
+
+
+def test_recurring_schedule_request_shape_defaults():
+    req = build_recurring_schedule_request()
+    # Maps 1:1 onto SchedulerFeature.schedule_add kwargs.
+    assert set(req) == {"cron_expression", "task_name", "args_json"}
+    assert req["cron_expression"] == RECURRING_DEFAULT_CRON
+    # Runs the schedulable workflows-feature tool, not a bespoke task name.
+    assert req["task_name"] == RECURRING_SCHEDULE_TASK_NAME == "workflow_run"
+    args = json.loads(req["args_json"])
+    assert args["name"] == RECURRING_WORKFLOW_NAME == "stalled_work_rescue"
+    # Observation-only params: no repair targets, no evidence, no approval.
+    assert args["params"] == {"stale_days": 3, "recurring": True}
+
+
+def test_recurring_schedule_request_custom_cron_and_stale_days():
+    req = build_recurring_schedule_request(cron="0 3 * * *", stale_days=7)
+    assert req["cron_expression"] == "0 3 * * *"
+    assert json.loads(req["args_json"])["params"]["stale_days"] == 7
+
+
+def test_recurring_default_params_are_safe():
+    assert is_safe_recurring_params({"stale_days": 3, "recurring": True})
+    assert assert_safe_recurring_params(None) == {}
+    assert assert_safe_recurring_params({}) == {}
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        {"repairs": ["#1"]},
+        {"repair_targets": ["#1"]},
+        {"resolved_todos": [{"id": 7}]},
+        {"evidence": {"ci_status": "green"}},
+    ],
+)
+def test_recurring_rejects_preseeded_irreversible_targets(unsafe):
+    # No A2A dispatch / close may be pre-authorized by a blanket schedule —
+    # targets and evidence are supplied per-run (criteria 2 & 3).
+    assert not is_safe_recurring_params(unsafe)
+    with pytest.raises(UnsafeRecurringScheduleError):
+        assert_safe_recurring_params(unsafe)
+    with pytest.raises(UnsafeRecurringScheduleError):
+        build_recurring_schedule_request(extra_params=unsafe)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"approved": True},
+        {"approved_by": "did:web:k.operator"},
+        {"consent": True},
+        {"decision": "approve"},
+        {"approval_id": "req-1"},
+    ],
+)
+def test_recurring_rejects_blanket_approval_marker(marker):
+    # Consent is collected fresh per run by the govern_intent gate; a schedule
+    # must never carry a standing approval (criterion 1: no blanket approval).
+    assert not is_safe_recurring_params(marker)
+    with pytest.raises(UnsafeRecurringScheduleError):
+        build_recurring_schedule_request(extra_params=marker)
+
+
+def test_recurring_scope_matches_consent_gate():
+    # The recurring loop's consent scope must match the built-in gate's scope
+    # (kestrel_feature_workflows library _stalled_work_rescue govern_intent).
+    assert RECURRING_CONSENT_SCOPE == "proactive_work_rescue"
+
+
+async def test_fleet_stalled_sweep_discovers_without_preseeded_items():
+    # Integration-style: the scheduled workflow_run input (observation-only
+    # params, no pre-seeded repair targets) yields non-empty observed candidates
+    # via live discovery (#2200, acceptance criterion 1 + P2 review finding).
+    req = build_recurring_schedule_request(stale_days=5)
+    params = json.loads(req["args_json"])["params"]
+    assert params == {"stale_days": 5, "recurring": True}
+
+    seen_stale_days = []
+
+    async def discover(stale_days):
+        seen_stale_days.append(stale_days)
+        return [{"id": "job-42", "kind": "talon_job", "status": "running"}]
+
+    reg = build_fleet_stalled_sweep_registration(discover)
+    result = await reg.handler(params)
+    assert result["stalled_count"] == 1
+    assert result["discovered"] is True
+    assert result["stalled_items"] == [
+        {"id": "job-42", "kind": "talon_job", "status": "running"}
+    ]
+    # The stale-days threshold from the schedule reaches the survey.
+    assert seen_stale_days == [5]
+
+
+async def test_fleet_stalled_sweep_preseeded_items_skip_discovery():
+    called = False
+
+    async def discover(stale_days):
+        nonlocal called
+        called = True
+        return [{"id": "should-not-appear"}]
+
+    reg = build_fleet_stalled_sweep_registration(discover)
+    result = await reg.handler({"stalled_items": ["#1"]})
+    assert result["stalled_count"] == 1
+    assert result["discovered"] is False
+    assert called is False
+
+
+async def test_fleet_stalled_sweep_discovery_error_degrades_to_zero():
+    async def discover(stale_days):
+        raise RuntimeError("survey backend unavailable")
+
+    reg = build_fleet_stalled_sweep_registration(discover)
+    result = await reg.handler({"stale_days": 3, "recurring": True})
+    # Observation degrades to "observed nothing" rather than aborting the loop.
+    assert result["stalled_count"] == 0
+    assert result["discovered"] is False
+
+
+def test_recurring_falsey_marker_values_are_allowed():
+    # A benign falsey value for a marker key does not trip the guard — only a
+    # truthy standing approval / pre-seeded target is unsafe.
+    assert is_safe_recurring_params({"approved": False, "repairs": []})
 
 
 # ---------------------------------------------------------------------------

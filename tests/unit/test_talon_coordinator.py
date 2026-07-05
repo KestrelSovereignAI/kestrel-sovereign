@@ -1102,3 +1102,128 @@ class TestTalonVerify:
             "ref",
             "issue-1626-restartcoordinator-busy-count",
         )
+
+
+class TestTalonScheduleWorkRescue:
+    """Safe recurring stalled_work_rescue scheduling (#2200)."""
+
+    @pytest.mark.asyncio
+    async def test_schedules_safe_recurring_loop(self):
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_agent()
+        scheduler = MagicMock()
+        scheduler.schedule_add = AsyncMock(
+            return_value=ToolResult.ok("added", data={"success": True})
+        )
+        agent.get_feature = MagicMock(return_value=scheduler)
+        feature = TalonCoordinatorFeature(agent)
+
+        result = await feature.talon_schedule_work_rescue()
+        assert result.status is ToolResultStatus.OK
+        scheduler.schedule_add.assert_awaited_once()
+        kwargs = scheduler.schedule_add.await_args.kwargs
+        assert kwargs["task_name"] == "workflow_run"
+        assert kwargs["cron_expression"] == "0 */6 * * *"
+        args = json.loads(kwargs["args_json"])
+        assert args["name"] == "stalled_work_rescue"
+        # Observation-only: never a pre-seeded target or standing approval.
+        assert args["params"] == {"stale_days": 3, "recurring": True}
+        assert result.data["schedule_request"]["task_name"] == "workflow_run"
+
+    @pytest.mark.asyncio
+    async def test_no_scheduler_returns_request_not_silent_noop(self):
+        agent = _make_agent()
+        agent.get_feature = MagicMock(return_value=None)
+        feature = TalonCoordinatorFeature(agent)
+
+        result = await feature.talon_schedule_work_rescue()
+        assert result.status is ToolResultStatus.ERROR
+        # The ready-to-use invocation is surfaced for a manual install.
+        assert result.data["schedule_request"]["task_name"] == "workflow_run"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_rejection_is_reported_failed(self):
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_agent()
+        scheduler = MagicMock()
+        scheduler.schedule_add = AsyncMock(
+            return_value=ToolResult.failed("Unknown scheduled task 'workflow_run'")
+        )
+        agent.get_feature = MagicMock(return_value=scheduler)
+        feature = TalonCoordinatorFeature(agent)
+
+        result = await feature.talon_schedule_work_rescue()
+        assert result.status is ToolResultStatus.ERROR
+        assert "Unknown scheduled task" in result.error
+
+
+class TestSurveyStalledTalonJobs:
+    """Live stalled-work discovery for fleet_stalled_sweep (#2200)."""
+
+    def _feature(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        # Keep the survey purely in-memory (no persisted-registry reload).
+        feature._reload_persisted_jobs = MagicMock()
+        return feature
+
+    @pytest.mark.asyncio
+    async def test_surveys_stalled_running_job(self):
+        from datetime import datetime, timedelta, timezone
+
+        feature = self._feature()
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        feature._jobs = {
+            "job-1": {
+                "status": "running", "started_at": old,
+                "label": "issue-1", "repo": "org/repo", "issue": 1,
+            },
+        }
+        stalled = await feature._survey_stalled_talon_jobs(3)
+        assert len(stalled) == 1
+        assert stalled[0]["id"] == "job-1"
+        assert stalled[0]["kind"] == "talon_job"
+        assert stalled[0]["repo"] == "org/repo"
+
+    @pytest.mark.asyncio
+    async def test_recent_and_completed_jobs_are_not_stalled(self):
+        from datetime import datetime, timedelta, timezone
+
+        feature = self._feature()
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        feature._jobs = {
+            "recent": {"status": "running", "started_at": recent},
+            "done": {"status": "complete", "started_at": old},
+        }
+        assert await feature._survey_stalled_talon_jobs(3) == []
+
+    @pytest.mark.asyncio
+    async def test_missing_timestamp_is_treated_as_stalled(self):
+        feature = self._feature()
+        feature._jobs = {"job-x": {"status": "dispatched"}}
+        stalled = await feature._survey_stalled_talon_jobs(3)
+        assert [j["id"] for j in stalled] == ["job-x"]
+
+    @pytest.mark.asyncio
+    async def test_survey_is_registered_as_fleet_discover(self):
+        # The coordinator binds its survey onto fleet_stalled_sweep so a
+        # recurring tick observes real candidates without pre-seeding.
+        from datetime import datetime, timedelta, timezone
+
+        from kestrel_sovereign.signals import SourceRegistry
+
+        feature = self._feature()
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        feature._jobs = {"job-1": {"status": "running", "started_at": old}}
+        registry = SourceRegistry()
+        feature.agent.signal_registry = registry
+        feature.agent.get_feature = MagicMock(return_value=None)
+        await feature.initialize()
+
+        reg = registry.get("fleet_stalled_sweep")
+        assert reg is not None
+        result = await reg.handler({"stale_days": 3, "recurring": True})
+        assert result["discovered"] is True
+        assert [j["id"] for j in result["stalled_items"]] == ["job-1"]

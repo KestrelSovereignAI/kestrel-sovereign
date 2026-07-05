@@ -190,6 +190,43 @@ COGNITION signal only when a watched field changes (state, merge,
 comments, checks) — args travel in the scheduled task's `args_json`
 (`repo`, `pr`/`issue`/`number`, optional `triggers`, `notify`).
 
+#### Recurring `stalled_work_rescue` — enable it *safely* (#2200)
+
+The built-in `stalled_work_rescue` workflow (detect stalled work → govern
+intent → dispatch repairs → verify evidence → close resolved) is
+schedulable through the workflows feature's `workflow_run` tool. But
+`dispatch_repairs` and `close_resolved` are **irreversible /
+evidence-gated**, so a recurring schedule must never carry a blanket
+approval marker or pre-seed repair targets/evidence — those are supplied
+**per-run, with fresh consent**.
+
+Use `talon_schedule_work_rescue` (or, by hand,
+`build_recurring_schedule_request()` in
+[`signals/sources/workflow_rescue.py`](kestrel_sovereign/signals/sources/workflow_rescue.py))
+rather than crafting the `schedule_add` args yourself:
+
+```text
+!talon schedule-rescue                    # every 6h (built-in cadence)
+!talon schedule-rescue cron="0 3 * * *"   # custom cron
+```
+
+This schedules `workflow_run` against `stalled_work_rescue` with
+**observation-only** params (`{stale_days, recurring: true}`). Each tick
+detects stalled work and requests fresh consent at the `govern_intent`
+gate; dispatch/close only proceed once that per-run approval and its
+evidence land — so the loop runs unattended without ever auto-dispatching
+or auto-closing. `assert_safe_recurring_params()` **fails closed** on any
+attempt to bake in `repairs`/`repair_targets`/`resolved_todos`/`evidence`
+or a standing approval marker (`approved`, `approved_by`, `consent`, …).
+
+Each tick's `fleet_stalled_sweep` observation surveys **live** stalled Talon
+jobs (still `dispatched`/`running` past `stale_days`) via the coordinator's
+`_survey_stalled_talon_jobs`, so a recurring loop discovers real work without
+pre-seeded candidates. Detected `stalled_items` are strictly observational:
+`a2a_repair_dispatch` requires **explicit** `repairs`/`repair_targets` and
+refuses to dispatch the survey's `stalled_items` — "detected" never becomes
+"dispatched" without a per-run approval selecting the target.
+
 ### Working with LLM providers
 1. Config in the `[llm]` section of `kestrel.toml`. Legacy standalone `llm_config.toml` was retired in epic #938 — run `kestrel migrate-llm-config` to fold a legacy file in.
 2. Provider implementations in `kestrel_sovereign/llm/`
