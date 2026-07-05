@@ -178,6 +178,25 @@ async def test_governance_review_records_intent_not_authorization(dispatcher):
     assert data["authorized"] is False
 
 
+async def test_governance_review_preserves_explicit_consent_marker(dispatcher):
+    result = await dispatcher.dispatch_signal(
+        _signal(
+            "governance_review",
+            {
+                "scope": "proactive_work_rescue",
+                "stalled_count": 2,
+                "approved": True,
+                "approved_by": "did:web:k.operator",
+            },
+        )
+    )
+    assert result.status == Status.OK
+    data = result.action_result
+    assert data["approved"] is True
+    assert data["approved_by"] == "did:web:k.operator"
+    assert data["authorized"] is False
+
+
 async def test_a2a_repair_dispatch_fails_closed_without_targets(dispatcher):
     result = await dispatcher.dispatch_signal(_signal("a2a_repair_dispatch", {}))
     assert result.status == Status.FAILED
