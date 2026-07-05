@@ -71,6 +71,70 @@ async def test_backup_blob_restores_into_fresh_storage(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_restore_coerces_text_timestamps_for_postgres(tmp_path, monkeypatch):
+    """#2116 regression: restore binds created_at/deleted_at that come out of the
+    SQLite backup as TEXT strings. On a Postgres target these must be coerced to
+    datetime, or asyncpg rejects a str for the TIMESTAMP column (_strip_tz only
+    handles datetime). Capture what gets bound and assert datetimes are passed."""
+    from datetime import datetime
+
+    source = await _storage(tmp_path, name="src.db")
+    try:
+        await source.add_conversation("user", "ts row")
+        blob = await source.create_backup_blob()
+    finally:
+        await source.close()
+
+    target = await _storage(tmp_path, name="tgt.db")
+    bound = []
+    real_execute = target.db.execute_commit
+
+    async def _spy(query, params=()):
+        if "INSERT INTO conversation_history" in query and "created_at" in query:
+            bound.append(params)
+        return await real_execute(query, params)
+
+    try:
+        # Force the Postgres coercion branch on an otherwise-SQLite target.
+        monkeypatch.setattr(type(target), "backend_type",
+                            property(lambda self: "postgres"))
+        monkeypatch.setattr(target.db, "execute_commit", _spy)
+        await target.restore_from_backup_blob(blob)
+    finally:
+        await target.close()
+
+    assert bound, "no conversation_history INSERT captured"
+    created_at = bound[0][6]  # (agent_id, role, content, model, provider, meta, created_at, deleted_at)
+    assert isinstance(created_at, datetime), f"created_at bound as {type(created_at)}"
+
+
+@pytest.mark.asyncio
+async def test_restore_preserves_created_at_on_sqlite(tmp_path):
+    """SQLite target: the string timestamp is preserved verbatim (faithful
+    restore, #F265) — the PG coercion must not alter the SQLite path."""
+    source = await _storage(tmp_path, name="src2.db")
+    try:
+        await source.add_conversation("user", "faithful ts")
+        row = await source.db.fetchone(
+            "SELECT created_at FROM conversation_history LIMIT 1"
+        )
+        original_created_at = row[0]
+        blob = await source.create_backup_blob()
+    finally:
+        await source.close()
+
+    target = await _storage(tmp_path, name="tgt2.db")
+    try:
+        await target.restore_from_backup_blob(blob)
+        row = await target.db.fetchone(
+            "SELECT created_at FROM conversation_history LIMIT 1"
+        )
+        assert row[0] == original_created_at
+    finally:
+        await target.close()
+
+
+@pytest.mark.asyncio
 async def test_backup_runs_off_event_loop(tmp_path, monkeypatch):
     storage = await _storage(tmp_path)
     try:

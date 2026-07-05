@@ -1068,6 +1068,22 @@ class AsyncStorage:
                     )
                     conversations = await cursor.fetchall()
 
+                    # created_at/deleted_at come out of the SQLite backup as
+                    # TEXT strings. Binding a string to a Postgres TIMESTAMP
+                    # column fails: PostgresBackend._strip_tz only handles
+                    # datetime instances, so asyncpg rejects the raw str. Coerce
+                    # to datetime on the Postgres path (SQLite takes the string
+                    # verbatim, preserving the exact stored form). An unparseable
+                    # value is left as-is so the backend raises loudly rather than
+                    # silently nulling a NOT NULL created_at.
+                    is_pg = self.backend_type == "postgres"
+
+                    def _ts(val):
+                        if val is None or not is_pg:
+                            return val
+                        dt = _parse_utc_datetime(val)
+                        return dt if dt is not None else val
+
                     for (
                         role, content, metadata_json, model, provider,
                         created_at, deleted_at,
@@ -1082,7 +1098,7 @@ class AsyncStorage:
                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 self.agent_id, role, content, model, provider,
-                                metadata_json, created_at, deleted_at,
+                                metadata_json, _ts(created_at), _ts(deleted_at),
                             )
                         )
                         stats["messages_restored"] += 1
