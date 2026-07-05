@@ -70,6 +70,51 @@ class TestStoreKeyInsertOnly:
         assert await storage.get_key("openai") == "sk-rotated"
 
     @pytest.mark.asyncio
+    async def test_reactivate_inactive_reactivates_tombstone(
+        self, storage: ServiceKeyStorage
+    ) -> None:
+        """#2092 regression fix: the host re-provision path may overwrite an
+        INACTIVE (removed) tombstone and reactivate it — without this, minting a
+        fresh key after a remove raised KeyStorageError and orphaned it."""
+        await storage.store_key(provider_id="openrouter", api_key="or-old")
+        await storage.deactivate_key(provider_id="openrouter")
+        assert await storage.has_key("openrouter") is False
+
+        await storage.store_key(
+            provider_id="openrouter", api_key="or-fresh",
+            reactivate_inactive=True,
+        )
+        assert await storage.has_key("openrouter") is True
+        assert await storage.get_key("openrouter") == "or-fresh"
+
+    @pytest.mark.asyncio
+    async def test_reactivate_inactive_still_refuses_active_key(
+        self, storage: ServiceKeyStorage
+    ) -> None:
+        """reactivate_inactive must NOT clobber an ACTIVE key — F196 preserved.
+        Only an inactive tombstone is overwritable via this path."""
+        await storage.store_key(provider_id="openrouter", api_key="or-active")
+
+        with pytest.raises(KeyStorageError, match="rotate_service_key"):
+            await storage.store_key(
+                provider_id="openrouter", api_key="or-attacker",
+                reactivate_inactive=True,
+            )
+        assert await storage.get_key("openrouter") == "or-active"
+
+    @pytest.mark.asyncio
+    async def test_reactivate_inactive_inserts_when_no_row(
+        self, storage: ServiceKeyStorage
+    ) -> None:
+        """With no existing row at all, reactivate_inactive falls through to a
+        plain insert."""
+        await storage.store_key(
+            provider_id="lighthouse", api_key="lh-first",
+            reactivate_inactive=True,
+        )
+        assert await storage.get_key("lighthouse") == "lh-first"
+
+    @pytest.mark.asyncio
     async def test_race_past_preflight_still_refused(
         self, storage: ServiceKeyStorage
     ) -> None:

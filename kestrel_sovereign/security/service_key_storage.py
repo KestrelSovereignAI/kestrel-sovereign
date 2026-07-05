@@ -169,28 +169,41 @@ class ServiceKeyStorage:
         api_key: str,
         quota_limit: Optional[int] = None,
         replace: bool = False,
+        reactivate_inactive: bool = False,
     ) -> str:
         """
         Store an encrypted API key for this agent.
 
         Insert-only by default: if a key already exists for this agent+provider
         (active OR inactive), this raises ``KeyStorageError`` unless ``replace``
-        is set. Only the approval-gated rotation path may pass ``replace=True``.
-        This makes storage the single enforcement point that prevents a plain
-        add from silently rotating a credential without constitutional approval
-        (F196).
+        or ``reactivate_inactive`` permits the write. ``replace=True`` is the
+        approval-gated rotation path (``rotate_service_key``) and may overwrite
+        an ACTIVE key. ``reactivate_inactive=True`` is the host-internal
+        PayerResolver re-provision path and may overwrite ONLY an inactive
+        tombstone (an active row still raises). This makes storage the single
+        enforcement point that prevents a model-controlled ``add_service_key``
+        from silently rotating a live credential without constitutional approval
+        (F196), while still letting the host re-provision a removed key.
 
         Args:
             provider_id: Service provider (openrouter, openai, etc.)
             api_key: The API key to store
             quota_limit: Optional usage limit
             replace: Allow overwriting an existing key (rotation only)
+            reactivate_inactive: For the host-internal PayerResolver re-provision
+                path. Overwrite ONLY an inactive (removed) tombstone row and
+                reactivate it; an ACTIVE row still raises ``KeyStorageError``
+                (never silently clobbered). Race-safe: the reactivation UPDATE is
+                scoped ``WHERE is_active = 0`` and the fall-through INSERT hits
+                ``UNIQUE(agent_did, provider_id)`` if an active row appears, so a
+                concurrent ``add_service_key``/rotation can never be overwritten.
 
         Returns:
             Key ID
 
         Raises:
-            KeyStorageError: If a key already exists and ``replace`` is False.
+            KeyStorageError: If a key already exists and neither ``replace`` nor
+                (for an *inactive* row) ``reactivate_inactive`` permits it.
         """
         await self._ensure_provider(provider_id)
 
@@ -225,6 +238,37 @@ class ServiceKeyStorage:
                 f"INSERT OR REPLACE INTO agent_service_keys {columns} {values}",
                 params,
             )
+        elif reactivate_inactive:
+            # Host-internal re-provision: reactivate ONLY an inactive tombstone,
+            # never an active row. Scoped WHERE is_active = 0 so a concurrently
+            # added/rotated ACTIVE key is untouched. If no inactive row matched
+            # (rows_affected == 0), fall through to a plain INSERT — which
+            # succeeds when there's no row at all, or raises KeyStorageError on
+            # the UNIQUE constraint if an active row exists (F196 preserved).
+            from kestrel_sovereign.storage.async_conversation_store import (
+                _rows_affected,
+            )
+            reactivated = await self._db.execute_commit(
+                "UPDATE agent_service_keys "
+                "SET id = ?, encrypted_key = ?, key_hash = ?, quota_limit = ?, "
+                "    quota_used = 0, is_active = 1, created_at = CURRENT_TIMESTAMP "
+                "WHERE agent_did = ? AND provider_id = ? AND is_active = 0",
+                (key_id, encrypted_b64, key_hash, quota_limit,
+                 self._agent_did, provider_id),
+            )
+            if _rows_affected(reactivated) == 0:
+                try:
+                    await self._db.execute(
+                        f"INSERT INTO agent_service_keys {columns} {values}",
+                        params,
+                    )
+                except QueryError as e:
+                    if _is_unique_violation(e):
+                        raise KeyStorageError(
+                            f"active key for {provider_id} exists — "
+                            f"use rotate_service_key"
+                        ) from e
+                    raise
         else:
             # Insert-only add. The preflight check gives a friendly error for
             # the common serial case, but is NOT the enforcement point — two

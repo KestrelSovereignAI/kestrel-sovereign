@@ -377,9 +377,19 @@ class FoundationPayerResolver:
         finally:
             await client.close()
 
+        # reactivate_inactive=True: authorized host-internal RE-PROVISION path,
+        # not the model's add_service_key. We reach here only after has_key()
+        # (active-only) returned False, having just minted a fresh remote
+        # credential. A prior REMOVED key leaves an inactive tombstone row
+        # (is_active=0, UNIQUE(agent_did, provider_id)) that the plain insert-only
+        # path would reject (F196 counts inactive rows) — orphaning the freshly
+        # minted remote key. reactivate_inactive reactivates ONLY that tombstone
+        # and still raises on an ACTIVE row, so it can never clobber a credential
+        # a concurrent add/rotation created outside this process-local lock.
         await agent_storage.store_key(
             provider_id="lighthouse",
             api_key=api_key,
+            reactivate_inactive=True,
         )
         logger.info(
             f"PayerResolver: minted Lighthouse SELF_WALLET key for agent "
@@ -652,11 +662,16 @@ class FoundationPayerResolver:
                     "cleanup). No local state was changed; retry is safe."
                 )
 
-            # Persist locally. Subsequent use_agent_key calls find it
-            # via key_storage.get_key("openrouter").
+            # Persist locally. Subsequent use_agent_key calls find it via
+            # key_storage.get_key("openrouter"). reactivate_inactive=True:
+            # authorized host-internal re-provision (see the lighthouse mint for
+            # the full rationale) — reactivates only an inactive tombstone (still
+            # raising on an active row), rather than raising KeyStorageError on a
+            # tombstone and orphaning the remote key we just minted above.
             await agent_storage.store_key(
                 provider_id="openrouter",
                 api_key=key_info.key,
+                reactivate_inactive=True,
             )
         finally:
             await provisioning.close()
