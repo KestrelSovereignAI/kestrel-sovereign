@@ -79,6 +79,8 @@ function stubApi(overrides = {}) {
         deleteConversation: rec('deleteConversation'),
         purgeConversation: rec('purgeConversation'),
         restoreConversation: rec('restoreConversation'),
+        restoreMessage: rec('restoreMessage'),
+        purgeMessage: rec('purgeMessage'),
     };
     return Object.assign(api, overrides);
 }
@@ -291,6 +293,163 @@ test('Trash view loads listTrash and menu offers Restore + Delete Permanently', 
     items.find((i) => i.dataset.action === 'restore').click();
     await new Promise((r) => setTimeout(r, 0));
     assert.ok(api.calls.some((c) => c.name === 'restoreConversation' && c.args[0] === 't1'));
+    handle.destroy();
+});
+
+// #2199 P2-1: individually-deleted messages (no session_id) are "orphans" in
+// groupTrashBySession. They must still surface as restore/purge-actionable rows
+// — dropping them makes trashed messages invisible and unmanageable. Their
+// actions act at the MESSAGE level (restoreMessage / purgeMessage).
+test('Trash view surfaces orphan messages with message-level restore/purge (#2199 P2-1)', async () => {
+    const container = makeContainer();
+    const api = stubApi({
+        listTrash: async () => ({
+            messages: [
+                {
+                    content: 'session msg', role: 'user',
+                    deleted_at: '2026-06-22T09:00:00Z',
+                    metadata: { session_id: 't1' },
+                },
+                {
+                    id: 'orphan-1', content: 'a lone deleted message', role: 'assistant',
+                    deleted_at: '2026-06-22T10:00:00Z',
+                    metadata: {}, // no session_id → orphan
+                },
+            ],
+        }),
+    });
+    const handle = mountConversations(container, { api, autoLoad: false });
+    await handle.refresh();
+    handle.setView('trash');
+    await new Promise((r) => setTimeout(r, 0));
+
+    const rows = rowsIn(container);
+    assert.equal(rows.length, 2, 'both the session row and the orphan row render');
+
+    // The orphan row (sorted newest-first by deleted_at) purges at the message
+    // level, not the conversation level.
+    const orphanRow = rows.find((r) => /lone deleted message/.test(r.textContent));
+    assert.ok(orphanRow, 'orphan message row is rendered');
+    const items = openKebab(orphanRow);
+    items.find((i) => i.dataset.action === 'purge').click();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(
+        api.calls.some((c) => c.name === 'purgeMessage' && c.args[0] === 'orphan-1'),
+        'orphan purge routes through purgeMessage',
+    );
+    assert.ok(
+        !api.calls.some((c) => c.name === 'purgeConversation'),
+        'orphan purge never hits purgeConversation',
+    );
+
+    const items2 = openKebab(rowsIn(container).find((r) => /lone deleted message/.test(r.textContent)));
+    items2.find((i) => i.dataset.action === 'restore').click();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(
+        api.calls.some((c) => c.name === 'restoreMessage' && c.args[0] === 'orphan-1'),
+        'orphan restore routes through restoreMessage',
+    );
+    handle.destroy();
+});
+
+// #2199 P2-3: during retarget()'s async reload the OLD agent's rows stay in the
+// DOM. A kebab Archive/Trash/Purge fired in that window would send the previous
+// agent's session_id against the API layer, which the host has already routed
+// to the NEW agent. Such stale actions must be dropped until the reload paints.
+test('a mutation fired during a retarget-in-flight is dropped (#2199 P2-3)', async () => {
+    const container = makeContainer();
+    // A listTrash/getConversations that never resolves within the test tick, so
+    // the retarget reload stays in flight while we click a stale row.
+    let releaseReload;
+    const gate = new Promise((r) => { releaseReload = r; });
+    const api = stubApi({
+        getConversations: async (decrypt, view) => {
+            api.calls.push({ name: 'getConversations', args: [decrypt, view] });
+            // First call (initial render) resolves immediately; the retarget
+            // reload blocks on the gate.
+            if (api.calls.filter((c) => c.name === 'getConversations').length > 1) {
+                await gate;
+            }
+            return {
+                conversations: [
+                    { session_id: 's1', preview: 'first', started_at: '2026-06-23T12:00:00Z', message_count: 1 },
+                ],
+            };
+        },
+    });
+    const handle = mountConversations(container, { api, agentName: 'AgentA', autoLoad: false });
+    await handle.refresh();
+
+    // Kick off a retarget; its reload is stuck on the gate. The old row is still
+    // interactive in the DOM.
+    handle.retarget('AgentB');
+    const staleRow = rowsIn(container)[0];
+    const items = openKebab(staleRow);
+    items.find((i) => i.dataset.action === 'archive').click();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(
+        !api.calls.some((c) => c.name === 'archiveConversation'),
+        'a stale-agent row action is dropped, not sent to the new agent route',
+    );
+
+    // Once the reload resolves and repaints, actions work again.
+    releaseReload();
+    await new Promise((r) => setTimeout(r, 0));
+    const freshRow = rowsIn(container)[0];
+    const items2 = openKebab(freshRow);
+    items2.find((i) => i.dataset.action === 'archive').click();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(
+        api.calls.some((c) => c.name === 'archiveConversation'),
+        'after the retarget repaints, row actions dispatch normally',
+    );
+    handle.destroy();
+});
+
+// #2199 P2-3 regression: renderCurrent() also runs on every search keystroke to
+// re-filter the cached list WITHOUT a reload. If the stale-row anchor were set in
+// renderCurrent() (rather than in refresh()'s seq-guarded success block), typing
+// in search during a retarget-in-flight would advance the anchor to the new agent
+// while still painting the OLD agent's rows — defeating the guard. This types in
+// search mid-retarget and asserts the mutation is still dropped.
+test('a search keystroke during retarget-in-flight does not defeat the stale guard (#2199 P2-3)', async () => {
+    const container = makeContainer();
+    let releaseReload;
+    const gate = new Promise((r) => { releaseReload = r; });
+    const api = stubApi({
+        getConversations: async (decrypt, view) => {
+            api.calls.push({ name: 'getConversations', args: [decrypt, view] });
+            if (api.calls.filter((c) => c.name === 'getConversations').length > 1) {
+                await gate;
+            }
+            return {
+                conversations: [
+                    { session_id: 's1', preview: 'first', started_at: '2026-06-23T12:00:00Z', message_count: 1 },
+                ],
+            };
+        },
+    });
+    const handle = mountConversations(container, { api, agentName: 'AgentA', autoLoad: false });
+    await handle.refresh();
+
+    // Retarget; its reload blocks on the gate. Now type in the search box — this
+    // synchronously re-filters AgentA's cached rows via renderCurrent().
+    handle.retarget('AgentB');
+    const searchInput = container.querySelector('.conversations-search');
+    searchInput.value = 'f';
+    searchInput.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+
+    // The still-AgentA row must remain stale: a mutation is dropped, not sent.
+    const staleRow = rowsIn(container)[0];
+    const items = openKebab(staleRow);
+    items.find((i) => i.dataset.action === 'archive').click();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(
+        !api.calls.some((c) => c.name === 'archiveConversation'),
+        'a stale-agent row action stays dropped even after a search keystroke repaints it',
+    );
+
+    releaseReload();
     handle.destroy();
 });
 

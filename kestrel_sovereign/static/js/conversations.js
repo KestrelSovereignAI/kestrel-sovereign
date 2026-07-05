@@ -16,13 +16,18 @@
  *   - right-click (contextmenu) opens the SAME menu as an accelerator
  *   - views/filters: Active, Archived, Trash (trash keeps restore/purge)
  *
- * Two consumption shapes:
+ * Three consumption shapes:
  *   - `buildConversationRow` / `renderConversationList` — the shared row +
- *     list primitives the sidebar reuses while keeping its own
- *     request-sequencing / agent-pinning guards and auto-load (identity.js).
+ *     list primitives.
  *   - `mountConversations(containerEl, config)` — a self-contained, embeddable
- *     surface (same contract family as chat's `mount()` / the panel host's
+ *     LIST surface (same contract family as chat's `mount()` / the panel host's
  *     `mountPanels()`), used by the history slideout and by embedders.
+ *   - `mountConversationsPane(containerEl, config)` — the full collapsible PANE
+ *     unit: `mountConversations` PLUS the pane chrome (collapse rail,
+ *     drag-resize with min/max + localStorage persistence, and a
+ *     search/view-bar/stats disclosure) with `open()/close()/toggle()` +
+ *     `onToggle`. The standalone console (#2199) and any embedder consume THIS
+ *     one implementation; a host provides only a container + config.
  */
 
 import API from './api.js';
@@ -324,6 +329,19 @@ function animateOut(rowEl) {
  * handle: `{ element, refresh, retarget(agentName), setView(view), destroy }`.
  * `retarget` lets an embedding host repoint the list when the active agent
  * switches (same contract family as chat's mount).
+ *
+ * Sidebar-oriented hooks (the standalone conversations pane in identity.js is a
+ * consumer as of #2199 — it no longer reimplements fetch/refresh/seq-guard):
+ *   - `showViewBar: false` hides the Active/Archived/Trash switcher so an
+ *     embedder can drive the view from its own chrome (the sidebar's
+ *     `#trash-toggle-btn` calls `setView`).
+ *   - `onSelect(conv, { agentName })` — the second arg carries the agent the
+ *     list was loaded for, so the consumer can pin the load (#1358).
+ *   - `onLoaded(conversations, { view, agentName })` — fires after each
+ *     non-stale load; the sidebar uses it for its #714 auto-load-most-recent.
+ *   - `onMutated(action, conv)` — fires after a successful archive / unarchive
+ *     / trash / purge / restore; the sidebar uses it to coordinate chat state
+ *     (start a fresh session when the currently-open conversation is deleted).
  */
 export function mountConversations(containerEl, config = {}) {
     if (!containerEl) throw new Error('mountConversations requires a container element');
@@ -344,6 +362,16 @@ export function mountConversations(containerEl, config = {}) {
     let agentName = config.agentName;
     let lastConversations = [];
     let refreshSeq = 0;
+    // The agent the CURRENTLY-PAINTED rows were rendered for (#2199 P2-3).
+    // retarget() flips `agentName` synchronously and then fires an async
+    // reload; until that reload repaints, the visible rows still belong to
+    // the OLD agent. A kebab Archive/Trash/Purge fired in that window would
+    // send the previous agent's session_id against the NEW agent's route.
+    // Mutation handlers compare against this to drop such stale actions.
+    let renderedForAgent = agentName;
+    function isStaleRow() {
+        return renderedForAgent !== agentName;
+    }
 
     containerEl.classList && containerEl.classList.add('conversations-component');
 
@@ -373,7 +401,7 @@ export function mountConversations(containerEl, config = {}) {
         viewButtons.set(v.key, b);
         viewBar.appendChild(b);
     }
-    controls.appendChild(viewBar);
+    if (config.showViewBar !== false) controls.appendChild(viewBar);
 
     // Search / filter box.
     const search = document.createElement('input');
@@ -471,56 +499,102 @@ export function mountConversations(containerEl, config = {}) {
         ];
     }
 
+    function notifyMutated(action, conv) {
+        if (typeof config.onMutated === 'function') config.onMutated(action, conv);
+    }
+
+    // Drop a mutation whose row belongs to an agent we've since retargeted
+    // away from (#2199 P2-3). The API layer is already routed to the NEW host
+    // agent, so acting on a stale row's session_id would hit the wrong route.
+    function dropIfStale() {
+        if (!isStaleRow()) return false;
+        Toast.info('Switched agents — reloading conversations');
+        return true;
+    }
+
     async function doArchive(conv, rowEl) {
+        if (dropIfStale()) return;
         try {
             await api.archiveConversation(conv.session_id);
             animateOut(rowEl);
             Toast.info('Conversation archived');
+            notifyMutated('archive', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to archive: ${e.message}`); }
     }
     async function doUnarchive(conv, rowEl) {
+        if (dropIfStale()) return;
         try {
             await api.unarchiveConversation(conv.session_id);
             animateOut(rowEl);
             Toast.info('Conversation unarchived');
+            notifyMutated('unarchive', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to unarchive: ${e.message}`); }
     }
     async function doTrash(conv, rowEl) {
+        if (dropIfStale()) return;
         if (!confirmTrash()) return;
         try {
             await api.deleteConversation(conv.session_id);
             animateOut(rowEl);
             Toast.info('Conversation moved to trash');
+            notifyMutated('trash', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to delete: ${e.message}`); }
     }
     async function doPurge(conv, rowEl) {
+        if (dropIfStale()) return;
         if (!confirmPurge()) return;
         try {
-            await api.purgeConversation(conv.session_id, 'user-initiated-ui');
+            // Orphan trash entries (individually-deleted messages with no
+            // session, #2199 P2-1) purge at the message level.
+            if (conv._trashMessageId) {
+                await api.purgeMessage(conv._trashMessageId, 'user-initiated-ui');
+            } else {
+                await api.purgeConversation(conv.session_id, 'user-initiated-ui');
+            }
             animateOut(rowEl);
             Toast.info('Conversation permanently deleted');
+            notifyMutated('purge', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to permanently delete: ${e.message}`); }
     }
     async function doRestore(conv, rowEl) {
+        if (dropIfStale()) return;
         try {
-            await api.restoreConversation(conv.session_id);
+            if (conv._trashMessageId) {
+                await api.restoreMessage(conv._trashMessageId);
+            } else {
+                await api.restoreConversation(conv.session_id);
+            }
             animateOut(rowEl);
             Toast.success('Conversation restored');
+            notifyMutated('restore', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to restore: ${e.message}`); }
     }
 
     function rowOpts() {
         const activeId = getActiveSessionId();
+        // Snapshot the agent at render time so each row's pin is immutable
+        // (#1358). retarget() mutates `agentName` synchronously and then fires
+        // an async refresh; the old rows stay clickable until the new list
+        // resolves. Reading the live `agentName` at click time would let a
+        // stale row dispatch under the NEW agent during that fetch window.
+        // Capturing here means a stale row always carries the agent it was
+        // rendered for, so loadConversation's currentAgentMatches gate drops it.
+        const renderAgent = agentName;
         return {
             api,
             group: config.group !== false,
             escapeHtml: config.escapeHtml,
-            onSelect: (conv) => onSelect(conv),
+            // Orphan trash rows (#2199 P2-1) have no session to open — their
+            // only affordances are the kebab's restore/purge.
+            onSelect: (conv) => {
+                if (conv._trashMessageId) return;
+                onSelect(conv, { agentName: renderAgent });
+            },
             buildMenuItems: menuItemsFor,
             // active flag applied per-row below via renderCurrent
             _activeId: activeId,
@@ -528,6 +602,12 @@ export function mountConversations(containerEl, config = {}) {
     }
 
     function renderCurrent() {
+        // NB: `renderedForAgent` is pinned in refresh()'s seq-guarded success
+        // block, NOT here — renderCurrent() also runs on every search keystroke
+        // to re-filter `lastConversations` without a reload. Anchoring the stale
+        // guard here would let a mid-retarget keystroke advance `renderedForAgent`
+        // to the new agent while still painting the OLD agent's rows, defeating
+        // the #2199 P2-3 guard. Pin to the agent the *data* belongs to instead.
         const convs = filtered(lastConversations);
         renderStats(convs);
         if (!convs.length) {
@@ -577,14 +657,27 @@ export function mountConversations(containerEl, config = {}) {
         const decrypt = state ? state.showDecrypted : true;
         if (view === 'trash') {
             const data = await api.listTrash(500);
-            const { sessions } = groupTrashBySession(data.messages || []);
-            return (sessions || []).map((s) => ({
+            const { sessions, orphans } = groupTrashBySession(data.messages || []);
+            const sessionRows = (sessions || []).map((s) => ({
                 session_id: s.session_id,
                 preview: s.preview,
                 message_count: s.count,
                 deleted_at: s.deleted_at,
                 started_at: s.deleted_at,
             }));
+            // Individually-deleted messages (no session_id) still need to be
+            // restore/purge-actionable, so surface them as single-message rows
+            // rather than dropping them (#2199 P2-1). They carry _trashMessageId
+            // so the restore/purge handlers act at the message level.
+            const orphanRows = (orphans || []).map((m) => ({
+                _trashMessageId: m.id,
+                preview: `${m.role || 'msg'}: ${(m.content || '').slice(0, 80) || '(empty)'}`,
+                message_count: 1,
+                deleted_at: m.deleted_at,
+                started_at: m.deleted_at,
+            }));
+            return [...sessionRows, ...orphanRows]
+                .sort((a, b) => (b.deleted_at || '').localeCompare(a.deleted_at || ''));
         }
         const data = await api.getConversations(decrypt, view);
         return data.conversations || [];
@@ -602,7 +695,15 @@ export function mountConversations(containerEl, config = {}) {
             const data = await loadData();
             if (seq !== refreshSeq) return; // stale — a newer refresh owns the list
             lastConversations = data;
+            // Pin the stale-row anchor to the agent this data was loaded for
+            // (#2199 P2-3). A pure re-filter repaint (search keystroke) leaves
+            // this pointing at the old agent until a retarget's reload lands, so
+            // isStaleRow() stays true across the whole in-flight window.
+            renderedForAgent = agentName;
             renderCurrent();
+            if (typeof config.onLoaded === 'function') {
+                config.onLoaded(data, { view, agentName });
+            }
         } catch (e) {
             if (seq !== refreshSeq) return;
             listEl.innerHTML = '';
@@ -636,4 +737,269 @@ export function mountConversations(containerEl, config = {}) {
     if (config.autoLoad !== false) refresh();
 
     return { element: root, refresh, retarget, setView, destroy, get view() { return view; } };
+}
+
+// ============================================================================
+// mountConversationsPane — the full collapsible pane unit (#2199)
+// ============================================================================
+
+// Best-effort localStorage: the console runs it, but embed hosts and jsdom
+// tests may not expose one. Every read/write is guarded so persistence
+// degrades to in-memory-less no-ops rather than throwing.
+function paneStorage() {
+    try {
+        if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
+    } catch (_) { /* access can throw under strict sandboxing */ }
+    return null;
+}
+function storeGet(key) {
+    const s = paneStorage();
+    if (!s) return null;
+    try { return s.getItem(key); } catch (_) { return null; }
+}
+function storeSet(key, value) {
+    const s = paneStorage();
+    if (!s) return;
+    try { s.setItem(key, value); } catch (_) { /* quota / disabled — ignore */ }
+}
+
+/**
+ * Mount the full collapsible conversations PANE — the embeddable list surface
+ * (`mountConversations`) PLUS the surrounding pane chrome. This is the ONE pane
+ * implementation shared by the standalone console (identity.js) and any embed;
+ * a host provides only a container + config and gets the complete unit:
+ *
+ *   - a `<` chevron collapse rail (the existing `.pane-sidebar` idiom) with
+ *     `open()` / `close()` / `toggle()` and an `onToggle(collapsed)` callback so
+ *     a host toolbar button (the `ki-history` chat-header trigger) can drive it;
+ *   - a drag-resize handle with min/max width + `localStorage` persistence;
+ *   - a disclosure toggle that collapses the search / view-bar / stats block
+ *     (default open, persisted);
+ *   - collapse/resize/filters state all persisted under `config.storageKey`.
+ *
+ * Chrome is ADOPT-or-BUILD: when the container already looks like a pane (the
+ * console's static `#conversations-pane` with its header / resize handle), those
+ * elements are reused; when the container is bare (the embedder contract — a
+ * host hands over just a `<div>`), the full chrome is built inside it. No
+ * two-pane layout is assumed (a third left pane is planned, #2203).
+ *
+ * Config (all optional except where a list needs them):
+ *   - api, onSelect, agentName, getActiveSessionId, onLoaded, onMutated,
+ *     autoLoad, showViewBar, showSearch, showStats, group — forwarded verbatim
+ *     to `mountConversations`.
+ *   - collapsed        — initial collapsed state (overridden by persistence).
+ *   - storageKey       — persistence namespace (default 'kestrel:conversations-pane').
+ *   - title            — pane header title (default 'Conversations').
+ *   - onToggle(bool)   — fired after every collapse/expand with the new state.
+ *   - minWidth/maxWidth — resize clamps (default 200 / 500, matching the CSS).
+ *
+ * Returns a handle:
+ *   `{ element, conversations, refresh, retarget, setView, view,
+ *      open, close, toggle, collapsed, setFiltersOpen, filtersOpen, destroy }`
+ * where `conversations` is the inner `mountConversations` handle.
+ */
+export function mountConversationsPane(containerEl, config = {}) {
+    if (!containerEl) throw new Error('mountConversationsPane requires a container element');
+    const doc = containerEl.ownerDocument
+        || (typeof document !== 'undefined' ? document : null);
+    if (!doc) throw new Error('mountConversationsPane requires a document');
+
+    const storageKey = config.storageKey || 'kestrel:conversations-pane';
+    const KEY_WIDTH = `${storageKey}:width`;
+    const KEY_COLLAPSED = `${storageKey}:collapsed`;
+    const KEY_FILTERS = `${storageKey}:filters`;
+    const minWidth = Number.isFinite(config.minWidth) ? config.minWidth : 200;
+    const maxWidth = Number.isFinite(config.maxWidth) ? config.maxWidth : 500;
+
+    // The container IS the pane element; tag it so it inherits the pane-sidebar
+    // chrome CSS whether it was already a pane (adopt) or a bare div (build).
+    if (containerEl.classList) {
+        containerEl.classList.add('pane-sidebar', 'conversations-pane');
+    }
+    const paneEl = containerEl;
+
+    // --- Header (adopt existing .pane-header, else build one) ---------------
+    let header = paneEl.querySelector('.pane-header');
+    let builtHeader = false;
+    if (!header) {
+        header = doc.createElement('div');
+        header.className = 'pane-header';
+        const h3 = doc.createElement('h3');
+        h3.className = 'conversations-pane-title';
+        h3.textContent = config.title || 'Conversations';
+        header.appendChild(h3);
+        paneEl.insertBefore(header, paneEl.firstChild);
+        builtHeader = true;
+    }
+
+    // Filters disclosure toggle — lives in the header, hides/shows the
+    // search/view-bar/stats block. Default open, state persisted.
+    const filtersToggle = doc.createElement('button');
+    filtersToggle.type = 'button';
+    filtersToggle.className = 'conversations-filters-toggle btn-icon';
+    filtersToggle.setAttribute('aria-label', 'Toggle search and filters');
+    filtersToggle.title = 'Search & filters';
+    filtersToggle.innerHTML = (typeof window !== 'undefined' && typeof window.kicon === 'function')
+        ? window.kicon('search')
+        : '<span class="ki ki-search" aria-hidden="true"></span>';
+
+    // --- Collapse rail (adopt existing .collapse-btn, else build one) -------
+    let collapseBtn = header.querySelector('.collapse-btn');
+    if (!collapseBtn) {
+        collapseBtn = doc.createElement('button');
+        collapseBtn.type = 'button';
+        collapseBtn.className = 'collapse-btn';
+        collapseBtn.title = 'Collapse';
+        collapseBtn.setAttribute('aria-label', 'Collapse conversations pane');
+        collapseBtn.innerHTML = (typeof window !== 'undefined' && typeof window.kicon === 'function')
+            ? window.kicon('chevron-left')
+            : '<span class="ki ki-chevron-left" aria-hidden="true"></span>';
+        header.appendChild(collapseBtn);
+    }
+    // The disclosure toggle sits just before the collapse chevron.
+    header.insertBefore(filtersToggle, collapseBtn);
+
+    // --- List body (adopt existing #conversations-list / .pane-content) -----
+    let body = paneEl.querySelector('#conversations-list')
+        || paneEl.querySelector('.conversations-pane-body');
+    if (!body) {
+        body = doc.createElement('div');
+        body.className = 'pane-content conversations-pane-body';
+        // Insert before any existing resize handle so the handle stays last.
+        const existingHandle = paneEl.querySelector('.resize-handle');
+        if (existingHandle) paneEl.insertBefore(body, existingHandle);
+        else paneEl.appendChild(body);
+    }
+
+    // --- Resize handle (adopt existing .resize-handle, else build one) ------
+    let resizeHandle = paneEl.querySelector('.resize-handle');
+    if (!resizeHandle) {
+        resizeHandle = doc.createElement('div');
+        resizeHandle.className = 'resize-handle conversations-resize-handle';
+        paneEl.appendChild(resizeHandle);
+    }
+
+    // --- Mount the shared list surface into the body -----------------------
+    const listHandle = mountConversations(body, {
+        api: config.api,
+        onSelect: config.onSelect,
+        agentName: config.agentName,
+        getActiveSessionId: config.getActiveSessionId,
+        onLoaded: config.onLoaded,
+        onMutated: config.onMutated,
+        autoLoad: config.autoLoad,
+        showViewBar: config.showViewBar,
+        showSearch: config.showSearch,
+        showStats: config.showStats,
+        group: config.group,
+        escapeHtml: config.escapeHtml,
+        view: config.view,
+    });
+
+    // The controls (view bar + search) and stats blocks the disclosure governs.
+    const controlsEl = listHandle.element.querySelector('.conversations-controls');
+    const statsEl = listHandle.element.querySelector('.conversations-stats');
+
+    // ---- Collapse state ---------------------------------------------------
+    function isCollapsed() {
+        return !!(paneEl.classList && paneEl.classList.contains('collapsed'));
+    }
+    function applyCollapsed(collapsed, persist) {
+        if (!paneEl.classList) return;
+        paneEl.classList.toggle('collapsed', collapsed);
+        if (persist) storeSet(KEY_COLLAPSED, collapsed ? '1' : '0');
+        if (typeof config.onToggle === 'function') config.onToggle(collapsed);
+    }
+    function open() { if (isCollapsed()) applyCollapsed(false, true); }
+    function close() { if (!isCollapsed()) applyCollapsed(true, true); }
+    function toggle() { applyCollapsed(!isCollapsed(), true); }
+
+    const onCollapseClick = () => toggle();
+    collapseBtn.addEventListener('click', onCollapseClick);
+
+    // Initial collapse state: persisted value wins over the config default.
+    const persistedCollapsed = storeGet(KEY_COLLAPSED);
+    const startCollapsed = persistedCollapsed !== null
+        ? persistedCollapsed === '1'
+        : !!config.collapsed;
+    if (startCollapsed) applyCollapsed(true, false);
+
+    // ---- Filters disclosure ----------------------------------------------
+    function applyFilters(open_, persist) {
+        if (controlsEl) controlsEl.style.display = open_ ? '' : 'none';
+        if (statsEl) statsEl.style.display = open_ ? '' : 'none';
+        filtersToggle.classList.toggle('active', open_);
+        filtersToggle.setAttribute('aria-expanded', open_ ? 'true' : 'false');
+        if (persist) storeSet(KEY_FILTERS, open_ ? '1' : '0');
+    }
+    let filtersOpen = storeGet(KEY_FILTERS);
+    filtersOpen = filtersOpen !== null ? filtersOpen === '1' : true; // default open
+    applyFilters(filtersOpen, false);
+    const onFiltersClick = () => {
+        filtersOpen = !filtersOpen;
+        applyFilters(filtersOpen, true);
+    };
+    filtersToggle.addEventListener('click', onFiltersClick);
+
+    // ---- Resize (min/max + persistence) -----------------------------------
+    // Restore a persisted width (clamped) before wiring the drag.
+    const persistedWidth = parseInt(storeGet(KEY_WIDTH), 10);
+    if (Number.isFinite(persistedWidth)) {
+        paneEl.style.width = `${Math.max(minWidth, Math.min(maxWidth, persistedWidth))}px`;
+    }
+    let startX = 0;
+    let startWidth = 0;
+    function onMouseMove(e) {
+        const diff = e.clientX - startX;
+        const w = Math.max(minWidth, Math.min(maxWidth, startWidth + diff));
+        paneEl.style.width = `${w}px`;
+    }
+    function onMouseUp() {
+        doc.removeEventListener('mousemove', onMouseMove);
+        doc.removeEventListener('mouseup', onMouseUp);
+        if (doc.body) {
+            doc.body.style.cursor = '';
+            doc.body.style.userSelect = '';
+        }
+        storeSet(KEY_WIDTH, String(paneEl.offsetWidth || parseInt(paneEl.style.width, 10) || startWidth));
+    }
+    function onResizeDown(e) {
+        startX = e.clientX;
+        startWidth = paneEl.offsetWidth || parseInt(paneEl.style.width, 10) || minWidth;
+        if (doc.body) {
+            doc.body.style.cursor = 'col-resize';
+            doc.body.style.userSelect = 'none';
+        }
+        doc.addEventListener('mousemove', onMouseMove);
+        doc.addEventListener('mouseup', onMouseUp);
+    }
+    resizeHandle.addEventListener('mousedown', onResizeDown);
+
+    function destroy() {
+        collapseBtn.removeEventListener('click', onCollapseClick);
+        filtersToggle.removeEventListener('click', onFiltersClick);
+        resizeHandle.removeEventListener('mousedown', onResizeDown);
+        doc.removeEventListener('mousemove', onMouseMove);
+        doc.removeEventListener('mouseup', onMouseUp);
+        try { listHandle.destroy(); } catch (_) { /* best-effort */ }
+        // Remove only chrome this mount built; adopted chrome is left in place.
+        if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
+        filtersToggle.remove();
+    }
+
+    return {
+        element: paneEl,
+        conversations: listHandle,
+        refresh: (...a) => listHandle.refresh(...a),
+        retarget: (...a) => listHandle.retarget(...a),
+        setView: (...a) => listHandle.setView(...a),
+        get view() { return listHandle.view; },
+        open,
+        close,
+        toggle,
+        get collapsed() { return isCollapsed(); },
+        setFiltersOpen(next) { filtersOpen = !!next; applyFilters(filtersOpen, true); },
+        get filtersOpen() { return filtersOpen; },
+        destroy,
+    };
 }
