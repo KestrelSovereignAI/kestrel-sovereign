@@ -157,22 +157,42 @@ class TestFeatureInstall:
         assert result == 1
         assert "Unknown" in capsys.readouterr().out
 
-    @patch("subprocess.run")
+    @patch("kestrel_sovereign.cli_features._extension_install_run")
     @patch("kestrel_sovereign.feature_registry.load_registry")
-    def test_install_runs_pip(self, mock_load, mock_run, capsys):
+    def test_install_routes_through_uv_aware_helper(self, mock_load, mock_install, capsys):
+        """install goes through _extension_install_run (uv-aware), not bare python -m pip."""
         from kestrel_sovereign.cli import cmd_feature_install
 
         mock_load.return_value = _make_registry()
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_install.return_value = MagicMock(returncode=0)
 
         args = _make_args(name="wallet")
         result = cmd_feature_install(args)
         assert result == 0
 
-        # Verify pip was called with the right package
-        call_args = mock_run.call_args[0][0]
-        assert "pip" in call_args
-        assert "kestrel-feature-wallet" in call_args
+        # Verify the uv-aware helper was called with the package spec
+        mock_install.assert_called_once_with(["kestrel-feature-wallet"])
+
+    @patch("kestrel_sovereign.cli_features._extension_install_run")
+    @patch("kestrel_sovereign.feature_registry.load_registry")
+    def test_install_git_fallback_uses_uv_aware_helper(self, mock_load, mock_install, capsys):
+        """A failed PyPI install falls back to git+ through the same uv-aware helper."""
+        from kestrel_sovereign.cli import cmd_feature_install
+
+        mock_load.return_value = _make_registry()
+        mock_install.side_effect = [
+            MagicMock(returncode=1, stderr="boom"),  # PyPI attempt fails
+            MagicMock(returncode=0),                 # git fallback succeeds
+        ]
+
+        args = _make_args(name="wallet")
+        result = cmd_feature_install(args)
+        assert result == 0
+
+        assert mock_install.call_args_list[0].args[0] == ["kestrel-feature-wallet"]
+        assert mock_install.call_args_list[1].args[0] == [
+            "git+https://github.com/example/wallet.git"
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -125,9 +125,11 @@ def test_upgrade_skips_editable_and_pip_upgrades_others(monkeypatch, fake_regist
     rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
 
     assert rc == 0
-    # exactly one pip call — the non-editable package
+    # exactly one install call — the non-editable package. The command is
+    # routed through the uv-aware helper, so the trailing args are the pip
+    # args regardless of whether it ran via `uv pip install` or `python -m pip`.
     assert len(spy.calls) == 1
-    assert spy.calls[0][-3:] == ["install", "--upgrade", "kestrel-feature-github"]
+    assert spy.calls[0][-2:] == ["--upgrade", "kestrel-feature-github"]
     out = capsys.readouterr().out
     assert "upgraded -> 0.2.0" in out
     assert "1 package(s) upgraded" in out
@@ -198,6 +200,32 @@ def test_upgrade_falls_back_to_git_on_pip_failure(monkeypatch, fake_registry, ca
     assert rc == 0
     assert len(calls) == 2
     assert calls[1][-1].startswith("git+https://github.com/")
+
+
+def test_upgrade_routes_through_uv_aware_helper(monkeypatch, fake_registry, capsys):
+    """upgrade goes through _extension_install_run (uv-aware), not bare python -m pip."""
+    import kestrel_sovereign.cli_features as cli_features
+
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [_dist("kestrel-feature-github", "0.1.0")],
+    )
+
+    calls = []
+
+    def fake_install(pip_args):
+        calls.append(pip_args)
+        return subprocess.CompletedProcess(
+            pip_args, 0, stdout="Successfully installed kestrel-feature-github-0.2.0", stderr=""
+        )
+
+    monkeypatch.setattr(cli_features, "_extension_install_run", fake_install)
+
+    rc = cli.cmd_feature_upgrade(types.SimpleNamespace(names=[], dry_run=False))
+
+    assert rc == 0
+    assert calls == [["--upgrade", "kestrel-feature-github"]]
 
 
 def test_upgrade_no_installed_extensions(monkeypatch, fake_registry, capsys):
