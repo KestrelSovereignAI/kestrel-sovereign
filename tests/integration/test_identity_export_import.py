@@ -220,6 +220,63 @@ class TestIdentityExporter:
     """Tests for IdentityExporter class."""
 
     @pytest.mark.asyncio
+    async def test_relationship_export_strips_own_namespace_for_roundtrip(self, test_db):
+        """#2112 F186: a user node imported under this agent's namespace
+        ({agent[:20]}_alice) must be re-exported with its RAW id (alice), so a
+        subsequent import doesn't grow the prefix every hop
+        ({B[:20]}_{A[:20]}_alice) and the roundtrip is idempotent."""
+        db = test_db
+        agent_id = "did:key:agentA-xxxxxxxxxxxxxxxxxxxx"
+        prefix = f"{agent_id[:20]}_"
+        namespaced_user = f"{prefix}alice"
+
+        # A user node as the importer would have written it (namespaced), linked
+        # to the agent by a relationship edge.
+        await db.execute(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, 'user', 'Alice', '{}')",
+            (namespaced_user,),
+        )
+        await db.execute(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, 'known_user', '{}')",
+            (agent_id, namespaced_user),
+        )
+        await db.commit()
+
+        exporter = IdentityExporter(db, agent_id)
+        rels = await exporter._get_relationships()
+        assert len(rels) == 1
+        # Exported with the RAW id — not the namespaced one.
+        assert rels[0].user_id == "alice", rels[0].user_id
+
+    @pytest.mark.asyncio
+    async def test_graphonly_skill_export_strips_own_namespace(self, test_db):
+        """#2112 F186: a graph-only skill node imported under this agent's
+        namespace is re-exported with its RAW id (not re-prefixed), and its
+        persisted usage data is preserved under the raw key."""
+        db = test_db
+        agent_id = "did:key:agentA-xxxxxxxxxxxxxxxxxxxx"
+        namespaced_skill = f"{agent_id[:20]}_summarize"
+        await db.execute(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, 'skill', 'Summarize', ?)",
+            (namespaced_skill, '{"times_used": 7, "type": "tool"}'),
+        )
+        await db.execute(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, 'has_skill', '{}')",
+            (agent_id, namespaced_skill),
+        )
+        await db.commit()
+
+        exporter = IdentityExporter(db, agent_id)
+        skills = await exporter._get_skills()
+        summ = [s for s in skills if s.skill_id == "summarize"]
+        assert summ, [s.skill_id for s in skills]  # raw id, not namespaced
+        assert summ[0].times_used == 7  # persisted usage preserved
+
+    @pytest.mark.asyncio
     async def test_export_basic(self, populated_db):
         """Test basic export functionality."""
         db, agent_id = populated_db
