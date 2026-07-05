@@ -249,8 +249,27 @@ class AuditAnchorFeature(Feature):
             first_at = anchor.get("first_entry_at")
             last_at = anchor.get("last_entry_at")
 
-            # Get entries in this anchor's time range
+            # Get entries in this anchor's time range (normalized selection).
             entries = await self._get_audit_entries_range(first_at, last_at)
+            computed_hash = AuditHasher.hash_entries(entries) if entries else None
+            passed = computed_hash is not None and computed_hash == stored_hash
+
+            # Legacy fallback (#2146): an anchor created before F092 stored RAW
+            # min/max boundaries and hashed the set a RAW-string range selected.
+            # Normalizing those boundaries can shift/invert the set and falsely
+            # fail. Re-select with the legacy raw comparison; a genuine anchor
+            # verifies against the exact set it hashed, a tampered log matches
+            # neither selection.
+            if not passed:
+                legacy_entries = await self._get_audit_entries_range(
+                    first_at, last_at, raw=True
+                )
+                if legacy_entries:
+                    legacy_hash = AuditHasher.hash_entries(legacy_entries)
+                    if legacy_hash == stored_hash:
+                        entries = legacy_entries
+                        computed_hash = legacy_hash
+                        passed = True
 
             if not entries:
                 results.append({
@@ -261,10 +280,6 @@ class AuditAnchorFeature(Feature):
                 })
                 all_passed = False
                 continue
-
-            # Re-compute hash
-            computed_hash = AuditHasher.hash_entries(entries)
-            passed = computed_hash == stored_hash
 
             if not passed:
                 all_passed = False
@@ -464,7 +479,7 @@ class AuditAnchorFeature(Feature):
         return entries
 
     async def _get_audit_entries_range(
-        self, first_at: Optional[str], last_at: Optional[str]
+        self, first_at: Optional[str], last_at: Optional[str], *, raw: bool = False
     ) -> list:
         """
         Get audit log entries within a time range (inclusive).
@@ -472,30 +487,55 @@ class AuditAnchorFeature(Feature):
         Args:
             first_at: Start timestamp (inclusive).
             last_at: End timestamp (inclusive).
+            raw: When True, reproduce the LEGACY pre-#2146 selection — a raw
+                string boundary comparison against the stored (possibly raw
+                min/max) boundaries. Anchors created before F092 stored
+                ``first_entry_at``/``last_entry_at`` as the RAW min/max over
+                mixed-format timestamps, and were verified with a raw
+                ``created_at >= ? AND <= ?`` range. Normalizing those raw
+                boundaries can shift (even invert) the selected set and thus the
+                hash, falsely failing a legitimate old anchor. verify_audit tries
+                the normalized selection first, then falls back to raw=True so an
+                old anchor still verifies against the exact set it hashed. A
+                tampered log matches neither. (#2146 regression fix.)
 
         Returns:
             List of entry dicts.
         """
         entries = []
 
-        # Boundary comparison happens in Python on NORMALIZED timestamps (F092),
-        # not via a SQL string range: security_audit_log rows can be a mix of
+        # Normalized boundaries (F092): security_audit_log rows can be a mix of
         # space-separated CURRENT_TIMESTAMP, naive-ISO, and offset-bearing ISO,
-        # and a raw string ``WHERE created_at >= ?`` silently drops rows whose
-        # format differs from the boundary's. The row's RAW created_at is kept in
-        # the returned dict so the anchor hash stays byte-identical.
+        # and a raw string range silently drops rows whose format differs from
+        # the boundary's. The row's RAW created_at is kept in the returned dict
+        # so the anchor hash stays byte-identical.
         first_norm = normalize_audit_timestamp(first_at)
         last_norm = normalize_audit_timestamp(last_at)
 
-        def _in_range(raw_ts) -> bool:
-            ts = normalize_audit_timestamp(raw_ts)
-            if not ts:
-                return not (first_norm or last_norm)
-            if first_norm and ts < first_norm:
-                return False
-            if last_norm and ts > last_norm:
-                return False
-            return True
+        if raw:
+            def _in_range(raw_ts) -> bool:
+                # Legacy raw-string comparison against the raw stored boundaries.
+                if raw_ts is None or raw_ts == "":
+                    return not (first_at or last_at)
+                if first_at and raw_ts < first_at:
+                    return False
+                if last_at and raw_ts > last_at:
+                    return False
+                return True
+            destr_first, destr_last = first_at, last_at
+        else:
+            def _in_range(raw_ts) -> bool:
+                ts = normalize_audit_timestamp(raw_ts)
+                if not ts:
+                    return not (first_norm or last_norm)
+                if first_norm and ts < first_norm:
+                    return False
+                if last_norm and ts > last_norm:
+                    return False
+                return True
+            # Destructive rows are canonical ISO already; pass canonical
+            # boundaries so an old naive/space boundary still matches them.
+            destr_first, destr_last = first_norm or None, last_norm or None
 
         permission_store = self._get_permission_store()
         if permission_store is not None:
@@ -516,12 +556,8 @@ class AuditAnchorFeature(Feature):
             except Exception as e:
                 logger.warning(f"Could not read audit log entries for range: {e}")
 
-        # Destructive rows are canonical ISO already; pass canonical boundaries
-        # so an old naive/space boundary still matches them.
         entries.extend(
-            await self._get_destructive_audit_entries_range(
-                first_norm or None, last_norm or None
-            )
+            await self._get_destructive_audit_entries_range(destr_first, destr_last)
         )
         return entries
 

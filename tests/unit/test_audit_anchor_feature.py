@@ -325,6 +325,51 @@ class TestAuditAnchorFeature:
         assert result.data["failed"] == 0
 
     @pytest.mark.asyncio
+    async def test_verify_audit_passes_legacy_mixed_format_anchor(self, tmp_path):
+        """#2146 regression: an anchor created BEFORE F092 stored RAW min/max
+        boundaries and hashed the set a RAW-string range selected. For
+        mixed-format rows the raw min/max isn't chronological, so normalizing the
+        boundaries shifts (here inverts) the selected set and falsely fails a
+        legitimate old anchor. verify must fall back to the raw selection."""
+        from kestrel_sovereign.features.audit_anchor.feature import AuditAnchorFeature
+
+        # Mixed formats: a space-form row (chrono 10:00) and an ISO row
+        # (chrono 09:00, but raw-string SORTS AFTER the space form because
+        # 'T' > ' '). So the RAW min/max an old anchor stored are ' 10:00' /
+        # 'T09:00' — normalizing them yields an inverted [10:00, 09:00] range.
+        entries = [
+            {"feature_name": "F1", "tool_name": "t1", "action": "exec",
+             "decision": "allowed", "created_at": "2026-07-01 10:00:00"},
+            {"feature_name": "F2", "tool_name": "t2", "action": "exec",
+             "decision": "denied", "created_at": "2026-07-01T09:00:00"},
+        ]
+        agent = await _make_mock_agent(tmp_path, audit_entries=entries)
+        feature = AuditAnchorFeature(agent)
+        await feature.initialize()
+
+        # Reconstruct the legacy anchor: raw min/max boundaries + the hash over
+        # the set the legacy RAW-string range selected.
+        raw_first = "2026-07-01 10:00:00"   # raw string min (space < 'T')
+        raw_last = "2026-07-01T09:00:00"    # raw string max
+        legacy_entries = await feature._get_audit_entries_range(
+            raw_first, raw_last, raw=True
+        )
+        assert len(legacy_entries) == 2, legacy_entries  # both rows covered
+        legacy_hash = AuditHasher.hash_entries(legacy_entries)
+
+        anchor_row = (
+            "anchor-legacy", "test-agent", legacy_hash, "ref",
+            2, raw_first, raw_last, "2026-07-01T10:05:00",
+        )
+        agent.storage.db.fetchall = AsyncMock(return_value=[anchor_row])
+        agent.storage.db.table_exists = AsyncMock(return_value=True)
+
+        result = await feature.verify_audit()
+        assert result.data["status"] == "verified", result.data
+        assert result.data["passed"] == 1
+        assert result.data["failed"] == 0
+
+    @pytest.mark.asyncio
     async def test_verify_audit_detects_tampering(self, tmp_path):
         """Verification fails when entries have been modified after anchoring."""
         from kestrel_sovereign.features.audit_anchor.feature import AuditAnchorFeature
