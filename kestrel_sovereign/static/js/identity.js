@@ -1027,6 +1027,12 @@ const activeConversationIdsByAgent = new Map();
 // component (conversations.js) — identity.js holds only this handle and the
 // sidebar-specific hooks below.
 let conversationsHandle = null;
+// Whether the mounted list has been pointed at an agent at least once. The
+// mount uses autoLoad:false, so until refreshConversationsPane() retargets it
+// the list has never fetched — hosts without the multi_agent agent-select
+// flow (embeds like Frinz) reach the pane ONLY through the history trigger,
+// which must therefore trigger the first load itself (codex round-2 P2).
+let conversationsPaneTargeted = false;
 
 function currentAgentMatches(expectedAgent) {
     return expectedAgent === API.getHostAgent();
@@ -1167,6 +1173,7 @@ export function refreshConversationsPane() {
     const handle = ensureConversationsMount();
     if (!handle) return;
     activeConversationId = getActiveConversationIdForAgent(API.getHostAgent());
+    conversationsPaneTargeted = true;
     handle.retarget(API.getHostAgent());
 }
 
@@ -1497,7 +1504,15 @@ window.toggleConversationsPane = function() {
     const wasHidden = pane && pane.style.display === 'none';
     if (wasHidden) pane.style.display = 'flex';
     const handle = ensureConversationsMount();
-    if (handle) { wasHidden ? handle.open() : handle.toggle(); }
+    if (handle) {
+        // Hosts without the multi_agent agent-select flow (embeds) never hit
+        // refreshConversationsPane() before this trigger — the autoLoad:false
+        // mount would open EMPTY and never fetch. First use targets the host
+        // agent; retarget is refreshSeq-guarded, and hosts already targeted by
+        // agent-select skip this entirely (codex round-2 P2).
+        if (!conversationsPaneTargeted) refreshConversationsPane();
+        wasHidden ? handle.open() : handle.toggle();
+    }
     else if (pane) pane.classList.toggle('collapsed');
 };
 
