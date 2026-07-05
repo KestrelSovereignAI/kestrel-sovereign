@@ -1834,6 +1834,86 @@ export async function handleSignalCompleted(payload) {
     }
 }
 
+/**
+ * Render a persisted COGNITION signal-wake prompt turn (tagged
+ * ``metadata.signal_wake`` by the dispatcher) as a compact, expandable
+ * "Autonomous wake" chip instead of dumping the raw internal instruction
+ * template as a user message. Mirrors the live ``signal-wake-message``
+ * attribution above; keeps the row auditable (the raw prompt is behind a
+ * ``<details>``) and manageable (delete / purge).
+ *
+ * Shared by both history loaders (history.js and identity.js), which resolve
+ * their own append target — pass it in, or omit to use the mounted pane.
+ */
+export function renderSignalWakeChip(msg, target = null) {
+    if (!target) {
+        const visibleAgent = state.mountedChatAgent;
+        const visiblePane = visibleAgent === undefined
+            ? null : state.chatPanes.get(visibleAgent);
+        target = visiblePane
+            ? visiblePane.element : document.getElementById('chat-container');
+    }
+    if (!target) return;
+
+    const wake = (msg.metadata && msg.metadata.signal_wake) || {};
+    const source = String(wake.source || 'signal');
+
+    const div = document.createElement('div');
+    div.className = 'message agent-message signal-wake-message';
+    if (msg.id) div.dataset.messageId = msg.id;
+
+    if (msg.id) {
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'msg-delete-btn';
+        deleteBtn.title = 'Move to trash';
+        deleteBtn.textContent = '✕';
+        deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (typeof window.deleteMessage === 'function') {
+                window.deleteMessage(msg.id, div);
+            }
+        };
+        div.appendChild(deleteBtn);
+
+        const purgeBtn = document.createElement('button');
+        purgeBtn.className = 'msg-purge-btn';
+        purgeBtn.title = 'Delete permanently (cannot be restored)';
+        purgeBtn.textContent = '⊘';
+        purgeBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (typeof window.purgeMessage === 'function') {
+                window.purgeMessage(msg.id, div);
+            }
+        };
+        div.appendChild(purgeBtn);
+    }
+
+    const attribution = document.createElement('div');
+    attribution.className = 'signal-wake-attribution';
+    const label = document.createElement('span');
+    label.textContent = `🐦 Autonomous wake (${source})`;
+    attribution.appendChild(label);
+    div.appendChild(attribution);
+
+    // The raw wake prompt stays available for audit, collapsed by default.
+    const isEncrypted = msg.encrypted && !state.showDecrypted;
+    if (!isEncrypted && msg.content) {
+        const details = document.createElement('details');
+        details.className = 'signal-wake-details';
+        const summary = document.createElement('summary');
+        summary.textContent = 'wake context';
+        details.appendChild(summary);
+        const pre = document.createElement('div');
+        pre.className = 'message-content signal-wake-prompt';
+        pre.textContent = String(msg.content);
+        details.appendChild(pre);
+        div.appendChild(details);
+    }
+
+    target.appendChild(div);
+    return div;
+}
+
 // State → accent colour for the restart-status bubble's left border.
 const RESTART_STATE_ACCENTS = {
     pending: 'rgba(59, 130, 246, 0.8)',    // blue — filed / deferred

@@ -24,6 +24,7 @@ import {
     handleRestartStatus,
     appendMessagePart,
     mountToolRenderers,
+    renderSignalWakeChip,
 } from './chat.js';
 
 // #1659: tool cards on reload come from the structured, position-stamped
@@ -212,6 +213,15 @@ window.loadConversation = async function(sessionId) {
                 return;
             }
             const msg = entry.item;
+            // A persisted COGNITION signal wake (tagged ``signal_wake`` by the
+            // dispatcher) carries its internal instruction template in the
+            // user-prompt position. Collapse it to a compact "Autonomous wake"
+            // chip — matching the live path (``handleSignalCompleted``), which
+            // renders only the wake's response bubble and never the raw prompt.
+            if (msg.role === 'user' && msg.metadata && msg.metadata.signal_wake) {
+                renderSignalWakeChip(msg);
+                return;
+            }
             const isEncrypted = msg.encrypted && !state.showDecrypted;
             let toolHtml = '';
             let bodyHtml = null;

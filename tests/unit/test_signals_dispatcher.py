@@ -752,6 +752,53 @@ async def test_cognition_routes_through_agent_process_input(
 
 
 @pytest.mark.asyncio
+async def test_cognition_tags_persisted_turn_with_signal_wake(
+    dispatcher_components, tmp_path
+):
+    """The dispatcher passes ``signal_wake={source, mode}`` to process_input
+    when the agent accepts it, so the persisted wake turn renders as a compact
+    'Autonomous wake' chip instead of the raw internal prompt template."""
+    c = dispatcher_components
+    captured: dict = {}
+
+    async def capturing_process_input(prompt, **kwargs):
+        captured["kwargs"] = kwargs
+        return "agent-said"
+
+    c.agent.process_input = capturing_process_input
+
+    template = tmp_path / "tpl.md"
+    template.write_text("source={source}")
+    c.registry.register(_cognition_reg(template, name="cog"))
+
+    result = await c.dispatcher.dispatch_signal(
+        _signal("cog", mode=SignalMode.COGNITION, payload={"k": "v"})
+    )
+    assert result.status == Status.OK
+    assert captured["kwargs"].get("signal_wake") == {
+        "source": "cog",
+        "mode": "cognition",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cognition_omits_signal_wake_when_agent_rejects_kwarg(
+    dispatcher_components, tmp_path
+):
+    """A minimal agent whose process_input takes only ``prompt`` still
+    dispatches — signal_wake is guarded by signature inspection, never forced."""
+    c = dispatcher_components
+    template = tmp_path / "tpl.md"
+    template.write_text("source={source}")
+    c.registry.register(_cognition_reg(template, name="cog"))
+    # _FakeAgent.process_input(self, prompt) declares no signal_wake / **kwargs.
+    result = await c.dispatcher.dispatch_signal(
+        _signal("cog", mode=SignalMode.COGNITION, payload={"k": "v"})
+    )
+    assert result.status == Status.OK
+
+
+@pytest.mark.asyncio
 async def test_cognition_uses_allowed_signal_prompt_template_override(
     dispatcher_components, tmp_path
 ):

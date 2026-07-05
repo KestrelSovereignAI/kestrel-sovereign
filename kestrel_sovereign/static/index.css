@@ -1222,6 +1222,29 @@ nav {
     opacity: 0.85;
 }
 
+/* A persisted COGNITION wake prompt rendered from history: the internal
+   instruction template stays available for audit but collapsed by default,
+   so it reads as a compact "Autonomous wake" chip rather than a raw user
+   message. Mirrors the live wake bubble, which never shows the prompt. */
+.signal-wake-details > summary {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    opacity: 0.7;
+    cursor: pointer;
+    list-style: revert;
+}
+.signal-wake-prompt {
+    margin-top: 0.375rem;
+    padding: 0.5rem 0.625rem;
+    font-size: 0.75rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-secondary);
+    background: var(--surface-2, rgba(127, 127, 127, 0.06));
+    border-radius: 6px;
+    opacity: 0.9;
+}
+
 /* #1551: restart/update lifecycle events rendered as chat-visible
    system/status bubbles. Audited deployment primitive — the Sovereign
    gets first-class evidence (request id, operation, state, deferral
