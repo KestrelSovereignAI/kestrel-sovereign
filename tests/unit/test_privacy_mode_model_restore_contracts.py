@@ -11,6 +11,38 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 
 
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_cancel_privacy_transition_discards_pending(monkeypatch):
+    """#2083: declining a staged PUBLIC→EPHEMERAL downgrade must DISCARD the
+    pending transition, so a later confirm can't apply the change the user
+    cancelled. cancel_privacy_transition clears it; a subsequent confirm no-ops
+    and the agent stays PUBLIC."""
+    from kestrel_sovereign.privacy import privacy_mode_to_config
+    monkeypatch.setattr(
+        "kestrel_sovereign.kestrel_agent.privacy_mode_to_config",
+        privacy_mode_to_config, raising=False,
+    )
+    agent = KestrelAgent.__new__(KestrelAgent)
+    agent._privacy_mode = PrivacyMode.PUBLIC
+    agent._pending_privacy_transition = PrivacyMode.EPHEMERAL  # staged
+
+    result = await agent.cancel_privacy_transition()
+    assert agent._pending_privacy_transition is None
+    assert "discarded" in result.message.lower()
+
+    # A later confirm now finds nothing pending — stays PUBLIC.
+    confirm = await agent.confirm_privacy_transition()
+    assert agent._privacy_mode == PrivacyMode.PUBLIC
+    assert "no pending" in confirm.message.lower()
+
+    # Cancelling again is a clean no-op.
+    again = await agent.cancel_privacy_transition()
+    assert "no pending" in again.message.lower()
+
+
 def _prepare_app(agent):
     from server import app
 

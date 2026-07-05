@@ -635,6 +635,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `GET /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode/confirm`
+  - `POST /api/agent/privacy-mode/cancel`
   - `GET /api/agent/reflection/status`
   - `POST /api/agent/stop`
   - `POST /api/agent/stream`
