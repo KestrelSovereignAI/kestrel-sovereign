@@ -1170,6 +1170,7 @@ export function mountChatPane(agentName) {
     container.scrollTop = target.scrollPos;
     if (messageInput) {
         messageInput.value = target.draftText || '';
+        autosizeComposer();
     }
 
     // Mermaid finalization was deferred while the pane was detached —
@@ -1454,6 +1455,12 @@ export function initChat() {
     messageInput?.addEventListener('blur', () => {
         setTimeout(hideCommandAutocomplete, 200);
     });
+    // Auto-grow: size the composer for any restored content now, and
+    // re-clamp when the panel height changes.
+    autosizeComposer();
+    if (typeof window.addEventListener === 'function') {
+        window.addEventListener('resize', autosizeComposer);
+    }
 
     // #1662: attachment composer (attach button, paste/drop, thumbnail tray).
     initAttachmentComposer();
@@ -2408,7 +2415,10 @@ export async function sendMessage(overrideText, overrideAgent) {
             // #1662: stash this turn's staged attachments with the queued
             // message so they ride the eventual re-dispatch; clear the tray now.
             if (fromComposer) pane.queuedAttachments = takeStagedAttachments(pane);
-            if (fromComposer) messageInput.value = '';
+            if (fromComposer) {
+                messageInput.value = '';
+                autosizeComposer();
+            }
             renderQueuedChip(pane, dispatchAgent, text);
             return;
         }
@@ -2486,7 +2496,10 @@ export async function sendMessage(overrideText, overrideAgent) {
     // queued re-dispatch passes overrideText and must not wipe
     // whatever the user has since typed for the (possibly different)
     // currently-mounted agent.
-    if (fromComposer) messageInput.value = '';
+    if (fromComposer) {
+        messageInput.value = '';
+        autosizeComposer();
+    }
     deps().state.waitingAgents.add(dispatchAgent);
     // Reset the dynamic status word for this turn; the streaming loop
     // advances it (reasoning → tool verb → writing) as signals arrive.
@@ -3608,6 +3621,7 @@ window.compactContext = async function() {
     if (originalValue && !originalValue.startsWith('!')) {
         messageInput.value = originalValue;
     }
+    autosizeComposer();
 }
 
 // ============================================================================
@@ -4138,10 +4152,51 @@ export async function syncSelectorIfModelToolUsed(pane, selector = sharedModelSe
 }
 
 // ============================================================================
+// Composer auto-grow
+// ============================================================================
+
+/**
+ * Grow the composer textarea with its content, capped at a configurable
+ * fraction of the chat panel height (`--composer-max-height-pct`, a
+ * unitless percentage read off the textarea's computed style, default
+ * 40). Past the cap the textarea keeps its max height and scrolls
+ * internally.
+ *
+ * Must be called after every programmatic `messageInput.value` write
+ * (draft restore, send-clear, command insertion), not just on input
+ * events, so the height always tracks the actual content.
+ */
+function autosizeComposer() {
+    if (!messageInput) return;
+    // Pure layout enhancement — skip in environments without layout
+    // APIs (minimal-DOM embedders, the node:test frontend harness).
+    if (typeof getComputedStyle !== 'function'
+        || typeof messageInput.closest !== 'function') return;
+    const pct = parseFloat(
+        getComputedStyle(messageInput).getPropertyValue('--composer-max-height-pct')
+    ) || 40;
+    // Measure against the whole chat panel, not #chat-container: the
+    // message container shrinks as the composer grows, which would feed
+    // the cap back into itself.
+    const panel = messageInput.closest('.panel') || document.body;
+    const panelHeight = panel.clientHeight || window.innerHeight;
+    const maxPx = Math.floor(panelHeight * pct / 100);
+    // Collapse to content height, then measure. scrollHeight excludes
+    // borders, which height: (border-box) includes — compensate or the
+    // textarea gains a phantom internal scrollbar.
+    messageInput.style.height = 'auto';
+    const border = messageInput.offsetHeight - messageInput.clientHeight;
+    const contentPx = messageInput.scrollHeight + border;
+    messageInput.style.height = Math.min(contentPx, maxPx) + 'px';
+    messageInput.style.overflowY = contentPx > maxPx ? 'auto' : 'hidden';
+}
+
+// ============================================================================
 // Command Autocomplete
 // ============================================================================
 
 function handleInput(e) {
+    autosizeComposer();
     const value = e.target.value;
 
     if (value === '!' || value.match(/\s!$/)) {
@@ -4281,6 +4336,7 @@ function selectCommand(cmd) {
     const cmdInfo = deps().commands.find(c => c.cmd === cmd);
 
     messageInput.value = cmd + ' ';
+    autosizeComposer();
     messageInput.focus();
     hideCommandAutocomplete();
 
@@ -4342,6 +4398,7 @@ function clearChat() {
     // Clear message input
     if (messageInput) {
         messageInput.value = '';
+        autosizeComposer();
         messageInput.focus();
     }
 
