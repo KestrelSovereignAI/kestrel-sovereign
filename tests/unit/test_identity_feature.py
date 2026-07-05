@@ -143,6 +143,63 @@ def test_unique_export_filename_does_not_collide():
 
 
 @pytest.mark.asyncio
+async def test_import_identity_forwards_allow_unsigned(monkeypatch, tmp_path):
+    """#2112 F185: the import tool exposes allow_unsigned and forwards it, so an
+    unsigned export (which the tool's own remediation advice tells the user to
+    `!identity import`) is actually importable — previously hardcoded False with
+    no way to override."""
+    from unittest.mock import AsyncMock, MagicMock as MM
+
+    pkg_path = tmp_path / "unsigned_pkg.json"
+    pkg_path.write_text('{"fake": "package"}')
+
+    fake_pkg = MM()
+    fake_pkg.constitution_text = None
+    fake_pkg.content_hash = None
+    fake_pkg.verify_constitution = lambda: True
+    fake_pkg.verify_content_hash = lambda: True
+    fake_pkg.did = "did:test:unsigned"
+    fake_pkg.get_summary.return_value = {
+        "did": "did:test:unsigned", "agent_name": "Unsigned Agent",
+        "created_at": "2026-05-08T00:00:00",
+        "export_timestamp": "2026-05-08T00:00:00",
+        "source_substrate": "anthropic_claude", "package_version": "1",
+        "episodes_count": 0, "saved_items_count": 0, "relationships_count": 0,
+        "skills_count": 0, "migrations_count": 0,
+    }
+
+    import kestrel_sovereign.identity as identity_mod
+    monkeypatch.setattr(
+        identity_mod, "AgentIdentityPackage",
+        MM(from_json=MM(return_value=fake_pkg)),
+    )
+
+    captured = {}
+    fake_result = MM(success=True, errors=[], warnings=[], stats={},
+                     imported_counts={})
+
+    async def _fake_import_package(package, **kwargs):
+        captured.update(kwargs)
+        return fake_result
+
+    fake_importer = MM(import_package=AsyncMock(side_effect=_fake_import_package))
+    monkeypatch.setattr(
+        identity_mod, "IdentityImporter", MM(return_value=fake_importer),
+    )
+    # resolve_feature_database must return a truthy db.
+    import kestrel_sovereign.features.identity.feature as feat_mod
+    monkeypatch.setattr(feat_mod, "resolve_feature_database", lambda agent: MM())
+
+    feat = _make_feature()
+    await feat.import_identity(str(pkg_path), allow_unsigned=True)
+    assert captured.get("allow_unsigned") is True, captured
+
+    captured.clear()
+    await feat.import_identity(str(pkg_path))  # default
+    assert captured.get("allow_unsigned") is False, captured
+
+
+@pytest.mark.asyncio
 async def test_verify_identity_unsigned_is_partial(monkeypatch, tmp_path):
     """Round 3 codex finding: an UNSIGNED package isn't a verify
     failure but is unimportable under the default

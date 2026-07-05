@@ -373,6 +373,23 @@ class IdentityExporter:
             })
         return insights
 
+    def _strip_own_namespace(self, node_id: str) -> str:
+        """Strip THIS agent's import namespace prefix (``agent_id[:20]_``) from a
+        graph node id so the exported package carries the RAW logical id (F186).
+
+        The importer writes package-supplied user/skill nodes under
+        ``{importer[:20]}_{raw_id}`` (see IdentityImporter._namespace_node_id).
+        Without stripping on export, a node imported as ``{me[:20]}_alice`` would
+        be re-exported namespaced and re-prefixed on the next import
+        (``{next[:20]}_{me[:20]}_alice``), growing the prefix every migration hop
+        and never matching a live node. Stripping our own prefix makes the
+        export/import roundtrip idempotent: alice -> {A}_alice -> alice -> {B}_alice.
+        """
+        prefix = f"{self.agent_id[:20]}_"
+        if node_id and node_id.startswith(prefix):
+            return node_id[len(prefix):]
+        return node_id
+
     async def _get_relationships(self) -> List[RelationshipRecord]:
         """
         Extract relationship records from graph.
@@ -390,7 +407,9 @@ class IdentityExporter:
 
         relationships = []
         for row in rows:
-            user_id = row[0]
+            # Export the raw logical id (strip our own import namespace) so a
+            # re-import doesn't grow the prefix on every migration hop (F186).
+            user_id = self._strip_own_namespace(row[0])
             props = json.loads(row[1]) if row[1] else {}
             edge_label = row[2]
 
@@ -428,7 +447,12 @@ class IdentityExporter:
         )
         for row in rows:
             props = json.loads(row[2]) if row[2] else {}
-            graph_skills[row[0]] = {
+            # Key by the RAW logical id (strip our own import namespace) so the
+            # runtime-tool merge below — which looks up graph_skills[agent_skill.id]
+            # with a raw id — finds an imported skill's persisted usage data
+            # (times_used/last_used), and so a re-export carries the raw id rather
+            # than re-prefixing it every migration hop (F186).
+            graph_skills[self._strip_own_namespace(row[0])] = {
                 "skill_name": row[1],
                 "type": props.get("type", "unknown"),
                 "proficiency": props.get("proficiency", 0.5),
@@ -465,6 +489,7 @@ class IdentityExporter:
         # 3. Include graph-only skills not covered by current runtime features
         #    (e.g., skills from features that were uninstalled but have history).
         for skill_id, data in graph_skills.items():
+            # graph_skills keys are already namespace-stripped above.
             if skill_id in seen_ids:
                 continue
             skills.append(SkillRecord(

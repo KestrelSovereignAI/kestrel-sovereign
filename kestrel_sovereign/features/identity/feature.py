@@ -401,6 +401,7 @@ class IdentityFeature(Feature):
         verify_signature: bool = True,
         merge_mode: str = "merge",
         key_hash: Optional[str] = None,
+        allow_unsigned: bool = False,
     ) -> ToolResult:
         """
         Import agent identity from a package.
@@ -414,11 +415,22 @@ class IdentityFeature(Feature):
                 `!identity export tier=ipfs|filecoin`; it is returned by that
                 export and must travel out-of-band with the CID. Ignored for
                 local file sources.
+            allow_unsigned: Import a package that carries NO signature (F185).
+                `!identity export` legitimately produces unsigned packages when
+                signing is disabled or the signer is unavailable (PARTIAL), and
+                the importer rejects unsigned packages by default. Pass True to
+                restore such an export. Default False — an unsigned package is an
+                integrity risk, so this is opt-in and warned on.
         """
         if not isinstance(verify_signature, bool):
             return ToolResult.failed(
                 "verify_signature must be a boolean, got "
                 f"{type(verify_signature).__name__}={verify_signature!r}"
+            )
+        if not isinstance(allow_unsigned, bool):
+            return ToolResult.failed(
+                "allow_unsigned must be a boolean, got "
+                f"{type(allow_unsigned).__name__}={allow_unsigned!r}"
             )
         merge_mode = _normalize_choice(merge_mode, _MERGE_MODE_ALIASES)
         if merge_mode not in ("replace", "merge", "skip_existing"):
@@ -488,7 +500,7 @@ class IdentityFeature(Feature):
                 package,
                 verify_signature=verify_signature,
                 merge_mode=merge_mode,
-                allow_unsigned=False,
+                allow_unsigned=allow_unsigned,
             )
         except Exception as e:
             logger.error(f"Identity import failed: {e}", exc_info=True)
