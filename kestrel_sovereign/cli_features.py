@@ -188,15 +188,13 @@ def cmd_feature_install(args) -> int:
     package = info.package
     print(f"Installing {package}...")
 
-    cmd = [sys.executable, "-m", "pip", "install", package]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _extension_install_run([package])
 
     if result.returncode != 0:
         # Try git URL as fallback
         if info.git:
             print(f"pip install failed, trying git: {info.git}")
-            cmd = [sys.executable, "-m", "pip", "install", f"git+{info.git}"]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = _extension_install_run([f"git+{info.git}"])
 
     if result.returncode == 0:
         print(f"Installed {package}")
@@ -354,11 +352,9 @@ def cmd_feature_upgrade(args) -> int:
             print(f"  {name:<34} {current:<10} would upgrade")
             continue
 
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", name]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _extension_install_run(["--upgrade", name])
         if result.returncode != 0 and git_urls.get(name):
-            cmd = [sys.executable, "-m", "pip", "install", "--upgrade", f"git+{git_urls[name]}"]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = _extension_install_run(["--upgrade", f"git+{git_urls[name]}"])
 
         if result.returncode != 0:
             rc = 1
