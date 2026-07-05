@@ -255,6 +255,32 @@ def test_sanitize_untrusted_env_strips_all_provider_creds_and_gh_token():
     assert env["HOME"] == "/home/agent"
 
 
+def test_sanitize_strips_all_kestrel_and_jwt_secrets_by_prefix():
+    """#2110/P2: stripping only a few enumerated KESTREL_ keys leaked the rest
+    (KESTREL_DB_PASSWORD, KESTREL_HOST_API_KEY, KESTREL_SESSION_SECRET,
+    KESTREL_USER_SECRET, KESTREL_USER_PASSWORDS, JWT_SECRET_KEY) to untrusted
+    verify code. The whole KESTREL_/JWT_ namespace is now stripped by prefix."""
+    base = {
+        "KESTREL_DB_PASSWORD": "pw",
+        "KESTREL_HOST_API_KEY": "hostkey",
+        "KESTREL_SESSION_SECRET": "sess",
+        "KESTREL_USER_SECRET": "usersec",
+        "KESTREL_USER_PASSWORDS": "userpw",
+        "KESTREL_FEATURE_X_TOKEN": "feat",
+        "JWT_SECRET_KEY": "jwt",
+        "PATH": "/usr/bin",
+    }
+    env, stripped = sanitize_untrusted_env(base)
+    for leaked in (
+        "KESTREL_DB_PASSWORD", "KESTREL_HOST_API_KEY", "KESTREL_SESSION_SECRET",
+        "KESTREL_USER_SECRET", "KESTREL_USER_PASSWORDS", "KESTREL_FEATURE_X_TOKEN",
+        "JWT_SECRET_KEY",
+    ):
+        assert leaked not in env, leaked
+        assert leaked in stripped, leaked
+    assert env["PATH"] == "/usr/bin"
+
+
 def test_build_talon_batch_invocation_passes_repo_dir_and_abs_prd(tmp_path):
     prd = tmp_path / "prd.json"
     prd.write_text("{}")

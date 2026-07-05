@@ -77,6 +77,14 @@ UNTRUSTED_ENV_STRIP_PREFIXES = (
     "HF_",
     "AWS_",
     "OLLAMA_",
+    # Kestrel's own secrets (F302/P2): the host process env carries
+    # KESTREL_DB_PASSWORD, KESTREL_HOST_API_KEY, KESTREL_SESSION_SECRET,
+    # KESTREL_USER_SECRET, KESTREL_USER_PASSWORDS, KESTREL_API_KEY, etc.
+    # Strip the whole namespace by prefix so a newly-added KESTREL_ secret is
+    # stripped by default rather than leaking to untrusted verify code until
+    # someone remembers to enumerate it. JWT_ covers JWT_SECRET_KEY.
+    "KESTREL_",
+    "JWT_",
 )
 # Explicit credential/secret keys that don't share a provider prefix.
 # The GitHub token is stripped ENTIRELY here (not merely scoped): verify
