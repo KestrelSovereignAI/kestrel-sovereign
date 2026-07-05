@@ -190,6 +190,65 @@ async def test_with_retry_caps_advised_delay_at_max():
 
     with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
         with pytest.raises(_FakeRateLimit):
-            await with_retry(throttled, max_retries=2)
+            # A throttle is bounded by throttle_max_retries, not max_retries.
+            await with_retry(throttled, throttle_max_retries=2)
 
     assert slept and all(d <= 120.0 for d in slept)
+
+
+class _FakeServerError(Exception):
+    """A transient 5xx (e.g. ollama 503 while a model loads) — retryable but NOT
+    a throttle, so it must use the tight budget, not the patient plan one."""
+
+    def __init__(self, message="503 service unavailable", *, status_code=503):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@pytest.mark.asyncio
+async def test_non_throttle_uses_tight_budget_for_fast_failover():
+    """#2074 regression: a transient 5xx must NOT get the patient 8x120 plan
+    budget — it uses the tight default (5 attempts, 60s cap) so the fallback
+    chain advances to a healthy route in ~seconds, not ~2 minutes."""
+    attempts = {"n": 0}
+
+    async def always_503():
+        attempts["n"] += 1
+        raise _FakeServerError()
+
+    slept = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
+        with pytest.raises(_FakeServerError):
+            await with_retry(always_503)
+
+    # Tight default: 5 total attempts (4 sleeps), each capped at 60s.
+    assert attempts["n"] == 5, attempts
+    assert len(slept) == 4, slept
+    assert all(d <= 60.0 for d in slept), slept
+
+
+@pytest.mark.asyncio
+async def test_throttle_uses_patient_budget():
+    """A 429 gets the patient plan-route budget (8 attempts) so a rate-limit
+    window is ridden out instead of downgrading to a metered route."""
+    attempts = {"n": 0}
+
+    async def always_429():
+        attempts["n"] += 1
+        raise _FakeRateLimit("429", status_code=429)
+
+    slept = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
+        with pytest.raises(_FakeRateLimit):
+            await with_retry(always_429)
+
+    assert attempts["n"] == 8, attempts  # patient budget
+    assert all(d <= 120.0 for d in slept), slept
