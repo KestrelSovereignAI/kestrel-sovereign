@@ -324,6 +324,19 @@ function animateOut(rowEl) {
  * handle: `{ element, refresh, retarget(agentName), setView(view), destroy }`.
  * `retarget` lets an embedding host repoint the list when the active agent
  * switches (same contract family as chat's mount).
+ *
+ * Sidebar-oriented hooks (the standalone conversations pane in identity.js is a
+ * consumer as of #2199 — it no longer reimplements fetch/refresh/seq-guard):
+ *   - `showViewBar: false` hides the Active/Archived/Trash switcher so an
+ *     embedder can drive the view from its own chrome (the sidebar's
+ *     `#trash-toggle-btn` calls `setView`).
+ *   - `onSelect(conv, { agentName })` — the second arg carries the agent the
+ *     list was loaded for, so the consumer can pin the load (#1358).
+ *   - `onLoaded(conversations, { view, agentName })` — fires after each
+ *     non-stale load; the sidebar uses it for its #714 auto-load-most-recent.
+ *   - `onMutated(action, conv)` — fires after a successful archive / unarchive
+ *     / trash / purge / restore; the sidebar uses it to coordinate chat state
+ *     (start a fresh session when the currently-open conversation is deleted).
  */
 export function mountConversations(containerEl, config = {}) {
     if (!containerEl) throw new Error('mountConversations requires a container element');
@@ -373,7 +386,7 @@ export function mountConversations(containerEl, config = {}) {
         viewButtons.set(v.key, b);
         viewBar.appendChild(b);
     }
-    controls.appendChild(viewBar);
+    if (config.showViewBar !== false) controls.appendChild(viewBar);
 
     // Search / filter box.
     const search = document.createElement('input');
@@ -471,11 +484,16 @@ export function mountConversations(containerEl, config = {}) {
         ];
     }
 
+    function notifyMutated(action, conv) {
+        if (typeof config.onMutated === 'function') config.onMutated(action, conv);
+    }
+
     async function doArchive(conv, rowEl) {
         try {
             await api.archiveConversation(conv.session_id);
             animateOut(rowEl);
             Toast.info('Conversation archived');
+            notifyMutated('archive', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to archive: ${e.message}`); }
     }
@@ -484,6 +502,7 @@ export function mountConversations(containerEl, config = {}) {
             await api.unarchiveConversation(conv.session_id);
             animateOut(rowEl);
             Toast.info('Conversation unarchived');
+            notifyMutated('unarchive', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to unarchive: ${e.message}`); }
     }
@@ -493,6 +512,7 @@ export function mountConversations(containerEl, config = {}) {
             await api.deleteConversation(conv.session_id);
             animateOut(rowEl);
             Toast.info('Conversation moved to trash');
+            notifyMutated('trash', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to delete: ${e.message}`); }
     }
@@ -502,6 +522,7 @@ export function mountConversations(containerEl, config = {}) {
             await api.purgeConversation(conv.session_id, 'user-initiated-ui');
             animateOut(rowEl);
             Toast.info('Conversation permanently deleted');
+            notifyMutated('purge', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to permanently delete: ${e.message}`); }
     }
@@ -510,17 +531,26 @@ export function mountConversations(containerEl, config = {}) {
             await api.restoreConversation(conv.session_id);
             animateOut(rowEl);
             Toast.success('Conversation restored');
+            notifyMutated('restore', conv);
             refresh();
         } catch (e) { Toast.error(`Failed to restore: ${e.message}`); }
     }
 
     function rowOpts() {
         const activeId = getActiveSessionId();
+        // Snapshot the agent at render time so each row's pin is immutable
+        // (#1358). retarget() mutates `agentName` synchronously and then fires
+        // an async refresh; the old rows stay clickable until the new list
+        // resolves. Reading the live `agentName` at click time would let a
+        // stale row dispatch under the NEW agent during that fetch window.
+        // Capturing here means a stale row always carries the agent it was
+        // rendered for, so loadConversation's currentAgentMatches gate drops it.
+        const renderAgent = agentName;
         return {
             api,
             group: config.group !== false,
             escapeHtml: config.escapeHtml,
-            onSelect: (conv) => onSelect(conv),
+            onSelect: (conv) => onSelect(conv, { agentName: renderAgent }),
             buildMenuItems: menuItemsFor,
             // active flag applied per-row below via renderCurrent
             _activeId: activeId,
@@ -603,6 +633,9 @@ export function mountConversations(containerEl, config = {}) {
             if (seq !== refreshSeq) return; // stale — a newer refresh owns the list
             lastConversations = data;
             renderCurrent();
+            if (typeof config.onLoaded === 'function') {
+                config.onLoaded(data, { view, agentName });
+            }
         } catch (e) {
             if (seq !== refreshSeq) return;
             listEl.innerHTML = '';

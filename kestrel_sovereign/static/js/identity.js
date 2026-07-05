@@ -7,11 +7,13 @@ import API from './api.js';
 import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts } from './chat.js';
 import { generateIdenticon } from './identicon.js';
-import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
-// #2149: the sidebar renders rows through the shared conversation-list
-// component so its row markup, kebab menu, and inline rename are the SAME as
-// the history slideout and any embedded mount — zero duplicated list logic.
-import { buildConversationRow, beginInlineRename } from './conversations.js';
+// #2199: the standalone conversations pane is now a `mountConversations`
+// consumer — one list orchestrator (fetch / refresh / seq-guard / views /
+// trash) shared with the history slideout and any embedded mount. identity.js
+// keeps NO bespoke conversation fetching or request-sequencing; it only wires
+// the sidebar-specific hooks (agent pinning, #714 auto-load, chat-state
+// coordination on delete) through the component's config.
+import { mountConversations } from './conversations.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
@@ -878,17 +880,15 @@ export async function loadAgents() {
         // from #765) without going through selectAgent.  selectAgent installs a
         // host-agent URL prefix that only exists in multi_agent routing — applying
         // it in standalone produces 404s for /api/conversations and /agent/invoke.
-        // Standalone has exactly one agent, so just show the pane and let
-        // loadConversations() populate the list against the un-prefixed routes.
+        // Standalone has exactly one agent, so just show the pane and let the
+        // mounted conversation list populate against the un-prefixed routes.
         // Skip in misconfig — the agent list is not safe to auto-target.
         if (isStandalone && agents.length > 0 && !hasLiveAgent && API.hasCapability('conversations')) {
             // #879: don't reveal the conversations pane (or fire its fetch)
-            // when the host opted out — its own loadConversations() guard
-            // would hide the pane after we re-show it, but the show/hide
-            // race produces a one-frame flicker we can avoid by gating here.
+            // when the host opted out — the capability gate below hides the pane.
             const conversationsPane = document.getElementById('conversations-pane');
             if (conversationsPane) conversationsPane.style.display = 'flex';
-            try { await loadConversations(agents[0].name); } catch (_) { /* best-effort */ }
+            try { refreshConversationsPane(); } catch (_) { /* best-effort */ }
         }
     } catch (e) {
         const container = document.getElementById('agents-list');
@@ -956,7 +956,6 @@ window.selectAgent = async function(agentName) {
     // Show conversations pane
     const conversationsPane = document.getElementById('conversations-pane');
     conversationsPane.style.display = 'flex';
-    prepareConversationsPaneForAgent(agentName);
 
     // Reset cached panel data so they reload for the new agent. Note
     // that `state.currentSessionId` is per-pane now (its getter reads
@@ -979,10 +978,14 @@ window.selectAgent = async function(agentName) {
     connectNotifications();
 
     // Reload all agent-specific data in parallel.
+    // #2199: retarget the mounted conversation list to the new agent. The
+    // component's `retarget` (its refreshSeq-guarded reload) is the ONLY
+    // list-refresh path on an agent switch — preserving #1358 pinning without a
+    // second request-sequence guard in identity.js.
+    refreshConversationsPane();
     await Promise.all([
         loadIdentity(),
         loadPrivacyMode(),
-        loadConversations(agentName),
         loadModels(),
         loadCommands(API),
         updateContextStatus(),
@@ -1017,8 +1020,13 @@ window.selectAgent = async function(agentName) {
 // ============================================================================
 
 let activeConversationId = null;
-let conversationListRequestSeq = 0;
 const activeConversationIdsByAgent = new Map();
+
+// #2199: the ONE mount handle for the standalone conversations pane. All list
+// fetch / refresh / request-sequencing / view filtering lives inside the shared
+// component (conversations.js) — identity.js holds only this handle and the
+// sidebar-specific hooks below.
+let conversationsHandle = null;
 
 function currentAgentMatches(expectedAgent) {
     return expectedAgent === API.getHostAgent();
@@ -1028,23 +1036,125 @@ function hasExpectedAgent(options) {
     return Object.prototype.hasOwnProperty.call(options || {}, 'expectedAgent');
 }
 
-function conversationAgentKey(agentName) {
-    return agentName === null || agentName === undefined
-        ? '__standalone__'
-        : String(agentName);
-}
-
 function getActiveConversationIdForAgent(agentName) {
     const pane = state.chatPanes.get(agentName);
     return pane?.sessionId || activeConversationIdsByAgent.get(agentName) || null;
 }
 
-function prepareConversationsPaneForAgent(agentName) {
+// #714 auto-load-most-recent, moved verbatim off the old bespoke loader. Fired
+// from the component's `onLoaded` hook for the active view only, pinned to the
+// agent the list was fetched for.
+function maybeAutoLoadMostRecent(conversations, autoTargetAgent, view) {
+    // Only the default (active) list drives auto-load; archived/trash views must
+    // never yank the chat pane onto a tidied-away or deleted session.
+    if (view && view !== 'active') return;
+    // Auto-load the most recent conversation on agent select (issue #714).
+    // Only when the chat pane is truly cold:
+    //   - no currentSessionId has been set since selectAgent mounted
+    //   - no in-flight stream against this agent
+    //   - no DOM activity in this agent's pane (user might have typed
+    //     during the parallel /api/conversations fetch)
+    //
+    // Without all three checks, an auto-load that lands AFTER the user
+    // started typing would call wipeAgentChatPane(), bump the pane
+    // generation, and gate out the in-flight stream — which surfaces
+    // user-side as "the agent keeps stopping mid-answer." The {auto: true}
+    // flag makes window.loadConversation re-check pane coldness post-await.
+    const autoTargetPane = state.chatPanes.get(autoTargetAgent);
+    const paneIsCold = autoTargetPane
+        && !autoTargetPane.streamingMsgDiv
+        && autoTargetPane.element.children.length === 0;
+    if (!state.currentSessionId
+        && !state.waitingAgents.has(autoTargetAgent)
+        && paneIsCold
+        && typeof window.loadConversation === 'function') {
+        const mostRecent = _pickMostRecentConversation(conversations);
+        if (mostRecent && mostRecent.session_id) {
+            // ``expectedAgent`` is pinned to the agent the LIST was fetched for —
+            // loadConversation drops the load if the host has since switched
+            // (#1358).
+            window.loadConversation(mostRecent.session_id, {
+                auto: true,
+                expectedAgent: autoTargetAgent,
+            });
+        }
+    }
+}
+
+// Chat-state coordination for a delete of the CURRENTLY-OPEN conversation.
+// Fired from the component's `onMutated` hook so the pane-aware behavior (start
+// a fresh session on trash, blank the pane on purge) is single-sourced here
+// while the list fetch/render stays in the component.
+async function handleSidebarConversationMutation(action, conv) {
+    if (action !== 'trash' && action !== 'purge') return;
+    if (state.currentSessionId !== conv.session_id) return;
+    const host = API.getHostAgent();
+    activeConversationId = null;
+    activeConversationIdsByAgent.delete(host);
+    if (action === 'trash') {
+        // Immediately create a fresh backend session so downstream state
+        // (context-status footer, auto-load logic) doesn't point at a
+        // vanished session.
+        const fresh = await API.newConversation();
+        wipeAgentChatPane(host, `
+            <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
+                <span style="font-size: 2rem;">\u{2728}</span>
+                <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
+            </div>
+        `);
+        state.currentSessionId = fresh.session_id;
+        activeConversationId = fresh.session_id;
+        activeConversationIdsByAgent.set(host, fresh.session_id);
+    } else {
+        wipeAgentChatPane(host);
+        state.currentSessionId = null;
+    }
+    if (typeof updateContextStatus === 'function') updateContextStatus();
+}
+
+// Mount the shared conversation-list component into the sidebar pane exactly
+// once, then reuse the handle. The sidebar drives its Active↔Trash toggle from
+// the header `#trash-toggle-btn` (so the component's own view bar is hidden),
+// and pins selection / auto-load to the loaded agent through the hooks above.
+function ensureConversationsMount() {
+    if (conversationsHandle) return conversationsHandle;
     const container = document.getElementById('conversations-list');
-    if (!container) return;
-    container.dataset.agentKey = conversationAgentKey(agentName);
-    activeConversationId = getActiveConversationIdForAgent(agentName);
-    container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Loading conversations...</p>';
+    if (!container) return null;
+    conversationsHandle = mountConversations(container, {
+        api: API,
+        autoLoad: false,
+        showViewBar: false,
+        showSearch: false,
+        showStats: false,
+        agentName: API.getHostAgent(),
+        getActiveSessionId: () => activeConversationId,
+        onSelect: (conv, ctx) => {
+            window.loadConversation(conv.session_id, { expectedAgent: ctx.agentName });
+        },
+        onLoaded: (conversations, ctx) => {
+            maybeAutoLoadMostRecent(conversations, ctx.agentName, ctx.view);
+        },
+        onMutated: (mutAction, conv) => {
+            handleSidebarConversationMutation(mutAction, conv);
+        },
+    });
+    return conversationsHandle;
+}
+
+// Repoint the mounted list at the current host agent (or first-load it). The
+// component's `retarget` (refreshSeq-guarded reload) is the ONLY list-refresh
+// path on an agent switch — no second request-sequence guard here (#1358 /
+// #2199). #879: hosts that opt out of conversations get the pane hidden.
+export function refreshConversationsPane() {
+    if (!API.hasCapability('conversations')) {
+        const pane = document.getElementById('conversations-pane');
+        if (pane) pane.style.display = 'none';
+        return;
+    }
+    const handle = ensureConversationsMount();
+    if (!handle) return;
+    activeConversationId = getActiveConversationIdForAgent(API.getHostAgent());
+    handle.retarget(API.getHostAgent());
 }
 
 // Exported for unit test — kept as a pure function so it's trivial to
@@ -1072,201 +1182,6 @@ export function _pickMostRecentConversation(conversations) {
     }
     return best;
 }
-
-export async function loadConversations(_agentName) {
-    // #879: deep-link defense — hosts with their own chat surface (e.g. Frinz)
-    // typically disable the conversations sidebar entirely.  Hide the pane and
-    // skip the /api/conversations fetch.
-    if (!API.hasCapability('conversations')) {
-        const pane = document.getElementById('conversations-pane');
-        if (pane) pane.style.display = 'none';
-        return;
-    }
-    // Capture the host agent BEFORE the fetch.  The auto-load below
-    // pins to whichever agent's list this call actually retrieved.
-    // Reading ``selectedAgentName`` (or ``API.getHostAgent()``) AFTER
-    // the await would catch the mutated value if a concurrent
-    // selectAgent(B) flipped it — that's the codex round-1 race on
-    // #1358: the list is A's, but the guard pins to B, and the
-    // auto-load fires A's session_id under B's URL.
-    //
-    // Use the ROUTING key (``API.getHostAgent()``), NOT the display
-    // name passed via ``_agentName``.  In standalone single-agent
-    // mode ``getHostAgent()`` returns null and the chat pane is
-    // keyed by null too; using ``_agentName`` (a display string)
-    // would miss the null-keyed pane and ``paneIsCold`` would read
-    // false, regressing the standalone auto-load.  Codex round-2 catch.
-    const requestAgent = API.getHostAgent();
-    const requestSeq = ++conversationListRequestSeq;
-    const requestAgentKey = conversationAgentKey(requestAgent);
-    prepareConversationsPaneForAgent(requestAgent);
-    // Agent routing is handled by API.setHostAgent() — all calls auto-prefix
-    try {
-        const data = await API.getConversations();
-        const conversations = data.conversations || [];
-
-        const container = document.getElementById('conversations-list');
-        if (!container
-            || !currentAgentMatches(requestAgent)
-            || requestSeq !== conversationListRequestSeq
-            || container.dataset.agentKey !== requestAgentKey) {
-            return;
-        }
-        activeConversationId = getActiveConversationIdForAgent(requestAgent);
-        if (conversations.length === 0) {
-            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No conversations yet</p>';
-            return;
-        }
-
-        container.innerHTML = '';
-        for (const conv of conversations) {
-            // Build the row through the shared component so the kebab menu,
-            // inline rename, and markup match every other conversation surface
-            // (#2149). The sidebar keeps its own agent-pinning: the row carries
-            // ``data-agent-key`` and the click is gated so a stale row can't
-            // dispatch under a switched host (#1358 — enforced by the
-            // conversation_agent_switch test). Menu actions route through the
-            // pane-aware window.* handlers below, which own the chat-state
-            // coordination (fresh-session on delete, etc.).
-            const item = buildConversationRow(conv, {
-                api: API,
-                active: activeConversationId === conv.session_id,
-                agentKey: requestAgentKey,
-                onSelect: (c, rowEl) => {
-                    if (rowEl.dataset.agentKey !== conversationAgentKey(API.getHostAgent())) {
-                        return;
-                    }
-                    window.loadConversation(c.session_id, { expectedAgent: requestAgent });
-                },
-                buildMenuItems: (c, rowEl) => [
-                    {
-                        label: 'Rename', labelKey: 'conv_menu_rename', action: 'rename',
-                        onSelect: () => {
-                            const previewEl = rowEl.querySelector
-                                ? rowEl.querySelector('.conversation-preview')
-                                : null;
-                            if (previewEl) beginInlineRename(previewEl, c, { api: API });
-                        },
-                    },
-                    {
-                        label: 'Archive', labelKey: 'conv_menu_archive', action: 'archive',
-                        onSelect: () => window.archiveConversation(c.session_id, rowEl),
-                    },
-                    {
-                        label: 'Move to Trash', labelKey: 'conv_menu_trash', action: 'trash',
-                        onSelect: () => window.deleteConversation(c.session_id, rowEl),
-                    },
-                    {
-                        label: 'Delete Permanently', labelKey: 'conv_menu_delete_permanent',
-                        action: 'purge', danger: true, separatorBefore: true,
-                        onSelect: () => window.purgeConversation(c.session_id, rowEl),
-                    },
-                ],
-            });
-            container.appendChild(item);
-        }
-
-        // Auto-load the most recent conversation on agent select (issue #714).
-        // Only when the chat pane is truly cold:
-        //   - no currentSessionId has been set since selectAgent mounted
-        //   - no in-flight stream against this agent
-        //   - no DOM activity in this agent's pane (user might have typed
-        //     during the parallel /api/conversations fetch)
-        //
-        // Without all three checks, an auto-load that lands AFTER the user
-        // started typing would call wipeAgentChatPane(), bump the pane
-        // generation, and gate out the in-flight stream — which surfaces
-        // user-side as "the agent keeps stopping mid-answer."
-        //
-        // Even with the synchronous checks there's a residual race between
-        // here and the actual wipe inside loadConversation. The auto path
-        // re-checks post-await; see the {auto: true} branch in
-        // window.loadConversation below.
-        // ``autoTargetAgent`` was previously read from the mutable
-        // ``selectedAgentName`` at response time — codex round-1 P2 on
-        // #1358 — which captured the LATEST agent rather than the one
-        // whose conversation list we actually fetched.  Pin to the
-        // request-time agent captured before the await above.
-        const autoTargetAgent = requestAgent;
-        const autoTargetPane = state.chatPanes.get(autoTargetAgent);
-        const paneIsCold = autoTargetPane
-            && !autoTargetPane.streamingMsgDiv
-            && autoTargetPane.element.children.length === 0;
-        if (!state.currentSessionId
-            && !state.waitingAgents.has(autoTargetAgent)
-            && paneIsCold
-            && typeof window.loadConversation === 'function') {
-            const mostRecent = _pickMostRecentConversation(conversations);
-            if (mostRecent && mostRecent.session_id) {
-                // Fire-and-forget; loadConversation is async and handles
-                // its own errors via Toast. The {auto: true} flag tells
-                // loadConversation to re-check pane coldness after its
-                // own fetch resolves and abort the wipe if the user has
-                // begun a turn in the meantime.
-                //
-                // ``expectedAgent`` is pinned to the agent the LIST was
-                // fetched for — loadConversation drops the load if
-                // ``API.getHostAgent()`` has since switched.  See #1358.
-                window.loadConversation(mostRecent.session_id, {
-                    auto: true,
-                    expectedAgent: autoTargetAgent,
-                });
-            }
-        }
-    } catch (e) {
-        const container = document.getElementById('conversations-list');
-        if (currentAgentMatches(requestAgent)
-            && requestSeq === conversationListRequestSeq
-            && container
-            && container.dataset.agentKey === requestAgentKey) {
-            container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load conversations</p>';
-        }
-    }
-}
-
-
-// #2149: archive/unarchive a whole session. Archive is a first-class
-// tidy-away state distinct from Trash: an archived conversation is hidden
-// from the default (active) list but is NOT staged for deletion. These are
-// the pane-aware sidebar handlers; the shared component's kebab menu routes
-// here so the chat-state coordination (below) is single-sourced.
-window.archiveConversation = async function(sessionId, rowEl) {
-    try {
-        const result = await API.archiveConversation(sessionId);
-        const count = result?.archived_count;
-        if (rowEl) {
-            rowEl.style.transition = 'opacity 0.2s, transform 0.2s';
-            rowEl.style.opacity = '0';
-            rowEl.style.transform = 'scale(0.97)';
-            setTimeout(() => rowEl.remove(), 200);
-        }
-        Toast.info(
-            typeof count === 'number'
-                ? `Conversation archived (${count} messages)`
-                : 'Conversation archived',
-        );
-    } catch (e) {
-        Toast.error(`Failed to archive conversation: ${e.message}`);
-    }
-};
-
-window.unarchiveConversation = async function(sessionId, rowEl) {
-    try {
-        await API.unarchiveConversation(sessionId);
-        if (rowEl) {
-            rowEl.style.transition = 'opacity 0.2s';
-            rowEl.style.opacity = '0';
-            setTimeout(() => rowEl.remove(), 200);
-        }
-        Toast.success('Conversation unarchived');
-        if (typeof loadConversations === 'function') {
-            try { await loadConversations(selectedAgentName); } catch (_) { /* noop */ }
-        }
-    } catch (e) {
-        Toast.error(`Failed to unarchive conversation: ${e.message}`);
-    }
-};
-
 
 // #2081: render an assistant turn that emitted typed component parts (#1914)
 // as interleaved bubbles — prose runs and the component cards between them —
@@ -1337,13 +1252,11 @@ window.loadConversation = async function(sessionId, options = {}) {
     activeConversationId = sessionId;
     activeConversationIdsByAgent.set(API.getHostAgent(), sessionId);
 
-    // Update selection UI
+    // Update selection UI. The mounted list re-renders per agent (retarget is
+    // the only refresh path on a switch, #2199), so every visible row already
+    // belongs to the current host — a session_id match is sufficient.
     document.querySelectorAll('.conversation-item').forEach(item => {
-        item.classList.toggle(
-            'active',
-            item.dataset.agentKey === conversationAgentKey(API.getHostAgent())
-                && item.dataset.sessionId === sessionId,
-        );
+        item.classList.toggle('active', item.dataset.sessionId === sessionId);
     });
 
     // Load conversation messages into chat panel
@@ -1364,7 +1277,7 @@ window.loadConversation = async function(sessionId, options = {}) {
 
         const currentAgent = API.getHostAgent();
 
-        // Auto-load defense-in-depth: the loadConversations() caller
+        // Auto-load defense-in-depth: the maybeAutoLoadMostRecent() caller
         // already checked the pane was cold synchronously, but the
         // /api/conversations fetch + this getConversation() fetch above
         // ran across multiple awaits — plenty of time for the user to
@@ -1473,330 +1386,38 @@ window.loadConversation = async function(sessionId, options = {}) {
     }
 };
 
-window.deleteConversation = async function(sessionId, rowEl) {
-    // Soft-delete (#763) — moves the conversation to Trash, recoverable
-    // via the trash sub-view (#765). Companion to per-message delete
-    // (#715). Goes through the privacy wrapper which rejects ephemeral
-    // mode.
-    if (!confirm(
-        'Move this conversation to Trash? You can restore it from the '
-        + 'trash view, or delete it permanently from there.'
-    )) {
-        return;
-    }
-
-    try {
-        const result = await API.deleteConversation(sessionId);
-        const count = result?.deleted_count;
-
-        // Animate the sidebar row out, then remove it so the list
-        // doesn't jump underneath the cursor.
-        if (rowEl) {
-            rowEl.style.transition = 'opacity 0.2s, transform 0.2s';
-            rowEl.style.opacity = '0';
-            rowEl.style.transform = 'scale(0.97)';
-            setTimeout(() => rowEl.remove(), 200);
-        }
-
-        // If the user was viewing the conversation they just deleted,
-        // immediately create a fresh backend session so downstream state
-        // (context-status footer, auto-load logic) doesn't point at a
-        // vanished session.
-        if (state.currentSessionId === sessionId) {
-            activeConversationId = null;
-            activeConversationIdsByAgent.delete(API.getHostAgent());
-            const fresh = await API.newConversation();
-            wipeAgentChatPane(API.getHostAgent(), `
-                <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
-                    <span style="font-size: 2rem;">\u{2728}</span>
-                    <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
-                </div>
-            `);
-            state.currentSessionId = fresh.session_id;
-            activeConversationId = fresh.session_id;
-            activeConversationIdsByAgent.set(API.getHostAgent(), fresh.session_id);
-            if (selectedAgentName) {
-                await loadConversations(selectedAgentName);
-            }
-            if (typeof updateContextStatus === 'function') {
-                updateContextStatus();
-            }
-        }
-
-        Toast.info(
-            typeof count === 'number'
-                ? `Conversation moved to trash (${count} messages)`
-                : 'Conversation moved to trash'
-        );
-    } catch (e) {
-        Toast.error(`Failed to delete conversation: ${e.message}`);
-    }
-};
-
-window.purgeConversation = async function(sessionId, rowEl) {
-    // Permanent delete (#765). Stronger confirm: the word "permanent"
-    // appears in bold in the dialog so the user can't muscle-memory
-    // through it. Hard SQL DELETE — no recovery possible.
-    if (!confirm(
-        `Delete this conversation PERMANENTLY?\n\n`
-        + `This is a hard delete — every message in the session will be `
-        + `removed and CANNOT be restored. Soft-delete first (the regular `
-        + `delete button) is the recoverable path.\n\n`
-        + `Type the word "permanent" in your head and click OK if you mean it.`
-    )) {
-        return;
-    }
-
-    try {
-        const result = await API.purgeConversation(sessionId, 'user-initiated-ui');
-        const count = result?.purged_count;
-
-        if (rowEl) {
-            rowEl.style.transition = 'opacity 0.2s, transform 0.2s';
-            rowEl.style.opacity = '0';
-            rowEl.style.transform = 'scale(0.97)';
-            setTimeout(() => rowEl.remove(), 200);
-        }
-
-        if (state.currentSessionId === sessionId) {
-            activeConversationId = null;
-            activeConversationIdsByAgent.delete(API.getHostAgent());
-            // Wipe ONLY the visible agent's pane and bump that agent's
-            // pane-local generation. In-flight streams on other agents
-            // are unaffected.
-            wipeAgentChatPane(API.getHostAgent());
-            state.currentSessionId = null;
-            if (typeof updateContextStatus === 'function') {
-                updateContextStatus();
-            }
-        }
-
-        Toast.info(
-            typeof count === 'number'
-                ? `Conversation permanently deleted (${count} messages)`
-                : 'Conversation permanently deleted'
-        );
-    } catch (e) {
-        Toast.error(`Failed to permanently delete: ${e.message}`);
-    }
-};
-
-window.restoreConversation = async function(sessionId, rowEl) {
-    // Pull a soft-deleted session back out of Trash (#765). No confirm
-    // needed — restore is a non-destructive action.
-    try {
-        const result = await API.restoreConversation(sessionId);
-        const count = result?.restored_count;
-
-        if (rowEl) {
-            rowEl.style.transition = 'opacity 0.2s';
-            rowEl.style.opacity = '0';
-            setTimeout(() => rowEl.remove(), 200);
-        }
-
-        Toast.success(
-            typeof count === 'number'
-                ? `Conversation restored (${count} messages)`
-                : 'Conversation restored'
-        );
-
-        // Refresh the regular conversations list so the restored row
-        // reappears in the right place (without forcing a full reload).
-        if (typeof loadConversations === 'function') {
-            try { await loadConversations(); } catch (_) { /* noop */ }
-        }
-    } catch (e) {
-        Toast.error(`Failed to restore: ${e.message}`);
-    }
-};
-
 // ============================================================================
-// Trash sub-view (#765)
+// Trash sub-view (#765) — now the mounted component's Trash view (#2199)
 // ============================================================================
 //
-// The Trash button in the conversations pane header swaps the pane's
-// content between the live conversations list and a trash list. Both
-// share the pane shell so the user sees the toggle as a *view*, not a
-// modal — which keeps the multi_agent-and-conversation switcher behavior
-// undisturbed.
-
-export async function loadTrash() {
-    const container = document.getElementById('conversations-trash');
-    if (!container) return;
-    container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Loading trash…</p>';
-
-    try {
-        const data = await API.listTrash(500);
-        const messages = data.messages || [];
-        if (messages.length === 0) {
-            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Nothing in trash.</p>';
-            return;
-        }
-
-        const { sessions, orphans } = groupTrashBySession(messages);
-
-        // Combine sessions and orphans into one list, sort by deleted_at desc.
-        const items = [
-            ...sessions.map((s) => ({ kind: 'session', ...s })),
-            ...orphans.map((m) => ({
-                kind: 'message',
-                message_id: m.id,
-                deleted_at: m.deleted_at,
-                preview: m.content?.slice(0, 80) || '(empty)',
-                role: m.role,
-            })),
-        ];
-        items.sort((a, b) => (b.deleted_at || '').localeCompare(a.deleted_at || ''));
-
-        // Bucket
-        const buckets = new Map();
-        for (const item of items) {
-            const key = trashGroupKey(item.deleted_at);
-            if (!buckets.has(key)) buckets.set(key, []);
-            buckets.get(key).push(item);
-        }
-
-        // Render in the canonical bucket order
-        const order = ['Today', 'Yesterday', 'Last 7 days', 'Older'];
-        container.innerHTML = '';
-        for (const key of order) {
-            const list = buckets.get(key);
-            if (!list || !list.length) continue;
-            const title = document.createElement('div');
-            title.className = 'trash-section-title';
-            title.textContent = key;
-            container.appendChild(title);
-            for (const item of list) {
-                container.appendChild(_renderTrashItem(item));
-            }
-        }
-
-        // Retention notice — v1 hardcodes the value the retention janitor
-        // (#764) defaults to. When that ticket lands the value comes
-        // from the agent's config.
-        const notice = document.createElement('div');
-        notice.className = 'trash-retention-notice';
-        notice.textContent = 'Trash items are automatically deleted after 30 days.';
-        container.appendChild(notice);
-    } catch (e) {
-        container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load trash: ${e.message}</p>`;
-    }
-}
-
-function _renderTrashItem(item) {
-    const row = document.createElement('div');
-    row.className = 'trash-item';
-
-    const preview = document.createElement('div');
-    preview.className = 'trash-preview';
-    preview.textContent = item.kind === 'session'
-        ? (item.preview || '(empty conversation)')
-        : `${item.role || 'msg'}: ${item.preview || '(empty)'}`;
-    row.appendChild(preview);
-
-    const meta = document.createElement('div');
-    meta.className = 'trash-meta';
-    const when = item.deleted_at ? new Date(item.deleted_at).toLocaleString() : 'unknown time';
-    const sub = item.kind === 'session'
-        ? `${item.count} message${item.count === 1 ? '' : 's'}`
-        : 'single message';
-    meta.innerHTML = `<span>${when}</span><span>${sub}</span>`;
-    row.appendChild(meta);
-
-    const actions = document.createElement('div');
-    actions.className = 'trash-actions';
-
-    const restore = document.createElement('button');
-    restore.className = 'btn-restore';
-    restore.textContent = 'Restore';
-    restore.addEventListener('click', async () => {
-        if (item.kind === 'session') {
-            await window.restoreConversation(item.session_id, row);
-        } else {
-            await _restoreMessageFromTrash(item.message_id, row);
-        }
-        // Refresh the trash list so counts/buckets stay accurate.
-        await loadTrash();
-    });
-
-    const purge = document.createElement('button');
-    purge.className = 'btn-purge';
-    purge.textContent = 'Delete permanently';
-    purge.addEventListener('click', async () => {
-        if (item.kind === 'session') {
-            await window.purgeConversation(item.session_id, row);
-        } else {
-            await _purgeMessageFromTrash(item.message_id, row);
-        }
-        await loadTrash();
-    });
-
-    actions.appendChild(restore);
-    actions.appendChild(purge);
-    row.appendChild(actions);
-    return row;
-}
-
-async function _restoreMessageFromTrash(messageId, rowEl) {
-    try {
-        await API.restoreMessage(messageId);
-        if (rowEl) {
-            rowEl.style.transition = 'opacity 0.2s';
-            rowEl.style.opacity = '0';
-            setTimeout(() => rowEl.remove(), 200);
-        }
-        Toast.success('Message restored');
-    } catch (e) {
-        Toast.error(`Failed to restore message: ${e.message}`);
-    }
-}
-
-async function _purgeMessageFromTrash(messageId, rowEl) {
-    if (!confirm(
-        `Delete this message PERMANENTLY?\n\n`
-        + `This is a hard delete — the message will be removed and CANNOT `
-        + `be restored.`
-    )) {
-        return;
-    }
-    try {
-        await API.purgeMessage(messageId, 'user-initiated-ui');
-        if (rowEl) {
-            rowEl.style.transition = 'opacity 0.2s';
-            rowEl.style.opacity = '0';
-            setTimeout(() => rowEl.remove(), 200);
-        }
-        Toast.info('Message permanently deleted');
-    } catch (e) {
-        Toast.error(`Failed to permanently delete: ${e.message}`);
-    }
-}
+// The Trash button in the conversations pane header no longer swaps two static
+// containers; it drives the mounted conversation list's `setView` between the
+// Active and Trash views. Restore / Delete Permanently live in each trash row's
+// kebab menu (owned by the shared component), so the bespoke trash renderer and
+// the pane-aware window.* delete/purge/restore handlers are gone.
 
 export function initTrashToggle() {
     const btn = document.getElementById('trash-toggle-btn');
     const title = document.getElementById('conversations-pane-title');
-    const list = document.getElementById('conversations-list');
-    const trash = document.getElementById('conversations-trash');
-    if (!btn || !list || !trash) return;
+    if (!btn) return;
 
-    btn.addEventListener('click', async () => {
+    btn.addEventListener('click', () => {
+        const handle = ensureConversationsMount();
+        if (!handle) return;
         const showingTrash = btn.dataset.mode === 'trash';
         if (showingTrash) {
-            // Switch back to conversations
+            // Switch back to the live conversations list.
             btn.dataset.mode = 'conversations';
             btn.title = 'Show Trash';
             btn.classList.remove('active');
-            list.style.display = '';
-            trash.style.display = 'none';
             if (title) title.textContent = 'Conversations';
+            handle.setView('active');
         } else {
             btn.dataset.mode = 'trash';
             btn.title = 'Show Conversations';
             btn.classList.add('active');
-            list.style.display = 'none';
-            trash.style.display = '';
             if (title) title.textContent = 'Trash';
-            await loadTrash();
+            handle.setView('trash');
         }
     });
 }
@@ -1861,9 +1482,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // real turns; reload the list so the new conversation shows up without a
     // manual page refresh.
     window.addEventListener('kestrel:conversations-stale', () => {
-        if (typeof loadConversations === 'function') {
-            loadConversations(selectedAgentName).catch(() => { /* best-effort */ });
-        }
+        if (conversationsHandle) conversationsHandle.refresh();
     });
 
     const newConversationSidebarBtn = document.getElementById('new-conversation-sidebar-btn');
@@ -1880,9 +1499,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else {
                     await API.newConversation();
                 }
-                if (selectedAgentName) {
-                    await loadConversations(selectedAgentName);
-                }
+                if (conversationsHandle) conversationsHandle.refresh();
             } catch (e) {
                 console.error('Failed to create new conversation:', e);
             }

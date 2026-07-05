@@ -18,7 +18,6 @@ export {
     loadPrivacyMode,
     updatePrivacyIndicator,
     loadAgents,
-    loadConversations,
 } from './identity.js';
 
 // Memories Module - Constitution, Memories
