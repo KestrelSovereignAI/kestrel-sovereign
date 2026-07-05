@@ -1826,6 +1826,28 @@ class KestrelAgent(
             self._pending_privacy_transition = None
             return await self._apply_privacy_mode_locked(mode)
 
+    async def cancel_privacy_transition(self) -> PrivacyTransitionResult:
+        """Discard a privacy transition previously staged as pending confirmation.
+
+        The counterpart to declining a ``requires_confirmation`` result: the
+        staged (data-destructive) mode is dropped so a later
+        :meth:`confirm_privacy_transition` — from another tab, the
+        ``!confirm-privacy-mode`` command, etc. — can't apply a change the user
+        declined. A no-op (with an explanatory message) if nothing is pending.
+        Nothing else is mutated; the agent stays in its current mode.
+        """
+        async with self._get_privacy_transition_lock():
+            had_pending = getattr(self, "_pending_privacy_transition", None) is not None
+            self._pending_privacy_transition = None
+            return PrivacyTransitionResult(
+                message=(
+                    "Pending privacy-mode change discarded."
+                    if had_pending
+                    else "No pending privacy-mode change to cancel."
+                ),
+                allows_cloud_llm=privacy_mode_to_config(self._privacy_mode).allows_cloud_llm(),
+            )
+
     async def _set_privacy_mode_with_effects_locked(self, mode: PrivacyMode) -> PrivacyTransitionResult:
         """Evaluate a privacy-mode transition, then apply it (or stage it).
 

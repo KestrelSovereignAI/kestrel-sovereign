@@ -171,6 +171,52 @@ test('renameConversation patches the conversation display name', async () => {
     assert.equal(fetchFn.calls[0].options.body, JSON.stringify({ name: 'Renamed Thread' }));
 });
 
+test('setPrivacyMode surfaces a staged requires_confirmation response (not applied)', async () => {
+    // A data-destructive downgrade is staged, not applied: the server returns
+    // 200 with {success:false, requires_confirmation:true, mode:'public'}. The
+    // client must receive that body (so callers can branch on it) — #2083.
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        success: false,
+        requires_confirmation: true,
+        pending_mode: 'ephemeral',
+        mode: 'public',
+        message: 'Switching to EPHEMERAL deletes existing data.',
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-secret' },
+    });
+    await client.init();
+    const result = await client.setPrivacyMode('ephemeral');
+    assert.equal(result.requires_confirmation, true);
+    assert.equal(result.mode, 'public');  // still public — not applied
+    assert.equal(fetchFn.calls[0].url, '/api/agent/privacy-mode');
+    assert.equal(fetchFn.calls[0].options.method, 'POST');
+    assert.equal(
+        fetchFn.calls[0].options.headers['X-Kestrel-Allow-Destructive'],
+        'user-initiated-mode-change',
+    );
+});
+
+test('confirmPrivacyMode POSTs the confirm endpoint with the destructive opt-in header', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        success: true, applied: true, mode: 'ephemeral',
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-secret' },
+    });
+    await client.init();
+    const result = await client.confirmPrivacyMode();
+    assert.equal(result.applied, true);
+    assert.equal(fetchFn.calls[0].url, '/api/agent/privacy-mode/confirm');
+    assert.equal(fetchFn.calls[0].options.method, 'POST');
+    assert.equal(
+        fetchFn.calls[0].options.headers['X-Kestrel-Allow-Destructive'],
+        'user-initiated-mode-change',
+    );
+});
+
 test('request with API key refreshes bootstrap key once and retries the original request', async () => {
     const fetchFn = createFetchQueue(
         jsonResponse(401, { detail: 'expired key' }),

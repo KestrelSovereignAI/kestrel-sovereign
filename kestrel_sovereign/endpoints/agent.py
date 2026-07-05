@@ -657,6 +657,35 @@ async def confirm_privacy_mode(request: Request):
         raise HTTPException(status_code=500, detail="Error confirming privacy mode.")
 
 
+@router.post("/privacy-mode/cancel")
+async def cancel_privacy_mode(request: Request):
+    """Discard a privacy-mode change staged pending confirmation.
+
+    The counterpart to declining a ``requires_confirmation`` response from
+    ``POST /privacy-mode``: drops the staged (data-destructive) transition so a
+    later confirm — from another tab or the ``!confirm-privacy-mode`` command —
+    can't apply a change the user declined. A no-op if nothing is pending. Not
+    destructive (it only clears a pending intent), so no demo-isolation gate.
+    """
+    try:
+        agent = get_agent(request)
+        if not getattr(type(agent), "cancel_privacy_transition", None):
+            # Nothing to cancel on an agent without staged transitions.
+            return {"success": True, "mode": agent.privacy_mode.value,
+                    "message": "No pending privacy-mode change to cancel."}
+        result = await agent.cancel_privacy_transition()
+        return {
+            "success": True,
+            "mode": agent.privacy_mode.value,
+            "message": result.message,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling privacy mode: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error cancelling privacy mode.")
+
+
 @router.get("/notifications")
 async def get_notifications(request: Request):
     """

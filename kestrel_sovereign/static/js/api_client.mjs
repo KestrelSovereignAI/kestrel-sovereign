@@ -462,6 +462,19 @@ export function createApiClient({
             headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-mode-change' },
             body: JSON.stringify({ mode }),
         }),
+        // Apply a privacy-mode change that setPrivacyMode staged with
+        // {requires_confirmation:true} — a data-destructive downgrade (e.g.
+        // PUBLIC→EPHEMERAL) the server refuses to apply until the user confirms.
+        // Carries the same destructive opt-in header.
+        confirmPrivacyMode: () => client.request('/api/agent/privacy-mode/confirm', {
+            method: 'POST',
+            headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-mode-change' },
+        }),
+        // Discard a staged (requires_confirmation) privacy-mode change when the
+        // user declines, so a later confirm can't apply what they cancelled.
+        cancelPrivacyMode: () => client.request('/api/agent/privacy-mode/cancel', {
+            method: 'POST',
+        }),
         getSessions: (limit = 50) => client.request(`/api/sessions?limit=${limit}`),
         getMemories: (nodeType = null, limit = 100) => {
             let url = `/api/memories?limit=${limit}`;

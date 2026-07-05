@@ -579,9 +579,51 @@ window.showPrivacySelector = function() {
                 return;
             }
             try {
-                const result = await API.setPrivacyMode(mode);
-                state.privacyMode = mode;
-                updatePrivacyIndicator(mode);
+                let result = await API.setPrivacyMode(mode);
+
+                // A data-destructive downgrade (e.g. PUBLIC→EPHEMERAL) is STAGED,
+                // not applied: the server returns {requires_confirmation:true}
+                // and the agent stays in its current mode. Do NOT flip the
+                // indicator — that would show EPHEMERAL while the agent is still
+                // PUBLIC and keeps persisting (split-state). Confirm first, then
+                // apply the staged transition and reflect the REAL result.
+                if (result && result.requires_confirmation) {
+                    dropdown.remove();
+                    const proceed = window.confirm(
+                        (result.message
+                            || `Switching to ${PRIVACY_MODES[mode]?.label || mode} will delete existing data.`)
+                        + '\n\nApply this change now?'
+                    );
+                    if (!proceed) {
+                        // Discard the server-side staged transition so a later
+                        // confirm (another tab / !confirm-privacy-mode) can't
+                        // apply the change the user just declined.
+                        try { await API.cancelPrivacyMode(); } catch (_) { /* best-effort */ }
+                        Toast.info(
+                            `Privacy mode unchanged (still ${PRIVACY_MODES[state.privacyMode]?.label || state.privacyMode}).`
+                        );
+                        return;
+                    }
+                    result = await API.confirmPrivacyMode();
+                    if (!result || !result.applied) {
+                        Toast.error(
+                            `Could not apply privacy mode: ${result?.message || 'unknown error'}`
+                        );
+                        return;
+                    }
+                    // Confirmed and applied — fall through to reflect it.
+                }
+
+                // Reflect the mode the SERVER actually applied, not the mode
+                // this tab clicked: a staged transition applies whatever was
+                // pending on the agent, which a concurrent tab could have
+                // changed. result.mode is the single source of truth (both the
+                // direct-apply and confirm responses carry it); fall back to the
+                // clicked mode only if the server didn't return one.
+                const appliedMode = (result && result.mode) || mode;
+                const appliedLabel = PRIVACY_MODES[appliedMode]?.label || appliedMode;
+                state.privacyMode = appliedMode;
+                updatePrivacyIndicator(appliedMode);
                 dropdown.remove();
 
                 // Auto-switch model selector when privacy mode requires local-only
@@ -596,21 +638,21 @@ window.showPrivacySelector = function() {
                         result.model_switched.vendor,
                         result.model_switched.model
                     );
-                    Toast.success(`Privacy: ${PRIVACY_MODES[mode]?.label || mode} — switched to ${result.model_switched.vendor} (local only)`);
+                    Toast.success(`Privacy: ${appliedLabel} — switched to ${result.model_switched.vendor} (local only)`);
                 } else if (result.allows_cloud_llm !== false) {
                     // Switching back to cloud-allowing mode — restore saved cloud selection
                     const savedProvider = localStorage.getItem('kestrel_saved_cloud_provider');
                     const savedModel = localStorage.getItem('kestrel_saved_cloud_model');
                     if (savedProvider && savedModel && window._sharedModelSelector) {
                         window._sharedModelSelector.setSelection(savedProvider, savedModel);
-                        Toast.success(`Privacy: ${PRIVACY_MODES[mode]?.label || mode} — restored ${savedProvider} model`);
+                        Toast.success(`Privacy: ${appliedLabel} — restored ${savedProvider} model`);
                         localStorage.removeItem('kestrel_saved_cloud_provider');
                         localStorage.removeItem('kestrel_saved_cloud_model');
                     } else {
-                        Toast.success(`Privacy mode set to ${PRIVACY_MODES[mode]?.label || mode}`);
+                        Toast.success(`Privacy mode set to ${appliedLabel}`);
                     }
                 } else {
-                    Toast.success(`Privacy mode set to ${PRIVACY_MODES[mode]?.label || mode}`);
+                    Toast.success(`Privacy mode set to ${appliedLabel}`);
                 }
             } catch (e) {
                 Toast.error(`Failed to set privacy mode: ${e.message}`);
