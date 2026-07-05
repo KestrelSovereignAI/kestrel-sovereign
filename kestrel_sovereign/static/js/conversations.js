@@ -362,6 +362,16 @@ export function mountConversations(containerEl, config = {}) {
     let agentName = config.agentName;
     let lastConversations = [];
     let refreshSeq = 0;
+    // The agent the CURRENTLY-PAINTED rows were rendered for (#2199 P2-3).
+    // retarget() flips `agentName` synchronously and then fires an async
+    // reload; until that reload repaints, the visible rows still belong to
+    // the OLD agent. A kebab Archive/Trash/Purge fired in that window would
+    // send the previous agent's session_id against the NEW agent's route.
+    // Mutation handlers compare against this to drop such stale actions.
+    let renderedForAgent = agentName;
+    function isStaleRow() {
+        return renderedForAgent !== agentName;
+    }
 
     containerEl.classList && containerEl.classList.add('conversations-component');
 
@@ -493,7 +503,17 @@ export function mountConversations(containerEl, config = {}) {
         if (typeof config.onMutated === 'function') config.onMutated(action, conv);
     }
 
+    // Drop a mutation whose row belongs to an agent we've since retargeted
+    // away from (#2199 P2-3). The API layer is already routed to the NEW host
+    // agent, so acting on a stale row's session_id would hit the wrong route.
+    function dropIfStale() {
+        if (!isStaleRow()) return false;
+        Toast.info('Switched agents — reloading conversations');
+        return true;
+    }
+
     async function doArchive(conv, rowEl) {
+        if (dropIfStale()) return;
         try {
             await api.archiveConversation(conv.session_id);
             animateOut(rowEl);
@@ -503,6 +523,7 @@ export function mountConversations(containerEl, config = {}) {
         } catch (e) { Toast.error(`Failed to archive: ${e.message}`); }
     }
     async function doUnarchive(conv, rowEl) {
+        if (dropIfStale()) return;
         try {
             await api.unarchiveConversation(conv.session_id);
             animateOut(rowEl);
@@ -512,6 +533,7 @@ export function mountConversations(containerEl, config = {}) {
         } catch (e) { Toast.error(`Failed to unarchive: ${e.message}`); }
     }
     async function doTrash(conv, rowEl) {
+        if (dropIfStale()) return;
         if (!confirmTrash()) return;
         try {
             await api.deleteConversation(conv.session_id);
@@ -522,9 +544,16 @@ export function mountConversations(containerEl, config = {}) {
         } catch (e) { Toast.error(`Failed to delete: ${e.message}`); }
     }
     async function doPurge(conv, rowEl) {
+        if (dropIfStale()) return;
         if (!confirmPurge()) return;
         try {
-            await api.purgeConversation(conv.session_id, 'user-initiated-ui');
+            // Orphan trash entries (individually-deleted messages with no
+            // session, #2199 P2-1) purge at the message level.
+            if (conv._trashMessageId) {
+                await api.purgeMessage(conv._trashMessageId, 'user-initiated-ui');
+            } else {
+                await api.purgeConversation(conv.session_id, 'user-initiated-ui');
+            }
             animateOut(rowEl);
             Toast.info('Conversation permanently deleted');
             notifyMutated('purge', conv);
@@ -532,8 +561,13 @@ export function mountConversations(containerEl, config = {}) {
         } catch (e) { Toast.error(`Failed to permanently delete: ${e.message}`); }
     }
     async function doRestore(conv, rowEl) {
+        if (dropIfStale()) return;
         try {
-            await api.restoreConversation(conv.session_id);
+            if (conv._trashMessageId) {
+                await api.restoreMessage(conv._trashMessageId);
+            } else {
+                await api.restoreConversation(conv.session_id);
+            }
             animateOut(rowEl);
             Toast.success('Conversation restored');
             notifyMutated('restore', conv);
@@ -555,7 +589,12 @@ export function mountConversations(containerEl, config = {}) {
             api,
             group: config.group !== false,
             escapeHtml: config.escapeHtml,
-            onSelect: (conv) => onSelect(conv, { agentName: renderAgent }),
+            // Orphan trash rows (#2199 P2-1) have no session to open — their
+            // only affordances are the kebab's restore/purge.
+            onSelect: (conv) => {
+                if (conv._trashMessageId) return;
+                onSelect(conv, { agentName: renderAgent });
+            },
             buildMenuItems: menuItemsFor,
             // active flag applied per-row below via renderCurrent
             _activeId: activeId,
@@ -563,6 +602,12 @@ export function mountConversations(containerEl, config = {}) {
     }
 
     function renderCurrent() {
+        // NB: `renderedForAgent` is pinned in refresh()'s seq-guarded success
+        // block, NOT here — renderCurrent() also runs on every search keystroke
+        // to re-filter `lastConversations` without a reload. Anchoring the stale
+        // guard here would let a mid-retarget keystroke advance `renderedForAgent`
+        // to the new agent while still painting the OLD agent's rows, defeating
+        // the #2199 P2-3 guard. Pin to the agent the *data* belongs to instead.
         const convs = filtered(lastConversations);
         renderStats(convs);
         if (!convs.length) {
@@ -612,14 +657,27 @@ export function mountConversations(containerEl, config = {}) {
         const decrypt = state ? state.showDecrypted : true;
         if (view === 'trash') {
             const data = await api.listTrash(500);
-            const { sessions } = groupTrashBySession(data.messages || []);
-            return (sessions || []).map((s) => ({
+            const { sessions, orphans } = groupTrashBySession(data.messages || []);
+            const sessionRows = (sessions || []).map((s) => ({
                 session_id: s.session_id,
                 preview: s.preview,
                 message_count: s.count,
                 deleted_at: s.deleted_at,
                 started_at: s.deleted_at,
             }));
+            // Individually-deleted messages (no session_id) still need to be
+            // restore/purge-actionable, so surface them as single-message rows
+            // rather than dropping them (#2199 P2-1). They carry _trashMessageId
+            // so the restore/purge handlers act at the message level.
+            const orphanRows = (orphans || []).map((m) => ({
+                _trashMessageId: m.id,
+                preview: `${m.role || 'msg'}: ${(m.content || '').slice(0, 80) || '(empty)'}`,
+                message_count: 1,
+                deleted_at: m.deleted_at,
+                started_at: m.deleted_at,
+            }));
+            return [...sessionRows, ...orphanRows]
+                .sort((a, b) => (b.deleted_at || '').localeCompare(a.deleted_at || ''));
         }
         const data = await api.getConversations(decrypt, view);
         return data.conversations || [];
@@ -637,6 +695,11 @@ export function mountConversations(containerEl, config = {}) {
             const data = await loadData();
             if (seq !== refreshSeq) return; // stale — a newer refresh owns the list
             lastConversations = data;
+            // Pin the stale-row anchor to the agent this data was loaded for
+            // (#2199 P2-3). A pure re-filter repaint (search keystroke) leaves
+            // this pointing at the old agent until a retarget's reload lands, so
+            // isStaleRow() stays true across the whole in-flight window.
+            renderedForAgent = agentName;
             renderCurrent();
             if (typeof config.onLoaded === 'function') {
                 config.onLoaded(data, { view, agentName });

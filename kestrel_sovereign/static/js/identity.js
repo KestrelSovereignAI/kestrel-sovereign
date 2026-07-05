@@ -1153,11 +1153,17 @@ function ensureConversationsMount() {
 // path on an agent switch — no second request-sequence guard here (#1358 /
 // #2199). #879: hosts that opt out of conversations get the pane hidden.
 export function refreshConversationsPane() {
+    // #2199 P2-2: the chat-header history trigger drives this same pane, so its
+    // visibility must track the same capability — otherwise a `conversations:
+    // false` host still shows a button that can reveal the disabled pane.
+    const trigger = document.getElementById('conversations-toggle-btn');
     if (!API.hasCapability('conversations')) {
         const pane = document.getElementById('conversations-pane');
         if (pane) pane.style.display = 'none';
+        if (trigger) trigger.style.display = 'none';
         return;
     }
+    if (trigger) trigger.style.display = '';
     const handle = ensureConversationsMount();
     if (!handle) return;
     activeConversationId = getActiveConversationIdForAgent(API.getHostAgent());
@@ -1476,6 +1482,11 @@ function initPaneResize(handleId, paneId) {
 // sidebar uses — ensureConversationsMount() so the toggle works even before the
 // first agent-select has revealed the pane.
 window.toggleConversationsPane = function() {
+    // #2199 P2-2: the history trigger drives the same conversations pane that
+    // refreshConversationsPane() gates on the `conversations` capability. A host
+    // with `conversations: false` gets that pane hidden — so the toggle must be
+    // a no-op there too, otherwise it would reveal and drive a disabled pane.
+    if (!API.hasCapability('conversations')) return;
     const pane = document.getElementById('conversations-pane');
     // Reveal the pane the first time the trigger is used (loadAgents also
     // reveals it on agent-select; either path is fine). When revealing from
