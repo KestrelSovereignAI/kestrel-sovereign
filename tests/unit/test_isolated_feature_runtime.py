@@ -680,6 +680,91 @@ def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
     assert runs == []
 
 
+def test_ensure_venv_does_not_mutate_operator_override_venv(tmp_path, monkeypatch):
+    """#2125 regression: an operator-supplied (override) venv that already exists
+    must NOT be `uv pip install --upgrade`'d — that rewrites a prebuilt/pinned
+    environment the operator provided (and hard-fails the feature at startup if
+    the index is unreachable). ensure_venv verifies + warns but leaves it
+    untouched and stamps no manifest we don't own."""
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    override_venv = tmp_path / "prebuilt" / ".venv"
+    py = override_venv / "bin" / "python"
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.touch()  # a venv that ALREADY exists (operator built it)
+
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature",
+        entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg",
+        runtime="isolated-venv",
+        service="o",
+        project="override-pkg",
+        venv=str(override_venv),  # pyproject `venv =` override
+    )
+    feature = ProxyFeature(Mock(storage_path=str(tmp_path / "a" / "db.db")),
+                           runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    assert feature._venv_path == override_venv.resolve()
+
+    runs = []
+    monkeypatch.setattr(feature, "_run", lambda cmd: runs.append(cmd))
+    # SDK mismatch present — must warn, but still NOT mutate.
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.29.0")
+
+    feature.ensure_venv()
+
+    assert runs == [], f"override venv must not be touched, ran: {runs}"
+    assert not (override_venv / ".kestrel_provision.json").exists()
+
+
+def test_ensure_venv_reprovisions_host_created_override_venv(tmp_path, monkeypatch):
+    """An override venv that KESTREL created earlier (carries our manifest) keeps
+    the reprovision lifecycle — a host SDK upgrade still triggers --upgrade. Only
+    prebuilt override venvs (no manifest) are left untouched (#2125)."""
+    import json
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    override_venv = tmp_path / "hostbuilt" / ".venv"
+    runtime = InstalledFeatureRuntime(
+        class_name="OverrideFeature", entry_point="o.feature:OverrideFeature",
+        distribution="override-pkg", runtime="isolated-venv", service="o",
+        project="override-pkg", venv=str(override_venv),
+    )
+    feature = ProxyFeature(Mock(storage_path=str(tmp_path / "a" / "db.db")),
+                           runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+
+    runs = []
+
+    def fake_run(cmd):
+        runs.append(cmd)
+        py = feature._venv_path / "bin" / "python"
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.touch()
+
+    monkeypatch.setattr(feature, "_run", fake_run)
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.28.0")
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.28.0")
+
+    # First startup: override path missing → bootstrap (create + install + stamp).
+    feature.ensure_venv()
+    assert any("install" in c for c in runs)
+    assert (override_venv / ".kestrel_provision.json").exists()
+
+    runs.clear()
+    feature.ensure_venv()  # unchanged host → no thrash even though it's an override
+    assert runs == []
+
+    # Host SDK upgrade → OUR override venv reprovisions (--upgrade).
+    monkeypatch.setattr(ir, "_host_sdk_version", lambda: "0.29.0")
+    monkeypatch.setattr(ir, "_venv_sdk_version", lambda _p: "0.29.0")
+    feature.ensure_venv()
+    upgrades = [c for c in runs if "pip" in c and "install" in c]
+    assert upgrades and "--upgrade" in upgrades[-1]
+
+
 # --- F023: isolated service launch env must not inherit interpreter shadowing --
 
 
