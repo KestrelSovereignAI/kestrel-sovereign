@@ -65,6 +65,20 @@ class TestAuditHasher:
         assert isinstance(h, str)
         assert len(h) == 64
 
+    def test_hasher_raises_on_null_created_at(self):
+        """#2146/P9 (codex follow-up): a NULL created_at makes the sort key None,
+        which is unorderable against the str timestamps of other rows — so hashing
+        a set that contains such a row raises at anchor-CREATE time. This is why a
+        legacy anchor can never have persisted a null-ts row into its hash: the
+        create would have crashed, not produced an anchor. The P9 create-path skip
+        both excludes the row from anchoring AND prevents this crash."""
+        entries = [
+            {"id": 1, "created_at": "2026-01-01T00:00:00"},
+            {"id": 2, "created_at": None},
+        ]
+        with pytest.raises(TypeError):
+            AuditHasher.hash_entries(entries)
+
     def test_serialize_entries_is_bytes(self):
         """serialize_entries returns bytes."""
         entries = [{"id": 1, "created_at": "2026-01-01"}]
@@ -360,6 +374,44 @@ class TestAuditAnchorFeature:
         anchor_row = (
             "anchor-legacy", "test-agent", legacy_hash, "ref",
             2, raw_first, raw_last, "2026-07-01T10:05:00",
+        )
+        agent.storage.db.fetchall = AsyncMock(return_value=[anchor_row])
+        agent.storage.db.table_exists = AsyncMock(return_value=True)
+
+        result = await feature.verify_audit()
+        assert result.data["status"] == "verified", result.data
+        assert result.data["passed"] == 1
+        assert result.data["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_null_created_at_row_excluded_from_anchor_and_verify(self, tmp_path):
+        """#2146/P9: a security_audit_log row with a NULL/empty created_at has no
+        orderable timestamp. It was INCLUDED in the anchored hash set but EXCLUDED
+        by verify's range filter (which drops empty-ts rows when the anchor has
+        boundaries) — a hash mismatch → false integrity failure. It must be
+        excluded from BOTH sides."""
+        from kestrel_sovereign.features.audit_anchor.feature import AuditAnchorFeature
+        from kestrel_sovereign.audit_time import normalize_audit_timestamp
+
+        entries = [
+            {"feature_name": "F1", "tool_name": "t1", "action": "exec",
+             "decision": "allowed", "created_at": "2026-07-01T10:00:00"},
+            {"feature_name": "F2", "tool_name": "t2", "action": "exec",
+             "decision": "denied", "created_at": None},  # NULL created_at
+        ]
+        agent = await _make_mock_agent(tmp_path, audit_entries=entries)
+        feature = AuditAnchorFeature(agent)
+        await feature.initialize()
+
+        # The anchored set excludes the NULL-created_at row.
+        anchored = await feature._get_audit_entries_since(None)
+        assert len(anchored) == 1, anchored
+        stored_hash = AuditHasher.hash_entries(anchored)
+
+        boundary = normalize_audit_timestamp("2026-07-01T10:00:00")
+        anchor_row = (
+            "a1", "agent", stored_hash, "ref", 1, boundary, boundary,
+            "2026-07-01T10:05:00",
         )
         agent.storage.db.fetchall = AsyncMock(return_value=[anchor_row])
         agent.storage.db.table_exists = AsyncMock(return_value=True)
