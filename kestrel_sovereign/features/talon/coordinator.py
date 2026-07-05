@@ -327,6 +327,25 @@ class TalonCoordinatorFeature(Feature):
                         "talon.job_complete signal source: %s", e,
                     )
 
+            # Register the host-provided sources the built-in
+            # ``stalled_work_rescue`` workflow references (#2192). The rescue
+            # loop is Talon/fleet-coordination domain — detect stalled work,
+            # dispatch repairs to Talon, verify evidence, close todos — so the
+            # coordinator owns these agent-native registrations. Without them
+            # the workflow runner's start-contract validation fails before a run
+            # record is created ("references unregistered source"). Idempotent:
+            # a source a host already registered with a richer implementation is
+            # left untouched.
+            from kestrel_sovereign.signals.sources.workflow_rescue import (
+                register_workflow_rescue_sources,
+            )
+            registered = register_workflow_rescue_sources(registry)
+            if registered:
+                logger.info(
+                    "TalonCoordinatorFeature registered workflow-rescue "
+                    "signal sources: %s", ", ".join(registered),
+                )
+
     async def post_all_features_loaded(self, agent):
         """Register the ``talon:`` Waitable provider with the wait engine.
 
