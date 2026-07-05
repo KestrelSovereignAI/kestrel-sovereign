@@ -37,7 +37,6 @@ loading_trash = "Loading trash…"
 loading_identity = "Loading identity..."
 
 # Chat panel
-chat_history_title = "History"
 chat_welcome_message = "Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?"
 chat_thinking = "Thinking..."
 # Dynamic thinking-status words: shown in place of "Thinking..." as the

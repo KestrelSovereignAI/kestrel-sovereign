@@ -836,10 +836,15 @@ test.describe('Local File Browser (Session 3)', () => {
 });
 
 // ============================================================================
-// Session 4: Chat History Browser Tests
+// Session 4: Conversations Pane Tests
+//
+// #2171 collapsed the two conversation surfaces into ONE placement: the
+// `#conversations-pane` sidebar (rendered by conversations.js). The old
+// `#history-sidebar` slideout, its `#toggle-history-btn`, and its
+// `#new-conversation-btn` were deleted. These tests target the surviving pane.
 // ============================================================================
 
-test.describe('Chat History Browser (Session 4)', () => {
+test.describe('Conversations Pane (Session 4)', () => {
     test.beforeEach(async ({ page }) => {
         await page.goto(KESTREL_URL);
         // Navigate to Chat panel
@@ -847,269 +852,118 @@ test.describe('Chat History Browser (Session 4)', () => {
         await page.waitForSelector('#panel-chat.active');
     });
 
-    test('should show history toggle button in chat header', async ({ page }) => {
-        // Verify the toggle button exists
-        const toggleBtn = page.locator('#toggle-history-btn');
-        await expect(toggleBtn).toBeVisible();
-        await expect(toggleBtn).toHaveAttribute('title', 'Chat History');
+    test('should NOT render the deleted history slideout or its toggle', async ({ page }) => {
+        // #2171 removed the slideout surface entirely — none of its markup
+        // should survive anywhere in the document.
+        await expect(page.locator('#toggle-history-btn')).toHaveCount(0);
+        await expect(page.locator('#history-sidebar')).toHaveCount(0);
+        await expect(page.locator('#history-container')).toHaveCount(0);
+        await expect(page.locator('#new-conversation-btn')).toHaveCount(0);
     });
 
-    test('should toggle history sidebar visibility', async ({ page }) => {
-        const toggleBtn = page.locator('#toggle-history-btn');
-        const sidebar = page.locator('#history-sidebar');
-
-        // Initially hidden
-        await expect(sidebar).not.toBeVisible();
-
-        // Click to show
-        await toggleBtn.click();
-        await expect(sidebar).toBeVisible();
-
-        // Click to hide
-        await toggleBtn.click();
-        await expect(sidebar).not.toBeVisible();
+    test('should show the conversations pane in standalone mode', async ({ page }) => {
+        // Standalone console auto-reveals the single conversations surface.
+        const pane = page.locator('#conversations-pane');
+        await expect(pane).toBeVisible();
+        // Its list container and new-conversation affordance are the pane's own.
+        await expect(page.locator('#conversations-list')).toBeVisible();
+        await expect(page.locator('#new-conversation-sidebar-btn')).toBeVisible();
     });
 
-    test('should load conversation history when sidebar opens', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
+    test('should populate the conversations list (items or empty state)', async ({ page }) => {
+        await expect(page.locator('#conversations-pane')).toBeVisible();
 
-        // Wait for content to load
+        // Wait for the list fetch to settle.
         await page.waitForTimeout(1000);
 
-        // Container should have content (either conversation list or empty state)
-        const container = page.locator('#history-container');
-        await expect(container).toBeVisible();
+        const list = page.locator('#conversations-list');
+        const listText = (await list.textContent()) || '';
+
+        const hasConversations = (await page.locator('#conversations-list .conversation-item').count()) > 0;
+        const hasEmptyState = listText.toLowerCase().includes('no conversation') ||
+                             listText.toLowerCase().includes('select an agent') ||
+                             listText.toLowerCase().includes('empty');
+        const hasLoading = listText.toLowerCase().includes('loading');
+
+        expect(hasConversations || hasEmptyState || hasLoading || listText.length > 5).toBe(true);
     });
 
-    test('should show New Conversation button in sidebar', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Verify New Conversation button exists
-        const newConvBtn = page.locator('#new-conversation-btn');
-        await expect(newConvBtn).toBeVisible();
-        await expect(newConvBtn).toContainText('New Conversation'); // Button text is "+ New Conversation"
-    });
-
-    test('should show empty state or conversations when sidebar opens', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
+    test('should render conversation items with preview and time metadata', async ({ page }) => {
+        await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
-        const container = page.locator('#history-container');
-        const containerText = await container.textContent() || '';
-
-        // Should show one of: conversations, empty state, loading, or error message
-        const hasConversations = (await page.locator('.history-item').count()) > 0;
-        const hasEmptyState = containerText.toLowerCase().includes('no conversation') ||
-                             containerText.toLowerCase().includes('no history') ||
-                             containerText.toLowerCase().includes('empty');
-        const hasError = containerText.toLowerCase().includes('fail') ||
-                        containerText.toLowerCase().includes('error');
-        const hasLoading = containerText.toLowerCase().includes('loading');
-
-        // At least one state should be displayed, or container has content
-        expect(hasConversations || hasEmptyState || hasError || hasLoading || containerText.length > 10).toBe(true);
-    });
-
-    test('should display conversation items with preview', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
-        await page.waitForTimeout(1000);
-
-        const historyItems = page.locator('.history-item');
-        const itemCount = await historyItems.count();
+        const items = page.locator('#conversations-list .conversation-item');
+        const itemCount = await items.count();
 
         if (itemCount > 0) {
-            const firstItem = historyItems.first();
-
-            // Should show preview text
-            await expect(firstItem.locator('.history-preview')).toBeVisible();
-
-            // Should show metadata (time and message count)
-            await expect(firstItem.locator('.history-meta')).toBeVisible();
+            const firstItem = items.first();
+            // Preview text row.
+            await expect(firstItem.locator('.conversation-preview')).toBeVisible();
+            // Meta row carries the timestamp.
+            await expect(firstItem.locator('.conversation-time')).toBeVisible();
         }
     });
 
-    test('should group conversations by date', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
+    test('should load a conversation when clicking an item', async ({ page }) => {
+        await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
-        const historyItems = page.locator('.history-item');
-        const itemCount = await historyItems.count();
+        const items = page.locator('#conversations-list .conversation-item');
+        const itemCount = await items.count();
 
         if (itemCount > 0) {
-            // Date headers should exist (Today, Yesterday, or date format)
-            const dateHeaders = page.locator('.history-date-header');
-            const headerCount = await dateHeaders.count();
-
-            // Should have at least one date header if there are conversations
-            expect(headerCount).toBeGreaterThan(0);
-        }
-    });
-
-    test('should load conversation when clicking history item', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
-        await page.waitForTimeout(1000);
-
-        const historyItems = page.locator('.history-item');
-        const itemCount = await historyItems.count();
-
-        if (itemCount > 0) {
-            // Click on first conversation
-            await historyItems.first().click();
-
-            // Wait for messages to load
+            await items.first().click();
             await page.waitForTimeout(1000);
 
-            // Chat container should have content
             const chatContainer = page.locator('#chat-container');
             const chatContent = await chatContainer.textContent();
-
-            // Should have either messages or be empty (if conversation was empty)
             expect(chatContent).not.toBeNull();
         }
     });
 
-    test('should highlight active conversation in history', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
+    test('should highlight the active conversation item', async ({ page }) => {
+        await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
-        const historyItems = page.locator('.history-item');
-        const itemCount = await historyItems.count();
+        const items = page.locator('#conversations-list .conversation-item');
+        const itemCount = await items.count();
 
         if (itemCount > 0) {
-            // Click on first conversation
-            await historyItems.first().click();
-
-            // Wait for selection to apply
+            await items.first().click();
             await page.waitForTimeout(500);
-
-            // First item should have active class
-            await expect(historyItems.first()).toHaveClass(/active/);
+            await expect(items.first()).toHaveClass(/active/);
         }
     });
 
-    test('should start new conversation on button click', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
+    test('should start a new conversation from the pane button', async ({ page }) => {
+        await expect(page.locator('#conversations-pane')).toBeVisible();
 
-        // Click New Conversation button
-        const newConvBtn = page.locator('#new-conversation-btn');
-        await newConvBtn.click();
-
-        // Wait for the action to complete
+        await page.click('#new-conversation-sidebar-btn');
         await page.waitForTimeout(1000);
 
-        // Chat container should be cleared or show empty state
-        // Toast notification should appear
+        // A toast confirms the new-conversation action.
         await expect(page.locator('.toast-item')).toBeVisible({ timeout: 5000 });
     });
 
-    test('should show message count in history item', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
+    test('should show message count in a conversation item when present', async ({ page }) => {
+        await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
-        const historyItems = page.locator('.history-item');
-        const itemCount = await historyItems.count();
+        const items = page.locator('#conversations-list .conversation-item');
+        const itemCount = await items.count();
 
         if (itemCount > 0) {
-            const firstItem = historyItems.first();
-            const metaText = await firstItem.locator('.history-meta').textContent();
-
-            // Should contain message count (e.g., "5 msgs" or "1 msg")
-            expect(metaText).toMatch(/\d+\s*msgs?/);
-        }
-    });
-
-    test('should show time in history item metadata', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
-        await page.waitForTimeout(1000);
-
-        const historyItems = page.locator('.history-item');
-        const itemCount = await historyItems.count();
-
-        if (itemCount > 0) {
-            const firstItem = historyItems.first();
-            const metaText = await firstItem.locator('.history-meta').textContent();
-
-            // Should contain time (AM/PM format or 24h format)
-            expect(metaText).toMatch(/\d{1,2}:\d{2}|AM|PM/i);
-        }
-    });
-
-    test('should be responsive on narrow screens', async ({ page }) => {
-        // Set viewport to narrow width
-        await page.setViewportSize({ width: 600, height: 800 });
-
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Sidebar should still be visible (toggle button works on narrow screens)
-        const newConvBtn = page.locator('#new-conversation-btn');
-        await expect(newConvBtn).toBeVisible();
-
-        // Can close via toggle button
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).not.toBeVisible();
-    });
-
-    test('should display rendered markdown in loaded messages', async ({ page }) => {
-        // Click to show history sidebar
-        await page.click('#toggle-history-btn');
-        await expect(page.locator('#history-sidebar')).toBeVisible();
-
-        // Wait for loading to complete
-        await page.waitForTimeout(1000);
-
-        const historyItems = page.locator('.history-item');
-        const itemCount = await historyItems.count();
-
-        if (itemCount > 0) {
-            // Load a conversation
-            await historyItems.first().click();
-            await page.waitForTimeout(1000);
-
-            // Check that messages are rendered (not just plain text)
-            const messages = page.locator('.message');
-            const messageCount = await messages.count();
-
-            if (messageCount > 0) {
-                // Message content should exist
-                await expect(messages.first().locator('.message-content')).toBeVisible();
+            const count = items.first().locator('.conversation-msg-count');
+            if ((await count.count()) > 0) {
+                await expect(count.first()).toContainText(/\d+\s*msgs?/);
             }
         }
+    });
+
+    test('should expose the Trash sub-view toggle in the pane', async ({ page }) => {
+        // The shared component's trash/archived affordance lives on the pane.
+        await expect(page.locator('#conversations-pane')).toBeVisible();
+        await expect(page.locator('#trash-toggle-btn')).toBeVisible();
     });
 });
 
