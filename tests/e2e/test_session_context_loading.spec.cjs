@@ -195,17 +195,13 @@ test.describe('Session Context Loading - UI Flow', () => {
         );
 
         // Step 3: Start a NEW conversation (creates time gap)
-        // Open history sidebar
-        const toggleBtn = page.locator('#toggle-history-btn');
-        if (await toggleBtn.isVisible()) {
-            await toggleBtn.click();
-            await page.waitForTimeout(1000);
-        }
-
-        // Click "New Conversation" if available
-        const newConvBtn = page.locator('button').filter({ hasText: /new conversation/i });
-        if (await newConvBtn.isVisible()) {
-            await newConvBtn.click();
+        // #2171 collapsed the two conversation surfaces into one: the
+        // `#conversations-pane` sidebar (auto-revealed in standalone). The
+        // deleted `#history-sidebar` slideout / `#toggle-history-btn` no longer
+        // exist — drive the pane's own new-conversation button instead.
+        const conversationsPane = page.locator('#conversations-pane');
+        if (await conversationsPane.isVisible()) {
+            await page.click('#new-conversation-sidebar-btn');
             await page.waitForTimeout(2000);
         }
 
@@ -214,12 +210,11 @@ test.describe('Session Context Loading - UI Flow', () => {
         await page.locator('#send-button').click();
         await page.waitForTimeout(5000);
 
-        // Step 5: Now load the FIRST conversation from history
-        // The conversation with our unique marker should be in history
-        const historySidebar = page.locator('#history-sidebar');
-        if (await historySidebar.isVisible()) {
+        // Step 5: Now load the FIRST conversation from the pane
+        // The conversation with our unique marker should be listed.
+        if (await conversationsPane.isVisible()) {
             // Find the conversation with our marker
-            const convItem = page.locator('.conversation-item').filter({
+            const convItem = page.locator('#conversations-list .conversation-item').filter({
                 hasText: new RegExp(uniqueMarker.substring(0, 20), 'i')
             });
 
@@ -265,18 +260,15 @@ test.describe('Session Context Loading - UI Flow', () => {
         await page.goto(BASE_URL);
         await page.locator('.nav-tab').filter({ hasText: /chat/i }).click();
 
-        // Open history
-        const toggleBtn = page.locator('#toggle-history-btn');
-        if (await toggleBtn.isVisible()) {
-            await toggleBtn.click();
-            await page.waitForTimeout(1000);
-        }
+        // #2171: the single conversation surface is the `#conversations-pane`
+        // sidebar (auto-revealed in standalone). Wait for it and its list.
+        await page.locator('#conversations-pane').waitFor({ state: 'visible', timeout: 10000 });
 
         // Wait for conversations to load
         await page.waitForTimeout(2000);
 
         // If there are conversation items, click one
-        const convItems = page.locator('.conversation-item');
+        const convItems = page.locator('#conversations-list .conversation-item');
         const count = await convItems.count();
 
         if (count > 0) {
