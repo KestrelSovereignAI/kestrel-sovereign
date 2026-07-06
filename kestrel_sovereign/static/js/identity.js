@@ -1436,7 +1436,7 @@ export function initTrashToggle() {
             btn.dataset.mode = 'conversations';
             btn.title = 'Show Trash';
             btn.classList.remove('active');
-            if (title) title.textContent = 'Conversations';
+            if (title) title.textContent = 'History';
             handle.setView('active');
         } else {
             btn.dataset.mode = 'trash';

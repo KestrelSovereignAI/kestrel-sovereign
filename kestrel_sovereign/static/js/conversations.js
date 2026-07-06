@@ -790,7 +790,7 @@ function storeSet(key, value) {
  *     to `mountConversations`.
  *   - collapsed        — initial collapsed state (overridden by persistence).
  *   - storageKey       — persistence namespace (default 'kestrel:conversations-pane').
- *   - title            — pane header title (default 'Conversations').
+ *   - title            — pane header title (default 'History').
  *   - onToggle(bool)   — fired after every collapse/expand with the new state.
  *   - minWidth/maxWidth — resize clamps (default 200 / 500, matching the CSS).
  *
@@ -827,7 +827,7 @@ export function mountConversationsPane(containerEl, config = {}) {
         header.className = 'pane-header';
         const h3 = doc.createElement('h3');
         h3.className = 'conversations-pane-title';
-        h3.textContent = config.title || 'Conversations';
+        h3.textContent = config.title || 'History';
         header.appendChild(h3);
         paneEl.insertBefore(header, paneEl.firstChild);
         builtHeader = true;
