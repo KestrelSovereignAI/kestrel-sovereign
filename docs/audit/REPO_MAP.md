@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-05
-**Scope:** 1919 tracked files (1254 `.py`, 323 `.md`, 342 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-06
+**Scope:** 1927 tracked files (1259 `.py`, 323 `.md`, 345 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -912,6 +912,8 @@ Repo entry points and standard project files.
   - `def build_wait_complete_registration()`
 - **kestrel_sovereign/signals/sources/wallet.py** — Source registration for the Stripe crypto-onramp deposit-complete webhook (Phase 6 of #889).
   - `def build_stripe_deposit_registration()`; `def build_signal_for_deposit(session, target_agent)`
+- **kestrel_sovereign/signals/sources/workflow_rescue.py** — Host-provided signal sources for the ``stalled_work_rescue`` workflow (#2192).
+  - `async def fleet_stalled_sweep_handler(payload)`; `async def governance_review_handler(payload)`; `async def a2a_repair_dispatch_handler(payload)`; `async def evidence_verify_handler(payload)`; `async def close_resolved_todos_handler(payload)`; `async def reopen_resolved_todos_handler(payload)`; `def build_fleet_stalled_sweep_registration(discover)`; `def build_governance_review_registration()`; `…`
 - **kestrel_sovereign/signals/store.py** — signal_log persistence.
   - `class SignalLogStore`
 - **kestrel_sovereign/spawn/__init__.py** — Spawn subsystem for Kestrel agent delegation.
@@ -1711,8 +1713,10 @@ Repo entry points and standard project files.
 - **tests/frontend/console_mount_cutover.test.mjs** — (mjs asset)
 - **tests/frontend/context_status_model_identity.test.mjs** — (mjs asset)
 - **tests/frontend/conversation_agent_switch.test.mjs** — (mjs asset)
+- **tests/frontend/conversation_pane_embed_first_load.test.mjs** — (mjs asset)
 - **tests/frontend/conversations.test.mjs** — (mjs asset)
 - **tests/frontend/conversations_css_coverage.test.mjs** — (mjs asset)
+- **tests/frontend/conversations_pane.test.mjs** — (mjs asset)
 - **tests/frontend/core_panels_regressions.test.mjs** — (mjs asset)
 - **tests/frontend/demo_reset_guard.test.mjs** — (mjs asset)
 - **tests/frontend/dynamic_thinking_status.test.mjs** — (mjs asset)
@@ -1720,6 +1724,7 @@ Repo entry points and standard project files.
 - **tests/frontend/feature_ui_contributions_loader.test.mjs** — (mjs asset)
 - **tests/frontend/history_rename.test.mjs** — (mjs asset)
 - **tests/frontend/icons_ellipsis_vertical.test.mjs** — (mjs asset)
+- **tests/frontend/icons_history.test.mjs** — (mjs asset)
 - **tests/frontend/initial_pane_migration.test.mjs** — (mjs asset)
 - **tests/frontend/interrupt_turn_boundary.test.mjs** — (mjs asset)
 - **tests/frontend/katex_math.test.mjs** — (mjs asset)
@@ -1876,6 +1881,8 @@ Repo entry points and standard project files.
   - `class MockAgent`; `async def temp_storage()`; `async def memory_feature(temp_storage)`; `class TestMemoryFeatureDiscovery`; `class TestSearchMemory`; `class TestRecallRecent`; `class TestMemoryStatus`; `class TestSearchMemoryEncryptionAware`; `…`
 - **tests/integration/test_memory_reflection_applied.py** — —
   - `async def test_pre_sleep_marks_only_llm_attested_retrieved_memories(tmp_path, caplog)`; `async def test_applied_count_changes_archive_set_on_consolidation(tmp_path)`
+- **tests/integration/test_metadata_like_minified_json.py** — Regression (#2158 follow-up): metadata flag lookups must match BOTH the space form (Python ``json.dumps`` — ``"key": value``) AND the minified form that SQLite ``json_set()`` re-emits (``"key":value`…
+  - `async def test_stashed_message_found_after_json_set_minifies_metadata(tmp_path)`; `async def test_excluded_message_found_after_json_set_minifies_metadata(tmp_path)`; `async def test_audit_failure_found_after_json_set_minifies_metadata(tmp_path)`; `async def test_space_format_rows_still_found(tmp_path)`
 - **tests/integration/test_model_mandate_e2e.py** — Integration tests for model mandate command and API.
   - `class TestModelMandateMethods`; `class TestModelDiscoveryAPI`; `class TestAuthKeyEndpoint`; `class TestProtectedEndpointsRequireAuth`; `class TestModelSetEndpoint`; `class TestChatCompletionsModelPassthrough`
 - **tests/integration/test_model_set_routing_e2e.py** — Integration tests for model-set command routing under the vendor/route/model schema.
@@ -2062,7 +2069,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_background_task_notification.py** — Regression tests for background-task completion notification formatting.
   - `def test_execute_skill_metadata_preserved()`; `def test_inbound_sender_and_task_type_used()`; `def test_scheduler_origin_via_causation_chain()`; `def test_causation_chain_single_segment_source()`; `def test_real_producer_keys_win_over_causation_chain()`; `def test_empty_metadata_falls_back_to_unknown_task()`; `def test_task_type_only_metadata()`; `def test_identifiers_expose_full_task_id()`; `…`
 - **tests/unit/test_backup_blob_online.py** — Online-backup behaviour for AsyncStorage.create_backup_blob (F266).
-  - `def data_key(monkeypatch)`; `async def test_connection_stays_open_and_usable_during_and_after_backup(tmp_path)`; `async def test_backup_blob_restores_into_fresh_storage(tmp_path)`; `async def test_backup_runs_off_event_loop(tmp_path, monkeypatch)`
+  - `def data_key(monkeypatch)`; `async def test_connection_stays_open_and_usable_during_and_after_backup(tmp_path)`; `async def test_backup_blob_restores_into_fresh_storage(tmp_path)`; `async def test_restore_coerces_text_timestamps_for_postgres(tmp_path, monkeypatch)`; `async def test_restore_preserves_created_at_on_sqlite(tmp_path)`; `async def test_backup_runs_off_event_loop(tmp_path, monkeypatch)`
 - **tests/unit/test_backup_cleanup.py** — —
   - `def test_dry_run_reports_correct_keep_delete_sets_against_synthetic_fixture()`; `async def test_apply_without_confirmation_refuses_to_delete(tmp_path)`; `async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp_path)`; `class AsyncDeleteClient`; `async def test_lighthouse_pagination_consumes_empty_and_multi_page_responses(caplog)`; `async def test_unattributed_lighthouse_files_are_reported_and_never_deleted()`; `async def test_manifest_index_attributes_export_car_and_rejects_malformed_manifest()`; `async def test_manifest_index_retries_429_and_preserves_attribution()`; `…`
 - **tests/unit/test_backup_remote_tier_policy.py** — —
@@ -2423,6 +2430,8 @@ Repo entry points and standard project files.
   - `class TestTalonConfig`; `class TestIssueContext`; `class TestProcessingResult`; `class TestCIStatus`; `class TestGitHubClientExtraction`; `class TestTalonE2E`
 - **tests/unit/test_github_repo_discovery.py** — —
   - `def clear_cache()`; `async def test_discovers_org_repos_with_configured_includes_and_excludes(monkeypatch)`; `async def test_include_private_false_requests_public_org_repos(monkeypatch)`; `async def test_repo_discovery_cache_avoids_repeat_github_calls(monkeypatch)`; `async def test_github_repos_endpoint_returns_plain_slug_list(monkeypatch)`; `def test_repo_scoped_request_slug(path, expected_slug)`; `def test_repo_scoped_request_rebuilds_safe_upstream(path, expected_upstream)`; `async def test_proxy_forwards_allowed_repo_path(monkeypatch)`; `…`
+- **tests/unit/test_google_adapter_parse.py** — Regression (#2129): GoogleAdapter.get_response must not crash on google-genai response shapes with no usable parts (safety-block / MAX_TOKENS) or on text parts whose always-present ``function_call``…
+  - `async def test_safety_blocked_candidate_content_none()`; `async def test_max_tokens_empty_parts_none()`; `async def test_no_candidates()`; `async def test_text_part_with_none_function_call()`; `async def test_real_function_call_part_parsed()`; `async def test_mixed_text_and_function_call_parts()`
 - **tests/unit/test_google_vertex_client_build.py** — Regression guards for #2117 (findings F045 + F046).
   - `def test_vertex_service_account_route_builds_client(monkeypatch)`; `def test_vertex_service_account_route_rejects_bogus_kwarg(monkeypatch)`; `def test_google_route_builds_genai_client(monkeypatch)`; `async def test_google_adapter_get_response_uses_routed_model()`
 - **tests/unit/test_gpt5_overlay.py** — Unit tests for the GPT-5 system-prompt overlay (#807 / #806).
@@ -2449,6 +2458,8 @@ Repo entry points and standard project files.
   - `async def db(tmp_path)`; `class TestPostgresUpsertCompatibility`; `class TestHostKeyStorageRoundTrip`; `class TestHostKeyStorageQueries`; `class TestHostKeyStorageDelete`; `class TestHostAgentIsolation`
 - **tests/unit/test_host_query_param_auth.py** — Unit tests for host.py API key query parameter restriction (GitHub issue #160).
   - `def app()`; `def client(app)`; `class TestQueryParamAuthOnSSEProxyPaths`; `class TestQueryParamAuthRejectedOnNonSSEPaths`; `class TestHeaderAuthStillWorks`; `class TestWrongKeyRejected`; `class TestSSEPathSuffixesConstant`
+- **tests/unit/test_host_webhook_auth_exemption.py** — #2091/P3: an external, keyless webhook caller must be able to reach a SPECIFIC agent's webhook on a heterogeneous multi-agent host via the documented ``/api/agents/{id}/webhooks/{name}`` path.
+  - `def test_webhook_path_re_matches_bare_and_agent_prefixed()`; `def app(monkeypatch)`; `def test_agent_prefixed_webhook_is_reachable_without_host_key(app)`; `def test_non_webhook_agent_route_still_requires_key(app)`
 - **tests/unit/test_hybrid_kem.py** — Hybrid KEM combiner tests — Wave 4 sub-PR 2 (#919).
   - `def hybrid_kp()`; `def test_default_pair_is_x25519_plus_mlkem768(hybrid_kp)`; `def test_distinct_keypairs()`; `def test_refuses_two_classical_pair()`; `def test_refuses_two_pq_pair()`; `def test_unregistered_alg_raises()`; `def test_encapsulate_decapsulate_round_trip(hybrid_kp)`; `def test_default_secret_is_32_bytes(hybrid_kp)`; `…`
 - **tests/unit/test_hybrid_keypair.py** — HybridKeypair tests — Wave 2 sub-PR 4 (#917).
@@ -2462,7 +2473,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_identity_endpoints.py** — Unit tests for the identity profile endpoints.
   - `class MockNode`; `class MockStorage`; `class MockFileStore`; `class MockDB`; `class MockAgent`; `class TestRenameAgentCore`; `class TestUpdateIdentityRequest`; `class TestGenerateAvatarRequest`; `…`
 - **tests/unit/test_identity_feature.py** — ToolResult contract tests for IdentityFeature (#1085).
-  - `async def test_migration_history_db_unavailable_returns_error()`; `async def test_migration_history_empty_returns_ok()`; `async def test_migration_history_malformed_row_partial()`; `async def test_assess_substrate_unknown_is_partial(monkeypatch)`; `def test_unique_export_filename_does_not_collide()`; `async def test_verify_identity_unsigned_is_partial(monkeypatch, tmp_path)`; `async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path)`; `async def test_export_identity_unknown_tier_is_failed()`; `…`
+  - `async def test_migration_history_db_unavailable_returns_error()`; `async def test_migration_history_empty_returns_ok()`; `async def test_migration_history_malformed_row_partial()`; `async def test_assess_substrate_unknown_is_partial(monkeypatch)`; `def test_unique_export_filename_does_not_collide()`; `async def test_import_identity_forwards_allow_unsigned(monkeypatch, tmp_path)`; `async def test_verify_identity_unsigned_is_partial(monkeypatch, tmp_path)`; `async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path)`; `…`
 - **tests/unit/test_identity_import_hardening.py** — Security-hardening unit tests for the identity importer (F185, F186).
   - `async def graph_db(tmp_path)`; `async def test_unsigned_rejected_even_when_verify_signature_false(graph_db)`; `async def test_unsigned_allowed_with_allow_unsigned_true(graph_db)`; `async def test_relationship_cannot_overwrite_identity_node(graph_db)`; `async def test_skill_refuses_reserved_node_collision(graph_db)`
 - **tests/unit/test_identity_lifecycle_status.py** — Tests for IdentityFeature.lifecycle_status and the migration_history schema-bitrot regression.
@@ -2660,7 +2671,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_privacy_mode_endpoint_rail.py** — Unit tests for the rail-gate on POST /agent/privacy-mode (#867-A).
   - `async def test_rail_refuses_privacy_mode_flip_on_live_agent_without_header()`; `async def test_rail_allows_privacy_mode_flip_on_live_agent_with_header()`; `async def test_rail_allows_privacy_mode_flip_on_demo_agent_without_header()`; `def test_endpoint_module_declares_rail_dependency()`
 - **tests/unit/test_privacy_mode_model_restore_contracts.py** — Contracts for model preservation across privacy-mode transitions.
-  - `def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()`; `def test_privacy_mode_endpoint_reports_deidentified_storage_fail_closed()`; `def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition()`; `def test_agent_level_privacy_transition_switches_to_local_model()`; `def test_agent_level_anonymous_transition_switches_to_local_model()`; `def test_privacy_command_path_uses_agent_level_model_transition()`
+  - `async def test_cancel_privacy_transition_discards_pending(monkeypatch)`; `def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()`; `def test_privacy_mode_endpoint_reports_deidentified_storage_fail_closed()`; `def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition()`; `def test_agent_level_privacy_transition_switches_to_local_model()`; `def test_agent_level_anonymous_transition_switches_to_local_model()`; `def test_privacy_command_path_uses_agent_level_model_transition()`
 - **tests/unit/test_privacy_preset_consistency.py** — Consistency tests for canonical privacy presets.
   - `def test_privacy_presets_match_canonical_flag_combinations()`; `def test_scrubbed_storage_is_legacy_alias_for_pii_redacted()`; `def test_legacy_deidentified_aliases_do_not_downgrade_to_normal()`; `def test_privacy_mode_round_trips_to_named_presets()`; `def test_privacy_agent_set_mode_reports_canonical_meanings()`; `def test_privacy_agent_handle_get_privacy_mode_matches_canonical_descriptions()`; `def test_command_handler_delegates_get_privacy_mode_to_privacy_agent()`; `def test_deidentified_status_reports_evidence_required_not_persistent()`
 - **tests/unit/test_privacy_transition_lock_order.py** — Deadlock-freedom regression for the privacy-transition lock order (F037).
@@ -2839,6 +2850,8 @@ Repo entry points and standard project files.
   - `def test_source_name_is_canonical()`; `def test_registration_shape()`; `def test_schema_requires_job_id_and_status()`; `def test_schema_rejects_non_dict()`; `def test_schema_injects_defaults_for_prompt_template_placeholders()`
 - **tests/unit/test_signals_ui_emit.py** — Phase 7 of #889: UI side-channel SSE emit for non-INTERNAL signals.
   - `async def components(tmp_path)`; `async def test_internal_signal_does_not_emit_ui_event(components)`; `async def test_user_visible_signal_emits_signal_completed(components)`; `async def test_admin_visible_signal_also_emits(components)`; `async def test_payload_carries_routing_fields(components)`; `async def test_payload_excludes_raw_artifact_and_action_result(components)`; `async def test_payload_includes_result_summary_when_source_sets_callback(components)`; `async def test_payload_result_summary_is_none_when_source_omits_callback(tmp_path)`; `…`
+- **tests/unit/test_signals_workflow_rescue_source.py** — Host-provided ``stalled_work_rescue`` workflow sources (#2192).
+  - `def test_builds_every_source_the_builtin_names()`; `def test_all_sources_are_action_mode_with_handlers()`; `def test_register_is_idempotent_and_reports_new_names()`; `def test_register_skips_a_preexisting_source()`; `def test_register_no_registry_is_noop()`; `async def dispatcher(tmp_path)`; `async def test_fleet_stalled_sweep_observes_and_quotes(dispatcher)`; `async def test_fleet_stalled_sweep_zero_is_ok(dispatcher)`; `…`
 - **tests/unit/test_skills_feature.py** — Unit tests for SkillsFeature and Skill serialization.
   - `class TestSkillModel`; `class TestHelpers`; `async def feature(tmp_path)`; `class TestToolRegistration`; `class TestExtractCandidates`; `class TestSkillSave`; `class TestListShowDelete`; `class TestModuleConstants`; `…`
 - **tests/unit/test_sleep_consolidation_routing.py** — #1674 P3: the sleep cycle consolidates through the single MemorySystem.consolidate() chokepoint (so it inherits the forgetting deletion tier), not the lower-level MemoryConsolidator.run_consolidation…
