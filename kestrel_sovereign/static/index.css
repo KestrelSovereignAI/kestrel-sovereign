@@ -584,9 +584,14 @@ nav {
     opacity: 1;
 }
 
-/* Collapsing the pane hides the disclosure toggle alongside the other
-   header controls (matches .pane-sidebar.collapsed .btn-icon). */
-.pane-sidebar.collapsed .conversations-filters-toggle {
+/* #2216: the conversations pane has exactly TWO states — open (full pane) and
+   fully HIDDEN. "Closed" is NOT the thin `.pane-sidebar.collapsed` chevron rail
+   (that idiom still serves the Agents pane); it is `display:none`, taking zero
+   width. mountConversationsPane sets `display:none` inline and toggles this
+   class in lock-step; this rule backs the inline hide so no rail can leak
+   through. The pane also lives inside #panel-chat, so it's scoped to the chat
+   tab automatically. */
+.conversations-pane.collapsed {
     display: none;
 }
 

@@ -876,18 +876,14 @@ export async function loadAgents() {
             }
         }
 
-        // Standalone mode: reveal the conversations pane (and its Trash sub-view
-        // from #765) without going through selectAgent.  selectAgent installs a
-        // host-agent URL prefix that only exists in multi_agent routing — applying
-        // it in standalone produces 404s for /api/conversations and /agent/invoke.
-        // Standalone has exactly one agent, so just show the pane and let the
-        // mounted conversation list populate against the un-prefixed routes.
-        // Skip in misconfig — the agent list is not safe to auto-target.
+        // Standalone mode: mount + target the conversations pane so its list
+        // populates against the un-prefixed routes (selectAgent installs a
+        // host-agent URL prefix that only exists in multi_agent routing — using
+        // it in standalone 404s /api/conversations and /agent/invoke). #2216:
+        // this does NOT reveal the pane — visibility is the component's persisted
+        // collapse state (default hidden), nothing else. Skip in misconfig — the
+        // agent list is not safe to auto-target.
         if (isStandalone && agents.length > 0 && !hasLiveAgent && API.hasCapability('conversations')) {
-            // #879: don't reveal the conversations pane (or fire its fetch)
-            // when the host opted out — the capability gate below hides the pane.
-            const conversationsPane = document.getElementById('conversations-pane');
-            if (conversationsPane) conversationsPane.style.display = 'flex';
             try { refreshConversationsPane(); } catch (_) { /* best-effort */ }
         }
     } catch (e) {
@@ -953,9 +949,10 @@ window.selectAgent = async function(agentName) {
     const navName = document.getElementById('nav-agent-name');
     if (navName) navName.textContent = agentName;
 
-    // Show conversations pane
-    const conversationsPane = document.getElementById('conversations-pane');
-    conversationsPane.style.display = 'flex';
+    // #2216: do NOT auto-reveal the conversations pane on agent select — the
+    // component's persisted collapse state is the only thing that decides its
+    // visibility. refreshConversationsPane() below mounts + retargets it without
+    // forcing it open.
 
     // Reset cached panel data so they reload for the new agent. Note
     // that `state.currentSessionId` is per-pane now (its getter reads
@@ -1503,26 +1500,19 @@ window.toggleConversationsPane = function() {
     // with `conversations: false` gets that pane hidden — so the toggle must be
     // a no-op there too, otherwise it would reveal and drive a disabled pane.
     if (!API.hasCapability('conversations')) return;
-    const pane = document.getElementById('conversations-pane');
-    // Reveal the pane the first time the trigger is used (loadAgents also
-    // reveals it on agent-select; either path is fine). When revealing from
-    // hidden, force it OPEN rather than toggle — a fresh mount with no persisted
-    // collapse state starts expanded, so a toggle would immediately collapse the
-    // just-revealed pane (and the outcome would flip depending on persisted
-    // state). open() no-ops if already expanded, so this is safe.
-    const wasHidden = pane && pane.style.display === 'none';
-    if (wasHidden) pane.style.display = 'flex';
     const handle = ensureConversationsMount();
-    if (handle) {
-        // Hosts without the multi_agent agent-select flow (embeds) never hit
-        // refreshConversationsPane() before this trigger — the autoLoad:false
-        // mount would open EMPTY and never fetch. First use targets the host
-        // agent; retarget is refreshSeq-guarded, and hosts already targeted by
-        // agent-select skip this entirely (codex round-2 P2).
-        if (!conversationsPaneTargeted) refreshConversationsPane();
-        wasHidden ? handle.open() : handle.toggle();
-    }
-    else if (pane) pane.classList.toggle('collapsed');
+    if (!handle) return;
+    // #2216: the component's open/close/toggle is the WHOLE story — no more
+    // two-layer "reveal from display:none THEN toggle the rail" dance. close()
+    // fully hides the pane; toggle() from that hidden state reopens it.
+    //
+    // Hosts without the multi_agent agent-select flow (embeds) never hit
+    // refreshConversationsPane() before this trigger — the autoLoad:false mount
+    // would open EMPTY and never fetch. First use targets the host agent (the
+    // #2199 codex round-2 first-load); retarget is refreshSeq-guarded, and hosts
+    // already targeted by agent-select skip this entirely.
+    if (!conversationsPaneTargeted) refreshConversationsPane();
+    handle.toggle();
 };
 
 // Setup collapse buttons and resize handles

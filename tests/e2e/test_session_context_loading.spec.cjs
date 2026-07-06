@@ -196,10 +196,15 @@ test.describe('Session Context Loading - UI Flow', () => {
 
         // Step 3: Start a NEW conversation (creates time gap)
         // #2171 collapsed the two conversation surfaces into one: the
-        // `#conversations-pane` sidebar (auto-revealed in standalone). The
-        // deleted `#history-sidebar` slideout / `#toggle-history-btn` no longer
-        // exist — drive the pane's own new-conversation button instead.
+        // `#conversations-pane` sidebar. #2216: it defaults to fully HIDDEN, so
+        // open it via the chat-header history trigger first. The deleted
+        // `#history-sidebar` slideout / `#toggle-history-btn` no longer exist —
+        // drive the pane's own new-conversation button instead.
         const conversationsPane = page.locator('#conversations-pane');
+        if (!(await conversationsPane.isVisible())) {
+            await page.click('#conversations-toggle-btn');
+            await conversationsPane.waitFor({ state: 'visible', timeout: 5000 });
+        }
         if (await conversationsPane.isVisible()) {
             await page.click('#new-conversation-sidebar-btn');
             await page.waitForTimeout(2000);
@@ -261,7 +266,9 @@ test.describe('Session Context Loading - UI Flow', () => {
         await page.locator('.nav-tab').filter({ hasText: /chat/i }).click();
 
         // #2171: the single conversation surface is the `#conversations-pane`
-        // sidebar (auto-revealed in standalone). Wait for it and its list.
+        // sidebar. #2216: it defaults to fully hidden — open it via the
+        // chat-header history trigger, then wait for it and its list.
+        await page.click('#conversations-toggle-btn');
         await page.locator('#conversations-pane').waitFor({ state: 'visible', timeout: 10000 });
 
         // Wait for conversations to load

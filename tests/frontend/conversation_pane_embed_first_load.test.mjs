@@ -76,7 +76,9 @@ test('history trigger on an embed host fires the FIRST list load — the reveale
     window.toggleConversationsPane();
     await new Promise((r) => setTimeout(r, 0));
 
-    assert.equal(pane.style.display, 'flex', 'trigger reveals the hidden pane');
+    // #2216: opening is the component's job — the pane goes from fully hidden to
+    // visible (display cleared, not 'none') and open (no `.collapsed`).
+    assert.notEqual(pane.style.display, 'none', 'trigger reveals the hidden pane');
     assert.equal(pane.classList.contains('collapsed'), false, 'revealed pane is open');
     assert.equal(fetchCount, 1, 'revealing an untargeted pane fetches the list exactly once');
     const rows = Array.from(document.querySelectorAll('.conversation-item'))

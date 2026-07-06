@@ -88,23 +88,6 @@
             <div id="resize-agents" class="resize-handle"></div>
         </aside>
 
-        <!-- Conversations Pane -->
-        <aside id="conversations-pane" class="pane-sidebar" style="display: none;">
-            <div class="pane-header">
-                <h3 id="conversations-pane-title">Conversations</h3>
-                <button id="new-conversation-sidebar-btn" class="btn-icon" data-label-attr-title="btn_new_conversation" title="New Conversation"><span class="ki ki-plus"></span></button>
-                <button id="trash-toggle-btn" class="btn-icon" title="Show Trash" data-mode="conversations"><span class="ki ki-trash"></span></button>
-                <button id="collapse-conversations-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse"><span class="ki ki-chevron-left"></span></button>
-            </div>
-            <div id="conversations-list" class="pane-content">
-                <p class="empty-state" data-label-key="empty_conversations">Select an agent to view conversations</p>
-            </div>
-            <div id="conversations-trash" class="pane-content" style="display: none;">
-                <p class="empty-state" data-label-key="loading_trash">Loading trash…</p>
-            </div>
-            <div id="resize-conversations" class="resize-handle"></div>
-        </aside>
-
         <!-- Identity Panel -->
         <div class="panel" id="panel-identity">
             <div class="panel-content">
@@ -118,6 +101,28 @@
         <!-- Chat Panel -->
         <div class="panel active" id="panel-chat">
             <div style="display: flex; height: 100%; gap: 0;">
+                <!-- #2216: the conversations pane lives INSIDE #panel-chat (row
+                     layout: pane | chat column) so tab switching scopes it — it's
+                     never visible on Identity / Memories / etc. The pane defaults
+                     to fully hidden; the component's persisted collapse state owns
+                     its visibility (chevron closes it, the chat-header history
+                     trigger reopens it). Same structure the Frinz embed uses. -->
+                <aside id="conversations-pane" class="pane-sidebar" style="display: none;">
+                    <div class="pane-header">
+                        <h3 id="conversations-pane-title">Conversations</h3>
+                        <button id="new-conversation-sidebar-btn" class="btn-icon" data-label-attr-title="btn_new_conversation" title="New Conversation"><span class="ki ki-plus"></span></button>
+                        <button id="trash-toggle-btn" class="btn-icon" title="Show Trash" data-mode="conversations"><span class="ki ki-trash"></span></button>
+                        <button id="collapse-conversations-btn" class="collapse-btn" data-label-attr-title="btn_collapse" title="Collapse"><span class="ki ki-chevron-left"></span></button>
+                    </div>
+                    <div id="conversations-list" class="pane-content">
+                        <p class="empty-state" data-label-key="empty_conversations">Select an agent to view conversations</p>
+                    </div>
+                    <div id="conversations-trash" class="pane-content" style="display: none;">
+                        <p class="empty-state" data-label-key="loading_trash">Loading trash…</p>
+                    </div>
+                    <div id="resize-conversations" class="resize-handle"></div>
+                </aside>
+
                 <!-- Main Chat Area -->
                 <div style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
                     <!-- Chat Header with History, New Chat, Model Selector, and Privacy -->

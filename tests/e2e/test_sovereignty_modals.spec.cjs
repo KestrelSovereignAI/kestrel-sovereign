@@ -845,6 +845,17 @@ test.describe('Local File Browser (Session 3)', () => {
 // ============================================================================
 
 test.describe('Conversations Pane (Session 4)', () => {
+    // #2216: the pane defaults to FULLY HIDDEN — the chat-header history trigger
+    // (`#conversations-toggle-btn`) opens it. Every test that inspects the pane
+    // opens it first via this helper.
+    async function openConversationsPane(page) {
+        const pane = page.locator('#conversations-pane');
+        if (!(await pane.isVisible())) {
+            await page.click('#conversations-toggle-btn');
+            await pane.waitFor({ state: 'visible', timeout: 5000 });
+        }
+    }
+
     test.beforeEach(async ({ page }) => {
         await page.goto(KESTREL_URL);
         // Navigate to Chat panel
@@ -861,9 +872,12 @@ test.describe('Conversations Pane (Session 4)', () => {
         await expect(page.locator('#new-conversation-btn')).toHaveCount(0);
     });
 
-    test('should show the conversations pane in standalone mode', async ({ page }) => {
-        // Standalone console auto-reveals the single conversations surface.
+    test('is hidden by default and the history trigger opens it (#2216)', async ({ page }) => {
+        // #2216: no auto-reveal — the standalone pane starts fully hidden.
         const pane = page.locator('#conversations-pane');
+        await expect(pane).toBeHidden();
+        // The chat-header rollback-clock trigger opens it.
+        await page.click('#conversations-toggle-btn');
         await expect(pane).toBeVisible();
         // Its list container and new-conversation affordance are the pane's own.
         await expect(page.locator('#conversations-list')).toBeVisible();
@@ -871,6 +885,7 @@ test.describe('Conversations Pane (Session 4)', () => {
     });
 
     test('should populate the conversations list (items or empty state)', async ({ page }) => {
+        await openConversationsPane(page);
         await expect(page.locator('#conversations-pane')).toBeVisible();
 
         // Wait for the list fetch to settle.
@@ -889,6 +904,7 @@ test.describe('Conversations Pane (Session 4)', () => {
     });
 
     test('should render conversation items with preview and time metadata', async ({ page }) => {
+        await openConversationsPane(page);
         await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
@@ -905,6 +921,7 @@ test.describe('Conversations Pane (Session 4)', () => {
     });
 
     test('should load a conversation when clicking an item', async ({ page }) => {
+        await openConversationsPane(page);
         await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
@@ -922,6 +939,7 @@ test.describe('Conversations Pane (Session 4)', () => {
     });
 
     test('should highlight the active conversation item', async ({ page }) => {
+        await openConversationsPane(page);
         await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
@@ -936,6 +954,7 @@ test.describe('Conversations Pane (Session 4)', () => {
     });
 
     test('should start a new conversation from the pane button', async ({ page }) => {
+        await openConversationsPane(page);
         await expect(page.locator('#conversations-pane')).toBeVisible();
 
         await page.click('#new-conversation-sidebar-btn');
@@ -946,6 +965,7 @@ test.describe('Conversations Pane (Session 4)', () => {
     });
 
     test('should show message count in a conversation item when present', async ({ page }) => {
+        await openConversationsPane(page);
         await expect(page.locator('#conversations-pane')).toBeVisible();
         await page.waitForTimeout(1000);
 
@@ -962,6 +982,7 @@ test.describe('Conversations Pane (Session 4)', () => {
 
     test('should expose the Trash sub-view toggle in the pane', async ({ page }) => {
         // The shared component's trash/archived affordance lives on the pane.
+        await openConversationsPane(page);
         await expect(page.locator('#conversations-pane')).toBeVisible();
         await expect(page.locator('#trash-toggle-btn')).toBeVisible();
     });
