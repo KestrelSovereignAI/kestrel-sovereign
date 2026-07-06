@@ -672,6 +672,68 @@ test('reveal state + active tab survive a destroy()/remount (agent-switch patter
     container.remove();
 });
 
+test('reveal state is host-observable: onReveal fires (incl. initial) and panels-revealed class tracks on scopeEl (#2211 addendum)', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    // Host chrome OUTSIDE the mount — e.g. an agent banner whose management
+    // buttons are [data-advanced-only] and gated by CSS on .panels-revealed.
+    const banner = document.createElement('div');
+    document.body.appendChild(banner);
+
+    const calls = [];
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { scopeEl: banner, onReveal: (r) => calls.push(r) },
+    });
+
+    assert.deepEqual(calls, [false], 'onReveal fires on the INITIAL (collapsed) state application');
+    assert.equal(banner.classList.contains('panels-revealed'), false, 'scope class absent while collapsed');
+
+    handle.toggleReveal(true);
+    assert.deepEqual(calls, [false, true], 'onReveal fires on reveal');
+    assert.ok(banner.classList.contains('panels-revealed'), 'scope class set on reveal — CSS-only hosts need zero JS');
+
+    handle.toggleReveal(false);
+    assert.deepEqual(calls, [false, true, false], 'onReveal fires on collapse');
+    assert.equal(banner.classList.contains('panels-revealed'), false, 'scope class cleared on collapse');
+
+    // Re-reveal then destroy: teardown clears the scope class (banner buttons
+    // must not stay revealed after the mount is gone) without firing onReveal.
+    handle.toggleReveal(true);
+    const callsBeforeDestroy = calls.length;
+    handle.destroy();
+    assert.equal(banner.classList.contains('panels-revealed'), false, 'destroy clears the scope class');
+    assert.equal(calls.length, callsBeforeDestroy, 'destroy does not fire onReveal (teardown, not a state change)');
+    container.remove();
+    banner.remove();
+});
+
+test('reveal onReveal throwing never wedges the toggle; scopeEl defaults to the container', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { onReveal: () => { throw new Error('host bug'); } },
+    });
+
+    // The throwing callback must not have prevented state application.
+    handle.toggleReveal(true);
+    assert.equal(handle.revealed, true, 'reveal state applied despite the throwing host callback');
+    assert.ok(container.classList.contains('panels-revealed'),
+        'no scopeEl -> the mount container carries the class');
+    handle.destroy();
+    container.remove();
+});
+
 test('non-reveal mount is unchanged: nav strip visible, no toggle, no reveal API effect', async () => {
     Panels._reset();
     const container = document.createElement('div');

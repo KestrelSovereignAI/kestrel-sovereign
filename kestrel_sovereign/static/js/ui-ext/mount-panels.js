@@ -146,7 +146,7 @@ export function attachDelegatedNav(navEl, activate) {
  *          its original parent/position. Ordering follows `before` (as in
  *          registerPanel); a host tab with no `before` registered first lands
  *          before the core panels (Chat-first).
- * @param {boolean|{toggleLabel?: string, anchor?: HTMLElement}} [config.reveal]
+ * @param {boolean|{toggleLabel?: string, anchor?: HTMLElement, scopeEl?: HTMLElement, onReveal?: (revealed: boolean) => void}} [config.reveal]
  *        - opt-in collapsed/"Advanced" mode (#2211). Omitted/falsy = today's
  *          always-visible nav strip (standalone console, unchanged). When set,
  *          the mount renders COLLAPSED: the nav strip is hidden (no tab headers)
@@ -305,6 +305,19 @@ export async function mountPanels(containerEl, config = {}) {
         // tab headers). Revealed: show the gated strip (Chat first).
         navEl.style.display = _revealed ? '' : 'none';
         if (_toggleEl) _toggleEl.setAttribute('aria-pressed', _revealed ? 'true' : 'false');
+        // Host observability (#2211 addendum): host chrome OUTSIDE the mount
+        // (e.g. an agent banner's management buttons) shows/hides with the
+        // reveal state. Two zero-JS-friendly hooks, both fired/applied on every
+        // state application including the initial one:
+        //  - `panels-revealed` class on `reveal.scopeEl` (default: the mount
+        //    container) so pure-CSS hosts can gate `[data-advanced-only]`.
+        //  - `reveal.onReveal(revealed)` callback for hosts that need JS.
+        const scope = (revealOpts.scopeEl && typeof revealOpts.scopeEl === 'object')
+            ? revealOpts.scopeEl : containerEl;
+        if (scope && scope.classList) scope.classList.toggle('panels-revealed', _revealed);
+        if (typeof revealOpts.onReveal === 'function') {
+            try { revealOpts.onReveal(_revealed); } catch (_) { /* host bug must not wedge the toggle */ }
+        }
     }
 
     function _setRevealed(next) {
@@ -358,6 +371,15 @@ export async function mountPanels(containerEl, config = {}) {
         destroy() {
             detachNav();
             _detachToggle();
+            // Clear the reveal scope class so host chrome gated on it (e.g.
+            // advanced-only banner buttons) doesn't stay revealed after the
+            // mount is gone. onReveal is NOT fired here — destroy is teardown,
+            // not a state change the host should react to (remount re-applies).
+            if (revealEnabled) {
+                const scope = (revealOpts.scopeEl && typeof revealOpts.scopeEl === 'object')
+                    ? revealOpts.scopeEl : containerEl;
+                if (scope && scope.classList) scope.classList.remove('panels-revealed');
+            }
             if (_toggleEl) {
                 if (_toggleOwned) {
                     _toggleEl.remove();
