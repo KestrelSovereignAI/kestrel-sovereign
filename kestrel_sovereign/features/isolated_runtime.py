@@ -259,10 +259,15 @@ class ProxyFeature(Feature):
         self._tools: List[AgentTool] = []
         self._supervision_task: Optional[asyncio.Task] = None
         self._stopping = False
-        # Held while ``set_config`` rebuilds the service with new config so the
-        # health supervisor doesn't race the intentional stop/start and "restart"
-        # a service that is mid-reload.
+        # Coordinate ``set_config``'s reload with the health supervisor so they
+        # never stop/start the client concurrently. ``_reloading`` skips probes
+        # during a reload; ``_reload_lock`` serializes the actual stop/start of
+        # reload vs. a supervisor restart; ``_reload_gen`` lets the supervisor
+        # detect that a reload cycled the client around its (now-stale) probe and
+        # skip restarting the freshly launched one.
         self._reloading = False
+        self._reload_lock = asyncio.Lock()
+        self._reload_gen = 0
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
         self._host_config: Dict[str, Any] = {}
@@ -317,14 +322,16 @@ class ProxyFeature(Feature):
         effect (config is forwarded only at the initialize handshake, so a live
         config change requires a re-launch). Guarded so the health supervisor
         doesn't treat the intentional stop as a crash and double-restart."""
-        self._reloading = True
-        try:
-            self._unregister_channel_bridge()
-            if self._client is not None:
-                await _maybe_await(self._client.stop())
-            await self._connect_client()
-        finally:
-            self._reloading = False
+        async with self._reload_lock:
+            self._reloading = True
+            self._reload_gen += 1
+            try:
+                self._unregister_channel_bridge()
+                if self._client is not None:
+                    await _maybe_await(self._client.stop())
+                await self._connect_client()
+            finally:
+                self._reloading = False
 
     async def shutdown(self):
         self._stopping = True
@@ -871,6 +878,10 @@ class ProxyFeature(Feature):
                 if self._reloading:
                     backoff = 1.0
                     continue
+                # Snapshot the reload generation BEFORE probing: if a reload cycles
+                # the client while this (now-stale) probe is in flight, we must not
+                # then "restart" the freshly launched client.
+                gen = self._reload_gen
                 try:
                     health = await asyncio.wait_for(
                         _maybe_await(self._client.health()),
@@ -894,17 +905,25 @@ class ProxyFeature(Feature):
 
                 if self._stopping:
                     break
-                try:
-                    await _maybe_await(self._client.stop())
-                except Exception:  # noqa: BLE001
-                    pass
-                await asyncio.sleep(backoff)
-                try:
-                    await _maybe_await(self._client.start())
-                    backoff = 1.0
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Isolated feature %s restart failed: %s", self.name, exc)
-                    backoff = min(backoff * 2, 30.0)
+                # Serialize the restart against a concurrent reload, and re-check
+                # under the lock: a reload may have started during our probe (so
+                # the failed probe was expected) or completed with a fresh healthy
+                # client. Either way the reload owns the lifecycle — skip.
+                async with self._reload_lock:
+                    if self._stopping or self._reloading or self._reload_gen != gen:
+                        backoff = 1.0
+                        continue
+                    try:
+                        await _maybe_await(self._client.stop())
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await asyncio.sleep(backoff)
+                    try:
+                        await _maybe_await(self._client.start())
+                        backoff = 1.0
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Isolated feature %s restart failed: %s", self.name, exc)
+                        backoff = min(backoff * 2, 30.0)
         finally:
             # If the task is cancelled (e.g. agent shutdown cancelling tracked
             # background tasks) rather than stopped via shutdown(), make sure the
