@@ -146,7 +146,25 @@ export function attachDelegatedNav(navEl, activate) {
  *          its original parent/position. Ordering follows `before` (as in
  *          registerPanel); a host tab with no `before` registered first lands
  *          before the core panels (Chat-first).
- * @returns {Promise<{activate(panelId: string): void, destroy(): void}>}
+ * @param {boolean|{toggleLabel?: string, anchor?: HTMLElement}} [config.reveal]
+ *        - opt-in collapsed/"Advanced" mode (#2211). Omitted/falsy = today's
+ *          always-visible nav strip (standalone console, unchanged). When set,
+ *          the mount renders COLLAPSED: the nav strip is hidden (no tab headers)
+ *          and only the first (leading/Chat) tab's body is visible. A single
+ *          capability-gated "Advanced" toggle reveals the full gated strip
+ *          (Chat first); `aria-pressed` is managed by the component. The toggle
+ *          is either component-owned (a `<button>` inserted before the nav) or,
+ *          when `reveal.anchor` is a host-provided element, that element wired in
+ *          place. `reveal.toggleLabel` sets the component-owned button's text
+ *          (default `'Advanced'`). If everything is gated off so only the first
+ *          tab remains, there is nothing to reveal — no toggle is emitted (chat
+ *          only). The returned handle gains `toggleReveal(next?)` and a
+ *          `revealed` getter so a host can restore the revealed/collapsed state
+ *          (alongside the active tab) across a `destroy()`/remount on agent
+ *          switch: capture `handle.revealed` + the active tab before destroy,
+ *          then after remount call `handle.toggleReveal(wasRevealed)` and
+ *          `handle.activate(savedPanelId)`.
+ * @returns {Promise<{activate(panelId: string): void, destroy(): void, toggleReveal(next?: boolean): boolean, revealed: boolean}>}
  */
 export async function mountPanels(containerEl, config = {}) {
     if (!containerEl) throw new Error('mountPanels: containerEl is required');
@@ -155,6 +173,9 @@ export async function mountPanels(containerEl, config = {}) {
     const activateFirst = config.activateFirst !== false;
     const wireRuntime = config.wireRuntime !== false;
     const hostTabs = Array.isArray(config.hostTabs) ? config.hostTabs : [];
+    const revealCfg = config.reveal;
+    const revealEnabled = !!revealCfg;
+    const revealOpts = (revealCfg && typeof revealCfg === 'object') ? revealCfg : {};
 
     const navEl = document.createElement('div');
     navEl.className = 'nav-tabs';
@@ -269,10 +290,84 @@ export async function mountPanels(containerEl, config = {}) {
         if (first) activate(first.dataset.panel);
     }
 
+    // ---- reveal mode (#2211) ------------------------------------------------
+    // Opt-in collapsed/"Advanced" mode: chat-only by default, a capability-gated
+    // toggle reveals the full nav strip. Omitted `reveal` leaves everything above
+    // exactly as-is (standalone console unchanged).
+    let _revealed = false;
+    let _toggleEl = null;
+    let _toggleOwned = false;
+    let _togglePrevAria = null;
+    let _detachToggle = () => {};
+
+    function _applyRevealState() {
+        // Collapsed: hide the whole nav strip so the embed shows chat-only (no
+        // tab headers). Revealed: show the gated strip (Chat first).
+        navEl.style.display = _revealed ? '' : 'none';
+        if (_toggleEl) _toggleEl.setAttribute('aria-pressed', _revealed ? 'true' : 'false');
+    }
+
+    function _setRevealed(next) {
+        _revealed = !!next;
+        _applyRevealState();
+        // With the strip hidden the user can't see or change the active tab, so
+        // collapsing returns the visible body to the leading (Chat) tab.
+        if (!_revealed) {
+            const first = navEl.querySelector('.nav-tab');
+            if (first) activate(first.dataset.panel);
+        }
+    }
+
+    if (revealEnabled) {
+        // Always start collapsed on the first (leading/Chat) tab, regardless of
+        // the caller's `activateFirst`.
+        const first = navEl.querySelector('.nav-tab');
+        if (first) activate(first.dataset.panel);
+
+        // The toggle only makes sense when there is MORE than the leading tab to
+        // reveal. Everything-gated-off (chat only) ⇒ nothing worth revealing ⇒ no
+        // toggle (acceptance: chat only, no toggle).
+        if (navEl.querySelectorAll('.nav-tab').length > 1) {
+            if (revealOpts.anchor && typeof revealOpts.anchor === 'object') {
+                // Host-provided anchor: wire it in place, never move/create it.
+                _toggleEl = revealOpts.anchor;
+                _togglePrevAria = _toggleEl.getAttribute('aria-pressed');
+            } else {
+                _toggleEl = document.createElement('button');
+                _toggleEl.type = 'button';
+                _toggleEl.className = 'nav-advanced-toggle';
+                _toggleEl.textContent = revealOpts.toggleLabel || 'Advanced';
+                _toggleOwned = true;
+                containerEl.insertBefore(_toggleEl, navEl);
+            }
+            const onToggle = () => _setRevealed(!_revealed);
+            _toggleEl.addEventListener('click', onToggle);
+            _detachToggle = () => _toggleEl.removeEventListener('click', onToggle);
+        }
+        _applyRevealState();
+    }
+
     return {
         activate,
+        get revealed() { return _revealed; },
+        toggleReveal(next) {
+            if (!revealEnabled) return _revealed;
+            _setRevealed(next === undefined ? !_revealed : !!next);
+            return _revealed;
+        },
         destroy() {
             detachNav();
+            _detachToggle();
+            if (_toggleEl) {
+                if (_toggleOwned) {
+                    _toggleEl.remove();
+                } else if (_togglePrevAria === null) {
+                    // Host-provided anchor: restore its prior aria-pressed state.
+                    _toggleEl.removeAttribute('aria-pressed');
+                } else {
+                    _toggleEl.setAttribute('aria-pressed', _togglePrevAria);
+                }
+            }
             // Return each adopted host element to its original parent/position
             // and display BEFORE the panel host is removed, so the host keeps a
             // live element (same node, listeners intact) to use outside the
