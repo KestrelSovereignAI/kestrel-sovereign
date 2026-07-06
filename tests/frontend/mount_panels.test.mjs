@@ -672,6 +672,53 @@ test('reveal state + active tab survive a destroy()/remount (agent-switch patter
     container.remove();
 });
 
+test('reveal toggle tracks RUNTIME tab changes: late-gated-on panel wires it in; regating to chat-only hides it and collapses (codex P2)', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    // Mount with EVERYTHING gated off — chat only, so no toggle initially.
+    const caps = {
+        identity: false, constitution: false, memory: false, tasks: false,
+        sovereignty: false, keys: false, wallet: false, metrics: false,
+        featureStore: false, audit: false, permissions: false,
+    };
+    const handle = await mountPanels(container, {
+        api: stubApi(caps),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { toggleLabel: 'Advanced' },
+    });
+    const tick = () => new Promise((r) => setTimeout(r, 0)); // MutationObserver is async
+
+    assert.equal(container.querySelector('.nav-advanced-toggle'), null,
+        'chat-only mount emits no toggle');
+
+    // A capability flips on later (the Frinz flow: feature panels register
+    // AFTER their manifest loads) — the toggle must appear, or the newly
+    // available panel is unreachable behind a display:none strip.
+    caps.identity = true;
+    Panels.syncNav();
+    await tick();
+    const toggle = container.querySelector('.nav-advanced-toggle');
+    assert.ok(toggle, 'toggle wired in when a second tab arrives at runtime');
+    assert.notEqual(toggle.style.display, 'none', 'and it is visible');
+
+    // Reveal, then regate down to chat-only: the toggle hides and the
+    // then-meaningless revealed strip collapses back to chat.
+    toggle.click();
+    assert.equal(handle.revealed, true, 'revealed via the late-wired toggle');
+    caps.identity = false;
+    Panels.syncNav();
+    await tick();
+    assert.equal(toggle.style.display, 'none', 'toggle hidden when gated back to chat-only');
+    assert.equal(handle.revealed, false, 'revealed strip collapsed when nothing remains to show');
+
+    handle.destroy();
+    container.remove();
+});
+
 test('reveal state is host-observable: onReveal fires (incl. initial) and panels-revealed class tracks on scopeEl (#2211 addendum)', async () => {
     Panels._reset();
     const container = document.createElement('div');

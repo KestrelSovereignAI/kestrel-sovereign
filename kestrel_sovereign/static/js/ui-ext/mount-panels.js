@@ -331,32 +331,51 @@ export async function mountPanels(containerEl, config = {}) {
         }
     }
 
+    let _navObserver = null;
+
+    function _ensureToggleWired() {
+        if (_toggleEl) return;
+        if (revealOpts.anchor && typeof revealOpts.anchor === 'object') {
+            // Host-provided anchor: wire it in place, never move/create it.
+            _toggleEl = revealOpts.anchor;
+            _togglePrevAria = _toggleEl.getAttribute('aria-pressed');
+        } else {
+            _toggleEl = document.createElement('button');
+            _toggleEl.type = 'button';
+            _toggleEl.className = 'nav-advanced-toggle';
+            _toggleEl.textContent = revealOpts.toggleLabel || 'Advanced';
+            _toggleOwned = true;
+            containerEl.insertBefore(_toggleEl, navEl);
+        }
+        const onToggle = () => _setRevealed(!_revealed);
+        _toggleEl.addEventListener('click', onToggle);
+        _detachToggle = () => _toggleEl.removeEventListener('click', onToggle);
+    }
+
+    // The toggle only makes sense when there is MORE than the leading tab to
+    // reveal. Everything-gated-off (chat only) ⇒ nothing worth revealing ⇒ no
+    // toggle (acceptance: chat only, no toggle). Tab availability is DYNAMIC —
+    // feature panels register after their manifest loads (Panels.registerPanel/
+    // syncNav can add or regate tabs at runtime), so this is re-evaluated on
+    // every nav mutation rather than once at mount (codex P2): a late-arriving
+    // panel wires the toggle in, and gating back down to chat-only hides it and
+    // collapses a then-meaningless revealed strip.
+    function _syncToggle() {
+        const multi = navEl.querySelectorAll('.nav-tab').length > 1;
+        if (multi) _ensureToggleWired();
+        if (_toggleEl) _toggleEl.style.display = multi ? '' : 'none';
+        if (!multi && _revealed) _setRevealed(false);
+    }
+
     if (revealEnabled) {
         // Always start collapsed on the first (leading/Chat) tab, regardless of
         // the caller's `activateFirst`.
         const first = navEl.querySelector('.nav-tab');
         if (first) activate(first.dataset.panel);
 
-        // The toggle only makes sense when there is MORE than the leading tab to
-        // reveal. Everything-gated-off (chat only) ⇒ nothing worth revealing ⇒ no
-        // toggle (acceptance: chat only, no toggle).
-        if (navEl.querySelectorAll('.nav-tab').length > 1) {
-            if (revealOpts.anchor && typeof revealOpts.anchor === 'object') {
-                // Host-provided anchor: wire it in place, never move/create it.
-                _toggleEl = revealOpts.anchor;
-                _togglePrevAria = _toggleEl.getAttribute('aria-pressed');
-            } else {
-                _toggleEl = document.createElement('button');
-                _toggleEl.type = 'button';
-                _toggleEl.className = 'nav-advanced-toggle';
-                _toggleEl.textContent = revealOpts.toggleLabel || 'Advanced';
-                _toggleOwned = true;
-                containerEl.insertBefore(_toggleEl, navEl);
-            }
-            const onToggle = () => _setRevealed(!_revealed);
-            _toggleEl.addEventListener('click', onToggle);
-            _detachToggle = () => _toggleEl.removeEventListener('click', onToggle);
-        }
+        _syncToggle();
+        _navObserver = new MutationObserver(_syncToggle);
+        _navObserver.observe(navEl, { childList: true });
         _applyRevealState();
     }
 
@@ -371,6 +390,7 @@ export async function mountPanels(containerEl, config = {}) {
         destroy() {
             detachNav();
             _detachToggle();
+            if (_navObserver) { _navObserver.disconnect(); _navObserver = null; }
             // Clear the reveal scope class so host chrome gated on it (e.g.
             // advanced-only banner buttons) doesn't stay revealed after the
             // mount is gone. onReveal is NOT fired here — destroy is teardown,
@@ -383,11 +403,16 @@ export async function mountPanels(containerEl, config = {}) {
             if (_toggleEl) {
                 if (_toggleOwned) {
                     _toggleEl.remove();
-                } else if (_togglePrevAria === null) {
-                    // Host-provided anchor: restore its prior aria-pressed state.
-                    _toggleEl.removeAttribute('aria-pressed');
                 } else {
-                    _toggleEl.setAttribute('aria-pressed', _togglePrevAria);
+                    // Host-provided anchor: restore its prior aria-pressed state
+                    // and undo any display:none _syncToggle applied while the
+                    // strip was gated down — the host owns the element again.
+                    if (_togglePrevAria === null) {
+                        _toggleEl.removeAttribute('aria-pressed');
+                    } else {
+                        _toggleEl.setAttribute('aria-pressed', _togglePrevAria);
+                    }
+                    _toggleEl.style.display = '';
                 }
             }
             // Return each adopted host element to its original parent/position
