@@ -471,3 +471,335 @@ test('hostTabs: adopted element keeps its inline display (flex) while active', a
     handle.destroy();
     assert.equal(chatEl.style.display, 'flex', 'restored after destroy');
 });
+
+// --- (e) reveal / "Advanced" collapsed mode (#2211) -------------------------
+
+function mkChatEl() {
+    const el = document.createElement('div');
+    el.id = 'host-chat';
+    return el;
+}
+
+test('reveal mount renders chat-only (no visible nav strip) + a single Advanced toggle', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { toggleLabel: 'Advanced' },
+    });
+
+    const nav = container.querySelector('.nav-tabs');
+    assert.equal(nav.style.display, 'none', 'nav strip hidden while collapsed (no tab headers)');
+    assert.equal(handle.revealed, false, 'starts collapsed');
+
+    // Exactly one component-owned toggle, chat body visible.
+    const toggles = container.querySelectorAll('.nav-advanced-toggle');
+    assert.equal(toggles.length, 1, 'exactly one Advanced toggle emitted');
+    assert.equal(toggles[0].textContent, 'Advanced', 'toggle uses the configured label');
+    assert.equal(toggles[0].getAttribute('aria-pressed'), 'false', 'toggle aria-pressed=false collapsed');
+    assert.ok(container.querySelector('#panel-chat').classList.contains('active'),
+        'chat is the visible (active) body while collapsed');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('clicking the Advanced toggle reveals the gated strip with Chat first; aria-pressed tracks', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { toggleLabel: 'Advanced' },
+    });
+
+    const nav = container.querySelector('.nav-tabs');
+    const toggle = container.querySelector('.nav-advanced-toggle');
+
+    toggle.dispatchEvent(new dom.window.Event('click'));
+    assert.equal(handle.revealed, true, 'revealed after click');
+    assert.notEqual(nav.style.display, 'none', 'nav strip now shown');
+    assert.equal(toggle.getAttribute('aria-pressed'), 'true', 'aria-pressed=true when revealed');
+
+    const tabIds = [...nav.querySelectorAll('.nav-tab')].map((t) => t.dataset.panel);
+    assert.equal(tabIds[0], 'chat', 'Chat leads the revealed strip');
+    assert.deepEqual(tabIds, ['chat', ...CORE_PANEL_DEFS.map((d) => d.panelId)]);
+
+    // Toggling back collapses + returns aria-pressed to false.
+    toggle.dispatchEvent(new dom.window.Event('click'));
+    assert.equal(handle.revealed, false, 'collapsed again after second click');
+    assert.equal(nav.style.display, 'none', 'nav strip hidden again');
+    assert.equal(toggle.getAttribute('aria-pressed'), 'false', 'aria-pressed=false when collapsed');
+    assert.ok(container.querySelector('#panel-chat').classList.contains('active'),
+        'collapsing returns to the Chat tab');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('toggleReveal() handle method drives reveal state programmatically', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: {},
+    });
+    const nav = container.querySelector('.nav-tabs');
+
+    assert.equal(handle.toggleReveal(true), true, 'toggleReveal(true) reveals');
+    assert.notEqual(nav.style.display, 'none');
+    assert.equal(handle.toggleReveal(), false, 'toggleReveal() toggles back to collapsed');
+    assert.equal(nav.style.display, 'none');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('reveal mount with everything gated off shows chat only and NO toggle', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    // Every core panel gated off — only the host chat tab survives.
+    const caps = {
+        identity: false, constitution: false, memory: false, tasks: false,
+        sovereignty: false, keys: false, wallet: false, metrics: false,
+        featureStore: false, audit: false, permissions: false,
+    };
+    const handle = await mountPanels(container, {
+        api: stubApi(caps),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { toggleLabel: 'Advanced' },
+    });
+
+    const nav = container.querySelector('.nav-tabs');
+    const tabIds = [...nav.querySelectorAll('.nav-tab')].map((t) => t.dataset.panel);
+    assert.deepEqual(tabIds, ['chat'], 'only the chat tab remains');
+    assert.equal(container.querySelector('.nav-advanced-toggle'), null,
+        'no toggle emitted when there is nothing to reveal');
+    assert.ok(container.querySelector('#panel-chat').classList.contains('active'), 'chat visible');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('reveal mode adopts a host-provided anchor as the toggle (no component button)', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const anchor = document.createElement('button');
+    anchor.id = 'btnAdvanced';
+    document.body.appendChild(anchor);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { anchor },
+    });
+
+    assert.equal(container.querySelector('.nav-advanced-toggle'), null,
+        'no component-owned button created when a host anchor is given');
+    assert.equal(anchor.getAttribute('aria-pressed'), 'false', 'anchor managed as the toggle');
+
+    anchor.dispatchEvent(new dom.window.Event('click'));
+    assert.equal(handle.revealed, true, 'host anchor reveals the strip');
+    assert.equal(anchor.getAttribute('aria-pressed'), 'true');
+
+    handle.destroy();
+    // Anchor is host-owned: not removed, aria-pressed restored to its prior (none).
+    assert.ok(anchor.parentNode, 'host anchor left in the DOM after destroy');
+    assert.equal(anchor.getAttribute('aria-pressed'), null, 'anchor aria-pressed restored on destroy');
+    container.remove();
+    anchor.remove();
+});
+
+test('reveal state + active tab survive a destroy()/remount (agent-switch pattern)', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    let handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { toggleLabel: 'Advanced' },
+    });
+    handle.toggleReveal(true);
+    handle.activate('metrics');
+
+    // Host captures state before the agent-switch remount.
+    const wasRevealed = handle.revealed;
+    const savedPanel = 'metrics';
+    handle.destroy();
+
+    handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { toggleLabel: 'Advanced' },
+    });
+    // Restore per the documented pattern.
+    handle.toggleReveal(wasRevealed);
+    handle.activate(savedPanel);
+
+    const nav = container.querySelector('.nav-tabs');
+    assert.equal(handle.revealed, true, 'revealed state restored across remount');
+    assert.notEqual(nav.style.display, 'none', 'strip shown after restore');
+    assert.ok(container.querySelector('#panel-metrics').classList.contains('active'),
+        'active tab restored across remount');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('reveal toggle tracks RUNTIME tab changes: late-gated-on panel wires it in; regating to chat-only hides it and collapses (codex P2)', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    // Mount with EVERYTHING gated off — chat only, so no toggle initially.
+    const caps = {
+        identity: false, constitution: false, memory: false, tasks: false,
+        sovereignty: false, keys: false, wallet: false, metrics: false,
+        featureStore: false, audit: false, permissions: false,
+    };
+    const handle = await mountPanels(container, {
+        api: stubApi(caps),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { toggleLabel: 'Advanced' },
+    });
+    const tick = () => new Promise((r) => setTimeout(r, 0)); // MutationObserver is async
+
+    assert.equal(container.querySelector('.nav-advanced-toggle'), null,
+        'chat-only mount emits no toggle');
+
+    // A capability flips on later (the Frinz flow: feature panels register
+    // AFTER their manifest loads) — the toggle must appear, or the newly
+    // available panel is unreachable behind a display:none strip.
+    caps.identity = true;
+    Panels.syncNav();
+    await tick();
+    const toggle = container.querySelector('.nav-advanced-toggle');
+    assert.ok(toggle, 'toggle wired in when a second tab arrives at runtime');
+    assert.notEqual(toggle.style.display, 'none', 'and it is visible');
+
+    // Reveal, then regate down to chat-only: the toggle hides and the
+    // then-meaningless revealed strip collapses back to chat.
+    toggle.click();
+    assert.equal(handle.revealed, true, 'revealed via the late-wired toggle');
+    caps.identity = false;
+    Panels.syncNav();
+    await tick();
+    assert.equal(toggle.style.display, 'none', 'toggle hidden when gated back to chat-only');
+    assert.equal(handle.revealed, false, 'revealed strip collapsed when nothing remains to show');
+
+    handle.destroy();
+    container.remove();
+});
+
+test('reveal state is host-observable: onReveal fires (incl. initial) and panels-revealed class tracks on scopeEl (#2211 addendum)', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    // Host chrome OUTSIDE the mount — e.g. an agent banner whose management
+    // buttons are [data-advanced-only] and gated by CSS on .panels-revealed.
+    const banner = document.createElement('div');
+    document.body.appendChild(banner);
+
+    const calls = [];
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { scopeEl: banner, onReveal: (r) => calls.push(r) },
+    });
+
+    assert.deepEqual(calls, [false], 'onReveal fires on the INITIAL (collapsed) state application');
+    assert.equal(banner.classList.contains('panels-revealed'), false, 'scope class absent while collapsed');
+
+    handle.toggleReveal(true);
+    assert.deepEqual(calls, [false, true], 'onReveal fires on reveal');
+    assert.ok(banner.classList.contains('panels-revealed'), 'scope class set on reveal — CSS-only hosts need zero JS');
+
+    handle.toggleReveal(false);
+    assert.deepEqual(calls, [false, true, false], 'onReveal fires on collapse');
+    assert.equal(banner.classList.contains('panels-revealed'), false, 'scope class cleared on collapse');
+
+    // Re-reveal then destroy: teardown clears the scope class (banner buttons
+    // must not stay revealed after the mount is gone) without firing onReveal.
+    handle.toggleReveal(true);
+    const callsBeforeDestroy = calls.length;
+    handle.destroy();
+    assert.equal(banner.classList.contains('panels-revealed'), false, 'destroy clears the scope class');
+    assert.equal(calls.length, callsBeforeDestroy, 'destroy does not fire onReveal (teardown, not a state change)');
+    container.remove();
+    banner.remove();
+});
+
+test('reveal onReveal throwing never wedges the toggle; scopeEl defaults to the container', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+        hostTabs: [{ panelId: 'chat', label: 'Chat', element: mkChatEl() }],
+        reveal: { onReveal: () => { throw new Error('host bug'); } },
+    });
+
+    // The throwing callback must not have prevented state application.
+    handle.toggleReveal(true);
+    assert.equal(handle.revealed, true, 'reveal state applied despite the throwing host callback');
+    assert.ok(container.classList.contains('panels-revealed'),
+        'no scopeEl -> the mount container carries the class');
+    handle.destroy();
+    container.remove();
+});
+
+test('non-reveal mount is unchanged: nav strip visible, no toggle, no reveal API effect', async () => {
+    Panels._reset();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+
+    const handle = await mountPanels(container, {
+        api: stubApi(),
+        loadFeatures: false,
+        wireRuntime: false,
+    });
+
+    const nav = container.querySelector('.nav-tabs');
+    assert.notEqual(nav.style.display, 'none', 'nav strip visible by default (standalone parity)');
+    assert.equal(container.querySelector('.nav-advanced-toggle'), null, 'no toggle without reveal');
+    // Reveal API is inert when reveal was not enabled.
+    assert.equal(handle.revealed, false);
+    assert.equal(handle.toggleReveal(true), false, 'toggleReveal is a no-op without reveal');
+    assert.notEqual(nav.style.display, 'none', 'strip stays visible');
+
+    handle.destroy();
+    container.remove();
+});
