@@ -259,6 +259,15 @@ class ProxyFeature(Feature):
         self._tools: List[AgentTool] = []
         self._supervision_task: Optional[asyncio.Task] = None
         self._stopping = False
+        # Coordinate ``set_config``'s reload with the health supervisor so they
+        # never stop/start the client concurrently. ``_reloading`` skips probes
+        # during a reload; ``_reload_lock`` serializes the actual stop/start of
+        # reload vs. a supervisor restart; ``_reload_gen`` lets the supervisor
+        # detect that a reload cycled the client around its (now-stale) probe and
+        # skip restarting the freshly launched one.
+        self._reloading = False
+        self._reload_lock = asyncio.Lock()
+        self._reload_gen = 0
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
         self._host_config: Dict[str, Any] = {}
@@ -289,13 +298,40 @@ class ProxyFeature(Feature):
         # forwarded to the isolated service through the initialize handshake (the
         # service is otherwise launched bare, with only env vars).
         self._host_config = await self._load_host_config()
+        await self._connect_client()
+        self._supervision_task = self._start_supervision()
+
+    async def _connect_client(self) -> None:
+        """Build + start the isolated client from the current ``_host_config``,
+        then wire event handling, tools, and the channel bridge.
+
+        Shared by ``initialize`` (first launch) and ``reload`` (re-launch after a
+        config change). ``_build_client`` snapshots ``_host_config`` into the
+        service's initialize handshake, so rebuilding here is how new config
+        actually reaches a running service.
+        """
         self._client = self._build_client()
         await _maybe_await(self._client.start())
         await self._register_event_handler()
         advertised_tools = await _maybe_await(self._client.list_tools())
         self._tools = [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
         self._register_channel_bridge()
-        self._supervision_task = self._start_supervision()
+
+    async def reload(self) -> None:
+        """Restart the isolated service so the current ``_host_config`` takes
+        effect (config is forwarded only at the initialize handshake, so a live
+        config change requires a re-launch). Guarded so the health supervisor
+        doesn't treat the intentional stop as a crash and double-restart."""
+        async with self._reload_lock:
+            self._reloading = True
+            self._reload_gen += 1
+            try:
+                self._unregister_channel_bridge()
+                if self._client is not None:
+                    await _maybe_await(self._client.stop())
+                await self._connect_client()
+            finally:
+                self._reloading = False
 
     async def shutdown(self):
         self._stopping = True
@@ -344,13 +380,39 @@ class ProxyFeature(Feature):
         )
 
     async def get_config(self) -> Dict:
+        """Return the feature's current host config.
+
+        The SDK client exposes no ``get_config`` (config only flows host→service
+        at initialize), so read from the in-memory host config, falling back to
+        the persisted ``feature_config:<name>`` node — NOT an empty passthrough,
+        which made the config API/UI show blank and drop write-only secrets on a
+        partial PATCH (#2214).
+        """
         if self._client is not None and hasattr(self._client, "get_config"):
-            return await _maybe_await(self._client.get_config())
-        return {}
+            live = await _maybe_await(self._client.get_config())
+            if live:
+                return dict(live)
+        if self._host_config:
+            return dict(self._host_config)
+        persisted = await self.load_persisted_config()
+        return dict(persisted) if isinstance(persisted, dict) else {}
 
     async def set_config(self, config: Dict) -> None:
-        if self._client is not None and hasattr(self._client, "set_config"):
-            await _maybe_await(self._client.set_config(config))
+        """Persist the config AND apply it to the running service.
+
+        The previous implementation forwarded to ``self._client.set_config`` —
+        which the SDK client does not implement — so config set via the API/UI
+        was silently dropped: never persisted (so lost on restart) and never
+        applied (#2214). Persist to the ``feature_config:<name>`` graph node (the
+        same node ``_load_host_config`` reads at startup), update the in-memory
+        host config, then ``reload`` so the new values reach the running service
+        through a fresh initialize handshake.
+        """
+        cfg = dict(config) if isinstance(config, dict) else {}
+        await self.persist_config(cfg)
+        self._host_config = cfg
+        if self._client is not None:
+            await self.reload()
 
     async def _load_host_config(self) -> Dict[str, Any]:
         """Resolve persisted/UI host config to forward into the service.
@@ -811,6 +873,15 @@ class ProxyFeature(Feature):
             backoff = 1.0
             while not self._stopping:
                 await asyncio.sleep(backoff)
+                # A ``set_config`` reload intentionally stops/starts the client;
+                # don't probe (and "restart") a service that is mid-reload.
+                if self._reloading:
+                    backoff = 1.0
+                    continue
+                # Snapshot the reload generation BEFORE probing: if a reload cycles
+                # the client while this (now-stale) probe is in flight, we must not
+                # then "restart" the freshly launched client.
+                gen = self._reload_gen
                 try:
                     health = await asyncio.wait_for(
                         _maybe_await(self._client.health()),
@@ -834,17 +905,25 @@ class ProxyFeature(Feature):
 
                 if self._stopping:
                     break
-                try:
-                    await _maybe_await(self._client.stop())
-                except Exception:  # noqa: BLE001
-                    pass
-                await asyncio.sleep(backoff)
-                try:
-                    await _maybe_await(self._client.start())
-                    backoff = 1.0
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Isolated feature %s restart failed: %s", self.name, exc)
-                    backoff = min(backoff * 2, 30.0)
+                # Serialize the restart against a concurrent reload, and re-check
+                # under the lock: a reload may have started during our probe (so
+                # the failed probe was expected) or completed with a fresh healthy
+                # client. Either way the reload owns the lifecycle — skip.
+                async with self._reload_lock:
+                    if self._stopping or self._reloading or self._reload_gen != gen:
+                        backoff = 1.0
+                        continue
+                    try:
+                        await _maybe_await(self._client.stop())
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await asyncio.sleep(backoff)
+                    try:
+                        await _maybe_await(self._client.start())
+                        backoff = 1.0
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Isolated feature %s restart failed: %s", self.name, exc)
+                        backoff = min(backoff * 2, 30.0)
         finally:
             # If the task is cancelled (e.g. agent shutdown cancelling tracked
             # background tasks) rather than stopped via shutdown(), make sure the

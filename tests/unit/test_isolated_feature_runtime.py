@@ -814,3 +814,91 @@ def test_build_client_passes_stripped_env(monkeypatch, tmp_path):
 
     assert "env" in captured
     assert "PYTHONPATH" not in captured["env"]
+
+
+class _FakeStorage:
+    """Minimal graph store double: records add_node, serves get_node."""
+
+    def __init__(self):
+        self.nodes = {}
+
+    async def add_node(self, node):
+        self.nodes[node.node_id] = node
+
+    async def get_node(self, node_id):
+        return self.nodes.get(node_id)
+
+
+def _cfg_runtime():
+    return InstalledFeatureRuntime(
+        class_name="TestFeature",
+        entry_point="test_pkg.feature:TestFeature",
+        distribution="test-pkg",
+        runtime="isolated-venv",
+        service="test_service",
+        description="Test proxy",
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_config_persists_node_reflects_in_get_config_and_reloads(monkeypatch, tmp_path):
+    """#2214: set_config must persist to the feature_config:<name> graph node,
+    get_config must reflect it (not an empty client passthrough), and the running
+    service must be reloaded so the new config actually takes effect."""
+    agent = Mock()
+    agent.features = {}
+    agent.storage = _FakeStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    clients = []
+
+    def client_factory(**kwargs):
+        c = FakeIsolatedClient(**kwargs)
+        clients.append(c)
+        return c
+
+    feature = ProxyFeature(agent, _cfg_runtime(), client_factory=client_factory)
+    await feature.initialize()
+    assert len(clients) == 1
+
+    new_cfg = {"enabled": True, "allowed_senders": ["8825903191"], "token": "12345:abc"}
+    await feature.set_config(new_cfg)
+
+    # 1) Persisted to the graph node the isolated runtime reads at startup.
+    node = agent.storage.nodes.get("feature_config:TestFeature")
+    assert node is not None, "set_config did not persist the feature_config node"
+    assert node.properties["config"]["allowed_senders"] == ["8825903191"]
+
+    # 2) get_config reflects it (previously always returned {}), incl. the secret
+    #    so the endpoint's write-only-secret preservation works.
+    got = await feature.get_config()
+    assert got["allowed_senders"] == ["8825903191"]
+    assert got["token"] == "12345:abc"
+
+    # 3) Reloaded: old client stopped, a NEW client built with the new config
+    #    forwarded through the initialize handshake (config only flows at init).
+    assert clients[0].stopped is True
+    assert len(clients) == 2
+    assert clients[1].kwargs.get("config") == new_cfg
+
+
+@pytest.mark.asyncio
+async def test_persisted_config_survives_restart(monkeypatch, tmp_path):
+    """A config set on one ProxyFeature is loaded by a fresh one (restart)."""
+    agent = Mock()
+    agent.features = {}
+    agent.storage = _FakeStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+
+    f1 = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    await f1.initialize()
+    await f1.set_config({"allowed_senders": ["777"], "token": "t"})
+
+    # Fresh feature (simulating a host/agent restart) reads the persisted node.
+    f2 = ProxyFeature(agent, _cfg_runtime(), client_factory=FakeIsolatedClient)
+    await f2.initialize()
+    assert (await f2.get_config())["allowed_senders"] == ["777"]
+    # And the reloaded service was launched with that config.
+    assert f2._host_config["allowed_senders"] == ["777"]
