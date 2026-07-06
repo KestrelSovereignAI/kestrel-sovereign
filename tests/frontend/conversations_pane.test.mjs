@@ -99,7 +99,17 @@ test('mount ADOPTS an existing static pane header + resize handle (console chrom
     handle.destroy();
 });
 
-test('toggle()/open()/close() flip collapse state, fire onToggle, and persist', () => {
+test('#2216: default first run is CLOSED — the pane is fully hidden (display:none), not a rail', () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const handle = mountConversationsPane(el, { api: fakeApi(), storageKey: 'k:test-default', autoLoad: false });
+    assert.equal(handle.collapsed, true, 'starts closed with no persisted state');
+    assert.equal(el.style.display, 'none', 'closed pane takes zero width (display:none)');
+    assert.ok(el.classList.contains('collapsed'), 'collapsed marker in lock-step with display');
+    handle.destroy();
+});
+
+test('open()/close()/toggle() flip state, fully hide on close, fire onToggle, and persist (#2216)', () => {
     const el = document.createElement('div');
     document.body.appendChild(el);
     const seen = [];
@@ -107,25 +117,57 @@ test('toggle()/open()/close() flip collapse state, fire onToggle, and persist', 
         api: fakeApi(), storageKey: 'k:test-toggle', autoLoad: false,
         onToggle: (c) => seen.push(c),
     });
-    assert.equal(handle.collapsed, false, 'starts expanded');
-    handle.toggle();
-    assert.equal(handle.collapsed, true, 'toggled to collapsed');
-    assert.ok(el.classList.contains('collapsed'), 'collapsed class applied');
-    assert.equal(localStorage.getItem('k:test-toggle:collapsed'), '1', 'collapse persisted');
+    // Default first-run is closed; the mount fires onToggle with the initial state.
+    assert.equal(handle.collapsed, true, 'starts closed by default');
+    assert.equal(el.style.display, 'none', 'closed pane fully hidden');
     handle.open();
-    assert.equal(handle.collapsed, false, 'open() expands');
+    assert.equal(handle.collapsed, false, 'open() shows the pane');
+    assert.notEqual(el.style.display, 'none', 'open pane is visible');
+    assert.equal(localStorage.getItem('k:test-toggle:collapsed'), '0', 'open state persisted');
     handle.close();
-    assert.equal(handle.collapsed, true, 'close() collapses');
-    assert.deepEqual(seen, [true, false, true], 'onToggle fired for each change');
+    assert.equal(handle.collapsed, true, 'close() fully hides');
+    assert.ok(el.classList.contains('collapsed'), 'collapsed class applied on close');
+    assert.equal(el.style.display, 'none', 'closed = display:none (no rail)');
+    assert.equal(localStorage.getItem('k:test-toggle:collapsed'), '1', 'closed state persisted');
+    handle.toggle();
+    assert.equal(handle.collapsed, false, 'toggle() from closed reopens');
+    assert.deepEqual(seen, [true, false, true, false], 'onToggle fired for init + each change');
     handle.destroy();
 });
 
-test('a persisted collapsed state is restored on the next mount', () => {
+test('a persisted CLOSED state is restored (hidden) on the next mount', () => {
     localStorage.setItem('k:test-restore:collapsed', '1');
     const el = document.createElement('div');
     document.body.appendChild(el);
     const handle = mountConversationsPane(el, { api: fakeApi(), storageKey: 'k:test-restore', autoLoad: false });
-    assert.equal(handle.collapsed, true, 'restored collapsed from localStorage');
+    assert.equal(handle.collapsed, true, 'restored closed from localStorage');
+    assert.equal(el.style.display, 'none', 'restored closed pane is fully hidden');
+    handle.destroy();
+});
+
+test('a persisted OPEN state is restored (visible) on the next mount', () => {
+    localStorage.setItem('k:test-restore-open:collapsed', '0');
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const handle = mountConversationsPane(el, { api: fakeApi(), storageKey: 'k:test-restore-open', autoLoad: false });
+    assert.equal(handle.collapsed, false, 'restored open from localStorage');
+    assert.notEqual(el.style.display, 'none', 'restored open pane is visible');
+    handle.destroy();
+});
+
+test('the chevron collapse button CLOSES the pane to fully hidden (#2216)', () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    // Start from a persisted-open pane so the chevron has something to close.
+    localStorage.setItem('k:test-chevron:collapsed', '0');
+    const handle = mountConversationsPane(el, { api: fakeApi(), storageKey: 'k:test-chevron', autoLoad: false });
+    assert.equal(handle.collapsed, false, 'starts open');
+    el.querySelector('.collapse-btn').click();
+    assert.equal(handle.collapsed, true, 'chevron closed the pane');
+    assert.equal(el.style.display, 'none', 'chevron fully hides the pane (no rail)');
+    // The chevron only closes — a second click does NOT reopen it.
+    el.querySelector('.collapse-btn').click();
+    assert.equal(handle.collapsed, true, 'chevron never reopens (that is the trigger\'s job)');
     handle.destroy();
 });
 

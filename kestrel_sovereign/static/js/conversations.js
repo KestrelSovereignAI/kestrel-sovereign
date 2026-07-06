@@ -23,8 +23,8 @@
  *     LIST surface (same contract family as chat's `mount()` / the panel host's
  *     `mountPanels()`), used by the history slideout and by embedders.
  *   - `mountConversationsPane(containerEl, config)` — the full collapsible PANE
- *     unit: `mountConversations` PLUS the pane chrome (collapse rail,
- *     drag-resize with min/max + localStorage persistence, and a
+ *     unit: `mountConversations` PLUS the pane chrome (a chevron that fully
+ *     hides the pane, drag-resize with min/max + localStorage persistence, and a
  *     search/view-bar/stats disclosure) with `open()/close()/toggle()` +
  *     `onToggle`. The standalone console (#2199) and any embedder consume THIS
  *     one implementation; a host provides only a container + config.
@@ -769,9 +769,10 @@ function storeSet(key, value) {
  * implementation shared by the standalone console (identity.js) and any embed;
  * a host provides only a container + config and gets the complete unit:
  *
- *   - a `<` chevron collapse rail (the existing `.pane-sidebar` idiom) with
- *     `open()` / `close()` / `toggle()` and an `onToggle(collapsed)` callback so
- *     a host toolbar button (the `ki-history` chat-header trigger) can drive it;
+ *   - a `<` chevron that fully HIDES the pane (`display:none`, no leftover rail;
+ *     #2216) with `open()` / `close()` / `toggle()` and an `onToggle(collapsed)`
+ *     callback so a host toolbar button (the `ki-history` chat-header trigger)
+ *     can reopen it;
  *   - a drag-resize handle with min/max width + `localStorage` persistence;
  *   - a disclosure toggle that collapses the search / view-bar / stats block
  *     (default open, persisted);
@@ -901,12 +902,23 @@ export function mountConversationsPane(containerEl, config = {}) {
     const statsEl = listHandle.element.querySelector('.conversations-stats');
 
     // ---- Collapse state ---------------------------------------------------
+    // #2216: the pane has exactly TWO states — open (full pane) and fully
+    // HIDDEN (`display:none`, zero width — NO collapsed chevron rail). close()
+    // hides the pane entirely; open() shows it. The `.collapsed` class is kept
+    // in lock-step with `display:none` as the single state marker so every
+    // reader (identity.js, tests, the KEY_COLLAPSED persistence — '1' = closed)
+    // sees one consistent representation. The chevron CLOSES; the chat-header
+    // history trigger reopens.
     function isCollapsed() {
         return !!(paneEl.classList && paneEl.classList.contains('collapsed'));
     }
     function applyCollapsed(collapsed, persist) {
         if (!paneEl.classList) return;
         paneEl.classList.toggle('collapsed', collapsed);
+        // Fully hide when closed; restore CSS-driven display when open. Inline
+        // display is the load-bearing hide (CSS `.conversations-pane.collapsed`
+        // backs it up); clearing it lets `.pane-sidebar { display:flex }` apply.
+        paneEl.style.display = collapsed ? 'none' : '';
         if (persist) storeSet(KEY_COLLAPSED, collapsed ? '1' : '0');
         if (typeof config.onToggle === 'function') config.onToggle(collapsed);
     }
@@ -914,15 +926,20 @@ export function mountConversationsPane(containerEl, config = {}) {
     function close() { if (!isCollapsed()) applyCollapsed(true, true); }
     function toggle() { applyCollapsed(!isCollapsed(), true); }
 
-    const onCollapseClick = () => toggle();
+    // The chevron `<` CLOSES the pane (fully hides it) — it never reopens; the
+    // chat-header history trigger owns reopening (#2216).
+    const onCollapseClick = () => close();
     collapseBtn.addEventListener('click', onCollapseClick);
 
-    // Initial collapse state: persisted value wins over the config default.
+    // Initial state: a persisted value wins; otherwise the first-run default is
+    // CLOSED/hidden (#2216 — an explicit `config.collapsed: false` can still
+    // start it open). Always applied so the pane's `display` reflects the state
+    // from mount, whichever branch wins.
     const persistedCollapsed = storeGet(KEY_COLLAPSED);
     const startCollapsed = persistedCollapsed !== null
         ? persistedCollapsed === '1'
-        : !!config.collapsed;
-    if (startCollapsed) applyCollapsed(true, false);
+        : (config.collapsed !== undefined ? !!config.collapsed : true);
+    applyCollapsed(startCollapsed, false);
 
     // ---- Filters disclosure ----------------------------------------------
     function applyFilters(open_, persist) {

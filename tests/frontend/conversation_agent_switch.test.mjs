@@ -172,33 +172,39 @@ test('standalone console consumes mountConversationsPane: chrome built + window.
     assert.ok(pane.querySelector('.collapse-btn'), 'collapse rail present');
     assert.ok(pane.querySelector('.resize-handle'), 'resize handle present');
 
+    // #2216: default first-run is CLOSED — the mounted pane starts fully hidden.
+    assert.ok(pane.classList.contains('collapsed'), 'starts closed (default hidden)');
+    assert.equal(pane.style.display, 'none', 'closed pane takes zero width');
     // The chat-header ki-history trigger drives the pane through the export API.
-    assert.equal(pane.classList.contains('collapsed'), false, 'starts expanded');
     window.toggleConversationsPane();
-    assert.ok(pane.classList.contains('collapsed'), 'toolbar trigger collapsed the pane');
+    assert.equal(pane.classList.contains('collapsed'), false, 'trigger opened the pane');
+    assert.notEqual(pane.style.display, 'none', 'opened pane is visible');
     window.toggleConversationsPane();
-    assert.equal(pane.classList.contains('collapsed'), false, 'toolbar trigger expands it again');
+    assert.ok(pane.classList.contains('collapsed'), 'trigger closes it again (fully hidden)');
+    assert.equal(pane.style.display, 'none', 'closed again = display:none');
 });
 
-test('first toggle from a hidden pane REVEALS it expanded, never collapses the just-revealed pane (#2199 cold start)', async () => {
-    // Cold-start / multi-agent-before-select case: the pane is display:none and
-    // (with no persisted collapse state) a fresh mount starts expanded. The
-    // history trigger must OPEN it, not toggle it collapsed on the first click.
+test('the chevron fully hides the pane; the history trigger reopens it (#2216)', async () => {
     API.getConversations = async () => ({ conversations: [] });
     API.setHostAgent('Emma');
-
-    const pane = document.getElementById('conversations-pane');
-    pane.style.display = 'none';
-    pane.classList.remove('collapsed');
-
-    window.toggleConversationsPane();
+    refreshConversationsPane();
     await new Promise((r) => setTimeout(r, 0));
 
-    assert.equal(pane.style.display, 'flex', 'hidden pane is revealed');
-    assert.equal(
-        pane.classList.contains('collapsed'), false,
-        'the first click from hidden leaves the pane EXPANDED (open), not collapsed',
-    );
+    const pane = document.getElementById('conversations-pane');
+    // Open it first via the trigger so the chevron has something to close.
+    if (pane.classList.contains('collapsed')) window.toggleConversationsPane();
+    assert.equal(pane.classList.contains('collapsed'), false, 'pane is open');
+    assert.notEqual(pane.style.display, 'none', 'open pane is visible');
+
+    // The chevron `<` CLOSES the pane to fully hidden — no leftover rail.
+    pane.querySelector('.collapse-btn').click();
+    assert.ok(pane.classList.contains('collapsed'), 'chevron closed the pane');
+    assert.equal(pane.style.display, 'none', 'chevron fully hides the pane');
+
+    // The history trigger reopens it.
+    window.toggleConversationsPane();
+    assert.equal(pane.classList.contains('collapsed'), false, 'history trigger reopens');
+    assert.notEqual(pane.style.display, 'none', 'reopened pane is visible');
 });
 
 test('a stale row clicked DURING the retarget fetch window stays pinned to the old agent (#2199 render-time snapshot)', async () => {
