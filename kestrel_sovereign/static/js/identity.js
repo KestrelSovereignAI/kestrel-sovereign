@@ -4,7 +4,8 @@
  */
 
 import API from './api.js';
-import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
+import { state, PRIVACY_MODES, Toast, Modal, loadCommands } from './ui.js';
+import { renderIdentityDangerZone } from './identity-danger-zone.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts, renderSignalWakeChip } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
@@ -334,6 +335,19 @@ export async function loadIdentity() {
                 </div>
             `;
         }
+
+        // #2208: danger-zone section (delete agent + future destructive actions).
+        // Rendered last so it sits at the bottom of the panel. The module decides
+        // visibility itself — it blanks the container when no host handler and no
+        // native capability apply, so re-rendering on every selectAgent is
+        // self-clearing and safe.
+        renderIdentityDangerZone({
+            container: document.getElementById('identity-danger-zone'),
+            identity,
+            api: API,
+            Modal,
+            Toast,
+        });
     } catch (e) {
         const card = document.getElementById('identity-card');
         if (card) card.innerHTML = `<div style="color: var(--error); padding: 1rem;">Failed to load identity: ${e.message}</div>`;
