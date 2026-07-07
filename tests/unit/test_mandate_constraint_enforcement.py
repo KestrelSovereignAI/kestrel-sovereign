@@ -1,11 +1,16 @@
 """Runtime enforcement of SpawnMandate additional_constraints (#2137).
 
-Covers the two halves of enforcement:
-  1. Durable: the mandate's constraints are woven into the child's *anchored*
-     constitution (so they reach the system prompt and integrity anchoring) and
-     recorded on the delegation edge.
-  2. Hard: a spawned child cannot actually invoke a `restricted_tools` entry —
-     the MandateRestrictionHook denies it at PRE_TOOL_USE.
+  1. Durable record: the mandate's constraints are persisted on the spawned_by
+     delegation edge, so enforcement can be reattached at load (survives restart)
+     without rewriting — and breaking the integrity hash of — the base
+     constitution.
+  2. Hard enforcement: a spawned child cannot actually invoke a `restricted_tools`
+     entry — the MandateRestrictionHook denies it at PRE_TOOL_USE, applied
+     uniformly on the load path (fresh spawn, reload, restart).
+
+Rendering the mandate's behavioral_rules into the child's effective constitution
+via the #1722 per-agent overlay is a follow-up (kept out of here so the base
+constitution stays canonical and integrity-verifiable).
 """
 
 import os
@@ -20,7 +25,6 @@ from kestrel_sovereign.multi_agent.agent_manager import AgentManager, _read_spaw
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
 from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 
@@ -30,9 +34,12 @@ RESTRICTED_TOOL = "computer_use_shell"
 
 
 @pytest.mark.asyncio
-async def test_mandate_constraints_woven_into_anchored_constitution(tmp_path):
-    """The child's anchored constitution carries the mandate's behavioral rules
-    and restricted-tools list, and the delegation edge records the constraints."""
+async def test_mandate_constraints_persisted_on_delegation_edge(tmp_path):
+    """The mandate's constraints are recorded on the spawned_by delegation edge,
+    the durable machine-readable record the load path reattaches enforcement
+    from. (The anchored base constitution is left canonical so its integrity
+    hash still verifies — the enforcement path is the edge + the load-time hook,
+    not a rewrite of the base constitution.)"""
     parent_private, _ = generate_secp256k1_keypair()
     parent_did = "did:pkh:eip155:1:0xParentEnforce"
 
@@ -60,22 +67,11 @@ async def test_mandate_constraints_woven_into_anchored_constitution(tmp_path):
     try:
         graph = AsyncGraphStore(db)
         out_edges = await graph.get_edges(creds.agent_did, direction="out")
-
-        # (1) constraints persisted on the spawned_by edge
         spawned = [e for e in out_edges if e.label == "spawned_by"]
         assert len(spawned) == 1
-        assert spawned[0].properties["additional_constraints"]["restricted_tools"] == [
-            RESTRICTED_TOOL
-        ]
-
-        # (2) anchored constitution (governed_by target) contains the constraints
-        governed = [e for e in out_edges if e.label == "governed_by"]
-        assert len(governed) == 1
-        files = AsyncFileStore(db)
-        constitution = (await files.retrieve_file(governed[0].target_id)).decode("utf-8")
-        assert "SPAWN MANDATE CONSTRAINTS" in constitution
-        assert BEHAVIOR_RULE in constitution
-        assert RESTRICTED_TOOL in constitution
+        constraints = spawned[0].properties["additional_constraints"]
+        assert constraints["restricted_tools"] == [RESTRICTED_TOOL]
+        assert constraints["behavioral_rules"] == [BEHAVIOR_RULE]
     finally:
         await db.close()
 
