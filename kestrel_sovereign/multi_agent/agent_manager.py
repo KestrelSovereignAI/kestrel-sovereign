@@ -125,6 +125,10 @@ class AgentManager:
             )
 
         await agent.initialize()
+        # Spawn-mandate enforcement (restricted_tools hook + spawn_mandate attach)
+        # is reattached inside KestrelAgent.initialize() from the persisted
+        # delegation edge (#2137), so it covers every boot path — not just this
+        # one — uniformly.
 
         self._agents[name] = agent
         self._agent_names[agent.agent_id] = name
@@ -419,6 +423,10 @@ class AgentManager:
 
         # Fill in child DID on the mandate
         mandate.child_did = child.agent_id
+        # Runtime enforcement (spawn_mandate attach + restricted_tools hook) is
+        # applied uniformly in load_agent from the persisted delegation edge
+        # (#2137), which already ran for this child inside create_agent — so it
+        # covers reload/restart, not just this in-process spawn.
 
         # Track parent-child relationship
         parent_did = parent_agent.agent_id

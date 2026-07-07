@@ -571,6 +571,16 @@ async def create_kestrel_identity_async(
             edge_properties["ttl_seconds"] = spawn_mandate.ttl_seconds
             edge_properties["max_child_depth"] = spawn_mandate.max_child_depth
             edge_properties["created_at"] = spawn_mandate.created_at
+            # Durable record of the enforcement constraints (#2137): the anchored
+            # constitution carries them for soft/system-prompt enforcement, and
+            # the delegation edge records the machine-readable form for audit and
+            # a future load-time re-attach of the runtime restricted_tools hook.
+            edge_properties["additional_constraints"] = (
+                getattr(spawn_mandate, "additional_constraints", {}) or {}
+            )
+            edge_properties["features_allowed"] = list(
+                getattr(spawn_mandate, "features_allowed", []) or []
+            )
         await graph.add_edge(agent_did, parent_did, "spawned_by", properties=edge_properties)
         logging.info(f"Recorded spawned_by edge from {agent_did} to {parent_did}")
 
