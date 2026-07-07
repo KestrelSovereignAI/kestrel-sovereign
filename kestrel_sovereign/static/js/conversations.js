@@ -368,11 +368,14 @@ export function mountConversations(containerEl, config = {}) {
     // source of truth, read at render time. `setActiveSessionId` lets a host —
     // or the component's own new-conversation action — override the highlight
     // synchronously, which is what paints a just-created tile active BEFORE any
-    // list refetch resolves. `undefined` means "no override, defer to the config
-    // getter"; a value (including `null`) wins.
-    let activeIdOverride; // undefined = defer to getActiveSessionId()
+    // list refetch resolves. A NULLISH id CLEARS the override (defer to the
+    // config getter): "no active session" must never be a sticky pin, or a
+    // host seeding the highlight while an agent has no current session
+    // (identity.js retarget) would mask the session chat.js learns on the
+    // first message — the list would never highlight it (codex P2 on #2224).
+    let activeIdOverride = null; // nullish = defer to getActiveSessionId()
     function currentActiveId() {
-        return activeIdOverride !== undefined ? activeIdOverride : getActiveSessionId();
+        return activeIdOverride != null ? activeIdOverride : getActiveSessionId();
     }
 
     let view = config.view || 'active';
