@@ -20,7 +20,10 @@
             <img id="nav-agent-avatar" src="" alt="" style="display: none; width: 32px; height: 32px; border-radius: 50%; object-fit: cover;">
             <h1 id="nav-agent-name">Kestrel</h1>
         </div>
-        <div class="nav-tabs">
+        <!-- #2229: the standalone console is chat-first — the tab strip starts
+             hidden and is revealed by the chat-header "Advanced" toggle (shared
+             reveal implementation, Panels.initReveal, wired in initNavigation). -->
+        <div class="nav-tabs" style="display: none;">
             <button class="nav-tab active" data-panel="chat" data-label-key="tab_chat">Chat</button>
             <button class="nav-tab" data-panel="identity" data-label-key="tab_identity">Identity</button>
             <button class="nav-tab" data-panel="constitution" data-label-key="tab_constitution">Constitution</button>
@@ -142,6 +145,12 @@
                                  the standalone conversations pane. -->
                             <button id="conversations-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_toggle_conversations" title="Conversations" aria-label="Toggle conversations pane" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-history"></span></button>
                             <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" data-label-attr-title="btn_new_chat" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
+                            <!-- #2229: chat-first "Advanced" toggle. Reveals the
+                                 capability-gated tab strip (hidden by default);
+                                 aria-pressed + visibility are managed by the shared
+                                 reveal code (Panels.initReveal). Starts hidden so a
+                                 single-tab console never shows it. -->
+                            <button id="advanced-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_advanced" title="Advanced" aria-label="Toggle advanced panels" aria-pressed="false" style="display: none; padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-gear"></span> <span data-label-key="btn_advanced">Advanced</span></button>
                         </div>
 
                         <!-- Center: Model Selection (Vendor → [Route] → Model).
