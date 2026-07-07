@@ -4,6 +4,22 @@
   "routes": [
     {
       "existing_code_refs": [
+        "AGENTS.md",
+        "KESTREL_FEATURES.md",
+        "README.md"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/ECOSYSTEM.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Kestrel Ecosystem Repository Index",
+      "type": "Documentation Index"
+    },
+    {
+      "existing_code_refs": [
         "README.md",
         "kestrel_sovereign/main.py",
         "main.py"
