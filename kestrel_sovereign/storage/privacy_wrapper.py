@@ -860,8 +860,12 @@ class PrivacyEnforcingStorage:
                     "metadata": meta,
                     "created_at": conv.get("created_at", None),
                 })
+            # Titles via the wrapper's OWN privacy-aware accessor — reading
+            # self._storage directly would surface persisted names against
+            # in-memory rows, leaking durable metadata into an isolated
+            # session (codex r3 P1).
             try:
-                names = await self._storage.get_conversation_names() or {}
+                names = await self.get_conversation_names() or {}
             except Exception:
                 names = {}
             return search_session_summaries(

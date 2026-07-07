@@ -274,16 +274,29 @@ class TestPrivacyWrappedSearch:
 
     @pytest.mark.asyncio
     async def test_isolated_searches_session_buffer(self):
+        from unittest.mock import AsyncMock
+
         from kestrel_sovereign.privacy import PrivacyMode
         from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
-        wrapper = PrivacyEnforcingStorage(MagicMock(), PrivacyMode.ISOLATED)
+        underlying = MagicMock()
+        # Persisted titles must NEVER surface in an isolated session, even
+        # when a buffer session_id collides with a persisted one (codex r3
+        # P1) — titles go through the wrapper's privacy-aware accessor,
+        # which returns {} in this mode.
+        underlying.get_conversation_names = AsyncMock(
+            return_value={"session-local": "Persisted secret title"}
+        )
+        wrapper = PrivacyEnforcingStorage(underlying, PrivacyMode.ISOLATED)
         await wrapper.add_conversation("user", "penguin in isolation")
         await wrapper.add_conversation("user", "unrelated")
 
         results = await wrapper.search_conversations("a", "penguin")
         assert len(results) == 1
         assert "penguin" in results[0]["match_snippet"]
+        assert "name" not in results[0]
+        # A query matching only the persisted title finds nothing here.
+        assert await wrapper.search_conversations("a", "persisted secret") == []
         # No archive concept in the buffer.
         assert await wrapper.search_conversations("a", "penguin", view="archived") == []
 
