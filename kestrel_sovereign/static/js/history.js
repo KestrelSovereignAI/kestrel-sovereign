@@ -305,6 +305,30 @@ window.toggleEncryptionView = async function() {
 
 window.startNewConversation = async function() {
     try {
+        // #2222: when the shared conversations pane is mounted for this host,
+        // route through its component-owned new-conversation action so the New
+        // tile appears instantly, becomes the CURRENT conversation (active
+        // highlight + subsequent messages land in it), and the host-side chat
+        // wiping / state / context-footer update runs exactly once (via the
+        // pane's `onNewConversation`). The pane's optimistic prepend replaces
+        // the pre-#2199 `loadConversationHistory()` list refresh here.
+        const viaPane = (typeof window.newConversationViaPane === 'function')
+            ? window.newConversationViaPane()
+            : null;
+        if (viaPane) {
+            // The pane's newConversation() handles its own failure (Toast.error
+            // + resolves null), so only claim success when it actually minted a
+            // session — otherwise the user would see both the error toast and a
+            // contradictory success toast.
+            const result = await viaPane;
+            if (result && result.session_id) {
+                Toast.success('New conversation started');
+            }
+            return;
+        }
+
+        // Fallback (no pane mounted — e.g. a host without the conversations
+        // surface): do the chat-side flow directly.
         const result = await API.newConversation();
 
         // Wipe the visible agent's pane and bump that agent's pane-
@@ -320,6 +344,7 @@ window.startNewConversation = async function() {
         `);
         state.currentSessionId = result.session_id;
 
+        // Signal the shared pane owner (identity.js) to reconcile its list.
         await loadConversationHistory();
 
         // Refresh the context status for the new (empty) session so the

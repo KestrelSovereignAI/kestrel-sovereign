@@ -153,7 +153,13 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
         # Coalesce same-UUID clusters (resumed-past-the-gap conversations) so a
         # listed session_id is a unique delete target, matching the lifecycle
         # tools and avoiding a delete-one-destroys-both collision (#2019).
-        grouped = coalesce_sessions_by_session_id(group_messages_into_sessions(normalized))
+        # keep_empty_markers=True so a just-started conversation (a session
+        # marker with no messages yet) is list-visible immediately (#2222) —
+        # the UI optimistically prepends a tile for it on New, and this
+        # reconciling list must include it or the tile vanishes on refresh.
+        grouped = coalesce_sessions_by_session_id(
+            group_messages_into_sessions(normalized, keep_empty_markers=True)
+        )
         # Newest-first by last activity so a resumed conversation ranks by its
         # latest message rather than its first cluster's position (#2019).
         grouped.sort(key=lambda s: s["last_message_at"], reverse=True)
