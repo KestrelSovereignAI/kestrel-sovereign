@@ -16,7 +16,7 @@ import pytest
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
-from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager, _read_spawn_mandate
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -78,6 +78,63 @@ async def test_mandate_constraints_woven_into_anchored_constitution(tmp_path):
         assert RESTRICTED_TOOL in constitution
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reload_reconstructs_mandate_and_enforces(tmp_path):
+    """The reload path (load_agent's helper) reconstructs the mandate from the
+    persisted edge and re-applies the restricted_tools hook — so enforcement
+    survives restart, not just the in-process spawn."""
+    parent_private, _ = generate_secp256k1_keypair()
+    parent_did = "did:pkh:eip155:1:0xParentReload"
+
+    mandate = SpawnMandate(
+        parent_did=parent_did,
+        purpose="scoped worker",
+        ttl_seconds=1800,
+        max_child_depth=0,
+        additional_constraints={"restricted_tools": [RESTRICTED_TOOL]},
+    )
+    mandate = sign_mandate(mandate, parent_private)
+
+    creds = await create_kestrel_identity_async(
+        output_dir=str(tmp_path),
+        is_test_instance=True,
+        agent_name="ReloadedChild",
+        parent_did=parent_did,
+        spawn_mandate=mandate,
+    )
+
+    # Simulate a fresh load: reconstruct the mandate from the persisted edge.
+    reconstructed = await _read_spawn_mandate(str(tmp_path), creds.agent_did)
+    assert reconstructed is not None
+    assert reconstructed.additional_constraints["restricted_tools"] == [RESTRICTED_TOOL]
+
+    # And it re-applies as a real block.
+    child = SimpleNamespace(name="ReloadedChild", hooks_manager=HooksManager())
+    AgentManager._enforce_restricted_tools(child, reconstructed)
+    out = await child.hooks_manager.execute_hooks(
+        HookEvent.PRE_TOOL_USE,
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name=RESTRICTED_TOOL,
+            tool_input={},
+        ),
+    )
+    blocked = evaluate_blocking_decision(out)
+    assert blocked is not None and blocked.decision == PermissionDecision.DENY
+
+
+@pytest.mark.asyncio
+async def test_read_spawn_mandate_none_for_root_agent(tmp_path):
+    """A non-spawned (root) agent has no spawned_by edge ⇒ no mandate."""
+    creds = await create_kestrel_identity_async(
+        output_dir=str(tmp_path),
+        is_test_instance=True,
+        agent_name="RootAgent",
+    )
+    assert await _read_spawn_mandate(str(tmp_path), creds.agent_did) is None
 
 
 @pytest.mark.asyncio

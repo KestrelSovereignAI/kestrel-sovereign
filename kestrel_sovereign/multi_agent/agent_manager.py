@@ -42,6 +42,44 @@ async def _get_agent_did(storage_dir: str) -> str:
         await storage.close()
 
 
+async def _read_spawn_mandate(storage_dir: str, agent_did: str) -> Optional[SpawnMandate]:
+    """Reconstruct a child's spawn mandate from its persisted ``spawned_by`` edge (#2137).
+
+    Returns ``None`` for a root (non-spawned) agent. The reconstruction is
+    intentionally UNSIGNED: the delegation edge is the durable record, and the
+    mandate is used only to *re-apply restrictions* at load (restrictions only
+    ever tighten — fail-safe), not to re-verify the parent signature. It carries
+    ``additional_constraints`` (the runtime-enforceable part) but deliberately
+    omits ``features_allowed`` — feature-load narrowing is already enforced at
+    load (#1946) and captured in the anchored constitution, and leaving it unset
+    avoids the constitution re-validation's features-subset check misfiring on
+    reload against the child's own already-narrowed feature set.
+    """
+    db_path = os.path.join(storage_dir, "kestrel_prime.db")
+    storage = AsyncStorage(db_path)
+    await storage.initialize()
+    try:
+        edges = await storage.get_edges_from(agent_did)
+    finally:
+        await storage.close()
+
+    spawned = [e for e in edges if e.label == "spawned_by"]
+    if not spawned:
+        return None
+    props = spawned[0].properties or {}
+    kwargs = {
+        "parent_did": spawned[0].target_id,
+        "purpose": props.get("purpose", ""),
+        "ttl_seconds": props.get("ttl_seconds", 3600),
+        "max_child_depth": props.get("max_child_depth", 0),
+        "additional_constraints": props.get("additional_constraints", {}) or {},
+        "child_did": agent_did,
+    }
+    if props.get("created_at"):
+        kwargs["created_at"] = props["created_at"]
+    return SpawnMandate(**kwargs)
+
+
 class AgentManager:
     """In-process multi-agent manager.
 
@@ -125,6 +163,17 @@ class AgentManager:
             )
 
         await agent.initialize()
+
+        # Reattach spawn-mandate enforcement from the persisted delegation edge
+        # (#2137). load_agent is the single load path for EVERY agent — fresh
+        # spawn (via create_agent), reload, and host restart — so a spawned
+        # child's restricted_tools are hard-enforced whenever it runs, not only
+        # in the process that first spawned it. The anchored constitution already
+        # carries the constraints for soft/system-prompt enforcement.
+        spawn_mandate = await _read_spawn_mandate(str(resolved_dir), agent_did)
+        if spawn_mandate is not None:
+            agent.spawn_mandate = spawn_mandate
+            self._enforce_restricted_tools(agent, spawn_mandate)
 
         self._agents[name] = agent
         self._agent_names[agent.agent_id] = name
@@ -441,15 +490,10 @@ class AgentManager:
 
         # Fill in child DID on the mandate
         mandate.child_did = child.agent_id
-
-        # Attach the mandate to the running child and enforce it (#2137).
-        # Setting ``spawn_mandate`` makes the existing constitution-integrity
-        # re-validation (``_verify_spawn_mandate_constraints``) live for this
-        # child, and lets a restricted_tools list be hard-enforced at runtime via
-        # a PRE_TOOL_USE hook — the anchored constitution already carries the
-        # constraints for soft/system-prompt enforcement.
-        child.spawn_mandate = mandate
-        self._enforce_restricted_tools(child, mandate)
+        # Runtime enforcement (spawn_mandate attach + restricted_tools hook) is
+        # applied uniformly in load_agent from the persisted delegation edge
+        # (#2137), which already ran for this child inside create_agent — so it
+        # covers reload/restart, not just this in-process spawn.
 
         # Track parent-child relationship
         parent_did = parent_agent.agent_id
