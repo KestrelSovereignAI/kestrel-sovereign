@@ -254,3 +254,41 @@ async def test_mint_managed_openrouter_key_public_helper(monkeypatch):
     assert info.key_hash == "boot-hash"
     posts = [r for c in _FakeAsyncClient.instances for r in c.requests if r[0] == "POST"]
     assert posts and posts[0][2]["limit"] == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_cache_keyed_per_management_key(monkeypatch):
+    """The bootstrap-key cache must be keyed by management key.
+
+    Two OpenRouter routes finalized in one process under DIFFERENT management
+    keys (different OpenRouter accounts) must each get their own minted child
+    key — otherwise the second route registers with the first account's key and
+    billing/account isolation breaks. The same management key still reuses its
+    cached key (idempotent per account).
+    """
+    from kestrel_sovereign.llm import provider_registry as pr
+    from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
+        OpenRouterProvisioningService,
+    )
+
+    class _Info:
+        def __init__(self, key):
+            self.key = key
+
+    async def _fake_create_agent_key(self, *, agent_name, limit_usd, limit_reset="monthly"):
+        # Derive the child key from the account's management key so the test
+        # can prove no cross-account reuse.
+        return _Info(f"sk-or-v1-child-of-{self.management_key}")
+
+    monkeypatch.setattr(
+        OpenRouterProvisioningService, "create_agent_key", _fake_create_agent_key
+    )
+
+    key_a1 = await pr._mint_bootstrap_openrouter_key("sk-or-mgmt-AAA")
+    key_b = await pr._mint_bootstrap_openrouter_key("sk-or-mgmt-BBB")
+    key_a2 = await pr._mint_bootstrap_openrouter_key("sk-or-mgmt-AAA")
+
+    assert key_a1 == "sk-or-v1-child-of-sk-or-mgmt-AAA"
+    assert key_b == "sk-or-v1-child-of-sk-or-mgmt-BBB"
+    assert key_a1 != key_b  # isolation: distinct accounts → distinct keys
+    assert key_a2 == key_a1  # idempotent per management key (cached)

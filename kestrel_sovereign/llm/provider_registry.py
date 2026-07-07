@@ -806,11 +806,13 @@ _CACHE_PROMPT_VENDORS = frozenset({"llama_cpp"})
 # roomy cap keeps the default route usable without babysitting.
 _BOOTSTRAP_OPENROUTER_LIMIT_USD = 50.0
 
-# Process-wide cache: mint the bootstrap key at most once per process, even
-# across multiple ``ProviderRegistry`` / ``LLMService`` instances (multi-agent
-# host). Guarded by a lazily-created asyncio.Lock so concurrent finalize calls
-# don't mint duplicates.
-_BOOTSTRAP_OPENROUTER_KEY: Optional[str] = None
+# Process-wide cache: mint the bootstrap key at most once per process *per
+# management key*, even across multiple ``ProviderRegistry`` / ``LLMService``
+# instances (multi-agent host). Keyed by management key so routes configured
+# with DIFFERENT OpenRouter accounts never reuse each other's minted child key
+# (preserves per-account billing isolation). Guarded by a lazily-created
+# asyncio.Lock so concurrent finalize calls don't mint duplicates.
+_BOOTSTRAP_OPENROUTER_KEYS: Dict[str, str] = {}
 _BOOTSTRAP_OPENROUTER_LOCK: Optional[asyncio.Lock] = None
 
 
@@ -835,14 +837,16 @@ async def _mint_bootstrap_openrouter_key(
     key is NOT persisted to any DB — it is process-lived and only backs the
     default route; per-user keys override it in the call path.
     """
-    global _BOOTSTRAP_OPENROUTER_KEY, _BOOTSTRAP_OPENROUTER_LOCK
-    if _BOOTSTRAP_OPENROUTER_KEY is not None:
-        return _BOOTSTRAP_OPENROUTER_KEY
+    global _BOOTSTRAP_OPENROUTER_LOCK
+    cached = _BOOTSTRAP_OPENROUTER_KEYS.get(management_key)
+    if cached is not None:
+        return cached
     if _BOOTSTRAP_OPENROUTER_LOCK is None:
         _BOOTSTRAP_OPENROUTER_LOCK = asyncio.Lock()
     async with _BOOTSTRAP_OPENROUTER_LOCK:
-        if _BOOTSTRAP_OPENROUTER_KEY is not None:
-            return _BOOTSTRAP_OPENROUTER_KEY
+        cached = _BOOTSTRAP_OPENROUTER_KEYS.get(management_key)
+        if cached is not None:
+            return cached
         # Late import: keep the provisioning surface (httpx) out of module
         # import so the registry loads on deployments that never touch it.
         from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
@@ -858,19 +862,19 @@ async def _mint_bootstrap_openrouter_key(
             )
         finally:
             await service.close()
-        _BOOTSTRAP_OPENROUTER_KEY = key_info.key
+        _BOOTSTRAP_OPENROUTER_KEYS[management_key] = key_info.key
         logger.info(
             "Minted process-wide bootstrap OpenRouter key "
             "(limit $%.2f/mo) as OpenRouter route default",
             limit_usd,
         )
-        return _BOOTSTRAP_OPENROUTER_KEY
+        return key_info.key
 
 
 def _reset_bootstrap_openrouter_key_cache() -> None:
     """Test hook: clear the process-wide bootstrap-key cache."""
-    global _BOOTSTRAP_OPENROUTER_KEY, _BOOTSTRAP_OPENROUTER_LOCK
-    _BOOTSTRAP_OPENROUTER_KEY = None
+    global _BOOTSTRAP_OPENROUTER_LOCK
+    _BOOTSTRAP_OPENROUTER_KEYS.clear()
     _BOOTSTRAP_OPENROUTER_LOCK = None
 
 
