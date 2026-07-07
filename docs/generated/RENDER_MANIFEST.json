@@ -56,13 +56,9 @@
         "scripts/generate_demo_evidence_docs.py",
         "scripts/generate_feature_docs.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "ECOSYSTEM.md"
-      ],
+      "missing_links": [],
       "path": "docs/README.md",
       "privacy": "public",
       "render": "public",
