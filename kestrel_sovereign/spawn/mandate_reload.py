@@ -23,22 +23,25 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
     """Reconstruct a child's mandate from its persisted ``spawned_by`` edge.
 
     Returns ``None`` for a root (non-spawned) agent or a spawn with no recorded
-    enforceable constraints. The reconstruction is intentionally UNSIGNED: the
-    edge is the durable record and the mandate is used only to *re-apply
-    restrictions* (which only ever tighten — fail-safe), not to re-verify the
-    parent signature. ``features_allowed`` is deliberately omitted — feature-load
-    narrowing is enforced at load (#1946), and leaving it unset avoids the
+    enforceable ``additional_constraints``. The reconstruction is intentionally
+    UNSIGNED: the edge is the durable record and the mandate is used only to
+    *re-apply restrictions* (which only ever tighten — fail-safe), not to
+    re-verify the parent signature.
+
+    Fail CLOSED: a delegation-edge read error is NOT swallowed — it propagates so
+    boot fails rather than silently continuing without a spawned child's
+    restrictions (the read runs against already-initialised local storage, so a
+    failure here is genuinely exceptional).
+
+    Scope: ``features_allowed`` is deliberately NOT reconstructed here. Enforcing
+    a spawned child's feature allowlist on non-AgentManager boot paths is
+    feature-load narrowing (#1946) and must run before feature discovery; it is
+    tracked as a separate follow-up. Leaving it unset here also avoids the
     constitution re-validation's features-subset check misfiring on reload
     against the child's own already-narrowed feature set.
     """
-    try:
-        edges = await storage.get_edges_from(agent_did)
-    except Exception as e:  # noqa: BLE001 — a read failure must not crash boot
-        logger.warning(
-            "spawn-mandate reload: could not read delegation edges for %s: %s",
-            agent_did[:30], e,
-        )
-        return None
+    # No try/except: propagate read errors (fail closed) — see docstring.
+    edges = await storage.get_edges_from(agent_did)
 
     spawned = [e for e in edges if getattr(e, "label", None) == "spawned_by"]
     if not spawned:
