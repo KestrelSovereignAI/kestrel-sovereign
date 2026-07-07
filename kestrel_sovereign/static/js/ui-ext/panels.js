@@ -430,6 +430,14 @@ export function initReveal(opts = {}) {
         // but must NOT clobber the persisted preference — returning tabs (or a
         // reload) should honor "operator lives in Advanced".
         if (!multi && _revealed) _setRevealed(false, { persist: false });
+        // ...and the inverse (codex P3 on #2231): when tabs ARRIVE — a second
+        // tab registers after boot, or regated tabs return — a persisted
+        // "revealed" preference must be reapplied, not just the toggle shown.
+        // Without this, an operator whose advanced tabs load late (feature
+        // manifests) boots collapsed forever despite the stored preference.
+        if (multi && !_revealed && _readPersisted() === true) {
+            _setRevealed(true, { persist: false });
+        }
     }
 
     // Start collapsed on the leading (Chat) tab, then wire the toggle + observer.

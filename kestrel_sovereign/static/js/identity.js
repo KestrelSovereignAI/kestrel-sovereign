@@ -161,6 +161,13 @@ export function initNavigation() {
             anchor: advancedToggle,
             storageKey: 'kestrel:console-advanced',
         });
+    } else if (navEl) {
+        // A host that disables the `chat` capability had #panel-chat pruned —
+        // and the Advanced toggle lives in the chat header, so it went with it.
+        // A chat-less console is all-panels: show the strip permanently instead
+        // of leaving every remaining panel unreachable behind a hidden nav with
+        // no surviving reveal control (codex P2 on #2231).
+        navEl.style.display = '';
     }
 
     // #2041: re-gate live when a feature is enabled/disabled at runtime. The

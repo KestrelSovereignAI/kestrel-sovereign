@@ -266,3 +266,47 @@ test('mountPanels reveal persistence can be disabled with storageKey:false', asy
     handle.destroy();
     container.remove();
 });
+
+test('persisted "revealed" is reapplied when tabs ARRIVE after a single-tab boot (codex P3 on #2231)', async () => {
+    // Operator lives in Advanced (persisted true), but their advanced tabs
+    // load late (feature manifests). Boot with only the chat tab: collapsed is
+    // correct (nothing to reveal). When a second tab registers, the stored
+    // preference must be REAPPLIED — not just the toggle shown.
+    const store = makeStore({ 'kestrel:console-advanced': 'true' });
+    const { dom, navEl, toggle } = bootConsole(store);
+    // Single tab at boot.
+    navEl.innerHTML = '<button class="nav-tab" data-panel="chat">Chat</button>';
+    const handle = Panels.initReveal({
+        navEl, anchor: toggle, activate: () => {},
+        storageKey: 'kestrel:console-advanced',
+    });
+    assert.equal(handle.revealed, false, 'single-tab boot stays collapsed despite persisted true');
+    assert.equal(toggle.style.display, 'none', 'toggle hidden with nothing to reveal');
+
+    // A second tab arrives (feature manifest loaded / regated back on).
+    const tab = dom.window.document.createElement('button');
+    tab.className = 'nav-tab';
+    tab.dataset.panel = 'identity';
+    tab.textContent = 'Identity';
+    navEl.appendChild(tab);
+    await new Promise((r) => setTimeout(r, 0)); // MutationObserver tick
+
+    assert.notEqual(toggle.style.display, 'none', 'toggle appears with the second tab');
+    assert.equal(handle.revealed, true, 'persisted revealed state reapplied on the single→multi transition');
+    assert.notEqual(navEl.style.display, 'none', 'strip visible again');
+    handle.destroy();
+});
+
+test('SOURCE CONTRACT: a chat-disabled console falls back to a visible strip (codex P2 on #2231)', () => {
+    // When the `chat` capability is off, initNavigation prunes #panel-chat and
+    // the Advanced toggle goes with it. identity.js must then UNHIDE the nav
+    // strip (all-panels console) rather than leave every remaining panel
+    // unreachable behind a hidden nav with no reveal control.
+    const identity = readFileSync(
+        resolve(here, '../../kestrel_sovereign/static/js/identity.js'), 'utf8');
+    const guard = identity.match(/const advancedToggle = document\.getElementById\('advanced-toggle-btn'\);[\s\S]{0,900}/);
+    assert.ok(guard, 'reveal wiring guard present');
+    assert.match(guard[0], /else if \(navEl\)/, 'fallback branch exists for a missing toggle');
+    assert.match(guard[0], /navEl\.style\.display = ''/,
+        'fallback unhides the strip so remaining panels stay reachable');
+});
