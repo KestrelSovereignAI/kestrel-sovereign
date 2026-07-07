@@ -137,8 +137,21 @@ async def list_conversations(
             sessions = []
             if search is not None:
                 sessions = await search(agent_id, search_query, limit=limit, view=view)
+            # Matching necessarily decrypts server-side (SQL cannot see
+            # encrypted content), but decrypt=false callers asked for no
+            # plaintext in the RESPONSE — redact the decrypted snippet and
+            # preview rather than leak readable excerpts (codex P2).
+            redact = (not decrypt) and encrypted_at_rest
             for session in sessions:
-                _decorate_preview(session)
+                if redact:
+                    session.pop("preview_content", None)
+                    session.pop("preview_metadata", None)
+                    session.setdefault("messages", [])
+                    session["preview"] = ""
+                    session["preview_encrypted"] = True
+                    session["match_snippet"] = None
+                else:
+                    _decorate_preview(session)
             return {
                 "conversations": sessions,
                 "total": len(sessions),

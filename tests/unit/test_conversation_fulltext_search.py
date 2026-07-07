@@ -342,6 +342,52 @@ def test_conversations_endpoint_q_dispatches_to_search():
         _restore_app(app, original)
 
 
+def test_conversations_endpoint_q_redacts_snippets_when_decrypt_false():
+    """decrypt=false must not leak plaintext through search results.
+
+    Matching necessarily decrypts server-side, but the RESPONSE must honor
+    the caller's no-plaintext request when the store is encrypted at rest:
+    snippet redacted, preview blanked + flagged (codex P2).
+    """
+    async def fake_search(agent_id, query, limit=20, view="active"):
+        return [{
+            "session_id": "s1",
+            "started_at": "2026-07-01T12:00:00",
+            "last_message_at": "2026-07-01T12:05:00",
+            "message_count": 2,
+            "user_message_count": 1,
+            "preview_content": "decrypted secret",
+            "preview_metadata": {},
+            "match_count": 1,
+            "match_role": "user",
+            "match_snippet": "decrypted secret excerpt",
+        }]
+
+    storage = MagicMock()
+    storage.agent_id = "agent-1"
+    storage.encryption_enabled = True
+    storage.search_conversations = fake_search
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        client = TestClient(app)
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            resp = client.get(
+                "/api/conversations?q=secret&decrypt=false",
+                headers={"X-API-Key": "test-key"},
+            )
+        assert resp.status_code == 200
+        conv = resp.json()["conversations"][0]
+        assert conv["match_snippet"] is None
+        assert conv["preview"] == ""
+        assert conv["preview_encrypted"] is True
+        assert "preview_content" not in conv
+        assert "decrypted secret" not in resp.text
+    finally:
+        _restore_app(app, original)
+
+
 def test_conversations_endpoint_without_q_lists_normally():
     async def fake_query_conversations(agent_id, limit=50, view="active"):
         return []

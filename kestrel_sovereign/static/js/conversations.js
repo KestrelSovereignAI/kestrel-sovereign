@@ -593,6 +593,16 @@ export function mountConversations(containerEl, config = {}) {
     }
 
     function notifyMutated(action, conv) {
+        // Every lifecycle mutation removes the row from the CURRENT view
+        // (archive/trash/purge leave active; unarchive leaves archived;
+        // restore leaves trash), so an active server-search overlay must drop
+        // the hit too — otherwise the mutation's refresh() repaints the stale
+        // `searchResults` row with actions for a view it no longer belongs to
+        // (codex P2). refresh() then re-runs the server search for the
+        // authoritative post-mutation hit list.
+        if (searchResults && conv && conv.session_id) {
+            searchResults = searchResults.filter((c) => c.session_id !== conv.session_id);
+        }
         if (typeof config.onMutated === 'function') config.onMutated(action, conv);
     }
 
@@ -788,6 +798,12 @@ export function mountConversations(containerEl, config = {}) {
 
     async function refresh() {
         syncViewButtons();
+        // Revalidate an active content-search overlay alongside the list
+        // reload — a mutation, retarget or view event may have changed which
+        // sessions match. Seq-guarded, so whichever response is newest wins.
+        if (searchTerm && view !== 'trash' && typeof api.searchConversations === 'function') {
+            runServerSearch();
+        }
         // Sequence token: a view switch or agent retarget while a previous
         // refresh is still in flight must win — otherwise the older response
         // lands late and renders the wrong rows under the new view (e.g. active
@@ -832,13 +848,11 @@ export function mountConversations(containerEl, config = {}) {
         agentName = nextAgentName;
         // Routing is handled by the API layer (API.setHostAgent); just reload.
         // A pending/answered server search belongs to the OLD agent — drop it
-        // and re-run for the new one so stale hits never paint post-switch.
+        // so stale hits never paint post-switch; refresh() re-runs the search
+        // for the new agent.
         searchResults = null;
         searchSeq++;
         if (searchDebounce) clearTimeout(searchDebounce);
-        if (searchTerm && view !== 'trash' && typeof api.searchConversations === 'function') {
-            runServerSearch();
-        }
         refresh();
     }
 

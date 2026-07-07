@@ -178,6 +178,47 @@ test('an api without searchConversations degrades to the client filter', async (
     handle.destroy();
 });
 
+test('a mutation drops the search hit immediately and revalidates the search', async () => {
+    // codex P2: with an active search, archiving/trashing a hit used to leave
+    // it in `searchResults`, so the mutation's refresh() repainted the stale
+    // row. The hit must vanish on mutation and the search re-run server-side.
+    let searchCalls = 0;
+    const api = stubApi({
+        archiveConversation: async () => ({ success: true }),
+        searchConversations: async (q, view, decrypt) => {
+            searchCalls += 1;
+            // After the archive, the server no longer returns the hit.
+            const conversations = searchCalls === 1
+                ? [{
+                    session_id: 's9', preview: 'server hit', message_count: 4,
+                    started_at: '2026-06-23T14:00:00Z',
+                    match_count: 1, match_role: 'user', match_snippet: 'penguin plans',
+                }]
+                : [];
+            return { conversations, query: q };
+        },
+    });
+    const container = makeContainer();
+    const handle = mountConversations(container, { api });
+    await settle();
+
+    type(container, 'penguin');
+    await settle(DEBOUNCE);
+    assert.equal(rowsIn(container).length, 1);
+
+    // Archive the hit via its kebab menu.
+    const kebab = container.querySelector('.conv-kebab-btn');
+    kebab.click();
+    const archiveItem = Array.from(document.querySelectorAll('.kebab-menu .kebab-menu-item'))
+        .find((i) => /Archive/.test(i.textContent));
+    archiveItem.click();
+    await settle();
+
+    assert.equal(rowsIn(container).length, 0, 'stale hit no longer painted');
+    assert.ok(searchCalls >= 2, 'server search revalidated after the mutation');
+    handle.destroy();
+});
+
 test('appendHighlighted builds text nodes + <mark>, never markup from content', () => {
     const el = document.createElement('div');
     appendHighlighted(el, '<img src=x onerror=alert(1)> penguin <b>Penguin</b>', 'penguin');
