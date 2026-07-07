@@ -992,6 +992,20 @@ class ObservabilityStore(UnifiedStoreBase):
         event_id = generate_id()
         now = self.now_utc_param()
 
+        # Privacy-gate content-bearing fields FIRST (F076): prompts/response
+        # previews, error text, tool-call args, and metadata all echo user
+        # content, so they must honour the agent's privacy mode exactly like
+        # the tool-call sink does. EPHEMERAL/ISOLATED elide to the gated
+        # marker, ANONYMOUS anonymizes; counts/latency/model always persist.
+        system_prompt = self._privacy_gate_text(system_prompt)
+        user_prompt = self._privacy_gate_text(user_prompt)
+        response = self._privacy_gate_text(response)
+        error_message = self._privacy_gate_text(error_message)
+        metadata = self._privacy_gate_metadata(metadata)
+        tool_calls_json = (
+            self._privacy_gate_args_json(tool_calls) if tool_calls else None
+        )
+
         # Truncate prompts/response to preview (first 500 chars)
         preview_len = 500
         system_preview = system_prompt[:preview_len] if system_prompt else None
@@ -1024,7 +1038,7 @@ class ObservabilityStore(UnifiedStoreBase):
                 duration_ms,
                 self.to_bool_param(success),
                 error_message,
-                json_dumps(tool_calls) if tool_calls else None,
+                tool_calls_json,
                 json_dumps(metadata or {}),
             ),
         )
