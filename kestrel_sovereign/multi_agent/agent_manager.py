@@ -310,6 +310,28 @@ class AgentManager:
         if not ok:
             raise ValueError(f"Spawn refused: {msg}")
 
+    @staticmethod
+    def _enforce_restricted_tools(child: KestrelAgent, mandate: SpawnMandate) -> None:
+        """Register the runtime restricted_tools deny hook on a spawned child (#2137).
+
+        No-op when the mandate lists no restricted tools or the child has no
+        hooks manager. The anchored constitution carries the restriction for
+        soft enforcement regardless; this adds the hard PRE_TOOL_USE deny for the
+        child's in-process lifetime.
+        """
+        constraints = getattr(mandate, "additional_constraints", None) or {}
+        restricted = constraints.get("restricted_tools") or []
+        hooks_manager = getattr(child, "hooks_manager", None)
+        if not restricted or hooks_manager is None:
+            return
+        from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
+
+        hooks_manager.register(MandateRestrictionHook(restricted))
+        logger.info(
+            "Registered MandateRestrictionHook on child '%s' for %d restricted tool(s) (#2137).",
+            getattr(child, "name", "?"), len(set(restricted)),
+        )
+
     async def spawn_agent(
         self,
         name: str,
@@ -419,6 +441,15 @@ class AgentManager:
 
         # Fill in child DID on the mandate
         mandate.child_did = child.agent_id
+
+        # Attach the mandate to the running child and enforce it (#2137).
+        # Setting ``spawn_mandate`` makes the existing constitution-integrity
+        # re-validation (``_verify_spawn_mandate_constraints``) live for this
+        # child, and lets a restricted_tools list be hard-enforced at runtime via
+        # a PRE_TOOL_USE hook — the anchored constitution already carries the
+        # constraints for soft/system-prompt enforcement.
+        child.spawn_mandate = mandate
+        self._enforce_restricted_tools(child, mandate)
 
         # Track parent-child relationship
         parent_did = parent_agent.agent_id

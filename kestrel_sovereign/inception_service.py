@@ -478,6 +478,30 @@ async def create_kestrel_identity_async(
                 "Amendment VIII activated for this agent — anchoring "
                 "Sovereign-authored Emancipation Contract."
             )
+        # Weave spawn-mandate constraints into the anchored constitution (#2137).
+        # A spawned child's additional_constraints / features_allowed must appear
+        # in the constitution that gets hashed and integrity-anchored (#1722) and
+        # rendered into the child's system prompt — otherwise the mandate is
+        # validated at spawn time (ScopedConstitution.validate_constraints) but
+        # never actually constrains the child at runtime. This is the durable,
+        # restart-surviving half of enforcement; the hard restricted_tools deny
+        # is the MandateRestrictionHook registered on the running child.
+        if spawn_mandate is not None and (
+            getattr(spawn_mandate, "additional_constraints", None)
+            or getattr(spawn_mandate, "features_allowed", None)
+        ):
+            from kestrel_sovereign.spawn.scoped_constitution import ScopedConstitution
+
+            scoped = ScopedConstitution(
+                base_constitution=constitution_content.decode("utf-8"),
+                additional_constraints=getattr(spawn_mandate, "additional_constraints", {}) or {},
+                features_allowed=list(getattr(spawn_mandate, "features_allowed", []) or []),
+            )
+            constitution_content = scoped.get_effective_constitution().encode("utf-8")
+            logging.info(
+                "Wove spawn-mandate constraints into anchored constitution for "
+                "child '%s' (#2137).", agent_name,
+            )
         constitution_hash = await files.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
         logging.info(f"Stored Kestrel Constitution with hash: {constitution_hash}")
     except FileNotFoundError:
@@ -571,6 +595,16 @@ async def create_kestrel_identity_async(
             edge_properties["ttl_seconds"] = spawn_mandate.ttl_seconds
             edge_properties["max_child_depth"] = spawn_mandate.max_child_depth
             edge_properties["created_at"] = spawn_mandate.created_at
+            # Durable record of the enforcement constraints (#2137): the anchored
+            # constitution carries them for soft/system-prompt enforcement, and
+            # the delegation edge records the machine-readable form for audit and
+            # a future load-time re-attach of the runtime restricted_tools hook.
+            edge_properties["additional_constraints"] = (
+                getattr(spawn_mandate, "additional_constraints", {}) or {}
+            )
+            edge_properties["features_allowed"] = list(
+                getattr(spawn_mandate, "features_allowed", []) or []
+            )
         await graph.add_edge(agent_did, parent_did, "spawned_by", properties=edge_properties)
         logging.info(f"Recorded spawned_by edge from {agent_did} to {parent_did}")
 
