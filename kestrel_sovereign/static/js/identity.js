@@ -1115,7 +1115,38 @@ async function handleSidebarConversationMutation(action, conv) {
         wipeAgentChatPane(host);
         state.currentSessionId = null;
     }
+    // #2222: keep the shared pane's highlight override in step with the new
+    // active-id (the trashed session's tile is gone; a fresh session, if any,
+    // becomes current).
+    if (conversationsHandle) conversationsHandle.setActiveSessionId(activeConversationId);
     if (typeof updateContextStatus === 'function') updateContextStatus();
+}
+
+// #2222: host-side new-conversation wiring, invoked by the component's New
+// button (via the pane's `onNewConversation` config). Mints the canonical
+// session, wipes the visible agent's chat pane, adopts the new session as the
+// current one (both `state.currentSessionId` and our per-agent active-id map so
+// the sidebar highlight and the chat pane agree), and refreshes the context
+// footer. The component handles the optimistic tile + active highlight from the
+// returned session_id — this owns ONLY the chat-side state so there is exactly
+// one `API.newConversation()` call.
+async function startNewConversationForPane() {
+    const host = API.getHostAgent();
+    const result = await API.newConversation();
+    wipeAgentChatPane(host, `
+        <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
+            <span style="font-size: 2rem;">\u{2728}</span>
+            <p style="margin-top: 0.5rem;">New conversation started. Say hello!</p>
+        </div>
+    `);
+    const sid = result && result.session_id;
+    if (sid) {
+        state.currentSessionId = sid;
+        activeConversationId = sid;
+        activeConversationIdsByAgent.set(host, sid);
+    }
+    if (typeof updateContextStatus === 'function') updateContextStatus();
+    return result;
 }
 
 // Mount the shared conversation PANE unit into the sidebar exactly once, then
@@ -1141,6 +1172,14 @@ function ensureConversationsMount() {
         showStats: true,
         agentName: API.getHostAgent(),
         getActiveSessionId: () => activeConversationId,
+        // #2222: the component owns the New button now; it calls this to mint
+        // the session, and does the optimistic tile + active highlight itself.
+        // We do the host-side chat wiring (wipe the pane, adopt the new session
+        // as current, refresh the context footer) and update our per-agent
+        // active-id map so the highlight stays unified across the sidebar and
+        // the chat pane. Returning the API result lets the component prepend a
+        // tile for the exact minted session_id.
+        onNewConversation: () => startNewConversationForPane(),
         onSelect: (conv, ctx) => {
             window.loadConversation(conv.session_id, { expectedAgent: ctx.agentName });
         },
@@ -1173,9 +1212,28 @@ export function refreshConversationsPane() {
     const handle = ensureConversationsMount();
     if (!handle) return;
     activeConversationId = getActiveConversationIdForAgent(API.getHostAgent());
+    // #2222: seed the component's highlight override for this agent so a
+    // just-created / previously-active session stays highlighted across the
+    // retarget repaint (and clears when switching to an agent with none).
+    handle.setActiveSessionId(activeConversationId);
     conversationsPaneTargeted = true;
     handle.retarget(API.getHostAgent());
 }
+
+// #2222: bridge for history.js's ``window.startNewConversation`` (the chat-header
+// "New Chat" button path). When the shared conversations pane is available for
+// this host, route the new-conversation action through the component so the New
+// tile appears instantly, becomes the current conversation, and the host-side
+// chat wiring runs exactly once (via the pane's ``onNewConversation``). Returns
+// the component's promise, or ``null`` when the pane is unavailable (no
+// container / capability off) so the caller can fall back to the direct flow.
+window.newConversationViaPane = function() {
+    if (!API.hasCapability('conversations')) return null;
+    const handle = ensureConversationsMount();
+    if (!handle) return null;
+    conversationsPaneTargeted = true;
+    return handle.newConversation();
+};
 
 // Exported for unit test — kept as a pure function so it's trivial to
 // verify without standing up DOM + fetch mocks.  Callers should treat
@@ -1271,6 +1329,12 @@ window.loadConversation = async function(sessionId, options = {}) {
 
     activeConversationId = sessionId;
     activeConversationIdsByAgent.set(API.getHostAgent(), sessionId);
+
+    // #2222: keep the shared pane's highlight unified with our active-id. The
+    // component owns the highlight now (setActiveSessionId re-renders with the
+    // active row marked); the manual class toggle below stays as a cheap
+    // fallback for the pre-mount / no-handle case.
+    if (conversationsHandle) conversationsHandle.setActiveSessionId(sessionId);
 
     // Update selection UI. The mounted list re-renders per agent (retarget is
     // the only refresh path on a switch, #2199), so every visible row already
@@ -1545,26 +1609,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (conversationsHandle) conversationsHandle.refresh();
     });
 
-    const newConversationSidebarBtn = document.getElementById('new-conversation-sidebar-btn');
-    if (newConversationSidebarBtn) {
-        newConversationSidebarBtn.addEventListener('click', async () => {
-            try {
-                // Delegate to the canonical start-new-conversation flow so we
-                // update state.currentSessionId, clear the chat, refresh the
-                // context-status footer, and reload the sidebar in one shot.
-                // Duplicating partial logic here left the footer showing the
-                // old conversation's message count and utilization.
-                if (typeof window.startNewConversation === 'function') {
-                    await window.startNewConversation();
-                } else {
-                    await API.newConversation();
-                }
-                if (conversationsHandle) conversationsHandle.refresh();
-            } catch (e) {
-                console.error('Failed to create new conversation:', e);
-            }
-        });
-    }
+    // #2222: the New-conversation button is now component-owned. The pane mount
+    // (`mountConversationsPane`) adopts the static `#new-conversation-sidebar-btn`
+    // (or builds a `ki-plus` button for bare embed containers) and wires it to
+    // the component's own new-conversation action — optimistic tile + active
+    // highlight, with the host-side chat wiring supplied via the
+    // `onNewConversation` config. identity.js owns no new-conversation wiring.
 
     // Initialize resize handles. The conversations pane's resize is owned by
     // the mountConversationsPane export (#2199); only the agents pane keeps the

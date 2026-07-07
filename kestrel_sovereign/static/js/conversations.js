@@ -326,9 +326,16 @@ function animateOut(rowEl) {
 
 /**
  * Mount the full conversation-list surface into `containerEl`. Returns a
- * handle: `{ element, refresh, retarget(agentName), setView(view), destroy }`.
+ * handle: `{ element, refresh, retarget(agentName), setView(view),
+ * setActiveSessionId(id), newConversation(), destroy }`.
  * `retarget` lets an embedding host repoint the list when the active agent
- * switches (same contract family as chat's mount).
+ * switches (same contract family as chat's mount). `setActiveSessionId` and
+ * `newConversation` are the #2222 active-highlight + new-tile surface:
+ *   - `setActiveSessionId(sessionId)` overrides the active-row highlight (what
+ *     a host calls when the current conversation changes).
+ *   - `newConversation()` calls `onNewConversation` (defaulting to
+ *     `api.newConversation()`), optimistically prepends a tile for the returned
+ *     `session_id`, marks it active, and fires a reconciling `refresh()`.
  *
  * Sidebar-oriented hooks (the standalone conversations pane in identity.js is a
  * consumer as of #2199 — it no longer reimplements fetch/refresh/seq-guard):
@@ -356,6 +363,20 @@ export function mountConversations(containerEl, config = {}) {
     const getActiveSessionId = typeof config.getActiveSessionId === 'function'
         ? config.getActiveSessionId
         : () => (state ? state.currentSessionId : null);
+
+    // Active-conversation highlight (#2222). `getActiveSessionId` is the host's
+    // source of truth, read at render time. `setActiveSessionId` lets a host —
+    // or the component's own new-conversation action — override the highlight
+    // synchronously, which is what paints a just-created tile active BEFORE any
+    // list refetch resolves. A NULLISH id CLEARS the override (defer to the
+    // config getter): "no active session" must never be a sticky pin, or a
+    // host seeding the highlight while an agent has no current session
+    // (identity.js retarget) would mask the session chat.js learns on the
+    // first message — the list would never highlight it (codex P2 on #2224).
+    let activeIdOverride = null; // nullish = defer to getActiveSessionId()
+    function currentActiveId() {
+        return activeIdOverride != null ? activeIdOverride : getActiveSessionId();
+    }
 
     let view = config.view || 'active';
     let searchTerm = '';
@@ -576,7 +597,7 @@ export function mountConversations(containerEl, config = {}) {
     }
 
     function rowOpts() {
-        const activeId = getActiveSessionId();
+        const activeId = currentActiveId();
         // Snapshot the agent at render time so each row's pin is immutable
         // (#1358). retarget() mutates `agentName` synchronously and then fires
         // an async refresh; the old rows stay clickable until the new list
@@ -620,7 +641,7 @@ export function mountConversations(containerEl, config = {}) {
             listEl.appendChild(empty);
             return;
         }
-        const activeId = getActiveSessionId();
+        const activeId = currentActiveId();
         const opts = rowOpts();
         // Wrap buildConversationRow so each row gets its active flag.
         listEl.innerHTML = '';
@@ -728,6 +749,51 @@ export function mountConversations(containerEl, config = {}) {
         refresh();
     }
 
+    // Override the active-conversation highlight and repaint (#2222). Hosts call
+    // this whenever the current conversation changes (select, agent switch, new
+    // conversation) so the pane's highlight and the host's notion of "current"
+    // stay unified — the pane no longer reads a divergent identity.js value.
+    function setActiveSessionId(sessionId) {
+        activeIdOverride = sessionId;
+        renderCurrent();
+    }
+
+    // Start a new conversation and surface it immediately (#2222). Calls the
+    // canonical API (or a host-supplied `onNewConversation` that also does the
+    // host-side chat wiring), then OPTIMISTICALLY prepends a tile for the minted
+    // session_id and marks it active — no wait for a list refetch. A reconciling
+    // refresh() follows; the server session-marker row keeps the tile present.
+    async function newConversation() {
+        const startNew = typeof config.onNewConversation === 'function'
+            ? config.onNewConversation
+            : () => api.newConversation();
+        let result;
+        try {
+            result = await startNew();
+        } catch (e) {
+            Toast.error(`Failed to start new conversation: ${e.message}`);
+            return null;
+        }
+        const sessionId = result && result.session_id;
+        if (!sessionId) return result || null;
+        const optimistic = {
+            session_id: sessionId,
+            preview: 'New conversation',
+            started_at: (result && result.started_at) || null,
+            message_count: 0,
+        };
+        lastConversations = [
+            optimistic,
+            ...lastConversations.filter((c) => c.session_id !== sessionId),
+        ];
+        activeIdOverride = sessionId;
+        renderCurrent();
+        // Reconcile with the authoritative server list without blocking the
+        // optimistic paint above.
+        refresh();
+        return result;
+    }
+
     function destroy() {
         closeKebabMenu();
         containerEl.innerHTML = '';
@@ -736,7 +802,16 @@ export function mountConversations(containerEl, config = {}) {
     syncViewButtons();
     if (config.autoLoad !== false) refresh();
 
-    return { element: root, refresh, retarget, setView, destroy, get view() { return view; } };
+    return {
+        element: root,
+        refresh,
+        retarget,
+        setView,
+        setActiveSessionId,
+        newConversation,
+        destroy,
+        get view() { return view; },
+    };
 }
 
 // ============================================================================
@@ -785,9 +860,9 @@ function storeSet(key, value) {
  * two-pane layout is assumed (a third left pane is planned, #2203).
  *
  * Config (all optional except where a list needs them):
- *   - api, onSelect, agentName, getActiveSessionId, onLoaded, onMutated,
- *     autoLoad, showViewBar, showSearch, showStats, group — forwarded verbatim
- *     to `mountConversations`.
+ *   - api, onSelect, onNewConversation, agentName, getActiveSessionId,
+ *     onLoaded, onMutated, autoLoad, showViewBar, showSearch, showStats,
+ *     group — forwarded verbatim to `mountConversations`.
  *   - collapsed        — initial collapsed state (overridden by persistence).
  *   - storageKey       — persistence namespace (default 'kestrel:conversations-pane').
  *   - title            — pane header title (default 'History').
@@ -884,6 +959,7 @@ export function mountConversationsPane(containerEl, config = {}) {
     const listHandle = mountConversations(body, {
         api: config.api,
         onSelect: config.onSelect,
+        onNewConversation: config.onNewConversation,
         agentName: config.agentName,
         getActiveSessionId: config.getActiveSessionId,
         onLoaded: config.onLoaded,
@@ -896,6 +972,35 @@ export function mountConversationsPane(containerEl, config = {}) {
         escapeHtml: config.escapeHtml,
         view: config.view,
     });
+
+    // --- New-conversation button (adopt existing, else build) --------------
+    // #2222: the New button is component-owned so embed hosts — which never run
+    // identity.js's DOMContentLoaded wiring — still get it. The standalone
+    // console's static `#new-conversation-sidebar-btn` is adopted in place; a
+    // built header gets a fresh `ki-plus` button. Same adopt-or-build pattern as
+    // the collapse chevron. Clicking it drives the component's own
+    // new-conversation action (optimistic tile + active highlight).
+    let newBtn = header.querySelector('#new-conversation-sidebar-btn')
+        || header.querySelector('.new-conversation-btn');
+    let builtNewBtn = false;
+    if (!newBtn) {
+        newBtn = doc.createElement('button');
+        newBtn.type = 'button';
+        newBtn.className = 'new-conversation-btn btn-icon';
+        newBtn.title = 'New Conversation';
+        newBtn.setAttribute('aria-label', 'New conversation');
+        newBtn.innerHTML = (typeof window !== 'undefined' && typeof window.kicon === 'function')
+            ? window.kicon('plus')
+            : '<span class="ki ki-plus" aria-hidden="true"></span>';
+        // Sit just after the title, before the filters/collapse cluster.
+        const titleEl = header.querySelector('.conversations-pane-title')
+            || header.querySelector('h3');
+        if (titleEl && titleEl.nextSibling) header.insertBefore(newBtn, titleEl.nextSibling);
+        else header.insertBefore(newBtn, header.firstChild);
+        builtNewBtn = true;
+    }
+    const onNewClick = () => { listHandle.newConversation(); };
+    newBtn.addEventListener('click', onNewClick);
 
     // The controls (view bar + search) and stats blocks the disclosure governs.
     const controlsEl = listHandle.element.querySelector('.conversations-controls');
@@ -995,12 +1100,14 @@ export function mountConversationsPane(containerEl, config = {}) {
     function destroy() {
         collapseBtn.removeEventListener('click', onCollapseClick);
         filtersToggle.removeEventListener('click', onFiltersClick);
+        newBtn.removeEventListener('click', onNewClick);
         resizeHandle.removeEventListener('mousedown', onResizeDown);
         doc.removeEventListener('mousemove', onMouseMove);
         doc.removeEventListener('mouseup', onMouseUp);
         try { listHandle.destroy(); } catch (_) { /* best-effort */ }
         // Remove only chrome this mount built; adopted chrome is left in place.
         if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
+        if (builtNewBtn) newBtn.remove();
         filtersToggle.remove();
     }
 
@@ -1010,6 +1117,8 @@ export function mountConversationsPane(containerEl, config = {}) {
         refresh: (...a) => listHandle.refresh(...a),
         retarget: (...a) => listHandle.retarget(...a),
         setView: (...a) => listHandle.setView(...a),
+        setActiveSessionId: (...a) => listHandle.setActiveSessionId(...a),
+        newConversation: (...a) => listHandle.newConversation(...a),
         get view() { return listHandle.view; },
         open,
         close,

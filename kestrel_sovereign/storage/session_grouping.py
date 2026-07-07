@@ -50,6 +50,7 @@ def group_messages_into_sessions(
     messages: Iterable[Dict[str, Any]],
     gap_minutes: float = SESSION_GAP_MINUTES,
     now: Optional[datetime] = None,
+    keep_empty_markers: bool = False,
 ) -> List[Dict[str, Any]]:
     """Group ordered messages into session clusters.
 
@@ -65,6 +66,14 @@ def group_messages_into_sessions(
         gap_minutes: minutes of inactivity that start a new session.
         now: clock used when a row has an unparseable/missing timestamp;
             defaults to ``datetime.now()`` (injectable for tests).
+        keep_empty_markers: when ``True``, a session established solely by a
+            ``new_session`` marker row (no real messages yet) is still returned,
+            with ``message_count == 0`` (#2222). A freshly-created conversation
+            is a real, list-visible session the moment the user starts it — the
+            UI prepends a tile for it and the reconciling refetch must find it
+            server-side, or the tile vanishes. The agent-facing memory tools
+            leave this ``False`` so empty just-started sessions stay out of
+            recall.
 
     Returns:
         list of session dicts ordered **oldest-first**, each with:
@@ -75,6 +84,13 @@ def group_messages_into_sessions(
     """
     sessions: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
+    # Whether ``current`` was established by a ``new_session`` marker row and has
+    # accumulated no real messages yet — the retain-if-``keep_empty_markers``
+    # case (#2222).
+    current_is_empty_marker = False
+
+    def _keep(session: Dict[str, Any], is_empty_marker: bool) -> bool:
+        return session["message_count"] > 0 or (keep_empty_markers and is_empty_marker)
 
     def _new_session(msg_id: Any, ts: datetime, session_uuid: Optional[str]) -> Dict[str, Any]:
         # Canonical identity (#2012): prefer the session's own metadata
@@ -112,6 +128,7 @@ def group_messages_into_sessions(
 
         if current is None:
             current = _new_session(msg_id, timestamp, meta_session_id)
+            current_is_empty_marker = False
 
         last_ts = datetime.fromisoformat(current["last_message_at"])
         gap = (timestamp - last_ts).total_seconds() / 60
@@ -138,10 +155,14 @@ def group_messages_into_sessions(
         )
 
         if gap > gap_minutes or is_new_session_marker or session_changed:
-            if current["message_count"] > 0:
+            if _keep(current, current_is_empty_marker):
                 sessions.append(current)
             current = _new_session(msg_id, timestamp, meta_session_id)
-            # The explicit marker row is structural, not a real message.
+            # The explicit marker row is structural, not a real message. Track
+            # that this new session so far exists ONLY because of it, so
+            # ``keep_empty_markers`` can retain a just-started conversation with
+            # no messages yet (#2222).
+            current_is_empty_marker = is_new_session_marker
             if is_new_session_marker:
                 continue
 
@@ -153,7 +174,7 @@ def group_messages_into_sessions(
                 current["preview_content"] = content
                 current["preview_metadata"] = meta
 
-    if current and current["message_count"] > 0:
+    if current and _keep(current, current_is_empty_marker):
         sessions.append(current)
 
     return sessions
