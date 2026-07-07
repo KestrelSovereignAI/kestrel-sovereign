@@ -935,6 +935,13 @@ class KestrelAgent(
                     )
                 )
 
+            # Async completion pass for routes the sync registry build couldn't
+            # bring up (e.g. an OpenRouter route with only a management key, now
+            # completed via a bootstrap child key). hasattr-guarded because
+            # tests inject lightweight LLM-service fakes without this hook.
+            if hasattr(self.llm_service, "finalize_providers"):
+                await self.llm_service.finalize_providers()
+
             # Initialize TaskManager for A2A unified routing
             # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
             if self._db_backend.lower() == "postgres" and self.pg_pool:

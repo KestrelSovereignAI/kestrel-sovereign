@@ -1353,6 +1353,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             logger.error(f"Failed to initialize providers: {e}")
             return []
 
+    async def finalize_providers(self) -> None:
+        """Async completion pass for routes sync init couldn't bring up.
+
+        Sync ``__init__`` builds the registry via ``initialize_providers()``,
+        but some routes need an async step to register (e.g. an OpenRouter
+        route configured with only ``OPENROUTER_MANAGEMENT_API_KEY``, which is
+        completed by minting a bootstrap child key). Called once from the
+        agent's async ``initialize()``. Safe to call multiple times.
+        """
+        registry = getattr(self, "provider_registry", None)
+        if registry is None or not hasattr(registry, "finalize_providers"):
+            return
+        try:
+            provider_infos = await registry.finalize_providers()
+        except Exception as e:  # noqa: BLE001 - never block startup on this
+            logger.warning("finalize_providers failed: %s", e)
+            return
+        self.providers = self._convert_providers_format(provider_infos)
+
     def _check_policy(self) -> None:
         """Guard called at the top of every public generation entry point.
 
