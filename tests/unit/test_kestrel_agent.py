@@ -1077,6 +1077,45 @@ class TestInitialize:
                         mock_storage_instance.initialize.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_initialize_wires_observability_store_into_llm_service(self, tmp_path):
+        """initialize() attaches the observability store to the LLMService (#2236).
+
+        Without this attach, LLMService._log_llm_call is a silent no-op and
+        the LLM Calls panel only shows rows from features that log directly
+        to the store (e.g. per-turn reflection) — never real chat calls."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+                with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
+                    with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
+                        mock_storage_instance = AsyncMock()
+                        mock_storage_instance.initialize = AsyncMock()
+                        mock_storage_instance.get_node = AsyncMock(return_value=None)
+                        mock_storage_instance.add_node = AsyncMock()
+                        mock_storage_instance.db = MagicMock()
+                        MockStorage.return_value = mock_storage_instance
+
+                        mock_memory_system = AsyncMock()
+                        mock_memory_system.initialize = AsyncMock()
+                        mock_memory_system.retriever = MagicMock()
+                        mock_memory_system.consolidator = MagicMock()
+                        MockMemorySystem.return_value = mock_memory_system
+
+                        mock_task_manager = AsyncMock()
+                        mock_task_manager.initialize = AsyncMock()
+                        mock_task_manager.register_agent = MagicMock()
+                        MockTaskManager.return_value = mock_task_manager
+
+                        await agent.initialize()
+
+                        assert agent.observability_store is not None
+                        assert agent.llm_service._observability_store is agent.observability_store
+
+    @pytest.mark.asyncio
     async def test_initialize_creates_memory_system(self, tmp_path):
         """initialize() creates memory_system."""
         agent = KestrelAgent(

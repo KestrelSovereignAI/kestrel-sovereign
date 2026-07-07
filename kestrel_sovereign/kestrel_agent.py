@@ -992,6 +992,14 @@ class KestrelAgent(
             # Expose observability store for orchestrator instrumentation
             self.observability_store = observability_store
 
+            # Wire the store into the per-agent LLMService so every chat /
+            # generate / streaming call lands in a2a_llm_calls (#2236). The
+            # service instruments all chokepoints but stays dark without
+            # this attach — only features logging directly to the store
+            # (e.g. reflection) showed up in the LLM Calls panel.
+            if hasattr(self.llm_service, "set_observability_store"):
+                self.llm_service.set_observability_store(observability_store)
+
             # Privacy-gate the observability sink at the layer boundary (F076).
             # Tool-call args and metadata are user content, so the sink must
             # honour the agent's privacy mode: EPHEMERAL/ISOLATED elide the
