@@ -21,11 +21,15 @@ import pytest
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
-from kestrel_sovereign.multi_agent.agent_manager import AgentManager, _read_spawn_mandate
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
+from kestrel_sovereign.spawn.mandate_reload import (
+    read_spawn_mandate,
+    register_restriction_hook,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 
 
@@ -78,9 +82,9 @@ async def test_mandate_constraints_persisted_on_delegation_edge(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reload_reconstructs_mandate_and_enforces(tmp_path):
-    """The reload path (load_agent's helper) reconstructs the mandate from the
-    persisted edge and re-applies the restricted_tools hook — so enforcement
-    survives restart, not just the in-process spawn."""
+    """The reload path reconstructs the mandate from the persisted edge and
+    re-applies the restricted_tools hook — so enforcement survives restart, not
+    just the in-process spawn."""
     parent_private, _ = generate_secp256k1_keypair()
     parent_did = "did:pkh:eip155:1:0xParentReload"
 
@@ -101,14 +105,20 @@ async def test_reload_reconstructs_mandate_and_enforces(tmp_path):
         spawn_mandate=mandate,
     )
 
-    # Simulate a fresh load: reconstruct the mandate from the persisted edge.
-    reconstructed = await _read_spawn_mandate(str(tmp_path), creds.agent_did)
+    # Simulate a fresh load: reconstruct the mandate from the persisted edge
+    # (the same helper KestrelAgent.initialize() uses on every boot path).
+    storage = AsyncStorage(os.path.join(str(tmp_path), "kestrel_prime.db"))
+    await storage.initialize()
+    try:
+        reconstructed = await read_spawn_mandate(storage, creds.agent_did)
+    finally:
+        await storage.close()
     assert reconstructed is not None
     assert reconstructed.additional_constraints["restricted_tools"] == [RESTRICTED_TOOL]
 
     # And it re-applies as a real block.
     child = SimpleNamespace(name="ReloadedChild", hooks_manager=HooksManager())
-    AgentManager._enforce_restricted_tools(child, reconstructed)
+    register_restriction_hook(child.hooks_manager, reconstructed)
     out = await child.hooks_manager.execute_hooks(
         HookEvent.PRE_TOOL_USE,
         HookInput(
@@ -130,7 +140,54 @@ async def test_read_spawn_mandate_none_for_root_agent(tmp_path):
         is_test_instance=True,
         agent_name="RootAgent",
     )
-    assert await _read_spawn_mandate(str(tmp_path), creds.agent_did) is None
+    storage = AsyncStorage(os.path.join(str(tmp_path), "kestrel_prime.db"))
+    await storage.initialize()
+    try:
+        assert await read_spawn_mandate(storage, creds.agent_did) is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_reattaches_enforcement_on_any_boot_path(tmp_path):
+    """End-to-end: a spawned child booted directly via KestrelAgent.initialize()
+    (the shared path used by single-agent server + CLI, not just AgentManager)
+    reattaches its spawn mandate and registers the restricted_tools hook."""
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.service import LLMService
+
+    parent_private, _ = generate_secp256k1_keypair()
+    parent_did = "did:pkh:eip155:1:0xParentBoot"
+    mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            purpose="scoped worker",
+            ttl_seconds=999,
+            additional_constraints={"restricted_tools": [RESTRICTED_TOOL]},
+        ),
+        parent_private,
+    )
+    creds = await create_kestrel_identity_async(
+        output_dir=str(tmp_path),
+        is_test_instance=True,
+        agent_name="BootChild",
+        parent_did=parent_did,
+        spawn_mandate=mandate,
+    )
+
+    agent = KestrelAgent(
+        did=creds.agent_did,
+        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
+        llm_service=LLMService(),
+    )
+    await agent.initialize()
+
+    hooks = agent.hooks_manager.get_hooks(HookEvent.PRE_TOOL_USE)
+    assert any(isinstance(h, MandateRestrictionHook) for h in hooks)
+    assert getattr(agent, "spawn_mandate", None) is not None
+    assert agent.spawn_mandate.additional_constraints["restricted_tools"] == [
+        RESTRICTED_TOOL
+    ]
 
 
 @pytest.mark.asyncio
@@ -161,14 +218,14 @@ async def test_restriction_hook_denies_restricted_allows_others():
 
 @pytest.mark.asyncio
 async def test_enforce_restricted_tools_blocks_via_hooks_manager():
-    """AgentManager._enforce_restricted_tools registers a hook that the
-    HooksManager evaluates as a real block for the restricted tool."""
+    """register_restriction_hook installs a hook that the HooksManager
+    evaluates as a real block for the restricted tool."""
     child = SimpleNamespace(name="ScopedChild", hooks_manager=HooksManager())
     mandate = SimpleNamespace(
         additional_constraints={"restricted_tools": [RESTRICTED_TOOL]}
     )
 
-    AgentManager._enforce_restricted_tools(child, mandate)
+    register_restriction_hook(child.hooks_manager, mandate)
 
     # restricted tool → blocked
     out = await child.hooks_manager.execute_hooks(
@@ -202,7 +259,7 @@ async def test_enforce_restricted_tools_noop_without_restrictions():
     child = SimpleNamespace(name="Plain", hooks_manager=HooksManager())
     mandate = SimpleNamespace(additional_constraints={"behavioral_rules": ["be nice"]})
 
-    AgentManager._enforce_restricted_tools(child, mandate)
+    register_restriction_hook(child.hooks_manager, mandate)
 
     hooks = child.hooks_manager.get_hooks(HookEvent.PRE_TOOL_USE)
     assert not any(isinstance(h, MandateRestrictionHook) for h in hooks)

@@ -1731,6 +1731,24 @@ class KestrelAgent(
             except Exception as e:
                 logging.warning(f"failed to start salvage worker: {e}")
 
+        # Reattach spawn-mandate enforcement (#2137). initialize() is the single
+        # boot path shared by single-agent, multi-agent (AgentManager), and
+        # direct-test starts, so registering here — not in AgentManager — means a
+        # spawned child's restricted_tools are hard-denied whenever the child
+        # runs, reconstructed from the durable spawned_by delegation edge
+        # (survives restart). No-op for root agents / spawns with no constraints.
+        if self.did and self.storage is not None and self.hooks_manager is not None:
+            from kestrel_sovereign.spawn.mandate_reload import (
+                read_spawn_mandate,
+                register_restriction_hook,
+            )
+
+            _spawn_mandate = await read_spawn_mandate(self.storage, self.did)
+            if _spawn_mandate is not None:
+                if getattr(self, "spawn_mandate", None) is None:
+                    self.spawn_mandate = _spawn_mandate
+                register_restriction_hook(self.hooks_manager, _spawn_mandate)
+
         # Lifecycle hardening (#377): refuse to declare initialization
         # successful when no LLM provider came up. Lives here rather than in
         # the server lifespan so single-agent, multi-agent (AgentManager),

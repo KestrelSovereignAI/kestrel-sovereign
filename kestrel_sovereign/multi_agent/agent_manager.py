@@ -42,44 +42,6 @@ async def _get_agent_did(storage_dir: str) -> str:
         await storage.close()
 
 
-async def _read_spawn_mandate(storage_dir: str, agent_did: str) -> Optional[SpawnMandate]:
-    """Reconstruct a child's spawn mandate from its persisted ``spawned_by`` edge (#2137).
-
-    Returns ``None`` for a root (non-spawned) agent. The reconstruction is
-    intentionally UNSIGNED: the delegation edge is the durable record, and the
-    mandate is used only to *re-apply restrictions* at load (restrictions only
-    ever tighten — fail-safe), not to re-verify the parent signature. It carries
-    ``additional_constraints`` (the runtime-enforceable part) but deliberately
-    omits ``features_allowed`` — feature-load narrowing is already enforced at
-    load (#1946) and captured in the anchored constitution, and leaving it unset
-    avoids the constitution re-validation's features-subset check misfiring on
-    reload against the child's own already-narrowed feature set.
-    """
-    db_path = os.path.join(storage_dir, "kestrel_prime.db")
-    storage = AsyncStorage(db_path)
-    await storage.initialize()
-    try:
-        edges = await storage.get_edges_from(agent_did)
-    finally:
-        await storage.close()
-
-    spawned = [e for e in edges if e.label == "spawned_by"]
-    if not spawned:
-        return None
-    props = spawned[0].properties or {}
-    kwargs = {
-        "parent_did": spawned[0].target_id,
-        "purpose": props.get("purpose", ""),
-        "ttl_seconds": props.get("ttl_seconds", 3600),
-        "max_child_depth": props.get("max_child_depth", 0),
-        "additional_constraints": props.get("additional_constraints", {}) or {},
-        "child_did": agent_did,
-    }
-    if props.get("created_at"):
-        kwargs["created_at"] = props["created_at"]
-    return SpawnMandate(**kwargs)
-
-
 class AgentManager:
     """In-process multi-agent manager.
 
@@ -163,17 +125,10 @@ class AgentManager:
             )
 
         await agent.initialize()
-
-        # Reattach spawn-mandate enforcement from the persisted delegation edge
-        # (#2137). load_agent is the single load path for EVERY agent — fresh
-        # spawn (via create_agent), reload, and host restart — so a spawned
-        # child's restricted_tools are hard-enforced whenever it runs, not only
-        # in the process that first spawned it. The anchored constitution already
-        # carries the constraints for soft/system-prompt enforcement.
-        spawn_mandate = await _read_spawn_mandate(str(resolved_dir), agent_did)
-        if spawn_mandate is not None:
-            agent.spawn_mandate = spawn_mandate
-            self._enforce_restricted_tools(agent, spawn_mandate)
+        # Spawn-mandate enforcement (restricted_tools hook + spawn_mandate attach)
+        # is reattached inside KestrelAgent.initialize() from the persisted
+        # delegation edge (#2137), so it covers every boot path — not just this
+        # one — uniformly.
 
         self._agents[name] = agent
         self._agent_names[agent.agent_id] = name
@@ -358,28 +313,6 @@ class AgentManager:
         ok, msg = scoped.validate_constraints()
         if not ok:
             raise ValueError(f"Spawn refused: {msg}")
-
-    @staticmethod
-    def _enforce_restricted_tools(child: KestrelAgent, mandate: SpawnMandate) -> None:
-        """Register the runtime restricted_tools deny hook on a spawned child (#2137).
-
-        No-op when the mandate lists no restricted tools or the child has no
-        hooks manager. The anchored constitution carries the restriction for
-        soft enforcement regardless; this adds the hard PRE_TOOL_USE deny for the
-        child's in-process lifetime.
-        """
-        constraints = getattr(mandate, "additional_constraints", None) or {}
-        restricted = constraints.get("restricted_tools") or []
-        hooks_manager = getattr(child, "hooks_manager", None)
-        if not restricted or hooks_manager is None:
-            return
-        from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
-
-        hooks_manager.register(MandateRestrictionHook(restricted))
-        logger.info(
-            "Registered MandateRestrictionHook on child '%s' for %d restricted tool(s) (#2137).",
-            getattr(child, "name", "?"), len(set(restricted)),
-        )
 
     async def spawn_agent(
         self,
