@@ -996,6 +996,72 @@ nav {
     white-space: nowrap;
     min-width: 0;
 }
+
+/* Identity danger zone (#2208): visually separated destructive-actions
+   section at the bottom of the Identity panel. */
+.identity-danger-zone {
+    border: 1px solid var(--error);
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    margin-top: 1.5rem;
+    background: color-mix(in srgb, var(--error) 6%, transparent);
+}
+
+.identity-danger-zone-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    color: var(--error);
+}
+
+.identity-danger-zone-header h3 {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--error);
+}
+
+.identity-danger-zone-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.identity-danger-zone-copy {
+    min-width: 0;
+}
+
+.identity-danger-zone-action-label {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.25rem;
+}
+
+.identity-danger-zone-desc {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.identity-danger-zone-btn {
+    flex: 0 0 auto;
+    background: transparent;
+    color: var(--error);
+    border: 1px solid var(--error);
+    border-radius: 8px;
+    padding: 0.5rem 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.identity-danger-zone-btn:hover {
+    background: var(--error);
+    color: white;
+}
+
 .hybrid-chain-depth {
     font-size: 0.7rem;
     color: var(--text-tertiary);

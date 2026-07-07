@@ -156,3 +156,11 @@ test('native delete targets the manager routing key, not the editable display na
 
     API.getHostAgent = prevGetHostAgent;
 });
+
+test('index.css styles the danger-zone section (#2237 shipped markup with no CSS)', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const css = await readFile(new URL('../../kestrel_sovereign/static/index.css', import.meta.url), 'utf8');
+    for (const cls of ['.identity-danger-zone', '.identity-danger-zone-header', '.identity-danger-zone-btn']) {
+        assert.ok(css.includes(cls), `${cls} must be styled in index.css`);
+    }
+});
