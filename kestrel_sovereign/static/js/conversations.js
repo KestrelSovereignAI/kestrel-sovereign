@@ -95,6 +95,31 @@ function esc(fn, value) {
     return typeof e === 'function' ? e(value) : String(value == null ? '' : value);
 }
 
+// Append `text` to `el` as text nodes with each case-insensitive occurrence of
+// `term` wrapped in <mark>. DOM-node construction only — snippet text is
+// decrypted message content and must never travel through innerHTML.
+export function appendHighlighted(el, text, term) {
+    const s = String(text == null ? '' : text);
+    const t = String(term == null ? '' : term);
+    if (!t) {
+        el.appendChild(document.createTextNode(s));
+        return;
+    }
+    const lower = s.toLowerCase();
+    const needle = t.toLowerCase();
+    let pos = 0;
+    for (;;) {
+        const idx = lower.indexOf(needle, pos);
+        if (idx < 0) break;
+        if (idx > pos) el.appendChild(document.createTextNode(s.slice(pos, idx)));
+        const mark = document.createElement('mark');
+        mark.textContent = s.slice(idx, idx + needle.length);
+        el.appendChild(mark);
+        pos = idx + needle.length;
+    }
+    if (pos < s.length) el.appendChild(document.createTextNode(s.slice(pos)));
+}
+
 // ============================================================================
 // Inline rename (the single rename implementation, #2149)
 // ============================================================================
@@ -239,6 +264,16 @@ export function buildConversationRow(conv, opts = {}) {
     });
     row.appendChild(previewEl);
 
+    // Full-text search hit context: a decrypted excerpt around the first
+    // matching message, with the matched term highlighted. Built with text
+    // nodes + <mark> (never innerHTML) so message content can't inject markup.
+    if (conv.match_snippet) {
+        const snip = document.createElement('div');
+        snip.className = 'conversation-match-snippet';
+        appendHighlighted(snip, conv.match_snippet, opts.highlightTerm || '');
+        row.appendChild(snip);
+    }
+
     if (typeof opts.onSelect === 'function') {
         row.addEventListener('click', () => opts.onSelect(conv, row));
         row.addEventListener('keydown', (e) => {
@@ -380,6 +415,17 @@ export function mountConversations(containerEl, config = {}) {
 
     let view = config.view || 'active';
     let searchTerm = '';
+    // Server-side full-text search overlay. While `searchTerm` is set, the
+    // instant client-side name/preview filter paints first; a debounced
+    // `GET /api/conversations?q=` then replaces the rows with content-level
+    // hits (decrypted + grouped server-side) carrying match snippets.
+    // `searchResults === null` means no server response applies to the
+    // current term. Trash view keeps the client filter only — trash rows are
+    // assembled client-side from /api/trash and have no search endpoint.
+    let searchResults = null;
+    let searchSeq = 0;
+    let searchDebounce = null;
+    const SEARCH_DEBOUNCE_MS = 250;
     let agentName = config.agentName;
     let lastConversations = [];
     let refreshSeq = 0;
@@ -389,9 +435,24 @@ export function mountConversations(containerEl, config = {}) {
     // the OLD agent. A kebab Archive/Trash/Purge fired in that window would
     // send the previous agent's session_id against the NEW agent's route.
     // Mutation handlers compare against this to drop such stale actions.
+    //
+    // Two anchors, one per data source: `renderedForAgent` tracks
+    // `lastConversations` (pinned in refresh()'s success block) and
+    // `searchForAgent` tracks `searchResults` (pinned in runServerSearch()'s
+    // success block). The search overlay and the plain list reload race each
+    // other during a retarget; whichever source is painted decides which
+    // anchor the stale guard reads — a single anchor would either reject
+    // actions on fresh search rows or accept them on stale list rows.
     let renderedForAgent = agentName;
+    let searchForAgent = agentName;
     function isStaleRow() {
-        return renderedForAgent !== agentName;
+        const anchor = usingSearchOverlay() ? searchForAgent : renderedForAgent;
+        return anchor !== agentName;
+    }
+
+    // Whether the server-search overlay currently owns the painted rows.
+    function usingSearchOverlay() {
+        return !!searchTerm && searchResults !== null && view !== 'trash';
     }
 
     containerEl.classList && containerEl.classList.add('conversations-component');
@@ -433,9 +494,40 @@ export function mountConversations(containerEl, config = {}) {
     if (config.showSearch !== false) {
         search.addEventListener('input', () => {
             searchTerm = String(search.value || '').trim().toLowerCase();
-            renderCurrent();
+            searchResults = null;
+            searchSeq++; // invalidate any in-flight server search
+            if (searchDebounce) clearTimeout(searchDebounce);
+            renderCurrent(); // instant name/preview filter while the server search runs
+            if (searchTerm && view !== 'trash' && typeof api.searchConversations === 'function') {
+                searchDebounce = setTimeout(runServerSearch, SEARCH_DEBOUNCE_MS);
+            }
         });
         controls.appendChild(search);
+    }
+
+    // Debounced content-level search against the server (full text, decrypted
+    // and grouped there). Seq-guarded like refresh(): a stale response — an
+    // older keystroke, or one that raced a view switch/retarget — must never
+    // paint over the rows the current term owns.
+    async function runServerSearch() {
+        const seq = ++searchSeq;
+        const term = searchTerm;
+        // The agent this search is issued for. The seq guard drops responses
+        // that predate a retarget, so a response that lands here belongs to
+        // the agent the API layer was routed to at issue time.
+        const forAgent = agentName;
+        try {
+            const decrypt = state ? state.showDecrypted : true;
+            const data = await api.searchConversations(term, view, decrypt);
+            if (seq !== searchSeq || term !== searchTerm) return;
+            searchResults = data.conversations || [];
+            searchForAgent = forAgent;
+            renderCurrent();
+        } catch (e) {
+            // Keep the client-side filtered view; searching-as-you-type must
+            // degrade quietly, not toast on every keystroke.
+            if (seq === searchSeq) searchResults = null;
+        }
     }
     root.appendChild(controls);
 
@@ -521,6 +613,16 @@ export function mountConversations(containerEl, config = {}) {
     }
 
     function notifyMutated(action, conv) {
+        // Every lifecycle mutation removes the row from the CURRENT view
+        // (archive/trash/purge leave active; unarchive leaves archived;
+        // restore leaves trash), so an active server-search overlay must drop
+        // the hit too — otherwise the mutation's refresh() repaints the stale
+        // `searchResults` row with actions for a view it no longer belongs to
+        // (codex P2). refresh() then re-runs the server search for the
+        // authoritative post-mutation hit list.
+        if (searchResults && conv && conv.session_id) {
+            searchResults = searchResults.filter((c) => c.session_id !== conv.session_id);
+        }
         if (typeof config.onMutated === 'function') config.onMutated(action, conv);
     }
 
@@ -617,6 +719,8 @@ export function mountConversations(containerEl, config = {}) {
                 onSelect(conv, { agentName: renderAgent });
             },
             buildMenuItems: menuItemsFor,
+            // Highlight term for match snippets (server search results only).
+            highlightTerm: searchTerm,
             // active flag applied per-row below via renderCurrent
             _activeId: activeId,
         };
@@ -629,15 +733,22 @@ export function mountConversations(containerEl, config = {}) {
         // guard here would let a mid-retarget keystroke advance `renderedForAgent`
         // to the new agent while still painting the OLD agent's rows, defeating
         // the #2199 P2-3 guard. Pin to the agent the *data* belongs to instead.
-        const convs = filtered(lastConversations);
+        // While a term is active and the server search has answered, its
+        // content-level hits own the list (they are a superset of the client
+        // name/preview filter and carry match snippets). Until then — and in
+        // the trash view, which has no server search — the instant client
+        // filter paints.
+        const convs = usingSearchOverlay() ? searchResults : filtered(lastConversations);
         renderStats(convs);
         if (!convs.length) {
             listEl.innerHTML = '';
             const empty = document.createElement('p');
             empty.className = 'empty-state';
-            empty.textContent = view === 'trash'
-                ? 'Nothing in trash.'
-                : (view === 'archived' ? 'No archived conversations.' : 'No conversations yet.');
+            empty.textContent = searchTerm
+                ? 'No matching conversations.'
+                : (view === 'trash'
+                    ? 'Nothing in trash.'
+                    : (view === 'archived' ? 'No archived conversations.' : 'No conversations yet.'));
             listEl.appendChild(empty);
             return;
         }
@@ -706,6 +817,12 @@ export function mountConversations(containerEl, config = {}) {
 
     async function refresh() {
         syncViewButtons();
+        // Revalidate an active content-search overlay alongside the list
+        // reload — a mutation, retarget or view event may have changed which
+        // sessions match. Seq-guarded, so whichever response is newest wins.
+        if (searchTerm && view !== 'trash' && typeof api.searchConversations === 'function') {
+            runServerSearch();
+        }
         // Sequence token: a view switch or agent retarget while a previous
         // refresh is still in flight must win — otherwise the older response
         // lands late and renders the wrong rows under the new view (e.g. active
@@ -740,12 +857,21 @@ export function mountConversations(containerEl, config = {}) {
         view = next;
         searchTerm = '';
         search.value = '';
+        searchResults = null;
+        searchSeq++;
+        if (searchDebounce) clearTimeout(searchDebounce);
         refresh();
     }
 
     function retarget(nextAgentName) {
         agentName = nextAgentName;
         // Routing is handled by the API layer (API.setHostAgent); just reload.
+        // A pending/answered server search belongs to the OLD agent — drop it
+        // so stale hits never paint post-switch; refresh() re-runs the search
+        // for the new agent.
+        searchResults = null;
+        searchSeq++;
+        if (searchDebounce) clearTimeout(searchDebounce);
         refresh();
     }
 
@@ -795,6 +921,8 @@ export function mountConversations(containerEl, config = {}) {
     }
 
     function destroy() {
+        if (searchDebounce) clearTimeout(searchDebounce);
+        searchSeq++; // orphan any in-flight server search
         closeKebabMenu();
         containerEl.innerHTML = '';
     }

@@ -491,6 +491,12 @@ export function createApiClient({
         getSovereigntyFiles: () => client.request('/api/sovereignty/files'),
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
         getConversations: (decrypt = true, view = 'active') => client.request(`/api/conversations?decrypt=${decrypt}&view=${encodeURIComponent(view)}`),
+        // Full-text search over conversation content + titles. Same endpoint
+        // as the list — `q` flips it into search mode and each returned
+        // session carries match_count / match_role / match_snippet.
+        searchConversations: (query, view = 'active', decrypt = true) => client.request(
+            `/api/conversations?decrypt=${decrypt}&view=${encodeURIComponent(view)}&q=${encodeURIComponent(query)}`,
+        ),
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
         renameConversation: (sessionId, name) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}`, {
             method: 'PATCH',

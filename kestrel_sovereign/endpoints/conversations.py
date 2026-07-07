@@ -64,12 +64,25 @@ async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
 
 
 @router.get("/conversations")
-async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=500), decrypt: bool = True, view: str = Query("active")):
+async def list_conversations(
+    request: Request,
+    limit: int = Query(50, ge=1, le=500),
+    decrypt: bool = True,
+    view: str = Query("active"),
+    q: str = Query(None, min_length=1, max_length=256),
+):
     """List conversation sessions grouped by date/time.
 
     ``view=active`` (default) lists live, non-archived sessions;
     ``view=archived`` lists archived sessions (#2149). Any other value
     falls back to ``active``.
+
+    ``q`` switches the endpoint into full-text search: only sessions whose
+    message content (decrypted server-side, sent-form unwrapped) or
+    user-assigned title matches is returned, each decorated with
+    ``match_count`` / ``match_role`` / ``match_snippet``. Search goes through
+    the privacy-wrapped storage, so EPHEMERAL mode returns nothing and
+    ISOLATED mode searches only the in-memory session buffer.
     """
     try:
         if view not in ("active", "archived"):
@@ -82,17 +95,6 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
 
         # Check if encryption is enabled via the wrapper's safe accessor
         encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
-
-        # Python still groups raw messages into sessions by 30-minute gaps, so
-        # fetch more rows than the requested session count while keeping a hard
-        # SQL-side budget for large histories.
-        row_limit = min(limit * SESSION_GAP_OVERSAMPLE, MAX_CONVERSATION_LIST_ROWS)
-
-        # Use privacy-aware query method instead of direct storage.db access.
-        rows = await storage.query_conversations(agent_id, limit=row_limit, view=view)
-
-        if not rows:
-            return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
 
         def _decorate_preview(session):
             # The shared grouper hands back the raw first-user-message content
@@ -125,6 +127,48 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
                 preview_content = extract_raw_user_content(preview_content)
             session["preview"] = preview_content[:100] + ("..." if len(preview_content) > 100 else "")
             session["preview_encrypted"] = is_encrypted and (not decrypt or decryption_failed)
+
+        # Full-text search path: the privacy-wrapped storage decrypts,
+        # unwraps and groups server-side; sessions come back already decorated
+        # with match_count/match_role/match_snippet and any user-assigned name.
+        search_query = q.strip() if q else ""
+        if search_query:
+            search = getattr(storage, "search_conversations", None)
+            sessions = []
+            if search is not None:
+                sessions = await search(agent_id, search_query, limit=limit, view=view)
+            # Matching necessarily decrypts server-side (SQL cannot see
+            # encrypted content), but decrypt=false callers asked for no
+            # plaintext in the RESPONSE — redact the decrypted snippet and
+            # preview rather than leak readable excerpts (codex P2).
+            redact = (not decrypt) and encrypted_at_rest
+            for session in sessions:
+                if redact:
+                    session.pop("preview_content", None)
+                    session.pop("preview_metadata", None)
+                    session.setdefault("messages", [])
+                    session["preview"] = ""
+                    session["preview_encrypted"] = True
+                    session["match_snippet"] = None
+                else:
+                    _decorate_preview(session)
+            return {
+                "conversations": sessions,
+                "total": len(sessions),
+                "encrypted_at_rest": encrypted_at_rest,
+                "query": search_query,
+            }
+
+        # Python still groups raw messages into sessions by 30-minute gaps, so
+        # fetch more rows than the requested session count while keeping a hard
+        # SQL-side budget for large histories.
+        row_limit = min(limit * SESSION_GAP_OVERSAMPLE, MAX_CONVERSATION_LIST_ROWS)
+
+        # Use privacy-aware query method instead of direct storage.db access.
+        rows = await storage.query_conversations(agent_id, limit=row_limit, view=view)
+
+        if not rows:
+            return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
 
         # Normalize raw rows (newest-first from SQL) into oldest-first dicts and
         # run them through the shared session-boundary algorithm (#2019) — the
