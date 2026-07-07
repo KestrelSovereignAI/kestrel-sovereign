@@ -20,7 +20,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
-from .session_grouping import summarize_sessions
+from .session_grouping import (
+    coalesce_sessions_by_session_id,
+    group_messages_into_sessions,
+    summarize_sessions,
+)
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
 from .encryption import (
@@ -264,6 +268,121 @@ def _token_match_score(query_tokens: List[str], content_lower: str) -> float:
 
     hits = sum(1 for t in query_tokens if t in content_lower)
     return hits / len(query_tokens)
+
+
+_MATCH_SNIPPET_RADIUS = 60
+
+
+def _build_match_snippet(text: str, query_lower: str, radius: int = _MATCH_SNIPPET_RADIUS) -> str:
+    """Return a short excerpt of *text* centered on the first *query_lower* hit.
+
+    Built from the wrapper-stripped projection — the same text the match was
+    decided on — so the snippet always contains the highlighted term and never
+    leaks ``<retrieved_context>`` transport into the UI.
+    """
+    stripped = " ".join(_strip_search_wrappers(text).split())
+    idx = stripped.lower().find(query_lower)
+    if idx < 0:
+        # Tokenized-fallback hit: no contiguous substring to center on.
+        head = stripped[: radius * 2]
+        return head + ("…" if len(stripped) > radius * 2 else "")
+    start = max(0, idx - radius)
+    end = min(len(stripped), idx + len(query_lower) + radius)
+    return ("…" if start > 0 else "") + stripped[start:end].strip() + ("…" if end < len(stripped) else "")
+
+
+def search_session_summaries(
+    normalized_messages: List[Dict[str, Any]],
+    query: str,
+    names: Optional[Dict[str, str]] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Full-text search over conversations, grouped into session summaries.
+
+    The pure core behind conversation search: callers hand in **decrypted**,
+    oldest-first normalized message dicts (``id``/``role``/``content``/
+    ``metadata``/``created_at``) — the persistent store after
+    ``_decrypt_with_fallback`` + ``_resolve_canonical``, the privacy wrapper
+    its in-memory ISOLATED buffer — and get back newest-first session
+    summaries for the sessions whose content (or user-assigned title) matches
+    *query*.
+
+    Matching reuses the exact semantics of ``search_history``: substring
+    match against the wrapper-stripped projection first (#1537/#1549), then
+    the tokenized ≥0.6-overlap fallback for multi-term queries, with
+    wrapper-only queries gated out entirely (#1554). Grouping reuses the
+    shared #2019 boundary algorithm, so a search hit is always a session the
+    list view (and the delete/archive lifecycle) agrees exists.
+
+    Returns session dicts shaped like ``group_messages_into_sessions`` output
+    (``preview_content``/``preview_metadata`` retained for the endpoint's
+    decorator) plus ``name`` (when titled), ``match_count``, ``match_role``,
+    and ``match_snippet`` — decrypted plaintext excerpts around the first hit.
+    """
+    names = names or {}
+    query_lower = query.strip().lower()
+    if not query_lower:
+        return []
+
+    query_tokens = _tokenize_for_search(query)
+    stripped_query_tokens = _tokenize_for_search(_strip_search_wrappers(query))
+    query_is_wrapper_only = bool(query_tokens) and not stripped_query_tokens
+    use_token_fallback = (
+        not query_is_wrapper_only and len(stripped_query_tokens) >= 2
+    )
+
+    grouped = coalesce_sessions_by_session_id(
+        group_messages_into_sessions(normalized_messages, collect_messages=True)
+    )
+
+    results: List[Dict[str, Any]] = []
+    for session in grouped:
+        messages = session.pop("messages", [])
+        sid = session.get("session_id")
+        name = names.get(sid)
+        if name is not None:
+            session["name"] = name
+
+        match_count = 0
+        first_hit: Optional[Dict[str, Any]] = None
+        best_token: Optional[Tuple[float, Dict[str, Any]]] = None
+        for msg in messages:
+            content = msg.get("content") or ""
+            if not isinstance(content, str):
+                continue
+            content_lower = _strip_search_wrappers(content).lower()
+            if query_lower in content_lower:
+                match_count += 1
+                if first_hit is None:
+                    first_hit = msg
+            elif use_token_fallback and match_count == 0:
+                score = _token_match_score(stripped_query_tokens, content_lower)
+                if score >= _TOKEN_MATCH_THRESHOLD and (
+                    best_token is None or score > best_token[0]
+                ):
+                    best_token = (score, msg)
+
+        name_match = bool(name) and query_lower in name.lower()
+        if match_count == 0 and first_hit is None and best_token is not None:
+            first_hit = best_token[1]
+            match_count = 1
+        if match_count == 0 and not name_match:
+            continue
+
+        session["match_count"] = match_count
+        if first_hit is not None:
+            session["match_role"] = first_hit.get("role")
+            session["match_snippet"] = _build_match_snippet(
+                first_hit.get("content") or "", query_lower
+            )
+        else:
+            # Title-only hit: the name itself is the evidence.
+            session["match_role"] = None
+            session["match_snippet"] = None
+        results.append(session)
+
+    results.sort(key=lambda s: s["last_message_at"], reverse=True)
+    return results[:limit]
 
 
 class AsyncConversationStore:
@@ -1748,6 +1867,77 @@ class AsyncConversationStore:
                 exact_results.append(entry)
 
         return exact_results
+
+    # Row budget for a session search scan — matches search_history's cap.
+    SEARCH_SESSIONS_SCAN_LIMIT = 5000
+
+    async def search_sessions(
+        self,
+        query: str,
+        view: str = "active",
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Full-text search across this agent's conversations (#2019 grouping).
+
+        Backs the conversations pane's server-side search: scans up to
+        ``SEARCH_SESSIONS_SCAN_LIMIT`` newest live rows (``view='archived'``
+        scans archived ones), decrypts client-side — SQL LIKE cannot see
+        encrypted content, same constraint as ``search_history`` — resolves
+        canonical content (#1402), and returns newest-first session summaries
+        whose content or title matches, via :func:`search_session_summaries`.
+        """
+        if view == "archived":
+            archive_clause = "archived_at IS NOT NULL"
+        else:
+            archive_clause = "archived_at IS NULL"
+        rows = await self.db.fetchall(
+            "SELECT id, role, content, metadata, created_at, rendered_content "
+            "FROM conversation_history "
+            f"WHERE agent_id = ? AND deleted_at IS NULL AND {archive_clause} "
+            "ORDER BY id DESC LIMIT ?",
+            (self.agent_id, self.SEARCH_SESSIONS_SCAN_LIMIT),
+        )
+
+        normalized: List[Dict[str, Any]] = []
+        for row in reversed(rows):  # oldest-first for the shared grouper
+            row_id = row[0]
+            meta = json.loads(row[3]) if row[3] else None
+            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+
+            # Opportunistic per-agent key migration, as in search_history.
+            if needs_migration and self._migrate_on_read:
+                try:
+                    await self._migrate_message(row_id, content, meta)
+                except Exception as e:
+                    logger.warning(
+                        f"Migration failed for message {row_id} in search_sessions: {e}"
+                    )
+
+            # Canonical/transport split (#1402): match and snippet against the
+            # raw user turn, never the rendered transport bytes.
+            content, _ = await self._resolve_canonical(
+                row_id, row[1], meta, content, row[5]
+            )
+
+            cleaned_meta = remove_enc_flag(meta)
+            if cleaned_meta:
+                cleaned_meta.pop('key_version', None)
+
+            normalized.append({
+                "id": row_id,
+                "role": row[1],
+                "content": content,
+                "metadata": cleaned_meta if cleaned_meta else {},
+                "created_at": row[4],
+            })
+
+        try:
+            names = await self.get_conversation_names()
+        except Exception as e:  # titles are best-effort decoration
+            logger.warning(f"search_sessions: name lookup failed: {e}")
+            names = {}
+
+        return search_session_summaries(normalized, query, names=names, limit=limit)
 
     async def clear_history(self) -> None:
         """Soft-delete every live message for this agent (#763).

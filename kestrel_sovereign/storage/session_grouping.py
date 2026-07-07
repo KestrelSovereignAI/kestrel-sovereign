@@ -51,6 +51,7 @@ def group_messages_into_sessions(
     gap_minutes: float = SESSION_GAP_MINUTES,
     now: Optional[datetime] = None,
     keep_empty_markers: bool = False,
+    collect_messages: bool = False,
 ) -> List[Dict[str, Any]]:
     """Group ordered messages into session clusters.
 
@@ -74,12 +75,19 @@ def group_messages_into_sessions(
             server-side, or the tile vanishes. The agent-facing memory tools
             leave this ``False`` so empty just-started sessions stay out of
             recall.
+        collect_messages: when ``True``, each returned session additionally
+            carries a ``messages`` list holding the (normalized) message dicts
+            attributed to it — structural ``new_session`` marker rows excluded.
+            Content search needs the message→session attribution this boundary
+            algorithm computes; exposing it here keeps search on the same
+            single source of truth instead of re-deriving boundaries.
 
     Returns:
         list of session dicts ordered **oldest-first**, each with:
             ``session_id``, ``started_at`` (iso), ``last_message_at`` (iso),
             ``message_count``, ``user_message_count``,
-            ``preview_content`` (raw, undecorated), ``preview_metadata`` (dict).
+            ``preview_content`` (raw, undecorated), ``preview_metadata`` (dict),
+            and — only when ``collect_messages`` — ``messages``.
         Callers reverse / slice / decorate as needed.
     """
     sessions: List[Dict[str, Any]] = []
@@ -97,7 +105,7 @@ def group_messages_into_sessions(
         # session_id (a UUID minted by the store) so the value surfaces match
         # where messages are actually filed. Fall back to the first message's
         # row id only for genuinely legacy clusters with no metadata session_id.
-        return {
+        session: Dict[str, Any] = {
             "session_id": str(session_uuid) if session_uuid else str(msg_id),
             "started_at": ts.isoformat(),
             "last_message_at": ts.isoformat(),
@@ -106,6 +114,9 @@ def group_messages_into_sessions(
             "preview_content": None,
             "preview_metadata": None,
         }
+        if collect_messages:
+            session["messages"] = []
+        return session
 
     for msg in messages:
         msg_id = msg.get("id")
@@ -168,6 +179,8 @@ def group_messages_into_sessions(
 
         current["message_count"] += 1
         current["last_message_at"] = timestamp.isoformat()
+        if collect_messages:
+            current["messages"].append(msg)
         if role == "user":
             current["user_message_count"] += 1
             if current["preview_content"] is None:
@@ -209,6 +222,8 @@ def coalesce_sessions_by_session_id(
             continue
         existing["message_count"] += session["message_count"]
         existing["user_message_count"] += session["user_message_count"]
+        if "messages" in existing and "messages" in session:
+            existing["messages"] = existing["messages"] + session["messages"]
         if session["started_at"] < existing["started_at"]:
             existing["started_at"] = session["started_at"]
         if session["last_message_at"] > existing["last_message_at"]:

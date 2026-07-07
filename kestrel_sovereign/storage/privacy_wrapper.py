@@ -31,7 +31,10 @@ from kestrel_sovereign.privacy import (
     privacy_config_to_mode,
 )
 from kestrel_sovereign.storage.conversation_ids import coerce_persistent_message_id
-from kestrel_sovereign.storage.async_conversation_store import _escape_like_session_value
+from kestrel_sovereign.storage.async_conversation_store import (
+    _escape_like_session_value,
+    search_session_summaries,
+)
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -815,6 +818,62 @@ class PrivacyEnforcingStorage:
             ORDER BY created_at DESC
             LIMIT ?
         """, (agent_id, bounded_limit))
+
+    async def search_conversations(
+        self, agent_id: str, query: str, limit: int = 20, view: str = "active"
+    ) -> List[Dict[str, Any]]:
+        """
+        Full-text search across conversations, respecting privacy mode.
+
+        In EPHEMERAL mode, returns an empty list (no persistent data exposed).
+        In ISOLATED mode, searches the in-memory session buffer.
+        In other modes, delegates to the conversation store, which decrypts
+        client-side and groups hits into session summaries (#2019).
+
+        Returns newest-first session summary dicts as produced by
+        :func:`~kestrel_sovereign.storage.async_conversation_store.search_session_summaries`
+        (``match_count`` / ``match_role`` / ``match_snippet`` decorated).
+        """
+        bounded_limit = max(1, min(int(limit), 500))
+        if view not in ("active", "archived"):
+            view = "active"
+
+        if self._privacy_config.is_ephemeral():
+            logger.debug("search_conversations blocked: ephemeral mode returns no data")
+            return []
+
+        if self._policy.use_session_storage:
+            # In-memory session storage has no archive concept.
+            if view == "archived":
+                return []
+            normalized = []
+            for i, conv in enumerate(self._session_conversations):
+                meta = dict(conv.get("metadata") or {})
+                sid = _conv_session_id(conv)
+                meta["session_id"] = (
+                    sid if sid is not None else _ISOLATED_UNLABELED_SESSION_ID
+                )
+                normalized.append({
+                    "id": i,
+                    "role": conv.get("role", ""),
+                    "content": conv.get("content", ""),
+                    "metadata": meta,
+                    "created_at": conv.get("created_at", None),
+                })
+            try:
+                names = await self._storage.get_conversation_names() or {}
+            except Exception:
+                names = {}
+            return search_session_summaries(
+                normalized, query, names=names, limit=bounded_limit
+            )
+
+        conv_store = getattr(self._storage, "conversation", None)
+        if conv_store is None:
+            return []
+        return await conv_store.search_sessions(
+            query, view=view, limit=bounded_limit
+        )
 
     async def query_conversation_start(
         self, message_id: str, agent_id: str

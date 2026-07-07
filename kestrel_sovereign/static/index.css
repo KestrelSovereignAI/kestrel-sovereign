@@ -454,6 +454,25 @@ nav {
     text-overflow: ellipsis;
 }
 
+/* Full-text search hit context: decrypted excerpt around the first matching
+   message, rendered under the preview with the term <mark>-highlighted. */
+.conversation-match-snippet {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.25rem;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.conversation-match-snippet mark {
+    background: var(--accent-color);
+    color: white;
+    border-radius: 2px;
+    padding: 0 1px;
+}
+
 /* Inline rename input (#716).  Sits inside .conversation-preview
    and matches its size/weight so the row doesn't shift on edit. */
 .conversation-rename-input {
