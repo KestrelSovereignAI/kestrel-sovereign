@@ -4,6 +4,22 @@
  */
 
 // ============================================================================
+// Overlay root (#2233)
+// ============================================================================
+// Body-level UI (modals, toasts — and anything else that floats) mounts into
+// a configurable root instead of document.body. Embeds that serve kestrel's
+// CSS scoped to their mount roots (e.g. Frinz's @scope-wrapped
+// chat-scoped.css) point this at an element INSIDE a scope root so overlay
+// content is styled; standalone keeps the document.body default. Fixed
+// positioning is unaffected by the parent, so overlays still cover the
+// viewport wherever the root lives.
+let _overlayRoot = null;
+export function setOverlayRoot(el) { _overlayRoot = el || null; }
+export function getOverlayRoot() {
+    return (_overlayRoot && _overlayRoot.isConnected) ? _overlayRoot : document.body;
+}
+
+// ============================================================================
 // Animation Styles
 // ============================================================================
 
@@ -228,7 +244,12 @@ export const Toast = {
                 z-index: 3000;
                 max-width: 400px;
             `;
-            document.body.appendChild(this._container);
+            getOverlayRoot().appendChild(this._container);
+        }
+        // Re-home a container created before setOverlayRoot ran (or whose root
+        // was torn down) so late configuration still takes effect.
+        if (this._container.parentNode !== getOverlayRoot()) {
+            getOverlayRoot().appendChild(this._container);
         }
         return this._container;
     },
@@ -416,7 +437,7 @@ export const Modal = {
         document.addEventListener('keydown', escHandler);
 
         overlay.appendChild(modal);
-        document.body.appendChild(overlay);
+        getOverlayRoot().appendChild(overlay);
         this._currentModal = overlay;
 
         const firstInput = modal.querySelector('input, select, textarea');
