@@ -25,6 +25,7 @@ This directory holds detailed documentation for kestrel-sovereign. The top-level
 - **[`../README.md`](../README.md)** — project entry point, install, quick start, feature stability matrix
 - **[`../QUICKSTART.md`](../QUICKSTART.md)** — concise install + first agent
 - **[`../KESTREL_FEATURES.md`](../KESTREL_FEATURES.md)** — canonical feature inventory (the live source of truth)
+- **[`ECOSYSTEM.md`](ECOSYSTEM.md)** — index of all sibling repositories (feature packages, providers, standalone tools)
 - **[`GETTING_STARTED.md`](GETTING_STARTED.md)** — developer-oriented setup
 - **[`PROJECT_VISION.md`](PROJECT_VISION.md)** — what kestrel-sovereign exists to do
 

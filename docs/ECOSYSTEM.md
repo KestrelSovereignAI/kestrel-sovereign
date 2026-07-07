@@ -1,0 +1,140 @@
+---
+type: Documentation Index
+title: Kestrel Ecosystem Repository Index
+description: High-level index of every repository in the Kestrel ecosystem — core
+  platform, feature packages, channel/voice/storage/cloud providers, and standalone
+  tools — with links to each repo's AGENTS.md code index.
+resource: /docs/ECOSYSTEM.md
+tags:
+- docs
+- documentation-index
+- ecosystem
+timestamp: '2026-07-07T00:00:00Z'
+status: active
+owner: documentation
+canonical: true
+generated: false
+privacy: public
+---
+
+# Kestrel Ecosystem — Repository Index
+
+A high-level map of every repository in the Kestrel ecosystem, written for both
+humans and coding agents. Each repository carries its own `AGENTS.md` at the
+root — read automatically by Claude Code, Codex, Cursor, and other coding
+agents — containing that package's structure tree, entry points,
+key-files-to-read-first, and test commands. This document is the hop between
+repos; the per-repo `AGENTS.md` is the code index within a repo.
+
+For **this** repository there is additionally a generated per-file index:
+[`docs/audit/REPO_MAP.md`](audit/REPO_MAP.md) — every tracked file with a
+one-line purpose and its public top-level Python symbols, regenerated nightly.
+
+All repositories live in the [KestrelSovereignAI](https://github.com/KestrelSovereignAI)
+GitHub organization. Repos marked **private** require org access; everything
+else is public. Commercial products built on top of Kestrel and internal
+business repositories are intentionally not listed here.
+
+## Core platform
+
+| Repository | What it is |
+|---|---|
+| [kestrel-sovereign](https://github.com/KestrelSovereignAI/kestrel-sovereign) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/AGENTS.md)) | This repo. Constitutional AI agent framework: DID identity, encrypted memory, constitution, multi-LLM routing, feature runtime, chat UI, multi-agent host. |
+| [kestrel-sovereign-sdk](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/blob/main/AGENTS.md)) | Lightweight SDK every feature package depends on: `Feature`/`Tool`/`Hook` base classes, provider protocols, isolated-feature service runtime. |
+| [kestrel-llms](https://github.com/KestrelSovereignAI/kestrel-llms) | LLM provider plugins monorepo (e.g. `kestrel-llm-bedrock`) feeding the Vendor/Route/Model routing layer. |
+
+## Feature packages (`kestrel-feature-*`)
+
+Plugins discovered via the `kestrel_sovereign.features` entry-point group.
+Core must never import them directly — see the boundary contract in
+[`architecture/core/MODULAR_RUNTIME.md`](architecture/core/MODULAR_RUNTIME.md)
+and the audited inventory in [`../KESTREL_FEATURES.md`](../KESTREL_FEATURES.md).
+
+| Repository | What it is |
+|---|---|
+| [kestrel-feature-mcp](https://github.com/KestrelSovereignAI/kestrel-feature-mcp) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-mcp/blob/main/AGENTS.md)) | MCP server management and tool bridging — unified access to 311+ MCP servers via Docker MCP Toolkit. |
+| [kestrel-feature-github](https://github.com/KestrelSovereignAI/kestrel-feature-github) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-github/blob/main/AGENTS.md)) | GitHub integration — issues, pull requests, and repositories from agent conversations. |
+| [kestrel-feature-github-app](https://github.com/KestrelSovereignAI/kestrel-feature-github-app) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-github-app/blob/main/AGENTS.md)) | GitHub App webhook handler — responds to issues and discussions. |
+| [kestrel-feature-code](https://github.com/KestrelSovereignAI/kestrel-feature-code) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-code/blob/main/AGENTS.md)) | Codebase tooling — read, search, edit, lint, test, commit, rollback with approval gates. |
+| [kestrel-feature-workflows](https://github.com/KestrelSovereignAI/kestrel-feature-workflows) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-workflows/blob/main/AGENTS.md)) | First-class agent workflow orchestration primitive. |
+| [kestrel-feature-features](https://github.com/KestrelSovereignAI/kestrel-feature-features) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-features/blob/main/AGENTS.md)) | FeatureFeature — agents writing their own Kestrel features end-to-end, on top of the workflow primitive. |
+| [kestrel-feature-reflection](https://github.com/KestrelSovereignAI/kestrel-feature-reflection) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-reflection/blob/main/AGENTS.md)) | Agent self-reflection and self-improvement. |
+| [kestrel-feature-intelligence](https://github.com/KestrelSovereignAI/kestrel-feature-intelligence) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-intelligence/blob/main/AGENTS.md)) | Metacognition and multi-model governance — reflection insights plus council deliberation. |
+| [kestrel-feature-parametric-self](https://github.com/KestrelSovereignAI/kestrel-feature-parametric-self) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-parametric-self/blob/main/AGENTS.md)) | Owned parametric self — a per-agent local model nightly-finetuned on the agent's own experience. |
+| [kestrel-feature-council](https://github.com/KestrelSovereignAI/kestrel-feature-council) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-council/blob/main/AGENTS.md)) | Multi-model council deliberation. |
+| [kestrel-feature-observability](https://github.com/KestrelSovereignAI/kestrel-feature-observability) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-observability/blob/main/AGENTS.md)) | Lifecycle event observability — hook-driven logging with shared Prometheus registry. |
+| [kestrel-feature-visual](https://github.com/KestrelSovereignAI/kestrel-feature-visual) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-visual/blob/main/AGENTS.md)) | Visual identity — avatar generation, selfies, LoRA training for character consistency. |
+| [kestrel-feature-voice](https://github.com/KestrelSovereignAI/kestrel-feature-voice) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-voice/blob/main/AGENTS.md)) | Voice feature — orchestrates the `kestrel-voice-*` provider packages. |
+| [kestrel-feature-wallet](https://github.com/KestrelSovereignAI/kestrel-feature-wallet) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-wallet/blob/main/AGENTS.md)) | Multi-currency agent wallet with Stripe on-ramp — FIL, USDC, USDT, economic gates, cryostasis thresholds. |
+| [kestrel-feature-entities](https://github.com/KestrelSovereignAI/kestrel-feature-entities) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-entities/blob/main/AGENTS.md)) | Declarative entity / ORM layer — SQLAlchemy 2.0 + Alembic, multi-tenant, privacy-aware. |
+| [kestrel-feature-story-archive](https://github.com/KestrelSovereignAI/kestrel-feature-story-archive) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-story-archive/blob/main/AGENTS.md)) | Agent-centric life-story timeline — collection, extraction, sharing, IPFS export, pluggable vector search. |
+| [kestrel-feature-healthcare](https://github.com/KestrelSovereignAI/kestrel-feature-healthcare) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-healthcare/blob/main/AGENTS.md)) | Patient-owned sovereign health records (FHIR/CCDA). |
+| [kestrel-feature-legal](https://github.com/KestrelSovereignAI/kestrel-feature-legal) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-legal/blob/main/AGENTS.md)) | Legal knowledge feature. |
+| [kestrel-feature-lora](https://github.com/KestrelSovereignAI/kestrel-feature-lora) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-lora/blob/main/AGENTS.md)) | Kestrel training adapters (proprietary). |
+| [kestrel-feature-social-core](https://github.com/KestrelSovereignAI/kestrel-feature-social-core) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-social-core/blob/main/AGENTS.md)) | Social archive import — shared core. |
+| [kestrel-feature-social-meta](https://github.com/KestrelSovereignAI/kestrel-feature-social-meta) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-social-meta/blob/main/AGENTS.md)) | Social archive import — Meta (Facebook/Instagram). |
+| [kestrel-feature-social-x](https://github.com/KestrelSovereignAI/kestrel-feature-social-x) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-feature-social-x/blob/main/AGENTS.md)) | Social archive import — X/Twitter. |
+
+## Channel packages (`kestrel-channel-*`)
+
+Messaging channels that connect agents to the outside world. These run in
+isolated feature venvs (see `docs/design/ISOLATED_FEATURE_RUNTIME.md`).
+
+| Repository | What it is |
+|---|---|
+| [kestrel-channel-whatsapp](https://github.com/KestrelSovereignAI/kestrel-channel-whatsapp) (private) | WhatsApp messaging channel — Twilio + WhatsApp-Web/neonize providers, QR pairing as a companion device. |
+| [kestrel-channel-telegram](https://github.com/KestrelSovereignAI/kestrel-channel-telegram) (private) | Telegram messaging channel — agent owns a bot (@BotFather token), default-deny allowlist, `/start` onboarding. |
+
+## Voice providers (`kestrel-voice-*`)
+
+| Repository | What it is |
+|---|---|
+| [kestrel-voice-openai](https://github.com/KestrelSovereignAI/kestrel-voice-openai) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-voice-openai/blob/main/AGENTS.md)) | OpenAI TTS + STT (including realtime). |
+| [kestrel-voice-elevenlabs](https://github.com/KestrelSovereignAI/kestrel-voice-elevenlabs) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-voice-elevenlabs/blob/main/AGENTS.md)) | ElevenLabs TTS. |
+| [kestrel-voice-deepgram](https://github.com/KestrelSovereignAI/kestrel-voice-deepgram) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-voice-deepgram/blob/main/AGENTS.md)) | Deepgram STT. |
+
+## Storage providers (`kestrel-storage-*`)
+
+| Repository | What it is |
+|---|---|
+| [kestrel-storage-filebase](https://github.com/KestrelSovereignAI/kestrel-storage-filebase) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-storage-filebase/blob/main/AGENTS.md)) | Filebase S3-compatible IPFS storage. |
+| [kestrel-storage-lighthouse](https://github.com/KestrelSovereignAI/kestrel-storage-lighthouse) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-storage-lighthouse/blob/main/AGENTS.md)) | Lighthouse IPFS pinning. |
+| [kestrel-storage-storacha](https://github.com/KestrelSovereignAI/kestrel-storage-storacha) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-storage-storacha/blob/main/AGENTS.md)) | Storacha (web3.storage) with UCAN auth. |
+
+## Cloud providers (`kestrel-cloud-*`)
+
+| Repository | What it is |
+|---|---|
+| [kestrel-cloud-gcp](https://github.com/KestrelSovereignAI/kestrel-cloud-gcp) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-cloud-gcp/blob/main/AGENTS.md)) | GCP Compute Engine — provision GPU instances, run LoRA training over SSH. |
+| [kestrel-cloud-runpod](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod) | RunPod GPU cloud provider. |
+| [kestrel-cloud-vastai](https://github.com/KestrelSovereignAI/kestrel-cloud-vastai) ([AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-cloud-vastai/blob/main/AGENTS.md)) | Vast.ai GPU marketplace — spot/on-demand instances, training over SSH. |
+
+## Standalone tools and layers
+
+Not feature plugins — separate applications that work with or on top of the
+platform.
+
+| Repository | What it is |
+|---|---|
+| [kestrel-talon](https://github.com/KestrelSovereignAI/kestrel-talon) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-talon/blob/main/AGENTS.md)) | Autonomous GitHub/ADO issue processor with Kestrel governance — any LLM via OpenCode or Claude Agent SDK. |
+| [kestrel-eye](https://github.com/KestrelSovereignAI/kestrel-eye) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-eye/blob/main/AGENTS.md)) | Vision-verified E2E feedback loop — AI reviews screenshots until they're right. |
+| [kestrel-flight](https://github.com/KestrelSovereignAI/kestrel-flight) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-flight/blob/main/AGENTS.md)) | Playwright demo/test orchestration with narration, state, and dependency management. |
+| [kestrel-claws](https://github.com/KestrelSovereignAI/kestrel-claws) (private) | The Grip — sovereign fleet orchestration CLI for the Falconer. |
+| [kestrel-claw](https://github.com/KestrelSovereignAI/kestrel-claw) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-claw/blob/main/AGENTS.md)) | OpenClaw + Kestrel Sovereign constitutional identity. |
+| [kestrel-castle](https://github.com/KestrelSovereignAI/kestrel-castle) (private) | The Castle — enterprise deployment layer for Kestrel flocks. |
+
+## Infrastructure and site
+
+| Repository | What it is |
+|---|---|
+| [agent-identities](https://github.com/KestrelSovereignAI/agent-identities) | DID documents for KestrelSovereignAI agents (W3C `did:web`), hosted at agents.kestrelsovereign.com. |
+| [kestrel-website](https://github.com/KestrelSovereignAI/kestrel-website) | kestrelsovereign.com — marketing site and blog (GitHub Pages). |
+
+## Maintaining this index
+
+- Add a row when a new ecosystem repository is created; remove it when a repo
+  is archived.
+- Keep descriptions to one line — the repo's own `README.md` and `AGENTS.md`
+  carry the detail.
+- Link a repo's `AGENTS.md` only if the file actually exists on its default
+  branch.

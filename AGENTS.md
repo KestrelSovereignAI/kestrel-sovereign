@@ -14,6 +14,11 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 - GPU cloud deployment (RunPod, Vast.ai, GCP)
 - Cloud Run serverless deployment (scales to zero)
 
+## Code Indexes
+
+- [docs/audit/REPO_MAP.md](docs/audit/REPO_MAP.md) — generated per-file index of this repo (every tracked file with a one-line purpose and its public Python symbols; regenerated nightly).
+- [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md) — index of all sibling repositories (feature packages, providers, standalone tools), each with its own `AGENTS.md`.
+
 ## Key Directories
 
 - `kestrel_sovereign/` - Main package

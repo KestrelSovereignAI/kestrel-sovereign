@@ -4,6 +4,22 @@
   "routes": [
     {
       "existing_code_refs": [
+        "AGENTS.md",
+        "KESTREL_FEATURES.md",
+        "README.md"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/ECOSYSTEM.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Kestrel Ecosystem Repository Index",
+      "type": "Documentation Index"
+    },
+    {
+      "existing_code_refs": [
         "README.md",
         "kestrel_sovereign/main.py",
         "main.py"
@@ -40,9 +56,13 @@
         "scripts/generate_demo_evidence_docs.py",
         "scripts/generate_feature_docs.py"
       ],
-      "findings": [],
+      "findings": [
+        "missing_local_links"
+      ],
       "missing_code_refs": [],
-      "missing_links": [],
+      "missing_links": [
+        "ECOSYSTEM.md"
+      ],
       "path": "docs/README.md",
       "privacy": "public",
       "render": "public",
