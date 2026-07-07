@@ -144,6 +144,25 @@ export function initNavigation() {
     // doesn't open onto a vanished panel.
     promoteActiveTabIfNeeded();
 
+    // #2229: the standalone console is chat-first, exactly like every embed.
+    // The tab strip starts hidden (index.html) and the chat-header "Advanced"
+    // toggle reveals the capability-gated strip through the SAME reveal
+    // implementation the embeddable mountPanels host uses (Panels.initReveal).
+    // Collapsed = chat only; revealing shows the gated strip (Chat first);
+    // collapsing returns to the Chat tab; the toggle hides when only one tab is
+    // available and tracks runtime gating changes (nav MutationObserver). The
+    // revealed state persists across reloads so an operator who lives in
+    // Advanced isn't re-collapsed every load.
+    const advancedToggle = document.getElementById('advanced-toggle-btn');
+    if (navEl && advancedToggle) {
+        Panels.initReveal({
+            navEl,
+            activate: activatePanel,
+            anchor: advancedToggle,
+            storageKey: 'kestrel:console-advanced',
+        });
+    }
+
     // #2041: re-gate live when a feature is enabled/disabled at runtime. The
     // boot prune above is destructive (host opt-out is static and authoritative);
     // runtime feature flips toggle visibility on the surviving tabs instead, so

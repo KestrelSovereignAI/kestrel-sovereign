@@ -146,7 +146,7 @@ export function attachDelegatedNav(navEl, activate) {
  *          its original parent/position. Ordering follows `before` (as in
  *          registerPanel); a host tab with no `before` registered first lands
  *          before the core panels (Chat-first).
- * @param {boolean|{toggleLabel?: string, anchor?: HTMLElement, scopeEl?: HTMLElement, onReveal?: (revealed: boolean) => void}} [config.reveal]
+ * @param {boolean|{toggleLabel?: string, anchor?: HTMLElement, scopeEl?: HTMLElement, onReveal?: (revealed: boolean) => void, storageKey?: string|false}} [config.reveal]
  *        - opt-in collapsed/"Advanced" mode (#2211). Omitted/falsy = today's
  *          always-visible nav strip (standalone console, unchanged). When set,
  *          the mount renders COLLAPSED: the nav strip is hidden (no tab headers)
@@ -163,7 +163,10 @@ export function attachDelegatedNav(navEl, activate) {
  *          (alongside the active tab) across a `destroy()`/remount on agent
  *          switch: capture `handle.revealed` + the active tab before destroy,
  *          then after remount call `handle.toggleReveal(wasRevealed)` and
- *          `handle.activate(savedPanelId)`.
+ *          `handle.activate(savedPanelId)`. The revealed state is also persisted
+ *          to `localStorage` under `reveal.storageKey` (default
+ *          `'kestrel:panels-revealed'`; pass `false` to disable) so a reload
+ *          restores it (#2229).
  * @returns {Promise<{activate(panelId: string): void, destroy(): void, toggleReveal(next?: boolean): boolean, revealed: boolean}>}
  */
 export async function mountPanels(containerEl, config = {}) {
@@ -290,131 +293,42 @@ export async function mountPanels(containerEl, config = {}) {
         if (first) activate(first.dataset.panel);
     }
 
-    // ---- reveal mode (#2211) ------------------------------------------------
+    // ---- reveal mode (#2211, shared helper #2229) ---------------------------
     // Opt-in collapsed/"Advanced" mode: chat-only by default, a capability-gated
     // toggle reveals the full nav strip. Omitted `reveal` leaves everything above
-    // exactly as-is (standalone console unchanged).
-    let _revealed = false;
-    let _toggleEl = null;
-    let _toggleOwned = false;
-    let _togglePrevAria = null;
-    let _detachToggle = () => {};
-
-    function _applyRevealState() {
-        // Collapsed: hide the whole nav strip so the embed shows chat-only (no
-        // tab headers). Revealed: show the gated strip (Chat first).
-        navEl.style.display = _revealed ? '' : 'none';
-        if (_toggleEl) _toggleEl.setAttribute('aria-pressed', _revealed ? 'true' : 'false');
-        // Host observability (#2211 addendum): host chrome OUTSIDE the mount
-        // (e.g. an agent banner's management buttons) shows/hides with the
-        // reveal state. Two zero-JS-friendly hooks, both fired/applied on every
-        // state application including the initial one:
-        //  - `panels-revealed` class on `reveal.scopeEl` (default: the mount
-        //    container) so pure-CSS hosts can gate `[data-advanced-only]`.
-        //  - `reveal.onReveal(revealed)` callback for hosts that need JS.
-        const scope = (revealOpts.scopeEl && typeof revealOpts.scopeEl === 'object')
-            ? revealOpts.scopeEl : containerEl;
-        if (scope && scope.classList) scope.classList.toggle('panels-revealed', _revealed);
-        if (typeof revealOpts.onReveal === 'function') {
-            try { revealOpts.onReveal(_revealed); } catch (_) { /* host bug must not wedge the toggle */ }
-        }
-    }
-
-    function _setRevealed(next) {
-        _revealed = !!next;
-        _applyRevealState();
-        // With the strip hidden the user can't see or change the active tab, so
-        // collapsing returns the visible body to the leading (Chat) tab.
-        if (!_revealed) {
-            const first = navEl.querySelector('.nav-tab');
-            if (first) activate(first.dataset.panel);
-        }
-    }
-
-    let _navObserver = null;
-
-    function _ensureToggleWired() {
-        if (_toggleEl) return;
-        if (revealOpts.anchor && typeof revealOpts.anchor === 'object') {
-            // Host-provided anchor: wire it in place, never move/create it.
-            _toggleEl = revealOpts.anchor;
-            _togglePrevAria = _toggleEl.getAttribute('aria-pressed');
-        } else {
-            _toggleEl = document.createElement('button');
-            _toggleEl.type = 'button';
-            _toggleEl.className = 'nav-advanced-toggle';
-            _toggleEl.textContent = revealOpts.toggleLabel || 'Advanced';
-            _toggleOwned = true;
-            containerEl.insertBefore(_toggleEl, navEl);
-        }
-        const onToggle = () => _setRevealed(!_revealed);
-        _toggleEl.addEventListener('click', onToggle);
-        _detachToggle = () => _toggleEl.removeEventListener('click', onToggle);
-    }
-
-    // The toggle only makes sense when there is MORE than the leading tab to
-    // reveal. Everything-gated-off (chat only) ⇒ nothing worth revealing ⇒ no
-    // toggle (acceptance: chat only, no toggle). Tab availability is DYNAMIC —
-    // feature panels register after their manifest loads (Panels.registerPanel/
-    // syncNav can add or regate tabs at runtime), so this is re-evaluated on
-    // every nav mutation rather than once at mount (codex P2): a late-arriving
-    // panel wires the toggle in, and gating back down to chat-only hides it and
-    // collapses a then-meaningless revealed strip.
-    function _syncToggle() {
-        const multi = navEl.querySelectorAll('.nav-tab').length > 1;
-        if (multi) _ensureToggleWired();
-        if (_toggleEl) _toggleEl.style.display = multi ? '' : 'none';
-        if (!multi && _revealed) _setRevealed(false);
-    }
-
+    // exactly as-is (standalone console unchanged). The reveal state machine is
+    // the SINGLE shared implementation in `Panels.initReveal` (#2229) — consumed
+    // identically by the standalone console boot (identity.js); mountPanels only
+    // supplies the DOM plumbing (a component-owned button placed before the nav,
+    // scope defaulting to the mount container) and its persistence default.
+    let _reveal = null;
     if (revealEnabled) {
-        // Always start collapsed on the first (leading/Chat) tab, regardless of
-        // the caller's `activateFirst`.
-        const first = navEl.querySelector('.nav-tab');
-        if (first) activate(first.dataset.panel);
-
-        _syncToggle();
-        _navObserver = new MutationObserver(_syncToggle);
-        _navObserver.observe(navEl, { childList: true });
-        _applyRevealState();
+        const storageKey = revealOpts.storageKey === false
+            ? null
+            : (typeof revealOpts.storageKey === 'string' ? revealOpts.storageKey : 'kestrel:panels-revealed');
+        _reveal = Panels.initReveal({
+            navEl,
+            activate,
+            anchor: (revealOpts.anchor && typeof revealOpts.anchor === 'object') ? revealOpts.anchor : null,
+            toggleLabel: revealOpts.toggleLabel || 'Advanced',
+            mountToggle: (btn) => containerEl.insertBefore(btn, navEl),
+            scopeEl: (revealOpts.scopeEl && typeof revealOpts.scopeEl === 'object')
+                ? revealOpts.scopeEl : containerEl,
+            onReveal: typeof revealOpts.onReveal === 'function' ? revealOpts.onReveal : null,
+            storageKey,
+        });
     }
 
     return {
         activate,
-        get revealed() { return _revealed; },
+        get revealed() { return _reveal ? _reveal.revealed : false; },
         toggleReveal(next) {
-            if (!revealEnabled) return _revealed;
-            _setRevealed(next === undefined ? !_revealed : !!next);
-            return _revealed;
+            if (!_reveal) return false;
+            return _reveal.toggleReveal(next);
         },
         destroy() {
             detachNav();
-            _detachToggle();
-            if (_navObserver) { _navObserver.disconnect(); _navObserver = null; }
-            // Clear the reveal scope class so host chrome gated on it (e.g.
-            // advanced-only banner buttons) doesn't stay revealed after the
-            // mount is gone. onReveal is NOT fired here — destroy is teardown,
-            // not a state change the host should react to (remount re-applies).
-            if (revealEnabled) {
-                const scope = (revealOpts.scopeEl && typeof revealOpts.scopeEl === 'object')
-                    ? revealOpts.scopeEl : containerEl;
-                if (scope && scope.classList) scope.classList.remove('panels-revealed');
-            }
-            if (_toggleEl) {
-                if (_toggleOwned) {
-                    _toggleEl.remove();
-                } else {
-                    // Host-provided anchor: restore its prior aria-pressed state
-                    // and undo any display:none _syncToggle applied while the
-                    // strip was gated down — the host owns the element again.
-                    if (_togglePrevAria === null) {
-                        _toggleEl.removeAttribute('aria-pressed');
-                    } else {
-                        _toggleEl.setAttribute('aria-pressed', _togglePrevAria);
-                    }
-                    _toggleEl.style.display = '';
-                }
-            }
+            if (_reveal) _reveal.destroy();
             // Return each adopted host element to its original parent/position
             // and display BEFORE the panel host is removed, so the host keeps a
             // live element (same node, listeners intact) to use outside the

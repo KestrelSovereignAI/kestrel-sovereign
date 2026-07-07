@@ -273,6 +273,215 @@ export function _reset() {
     _ctx = null;
 }
 
+// ============================================================================
+// Reveal state machine (#2211 / #2229)
+// ============================================================================
+//
+// The single, shared "chat-first / Advanced toggle" reveal implementation used
+// by BOTH the embeddable `mountPanels` host and the standalone console boot
+// (identity.js). Extracted here (#2229) so there is exactly one reveal code path
+// — collapse hides the whole nav strip (chat only), an `aria-pressed` toggle
+// reveals the gated strip (Chat first), collapsing returns to the leading tab,
+// and the toggle is hidden whenever only a single tab is available (tracked live
+// via a nav MutationObserver, so a late-registered feature panel wires the toggle
+// in and gating back down to chat-only hides it again).
+//
+// Both callers differ only in DOM plumbing, which is fully parameterized:
+//   - `navEl`      the nav-tab strip to show/hide (created by mountPanels;
+//                  the static `.nav-tabs` in index.html for standalone).
+//   - `activate`   the panel activator (collapse re-activates the leading tab).
+//   - `anchor`     a host-provided toggle element (standalone's chat-header
+//                  button, or an embedder's own button). When absent, a
+//                  component-owned `<button.nav-advanced-toggle>` is created and
+//                  placed via `mountToggle`.
+//   - `scopeEl`    element that carries the `panels-revealed` class (embeds gate
+//                  host chrome on it). Defaults to `navEl`.
+//   - `onReveal`   host callback fired on every state application (incl. initial).
+//   - `storageKey` localStorage key persisting the revealed state across reloads
+//                  (default on for both callers). `false`/`null` disables it.
+
+function _revealStorage() {
+    try {
+        return (typeof globalThis !== 'undefined' && globalThis.localStorage) || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Wire the collapsed/"Advanced" reveal behavior against an existing nav strip.
+ *
+ * @param {object} opts
+ * @param {HTMLElement} opts.navEl              nav-tab strip to reveal/collapse
+ * @param {(panelId: string) => void} opts.activate  activator (collapse returns to leading tab)
+ * @param {HTMLElement} [opts.anchor]           host-provided toggle element
+ * @param {string} [opts.toggleLabel]           component-owned button text (default 'Advanced')
+ * @param {string} [opts.toggleClassName]       component-owned button class (default 'nav-advanced-toggle')
+ * @param {(btn: HTMLElement) => void} [opts.mountToggle]  place a component-owned button
+ * @param {HTMLElement} [opts.scopeEl]          element carrying `panels-revealed` (default navEl)
+ * @param {(revealed: boolean) => void} [opts.onReveal]    host callback
+ * @param {string|false|null} [opts.storageKey] localStorage persistence key (default off unless provided)
+ * @returns {{revealed: boolean, setRevealed(next?: boolean): boolean, toggleReveal(next?: boolean): boolean, syncToggle(): void, destroy(): void} | null}
+ */
+export function initReveal(opts = {}) {
+    const {
+        navEl,
+        activate,
+        anchor = null,
+        toggleLabel = 'Advanced',
+        toggleClassName = 'nav-advanced-toggle',
+        mountToggle = null,
+        scopeEl = null,
+        onReveal = null,
+        storageKey = null,
+    } = opts;
+    if (!navEl) return null;
+
+    const _anchor = (anchor && typeof anchor === 'object') ? anchor : null;
+    const _scope = (scopeEl && typeof scopeEl === 'object') ? scopeEl : navEl;
+    const _key = (typeof storageKey === 'string' && storageKey) ? storageKey : null;
+
+    let _revealed = false;
+    let _toggleEl = null;
+    let _toggleOwned = false;
+    let _togglePrevAria = null;
+    let _detachToggle = () => {};
+    let _navObserver = null;
+
+    function _readPersisted() {
+        if (!_key) return null;
+        const store = _revealStorage();
+        if (!store) return null;
+        try {
+            const v = store.getItem(_key);
+            if (v === null || v === undefined) return null;
+            return v === '1' || v === 'true';
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function _writePersisted(val) {
+        if (!_key) return;
+        const store = _revealStorage();
+        if (!store) return;
+        try {
+            store.setItem(_key, val ? '1' : '0');
+        } catch (_) { /* best-effort */ }
+    }
+
+    function _applyRevealState() {
+        // Collapsed: hide the whole nav strip (chat-only, no tab headers).
+        // Revealed: show the gated strip (Chat first).
+        navEl.style.display = _revealed ? '' : 'none';
+        if (_toggleEl) _toggleEl.setAttribute('aria-pressed', _revealed ? 'true' : 'false');
+        // Host observability: a `panels-revealed` class on `scopeEl` (zero-JS
+        // hosts gate CSS on it) plus an `onReveal` callback for JS hosts. Both
+        // fire on every application, including the initial one.
+        if (_scope && _scope.classList) _scope.classList.toggle('panels-revealed', _revealed);
+        if (typeof onReveal === 'function') {
+            try { onReveal(_revealed); } catch (_) { /* host bug must not wedge the toggle */ }
+        }
+    }
+
+    function _setRevealed(next, { persist = true } = {}) {
+        _revealed = !!next;
+        _applyRevealState();
+        if (persist) _writePersisted(_revealed);
+        // With the strip hidden the user can't see or change the active tab, so
+        // collapsing returns the visible body to the leading (Chat) tab.
+        if (!_revealed) {
+            const first = navEl.querySelector('.nav-tab');
+            if (first && typeof activate === 'function') activate(first.dataset.panel);
+        }
+    }
+
+    function _ensureToggleWired() {
+        if (_toggleEl) return;
+        if (_anchor) {
+            // Host-provided anchor: wire it in place, never move/create it.
+            _toggleEl = _anchor;
+            _togglePrevAria = _toggleEl.getAttribute('aria-pressed');
+        } else {
+            _toggleEl = document.createElement('button');
+            _toggleEl.type = 'button';
+            _toggleEl.className = toggleClassName;
+            _toggleEl.textContent = toggleLabel || 'Advanced';
+            _toggleOwned = true;
+            if (typeof mountToggle === 'function') mountToggle(_toggleEl);
+        }
+        const onToggle = () => _setRevealed(!_revealed);
+        _toggleEl.addEventListener('click', onToggle);
+        _detachToggle = () => _toggleEl.removeEventListener('click', onToggle);
+    }
+
+    // The toggle only makes sense when there is MORE than the leading tab to
+    // reveal. A host-provided anchor is wired eagerly (it pre-exists in the
+    // host's DOM, so we must be able to hide it when there is nothing to
+    // reveal); a component-owned button is only CREATED once a second tab
+    // exists (so a chat-only mount emits no button at all). Tab availability is
+    // DYNAMIC — feature panels register after their manifest loads — so this is
+    // re-evaluated on every nav mutation, not once at init.
+    function _syncToggle() {
+        const multi = navEl.querySelectorAll('.nav-tab').length > 1;
+        if (_anchor || multi) _ensureToggleWired();
+        if (_toggleEl) _toggleEl.style.display = multi ? '' : 'none';
+        // Regating down to chat-only collapses a then-meaningless revealed strip,
+        // but must NOT clobber the persisted preference — returning tabs (or a
+        // reload) should honor "operator lives in Advanced".
+        if (!multi && _revealed) _setRevealed(false, { persist: false });
+    }
+
+    // Start collapsed on the leading (Chat) tab, then wire the toggle + observer.
+    const first = navEl.querySelector('.nav-tab');
+    if (first && typeof activate === 'function') activate(first.dataset.panel);
+    _syncToggle();
+    _navObserver = new MutationObserver(_syncToggle);
+    _navObserver.observe(navEl, { childList: true });
+
+    // Restore the persisted revealed state, but only when there is something to
+    // reveal (the toggle is present + visible). Otherwise apply the collapsed
+    // state (which also fires the initial onReveal / scope-class application).
+    const persisted = _readPersisted();
+    if (persisted === true && _toggleEl && _toggleEl.style.display !== 'none') {
+        _setRevealed(true, { persist: false });
+    } else {
+        _applyRevealState();
+    }
+
+    return {
+        get revealed() { return _revealed; },
+        setRevealed(next) { _setRevealed(next); return _revealed; },
+        toggleReveal(next) {
+            _setRevealed(next === undefined ? !_revealed : !!next);
+            return _revealed;
+        },
+        syncToggle: _syncToggle,
+        destroy() {
+            _detachToggle();
+            if (_navObserver) { _navObserver.disconnect(); _navObserver = null; }
+            // Clear the reveal scope class so host chrome gated on it doesn't
+            // stay revealed after teardown. onReveal is NOT fired here — destroy
+            // is teardown, not a state change (a remount re-applies).
+            if (_scope && _scope.classList) _scope.classList.remove('panels-revealed');
+            if (_toggleEl) {
+                if (_toggleOwned) {
+                    _toggleEl.remove();
+                } else {
+                    // Host-provided anchor: restore its prior aria-pressed state
+                    // and undo any display:none applied while gated down.
+                    if (_togglePrevAria === null) {
+                        _toggleEl.removeAttribute('aria-pressed');
+                    } else {
+                        _toggleEl.setAttribute('aria-pressed', _togglePrevAria);
+                    }
+                    _toggleEl.style.display = '';
+                }
+            }
+        },
+    };
+}
+
 export const Panels = {
     registerPanel,
     unregisterPanel,
@@ -280,6 +489,7 @@ export const Panels = {
     syncNav,
     activate,
     panels,
+    initReveal,
     _reset,
 };
 
