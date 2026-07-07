@@ -9,6 +9,7 @@ from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import FeaturePackageInfo, FeatureStatus
 from kestrel_sovereign.ui_capabilities import (
     compute_feature_capabilities,
+    render_multi_agent_host_config_script,
     render_ui_config_script,
 )
 
@@ -201,6 +202,23 @@ class TestRenderUiConfigScript:
 
         assert "</script>ird" not in script
         assert "\\u003c" in script
+
+
+# ---------------------------------------------------------------------------
+# render_multi_agent_host_config_script
+# ---------------------------------------------------------------------------
+
+
+class TestRenderMultiAgentHostConfigScript:
+    def test_seeds_multi_agent_host_flag(self):
+        script = render_multi_agent_host_config_script()
+
+        assert script.startswith("<script>")
+        assert script.endswith("</script>")
+        assert "window.KESTREL_UI_CONFIG" in script
+        assert '"multiAgentHost": true' in script
+        # No agent is resolvable in this mode, so no capability map is seeded.
+        assert "featureCapabilities" not in script
 
 
 # ---------------------------------------------------------------------------

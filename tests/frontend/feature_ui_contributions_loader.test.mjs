@@ -253,6 +253,23 @@ test('capabilities:changed re-runs the loader before re-gating the nav (runtime-
     assert.ok(loadIdx < reconcileIdx, 'import the newly-enabled module BEFORE re-gating');
 });
 
+test('app.js skips the boot fetches when the render seeded multiAgentHost (#2048)', () => {
+    // In multi-agent host mode no agent is selected at boot, so the
+    // un-prefixed /api/ui/capabilities and /api/ui/contributions calls are
+    // known to 503 — the page render seeds `multiAgentHost` and app.js must
+    // not fire them (selectAgent runs both once routing is pinned).
+    assert.match(
+        appSrc,
+        /if \(!bootConfig\.featureCapabilities && !bootConfig\.multiAgentHost\) \{\s*await API\.refreshCapabilities\(\);/,
+        'the boot capabilities fetch must be gated on !multiAgentHost',
+    );
+    assert.match(
+        appSrc,
+        /if \(!bootConfig\.multiAgentHost\) \{\s*await loadFeatureUIContributions\(\);/,
+        'the boot contributions load must be gated on !multiAgentHost',
+    );
+});
+
 test('app.js imports the shared loader rather than defining it inline', () => {
     assert.match(
         appSrc,

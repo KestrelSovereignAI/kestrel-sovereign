@@ -73,18 +73,42 @@ def compute_feature_capabilities(agent) -> Dict[str, bool]:
     return caps
 
 
-def render_ui_config_script(agent) -> str:
-    """Return an inline ``<script>`` that seeds ``window.KESTREL_UI_CONFIG``.
+def render_config_script(payload: Dict[str, Any]) -> str:
+    """Return an inline ``<script>`` merging ``payload`` into ``KESTREL_UI_CONFIG``.
 
     Injected into the served console HTML *before* the module scripts load so
-    the capability set is known before ``app.js`` runs feature registrations and
-    ``initNavigation`` prunes panels (the boot-ordering requirement). Existing
-    host-supplied config is preserved — only ``featureCapabilities`` is merged
-    in. ``<`` is escaped so a feature name can never break out of the script.
+    the config is known before ``app.js`` boots. Existing host-supplied config
+    is preserved — only the given keys are merged in. ``<`` is escaped so a
+    payload value can never break out of the script.
     """
-    payload = {"featureCapabilities": compute_feature_capabilities(agent)}
     encoded = json.dumps(payload).replace("<", "\\u003c")
     return (
         "<script>window.KESTREL_UI_CONFIG = Object.assign("
         f"{{}}, window.KESTREL_UI_CONFIG || {{}}, {encoded});</script>"
     )
+
+
+def render_ui_config_script(agent) -> str:
+    """Return an inline ``<script>`` seeding ``featureCapabilities`` for ``agent``.
+
+    Injected so the capability set is known before ``app.js`` runs feature
+    registrations and ``initNavigation`` prunes panels (the boot-ordering
+    requirement).
+    """
+    return render_config_script(
+        {"featureCapabilities": compute_feature_capabilities(agent)}
+    )
+
+
+def render_multi_agent_host_config_script() -> str:
+    """Return an inline ``<script>`` marking the page as a multi-agent host boot.
+
+    In multi-agent host mode the render cannot resolve a single agent, so no
+    ``featureCapabilities`` map can be seeded. Without a marker the frontend
+    boot would fall back to fetching un-prefixed ``/api/ui/capabilities`` /
+    ``/api/ui/contributions`` — requests that are *known* to 503 ("Agent not
+    initialized") until an agent is selected, at which point ``selectAgent``
+    re-runs both anyway (#2048). ``multiAgentHost`` tells ``app.js`` to skip
+    those doomed boot fetches and wait for agent selection.
+    """
+    return render_config_script({"multiAgentHost": True})

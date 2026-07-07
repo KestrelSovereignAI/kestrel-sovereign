@@ -63,12 +63,18 @@ async function init() {
 
     // #2041: the capability set is derived from enabled features. The standalone
     // server injects window.KESTREL_UI_CONFIG.featureCapabilities at page render
-    // so the merge is ready synchronously. In multi-agent host / embed mode where
-    // the render could not resolve a single agent, fetch the map now — BEFORE
-    // initNavigation prunes panels or any feature registration runs (boot order:
+    // so the merge is ready synchronously. In embed mode where the render could
+    // not resolve a single agent, fetch the map now — BEFORE initNavigation
+    // prunes panels or any feature registration runs (boot order:
     // config+capabilities → registry/nav → render).
+    //
+    // #2048: a multi-agent host render seeds `multiAgentHost` instead — no agent
+    // is selected yet, so the un-prefixed fetch is KNOWN to 503 ("Agent not
+    // initialized"). Skip it; selectAgent() refreshes capabilities once routing
+    // is pinned. Until then the default capability set gates the nav, exactly as
+    // it did when the doomed fetch failed and was swallowed.
     const bootConfig = (typeof globalThis !== 'undefined' && globalThis.KESTREL_UI_CONFIG) || {};
-    if (!bootConfig.featureCapabilities) {
+    if (!bootConfig.featureCapabilities && !bootConfig.multiAgentHost) {
         await API.refreshCapabilities();
     }
 
@@ -140,13 +146,16 @@ async function init() {
     // module self-registers its shell (🎙️ button, path badge, picker modal,
     // per-agent controls) into the slot zones on import.
     //
-    // #2048: in multi-agent host mode no agent is selected yet, so this call hits
-    // the host's un-prefixed /api/ui/contributions with no active agent and 503s
-    // (imports nothing). That's expected — selectAgent() re-runs the loader once
-    // routing is pinned, and onCapabilitiesChanged() re-runs it on a runtime
-    // feature enable. In standalone mode an agent IS resolved here, so this boot
-    // call does the real import.
-    await loadFeatureUIContributions();
+    // #2048: in multi-agent host mode no agent is selected yet, so this call
+    // would hit the host's un-prefixed /api/ui/contributions with no active
+    // agent and 503 (importing nothing). The render seeds `multiAgentHost` for
+    // exactly this case — skip the doomed boot call; selectAgent() runs the
+    // loader once routing is pinned, and onCapabilitiesChanged() re-runs it on
+    // a runtime feature enable. In standalone mode an agent IS resolved here,
+    // so this boot call does the real import.
+    if (!bootConfig.multiAgentHost) {
+        await loadFeatureUIContributions();
+    }
 
     // Initialize tasks component
     initTasks();

@@ -1031,15 +1031,28 @@ if SERVE_UI:
         # #2041: seed window.KESTREL_UI_CONFIG.featureCapabilities before the
         # module scripts load so the capability set is known before app.js runs
         # feature registrations / nav gating. Only possible when a single agent
-        # is resolvable here; in multi-agent host mode the frontend fetches
-        # /api/ui/capabilities (host-agent-prefixed) during boot instead.
+        # is resolvable here; in multi-agent host mode no agent is selected at
+        # render, so seed `multiAgentHost` instead — app.js then skips the
+        # un-prefixed boot fetches of /api/ui/capabilities and
+        # /api/ui/contributions (which would 503 "Agent not initialized") and
+        # lets selectAgent() run both once routing is pinned (#2048).
         agent = getattr(request.state, "agent", None) or getattr(
             request.app.state, "agent", None
         )
-        if agent is not None and "</head>" in html:
-            from kestrel_sovereign.ui_capabilities import render_ui_config_script
+        if "</head>" in html:
+            script = None
+            if agent is not None:
+                from kestrel_sovereign.ui_capabilities import render_ui_config_script
 
-            html = html.replace("</head>", f"{render_ui_config_script(agent)}\n</head>", 1)
+                script = render_ui_config_script(agent)
+            elif getattr(request.app.state, "agent_manager", None) is not None:
+                from kestrel_sovereign.ui_capabilities import (
+                    render_multi_agent_host_config_script,
+                )
+
+                script = render_multi_agent_host_config_script()
+            if script:
+                html = html.replace("</head>", f"{script}\n</head>", 1)
 
         return HTMLResponse(content=html, status_code=200)
 

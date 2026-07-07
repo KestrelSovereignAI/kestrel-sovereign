@@ -42,7 +42,10 @@ export function initAgentFromUrl() {
         console.log('Kestrel Sovereign Console: Agent mode enabled for', currentAgentId);
         document.title = `Sovereign Console - Agent ${currentAgentId.slice(0, 8)}...`;
     } else {
-        console.log('Kestrel Sovereign Console: Single-agent mode (default)');
+        // No ?agent= pin — this says nothing about whether the HOST is
+        // single- or multi-agent (that's the sidebar/selectAgent flow); it
+        // only means the URL didn't pre-select one.
+        console.log('Kestrel Sovereign Console: no agent pinned in URL');
     }
 }
 

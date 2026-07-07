@@ -395,7 +395,21 @@ async def serve_index():
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="index.html not found")
-    return HTMLResponse(content=index_path.read_text(), status_code=200)
+    html = index_path.read_text()
+    # This host is unconditionally multi-agent: no single agent is resolvable
+    # at render, so seed `multiAgentHost` — app.js then skips the un-prefixed
+    # boot fetches of /api/ui/capabilities and /api/ui/contributions (which
+    # would fail here) and lets selectAgent() run both once routing is pinned
+    # (#2048).
+    if "</head>" in html:
+        from kestrel_sovereign.ui_capabilities import (
+            render_multi_agent_host_config_script,
+        )
+
+        html = html.replace(
+            "</head>", f"{render_multi_agent_host_config_script()}\n</head>", 1
+        )
+    return HTMLResponse(content=html, status_code=200)
 
 
 @app.get("/api/auth/key")
