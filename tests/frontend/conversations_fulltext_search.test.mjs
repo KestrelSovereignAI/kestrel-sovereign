@@ -219,6 +219,48 @@ test('a mutation drops the search hit immediately and revalidates the search', a
     handle.destroy();
 });
 
+test('search rows painted after a retarget accept mutations before the list load lands', async () => {
+    // codex r2 P2: during a retarget with an active search, the server search
+    // can resolve and paint the NEW agent's rows while the slower plain-list
+    // load is still in flight. Those rows are current — the stale-row guard
+    // must not reject their lifecycle actions.
+    let releaseList;
+    const listGate = new Promise((r) => { releaseList = r; });
+    let firstLoad = true;
+    const archived = [];
+    const api = stubApi({
+        getConversations: async () => {
+            if (firstLoad) { firstLoad = false; return { conversations: LIST }; }
+            await listGate; // the retargeted list load hangs
+            return { conversations: [] };
+        },
+        archiveConversation: async (id) => { archived.push(id); return { success: true }; },
+    });
+    const container = makeContainer();
+    const handle = mountConversations(container, { api, agentName: 'emma' });
+    await settle();
+
+    type(container, 'penguin');
+    await settle(DEBOUNCE);
+    assert.equal(rowsIn(container).length, 1);
+
+    handle.retarget('kite'); // list load blocks on the gate; search re-runs fast
+    await settle(DEBOUNCE);
+    assert.equal(rowsIn(container).length, 1, 'new agent search rows painted');
+
+    const kebab = container.querySelector('.conv-kebab-btn');
+    kebab.click();
+    const archiveItem = Array.from(document.querySelectorAll('.kebab-menu .kebab-menu-item'))
+        .find((i) => /Archive/.test(i.textContent));
+    archiveItem.click();
+    await settle();
+    assert.deepEqual(archived, ['s9'], 'mutation on a fresh search row goes through');
+
+    releaseList();
+    await settle();
+    handle.destroy();
+});
+
 test('appendHighlighted builds text nodes + <mark>, never markup from content', () => {
     const el = document.createElement('div');
     appendHighlighted(el, '<img src=x onerror=alert(1)> penguin <b>Penguin</b>', 'penguin');

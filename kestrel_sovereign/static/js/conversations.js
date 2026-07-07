@@ -435,9 +435,24 @@ export function mountConversations(containerEl, config = {}) {
     // the OLD agent. A kebab Archive/Trash/Purge fired in that window would
     // send the previous agent's session_id against the NEW agent's route.
     // Mutation handlers compare against this to drop such stale actions.
+    //
+    // Two anchors, one per data source: `renderedForAgent` tracks
+    // `lastConversations` (pinned in refresh()'s success block) and
+    // `searchForAgent` tracks `searchResults` (pinned in runServerSearch()'s
+    // success block). The search overlay and the plain list reload race each
+    // other during a retarget; whichever source is painted decides which
+    // anchor the stale guard reads — a single anchor would either reject
+    // actions on fresh search rows or accept them on stale list rows.
     let renderedForAgent = agentName;
+    let searchForAgent = agentName;
     function isStaleRow() {
-        return renderedForAgent !== agentName;
+        const anchor = usingSearchOverlay() ? searchForAgent : renderedForAgent;
+        return anchor !== agentName;
+    }
+
+    // Whether the server-search overlay currently owns the painted rows.
+    function usingSearchOverlay() {
+        return !!searchTerm && searchResults !== null && view !== 'trash';
     }
 
     containerEl.classList && containerEl.classList.add('conversations-component');
@@ -497,11 +512,16 @@ export function mountConversations(containerEl, config = {}) {
     async function runServerSearch() {
         const seq = ++searchSeq;
         const term = searchTerm;
+        // The agent this search is issued for. The seq guard drops responses
+        // that predate a retarget, so a response that lands here belongs to
+        // the agent the API layer was routed to at issue time.
+        const forAgent = agentName;
         try {
             const decrypt = state ? state.showDecrypted : true;
             const data = await api.searchConversations(term, view, decrypt);
             if (seq !== searchSeq || term !== searchTerm) return;
             searchResults = data.conversations || [];
+            searchForAgent = forAgent;
             renderCurrent();
         } catch (e) {
             // Keep the client-side filtered view; searching-as-you-type must
@@ -718,8 +738,7 @@ export function mountConversations(containerEl, config = {}) {
         // name/preview filter and carry match snippets). Until then — and in
         // the trash view, which has no server search — the instant client
         // filter paints.
-        const usingSearch = !!searchTerm && searchResults !== null && view !== 'trash';
-        const convs = usingSearch ? searchResults : filtered(lastConversations);
+        const convs = usingSearchOverlay() ? searchResults : filtered(lastConversations);
         renderStats(convs);
         if (!convs.length) {
             listEl.innerHTML = '';

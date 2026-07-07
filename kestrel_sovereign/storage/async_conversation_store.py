@@ -331,8 +331,14 @@ def search_session_summaries(
         not query_is_wrapper_only and len(stripped_query_tokens) >= 2
     )
 
+    # keep_empty_markers=True to mirror the UI list (#2222): a just-started,
+    # renamed-but-still-empty conversation is list-visible, so its title must
+    # be title-searchable too — dropping the marker here would make search
+    # disagree with the list it filters.
     grouped = coalesce_sessions_by_session_id(
-        group_messages_into_sessions(normalized_messages, collect_messages=True)
+        group_messages_into_sessions(
+            normalized_messages, collect_messages=True, keep_empty_markers=True
+        )
     )
 
     results: List[Dict[str, Any]] = []

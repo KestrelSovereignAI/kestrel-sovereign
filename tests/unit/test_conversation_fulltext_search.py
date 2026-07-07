@@ -144,6 +144,28 @@ class TestSearchSessionSummaries:
         assert results[0]["preview_content"] == "penguin talk"
         assert "preview_metadata" in results[0]
 
+    def test_marker_only_renamed_session_is_title_searchable(self):
+        """A just-started conversation (marker row, no messages yet) is
+        list-visible (#2222), so its user-assigned title must be searchable
+        too (codex r2 P2)."""
+        marker = {
+            "id": 1,
+            "role": "system",
+            "content": "",
+            "metadata": {"new_session": True, "session_id": "s-new"},
+            "created_at": BASE,
+        }
+        results = search_session_summaries(
+            [marker], "budget", names={"s-new": "Budget planning"}
+        )
+        assert [s["session_id"] for s in results] == ["s-new"]
+        assert results[0]["message_count"] == 0
+        assert results[0]["match_snippet"] is None
+        # ...and a non-matching title still keeps the empty session out.
+        assert search_session_summaries(
+            [marker], "zebra", names={"s-new": "Budget planning"}
+        ) == []
+
     def test_resumed_session_coalesces_to_one_hit(self):
         """A session resumed past the gap must surface as ONE result (#2019)."""
         msgs = [
