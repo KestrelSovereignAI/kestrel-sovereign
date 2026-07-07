@@ -128,3 +128,31 @@ test('loadIdentity() renders a host-injected delete handler even without native 
 
     delete globalThis.KESTREL_UI_CONFIG;
 });
+
+test('native delete targets the manager routing key, not the editable display name (#2208 codex P2)', async () => {
+    resetPanel();
+    // Renamed agent: identity display name differs from the multi-agent
+    // manager's routing key. DELETE must hit the routing key or it 404s.
+    API.getIdentity = async () => ({ name: 'Renamed Emma', did: 'did:pkh:emma' });
+    API.hasCapability = () => true;
+    const prevGetHostAgent = API.getHostAgent;
+    API.getHostAgent = () => 'emma';
+    let deleted = null;
+    API.deleteAgent = async (name) => { deleted = name; return { success: true }; };
+    delete globalThis.KESTREL_UI_CONFIG;
+
+    await loadIdentity();
+
+    const btn = document.getElementById('danger-zone-delete-btn');
+    assert.ok(btn, 'delete action rendered');
+    btn.click();
+    const input = document.getElementById('danger-zone-confirm-input');
+    // The confirm gate still types the DISPLAY name the user sees...
+    input.value = 'Renamed Emma';
+    document.querySelector('#modal-overlay .modal-btn-danger').click();
+    await new Promise((r) => setTimeout(r, 0));
+    // ...but the DELETE goes to the routing key.
+    assert.equal(deleted, 'emma', 'deleteAgent called with the routing key');
+
+    API.getHostAgent = prevGetHostAgent;
+});

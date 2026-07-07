@@ -75,11 +75,19 @@ export function resolveDeleteAction({ identity, api, dz }) {
     // on the `multi_agent` capability so a pure single-agent standalone (where the
     // endpoint 400s and self-deleting the only agent is meaningless) hides the
     // section instead of offering a broken button.
+    //
+    // The manager is keyed by the ROUTING key (the selected agent name from
+    // `/api/agents`, tracked by `api.getHostAgent()`), NOT the identity panel's
+    // editable display name — a renamed agent would 404 the wrong target. Fall
+    // back to the display name only when no routing key is tracked.
+    const agentKey = (
+        api && typeof api.getHostAgent === 'function' && api.getHostAgent()
+    ) || name;
     const canNative = !!(
         api
         && typeof api.hasCapability === 'function'
         && api.hasCapability('multi_agent')
-        && name
+        && agentKey
         && typeof api.deleteAgent === 'function'
     );
 
@@ -88,7 +96,7 @@ export function resolveDeleteAction({ identity, api, dz }) {
     const native = !hostHandler && canNative;
     const handler = hostHandler
         ? () => hostHandler(identity)
-        : () => api.deleteAgent(name);
+        : () => api.deleteAgent(agentKey);
 
     // The name the user must type to arm the button. Hosts may override it (e.g.
     // a companion display name that differs from the Kestrel agent name).
