@@ -390,3 +390,90 @@ async def delete_agent_key(key_hash: str) -> bool:
         return await service.delete_key(key_hash)
     finally:
         await service.close()
+
+
+# ---------------------------------------------------------------------------
+# Public SDK — mint/update/inspect a managed OpenRouter key by hash.
+#
+# These wrap OpenRouterProvisioningService with an explicit ``management_key``
+# argument so downstream products (e.g. Frinz) can manage per-user keys without
+# importing framework internals or relying on process env. Each opens and
+# closes its own provisioning client.
+# ---------------------------------------------------------------------------
+
+
+async def mint_managed_openrouter_key(
+    management_key: str,
+    name: str,
+    limit_usd: float = 0.10,
+    reset: Optional[Literal["daily", "weekly", "monthly"]] = "monthly",
+) -> AgentKeyInfo:
+    """Mint a new managed OpenRouter child key from a management key.
+
+    Args:
+        management_key: OpenRouter management API key that owns the child.
+        name: Identifier for the key (e.g. a per-user handle).
+        limit_usd: Spending limit in USD.
+        reset: Limit reset interval (daily/weekly/monthly) or None.
+
+    Returns:
+        AgentKeyInfo with the new key (``key`` is only available here).
+    """
+    service = OpenRouterProvisioningService(management_key=management_key)
+    try:
+        return await service.create_agent_key(
+            agent_name=name,
+            limit_usd=limit_usd,
+            limit_reset=reset,
+        )
+    finally:
+        await service.close()
+
+
+async def update_provider_key_limit(
+    management_key: str,
+    key_hash: str,
+    limit_usd: float,
+    reset: Optional[Literal["daily", "weekly", "monthly"]] = "monthly",
+) -> KeyUsage:
+    """Update a managed OpenRouter key's spending limit by hash.
+
+    Args:
+        management_key: OpenRouter management API key that owns the child.
+        key_hash: The key hash to update.
+        limit_usd: New spending limit in USD.
+        reset: Limit reset interval (daily/weekly/monthly) or None to leave
+            the existing interval unchanged.
+
+    Returns:
+        Updated KeyUsage.
+    """
+    service = OpenRouterProvisioningService(management_key=management_key)
+    try:
+        return await service.update_key_limit(
+            key_hash=key_hash,
+            limit_usd=limit_usd,
+            limit_reset=reset,
+        )
+    finally:
+        await service.close()
+
+
+async def get_provider_key_usage(
+    management_key: str,
+    key_hash: str,
+) -> KeyUsage:
+    """Get usage for a managed OpenRouter key by hash.
+
+    Args:
+        management_key: OpenRouter management API key that owns the child.
+        key_hash: The key hash to inspect.
+
+    Returns:
+        KeyUsage with current usage and limits.
+    """
+    service = OpenRouterProvisioningService(management_key=management_key)
+    try:
+        return await service.get_key_usage(key_hash)
+    finally:
+        await service.close()

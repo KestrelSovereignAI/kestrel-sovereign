@@ -34,9 +34,10 @@ code iterates ``self.providers`` as routes; discovery groups by
 Entry-point providers (external packages) register under their advertised
 ``provider_name``; they become a single-route vendor with route ``api``.
 """
+import asyncio
 import logging
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 import json as _json
@@ -174,6 +175,18 @@ class ProviderRegistry:
         self.config = config
         self.providers: List[ProviderInfo] = []
         self._initialized = False
+        # OpenRouter routes that declared only a management key (no static
+        # OPENROUTER_API_KEY). Sync init can't mint (async), so it records the
+        # route here and the async ``finalize_providers()`` hook brings it up
+        # with a bootstrap child key. Each entry: (vendor, route, vendor_cfg,
+        # route_cfg).
+        self._deferred_openrouter_routes: List[
+            Tuple[str, str, Dict[str, Any], Dict[str, Any]]
+        ] = []
+        # Injected by ``finalize_providers()`` just before rebuilding a
+        # deferred OpenRouter route, so the sync OpenRouter branch uses the
+        # freshly-minted bootstrap key as the route default.
+        self._bootstrap_openrouter_key: Optional[str] = None
 
     def initialize_providers(self) -> List[ProviderInfo]:
         """Initialize all routes declared under ``vendors``.
@@ -236,7 +249,7 @@ class ProviderRegistry:
             existing.add(ep.name)
             logger.info("Registered entry_point route: %s", ep.name)
 
-        if not initialized:
+        if not initialized and not self._deferred_openrouter_routes:
             raise ProviderInitializationError(
                 "No routes could be initialized. Check vendor auth envs "
                 "(e.g. ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN for the "
@@ -251,6 +264,59 @@ class ProviderRegistry:
 
         self.providers = initialized
         self._initialized = True
+        return self.providers
+
+    async def finalize_providers(self) -> List[ProviderInfo]:
+        """Async completion pass for routes sync init could not bring up.
+
+        ``initialize_providers()`` is synchronous, but some routes need an
+        async step to register. Today that is OpenRouter routes which declared
+        only ``OPENROUTER_MANAGEMENT_API_KEY`` (no static ``OPENROUTER_API_KEY``):
+        we mint a process-wide, ephemeral bootstrap child key from the
+        management key and register the route using it as the default. Per-user
+        keys still override this in the call path.
+
+        Idempotent and safe to call multiple times: routes already registered
+        are skipped, and the bootstrap key is minted at most once per process.
+        """
+        if not self._deferred_openrouter_routes:
+            return self.providers
+
+        pending = list(self._deferred_openrouter_routes)
+        self._deferred_openrouter_routes = []
+
+        newly: List[ProviderInfo] = []
+        existing = {p.name for p in self.providers}
+        for vendor, route, vendor_cfg, route_cfg in pending:
+            name = f"{vendor}:{route}"
+            if name in existing:
+                continue
+            management_key = _openrouter_management_key(route_cfg)
+            if not management_key:
+                # Config changed underneath us; nothing to mint from.
+                continue
+            try:
+                self._bootstrap_openrouter_key = await _mint_bootstrap_openrouter_key(
+                    management_key
+                )
+                info = self._build_route(vendor, route, vendor_cfg, route_cfg)
+                if info is not None:
+                    self.providers.append(info)
+                    existing.add(info.name)
+                    newly.append(info)
+                    logger.info(
+                        "Initialized OpenRouter route via bootstrap key: %s",
+                        info.name,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to finalize OpenRouter route '%s': %s", name, e
+                )
+            finally:
+                self._bootstrap_openrouter_key = None
+
+        for info in newly:
+            _warn_unimplemented_capabilities(info)
         return self.providers
 
     # ------------------------------------------------------------------ routes
@@ -429,13 +495,46 @@ class ProviderRegistry:
         if adapter_cls is OpenRouterAdapter:
             api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key")
             if not api_key:
+                # A bootstrap child key minted by ``finalize_providers()`` from
+                # the management key is injected here on the async pass. When a
+                # static OPENROUTER_API_KEY IS set this stays None and behavior
+                # is byte-identical to before.
+                api_key = self._bootstrap_openrouter_key
+            if not api_key:
+                # No static key and no bootstrap key yet. If a management key
+                # is available, defer this route to the async
+                # ``finalize_providers()`` hook (sync init can't await the
+                # mint). With neither key set, fail closed exactly as before.
+                if _openrouter_management_key(route_cfg):
+                    deferral = (vendor, route, vendor_cfg, route_cfg)
+                    if deferral not in self._deferred_openrouter_routes:
+                        self._deferred_openrouter_routes.append(deferral)
+                    logger.info(
+                        "Deferring OpenRouter route %s:%s to async bootstrap "
+                        "mint (OPENROUTER_API_KEY not set; management key present)",
+                        vendor,
+                        route,
+                    )
+                    return None, None
                 raise ValueError(f"{vendor}:{route} requires OPENROUTER_API_KEY")
             base_url = route_cfg.get("base_url") or get_openrouter_api_base()
             # max_retries=0: the OpenAI SDK has its own retry layer that
             # duplicates (and contradicts) our llm/retry.py policy. One retry
             # owner only.
             client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
-            return client, adapter_cls()
+            adapter = adapter_cls()
+            # The adapter constructs its own ``self.api_key`` from
+            # OPENROUTER_API_KEY at __init__. Model discovery
+            # (``list_models``) and its fallback ``_get_client`` use that
+            # value directly and ignore the framework-provided client. When
+            # the route registers off a minted *bootstrap* key (management
+            # key only, no static OPENROUTER_API_KEY), the adapter's own
+            # key is None and discovery would return an empty catalog —
+            # breaking ``model="auto"`` resolution even though generation on
+            # the injected client works. Point the adapter at the resolved
+            # key so both surfaces authenticate with the same credential.
+            adapter.api_key = api_key
+            return client, adapter
 
         # --- Ollama (local or remote via OLLAMA_HOST) ---
         if adapter_cls is OllamaAdapter:
@@ -696,6 +795,87 @@ class ProviderRegistry:
 # Groq, Cerebras, …) can error on strict implementations, so we gate tightly.
 # See issue #704.
 _CACHE_PROMPT_VENDORS = frozenset({"llama_cpp"})
+
+
+# --------------------------------------------------------------------------
+# OpenRouter bootstrap child key (registry route default)
+# --------------------------------------------------------------------------
+
+# Default generous monthly limit for the ephemeral bootstrap child key. It is
+# only the *route default* — per-user keys override it in the call path — so a
+# roomy cap keeps the default route usable without babysitting.
+_BOOTSTRAP_OPENROUTER_LIMIT_USD = 50.0
+
+# Process-wide cache: mint the bootstrap key at most once per process *per
+# management key*, even across multiple ``ProviderRegistry`` / ``LLMService``
+# instances (multi-agent host). Keyed by management key so routes configured
+# with DIFFERENT OpenRouter accounts never reuse each other's minted child key
+# (preserves per-account billing isolation). Guarded by a lazily-created
+# asyncio.Lock so concurrent finalize calls don't mint duplicates.
+_BOOTSTRAP_OPENROUTER_KEYS: Dict[str, str] = {}
+_BOOTSTRAP_OPENROUTER_LOCK: Optional[asyncio.Lock] = None
+
+
+def _openrouter_management_key(route_cfg: Dict[str, Any]) -> Optional[str]:
+    """Resolve an OpenRouter management key for a route.
+
+    Reads the env var named by ``management_api_key_env`` (default
+    ``OPENROUTER_MANAGEMENT_API_KEY``) or an inline ``management_api_key``.
+    Returns None when neither is set.
+    """
+    env_name = route_cfg.get("management_api_key_env") or "OPENROUTER_MANAGEMENT_API_KEY"
+    return os.environ.get(env_name) or route_cfg.get("management_api_key")
+
+
+async def _mint_bootstrap_openrouter_key(
+    management_key: str,
+    limit_usd: float = _BOOTSTRAP_OPENROUTER_LIMIT_USD,
+) -> str:
+    """Mint (once per process) an ephemeral OpenRouter child key.
+
+    Used as the route default when a route declares only a management key. The
+    key is NOT persisted to any DB — it is process-lived and only backs the
+    default route; per-user keys override it in the call path.
+    """
+    global _BOOTSTRAP_OPENROUTER_LOCK
+    cached = _BOOTSTRAP_OPENROUTER_KEYS.get(management_key)
+    if cached is not None:
+        return cached
+    if _BOOTSTRAP_OPENROUTER_LOCK is None:
+        _BOOTSTRAP_OPENROUTER_LOCK = asyncio.Lock()
+    async with _BOOTSTRAP_OPENROUTER_LOCK:
+        cached = _BOOTSTRAP_OPENROUTER_KEYS.get(management_key)
+        if cached is not None:
+            return cached
+        # Late import: keep the provisioning surface (httpx) out of module
+        # import so the registry loads on deployments that never touch it.
+        from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
+            OpenRouterProvisioningService,
+        )
+
+        service = OpenRouterProvisioningService(management_key=management_key)
+        try:
+            key_info = await service.create_agent_key(
+                agent_name="bootstrap-registry-default",
+                limit_usd=limit_usd,
+                limit_reset="monthly",
+            )
+        finally:
+            await service.close()
+        _BOOTSTRAP_OPENROUTER_KEYS[management_key] = key_info.key
+        logger.info(
+            "Minted process-wide bootstrap OpenRouter key "
+            "(limit $%.2f/mo) as OpenRouter route default",
+            limit_usd,
+        )
+        return key_info.key
+
+
+def _reset_bootstrap_openrouter_key_cache() -> None:
+    """Test hook: clear the process-wide bootstrap-key cache."""
+    global _BOOTSTRAP_OPENROUTER_LOCK
+    _BOOTSTRAP_OPENROUTER_KEYS.clear()
+    _BOOTSTRAP_OPENROUTER_LOCK = None
 
 
 def provider_cache_body(provider: Dict[str, Any]) -> Optional[Dict[str, Any]]:

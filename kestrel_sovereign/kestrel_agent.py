@@ -3,6 +3,7 @@ import json
 import os
 import asyncio
 import hashlib
+import inspect
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -934,6 +935,17 @@ class KestrelAgent(
                         not pa.privacy_config.allows_cloud_llm()
                     )
                 )
+
+            # Async completion pass for routes the sync registry build couldn't
+            # bring up (e.g. an OpenRouter route with only a management key, now
+            # completed via a bootstrap child key). Guard on iscoroutinefunction
+            # rather than hasattr: MagicMock-based LLM-service fakes satisfy
+            # hasattr (auto-attr) but are NOT awaitable, so a bare hasattr guard
+            # would raise "MagicMock can't be awaited" in every such test. Only
+            # await a genuine async finalize hook.
+            finalize_providers = getattr(self.llm_service, "finalize_providers", None)
+            if inspect.iscoroutinefunction(finalize_providers):
+                await finalize_providers()
 
             # Initialize TaskManager for A2A unified routing
             # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
