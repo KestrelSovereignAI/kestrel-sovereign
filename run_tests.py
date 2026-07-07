@@ -197,11 +197,16 @@ class SmartTestRunner:
             "--ignore=tests/infrastructure/",
         ])
 
+        # Normal collection of the full suite runs ~22-25s; slower CI runners
+        # routinely land in the high-20s/30s range. Keep a generous ceiling so
+        # ordinary runner variance doesn't spuriously fail the job, while still
+        # tripping on a genuine heavy-import regression (which balloons
+        # collection to minutes, not seconds).
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=90,
             cwd=self.root_dir,
         )
 
@@ -219,10 +224,11 @@ class SmartTestRunner:
 
             return False
 
-        # Warn about slow collection but don't fail - CI environments are slower
+        # Warn about slow collection but don't fail - CI environments are slower.
+        # A genuine heavy-import regression trips the subprocess timeout above
+        # (collection would take minutes); a merely-slow runner shouldn't fail.
         if elapsed > 30:
             self.log(f"Collection took {elapsed:.1f}s - check for heavy imports!", "warning")
-            return False
         elif elapsed > 10:
             self.log(f"Collection took {elapsed:.1f}s (slow but acceptable)", "warning")
 
