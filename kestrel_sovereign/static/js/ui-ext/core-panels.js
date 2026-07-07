@@ -38,6 +38,7 @@ const IDENTITY_BODY = `
         <div class="loading" data-label-key="loading_identity">Loading identity...</div>
     </div>
     <div id="genesis-audit"></div>
+    <div id="identity-danger-zone"></div>
 `;
 
 const CONSTITUTION_BODY = `

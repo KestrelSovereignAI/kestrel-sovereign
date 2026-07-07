@@ -14,6 +14,11 @@
  */
 
 const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
+// A bare ``/api/agents/{name}`` (no further path segments) is the multi-agent
+// manager's own resource — create/delete of an agent (#2208), not a per-agent
+// proxy target. It must NOT be host-agent-prefixed into
+// ``/api/agents/{selected}/api/agents/{name}``.
+const HOST_LEVEL_AGENT_RESOURCE_RE = /^\/api\/agents\/[^/]+(\?.*)?$/;
 
 // Canonical list of known UI capability keys (#879, #2041).
 //
@@ -63,6 +68,7 @@ function getRequiredDependency(name, value) {
 export function isHostLevelEndpoint(endpoint) {
     if (endpoint === '/api/agents' || endpoint.startsWith('/api/agents?')) return true;
     if (HOST_LEVEL_AGENTS_RE.test(endpoint)) return true;
+    if (HOST_LEVEL_AGENT_RESOURCE_RE.test(endpoint)) return true;
     if (endpoint === '/api/auth/key' || endpoint.startsWith('/api/auth/')) return true;
     if (endpoint === '/health') return true;
     return false;
@@ -419,6 +425,17 @@ export function createApiClient({
         health: () => client.request('/health'),
         getAgentInfo: () => client.request('/api/agent/info'),
         getAgents: () => client.request('/api/agents'),
+        // Native agent deletion (#2208) — the multi-agent manager's
+        // ``DELETE /api/agents/{name}`` (see endpoints/models.py). Only meaningful
+        // when the server runs in multi-agent mode; the danger-zone section gates
+        // this on the ``multi_agent`` capability before ever calling it. Carries
+        // the destructive opt-in header like every other destructive UI action
+        // (#766) so the demo-isolation rail sees an intentional, user-initiated
+        // delete. Host-level endpoint — never host-agent-prefixed.
+        deleteAgent: (name) => client.request(`/api/agents/${encodeURIComponent(name)}`, {
+            method: 'DELETE',
+            headers: { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui' },
+        }),
         getIdentity: () => client.request('/api/identity'),
         updateIdentity: (data) => client.request('/api/identity', {
             method: 'PATCH',
