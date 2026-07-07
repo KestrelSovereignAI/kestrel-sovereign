@@ -354,3 +354,88 @@ async def test_purge_ephemeral_session_drives_observability_sweep(tmp_path):
         assert await _dispatch_row(backend) is None
     finally:
         await store.close()
+
+
+# ---------------------------------------------------------------------------
+# log_llm_call gating (#2236 codex P1): wiring the store into LLMService made
+# prompt/response previews persist for EVERY call, so the previews (plus
+# error text, tool_calls, metadata) must honour privacy mode like every
+# other content-bearing sink field. Counts/latency/model always persist.
+# ---------------------------------------------------------------------------
+
+async def _llm_row(backend):
+    return await backend.fetch_one(
+        "SELECT system_prompt_preview, user_prompt_preview, response_preview, "
+        "error_message, tool_calls, metadata, input_tokens, duration_ms, model "
+        "FROM a2a_llm_calls WHERE agent_did=?",
+        ("did:test:emma",),
+    )
+
+
+async def _log_pii_llm_call(store):
+    await store.log_llm_call(
+        provider="openai",
+        model="gpt-test",
+        duration_ms=1200,
+        success=True,
+        agent_did="did:test:emma",
+        system_prompt="You are Emma. The user is alice@example.com",
+        user_prompt="my email is alice@example.com",
+        response="Sure thing, alice@example.com!",
+        error_message="upstream said: alice@example.com",
+        tool_calls=[{"name": "mail", "args": {"to": "alice@example.com"}}],
+        metadata={"note": "email me at alice@example.com"},
+        input_tokens=10,
+        output_tokens=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_elides_llm_call_content_but_keeps_metrics(tmp_path):
+    backend, store = await _store(tmp_path, "llm-ephemeral.db")
+    try:
+        store.set_privacy_config_provider(lambda: get_privacy_preset("ephemeral"))
+        await _log_pii_llm_call(store)
+
+        row = await _llm_row(backend)
+        assert row is not None, "row itself still persists (content-free metrics)"
+        for content_col in row[:6]:
+            assert content_col is None or "alice@example.com" not in str(content_col)
+        # counts / latency / model still metered
+        assert row[6] == 10
+        assert row[7] == 1200
+        assert row[8] == "gpt-test"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_anonymous_redacts_llm_call_content(tmp_path):
+    backend, store = await _store(tmp_path, "llm-anon.db")
+    try:
+        store.set_privacy_config_provider(lambda: get_privacy_preset("anonymous"))
+        await _log_pii_llm_call(store)
+
+        row = await _llm_row(backend)
+        assert row is not None
+        for content_col in row[:6]:
+            assert content_col is None or "alice@example.com" not in str(content_col)
+        # anonymized, not elided: prompt text survives minus the PII
+        assert row[1] and "my email is" in row[1]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_persists_llm_call_content(tmp_path):
+    backend, store = await _store(tmp_path, "llm-normal.db")
+    try:
+        store.set_privacy_config_provider(lambda: get_privacy_preset("normal"))
+        await _log_pii_llm_call(store)
+
+        row = await _llm_row(backend)
+        assert row is not None
+        assert row[0] and "alice@example.com" in row[0]
+        assert row[2] and "alice@example.com" in row[2]
+    finally:
+        await store.close()
