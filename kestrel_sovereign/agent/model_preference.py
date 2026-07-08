@@ -16,6 +16,7 @@ class ModelPreferenceMixin:
     """Mixin providing model preference and solvency methods for KestrelAgent."""
 
     MODEL_PREFERENCE_KEY = "model_preference"
+    EMBEDDING_ROUTE_KEY = "embedding_route"
 
     async def list_available_models(self, use_cache: bool = True) -> List[Dict[str, Any]]:
         """
@@ -122,6 +123,42 @@ class ModelPreferenceMixin:
             )
         except Exception as e:
             logging.warning(f"Failed to persist model preference: {e}")
+
+    async def _load_embedding_route(self) -> None:
+        """Load the persisted top-level embedding_route knob (#2263).
+
+        Mirrors ``_load_model_preference``: a persisted runtime value in
+        agent_metadata overrides the config default. Absence leaves the
+        config-seeded value (or None = auto) in place.
+        """
+        try:
+            result = await self._raw_storage.db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (self.agent_id, self.EMBEDDING_ROUTE_KEY),
+            )
+            if not result:
+                return
+            route = json.loads(result[0][0])
+            # ``route`` may be a string (explicit selector) or None (auto).
+            self.llm_service.set_embedding_route(route, persist=False)
+            if route:
+                logging.info("Loaded persisted embedding_route: %s", route)
+            else:
+                logging.info("Loaded persisted embedding_route: auto (follow chat)")
+        except Exception as e:
+            logging.warning(f"Failed to load embedding_route: {e}")
+
+    async def _persist_embedding_route(self, route: str | None) -> None:
+        """Persist the top-level embedding_route knob to agent_metadata (#2263)."""
+        try:
+            value = json.dumps(route)
+            await self._raw_storage.db.execute(
+                """INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (self.agent_id, self.EMBEDDING_ROUTE_KEY, value, datetime.now(timezone.utc)),
+            )
+        except Exception as e:
+            logging.warning(f"Failed to persist embedding_route: {e}")
 
     def _get_local_model_fallback(self) -> str:
         """Get the configured local (ollama) model for economy/solvency fallback."""

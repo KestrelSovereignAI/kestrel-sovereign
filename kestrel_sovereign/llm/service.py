@@ -326,6 +326,26 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
 
+        # Top-level embedding-route knob (#2263). ``[llm] embedding_route =
+        # "<vendor>:<route>"`` selects the embedding channel independently of
+        # the chat route — one setting instead of repeating ``embedding_sibling``
+        # under every vendor. ``None`` means "auto / follow chat route" (the
+        # pre-#2263 default). The config value seeds the runtime state; a
+        # persisted runtime override (agent_metadata) is applied on startup and
+        # wins over config, mirroring how model preference persists.
+        configured_embedding_route = None
+        if isinstance(self.config, dict):
+            raw_embedding_route = self.config.get("embedding_route")
+            if raw_embedding_route:
+                configured_embedding_route = str(raw_embedding_route).strip() or None
+        # Same normalization as set_embedding_route: the documented
+        # ``embedding_route = "auto"`` means "follow chat" — storing the
+        # literal would make resolve treat it as an explicit (nonexistent)
+        # provider and silently keyword-fallback (codex P2 on #2270).
+        if configured_embedding_route and configured_embedding_route.lower() == "auto":
+            configured_embedding_route = None
+        self._embedding_route: Optional[str] = configured_embedding_route
+
         # Remote GPU backend state (merged from BrainRouter)
         self._backend = BackendType.CLOUD
         self._default_backend = BackendType.CLOUD
@@ -365,6 +385,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Set via set_preference_persistence_callback() after initialization
         self._preference_persistence_callback = None
         self._preference_persistence_tasks: set[asyncio.Task[None]] = set()
+
+        # Persistence callback for the top-level embedding_route knob (#2263).
+        # Set via set_embedding_route_persistence_callback(); mirrors the model
+        # preference persistence mechanism so a runtime change survives restart.
+        self._embedding_route_persistence_callback = None
 
         # Routes that have failed with a permanent auth error (401/403 or
         # the equivalent "User not found" / "invalid api key" message). Once
@@ -418,6 +443,164 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """
         self._preference_persistence_callback = callback
         logger.info("Model preference persistence enabled")
+
+    def set_embedding_route_persistence_callback(self, callback) -> None:
+        """Set the persistence callback for the embedding_route knob (#2263).
+
+        The callback is ``async (route: str|None) -> None`` and is invoked
+        whenever ``set_embedding_route`` / ``clear_embedding_route`` changes the
+        value, so the caller can persist it the same way model preference is
+        persisted (agent_metadata row).
+        """
+        self._embedding_route_persistence_callback = callback
+        logger.info("Embedding route persistence enabled")
+
+    def get_embedding_route(self) -> Optional[str]:
+        """Return the configured top-level embedding_route (#2263).
+
+        ``None`` means "auto — embedding follows the active chat route" (the
+        pre-#2263 default). Otherwise a ``"<vendor>"`` or ``"<vendor>:<route>"``
+        selector chosen deliberately by the operator.
+        """
+        return getattr(self, "_embedding_route", None)
+
+    def set_embedding_route(self, route: Optional[str], *, persist: bool = True) -> None:
+        """Set the top-level embedding_route knob (#2263).
+
+        ``route`` is a ``"<vendor>"`` or ``"<vendor>:<route>"`` selector. An
+        empty string or ``"auto"`` clears the knob (falls back to
+        follow-chat/auto). The route is validated against the configured
+        providers — an unknown route, or one that advertises no embedding
+        support, is refused so the setting can never silently degrade to
+        keyword search on the next storage write.
+
+        Args:
+            route: The embedding route selector, or ``None``/``""``/``"auto"``
+                to clear.
+            persist: When True (default) and a persistence callback is bound,
+                schedule the value to be persisted. Set False when applying a
+                value that was just loaded from storage.
+
+        Raises:
+            ValueError: if the route names no configured provider, or the
+                matched route(s) advertise no embedding support.
+        """
+        if route is not None:
+            route = route.strip()
+            if not route or route.lower() == "auto":
+                route = None
+        if route is not None:
+            self._validate_embedding_route(route)
+
+        self._embedding_route = route
+        if route:
+            logger.info("Embedding route set: %s", route)
+        else:
+            logger.info(
+                "Embedding route cleared — embeddings follow the active chat "
+                "route (auto)."
+            )
+
+        if persist and self._embedding_route_persistence_callback:
+            self._schedule_embedding_route_persistence(route)
+
+    def clear_embedding_route(self) -> None:
+        """Clear the embedding_route knob, returning to auto/follow-chat (#2263)."""
+        self.set_embedding_route(None)
+
+    def _validate_embedding_route(self, route: str) -> None:
+        """Validate an embedding_route selector against configured providers.
+
+        Permissive about UNKNOWN state (mirrors ``_validate_explicit_mandate``):
+        when no providers are configured yet (pre-init / bare harness) the
+        route is trusted. Once providers exist, the selector must match at
+        least one, and at least one matched route must advertise embedding
+        support.
+        """
+        providers = getattr(self, "providers", None) or []
+        if not providers:
+            return
+
+        matching = self._filter_providers_by_selector(providers, route)
+        if not matching:
+            known = sorted({p.get("name") for p in providers if p.get("name")})
+            raise ValueError(
+                f"Cannot set embedding_route: no configured route matches "
+                f"'{route}'. Known routes: {known or '(none)'}."
+            )
+        if not any(self._provider_supports_embeddings(p) for p in matching):
+            raise ValueError(
+                f"Cannot set embedding_route '{route}': that route does not "
+                f"advertise embedding support."
+            )
+
+    def _schedule_embedding_route_persistence(
+        self, route: Optional[str]
+    ) -> Optional["asyncio.Task[None]"]:
+        """Own embedding_route persistence callbacks so close() can await them.
+
+        Callback signature is ``async (route) -> None``. Tasks are tracked in
+        the shared ``_preference_persistence_tasks`` set so
+        ``drain_preference_persistence`` covers them too.
+        """
+        if not self._embedding_route_persistence_callback:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — skip persistence (tests / sync contexts).
+            return None
+        task = loop.create_task(
+            self._embedding_route_persistence_callback(route),
+            name="llm-embedding-route-persistence",
+        )
+        self._preference_persistence_tasks.add(task)
+        task.add_done_callback(self._handle_preference_persistence_done)
+        return task
+
+    def get_embedding_settings(self) -> Dict[str, Any]:
+        """Return the resolved embedding-channel state for the active session (#2263).
+
+        Shape (enough for a UI to render an "Auto — follow chat" default and a
+        dimension-mismatch warning):
+
+            embedding_route:        the configured knob, or ``None`` == auto.
+            resolved_route:         the ``"<vendor>:<route>"`` actually resolved
+                                    for the active session, or ``None`` when
+                                    embedding is unavailable (keyword fallback).
+            embedding_model:        the resolved provider's embedding model id.
+            embedding_dim:          the resolved provider's embedding dimension.
+            kestrel_embedding_dim:  the deployment's effective embedding dim
+                                    (driven by ``KESTREL_EMBEDDING_DIM``), which
+                                    the vector columns are sized to.
+        """
+        configured = getattr(self, "_embedding_route", None)
+        provider = self.resolve_embedding_provider()
+        resolved_route = None
+        embedding_model = None
+        embedding_dim = None
+        if provider is not None:
+            resolved_route = provider.get("name")
+            capabilities = provider.get("capabilities") or {}
+            embedding_model = capabilities.get("embedding_model")
+            embedding_dim = capabilities.get("embedding_dim")
+
+        try:
+            from kestrel_sovereign.storage.sqla.conversation_message import (
+                resolve_embedding_dim,
+            )
+
+            deployment_dim = resolve_embedding_dim()
+        except Exception:  # pragma: no cover - defensive; never crash a GET
+            deployment_dim = None
+
+        return {
+            "embedding_route": configured,
+            "resolved_route": resolved_route,
+            "embedding_model": embedding_model,
+            "embedding_dim": embedding_dim,
+            "kestrel_embedding_dim": deployment_dim,
+        }
 
     @staticmethod
     def _is_permanent_auth_error(exc: Exception) -> bool:
@@ -1123,27 +1306,61 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             None,
         )
 
+    def _lookup_embedding_route_candidates(
+        self, selector: str
+    ) -> List[Dict[str, Any]]:
+        """Return ALL available providers an embedding_route selector matches.
+
+        Same availability source and selector semantics as
+        ``_lookup_sibling_provider`` (``"<vendor>"`` or ``"<vendor>:<route>"``),
+        but returns every match instead of the first — the explicit
+        embedding_route branch picks the first EMBEDDING-CAPABLE match, so a
+        bare-vendor selector isn't defeated by a non-embedding route sorting
+        first (codex P2 on #2270).
+        """
+        if hasattr(self, "_available_providers") and callable(
+            getattr(self, "_available_providers")
+        ):
+            try:
+                candidates = self._available_providers()
+            except Exception:
+                candidates = getattr(self, "providers", None) or []
+        else:
+            candidates = getattr(self, "providers", None) or []
+        if not candidates:
+            return []
+        if ":" in selector:
+            return [p for p in candidates if p.get("name") == selector]
+        return [p for p in candidates if p.get("vendor") == selector]
+
     def resolve_embedding_provider(self) -> Optional[Dict[str, Any]]:
         """Return a provider that can embed text for the active chat session.
 
-        Resolution order (#1494 — sibling-route per chat provider):
+        Resolution order (#2263 — top-level embedding_route + #1494 sibling):
 
-        1. Active chat route supports embeddings → return it. (Today's
+        1. Explicit top-level ``embedding_route`` (#2263) is set → resolve it.
+           The user's deliberate choice wins even when the active chat route
+           embeds natively. This branch is terminal: if the configured route is
+           unavailable, refused by the privacy gate, or advertises no embedding
+           support, we log and fall back to keyword search (``None``) rather
+           than second-guessing with the chat route.
+        2. Active chat route supports embeddings → return it. (Today's
            "embedding follows chat provider" behavior — preserved as
-           the default.)
-        2. Active route has ``embedding_sibling`` configured AND the
+           the default when no explicit ``embedding_route`` is set.)
+        3. Active route has ``embedding_sibling`` configured AND the
            sibling exists in ``self.providers`` AND it supports
            embeddings AND it passes the ``force_local_only`` filter →
            return the sibling.
-        3. Otherwise → ``None``. Storage callers fall back to
+        4. Otherwise → ``None``. Storage callers fall back to
            keyword / LIKE search; never an unrelated global Ollama
            singleton, never a cloud route under local-only mode.
 
         Privacy gate (#1492): the bound ``force_local_only`` provider
-        is applied at every routing call here AND on the sibling
-        lookup. A cloud sibling for an ISOLATED/EPHEMERAL session is
-        rejected — privacy wins, even at the cost of losing
-        embedding for the operator who configured a non-local sibling.
+        is applied to EVERY branch — the explicit ``embedding_route``,
+        the active chat route, AND the sibling lookup. A cloud channel
+        for an ISOLATED/EPHEMERAL session is rejected — privacy wins,
+        even at the cost of losing embedding for the operator who
+        configured a non-local channel.
 
         Sibling resolution is one hop only. The chosen sibling is
         used directly; ``embedding_sibling`` on the sibling itself is
@@ -1154,6 +1371,52 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return None
 
         force_local_only = self._current_force_local_only()
+
+        # --- 1. Explicit top-level embedding_route knob (#2263) --------------
+        # The user's deliberate choice wins even when the chat route embeds
+        # natively. Terminal branch — never falls through to chat/sibling.
+        explicit_route = getattr(self, "_embedding_route", None)
+        if explicit_route:
+            # Consider EVERY available route the selector matches, not just the
+            # vendor's first route (codex P2 on #2270): a bare-vendor selector
+            # like "openai" must find openai:api's embedding support even when
+            # a non-embedding openai-compatible route sorts first.
+            matches = self._lookup_embedding_route_candidates(explicit_route)
+            if not matches:
+                logger.warning(
+                    "Configured embedding_route %s matches no initialized "
+                    "provider; semantic storage search will use keyword "
+                    "fallback.",
+                    explicit_route,
+                )
+                return None
+            if force_local_only:
+                matches = [p for p in matches if p.get("is_local")]
+                if not matches:
+                    logger.info(
+                        "Configured embedding_route %s is non-local under "
+                        "force_local_only=True; semantic storage search will use "
+                        "keyword fallback (privacy mode overrides embedding_route).",
+                        explicit_route,
+                    )
+                    return None
+            target = next(
+                (p for p in matches if self._provider_supports_embeddings(p)),
+                None,
+            )
+            if target is None:
+                logger.warning(
+                    "Configured embedding_route %s does not advertise "
+                    "supports_embeddings; semantic storage search will use "
+                    "keyword fallback.",
+                    explicit_route,
+                )
+                return None
+            logger.info(
+                "Using configured embedding_route %s for embeddings.",
+                explicit_route,
+            )
+            return target
 
         # ``resolve_provider_routing`` raises RuntimeError when
         # force_local_only=True and no local provider exists. For
