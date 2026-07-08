@@ -391,22 +391,13 @@ class AgentManager:
         # Ed25519 and ML-DSA-65; legacy parents fall through to the
         # bare-hex ECDSA path. The parent's runtime identity is set
         # on the agent at startup by KestrelAgent.__init__ (#999).
-        parent_private_key = getattr(parent_agent, '_private_key', None)
-        parent_identity = getattr(parent_agent, 'identity', None)
-        if parent_private_key is not None:
-            sign_mandate(
-                mandate, parent_private_key,
-                parent_identity=parent_identity,
-            )
-
-        # Create the child via the existing create_agent flow. Thread the
-        # mandate's feature allowlist into the child's config so the grant is
-        # actually enforced at load time — without this the child loads ALL
-        # features regardless of what the mandate permitted (#1946). An empty
-        # list is a real (empty) allowlist; only ``None`` means "load all".
-        features_allowed = getattr(mandate, "features_allowed", None)
-        if features_allowed:
-            child_features = list(features_allowed)
+        # Resolve the child's feature ceiling BEFORE signing so the signed
+        # mandate — and the spawned_by edge inception persists from it — records
+        # the ACTUAL ceiling, explicit or inherited (#1946). An empty list is a
+        # real (empty) allowlist; only ``None`` means "load all".
+        explicit_features = getattr(mandate, "features_allowed", None)
+        if explicit_features:
+            child_features = list(explicit_features)
         else:
             # No explicit allowlist ⇒ inherit the PARENT's feature ceiling, NOT
             # "load all discovered features" (F277 / codex P1). Otherwise a
@@ -414,6 +405,21 @@ class AgentManager:
             # omitting features_allowed. A parent with no resolvable feature set
             # (degenerate/test doubles) falls back to None (load all).
             child_features = sorted(self._parent_feature_names(parent_agent)) or None
+            # Persist the INHERITED ceiling onto the mandate so it is durable on
+            # the edge and enforced on every boot path (#2226) — not just via
+            # this process's config threading. Without this, an inherited-ceiling
+            # child persists an empty features_allowed and, on a direct restart
+            # outside AgentManager, would escape its ceiling and load everything.
+            if child_features:
+                mandate.features_allowed = list(child_features)
+
+        parent_private_key = getattr(parent_agent, '_private_key', None)
+        parent_identity = getattr(parent_agent, 'identity', None)
+        if parent_private_key is not None:
+            sign_mandate(
+                mandate, parent_private_key,
+                parent_identity=parent_identity,
+            )
         child = await self.create_agent(
             name,
             parent_did=parent_agent.agent_id,

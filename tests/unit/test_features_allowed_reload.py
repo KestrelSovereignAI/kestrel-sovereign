@@ -98,6 +98,42 @@ async def test_direct_boot_enforces_feature_ceiling(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_do_spawn_persists_inherited_ceiling():
+    """When a mandate omits features_allowed, _do_spawn writes the inherited
+    parent ceiling onto the mandate BEFORE signing, so inception persists it on
+    the edge and a direct restart still enforces it (not just this process)."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    mgr = AgentManager()
+    parent = SimpleNamespace(
+        _private_key=None,  # skip signing
+        identity=None,
+        agent_id="did:pkh:eip155:1:0xParentInherit",
+        features={"MemoryFeature": object(), "ComputeFeature": object()},
+    )
+    child = SimpleNamespace(agent_id="did:pkh:eip155:1:0xChildInherit")
+    captured = {}
+
+    async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
+        captured["config_features"] = features
+        captured["mandate_features"] = list(mandate.features_allowed)
+        return child
+
+    mgr.create_agent = fake_create_agent
+
+    mandate = SpawnMandate(parent_did=parent.agent_id, purpose="inherit test")
+    assert mandate.features_allowed == []  # no explicit allowlist
+    await mgr._do_spawn("InheritKid", parent, mandate)
+
+    expected = ["ComputeFeature", "MemoryFeature"]  # sorted parent ceiling
+    assert mandate.features_allowed == expected
+    assert captured["config_features"] == expected
+    assert captured["mandate_features"] == expected  # persisted at inception time
+
+
+@pytest.mark.asyncio
 async def test_root_agent_loads_beyond_the_ceiling(tmp_path):
     """Control: a non-spawned agent has no ceiling, so it loads optional features
     the spawned child above was denied — proving the restriction is spawn-scoped."""
