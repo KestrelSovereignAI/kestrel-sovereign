@@ -31,7 +31,13 @@ def test_llm_quickstart_falls_back_to_ollama_when_nothing_detected(
     rerun the interactive wizard to pick a cloud vendor.
     """
     # Strip any cloud keys the developer may have exported in their shell.
-    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+    for var in (
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_MANAGEMENT_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
     # Ollama not running.
     monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
@@ -50,7 +56,13 @@ def test_llm_quickstart_picks_ollama_when_only_ollama_reachable(
     """Ollama running, no cloud keys → quickstart writes Ollama-only.
     Same on-disk shape as the no-detection fallback, but the path
     that got us there is "we found Ollama" (logged at INFO)."""
-    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+    for var in (
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_MANAGEMENT_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: True)
 
@@ -86,7 +98,12 @@ def test_llm_quickstart_combines_cloud_and_ollama_when_both_available(
     Mirrors the README's "OpenRouter recommended; Ollama for free
     local fallback" recipe.
     """
-    for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+    for var in (
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_MANAGEMENT_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: True)
@@ -121,7 +138,13 @@ def test_llm_quickstart_reads_keys_from_dotenv_too(tmp_path, monkeypatch):
     the wizard's keys-step may have populated .env earlier in the same
     --quickstart run, and the parent shell may have nothing exported.
     """
-    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+    for var in (
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_MANAGEMENT_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
     write_env(tmp_path / ".env", {"OPENAI_API_KEY": "sk-from-dotenv"})
@@ -158,6 +181,7 @@ def test_llm_quickstart_promotes_shell_env_keys_to_dotenv(tmp_path, monkeypatch)
     """
     monkeypatch.setenv("OPENAI_API_KEY", "sk-shell-exported")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
@@ -248,7 +272,7 @@ def test_llm_google_path(tmp_path):
 
 def test_llm_openrouter_path(tmp_path):
     answers = [
-        "OpenRouter (multi-vendor proxy — needs OPENROUTER_API_KEY)",
+        llm._OPENROUTER.label,
         False, False, False, False,
         "sk-or-v1-test",
     ]
@@ -259,6 +283,90 @@ def test_llm_openrouter_path(tmp_path):
     assert config["llm"]["route_priority"] == ["openrouter:api"]
     assert env["OPENROUTER_API_KEY"] == "sk-or-v1-test"
     assert config["llm"]["vendors"]["openrouter"]["routes"]["api"]["adapter"] == "OpenRouterAdapter"
+
+
+def test_llm_openrouter_management_key_only_path(tmp_path):
+    """Interactive OpenRouter with a blank OPENROUTER_API_KEY offers the
+    management key instead (management-key-only setup, #2243/#2245)."""
+    answers = [
+        llm._OPENROUTER.label,
+        False, False, False, False,
+        "",  # blank OPENROUTER_API_KEY
+        "sk-or-mgmt-test",  # management key instead
+    ]
+    ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, answers=answers)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    env = read_env(tmp_path / ".env")
+    assert config["llm"]["route_priority"] == ["openrouter:api"]
+    assert env["OPENROUTER_MANAGEMENT_API_KEY"] == "sk-or-mgmt-test"
+    assert "OPENROUTER_API_KEY" not in env
+    assert ctx.blockers == []
+
+
+def test_llm_quickstart_detects_openrouter_management_key(tmp_path, monkeypatch):
+    """A management key alone (no static OPENROUTER_API_KEY) exported in the
+    shell is enough for quickstart to auto-detect and configure OpenRouter."""
+    for var in (
+        "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OPENROUTER_MANAGEMENT_API_KEY", "sk-or-mgmt")
+    monkeypatch.setattr(llm, "_is_ollama_reachable", lambda *a, **kw: False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    llm.run(ctx)
+    config = read_toml(tmp_path / "kestrel.toml")
+    env = read_env(tmp_path / ".env")
+    assert config["llm"]["route_priority"] == ["openrouter:api"]
+    assert env["OPENROUTER_MANAGEMENT_API_KEY"] == "sk-or-mgmt"
+    assert ctx.blockers == []
+
+
+def test_llm_check_mode_accepts_openrouter_management_key(tmp_path, monkeypatch):
+    """CHECK must not report OpenRouter as unconfigured when only the
+    management key is present (#2245)."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    write_toml(
+        tmp_path / "kestrel.toml",
+        {
+            "llm": {
+                "route_priority": ["openrouter:api"],
+                "vendors": {
+                    "openrouter": {
+                        "routes": {"api": {"api_key_env": "OPENROUTER_API_KEY"}}
+                    }
+                },
+            }
+        },
+    )
+    write_env(tmp_path / ".env", {"OPENROUTER_MANAGEMENT_API_KEY": "sk-or-mgmt"})
+    ctx = _make_ctx(tmp_path, Flow.CHECK)
+    llm.run(ctx)
+    assert ctx.blockers == []
+
+
+def test_llm_check_mode_blocks_openrouter_without_any_key(tmp_path, monkeypatch):
+    """With neither OPENROUTER_API_KEY nor the management key set, CHECK
+    still reports the route as unconfigured."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
+    write_toml(
+        tmp_path / "kestrel.toml",
+        {
+            "llm": {
+                "route_priority": ["openrouter:api"],
+                "vendors": {
+                    "openrouter": {
+                        "routes": {"api": {"api_key_env": "OPENROUTER_API_KEY"}}
+                    }
+                },
+            }
+        },
+    )
+    ctx = _make_ctx(tmp_path, Flow.CHECK)
+    llm.run(ctx)
+    assert any("OPENROUTER_API_KEY" in b for b in ctx.blockers)
 
 
 def test_llm_multi_vendor_chain(tmp_path):
