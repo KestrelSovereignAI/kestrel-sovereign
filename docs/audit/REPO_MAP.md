@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-07-08
-**Scope:** 1940 tracked files (1265 `.py`, 324 `.md`, 351 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 1942 tracked files (1266 `.py`, 324 `.md`, 352 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -29,6 +29,15 @@ GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scri
 
 Repo entry points and standard project files.
 
+- **README.md** — Kestrel: Sovereign AI Agent Framework — > Build AI agents that nobody can take away from their users — not you, not the cloud, not the next pivot.
+- **QUICKSTART.md** — Kestrel Quickstart — Sovereign Agent in 30 Minutes — By the end of this guide you will have a running Kestrel agent with all three sovereignty pillars active: - A cryptographic DID identity (yours, portable, no platform owns it) - An encrypted memory s…
+- **KESTREL_FEATURES.md** — Kestrel Sovereign Feature Inventory — > Canonical source of truth for the maintained Kestrel surface.
+- **CONTRIBUTING.md** — Contributing to Kestrel — Thank you for your interest in contributing.
+- **CODE_OF_CONDUCT.md** — Contributor Covenant Code of Conduct — ## Our Pledge
+- **SECURITY.md** — Security Policy — ## Reporting a Vulnerability
+- **AGENTS.md** — Kestrel Sovereign — Agent Instructions — > **🐢 See [docs/TORTOISE_DOCTRINE.md](docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and coding standards.**
+- **CLAUDE.md** — Claude Code Instructions — This file is a pointer for Claude Code.
+- **LICENSE** — —
 - **.coveragerc** — —
 - **.cursorrules** — —
 - **.dockerignore** — —
@@ -38,17 +47,8 @@ Repo entry points and standard project files.
 - **.gitignore** — —
 - **.kestrel-host-features.toml.example** — —
 - **.windsurfrules** — —
-- **AGENTS.md** — Kestrel Sovereign — Agent Instructions — > **🐢 See [docs/TORTOISE_DOCTRINE.md](docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and coding standards.**
-- **CLAUDE.md** — Claude Code Instructions — This file is a pointer for Claude Code.
-- **CODE_OF_CONDUCT.md** — Contributor Covenant Code of Conduct — ## Our Pledge
-- **CONTRIBUTING.md** — Contributing to Kestrel — Thank you for your interest in contributing.
 - **Dockerfile** — —
 - **Dockerfile.agent.remote** — —
-- **KESTREL_FEATURES.md** — Kestrel Sovereign Feature Inventory — > Canonical source of truth for the maintained Kestrel surface.
-- **LICENSE** — —
-- **QUICKSTART.md** — Kestrel Quickstart — Sovereign Agent in 30 Minutes — By the end of this guide you will have a running Kestrel agent with all three sovereignty pillars active: - A cryptographic DID identity (yours, portable, no platform owns it) - An encrypted memory s…
-- **README.md** — Kestrel: Sovereign AI Agent Framework — > Build AI agents that nobody can take away from their users — not you, not the cloud, not the next pivot.
-- **SECURITY.md** — Security Policy — ## Reporting a Vulnerability
 - **council_config.toml** — (configuration)
 - **deploy_config.toml** — (configuration)
 - **deploy_config.toml.example** — —
@@ -1725,6 +1725,7 @@ Repo entry points and standard project files.
 - **tests/frontend/conversations_fulltext_search.test.mjs** — (mjs asset)
 - **tests/frontend/conversations_new_conversation.test.mjs** — (mjs asset)
 - **tests/frontend/conversations_pane.test.mjs** — (mjs asset)
+- **tests/frontend/conversations_turn_refresh.test.mjs** — (mjs asset)
 - **tests/frontend/core_panels_regressions.test.mjs** — (mjs asset)
 - **tests/frontend/demo_reset_guard.test.mjs** — (mjs asset)
 - **tests/frontend/dynamic_thinking_status.test.mjs** — (mjs asset)
@@ -2435,6 +2436,8 @@ Repo entry points and standard project files.
   - `def data_key(monkeypatch)`; `def test_encrypted_content_restores_without_sidecar(tmp_path, data_key)`; `def test_store_and_retrieve_roundtrip_encrypted(tmp_path, data_key)`; `def test_legacy_sidecar_still_decrypts(tmp_path, data_key)`
 - **tests/unit/test_filecoin_miner_selection.py** — Unit tests for Filecoin miner selection logic.
   - `class TestMinerSelection`; `class TestMinerSelectionIntegration`; `class TestMinerSelectionEdgeCases`
+- **tests/unit/test_finalize_route_discovery.py** — Regression tests for #2247: model discovery must include finalize-registered routes.
+  - `async def test_finalize_clears_stale_cache_when_new_route_registers()`; `async def test_finalize_keeps_cache_when_no_new_route()`; `async def test_cache_hit_resolves_late_registered_auto_route()`
 - **tests/unit/test_gcp_auth.py** — Tests for the shared GCP credential discovery in ``kestrel_sovereign.features.deploy._gcp_auth``.
   - `def test_setup_gcp_auth_clears_stale_credentials_env_var(tmp_path, monkeypatch, caplog)`; `def test_setup_gcp_auth_keeps_valid_credentials_env_var(tmp_path, monkeypatch)`
 - **tests/unit/test_generate_feature_docs.py** — Tests for the feature-doc generation pipeline.
