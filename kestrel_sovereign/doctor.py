@@ -112,12 +112,21 @@ def _check_llm(
         vendor = vendors.get(vendor_key) or {}
         route = (vendor.get("routes") or {}).get(route_key) or {}
         api_key_env = route.get("api_key_env")
-        if api_key_env and not env.get(api_key_env):
-            report.fail.append(
-                f"{api_key_env} not set in .env (required for {route_id})"
-            )
-        elif api_key_env:
+        # A management/provisioning key is an accepted alternative to the static
+        # api key (e.g. OpenRouter registers + mints per-user keys from
+        # OPENROUTER_MANAGEMENT_API_KEY alone — #2243/#2245). Treat the route as
+        # configured if either credential is present, so a management-key-only
+        # setup that `kestrel setup --check` accepts doesn't get flagged here.
+        mgmt_key_env = route.get("management_api_key_env")
+        if api_key_env and env.get(api_key_env):
             report.ok.append(f"{api_key_env} set for {route_id}")
+        elif mgmt_key_env and env.get(mgmt_key_env):
+            report.ok.append(f"{mgmt_key_env} (management key) set for {route_id}")
+        elif api_key_env:
+            alt = f" or {mgmt_key_env}" if mgmt_key_env else ""
+            report.fail.append(
+                f"{api_key_env}{alt} not set in .env (required for {route_id})"
+            )
 
 
 def _check_multi_agent(

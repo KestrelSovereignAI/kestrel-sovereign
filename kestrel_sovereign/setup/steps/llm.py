@@ -159,6 +159,10 @@ _OPENROUTER = _Vendor(
                     "api": {
                         "adapter": "OpenRouterAdapter",
                         "api_key_env": "OPENROUTER_API_KEY",
+                        # Management-key-only setups are valid: the registry
+                        # (#2243) registers OpenRouter + mints keys from this
+                        # alone, and doctor treats it as an accepted credential.
+                        "management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY",
                         "model": "auto",
                         "selection_hints": ["sonnet", "gpt", "gemini"],
                     }
