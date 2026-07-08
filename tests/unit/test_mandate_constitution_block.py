@@ -52,7 +52,7 @@ def test_render_block_survives_mixed_type_values():
                 "restricted_tools": [1, "a", "computer_use_shell"],
                 "behavioral_rules": {2: "num-keyed", "b": "rule"},
             },
-            features_allowed=["z", 3],
+            features_allowed=[],
         )
     )
     assert "SPAWN MANDATE CONSTRAINTS" in block
@@ -63,6 +63,15 @@ def test_render_block_empty_when_no_constraints():
     assert render_mandate_constitution_block(None) == ""
     assert render_mandate_constitution_block(
         SimpleNamespace(additional_constraints={}, features_allowed=[])
+    ) == ""
+
+
+def test_render_block_ignores_features_allowed_only():
+    # #2225 scopes to additional_constraints; a mandate with only
+    # features_allowed produces no block here — feature-scope surfacing is
+    # tracked in #2226, not advertised by this helper.
+    assert render_mandate_constitution_block(
+        SimpleNamespace(additional_constraints={}, features_allowed=["a", "b"])
     ) == ""
 
 

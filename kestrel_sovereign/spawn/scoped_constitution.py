@@ -225,22 +225,27 @@ class ScopedConstitution:
 
 
 def render_mandate_constitution_block(mandate) -> str:
-    """Render a spawn mandate's constraints as a constitution section (#2225).
+    """Render a spawn mandate's ``additional_constraints`` as a constitution
+    section (#2225).
 
     Returns the ``--- SPAWN MANDATE CONSTRAINTS ---`` block (behavioral_rules,
     restricted_tools, restrictions, token limits) for appending to a spawned
     child's governing constitution, or ``""`` when ``mandate`` is None or carries
-    no enforceable constraints. Never includes the base constitution, so callers
-    append it without disturbing the anchored base hash.
+    no ``additional_constraints``. Never includes the base constitution, so
+    callers append it without disturbing the anchored base hash.
+
+    ``features_allowed`` is intentionally NOT rendered here: it is not carried on
+    the reload-reconstructed mandate (#2137, to avoid the constitution
+    features-subset re-validation misfiring), so surfacing it would advertise a
+    capability the real spawn/reload path never populates. Surfacing AND
+    enforcing the feature allowlist is tracked in #2226.
     """
     if mandate is None:
         return ""
     additional_constraints = getattr(mandate, "additional_constraints", None) or {}
-    features_allowed = list(getattr(mandate, "features_allowed", None) or [])
-    if not (additional_constraints or features_allowed):
+    if not additional_constraints:
         return ""
     return ScopedConstitution(
         base_constitution="",
         additional_constraints=additional_constraints,
-        features_allowed=features_allowed,
     ).constraints_section()
