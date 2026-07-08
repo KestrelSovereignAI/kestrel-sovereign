@@ -140,6 +140,23 @@ class ScopedConstitution:
         logger.info("Scoped constitution constraints validated successfully")
         return True, "All constraints are valid restrictions"
 
+    def constraints_section(self) -> str:
+        """Return only the scoped-constraints section (no base constitution).
+
+        Empty string when the mandate carries no constraints/features. Used to
+        append a spawned child's mandate constraints to its *governing*
+        constitution at prompt-build time (#2225) — surfacing behavioral_rules,
+        restricted_tools, and restrictions to the model — without rewriting or
+        re-hashing the anchored base constitution.
+        """
+        if not (self.additional_constraints or self.features_allowed):
+            return ""
+        base, self.base_constitution = self.base_constitution, ""
+        try:
+            return self.get_effective_constitution().strip()
+        finally:
+            self.base_constitution = base
+
     def get_effective_constitution(self) -> str:
         """Return the full constitution text including scoped constraints.
 
@@ -197,3 +214,25 @@ class ScopedConstitution:
                 "INTEGRITY FAILURE: Scoped constitution constraints have been modified"
             )
         return True, "Scoped constitution integrity verified"
+
+
+def render_mandate_constitution_block(mandate) -> str:
+    """Render a spawn mandate's constraints as a constitution section (#2225).
+
+    Returns the ``--- SPAWN MANDATE CONSTRAINTS ---`` block (behavioral_rules,
+    restricted_tools, restrictions, token limits) for appending to a spawned
+    child's governing constitution, or ``""`` when ``mandate`` is None or carries
+    no enforceable constraints. Never includes the base constitution, so callers
+    append it without disturbing the anchored base hash.
+    """
+    if mandate is None:
+        return ""
+    additional_constraints = getattr(mandate, "additional_constraints", None) or {}
+    features_allowed = list(getattr(mandate, "features_allowed", None) or [])
+    if not (additional_constraints or features_allowed):
+        return ""
+    return ScopedConstitution(
+        base_constitution="",
+        additional_constraints=additional_constraints,
+        features_allowed=features_allowed,
+    ).constraints_section()
