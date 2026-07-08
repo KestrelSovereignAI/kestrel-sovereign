@@ -41,14 +41,33 @@ export function setChatDeps(partial) {
 // corrects the preview text). Debounced so rapid/queued turns coalesce into a
 // single reload instead of thrashing the list request.
 let _conversationsStaleTimer = null;
-function notifyConversationsStale() {
+let _conversationsStaleDetail = null;
+// #2254: carry `{ sessionId, agent }` in the stale event so identity.js's
+// listener can sync the active-row highlight for ORGANIC sessions — the ones
+// the user reaches by just typing, where the effective session id is learned
+// from the X-Session-Id header onto `pane.sessionId` and identity.js's
+// `activeConversationId` was never updated. The detail is captured at call time
+// (the latest turn wins) and read at fire time, since the dispatch is debounced.
+function notifyConversationsStale(sessionId, agent) {
     if (typeof window === 'undefined'
         || typeof window.dispatchEvent !== 'function') return;
     if (_conversationsStaleTimer) clearTimeout(_conversationsStaleTimer);
+    _conversationsStaleDetail = {
+        sessionId: sessionId || null,
+        agent: agent || null,
+    };
     _conversationsStaleTimer = setTimeout(() => {
         _conversationsStaleTimer = null;
+        const detail = _conversationsStaleDetail;
+        _conversationsStaleDetail = null;
         try {
-            window.dispatchEvent(new Event('kestrel:conversations-stale'));
+            const EventCtor = typeof window.CustomEvent === 'function'
+                ? window.CustomEvent
+                : (typeof CustomEvent === 'function' ? CustomEvent : null);
+            const evt = EventCtor
+                ? new EventCtor('kestrel:conversations-stale', { detail })
+                : new Event('kestrel:conversations-stale');
+            window.dispatchEvent(evt);
         } catch (_) { /* best-effort — the pane refresh is non-critical */ }
     }, 400);
 }
@@ -2996,7 +3015,9 @@ export async function sendMessage(overrideText, overrideAgent) {
         // non-aborted turn signals (an orphaned prior turn's late finally must
         // not); the debounced dispatch is a no-op when the pane isn't mounted.
         if (ownsStream() && !wasAborted) {
-            notifyConversationsStale();
+            // #2254: carry this turn's learned session id + agent so the pane
+            // can highlight the active row for an organic (just-typed) session.
+            notifyConversationsStale(pane.sessionId, dispatchAgent);
         }
         // Toast the user when a non-visible agent finishes responding,
         // so a long-running answer on Agent A surfaces while they're

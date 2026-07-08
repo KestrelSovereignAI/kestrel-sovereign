@@ -373,7 +373,10 @@ nav {
 
 /* Conversation items in Conversations pane */
 .conversation-item {
-    padding: 0.75rem;
+    /* #2254: reserve right padding so the tile's text (meta row + preview)
+       never underlaps the kebab, which is now absolutely pinned to the tile's
+       right edge and vertically centered (see `.conversation-item .kebab-btn`). */
+    padding: 0.75rem 2.25rem 0.75rem 0.75rem;
     border-radius: 8px;
     cursor: pointer;
     margin-bottom: 0.5rem;
@@ -385,10 +388,6 @@ nav {
 
 .conversation-item:hover {
     background: var(--bg-tertiary);
-}
-
-.conversation-item .conversation-meta-row {
-    padding-right: 2rem;
 }
 
 /* Hover-reveal delete affordance on conversation rows (#715). */
@@ -627,9 +626,10 @@ nav {
     padding: 0.5rem 0.25rem 0.25rem;
 }
 
-/* Meta row: time + message count on the left, kebab pinned right. Never wraps
-   (#2165) — at ~220px the compact time truncates with an ellipsis while the
-   count and kebab hold their size and the kebab stays pinned right. */
+/* Meta row: time + message count on the left. Never wraps (#2165) — at ~220px
+   the compact time truncates with an ellipsis while the count holds its size.
+   #2254: the kebab no longer lives in this row's flow; it is absolutely pinned
+   to the RIGHT of the whole tile, vertically centered (see below). */
 .conversation-item .conversation-meta-row {
     display: flex;
     flex-wrap: nowrap;
@@ -650,11 +650,8 @@ nav {
 }
 
 /* Kebab (⋯) button: a quiet icon button. Hover-reveal on row hover, but
-   always focusable (keyboard) — matching the old conv-delete-btn pattern.
-   Sits at the right end of the meta row via margin-left:auto. */
+   always focusable (keyboard) — matching the old conv-delete-btn pattern. */
 .kebab-btn {
-    margin-left: auto;
-    flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -670,6 +667,19 @@ nav {
     cursor: pointer;
     opacity: 0;
     transition: opacity 0.15s, background-color 0.15s;
+}
+
+/* #2254: pin the kebab to the RIGHT side of the tile, VERTICALLY CENTERED in
+   the row, rather than at the right end of the meta (time + count) line where
+   it read as awkward. `.conversation-item` is `position: relative`, so the
+   absolute kebab centers against the whole tile; the tile reserves right
+   padding so text never underlaps it. Hover-reveal + focusability are preserved
+   by the shared rules below, which are class-based (not layout-dependent). */
+.conversation-item .kebab-btn {
+    position: absolute;
+    right: 0.5rem;
+    top: 50%;
+    transform: translateY(-50%);
 }
 
 .conversation-item:hover .kebab-btn,
