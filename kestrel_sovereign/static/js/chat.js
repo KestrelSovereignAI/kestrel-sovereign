@@ -31,6 +31,28 @@ export function setChatDeps(partial) {
     _deps = { ..._deps, ...(partial || {}) };
 }
 
+// #2248: a completed turn grows the active conversation's message_count and
+// preview server-side, but the conversations pane's tile (including the #2222
+// optimistic New tile hardcoded at message_count:0) only refreshes on
+// open/targeted events + kebab mutations — so the visible tile stays "0 msgs"
+// the whole session. Signal the pane to reload after a turn ends. Reuses the
+// established `kestrel:conversations-stale` window event (voice already fires
+// it; identity.js's listener calls conversationsHandle.refresh(), which also
+// corrects the preview text). Debounced so rapid/queued turns coalesce into a
+// single reload instead of thrashing the list request.
+let _conversationsStaleTimer = null;
+function notifyConversationsStale() {
+    if (typeof window === 'undefined'
+        || typeof window.dispatchEvent !== 'function') return;
+    if (_conversationsStaleTimer) clearTimeout(_conversationsStaleTimer);
+    _conversationsStaleTimer = setTimeout(() => {
+        _conversationsStaleTimer = null;
+        try {
+            window.dispatchEvent(new Event('kestrel:conversations-stale'));
+        } catch (_) { /* best-effort — the pane refresh is non-critical */ }
+    }, 400);
+}
+
 function deps() {
     const globalWindow = typeof window !== 'undefined' ? window : {};
     return {
@@ -2968,6 +2990,13 @@ export async function sendMessage(overrideText, overrideAgent) {
         // Context status touches a global singleton — gate on visible.
         if (isCurrentVisible()) {
             updateContextStatus();
+        }
+        // #2248: nudge the conversations pane to reload so the active tile's
+        // message_count + preview learn this turn's exchange. Only the owning,
+        // non-aborted turn signals (an orphaned prior turn's late finally must
+        // not); the debounced dispatch is a no-op when the pane isn't mounted.
+        if (ownsStream() && !wasAborted) {
+            notifyConversationsStale();
         }
         // Toast the user when a non-visible agent finishes responding,
         // so a long-running answer on Agent A surfaces while they're
