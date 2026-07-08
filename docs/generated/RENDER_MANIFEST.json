@@ -6,7 +6,8 @@
       "existing_code_refs": [
         "AGENTS.md",
         "KESTREL_FEATURES.md",
-        "README.md"
+        "README.md",
+        "scripts/generate_repo_map.py"
       ],
       "findings": [],
       "missing_code_refs": [],
