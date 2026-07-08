@@ -1398,6 +1398,33 @@ class KestrelAgent(
             # follow-up PRs. With no deltas the effective set == the bootstrap
             # allowlist, so behavior is unchanged today.
             effective_features = await self._effective_allowed_features()
+            # Enforce a spawned child's mandate feature ceiling (#2226) on EVERY
+            # boot path. The AgentManager spawn path threads mandate.features_
+            # allowed into config (#1946), but single-agent server / CLI / direct
+            # KestrelAgent boots do not — so without this a restarted child would
+            # load features beyond its mandate. The ceiling is read from the
+            # durable spawned_by edge and INTERSECTED with any operator allowlist
+            # (never widening it). discover_features always force-loads
+            # MANDATORY_FEATURES regardless, so this can't drop constitution/
+            # security. Fail-closed: a read error propagates (see mandate_reload).
+            if self.did and self.storage is not None:
+                from kestrel_sovereign.spawn.mandate_reload import (
+                    read_spawn_features_allowed,
+                )
+
+                mandate_features = await read_spawn_features_allowed(
+                    self.storage, self.did
+                )
+                # A recorded ceiling is always a non-empty list; None/empty means
+                # "no explicit ceiling" (root, legacy, or inherit-from-degenerate-
+                # parent) → load all. See read_spawn_features_allowed.
+                if mandate_features:
+                    ceiling = set(mandate_features)
+                    effective_features = (
+                        ceiling
+                        if effective_features is None
+                        else set(effective_features) & ceiling
+                    )
             # Disabled deltas must be honored even when there is no bootstrap
             # allowlist (effective is None → discover_features loads all), so a
             # runtime feature_remove survives restart for bootstrap-less agents

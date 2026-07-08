@@ -33,12 +33,12 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
     restrictions (the read runs against already-initialised local storage, so a
     failure here is genuinely exceptional).
 
-    Scope: ``features_allowed`` is deliberately NOT reconstructed here. Enforcing
-    a spawned child's feature allowlist on non-AgentManager boot paths is
-    feature-load narrowing (#1946) and must run before feature discovery; it is
-    tracked as a separate follow-up. Leaving it unset here also avoids the
-    constitution re-validation's features-subset check misfiring on reload
-    against the child's own already-narrowed feature set.
+    Scope: ``features_allowed`` is deliberately NOT reconstructed onto this
+    mandate object. Enforcing a spawned child's feature allowlist runs at feature
+    discovery (see :func:`read_spawn_features_allowed`, applied in
+    ``KestrelAgent.initialize`` — #2226); keeping it off the mandate object also
+    avoids the constitution re-validation's features-subset check misfiring on
+    reload against the child's own already-narrowed feature set.
     """
     # No try/except: propagate read errors (fail closed) — see docstring.
     edges = await storage.get_edges_from(agent_did)
@@ -62,6 +62,41 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
     if props.get("created_at"):
         kwargs["created_at"] = props["created_at"]
     return SpawnMandate(**kwargs)
+
+
+async def read_spawn_features_allowed(storage: Any, agent_did: str) -> Optional[list]:
+    """Read a spawned child's persisted ``features_allowed`` ceiling (#2226).
+
+    Returns a non-empty ``list`` of canonical feature class names when a ceiling
+    is recorded, else ``None`` (no ceiling → load all).
+
+    An EMPTY or absent ``features_allowed`` returns ``None``, by design:
+    ``SpawnMandate.features_allowed`` defaults to ``[]`` and ``_do_spawn`` treats
+    ``[]`` as "inherit the parent ceiling / unspecified" — a genuine zero-feature
+    grant is not expressible in the current data model. Crucially this keeps
+    backward compatibility: children spawned before this change persisted an
+    empty ``features_allowed`` for the inherited case, and must NOT be
+    reinterpreted as "only mandatory features" on a post-upgrade restart. Real
+    ceilings (explicit, or the inherited set now written by ``_do_spawn``) are
+    always non-empty.
+
+    Applied at feature discovery in ``KestrelAgent.initialize`` so the ceiling is
+    enforced on EVERY boot path — single-agent server, CLI, direct
+    ``KestrelAgent`` — not only the ``AgentManager`` path that threads it through
+    ``LocalAgentConfig``.
+
+    Fail CLOSED: like :func:`read_spawn_mandate`, an edge read error propagates
+    (boot fails) rather than silently loading a child without its feature ceiling.
+    """
+    edges = await storage.get_edges_from(agent_did)
+    spawned = [e for e in edges if getattr(e, "label", None) == "spawned_by"]
+    if not spawned:
+        return None
+    raw = (spawned[0].properties or {}).get("features_allowed")
+    if not raw:
+        return None
+    names = [str(f) for f in raw if str(f).strip()]
+    return names or None
 
 
 def register_restriction_hook(hooks_manager: Any, mandate: Any) -> int:
