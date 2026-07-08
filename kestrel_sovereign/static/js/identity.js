@@ -1654,7 +1654,25 @@ document.addEventListener('DOMContentLoaded', () => {
     // talks straight to OpenAI). voice/ui.js fires this when a call ends with
     // real turns; reload the list so the new conversation shows up without a
     // manual page refresh.
-    window.addEventListener('kestrel:conversations-stale', () => {
+    window.addEventListener('kestrel:conversations-stale', (event) => {
+        // #2254: an ORGANIC session (the user just types) learns its effective
+        // session id from the X-Session-Id header onto `pane.sessionId`, but
+        // never told identity.js — so `activeConversationId` stayed null and no
+        // row highlighted, even after the #2250 turn-end refresh repainted. The
+        // turn-end event now carries `{ sessionId, agent }`; adopt it into the
+        // per-agent active-id map (and the live highlight when it's the current
+        // host agent) BEFORE the refresh repaints, so the matching row survives:
+        // organic first message, pane opened later, and companion/agent switch.
+        const detail = event && event.detail;
+        if (detail && detail.sessionId && detail.agent) {
+            activeConversationIdsByAgent.set(detail.agent, detail.sessionId);
+            if (currentAgentMatches(detail.agent)) {
+                activeConversationId = detail.sessionId;
+                if (conversationsHandle) {
+                    conversationsHandle.setActiveSessionId(activeConversationId);
+                }
+            }
+        }
         if (conversationsHandle) conversationsHandle.refresh();
     });
 

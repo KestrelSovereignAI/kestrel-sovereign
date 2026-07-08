@@ -98,7 +98,7 @@ test('SOURCE CONTRACT: chat.js signals the conversations pane on turn completion
         'chat.js fires the conversations-stale signal so the pane refreshes after a turn');
     // The signal must live in the turn-teardown path (the finally block) gated
     // on the owning, non-aborted turn — not in some unrelated helper.
-    assert.match(chat, /ownsStream\(\)\s*&&\s*!wasAborted\)\s*\{\s*notifyConversationsStale\(\)/s,
+    assert.match(chat, /ownsStream\(\)\s*&&\s*!wasAborted\)\s*\{[\s\S]*?notifyConversationsStale\(/s,
         'the stale signal fires from the owning, non-aborted turn on completion');
 });
 
