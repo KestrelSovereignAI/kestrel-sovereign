@@ -2133,8 +2133,10 @@ function renderRestartStatusBody(div, payload) {
     }
     rows.push(['Policy / urgency',
         `${String(payload.policy || '—')} · ${String(payload.urgency || '—')}`]);
-    if (payload.requested_by_agent) {
-        rows.push(['Requested by', String(payload.requested_by_agent)]);
+    const requestedByName = String(payload.requested_by_agent_name || '').trim();
+    const requestedByAgent = String(payload.requested_by_agent || '').trim();
+    if (requestedByName || requestedByAgent) {
+        rows.push(['Requested by', requestedByName || requestedByAgent]);
     }
     if (payload.reason) rows.push(['Reason', String(payload.reason)]);
     if (deferralReason) rows.push(['Deferred', deferralReason]);
