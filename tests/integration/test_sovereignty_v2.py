@@ -103,6 +103,9 @@ class MockLLMService:
     def set_preference_persistence_callback(self, callback):
         self._persistence_callback = callback
 
+    def set_embedding_route_persistence_callback(self, callback):
+        self._embedding_route_persistence_callback = callback
+
 
 class MockWallet:
     def can_afford(self, amount):

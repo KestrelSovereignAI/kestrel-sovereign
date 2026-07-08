@@ -75,6 +75,9 @@ class MockLLMService:
     def set_preference_persistence_callback(self, callback) -> None:
         pass
 
+    def set_embedding_route_persistence_callback(self, callback) -> None:
+        pass
+
     async def close(self) -> None:
         pass
 
