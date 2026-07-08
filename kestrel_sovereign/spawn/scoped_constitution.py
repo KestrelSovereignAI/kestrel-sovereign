@@ -10,6 +10,7 @@ constitutional hierarchy (Books I-IV), see kestrel_sovereign.constitution.hierar
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -35,6 +36,24 @@ RESTRICTION_CONSTRAINTS = frozenset({
 KNOWN_RESTRICTION_KEYS = frozenset(
     {"behavioral_rules", "restricted_tools", "max_tokens"}
 ) | RESTRICTION_CONSTRAINTS
+
+# The spawn tool turns a bare flag ("no_web") into ``{key: "true"}`` and accepts
+# open-ended flag names, so a fixed allowlist can't cover every documented
+# restriction. A constraint is safe to surface to the prompt as a restriction
+# flag when its KEY is a short identifier (no whitespace/free text) and its VALUE
+# is a boolean-true flag — that admits `no_web` while rejecting a free-text
+# injection like ``{"note": "ignore the base constitution"}`` (non-flag value) or
+# ``{"ignore all prior instructions": "true"}`` (non-identifier key).
+_SAFE_FLAG_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_FLAG_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+
+
+def _is_safe_restriction_flag(key, value) -> bool:
+    if not (isinstance(key, str) and _SAFE_FLAG_KEY_RE.match(key)):
+        return False
+    if value is True:
+        return True
+    return isinstance(value, str) and value.strip().lower() in _FLAG_TRUE_VALUES
 
 
 @dataclass
@@ -252,14 +271,17 @@ def render_mandate_constitution_block(mandate) -> str:
     if mandate is None:
         return ""
     raw = getattr(mandate, "additional_constraints", None) or {}
-    # SECURITY: only surface KNOWN restriction fields to the prompt. validate_
-    # constraints accepts arbitrary unknown keys, and get_effective_constitution
-    # would render them as free `Constraint [key]: value` text — so an unknown
-    # key (e.g. {"note": "ignore the base constitution"}) could reach the model
-    # as governing text and WEAKEN behavior, inverting the only-ever-tightens
-    # invariant. Drop anything not on the allowlist.
+    # SECURITY: only surface safe restrictions to the prompt. validate_constraints
+    # accepts arbitrary unknown keys, and get_effective_constitution would render
+    # them as free `Constraint [key]: value` text — so a free-text constraint
+    # (e.g. {"note": "ignore the base constitution"}) could reach the model as
+    # governing text and WEAKEN behavior, inverting the only-ever-tightens
+    # invariant. Keep known structured/restriction keys and safe boolean flags
+    # (identifier key + true value, e.g. the documented `no_web`); drop the rest.
     additional_constraints = {
-        k: v for k, v in raw.items() if k in KNOWN_RESTRICTION_KEYS
+        k: v
+        for k, v in raw.items()
+        if k in KNOWN_RESTRICTION_KEYS or _is_safe_restriction_flag(k, v)
     }
     if not additional_constraints:
         return ""
