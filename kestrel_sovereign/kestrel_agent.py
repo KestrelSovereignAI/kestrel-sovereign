@@ -1658,6 +1658,10 @@ class KestrelAgent(
             await self._load_model_preference()
             self.llm_service.set_preference_persistence_callback(self._persist_model_preference)
 
+            # Load persisted embedding_route knob and register persistence (#2263)
+            await self._load_embedding_route()
+            self.llm_service.set_embedding_route_persistence_callback(self._persist_embedding_route)
+
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
 

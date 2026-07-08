@@ -15,6 +15,14 @@
 [llm]
 route_priority = ["ollama:local", "openai:api"]
 
+# Top-level embedding channel (#2263). Selects which route embeds stored
+# memories/documents, independent of the chat route — one setting instead of
+# repeating ``embedding_sibling`` under every vendor. Value is a
+# "<vendor>:<route>" (or bare "<vendor>") selector. Leave unset (or "auto") to
+# follow the active chat route, falling back to a route's ``embedding_sibling``.
+# A cloud embedding_route is refused for local-only privacy sessions.
+#embedding_route = "ollama:local"
+
 # --- Ollama (local inference) — install from https://ollama.ai ---------------
 [llm.vendors.ollama]
 is_cloud = false

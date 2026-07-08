@@ -1387,6 +1387,63 @@ async def set_current_model(request: Request):
         raise HTTPException(status_code=500, detail="Error setting model.")
 
 
+@router.get("/api/embedding/settings")
+async def get_embedding_settings(request: Request):
+    """Return the resolved embedding-channel state for the active session (#2263).
+
+    Surfaces enough for a UI to render an "Auto — follow chat" default and a
+    dimension-mismatch warning: the configured ``embedding_route`` (or null =
+    auto), the RESOLVED provider for the active session, its ``embedding_model``
+    and ``embedding_dim``, and the deployment's ``KESTREL_EMBEDDING_DIM``.
+    """
+    try:
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+        return agent.llm_service.get_embedding_settings()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting embedding settings: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error getting embedding settings.")
+
+
+@router.api_route("/api/embedding/settings", methods=["POST", "PUT"])
+async def set_embedding_settings(request: Request):
+    """Set or clear the top-level ``embedding_route`` knob at runtime (#2263).
+
+    Accepts JSON body ``{"embedding_route": "<vendor>:<route>"}`` to set, or
+    ``{"embedding_route": null}`` (or ``""``/``"auto"``) to clear back to
+    auto/follow-chat. Persists the value the same way runtime model selection
+    persists (agent_metadata row), so it survives restart.
+    """
+    try:
+        data = await request.json()
+        if "embedding_route" not in data:
+            raise HTTPException(
+                status_code=400,
+                detail="'embedding_route' field is required (use null to clear).",
+            )
+        route = data.get("embedding_route")
+
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+
+        try:
+            agent.llm_service.set_embedding_route(route)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+        settings = agent.llm_service.get_embedding_settings()
+        return {"success": True, **settings}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting embedding route: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error setting embedding route.")
+
+
 @router.get("/v1/models")
 def list_models_v1(request: Request):
     """Return a minimal models list for OpenAI-compatible clients.
