@@ -92,6 +92,26 @@ def test_render_block_surfaces_documented_boolean_flags():
     assert "SPAWN MANDATE CONSTRAINTS" in block
 
 
+def test_render_block_drops_forbidden_weakening_keys():
+    """Explicitly-forbidden weakening keys must never reach the prompt, even as
+    truthy flags on a validation-skipping path."""
+    block = render_mandate_constitution_block(
+        SimpleNamespace(
+            additional_constraints={
+                "behavioral_rules": [BEHAVIOR_RULE],
+                "override_constitution": "true",
+                "grant_features": "true",
+                "remove_restrictions": "true",
+            },
+            features_allowed=[],
+        )
+    )
+    assert BEHAVIOR_RULE in block
+    assert "override_constitution" not in block
+    assert "grant_features" not in block
+    assert "remove_restrictions" not in block
+
+
 def test_render_block_empty_when_freetext_only():
     """A mandate carrying only a free-text constraint surfaces nothing."""
     assert render_mandate_constitution_block(

@@ -47,9 +47,19 @@ KNOWN_RESTRICTION_KEYS = frozenset(
 _SAFE_FLAG_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _FLAG_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
 
+# Keys that would LOOSEN rather than tighten. validate_constraints rejects these,
+# but rendering runs on paths that may skip validation (reconstructed-from-edge
+# or direct inception), so the surfacing filter must exclude them itself — a
+# truthy `override_constitution`/`grant_features` must never reach the prompt.
+FORBIDDEN_CONSTRAINT_KEYS = frozenset(
+    {"grant_features", "override_constitution", "remove_restrictions"}
+)
+
 
 def _is_safe_restriction_flag(key, value) -> bool:
-    if not (isinstance(key, str) and _SAFE_FLAG_KEY_RE.match(key)):
+    if not isinstance(key, str) or key in FORBIDDEN_CONSTRAINT_KEYS:
+        return False
+    if not _SAFE_FLAG_KEY_RE.match(key):
         return False
     if value is True:
         return True
@@ -281,7 +291,8 @@ def render_mandate_constitution_block(mandate) -> str:
     additional_constraints = {
         k: v
         for k, v in raw.items()
-        if k in KNOWN_RESTRICTION_KEYS or _is_safe_restriction_flag(k, v)
+        if k not in FORBIDDEN_CONSTRAINT_KEYS
+        and (k in KNOWN_RESTRICTION_KEYS or _is_safe_restriction_flag(k, v))
     }
     if not additional_constraints:
         return ""
