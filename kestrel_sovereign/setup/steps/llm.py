@@ -34,6 +34,12 @@ class _Vendor:
     is_cloud: bool
     api_key_env: str | None
     toml_block: dict
+    # Optional second env var that also satisfies this vendor's auth. For
+    # OpenRouter this is ``OPENROUTER_MANAGEMENT_API_KEY``: the provider
+    # registry mints a bootstrap child key from it when the static
+    # ``OPENROUTER_API_KEY`` is absent (see #2243), so a management key alone
+    # is a valid credential for CHECK and setup.
+    alt_api_key_env: str | None = None
 
 
 _OLLAMA = _Vendor(
@@ -132,13 +138,19 @@ _GOOGLE = _Vendor(
 )
 
 # OpenRouter — meta-provider that proxies many model families. Users get
-# Anthropic/Google/Mistral/etc. behind one key.
+# Anthropic/Google/Mistral/etc. behind one key. Either a static
+# OPENROUTER_API_KEY or an OPENROUTER_MANAGEMENT_API_KEY (from which the
+# registry mints a bootstrap child key, #2243) is a valid credential.
 _OPENROUTER = _Vendor(
     key="openrouter",
-    label="OpenRouter (multi-vendor proxy — needs OPENROUTER_API_KEY)",
+    label=(
+        "OpenRouter (multi-vendor proxy — needs OPENROUTER_API_KEY "
+        "or OPENROUTER_MANAGEMENT_API_KEY)"
+    ),
     route_id="openrouter:api",
     is_cloud=True,
     api_key_env="OPENROUTER_API_KEY",
+    alt_api_key_env="OPENROUTER_MANAGEMENT_API_KEY",
     toml_block={
         "vendors": {
             "openrouter": {
@@ -147,6 +159,10 @@ _OPENROUTER = _Vendor(
                     "api": {
                         "adapter": "OpenRouterAdapter",
                         "api_key_env": "OPENROUTER_API_KEY",
+                        # Management-key-only setups are valid: the registry
+                        # (#2243) registers OpenRouter + mints keys from this
+                        # alone, and doctor treats it as an accepted credential.
+                        "management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY",
                         "model": "auto",
                         "selection_hints": ["sonnet", "gpt", "gemini"],
                     }
@@ -180,6 +196,26 @@ def run(ctx: SetupContext) -> None:
             ).get(route_key) or {}
             api_key_env = route.get("api_key_env")
             if api_key_env and not existing_keys.get(api_key_env):
+                # An alternative credential can still satisfy the route.
+                # For OpenRouter, an OPENROUTER_MANAGEMENT_API_KEY (the
+                # route's ``management_api_key_env`` or the default) lets the
+                # registry mint a bootstrap child key (#2243), so a management
+                # key alone is a valid config — don't report it as missing.
+                # CHECK mode validates on-disk state only: a key exported in
+                # the operator's shell but absent from .env would not survive a
+                # managed restart or a different shell, so only ``existing_keys``
+                # (.env) counts here — matching the primary key path above.
+                vendor = _VENDORS_BY_KEY.get(vendor_key)
+                alt_envs = [
+                    e
+                    for e in (
+                        route.get("management_api_key_env"),
+                        vendor.alt_api_key_env if vendor else None,
+                    )
+                    if e
+                ]
+                if any(existing_keys.get(e) for e in alt_envs):
+                    continue
                 ctx.block(
                     f"{api_key_env} not set in .env (required for {route_id})"
                 )
@@ -263,7 +299,17 @@ def _detect_available_vendors(existing_keys: dict[str, str]) -> list[_Vendor]:
         env_var = vendor.api_key_env
         if not env_var:
             continue
-        value = os.environ.get(env_var) or existing_keys.get(env_var)
+        candidates = [env_var]
+        if vendor.alt_api_key_env:
+            candidates.append(vendor.alt_api_key_env)
+        value = next(
+            (
+                os.environ.get(e) or existing_keys.get(e)
+                for e in candidates
+                if os.environ.get(e) or existing_keys.get(e)
+            ),
+            None,
+        )
         if value:
             detected.append(vendor)
 
@@ -381,22 +427,28 @@ def _gather_api_keys(
     for vendor in selected:
         if not vendor.api_key_env:
             continue
-        current = existing_keys.get(vendor.api_key_env, "")
-        if current:
+        # A vendor may accept more than one env var (OpenRouter also takes
+        # a management key). If any acceptable key is already in .env, leave
+        # it alone.
+        key_envs = [vendor.api_key_env]
+        if vendor.alt_api_key_env:
+            key_envs.append(vendor.alt_api_key_env)
+        if any(existing_keys.get(e) for e in key_envs):
             continue
         # Promote a shell-exported key into .env (quickstart only) so
         # the runtime sees it. The autodetect pass treated this vendor
-        # as available because of the env var; we honor that here by
-        # persisting the value. Interactive setup falls through to the
-        # prompt — the operator chose to be asked.
+        # as available because of one of these env vars; we honor that
+        # here by persisting whichever is present. Interactive setup
+        # falls through to the prompt — the operator chose to be asked.
         if ctx.flow is Flow.QUICKSTART:
-            from_environ = os.environ.get(vendor.api_key_env, "")
-            if from_environ:
-                updates[vendor.api_key_env] = from_environ
+            promoted = next(
+                (e for e in key_envs if os.environ.get(e)), None
+            )
+            if promoted:
+                updates[promoted] = os.environ[promoted]
                 continue
-        if ctx.flow is Flow.QUICKSTART:
             ctx.block(
-                f"{vendor.api_key_env} not set in .env "
+                f"{' or '.join(key_envs)} not set in .env "
                 f"(required for {vendor.label}). Set it and re-run setup."
             )
             continue
@@ -406,11 +458,22 @@ def _gather_api_keys(
         )
         if value:
             updates[vendor.api_key_env] = value
-        else:
-            ctx.block(
-                f"{vendor.api_key_env} left blank — {vendor.label} disabled "
-                f"until you add it"
+            continue
+        # Offer the alternative credential (e.g. management-key-only for
+        # OpenRouter) before treating the vendor as disabled.
+        if vendor.alt_api_key_env:
+            alt_value = ctx.prompter.secret(
+                f"Paste your {vendor.alt_api_key_env} instead "
+                f"(leave blank to skip)",
+                default="",
             )
+            if alt_value:
+                updates[vendor.alt_api_key_env] = alt_value
+                continue
+        ctx.block(
+            f"{vendor.api_key_env} left blank — {vendor.label} disabled "
+            f"until you add it"
+        )
     return updates
 
 
