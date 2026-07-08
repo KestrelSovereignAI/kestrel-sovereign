@@ -64,6 +64,7 @@ def _make_agent(backend, did="did:test:agent", emit=None):
         emit.captured = captured  # type: ignore[attr-defined]
     return SimpleNamespace(
         did=did,
+        name="Test Agent",
         agent_id=did,
         _raw_storage=raw_storage,
         storage=None,
@@ -117,6 +118,26 @@ def test_event_payload_includes_dedupe_signature():
     assert payload["dedupe_signature"] == "abc123:pending"
     assert payload["status"] == "pending"
     assert payload["request_id"] == "abc123"
+    assert payload["requested_by_agent_name"] == ""
+
+
+def test_event_payload_includes_resolved_requester_name():
+    req = SimpleNamespace(
+        id="abc123",
+        requested_by_agent="did:test:agent",
+        operation="restart_only",
+        urgency="normal",
+        policy="idle_agents_only",
+        reason="config landed",
+        update_target_ref="",
+        update_profile="",
+        completed_at=None,
+    )
+    payload = build_restart_status_event(
+        req, state="pending", requested_by_agent_name="Emma",
+    )
+    assert payload["requested_by_agent"] == "did:test:agent"
+    assert payload["requested_by_agent_name"] == "Emma"
 
 
 def test_event_payload_signature_excludes_volatile_deferral_reason():
@@ -283,6 +304,27 @@ async def test_emit_persists_and_sse_emits(tmp_path):
     event_type, payload = captured[0]
     assert event_type == "restart_status"
     assert payload["dedupe_signature"] == f"{req.id}:pending"
+    assert payload["requested_by_agent_name"] == "Test Agent"
+
+
+@pytest.mark.asyncio
+async def test_emit_resolves_requester_name_from_cohosted_agents(tmp_path):
+    db = await _backend(tmp_path)
+    agent = _make_agent(db, did="did:test:agent")
+    agent._cohosted_agents_provider = lambda: [
+        agent,
+        SimpleNamespace(did="did:test:emma", name="Emma"),
+    ]
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    req = await insert_request(
+        db, requested_by_agent="did:test:emma", reason="ship",
+    )
+    await feat._emit_status_event(req, state="pending")
+
+    captured = agent.emit_event.captured  # type: ignore[attr-defined]
+    assert captured[0][1]["requested_by_agent"] == "did:test:emma"
+    assert captured[0][1]["requested_by_agent_name"] == "Emma"
 
 
 @pytest.mark.asyncio

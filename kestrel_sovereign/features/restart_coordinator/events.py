@@ -33,6 +33,7 @@ def build_restart_status_event(
     deferral_reason: str = "",
     status_reason: str = "",
     agent_did: str = "",
+    requested_by_agent_name: str = "",
 ) -> Dict[str, Any]:
     """Build the ``restart_status`` UI event payload for one request.
 
@@ -57,6 +58,7 @@ def build_restart_status_event(
         "requested_by_agent": str(
             getattr(request, "requested_by_agent", "") or agent_did
         ),
+        "requested_by_agent_name": str(requested_by_agent_name or ""),
         "operation": str(getattr(request, "operation", "restart_only")),
         "urgency": str(getattr(request, "urgency", "normal")),
         "policy": str(getattr(request, "policy", "idle_agents_only")),

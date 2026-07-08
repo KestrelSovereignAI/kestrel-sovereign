@@ -80,11 +80,12 @@ async def _backend(tmp_path):
     return db
 
 
-def _make_agent(backend, did="did:test:agent", dispatcher=None,
-                registry=None):
+def _make_agent(backend, did="did:test:agent", name="Test Agent",
+                dispatcher=None, registry=None):
     raw_storage = SimpleNamespace(db=backend)
     return SimpleNamespace(
         did=did,
+        name=name,
         agent_id=did,
         _raw_storage=raw_storage,
         storage=None,
@@ -1735,8 +1736,81 @@ async def test_request_restart_emits_pending_status_event(tmp_path):
     assert ev["status"] == "pending"
     assert ev["operation"] == "restart_only"
     assert ev["requested_by_agent"] == "did:test:agent"
+    assert ev["requested_by_agent_name"] == "Test Agent"
     assert ev["reason"] == "kestrel.toml change landed"
     assert ev["deferral_reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_status_event_resolves_cohosted_requester_name(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    feat.agent._cohosted_agents_provider = lambda: [
+        feat.agent,
+        SimpleNamespace(did="did:test:emma", name="Emma"),
+    ]
+    req = await insert_request(
+        backend, requested_by_agent="did:test:emma", reason="from sibling",
+    )
+    await feat._emit_status_event(req, state="pending")
+
+    events = _restart_status_events(captured)
+    assert len(events) == 1
+    assert events[0]["requested_by_agent"] == "did:test:emma"
+    assert events[0]["requested_by_agent_name"] == "Emma"
+
+
+@pytest.mark.asyncio
+async def test_status_event_resolves_real_agent_private_name(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    delattr(feat.agent, "name")
+    feat.agent._agent_name = "Production Agent"
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="self request",
+    )
+    await feat._emit_status_event(req, state="pending")
+
+    events = _restart_status_events(captured)
+    assert len(events) == 1
+    assert events[0]["requested_by_agent"] == "did:test:agent"
+    assert events[0]["requested_by_agent_name"] == "Production Agent"
+
+
+@pytest.mark.asyncio
+async def test_status_event_resolves_requester_name_from_agent_manager(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    feat.agent._agent_manager = SimpleNamespace(
+        get_agent_name=lambda did: {
+            "did:test:emma": "Emma",
+        }.get(did)
+    )
+    req = await insert_request(
+        backend, requested_by_agent="did:test:emma", reason="manager lookup",
+    )
+    await feat._emit_status_event(req, state="pending")
+
+    events = _restart_status_events(captured)
+    assert len(events) == 1
+    assert events[0]["requested_by_agent"] == "did:test:emma"
+    assert events[0]["requested_by_agent_name"] == "Emma"
+
+
+@pytest.mark.asyncio
+async def test_status_event_leaves_unknown_requester_name_empty(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    feat.agent._cohosted_agents_provider = lambda: [feat.agent]
+    req = await insert_request(
+        backend, requested_by_agent="did:test:remote", reason="remote",
+    )
+    await feat._emit_status_event(req, state="pending")
+
+    events = _restart_status_events(captured)
+    assert len(events) == 1
+    assert events[0]["requested_by_agent"] == "did:test:remote"
+    assert events[0]["requested_by_agent_name"] == ""
 
 
 @pytest.mark.asyncio

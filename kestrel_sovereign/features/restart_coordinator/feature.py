@@ -840,12 +840,18 @@ class RestartCoordinatorFeature(Feature):
         primary; the SSE emit is the live-paint side-channel.
         """
         agent_did = getattr(self.agent, "did", "") or ""
+        requested_by_agent = str(
+            getattr(req, "requested_by_agent", "") or agent_did
+        )
         payload = build_restart_status_event(
             req,
             state=state,
             deferral_reason=deferral_reason,
             status_reason=status_reason,
             agent_did=str(agent_did),
+            requested_by_agent_name=self._resolve_requesting_agent_name(
+                requested_by_agent
+            ),
         )
 
         # Audit row first. If the persist fails AND a DB is available,
@@ -861,9 +867,7 @@ class RestartCoordinatorFeature(Feature):
                     self._db,
                     request_id=str(getattr(req, "id", "")),
                     state=str(state),
-                    agent_id=str(
-                        getattr(req, "requested_by_agent", "") or agent_did
-                    ),
+                    agent_id=requested_by_agent,
                     payload=payload,
                     operation=str(
                         getattr(req, "operation", "restart_only")
@@ -894,6 +898,50 @@ class RestartCoordinatorFeature(Feature):
                 "restart_status emit failed for %s: %s",
                 getattr(req, "id", "?"), e,
             )
+
+    def _resolve_requesting_agent_name(self, requested_by_agent: str) -> str:
+        """Resolve a restart requester DID to a co-hosted agent name."""
+        requester_did = str(requested_by_agent or "")
+        if not requester_did:
+            return ""
+        own_name = self._agent_name_if_did_matches(self.agent, requester_did)
+        if own_name:
+            return own_name
+        manager_name = self._agent_manager_name_for_did(requester_did)
+        if manager_name:
+            return manager_name
+        agents = self._resolve_cohosted_agents()
+        if not agents:
+            return ""
+        for agent in agents:
+            name = self._agent_name_if_did_matches(agent, requester_did)
+            if name:
+                return name
+        return ""
+
+    @staticmethod
+    def _agent_name_if_did_matches(agent: Any, requested_by_agent: str) -> str:
+        if str(getattr(agent, "did", "") or "") != requested_by_agent:
+            return ""
+        for attr in ("name", "_agent_name", "agent_name"):
+            name = str(getattr(agent, attr, "") or "")
+            if name and name != requested_by_agent:
+                return name
+        return ""
+
+    def _agent_manager_name_for_did(self, requested_by_agent: str) -> str:
+        for attr in ("_agent_manager", "agent_manager"):
+            manager = getattr(self.agent, attr, None)
+            get_agent_name = getattr(manager, "get_agent_name", None)
+            if get_agent_name is None:
+                continue
+            try:
+                name = str(get_agent_name(requested_by_agent) or "")
+            except Exception:  # pragma: no cover - defensive
+                continue
+            if name and name != requested_by_agent:
+                return name
+        return ""
 
     def _evaluate_safety(self, req) -> Dict[str, Any]:
         """Return ``{safe, reason, deferable}`` for one request.
