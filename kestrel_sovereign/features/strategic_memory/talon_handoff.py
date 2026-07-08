@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # via the recipient's /api/agent/tasks/send endpoint — same wire path
 # PeersFeature.send_a2a_task uses, just called inline from the handoff.
 from kestrel_sovereign.features.strategic_memory.github_integration import (
+    GitHubAuthError,
     fetch_github_signal,
     get_github_token,
     github_api_get,
@@ -71,8 +72,12 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "context": f"Blocker (severity: {b.get('severity')}): {b.get('notes', '')}",
                 }
 
-    # 2. Fetch live signal for at-risk milestones
-    github_data = await fetch_github_signal(data)
+    # 2. Fetch live signal for at-risk milestones (tolerate an invalid token
+    #    the same way as no live data -- fall through to YAML-driven picks).
+    try:
+        github_data = await fetch_github_signal(data)
+    except GitHubAuthError:
+        github_data = {}
 
     # 3. Find open issues from at-risk or in-progress milestones
     at_risk_milestones = [

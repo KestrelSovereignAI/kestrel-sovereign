@@ -16,6 +16,37 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Prerequisite states for live GitHub signal fetching. These let callers
+# surface the correct remediation instead of always blaming the token.
+GITHUB_SIGNAL_READY = "ready"
+GITHUB_SIGNAL_NO_SCAN_REPOS = "no_scan_repos"
+GITHUB_SIGNAL_NO_TOKEN = "no_token"
+
+
+class GitHubAuthError(Exception):
+    """GitHub rejected the supplied credentials (HTTP 401/403).
+
+    Raised from ``github_api_get`` only when ``raise_on_auth=True`` so that
+    live-signal callers can tell "token present but invalid" apart from a
+    transient network failure and surface the token remediation (#2271).
+    """
+
+
+def github_signal_prerequisite(data: Dict[str, Any]) -> str:
+    """Classify whether live GitHub scanning can run, and if not, why.
+
+    Returns one of ``GITHUB_SIGNAL_READY``, ``GITHUB_SIGNAL_NO_SCAN_REPOS``,
+    or ``GITHUB_SIGNAL_NO_TOKEN``. ``scan_repos`` is checked before the token
+    so an empty repo list is not misreported as a missing token (#2271).
+    """
+    config = data.get("morning_signal_config", {})
+    repos = config.get("scan_repos", [])
+    if not repos:
+        return GITHUB_SIGNAL_NO_SCAN_REPOS
+    if not get_github_token():
+        return GITHUB_SIGNAL_NO_TOKEN
+    return GITHUB_SIGNAL_READY
+
 
 def get_github_token() -> Optional[str]:
     """Get GitHub token from environment or .env file."""
@@ -32,8 +63,15 @@ def get_github_token() -> Optional[str]:
     return None
 
 
-async def github_api_get(path: str, token: str) -> Any:
-    """Make a GitHub API GET request. Returns parsed JSON or None on error."""
+async def github_api_get(path: str, token: str, *, raise_on_auth: bool = False) -> Any:
+    """Make a GitHub API GET request. Returns parsed JSON or None on error.
+
+    When ``raise_on_auth`` is set, a 401/403 response raises
+    ``GitHubAuthError`` instead of being flattened to ``None`` -- this lets
+    live-signal callers distinguish an invalid token from a transient failure.
+    Callers that leave it ``False`` keep the historical "None on any error"
+    contract.
+    """
     url = f"https://api.github.com{path}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"token {token}",
@@ -45,7 +83,13 @@ async def github_api_get(path: str, token: str) -> Any:
             lambda: urllib.request.urlopen(req, timeout=10).read()
         )
         return json.loads(resp)
-    except (urllib.error.URLError, urllib.error.HTTPError, Exception) as e:
+    except urllib.error.HTTPError as e:
+        if raise_on_auth and e.code in (401, 403):
+            logger.warning(f"GitHub API auth error ({e.code}) for {path}")
+            raise GitHubAuthError(str(e.code)) from e
+        logger.warning(f"GitHub API error for {path}: {e}")
+        return None
+    except (urllib.error.URLError, Exception) as e:
         logger.warning(f"GitHub API error for {path}: {e}")
         return None
 
@@ -85,16 +129,21 @@ async def fetch_github_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         data: The strategic memory data dict (needs morning_signal_config).
 
     Returns a dict with per-repo issue counts, open PRs, and recent comments.
-    """
-    config = data.get("morning_signal_config", {})
-    repos = config.get("scan_repos", [])
-    if not repos:
-        return {}
 
-    token = get_github_token()
-    if not token:
+    Raises ``GitHubAuthError`` when a token is configured but GitHub rejects
+    it (401/403), so callers can surface the token remediation rather than
+    treating placeholder repo shells as live data (#2271).
+    """
+    prereq = github_signal_prerequisite(data)
+    if prereq == GITHUB_SIGNAL_NO_SCAN_REPOS:
+        return {}
+    if prereq == GITHUB_SIGNAL_NO_TOKEN:
         logger.info("No GITHUB_TOKEN found -- Morning Signal will use YAML data only")
         return {}
+
+    config = data.get("morning_signal_config", {})
+    repos = config.get("scan_repos", [])
+    token = get_github_token()
 
     result: Dict[str, Any] = {}
     since = datetime.now(timezone.utc).replace(
@@ -107,6 +156,7 @@ async def fetch_github_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         # Fetch open issues (not PRs, up to 100)
         issues = await github_api_get(
             f"/repos/{repo}/issues?state=open&per_page=100", token,
+            raise_on_auth=True,
         )
         if isinstance(issues, list):
             # Filter out PRs (they appear in /issues too)
@@ -133,6 +183,7 @@ async def fetch_github_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         # Fetch open PRs
         prs = await github_api_get(
             f"/repos/{repo}/pulls?state=open&per_page=20", token,
+            raise_on_auth=True,
         )
         if isinstance(prs, list):
             repo_data["prs"] = [
@@ -149,6 +200,7 @@ async def fetch_github_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         comments = await github_api_get(
             f"/repos/{repo}/issues/comments?since={since}&sort=updated&direction=desc&per_page=5",
             token,
+            raise_on_auth=True,
         )
         if isinstance(comments, list):
             repo_data["comments_24h"] = len(comments)
