@@ -391,3 +391,50 @@ test('popover toggles open/closed and re-homes the panel under the overlay root'
     assert.equal(panel.style.display, 'none');
     assert.equal(button.attrs['aria-expanded'], 'false');
 });
+
+test('route switch that drops the selected model COMMITS the coerced model (codex P2)', async () => {
+    // plan serves opus; api does NOT. Switching plan→api coerces the model
+    // combo to the first valid api model — that coerced selection must be
+    // committed, or the UI shows sonnet while the server stays on opus/api.
+    const perRoute = {
+        'anthropic::plan': [{ id: 'claude-opus-4-7', provider: 'anthropic', is_featured: true }],
+        'anthropic::api': [
+            { id: 'claude-sonnet-4-6', provider: 'anthropic', is_featured: true },
+        ],
+    };
+    const commits = [];
+    const { selector, providerSelect, routeSelect } = loadSelector({
+        fetchImpl: async (url) => {
+            const route = /route=([^&]+)/.exec(url)?.[1] || '';
+            const key = `anthropic::${route}`;
+            return { ok: true, json: async () => ({ by_vendor: { anthropic: perRoute[key] } }) };
+        },
+    });
+    selector.onModelChange = (vendor, model, _c, route) => { commits.push([vendor, model, route]); };
+
+    selector.allModelsData = {
+        by_vendor: { anthropic: perRoute['anthropic::plan'] },
+        routes: [
+            { vendor: 'anthropic', route: 'plan' },
+            { vendor: 'anthropic', route: 'api' },
+        ],
+    };
+    selector.isInitialLoad = false;
+    selector._lastSyncedSelection = { vendor: 'anthropic', model: 'claude-opus-4-7', route: 'plan' };
+    providerSelect.value = 'anthropic';
+    selector.selectedProvider = 'anthropic';
+    selector.selectedModel = 'claude-opus-4-7';
+    selector.selectedRoute = 'plan';
+    selector._populateRoutes();
+    selector._populateModels();
+
+    routeSelect.value = 'api';
+    selector._handleRouteChange();
+    // Let the async route-scoped fetch + repopulate land.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const last = commits[commits.length - 1];
+    assert.ok(last, 'a commit fired');
+    assert.equal(last[1], 'claude-sonnet-4-6', 'the COERCED model was committed to the server');
+    assert.equal(last[2], 'api');
+});

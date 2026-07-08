@@ -359,6 +359,14 @@ class ModelSelector {
             const models = (data.by_vendor && data.by_vendor[vendor]) || data.all || [];
             this._routeModels = { key: `${vendor}::${route}`, models };
             this._populateModels();
+            // The repopulate may have COERCED the selection (previous model
+            // absent from this route's catalog → first valid route model).
+            // The change handlers committed the PRE-fetch selection, so
+            // without a re-commit here the UI shows the coerced model while
+            // the server keeps the stale one (codex P2 on #2275).
+            // _maybeCommit diffs against _lastSyncedSelection, so this is a
+            // no-op whenever the selection survived the route switch.
+            this._maybeCommit();
         } catch (e) {
             // Keep the vendor-wide list on failure — never blank the combo.
         }
