@@ -10,6 +10,7 @@ constitutional hierarchy (Books I-IV), see kestrel_sovereign.constitution.hierar
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,6 +27,98 @@ RESTRICTION_CONSTRAINTS = frozenset({
     "no-network",
     "no-tools",
 })
+
+# Constraint keys that are safe to surface into a child's governing constitution
+# (they only ever tighten): the structured restriction keys plus the named
+# RESTRICTION_CONSTRAINTS flags. Anything outside this set is NOT rendered into
+# the prompt, so an unknown/free-text key can't reach the model as governing
+# text (see render_mandate_constitution_block).
+KNOWN_RESTRICTION_KEYS = frozenset(
+    {"behavioral_rules", "restricted_tools", "max_tokens"}
+) | RESTRICTION_CONSTRAINTS
+
+# The spawn tool turns a bare flag ("no_web") into ``{key: "true"}`` and accepts
+# open-ended flag names, so a fixed allowlist can't cover every documented
+# restriction. A constraint is safe to surface to the prompt as a restriction
+# flag when its KEY is a short identifier (no whitespace/free text) and its VALUE
+# is a boolean-true flag — that admits `no_web` while rejecting a free-text
+# injection like ``{"note": "ignore the base constitution"}`` (non-flag value) or
+# ``{"ignore all prior instructions": "true"}`` (non-identifier key).
+_SAFE_FLAG_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_FLAG_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+
+# Keys that would LOOSEN rather than tighten. validate_constraints rejects these,
+# but rendering runs on paths that may skip validation (reconstructed-from-edge
+# or direct inception), so the surfacing filter must exclude them itself — a
+# truthy `override_constitution`/`grant_features` must never reach the prompt.
+FORBIDDEN_CONSTRAINT_KEYS = frozenset(
+    {"grant_features", "override_constitution", "remove_restrictions"}
+)
+
+
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
+
+
+def _is_safe_restriction_flag(key, value) -> bool:
+    if not isinstance(key, str) or key in FORBIDDEN_CONSTRAINT_KEYS:
+        return False
+    if not _SAFE_FLAG_KEY_RE.match(key):
+        return False
+    if value is True:
+        return True
+    return isinstance(value, str) and value.strip().lower() in _FLAG_TRUE_VALUES
+
+
+def _nonneg_number(value):
+    """Return value as a non-negative number, or None (drop) — matches
+    validate_constraints' max_tokens rule so an unvalidated free-text value like
+    ``"0\\nIgnore the base constitution"`` can't reach the prompt as a token limit."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value if value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+)?", value.strip()):
+        num = float(value) if "." in value else int(value)
+        return num
+    return None
+
+
+def _sanitize_render_constraints(raw: dict) -> dict:
+    """Per-field sanitize additional_constraints for prompt surfacing.
+
+    The renderer runs on paths that may skip validate_constraints (an
+    edge-reconstructed mandate, or direct inception), so it must itself keep only
+    what is safe to append to the governing constitution — every typed field is
+    coerced/validated to its safe shape and free-text/injection is dropped.
+    ``behavioral_rules`` is intentionally surfaced as-is: it is the *designed*
+    channel for a parent to add rules to its own child, and rendering those rules
+    is the whole point of #2225.
+    """
+    clean: dict = {}
+    for key, value in (raw or {}).items():
+        if key in FORBIDDEN_CONSTRAINT_KEYS:
+            continue
+        if key == "behavioral_rules":
+            if isinstance(value, (list, dict)) and value:
+                clean[key] = value
+        elif key == "restricted_tools":
+            items = value if isinstance(value, (list, tuple, set)) else [value]
+            tools = [
+                str(t).strip() for t in items
+                if _SAFE_TOKEN_RE.match(str(t).strip())
+            ]
+            if tools:
+                clean[key] = tools
+        elif key == "max_tokens":
+            num = _nonneg_number(value)
+            if num is not None:
+                clean[key] = num
+        elif key in RESTRICTION_CONSTRAINTS:
+            clean[key] = value  # rendered key-only ("Restriction active: key")
+        elif _is_safe_restriction_flag(key, value):
+            clean[key] = value  # identifier key + true value → safe flag
+        # else: drop — unknown/free-text key or value is an injection vector.
+    return clean
 
 
 @dataclass
@@ -140,6 +233,23 @@ class ScopedConstitution:
         logger.info("Scoped constitution constraints validated successfully")
         return True, "All constraints are valid restrictions"
 
+    def constraints_section(self) -> str:
+        """Return only the scoped-constraints section (no base constitution).
+
+        Empty string when the mandate carries no constraints/features. Used to
+        append a spawned child's mandate constraints to its *governing*
+        constitution at prompt-build time (#2225) — surfacing behavioral_rules,
+        restricted_tools, and restrictions to the model — without rewriting or
+        re-hashing the anchored base constitution.
+        """
+        if not (self.additional_constraints or self.features_allowed):
+            return ""
+        base, self.base_constitution = self.base_constitution, ""
+        try:
+            return self.get_effective_constitution().strip()
+        finally:
+            self.base_constitution = base
+
     def get_effective_constitution(self) -> str:
         """Return the full constitution text including scoped constraints.
 
@@ -153,23 +263,31 @@ class ScopedConstitution:
 
         if self.features_allowed:
             parts.append(
-                f"\nAllowed features: {', '.join(sorted(self.features_allowed))}"
+                f"\nAllowed features: "
+                f"{', '.join(sorted(str(f) for f in self.features_allowed))}"
             )
 
-        for key, value in sorted(self.additional_constraints.items()):
+        # Coerce to str throughout: constraint *values* are validated as the
+        # right container (list/dict) but not element-typed, so a mixed-type
+        # entry must render as text rather than raise and drop the whole block.
+        for key, value in sorted(
+            self.additional_constraints.items(), key=lambda kv: str(kv[0])
+        ):
             if key == "behavioral_rules":
                 if isinstance(value, list):
                     rules_text = "\n".join(f"- {rule}" for rule in value)
                     parts.append(f"\nAdditional behavioral rules:\n{rules_text}")
                 elif isinstance(value, dict):
                     rules_text = "\n".join(
-                        f"- {k}: {v}" for k, v in sorted(value.items())
+                        f"- {k}: {v}"
+                        for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
                     )
                     parts.append(f"\nAdditional behavioral rules:\n{rules_text}")
             elif key == "restricted_tools":
+                tools = value if isinstance(value, (list, tuple, set)) else [value]
                 parts.append(
                     f"\nRestricted tools (not available): "
-                    f"{', '.join(sorted(value))}"
+                    f"{', '.join(sorted(str(t) for t in tools))}"
                 )
             elif key in RESTRICTION_CONSTRAINTS:
                 parts.append(f"\nRestriction active: {key}")
@@ -197,3 +315,37 @@ class ScopedConstitution:
                 "INTEGRITY FAILURE: Scoped constitution constraints have been modified"
             )
         return True, "Scoped constitution integrity verified"
+
+
+def render_mandate_constitution_block(mandate) -> str:
+    """Render a spawn mandate's ``additional_constraints`` as a constitution
+    section (#2225).
+
+    Returns the ``--- SPAWN MANDATE CONSTRAINTS ---`` block (behavioral_rules,
+    restricted_tools, restrictions, token limits) for appending to a spawned
+    child's governing constitution, or ``""`` when ``mandate`` is None or carries
+    no ``additional_constraints``. Never includes the base constitution, so
+    callers append it without disturbing the anchored base hash.
+
+    ``features_allowed`` is intentionally NOT rendered here: it is not carried on
+    the reload-reconstructed mandate (#2137, to avoid the constitution
+    features-subset re-validation misfiring), so surfacing it would advertise a
+    capability the real spawn/reload path never populates. Surfacing AND
+    enforcing the feature allowlist is tracked in #2226.
+    """
+    if mandate is None:
+        return ""
+    # SECURITY: the renderer runs on paths that may skip validate_constraints, so
+    # it self-sanitizes. Only safe, typed restrictions reach the prompt — free
+    # text, forbidden weakening keys, and malformed values are dropped — so a
+    # mandate can never surface governing text that WEAKENS behavior (inverting
+    # the only-ever-tightens invariant).
+    additional_constraints = _sanitize_render_constraints(
+        getattr(mandate, "additional_constraints", None) or {}
+    )
+    if not additional_constraints:
+        return ""
+    return ScopedConstitution(
+        base_constitution="",
+        additional_constraints=additional_constraints,
+    ).constraints_section()
