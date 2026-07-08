@@ -1936,6 +1936,80 @@ nav {
     border-color: var(--accent-color);
 }
 
+/* Unified Model-settings popover (#2264) */
+.model-settings-button {
+    padding: 0.5rem 0.9rem;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 280px;
+}
+
+.model-settings-button:hover,
+.model-settings-button[aria-expanded="true"] {
+    border-color: var(--accent-color);
+}
+
+.model-settings-summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-settings-panel {
+    /* Positioned as a fixed overlay by ModelSettingsPopover on open; these
+       styles cover the resting appearance and scoped-embed fallback. */
+    min-width: 260px;
+    max-width: 340px;
+    padding: 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--bg-secondary, var(--bg-primary));
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.model-settings-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.model-settings-section .model-selector {
+    max-width: none;
+    width: 100%;
+}
+
+.model-settings-section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary, var(--text-primary));
+}
+
+.embedding-dim-readout {
+    font-size: 0.72rem;
+    color: var(--text-secondary, var(--text-primary));
+}
+
+.embedding-dim-warning {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--warning-color, #b45309);
+    background: rgba(180, 83, 9, 0.1);
+    border-radius: 6px;
+    padding: 0.4rem 0.5rem;
+}
+
 /* Model Controls Container */
 .model-controls {
     display: flex;

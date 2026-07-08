@@ -1272,11 +1272,16 @@ async def list_agent_models(
         routes = []
         if hasattr(agent, 'llm_service') and agent.llm_service:
             for p in agent.llm_service.providers:
+                capabilities = p.get("capabilities") or {}
                 routes.append({
                     "vendor": p.get("vendor"),
                     "route": p.get("route"),
                     "is_local": p.get("is_local"),
                     "model": p.get("model"),
+                    # Whether this route can serve embeddings — lets the model
+                    # settings popover's Embeddings section list only
+                    # embedding-capable routes without a second round-trip (#2264).
+                    "supports_embeddings": bool(capabilities.get("supports_embeddings")),
                 })
 
         return {

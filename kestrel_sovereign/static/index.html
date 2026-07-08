@@ -153,20 +153,44 @@
                             <button id="advanced-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_advanced" title="Advanced" aria-label="Toggle advanced panels" aria-pressed="false" style="display: none; padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-gear"></span> <span data-label-key="btn_advanced">Advanced</span></button>
                         </div>
 
-                        <!-- Center: Model Selection (Vendor → [Route] → Model).
-                             The route selector is populated only when the selected
-                             vendor has >1 configured route (e.g. anthropic:api vs
-                             anthropic:plan). Hidden otherwise. -->
+                        <!-- Center: unified Model-settings popover (#2264). One
+                             button opens a panel with two labeled sections —
+                             Chat (vendor → [route] → [upstream] → model) and
+                             Embeddings (Auto-follow or an explicit provider:route).
+                             The canonical select IDs live inside the panel so the
+                             shared selector keeps driving them. -->
                         <div style="display: flex; gap: 0.5rem; align-items: center; flex: 1; justify-content: center;">
-                            <select id="provider-selector" class="model-selector" data-label-attr-title="model_selector_vendor_title" title="Select vendor" style="min-width: 120px;">
-                                <option value="" data-label-key="model_selector_vendor_placeholder">Vendor...</option>
-                            </select>
-                            <select id="route-selector" class="model-selector" data-label-attr-title="model_selector_route_title" title="Select route (auth/endpoint)" style="min-width: 90px; display: none;">
-                                <option value="" data-label-key="model_selector_route_placeholder">Route...</option>
-                            </select>
-                            <select id="model-selector" class="model-selector" data-label-attr-title="model_selector_model_title" title="Select model" style="min-width: 180px;">
-                                <option value="" data-label-key="model_selector_model_placeholder">Model...</option>
-                            </select>
+                            <button id="model-settings-button" class="model-settings-button" type="button"
+                                    data-label-attr-title="model_settings_button_title" title="Model settings">
+                                <span id="model-settings-summary" class="model-settings-summary">Model settings</span>
+                            </button>
+                            <div id="model-settings-panel" class="model-settings-panel" style="display: none;" role="dialog" aria-label="Model settings">
+                                <div class="model-settings-section">
+                                    <div class="model-settings-section-title" data-label-key="model_settings_chat_section">Chat</div>
+                                    <select id="provider-selector" class="model-selector" data-label-attr-title="model_selector_vendor_title" title="Select vendor">
+                                        <option value="" data-label-key="model_selector_vendor_placeholder">Vendor...</option>
+                                    </select>
+                                    <select id="route-selector" class="model-selector" data-label-attr-title="model_selector_route_title" title="Select route (auth/endpoint)" style="display: none;">
+                                        <option value="" data-label-key="model_selector_route_placeholder">Route...</option>
+                                    </select>
+                                    <select id="upstream-selector" class="model-selector" title="Filter by upstream provider" style="display: none;">
+                                        <option value="All">All upstreams</option>
+                                    </select>
+                                    <select id="model-selector" class="model-selector" data-label-attr-title="model_selector_model_title" title="Select model">
+                                        <option value="" data-label-key="model_selector_model_placeholder">Model...</option>
+                                    </select>
+                                </div>
+                                <div class="model-settings-section">
+                                    <div class="model-settings-section-title" data-label-key="model_settings_embeddings_section">Embeddings</div>
+                                    <select id="embedding-mode-selector" class="model-selector" title="Embedding provider mode">
+                                        <option value="auto" data-label-key="model_settings_embeddings_auto">Auto — follow chat provider</option>
+                                        <option value="explicit" data-label-key="model_settings_embeddings_explicit">Choose provider…</option>
+                                    </select>
+                                    <select id="embedding-route-selector" class="model-selector" title="Embedding provider:route" style="display: none;"></select>
+                                    <div id="embedding-dim-readout" class="embedding-dim-readout"></div>
+                                    <div id="embedding-dim-warning" class="embedding-dim-warning" style="display: none;"></div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Right: Global security mode + Privacy Mode -->
@@ -867,6 +891,8 @@
     <script src="shared/markdown/katex.js"></script>
     <script src="shared/markdown/index.js"></script>
     <script src="shared/model-selector/index.js"></script>
+    <script src="shared/model-selector/embeddings.js"></script>
+    <script src="shared/model-selector/popover.js"></script>
     <script type="module" src="js/resources.js"></script>
     <script type="module" src="js/app.js"></script>
 </body>
