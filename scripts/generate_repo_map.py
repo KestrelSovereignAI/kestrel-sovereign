@@ -253,12 +253,13 @@ def fmt_entry(entry: FileEntry) -> str:
 
 
 def fmt_section(title: str, entries: list[FileEntry], description: str = "") -> str:
+    """Render a section. Entries are emitted in the order given — callers sort."""
     lines = [f"## {title}"]
     if description:
         lines.append("")
         lines.append(description)
     lines.append("")
-    for entry in sorted(entries, key=lambda e: e.path):
+    for entry in entries:
         lines.append(fmt_entry(entry))
     return "\n".join(lines)
 
@@ -340,13 +341,17 @@ def build_map(files: list[str]) -> str:
     seen: set[str] = set()
     for top in DIR_ORDER:
         if top in groups:
-            sections.append(fmt_section(f"`{top}/`", groups[top]))
+            sections.append(
+                fmt_section(f"`{top}/`", sorted(groups[top], key=lambda e: e.path))
+            )
             seen.add(top)
 
     for top in sorted(groups):
         if top in seen:
             continue
-        sections.append(fmt_section(f"`{top}/`", groups[top]))
+        sections.append(
+            fmt_section(f"`{top}/`", sorted(groups[top], key=lambda e: e.path))
+        )
 
     return "\n".join(header) + "\n\n".join(sections) + "\n"
 
