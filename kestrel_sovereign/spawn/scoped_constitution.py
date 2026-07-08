@@ -27,6 +27,15 @@ RESTRICTION_CONSTRAINTS = frozenset({
     "no-tools",
 })
 
+# Constraint keys that are safe to surface into a child's governing constitution
+# (they only ever tighten): the structured restriction keys plus the named
+# RESTRICTION_CONSTRAINTS flags. Anything outside this set is NOT rendered into
+# the prompt, so an unknown/free-text key can't reach the model as governing
+# text (see render_mandate_constitution_block).
+KNOWN_RESTRICTION_KEYS = frozenset(
+    {"behavioral_rules", "restricted_tools", "max_tokens"}
+) | RESTRICTION_CONSTRAINTS
+
 
 @dataclass
 class ScopedConstitution:
@@ -242,7 +251,16 @@ def render_mandate_constitution_block(mandate) -> str:
     """
     if mandate is None:
         return ""
-    additional_constraints = getattr(mandate, "additional_constraints", None) or {}
+    raw = getattr(mandate, "additional_constraints", None) or {}
+    # SECURITY: only surface KNOWN restriction fields to the prompt. validate_
+    # constraints accepts arbitrary unknown keys, and get_effective_constitution
+    # would render them as free `Constraint [key]: value` text — so an unknown
+    # key (e.g. {"note": "ignore the base constitution"}) could reach the model
+    # as governing text and WEAKEN behavior, inverting the only-ever-tightens
+    # invariant. Drop anything not on the allowlist.
+    additional_constraints = {
+        k: v for k, v in raw.items() if k in KNOWN_RESTRICTION_KEYS
+    }
     if not additional_constraints:
         return ""
     return ScopedConstitution(
