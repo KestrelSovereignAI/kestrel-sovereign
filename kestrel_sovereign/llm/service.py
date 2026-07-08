@@ -338,6 +338,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             raw_embedding_route = self.config.get("embedding_route")
             if raw_embedding_route:
                 configured_embedding_route = str(raw_embedding_route).strip() or None
+        # Same normalization as set_embedding_route: the documented
+        # ``embedding_route = "auto"`` means "follow chat" — storing the
+        # literal would make resolve treat it as an explicit (nonexistent)
+        # provider and silently keyword-fallback (codex P2 on #2270).
+        if configured_embedding_route and configured_embedding_route.lower() == "auto":
+            configured_embedding_route = None
         self._embedding_route: Optional[str] = configured_embedding_route
 
         # Remote GPU backend state (merged from BrainRouter)
@@ -481,7 +487,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """
         if route is not None:
             route = route.strip()
-            if not route or route == "auto":
+            if not route or route.lower() == "auto":
                 route = None
         if route is not None:
             self._validate_embedding_route(route)
@@ -1300,6 +1306,33 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             None,
         )
 
+    def _lookup_embedding_route_candidates(
+        self, selector: str
+    ) -> List[Dict[str, Any]]:
+        """Return ALL available providers an embedding_route selector matches.
+
+        Same availability source and selector semantics as
+        ``_lookup_sibling_provider`` (``"<vendor>"`` or ``"<vendor>:<route>"``),
+        but returns every match instead of the first — the explicit
+        embedding_route branch picks the first EMBEDDING-CAPABLE match, so a
+        bare-vendor selector isn't defeated by a non-embedding route sorting
+        first (codex P2 on #2270).
+        """
+        if hasattr(self, "_available_providers") and callable(
+            getattr(self, "_available_providers")
+        ):
+            try:
+                candidates = self._available_providers()
+            except Exception:
+                candidates = getattr(self, "providers", None) or []
+        else:
+            candidates = getattr(self, "providers", None) or []
+        if not candidates:
+            return []
+        if ":" in selector:
+            return [p for p in candidates if p.get("name") == selector]
+        return [p for p in candidates if p.get("vendor") == selector]
+
     def resolve_embedding_provider(self) -> Optional[Dict[str, Any]]:
         """Return a provider that can embed text for the active chat session.
 
@@ -1344,8 +1377,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # natively. Terminal branch — never falls through to chat/sibling.
         explicit_route = getattr(self, "_embedding_route", None)
         if explicit_route:
-            target = self._lookup_sibling_provider(explicit_route)
-            if target is None:
+            # Consider EVERY available route the selector matches, not just the
+            # vendor's first route (codex P2 on #2270): a bare-vendor selector
+            # like "openai" must find openai:api's embedding support even when
+            # a non-embedding openai-compatible route sorts first.
+            matches = self._lookup_embedding_route_candidates(explicit_route)
+            if not matches:
                 logger.warning(
                     "Configured embedding_route %s matches no initialized "
                     "provider; semantic storage search will use keyword "
@@ -1353,15 +1390,21 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     explicit_route,
                 )
                 return None
-            if force_local_only and not target.get("is_local"):
-                logger.info(
-                    "Configured embedding_route %s is non-local under "
-                    "force_local_only=True; semantic storage search will use "
-                    "keyword fallback (privacy mode overrides embedding_route).",
-                    explicit_route,
-                )
-                return None
-            if not self._provider_supports_embeddings(target):
+            if force_local_only:
+                matches = [p for p in matches if p.get("is_local")]
+                if not matches:
+                    logger.info(
+                        "Configured embedding_route %s is non-local under "
+                        "force_local_only=True; semantic storage search will use "
+                        "keyword fallback (privacy mode overrides embedding_route).",
+                        explicit_route,
+                    )
+                    return None
+            target = next(
+                (p for p in matches if self._provider_supports_embeddings(p)),
+                None,
+            )
+            if target is None:
                 logger.warning(
                     "Configured embedding_route %s does not advertise "
                     "supports_embeddings; semantic storage search will use "

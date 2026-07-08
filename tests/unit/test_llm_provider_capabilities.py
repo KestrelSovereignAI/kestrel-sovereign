@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from kestrel_sdk.llm import (
     ProviderCapabilities,
@@ -1097,3 +1097,33 @@ def test_in_tree_adapter_capability_matrix():
         assert capabilities.structured_output_mode == structured_output_mode
         assert capabilities.tool_streaming_mode == tool_streaming_mode
         assert capabilities.vision_input_mode == vision_input_mode
+
+
+def test_config_seeded_auto_embedding_route_normalizes_to_none():
+    """codex P2 on #2270 — the documented ``embedding_route = "auto"`` config
+    value must seed as None (follow-chat), not as a literal explicit route that
+    resolve treats as a nonexistent provider and keyword-falls-back."""
+    with patch(
+        "kestrel_sovereign.llm.service.load_section",
+        return_value={"embedding_route": "auto"},
+    ), patch("kestrel_sovereign.llm.service.ProviderRegistry") as mock_registry_class:
+        mock_registry = MagicMock()
+        mock_registry.initialize_providers.return_value = []
+        mock_registry.providers = []
+        mock_registry_class.return_value = mock_registry
+        service = LLMService()
+    assert service.get_embedding_route() is None
+    # And explicit set is case-insensitive about the sentinel too.
+    service.set_embedding_route("AUTO", persist=False)
+    assert service.get_embedding_route() is None
+
+
+def test_bare_vendor_embedding_route_prefers_embedding_capable_route():
+    """codex P2 on #2270 — ``embedding_route = "openai"`` must resolve to the
+    vendor's embedding-capable route even when a non-embedding route for the
+    same vendor sorts first in the provider table."""
+    compat = _route("openai:compat", "openai", AnthropicAdapter())  # no embeddings
+    api = _route("openai:api", "openai", OpenAIAdapter())           # embeddings
+    service = _embedding_service([compat, api], embedding_route="openai")
+
+    assert service.resolve_embedding_provider() is api
