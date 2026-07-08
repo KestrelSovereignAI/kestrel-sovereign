@@ -705,6 +705,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agents`
   - `DELETE /api/agents/{agent_name}`
   - `GET /api/constitution`
+  - `GET /api/embedding/settings`
   - `GET /api/identity`
   - `PATCH /api/identity`
   - `POST /api/identity/avatar`
