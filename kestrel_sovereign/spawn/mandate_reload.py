@@ -67,13 +67,18 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
 async def read_spawn_features_allowed(storage: Any, agent_did: str) -> Optional[list]:
     """Read a spawned child's persisted ``features_allowed`` ceiling (#2226).
 
-    Returns:
-      * ``None`` when NO ceiling is recorded — a root/non-spawned agent, or a
-        pre-#2137 spawn edge that never persisted the allowlist — meaning "load
-        all" (backward compatible).
-      * a ``list`` of canonical feature class names otherwise. An EMPTY list is a
-        real, restrictive allowlist (only MANDATORY_FEATURES load), distinct from
-        ``None`` — an explicit empty grant must survive a direct restart.
+    Returns a non-empty ``list`` of canonical feature class names when a ceiling
+    is recorded, else ``None`` (no ceiling → load all).
+
+    An EMPTY or absent ``features_allowed`` returns ``None``, by design:
+    ``SpawnMandate.features_allowed`` defaults to ``[]`` and ``_do_spawn`` treats
+    ``[]`` as "inherit the parent ceiling / unspecified" — a genuine zero-feature
+    grant is not expressible in the current data model. Crucially this keeps
+    backward compatibility: children spawned before this change persisted an
+    empty ``features_allowed`` for the inherited case, and must NOT be
+    reinterpreted as "only mandatory features" on a post-upgrade restart. Real
+    ceilings (explicit, or the inherited set now written by ``_do_spawn``) are
+    always non-empty.
 
     Applied at feature discovery in ``KestrelAgent.initialize`` so the ceiling is
     enforced on EVERY boot path — single-agent server, CLI, direct
@@ -88,9 +93,10 @@ async def read_spawn_features_allowed(storage: Any, agent_did: str) -> Optional[
     if not spawned:
         return None
     raw = (spawned[0].properties or {}).get("features_allowed")
-    if raw is None:
+    if not raw:
         return None
-    return [str(f) for f in raw if str(f).strip()]
+    names = [str(f) for f in raw if str(f).strip()]
+    return names or None
 
 
 def register_restriction_hook(hooks_manager: Any, mandate: Any) -> int:

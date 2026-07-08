@@ -72,36 +72,18 @@ async def test_read_features_allowed_none_for_root(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_features_allowed_explicit_empty_is_list(tmp_path):
-    """An explicit empty allowlist persists as [] (a real restrictive ceiling),
-    NOT None — so it survives a direct restart."""
+async def test_read_features_allowed_none_for_empty(tmp_path):
+    """An empty features_allowed on the edge → None (no ceiling). In the current
+    data model [] means 'inherit / unspecified', not a genuine empty grant, and
+    legacy inherited-ceiling children persisted [] — they must not be reduced to
+    mandatory-only on a post-upgrade restart."""
     creds = await _spawn_child_dir(tmp_path, "EmptyChild", [])
     storage = AsyncStorage(os.path.join(str(tmp_path), "kestrel_prime.db"))
     await storage.initialize()
     try:
-        assert await read_spawn_features_allowed(storage, creds.agent_did) == []
+        assert await read_spawn_features_allowed(storage, creds.agent_did) is None
     finally:
         await storage.close()
-
-
-@pytest.mark.asyncio
-async def test_direct_boot_enforces_empty_ceiling(tmp_path):
-    """A child spawned with an explicit empty allowlist loads ONLY mandatory
-    features on a direct boot — no optional features escape the empty grant."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-    from kestrel_sovereign.llm.service import LLMService
-
-    creds = await _spawn_child_dir(tmp_path, "EmptyCeil", [])
-    agent = KestrelAgent(
-        did=creds.agent_did,
-        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
-        llm_service=LLMService(),
-    )
-    await agent.initialize()
-
-    loaded = _loaded_classes(agent)
-    assert loaded <= set(MANDATORY_FEATURES), f"optional features escaped: {loaded - set(MANDATORY_FEATURES)}"
-    assert "MemoryFeature" not in loaded
 
 
 def _loaded_classes(agent):

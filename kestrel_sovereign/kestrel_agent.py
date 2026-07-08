@@ -1415,10 +1415,10 @@ class KestrelAgent(
                 mandate_features = await read_spawn_features_allowed(
                     self.storage, self.did
                 )
-                # ``None`` = no ceiling recorded (root / pre-#2137 edge). An empty
-                # list is a REAL restrictive allowlist (only mandatory features)
-                # and must be applied, so gate on ``is not None``.
-                if mandate_features is not None:
+                # A recorded ceiling is always a non-empty list; None/empty means
+                # "no explicit ceiling" (root, legacy, or inherit-from-degenerate-
+                # parent) → load all. See read_spawn_features_allowed.
+                if mandate_features:
                     ceiling = set(mandate_features)
                     effective_features = (
                         ceiling
