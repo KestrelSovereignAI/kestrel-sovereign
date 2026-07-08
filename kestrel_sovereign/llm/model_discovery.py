@@ -188,6 +188,66 @@ class ModelDiscoveryMixin:
             providers=providers
         )
 
+    async def discover_models_for_route(
+        self,
+        vendor: str,
+        route: Optional[str] = None,
+        *,
+        use_cache: bool = True,
+        featured_only: bool = False,
+        category: Optional[ModelCategory] = None,
+    ) -> List[ModelInfo]:
+        """Discover the models a SPECIFIC ``(vendor, route)`` can actually serve.
+
+        A vendor's routes can expose different model sets: ``anthropic:plan``
+        (Claude subscription via OAuth) serves the Claude-CLI set while
+        ``anthropic:api`` serves the metered API catalog; ``openai:plan``
+        (CodexAdapter → codex app-server) serves the codex set while
+        ``openai:api`` serves the full platform catalog. The vendor-keyed
+        discovery + ``llm.catalog`` metadata are a DEFAULT; a route whose
+        adapter exposes its OWN serveable set (tracked in
+        ``self._route_catalogs``, e.g. codex/``openai:plan``) OVERRIDES it, so
+        an api-only model never leaks into a plan route's list (#2262).
+
+        Routes without a route-specific catalog (today: everything except
+        CodexAdapter — ``ClaudeMaxAdapter``'s ``list_models`` still raises
+        ``NotImplementedError``) inherit the vendor's discovered set, which is
+        the best available answer until that adapter discovers its own models.
+
+        The route catalog carries only MEMBERSHIP (which model ids the route
+        serves); it is still enriched through the vendor-keyed ``llm.catalog``
+        so display names / categories / hidden / context overrides apply — the
+        catalog decorates, it does not inject membership.
+        """
+        # Run full discovery so BOTH the vendor catalog and the per-route
+        # catalogs (self._route_catalogs) are populated for this instance.
+        vendor_models = await self.discover_all_models(
+            use_cache=use_cache,
+            providers=[vendor],
+        )
+
+        route_key = f"{vendor}:{route}" if route else None
+        route_catalogs = getattr(self, "_route_catalogs", None) or {}
+
+        if route_key is not None and route_key in route_catalogs:
+            # Route-scoped (e.g. codex/openai:plan): the route's own adapter
+            # discovery is authoritative. Enrich it with the vendor catalog
+            # for metadata, but NEVER fall back to the vendor's membership —
+            # an empty route catalog means "this route advertises no explicit
+            # set", not "show the api-only catalog".
+            catalog = get_catalog_service()
+            scoped = route_catalogs[route_key] or []
+            models = catalog.enrich_models(list(scoped))
+        else:
+            models = vendor_models
+
+        return self._filter_models(
+            models,
+            featured_only=featured_only,
+            category=category,
+            providers=None,
+        )
+
     async def _resolve_local_auto_routes(self) -> None:
         """Resolve ``model="auto"`` LOCAL routes WITHOUT contacting cloud.
 
