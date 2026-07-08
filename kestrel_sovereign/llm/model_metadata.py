@@ -21,6 +21,46 @@ explicitly. ``ModelInfo.from_dict`` preserves the legacy
 written before the field existed.
 """
 
-from kestrel_sdk.llm import ModelCategory, ModelInfo
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+from kestrel_sdk.llm import ModelCategory
+from kestrel_sdk.llm import ModelInfo as _SDKModelInfo
+
+
+@dataclass
+class ModelInfo(_SDKModelInfo):
+    """Framework ModelInfo — the SDK dataclass plus ``underlying_provider``.
+
+    Meta-provider catalogs (OpenRouter, and any future aggregator) route to
+    many upstream vendors, so a single ``provider="openrouter"`` bucket hides
+    the real substrate. OpenRouter's ``/models`` ids already encode it as a
+    prefix (``anthropic/claude-3-opus`` → ``anthropic``); this field carries
+    that prefix so UI faceting doesn't have to re-parse the id (#2262).
+
+    The canonical shape still lives in the SDK; this subclass only ADDS the
+    optional field (never reshapes existing ones) so external adapters that
+    construct the SDK ``ModelInfo`` remain forward-compatible — they simply
+    leave ``underlying_provider`` at ``None``. All in-tree code imports
+    ``ModelInfo`` from this module, so it uniformly gets the extended type.
+    """
+
+    underlying_provider: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = super().to_dict()
+        data["underlying_provider"] = self.underlying_provider
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ModelInfo":
+        # Reuse the SDK round-trip for the shared fields, then layer the
+        # framework-only field on top. ``super().from_dict`` returns a
+        # ``cls`` instance (classmethod), so the base fields land correctly
+        # and only ``underlying_provider`` needs to be applied here.
+        model = super().from_dict(data)
+        model.underlying_provider = data.get("underlying_provider")
+        return model
+
 
 __all__ = ["ModelCategory", "ModelInfo"]

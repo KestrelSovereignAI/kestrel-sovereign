@@ -1155,6 +1155,8 @@ async def list_agent_models(
     featured_only: bool = Query(False, description="Only return featured models"),
     category: Optional[str] = Query(None, description="Filter by category (chat, embedding, image, audio)"),
     providers: Optional[str] = Query(None, description="Comma-separated provider names to filter"),
+    vendor: Optional[str] = Query(None, description="Scope the list to a single vendor (pairs with 'route')"),
+    route: Optional[str] = Query(None, description="Scope the list to a single route of 'vendor' (e.g. plan, api)"),
     use_cache: bool = Query(True, description="Use cached results if available"),
 ):
     """
@@ -1166,6 +1168,13 @@ async def list_agent_models(
             client-side via the "Show all" expander)
         category: Filter by category (chat, embedding, image, audio)
         providers: Comma-separated list of providers to include
+        vendor: Scope the returned list to a single vendor. When combined
+            with ``route``, the list is drawn from THAT route's own serveable
+            set (route-scoped discovery), so a plan route no longer offers
+            api-only models it can't serve (#2262). Requires ``route``.
+        route: The route of ``vendor`` to scope to (e.g. ``plan``, ``api``).
+            Requires ``vendor``. A route change on the UI selector re-fetches
+            with the new pair to repopulate the model combo.
         use_cache: Use cached results (default: true)
 
     Returns:
@@ -1196,13 +1205,33 @@ async def list_agent_models(
         if providers:
             provider_list = [p.strip() for p in providers.split(",")]
 
-        if hasattr(agent, 'llm_service') and agent.llm_service:
-            models = await agent.llm_service.discover_all_models(
-                use_cache=use_cache,
-                featured_only=featured_only,
-                category=model_category,
-                providers=provider_list
+        # ``route`` without ``vendor`` is ambiguous — a route name (plan/api)
+        # only identifies a serveable set relative to its vendor.
+        if route and not vendor:
+            raise HTTPException(
+                status_code=400,
+                detail="'route' requires 'vendor' — a route is only meaningful within a vendor.",
             )
+
+        if hasattr(agent, 'llm_service') and agent.llm_service:
+            if vendor:
+                # Route-scoped discovery: the returned set comes from THIS
+                # (vendor, route)'s own adapter discovery, so a plan route's
+                # list never cross-contaminates with api-only models (#2262).
+                models = await agent.llm_service.discover_models_for_route(
+                    vendor,
+                    route,
+                    use_cache=use_cache,
+                    featured_only=featured_only,
+                    category=model_category,
+                )
+            else:
+                models = await agent.llm_service.discover_all_models(
+                    use_cache=use_cache,
+                    featured_only=featured_only,
+                    category=model_category,
+                    providers=provider_list
+                )
 
         # Convert to dicts for JSON response
         models_data = [m.to_dict() for m in models]

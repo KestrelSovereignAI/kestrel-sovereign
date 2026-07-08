@@ -264,6 +264,10 @@ class OpenRouterAdapter(OpenAIAdapter):
                     supports_vision=supports_vision,
                     supports_tools=supports_tools,
                     supports_streaming=True,  # OpenRouter streams every chat route
+                    # Carry the upstream substrate (e.g. ``anthropic`` from
+                    # ``anthropic/claude-3-opus``) so UI can facet the
+                    # meta-provider catalog without re-parsing ids (#2262).
+                    underlying_provider=underlying_provider,
                 ))
 
             logger.info(f"OpenRouter: discovered {len(models)} models")

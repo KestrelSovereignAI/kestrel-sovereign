@@ -391,6 +391,51 @@ def test_models_endpoint_groups_results_and_rejects_invalid_category():
         _restore_app(app, original)
 
 
+def test_models_endpoint_scopes_list_to_vendor_route():
+    """``/api/models?vendor=openai&route=plan`` must draw the list from the
+    route-scoped discovery, not the flattened vendor discovery (#2262)."""
+    plan_model = MagicMock()
+    plan_model.provider = "openai"
+    plan_model.is_featured = True
+    plan_model.to_dict.return_value = {"id": "gpt-5.5", "provider": "openai"}
+
+    llm_service = MagicMock()
+    llm_service.discover_models_for_route = AsyncMock(return_value=[plan_model])
+    llm_service.discover_all_models = AsyncMock(return_value=[])
+    llm_service.get_active_model_id = MagicMock(return_value="openai:plan/gpt-5.5")
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                scoped = client.get(
+                    "/api/models?vendor=openai&route=plan",
+                    headers=_api_headers(),
+                )
+                bad = client.get(
+                    "/api/models?route=plan",
+                    headers=_api_headers(),
+                )
+        assert scoped.status_code == 200
+        payload = scoped.json()
+        assert payload["count"] == 1
+        assert set(payload["by_vendor"]) == {"openai"}
+        llm_service.discover_models_for_route.assert_awaited_once_with(
+            "openai",
+            "plan",
+            use_cache=True,
+            featured_only=False,
+            category=None,
+        )
+        # The vendor-scoped path must NOT fall through to global discovery.
+        llm_service.discover_all_models.assert_not_awaited()
+        # route without vendor is a 400.
+        assert bad.status_code == 400
+    finally:
+        _restore_app(app, original)
+
+
 def test_current_and_set_model_endpoints_share_runtime_preference_contract():
     # Simulate a realistic set→get roundtrip: the endpoint now re-reads the
     # persisted mandate after set_model_preference (so auto-resolution or
