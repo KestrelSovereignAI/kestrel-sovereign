@@ -64,14 +64,21 @@ async def read_spawn_mandate(storage: Any, agent_did: str) -> Optional[SpawnMand
     return SpawnMandate(**kwargs)
 
 
-async def read_spawn_features_allowed(storage: Any, agent_did: str) -> list:
+async def read_spawn_features_allowed(storage: Any, agent_did: str) -> Optional[list]:
     """Read a spawned child's persisted ``features_allowed`` ceiling (#2226).
 
-    Returns the list of canonical feature class names the child's mandate permits
-    (empty for a root/non-spawned agent or a mandate with no allowlist). Applied
-    at feature discovery in ``KestrelAgent.initialize`` so the ceiling is enforced
-    on EVERY boot path — single-agent server, CLI, direct ``KestrelAgent`` — not
-    only the ``AgentManager`` path that threads it through ``LocalAgentConfig``.
+    Returns:
+      * ``None`` when NO ceiling is recorded — a root/non-spawned agent, or a
+        pre-#2137 spawn edge that never persisted the allowlist — meaning "load
+        all" (backward compatible).
+      * a ``list`` of canonical feature class names otherwise. An EMPTY list is a
+        real, restrictive allowlist (only MANDATORY_FEATURES load), distinct from
+        ``None`` — an explicit empty grant must survive a direct restart.
+
+    Applied at feature discovery in ``KestrelAgent.initialize`` so the ceiling is
+    enforced on EVERY boot path — single-agent server, CLI, direct
+    ``KestrelAgent`` — not only the ``AgentManager`` path that threads it through
+    ``LocalAgentConfig``.
 
     Fail CLOSED: like :func:`read_spawn_mandate`, an edge read error propagates
     (boot fails) rather than silently loading a child without its feature ceiling.
@@ -79,8 +86,10 @@ async def read_spawn_features_allowed(storage: Any, agent_did: str) -> list:
     edges = await storage.get_edges_from(agent_did)
     spawned = [e for e in edges if getattr(e, "label", None) == "spawned_by"]
     if not spawned:
-        return []
-    raw = (spawned[0].properties or {}).get("features_allowed") or []
+        return None
+    raw = (spawned[0].properties or {}).get("features_allowed")
+    if raw is None:
+        return None
     return [str(f) for f in raw if str(f).strip()]
 
 
