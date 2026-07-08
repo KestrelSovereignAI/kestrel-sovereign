@@ -7,7 +7,14 @@ enriched with live GitHub data.
 from datetime import date, datetime
 from typing import Any, Dict, List
 
-from .github_integration import fetch_github_signal, short_repo
+from .github_integration import (
+    GITHUB_SIGNAL_NO_SCAN_REPOS,
+    GITHUB_SIGNAL_NO_TOKEN,
+    GitHubAuthError,
+    fetch_github_signal,
+    github_signal_prerequisite,
+    short_repo,
+)
 
 
 async def generate_morning_signal(data: Dict[str, Any]) -> str:
@@ -25,8 +32,15 @@ async def generate_morning_signal(data: Dict[str, Any]) -> str:
     today = date.today()
     lines = [f"# Morning Signal -- {today.strftime('%B %d, %Y')}", ""]
 
-    # Fetch live GitHub data (non-blocking, graceful on failure)
-    github_data = await fetch_github_signal(data)
+    # Fetch live GitHub data (non-blocking, graceful on failure). An invalid
+    # token surfaces as GitHubAuthError so we can point at the token
+    # remediation instead of printing placeholder repo shells as live data.
+    auth_failed = False
+    try:
+        github_data = await fetch_github_signal(data)
+    except GitHubAuthError:
+        github_data = {}
+        auth_failed = True
     has_live = bool(github_data)
 
     if has_live:
@@ -180,7 +194,16 @@ async def generate_morning_signal(data: Dict[str, Any]) -> str:
 
     lines.append("")
     if not has_live:
-        lines.append("*Set GITHUB_TOKEN to enable live repo scanning.*")
+        prereq = github_signal_prerequisite(data)
+        if auth_failed:
+            # Token was configured but GitHub rejected it (401/403).
+            lines.append("*Set GITHUB_TOKEN to a valid token to enable live repo scanning.*")
+        elif prereq == GITHUB_SIGNAL_NO_SCAN_REPOS:
+            lines.append("*Configure `morning_signal_config.scan_repos` to enable live repo scanning.*")
+        elif prereq == GITHUB_SIGNAL_NO_TOKEN:
+            lines.append("*Set GITHUB_TOKEN to enable live repo scanning.*")
+        else:
+            lines.append("*Live GitHub data unavailable; showing YAML data only.*")
         lines.append("")
     lines.append("**Your call. What resonates?**")
 
