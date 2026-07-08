@@ -1114,7 +1114,16 @@ class ConstitutionMixin:
                 if block:
                     constitution_text = f"{constitution_text}\n\n{block}"
             except Exception:
-                pass
+                # Rendering coerces to str and shouldn't raise on accepted
+                # values; if it somehow does, surface it loudly rather than
+                # silently ship a governing constitution missing the mandate's
+                # restrictions (the control this adds). Don't abort the whole
+                # constitution — that would break the prompt entirely.
+                logging.exception(
+                    "Failed to render spawn-mandate constraints into governing "
+                    "constitution for %s; the mandate block is MISSING from this "
+                    "render.", getattr(self, "agent_id", "?"),
+                )
             return constitution_text
         except Exception as e:
             return f"Error: Could not retrieve constitution for hash {constitution_hash}. Reason: {e}"

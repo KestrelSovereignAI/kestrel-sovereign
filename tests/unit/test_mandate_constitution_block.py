@@ -43,6 +43,22 @@ def test_render_block_contains_rules_and_no_base():
     assert not block.startswith("\n")
 
 
+def test_render_block_survives_mixed_type_values():
+    """Mixed-type constraint values render as text instead of raising (so the
+    block is never silently dropped from the governing constitution)."""
+    block = render_mandate_constitution_block(
+        SimpleNamespace(
+            additional_constraints={
+                "restricted_tools": [1, "a", "computer_use_shell"],
+                "behavioral_rules": {2: "num-keyed", "b": "rule"},
+            },
+            features_allowed=["z", 3],
+        )
+    )
+    assert "SPAWN MANDATE CONSTRAINTS" in block
+    assert "computer_use_shell" in block
+
+
 def test_render_block_empty_when_no_constraints():
     assert render_mandate_constitution_block(None) == ""
     assert render_mandate_constitution_block(

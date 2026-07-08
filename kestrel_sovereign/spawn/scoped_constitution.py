@@ -170,23 +170,31 @@ class ScopedConstitution:
 
         if self.features_allowed:
             parts.append(
-                f"\nAllowed features: {', '.join(sorted(self.features_allowed))}"
+                f"\nAllowed features: "
+                f"{', '.join(sorted(str(f) for f in self.features_allowed))}"
             )
 
-        for key, value in sorted(self.additional_constraints.items()):
+        # Coerce to str throughout: constraint *values* are validated as the
+        # right container (list/dict) but not element-typed, so a mixed-type
+        # entry must render as text rather than raise and drop the whole block.
+        for key, value in sorted(
+            self.additional_constraints.items(), key=lambda kv: str(kv[0])
+        ):
             if key == "behavioral_rules":
                 if isinstance(value, list):
                     rules_text = "\n".join(f"- {rule}" for rule in value)
                     parts.append(f"\nAdditional behavioral rules:\n{rules_text}")
                 elif isinstance(value, dict):
                     rules_text = "\n".join(
-                        f"- {k}: {v}" for k, v in sorted(value.items())
+                        f"- {k}: {v}"
+                        for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
                     )
                     parts.append(f"\nAdditional behavioral rules:\n{rules_text}")
             elif key == "restricted_tools":
+                tools = value if isinstance(value, (list, tuple, set)) else [value]
                 parts.append(
                     f"\nRestricted tools (not available): "
-                    f"{', '.join(sorted(value))}"
+                    f"{', '.join(sorted(str(t) for t in tools))}"
                 )
             elif key in RESTRICTION_CONSTRAINTS:
                 parts.append(f"\nRestriction active: {key}")
