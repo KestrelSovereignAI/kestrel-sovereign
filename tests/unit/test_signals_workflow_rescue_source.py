@@ -222,6 +222,55 @@ async def test_a2a_repair_dispatch_fails_closed_with_only_stalled_items(dispatch
     assert result.status == Status.FAILED
 
 
+async def test_a2a_repair_dispatch_recurring_tick_no_targets_is_clean_noop(dispatcher):
+    # A recurring observation-only tick reaches dispatch with no per-run approval
+    # having selected any target. It must complete cleanly (no-op), not fail the
+    # unattended run (#2249). Direct fail-closed calls above are unaffected.
+    result = await dispatcher.dispatch_signal(
+        _signal("a2a_repair_dispatch", {"recurring": True, "stale_days": 3})
+    )
+    assert result.status == Status.OK
+    data = result.action_result
+    assert data["skipped"] is True
+    assert data["dispatched_count"] == 0
+    assert data["state"] == "skipped"
+    # A no-op must never look like real work — no merged/shipped/dispatched list.
+    assert "merged" not in data
+    assert "shipped" not in data
+
+
+async def test_a2a_repair_dispatch_recurring_with_stalled_items_still_no_dispatch(
+    dispatcher,
+):
+    # Even carrying detected stalled_items, a recurring tick with no explicit
+    # repair targets must not dispatch them — it skips cleanly (#2249 + #2200).
+    result = await dispatcher.dispatch_signal(
+        _signal(
+            "a2a_repair_dispatch",
+            {"recurring": True, "stalled_items": ["#1", "#2"]},
+        )
+    )
+    assert result.status == Status.OK
+    data = result.action_result
+    assert data["skipped"] is True
+    assert data["dispatched_count"] == 0
+    # The detected items were NOT promoted to dispatched targets.
+    assert data.get("dispatched", []) == []
+
+
+async def test_a2a_repair_dispatch_recurring_with_targets_still_dispatches(dispatcher):
+    # When a per-run approval DOES select targets mid-loop, a recurring tick
+    # dispatches them normally — the no-op branch only triggers on empty targets.
+    result = await dispatcher.dispatch_signal(
+        _signal("a2a_repair_dispatch", {"recurring": True, "repairs": ["#9"]})
+    )
+    assert result.status == Status.OK
+    data = result.action_result
+    assert data["dispatched_count"] == 1
+    assert data["state"] == "dispatched"
+    assert data.get("skipped") is not True
+
+
 async def test_a2a_repair_dispatch_records_dispatched_not_merged(dispatcher):
     result = await dispatcher.dispatch_signal(
         _signal("a2a_repair_dispatch", {"repairs": ["#1", "#2"]})
@@ -260,6 +309,85 @@ async def test_close_resolved_fails_closed_without_evidence(dispatcher):
         _signal("close_resolved_todos", {"resolved_todos": [{"id": 7}]})
     )
     assert result.status == Status.FAILED
+
+
+async def test_evidence_verify_recurring_tick_no_evidence_is_clean_noop(dispatcher):
+    # A recurring tick that dispatched nothing has nothing to verify — it must
+    # complete cleanly, not fail closed (#2249).
+    result = await dispatcher.dispatch_signal(
+        _signal("evidence_verify", {"recurring": True})
+    )
+    assert result.status == Status.OK
+    data = result.action_result
+    assert data["skipped"] is True
+    # Must not claim anything was verified.
+    assert data.get("verified") is not True
+
+
+async def test_evidence_verify_recurring_with_dispatched_repairs_still_fails_closed(
+    dispatcher,
+):
+    # #2249 P1: the runner merges run params into every stage payload, so a
+    # recurring run that DID select explicit repair targets carries them into
+    # evidence_verify. A real dispatch happened — the recurring no-op branch must
+    # NOT skip verification. Without evidence this must fail closed, not pass as a
+    # no-op (which would complete the run with an unverified irreversible action).
+    result = await dispatcher.dispatch_signal(
+        _signal("evidence_verify", {"recurring": True, "repairs": ["#9"]})
+    )
+    assert result.status == Status.FAILED
+
+
+async def test_evidence_verify_recurring_with_dispatched_marker_fails_closed(
+    dispatcher,
+):
+    # The dispatch stage's forwarded output (dispatched/dispatched_count) also
+    # marks a real action — a recurring tick that sees it must be proven, not
+    # skipped.
+    result = await dispatcher.dispatch_signal(
+        _signal(
+            "evidence_verify",
+            {"recurring": True, "dispatched": ["#9"], "dispatched_count": 1},
+        )
+    )
+    assert result.status == Status.FAILED
+
+
+async def test_evidence_verify_recurring_after_noop_dispatch_still_skips(dispatcher):
+    # A recurring tick whose dispatch was itself a no-op forwards
+    # ``skipped: True`` / ``dispatched_count: 0`` — that is not a selected action,
+    # so evidence_verify may still complete cleanly as a no-op.
+    result = await dispatcher.dispatch_signal(
+        _signal(
+            "evidence_verify",
+            {"recurring": True, "skipped": True, "dispatched_count": 0},
+        )
+    )
+    assert result.status == Status.OK
+    assert result.action_result["skipped"] is True
+
+
+async def test_close_resolved_recurring_with_dispatched_repairs_fails_closed(
+    dispatcher,
+):
+    # #2249 P1 mirror for the close stage: a recurring run that selected explicit
+    # repair targets must not slip past the close gate as a no-op.
+    result = await dispatcher.dispatch_signal(
+        _signal("close_resolved_todos", {"recurring": True, "repairs": ["#9"]})
+    )
+    assert result.status == Status.FAILED
+
+
+async def test_close_resolved_recurring_tick_no_todos_is_clean_noop(dispatcher):
+    # A recurring tick that resolved nothing has nothing to close — clean no-op,
+    # not a failed run (#2249).
+    result = await dispatcher.dispatch_signal(
+        _signal("close_resolved_todos", {"recurring": True})
+    )
+    assert result.status == Status.OK
+    data = result.action_result
+    assert data["skipped"] is True
+    assert data["closed_count"] == 0
 
 
 async def test_close_resolved_closes_only_with_evidence(dispatcher):

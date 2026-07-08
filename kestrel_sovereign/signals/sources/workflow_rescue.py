@@ -34,6 +34,25 @@ infer merged/shipped/resolved state without upstream evidence in the payload:
     - ``close_resolved_todos`` refuses to close a todo that carries no resolution
       evidence.
 
+**Recurring observation-only ticks (#2249).** A recurring schedule runs with
+``recurring: True`` in its params (see :func:`build_recurring_schedule_request`),
+and the workflow runner merges the run params into every stage payload. When a
+recurring tick reaches an irreversible/evidence-gated stage with **nothing
+approved to act on** — no repair targets, no evidence, no resolved todos — the
+stage completes cleanly as a *no-op* (``skipped: True``, zero count) instead of
+failing the whole unattended run. This does not relax the fail-closed contract:
+a **direct** (non-recurring) call to those stages still raises when its required
+targets/evidence are absent, and even a recurring tick never auto-dispatches the
+survey's detected ``stalled_items``. Dispatch/close only ever fire once a per-run
+approval selects an explicit target and supplies its evidence.
+
+Crucially, the no-op branch is gated on *nothing having been selected this run*.
+If a recurring run **did** select explicit repair targets (``repairs`` /
+``repair_targets`` merged into every stage payload from the run params) and
+dispatched real work, the downstream ``evidence_verify`` / ``close_resolved``
+stages still fail closed on missing evidence — a genuine irreversible dispatch
+must be proven, never skipped past as a no-op (#2249 P1).
+
 An ACTION handler that returns normally yields ``SignalResult.status == OK`` (the
 ``signal_status_ok`` gate passes); raising fails the stage. Failing closed is the
 whole point when required evidence is absent.
@@ -114,6 +133,73 @@ def _as_list(value: Any) -> List[Any]:
     if isinstance(value, (list, tuple)):
         return list(value)
     return [value]
+
+
+def _is_recurring_tick(payload: Dict[str, Any]) -> bool:
+    """True when this stage payload belongs to a recurring observation-only loop.
+
+    A recurring ``stalled_work_rescue`` schedule runs with ``recurring: True`` in
+    its params (see :func:`build_recurring_schedule_request`); the workflow runner
+    merges the run params into every stage payload, so the flag reaches each
+    irreversible/evidence-gated stage. When a recurring tick reaches such a stage
+    with **nothing approved to act on**, the stage completes cleanly as a no-op
+    instead of failing the whole unattended run (#2249). A **direct**
+    (non-recurring) call is unaffected and still fails closed when its required
+    targets/evidence are absent — so "detected" never becomes "dispatched" and
+    nothing is closed without evidence.
+    """
+    return bool(payload.get("recurring"))
+
+
+# Markers that mean a real, per-run-approved action was selected/performed this
+# run: explicit repair targets (merged into every stage payload from the run
+# params) and the dispatch stage's own output (forwarded downstream). When any
+# of these is present, later evidence-gated stages must NOT take the recurring
+# no-op branch — a genuine irreversible dispatch has to be proven, not skipped
+# (#2249 P1).
+_ACTION_TARGET_FIELDS = ("repairs", "repair_targets")
+_DISPATCHED_MARKER_FIELDS = ("dispatched", "dispatched_count")
+
+
+def _run_selected_action(payload: Dict[str, Any]) -> bool:
+    """True when this run selected/performed an explicit irreversible action.
+
+    Guards the recurring no-op branch of the evidence-gated stages: a recurring
+    tick is only allowed to skip when *nothing* was approved to act on. If the
+    run carries explicit repair targets or a dispatched-work marker (from
+    ``a2a_repair_dispatch``), the fix must be verified with real evidence — the
+    no-op branch must not turn a real dispatch into a completed run without proof.
+    A skipped (no-op) dispatch sets ``dispatched_count: 0`` and is not counted.
+    """
+    for field in _ACTION_TARGET_FIELDS:
+        if payload.get(field):
+            return True
+    if payload.get("skipped"):
+        # A no-op dispatch forwarded its own ``dispatched: []`` / count 0 — that
+        # is not a selected action.
+        return False
+    for field in _DISPATCHED_MARKER_FIELDS:
+        if payload.get(field):
+            return True
+    return False
+
+
+def _recurring_skip(source: str, count_field: str, reason: str) -> Dict[str, Any]:
+    """A clean no-op result for a recurring tick with nothing to act on.
+
+    Records ``skipped: True`` and a zero count so no reader (or downstream
+    synthesis stage) can mistake it for real work performed. Returning normally
+    yields ``SignalResult.status == OK`` so the recurring run completes cleanly.
+    """
+    return {
+        "source": source,
+        "skipped": True,
+        "recurring": True,
+        "state": "skipped",
+        count_field: 0,
+        "reason": reason,
+        "observation": _quote(source, count_field, 0),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +313,19 @@ async def a2a_repair_dispatch_handler(payload: Dict[str, Any]) -> Dict[str, Any]
         or payload.get("repair_targets")
     )
     if not targets:
+        # A recurring observation-only tick reached dispatch with no per-run
+        # approval having selected any target: complete cleanly as a no-op
+        # rather than failing the unattended run (#2249). This does NOT relax
+        # the fail-closed contract — a direct call still raises below, and even
+        # a recurring tick never auto-dispatches detected ``stalled_items``
+        # (they are not forwarded here; only explicit repair targets dispatch).
+        if _is_recurring_tick(payload):
+            return _recurring_skip(
+                A2A_REPAIR_DISPATCH,
+                "dispatched_count",
+                "recurring observation-only tick: no approved repair targets "
+                "selected this run",
+            )
         raise ValueError(
             "a2a_repair_dispatch: no explicit repair targets supplied "
             "(repairs/repair_targets); refusing to dispatch. Detected "
@@ -253,6 +352,18 @@ async def evidence_verify_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     evidence = payload.get("evidence")
     if not evidence:
+        # A recurring observation-only tick that dispatched nothing has nothing
+        # to verify: complete cleanly as a no-op (#2249). But a recurring run
+        # that DID select explicit repair targets and dispatched real work must
+        # still be proven — otherwise the no-op branch would turn a genuine
+        # irreversible dispatch into a completed run without evidence (#2249 P1).
+        # A direct call is likewise unaffected and still fails closed.
+        if _is_recurring_tick(payload) and not _run_selected_action(payload):
+            return _recurring_skip(
+                EVIDENCE_VERIFY,
+                "verified_count",
+                "recurring observation-only tick: no dispatched work to verify",
+            )
         raise ValueError(
             "evidence_verify: no evidence supplied; cannot confirm the fix "
             "landed (fail closed)"
@@ -274,6 +385,18 @@ async def close_resolved_todos_handler(payload: Dict[str, Any]) -> Dict[str, Any
     """
     resolved = _as_list(payload.get("resolved_todos"))
     if not resolved:
+        # A recurring observation-only tick that resolved nothing has nothing to
+        # close: complete cleanly as a no-op (#2249). But a recurring run that
+        # selected explicit repair targets / dispatched real work must not slip
+        # past the close gate as a no-op — a real intervention has to reconcile
+        # its own resolution evidence (#2249 P1). A direct call still fails
+        # closed — a todo is never closed without upstream resolution evidence.
+        if _is_recurring_tick(payload) and not _run_selected_action(payload):
+            return _recurring_skip(
+                CLOSE_RESOLVED_TODOS,
+                "closed_count",
+                "recurring observation-only tick: no resolved todos to close",
+            )
         raise ValueError(
             "close_resolved_todos: no resolved todos supplied; nothing may be "
             "closed without upstream evidence (fail closed)"
