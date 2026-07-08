@@ -1365,12 +1365,29 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         registry = getattr(self, "provider_registry", None)
         if registry is None or not hasattr(registry, "finalize_providers"):
             return
+        before = {p.get("name") for p in (self.providers or [])}
         try:
             provider_infos = await registry.finalize_providers()
         except Exception as e:  # noqa: BLE001 - never block startup on this
             logger.warning("finalize_providers failed: %s", e)
             return
         self.providers = self._convert_providers_format(provider_infos)
+        after = {p.get("name") for p in self.providers}
+        # A late-registered route (e.g. an OpenRouter bootstrap route minted
+        # here from a management key) is absent from any model-discovery
+        # snapshot taken before this point. If discovery already populated the
+        # shared cache, subsequent ``discover_all_models(use_cache=True)`` calls
+        # hit that pre-finalize snapshot — the new vendor never gets a
+        # ``/models`` query, ``by_vendor`` omits it, and its ``model="auto"``
+        # route stays unresolved (#2247). Drop the stale cache so the next
+        # discovery re-runs over the now-complete provider list.
+        if after - before:
+            try:
+                from .model_cache import get_shared_model_cache
+
+                get_shared_model_cache().clear()
+            except Exception as e:  # noqa: BLE001 - cache clear is best-effort
+                logger.debug("Could not clear model cache after finalize: %s", e)
 
     def _check_policy(self) -> None:
         """Guard called at the top of every public generation entry point.

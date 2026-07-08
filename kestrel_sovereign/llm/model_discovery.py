@@ -50,6 +50,15 @@ class ModelDiscoveryMixin:
             cached = shared_cache.get()
             if cached is not None:
                 logger.debug("Using shared model cache")
+                # Resolve THIS instance's ``model="auto"`` routes against the
+                # cached models before returning. A route registered after the
+                # cache was populated (e.g. an OpenRouter bootstrap route minted
+                # by ``finalize_providers()``) is still ``"auto"`` on a cache
+                # hit, and the early return would otherwise skip the
+                # ``_resolve_auto_providers`` pass that only runs on a cache
+                # miss — leaving it unresolved even when the cached snapshot
+                # already contains that vendor's models (#2247).
+                self._resolve_auto_providers(cached)
                 return self._filter_models(
                     cached,
                     featured_only=featured_only,
