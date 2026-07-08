@@ -71,6 +71,11 @@ model_selector_route_title = "Select route (auth/endpoint)"
 model_selector_route_placeholder = "Route..."
 model_selector_model_title = "Select model"
 model_selector_model_placeholder = "Model..."
+model_settings_button_title = "Model settings"
+model_settings_chat_section = "Chat"
+model_settings_embeddings_section = "Embeddings"
+model_settings_embeddings_auto = "Auto — follow chat provider"
+model_settings_embeddings_explicit = "Choose provider…"
 
 # Constitution panel
 constitution_title = "Kestrel Constitution"

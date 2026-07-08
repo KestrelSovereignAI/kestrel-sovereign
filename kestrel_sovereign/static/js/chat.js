@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
+import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml, getOverlayRoot } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import bus from './ui-ext/bus.js';
 import {
@@ -79,6 +79,8 @@ function deps() {
         markdown: _deps.markdown || globalWindow.SharedMarkdown,
         kicon: _deps.kicon || globalWindow.kicon || globalThis.kicon,
         ModelSelector: _deps.ModelSelector || globalWindow.SharedModelSelector,
+        EmbeddingSelector: _deps.EmbeddingSelector || globalWindow.EmbeddingSelector,
+        ModelSettingsPopover: _deps.ModelSettingsPopover || globalWindow.ModelSettingsPopover,
         toast: _deps.toast || Toast,
         escapeHtml: _deps.escapeHtml || escapeHtml,
         commands: _deps.commands || AGENT_COMMANDS,
@@ -1121,6 +1123,9 @@ let composerModeToggle = null;  // #1257 send-while-busy mode toggle
 
 // Shared model selector instance
 let sharedModelSelector = null;
+// Embeddings section controller + the popover that houses both sections (#2264).
+let embeddingSelector = null;
+let modelSettingsPopover = null;
 // One-time guard: the selector claim auto-release bridge (capabilities:changed →
 // claims.onCapabilitiesChanged) is wired once, then forwards to whatever
 // selector is live. See loadModels(). (#2047)
@@ -4060,6 +4065,7 @@ export async function loadModels() {
     sharedModelSelector = new ModelSelector({
         providerSelectId: 'provider-selector',
         routeSelectId: 'route-selector',
+        upstreamSelectId: 'upstream-selector',
         modelSelectId: 'model-selector',
         apiEndpoint: deps().api.buildAgentUrl('/api/models'),
         currentModelEndpoint: deps().api.buildAgentUrl('/api/model/current'),
@@ -4143,6 +4149,41 @@ export async function loadModels() {
     // or temporarily seize it can (re)attach (#2047). chat.js itself stays
     // feature-agnostic: it publishes the event, it does not know who listens.
     UI.emit('model-selector:ready', { selector: sharedModelSelector });
+
+    // Embeddings section (#2263/#2264) — reads/writes the embedding-settings
+    // API and lists only embedding-capable routes surfaced by /api/models.
+    const EmbeddingSelectorCtor = deps().EmbeddingSelector;
+    if (EmbeddingSelectorCtor && el('embedding-mode-selector')) {
+        embeddingSelector = new EmbeddingSelectorCtor({
+            settingsEndpoint: deps().api.buildAgentUrl('/api/embedding/settings'),
+            modeSelectId: 'embedding-mode-selector',
+            routeSelectId: 'embedding-route-selector',
+            dimReadoutId: 'embedding-dim-readout',
+            warningId: 'embedding-dim-warning',
+            getAuthHeader: async () => await deps().api.applyAuth({}),
+            getEmbeddingRoutes: () => {
+                const routes = (sharedModelSelector?.allModelsData?.routes) || [];
+                return routes
+                    .filter(r => r.supports_embeddings)
+                    .map(r => ({ vendor: r.vendor, route: r.route }));
+            },
+        });
+        await embeddingSelector.init();
+        window._embeddingSelector = embeddingSelector;
+    }
+
+    // The single toolbar button that toggles the two-section popover. Built
+    // once; it targets the live panel across selector rebuilds. Respects the
+    // configured overlay root so scoped embeds aren't clipped (#2233).
+    const PopoverCtor = deps().ModelSettingsPopover;
+    if (PopoverCtor && !modelSettingsPopover && el('model-settings-button') && el('model-settings-panel')) {
+        modelSettingsPopover = new PopoverCtor({
+            buttonId: 'model-settings-button',
+            panelId: 'model-settings-panel',
+            getOverlayRoot: () => getOverlayRoot(),
+        });
+        window._modelSettingsPopover = modelSettingsPopover;
+    }
 }
 
 /**
