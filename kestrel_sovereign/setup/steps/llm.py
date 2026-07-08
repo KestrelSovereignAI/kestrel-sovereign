@@ -17,6 +17,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.env_file import read_env, write_env
 from kestrel_sovereign.setup.toml_file import read_toml, write_toml
@@ -34,6 +35,11 @@ class _Vendor:
     is_cloud: bool
     api_key_env: str | None
     toml_block: dict
+    # An alternate credential env var that also satisfies this vendor
+    # (e.g. OpenRouter accepts a management key from which the runtime
+    # mints a scoped inference key). ``None`` for vendors with a single
+    # accepted key.
+    alt_api_key_env: str | None = None
 
 
 _OLLAMA = _Vendor(
@@ -135,10 +141,11 @@ _GOOGLE = _Vendor(
 # Anthropic/Google/Mistral/etc. behind one key.
 _OPENROUTER = _Vendor(
     key="openrouter",
-    label="OpenRouter (multi-vendor proxy — needs OPENROUTER_API_KEY)",
+    label="OpenRouter (multi-vendor proxy — needs OPENROUTER_API_KEY or OPENROUTER_MANAGEMENT_API_KEY)",
     route_id="openrouter:api",
     is_cloud=True,
     api_key_env="OPENROUTER_API_KEY",
+    alt_api_key_env="OPENROUTER_MANAGEMENT_API_KEY",
     toml_block={
         "vendors": {
             "openrouter": {
@@ -147,6 +154,10 @@ _OPENROUTER = _Vendor(
                     "api": {
                         "adapter": "OpenRouterAdapter",
                         "api_key_env": "OPENROUTER_API_KEY",
+                        # Declare the management-key env so the runtime,
+                        # setup --check, and doctor all recognize a
+                        # management-key-only credential (#2245).
+                        "management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY",
                         "model": "auto",
                         "selection_hints": ["sonnet", "gpt", "gemini"],
                     }
@@ -178,10 +189,11 @@ def run(ctx: SetupContext) -> None:
             route = (
                 (existing_vendors.get(vendor_key) or {}).get("routes") or {}
             ).get(route_key) or {}
-            api_key_env = route.get("api_key_env")
-            if api_key_env and not existing_keys.get(api_key_env):
+            accepted = accepted_credential_envs(route_id, route)
+            if accepted and not any(existing_keys.get(name) for name in accepted):
                 ctx.block(
-                    f"{api_key_env} not set in .env (required for {route_id})"
+                    f"{' or '.join(accepted)} not set in .env "
+                    f"(required for {route_id})"
                 )
         return
 
@@ -260,11 +272,13 @@ def _detect_available_vendors(existing_keys: dict[str, str]) -> list[_Vendor]:
     # treat the vendor as available.
     cloud_priority = (_OPENROUTER, _ANTHROPIC, _OPENAI, _GOOGLE)
     for vendor in cloud_priority:
-        env_var = vendor.api_key_env
-        if not env_var:
+        # A vendor is available if any of its accepted credential env vars
+        # (primary or alternate, e.g. OpenRouter's management key) is set
+        # in either the parent shell or the .env file.
+        env_vars = [e for e in (vendor.api_key_env, vendor.alt_api_key_env) if e]
+        if not env_vars:
             continue
-        value = os.environ.get(env_var) or existing_keys.get(env_var)
-        if value:
+        if any(os.environ.get(e) or existing_keys.get(e) for e in env_vars):
             detected.append(vendor)
 
     if _is_ollama_reachable():
@@ -381,8 +395,11 @@ def _gather_api_keys(
     for vendor in selected:
         if not vendor.api_key_env:
             continue
-        current = existing_keys.get(vendor.api_key_env, "")
-        if current:
+        # A vendor's credential requirement is satisfied by any of its
+        # accepted env vars (primary or alternate). If .env already has
+        # one, there's nothing to gather.
+        accepted = [e for e in (vendor.api_key_env, vendor.alt_api_key_env) if e]
+        if any(existing_keys.get(e) for e in accepted):
             continue
         # Promote a shell-exported key into .env (quickstart only) so
         # the runtime sees it. The autodetect pass treated this vendor
@@ -390,9 +407,12 @@ def _gather_api_keys(
         # persisting the value. Interactive setup falls through to the
         # prompt — the operator chose to be asked.
         if ctx.flow is Flow.QUICKSTART:
-            from_environ = os.environ.get(vendor.api_key_env, "")
-            if from_environ:
-                updates[vendor.api_key_env] = from_environ
+            for env_var in accepted:
+                from_environ = os.environ.get(env_var, "")
+                if from_environ:
+                    updates[env_var] = from_environ
+                    break
+            if any(e in updates for e in accepted):
                 continue
         if ctx.flow is Flow.QUICKSTART:
             ctx.block(

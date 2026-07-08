@@ -97,6 +97,48 @@ def test_doctor_blocks_on_missing_api_key_env(tmp_path):
     assert any("OPENAI_API_KEY" in m for m in report.fail)
 
 
+def test_doctor_accepts_openrouter_management_key_only(tmp_path):
+    """Management-key-only OpenRouter passes doctor even when the route
+    TOML omits ``management_api_key_env`` (#2245).
+
+    setup --check accepts this shape via the vendor alt-key fallback;
+    doctor must agree or a valid setup fails ``kestrel doctor``.
+    """
+    _seed_ready(tmp_path)
+    write_env(
+        tmp_path / ".env",
+        {
+            "KESTREL_DATA_KEY": Fernet.generate_key().decode("ascii"),
+            "OPENROUTER_MANAGEMENT_API_KEY": "sk-mgmt-x",
+        },
+    )
+    write_toml(
+        tmp_path / "kestrel.toml",
+        {
+            "llm": {
+                "route_priority": ["openrouter:api"],
+                "vendors": {
+                    "openrouter": {
+                        "is_cloud": True,
+                        "routes": {
+                            "api": {
+                                "adapter": "OpenRouterAdapter",
+                                # NOTE: no management_api_key_env declared —
+                                # doctor must fall back to the vendor alt key.
+                                "api_key_env": "OPENROUTER_API_KEY",
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        deep_merge=False,
+    )
+    report = diagnose(tmp_path)
+    assert report.ready, f"fail={report.fail}"
+    assert not any("OPENROUTER_API_KEY not set" in m for m in report.fail)
+
+
 def test_doctor_blocks_when_no_agents(tmp_path):
     _seed_ready(tmp_path)
     (tmp_path / "multi_agent.toml").unlink()

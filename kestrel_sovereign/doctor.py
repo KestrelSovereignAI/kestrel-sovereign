@@ -8,8 +8,9 @@ Checks performed:
 
   - ``KESTREL_DATA_KEY`` set in ``.env``
   - ``[llm]`` section present with a non-empty ``route_priority``
-  - For each cloud route in ``route_priority``, the matching
-    ``api_key_env`` is set in ``.env``
+  - For each cloud route in ``route_priority``, one of its accepted
+    credential env vars is set in ``.env`` (e.g. OpenRouter accepts
+    either ``OPENROUTER_API_KEY`` or ``OPENROUTER_MANAGEMENT_API_KEY``)
   - At least one agent registered in ``multi_agent.toml``
   - For each registered agent, ``kestrel_prime.db`` exists
   - For each registered agent, the anchored ``constitution_hash``
@@ -29,6 +30,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
@@ -111,13 +113,16 @@ def _check_llm(
         vendor_key, _, route_key = route_id.partition(":")
         vendor = vendors.get(vendor_key) or {}
         route = (vendor.get("routes") or {}).get(route_key) or {}
-        api_key_env = route.get("api_key_env")
-        if api_key_env and not env.get(api_key_env):
+        accepted = accepted_credential_envs(route_id, route)
+        if not accepted:
+            continue
+        satisfied = next((name for name in accepted if env.get(name)), None)
+        if satisfied:
+            report.ok.append(f"{satisfied} set for {route_id}")
+        else:
             report.fail.append(
-                f"{api_key_env} not set in .env (required for {route_id})"
+                f"{' or '.join(accepted)} not set in .env (required for {route_id})"
             )
-        elif api_key_env:
-            report.ok.append(f"{api_key_env} set for {route_id}")
 
 
 def _check_multi_agent(
