@@ -653,7 +653,7 @@ class MemoryFeature(Feature):
             formatted.append({
                 "content": content,
                 "role": role,
-                "score": mem.get("score", 0),
+                "score": mem.get("retrieval_score", mem.get("score", 0)),
                 "emotional_valence": meta.get("emotional_valence", 0),
                 "importance": meta.get("importance", 0.5),
                 "timestamp": mem.get("timestamp", ""),

@@ -743,13 +743,26 @@ class ContextManager:
                     emotional_context=emotional_context,
                     min_score=retrieval_cfg["memory_min_score"],
                     min_relevance=retrieval_cfg["memory_min_relevance"],
+                    read_only=True,
+                    return_details=True,
                 )
                 if memories:
-                    memory_tokens = self.counter.count(memories)
+                    from kestrel_sovereign.agent.memory_manager import RetrievedMemoryBlock
+
+                    memory_text = (
+                        memories.text
+                        if isinstance(memories, RetrievedMemoryBlock)
+                        else memories
+                    )
+                    memory_tokens = self.counter.count(memory_text)
                     if budget.can_fit("memories", memory_tokens):
                         budget.use("memories", memory_tokens)
-                        dynamic_blocks.append(f"<memories>\n{memories}\n</memories>")
-                        memory_count = memories.count("[Memory")
+                        dynamic_blocks.append(f"<memories>\n{memory_text}\n</memories>")
+                        memory_count = memory_text.count("[Memory")
+                        if isinstance(memories, RetrievedMemoryBlock):
+                            await self.memory_retriever.record_accesses(
+                                memories.message_ids, self.agent_id
+                            )
                         logger.debug(f"Added {memory_count} memories to dynamic context")
             except Exception as e:
                 logger.warning(f"Memory retrieval failed: {e}")

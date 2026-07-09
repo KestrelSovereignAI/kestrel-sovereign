@@ -37,7 +37,7 @@ import logging
 import math
 import struct
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional, Sequence, Tuple
+from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
 from .memory_models import MemoryMetadata
@@ -367,6 +367,11 @@ class MemoryRetriever:
         self._access_update_tasks.add(task)
         task.add_done_callback(self._access_update_tasks.discard)
         return task
+
+    async def record_accesses(self, message_ids: Iterable[int], agent_id: str) -> None:
+        """Record rehearsal only for memories a caller actually surfaced."""
+        for message_id in dict.fromkeys(message_ids):
+            self._schedule_access_update(message_id, agent_id)
 
     async def drain_access_updates(self, *, cancel: bool = False) -> None:
         """Wait for scheduled access-count updates before storage lifecycle changes."""

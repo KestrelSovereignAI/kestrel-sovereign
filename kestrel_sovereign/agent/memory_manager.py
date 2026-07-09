@@ -7,6 +7,7 @@ Extracted from ContextManager to improve modularity and maintainability.
 
 import html
 import logging
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import uuid
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 # compaction). Matches the prior no-limit get_full_history() scope while still
 # bounding a pathological read.
 _COMPACT_HISTORY_LIMIT = 1_000_000
+
+
+@dataclass(frozen=True)
+class RetrievedMemoryBlock:
+    """Rendered memories plus the rows that were actually rendered."""
+
+    text: str
+    message_ids: tuple[int, ...]
 
 
 class MemoryManager:
@@ -121,7 +130,8 @@ class MemoryManager:
         min_score: Optional[float] = None,
         min_relevance: Optional[float] = None,
         read_only: bool = False,
-    ) -> Optional[str]:
+        return_details: bool = False,
+    ) -> Optional[str | RetrievedMemoryBlock]:
         """
         Retrieve emotionally-weighted memories.
 
@@ -140,6 +150,9 @@ class MemoryManager:
                 underlying ``MemoryRetriever`` default (0.1).
             read_only: When True, run the same retrieval and formatting path
                 without scheduling access-count updates.
+            return_details: Return the rendered block together with the IDs of
+                rows that fit the token budget. Context assembly uses this to
+                apply rehearsal accounting only after insertion succeeds.
         """
         if not self.memory_retriever:
             return None
@@ -169,8 +182,10 @@ class MemoryManager:
                 retrieve_kwargs["min_score"] = min_score
             if min_relevance is not None:
                 retrieve_kwargs["min_relevance"] = min_relevance
-            if read_only:
-                retrieve_kwargs["read_only"] = True
+            # Selection happens below, after formatting and token accounting.
+            # Suppress the retriever's eager rehearsal writes so over-budget
+            # rows do not gain strength merely for being candidates.
+            retrieve_kwargs["read_only"] = True
             memories = await self.memory_retriever.retrieve(**retrieve_kwargs)
 
             if not memories:
@@ -184,9 +199,14 @@ class MemoryManager:
             # model reads surfaced memories with provenance. This is what
             # lets ``MemoryRetriever`` include user-role rows again (the
             # over-broad #271 filter was unblocked by #1481).
-            parts = ["--- RELEVANT MEMORIES (from past conversations) ---"]
-            parts.append("NOTE: These are retrieved from earlier conversations, not the current session.\n")
-            for i, mem in enumerate(memories, 1):
+            header = [
+                "--- RELEVANT MEMORIES (from past conversations) ---",
+                "NOTE: These are retrieved from earlier conversations, not the current session.\n",
+            ]
+            footer = "--- END MEMORIES ---"
+            parts = list(header)
+            rendered_ids: list[int] = []
+            for mem in memories:
                 content = mem.get("content", "")
                 meta = mem.get("metadata", {})
                 created_at = mem.get("created_at", "unknown")
@@ -247,14 +267,38 @@ class MemoryManager:
                 # has had a NOT NULL role since the initial schema).
                 role_prefix = f"{role.capitalize()}: " if role else ""
 
-                parts.append(
-                    f"[Memory {i}] ({created_at}) {role_prefix}{content}\n"
+                display_index = len(parts) - len(header) + 1
+                rendered = (
+                    f"[Memory {display_index}] ({created_at}) {role_prefix}{content}\n"
                     f"  Importance: {meta.get('importance', 0.5):.1f}, "
                     f"Emotion: {meta.get('emotional_valence', 0):.1f}"
                 )
-            parts.append("--- END MEMORIES ---")
+                candidate = "\n".join([*parts, rendered, footer])
+                candidate_tokens = counter.count(candidate)
+                if (
+                    isinstance(candidate_tokens, (int, float))
+                    and candidate_tokens > max_tokens
+                ):
+                    continue
+                parts.append(rendered)
+                message_id = mem.get("id")
+                if isinstance(message_id, int):
+                    rendered_ids.append(message_id)
 
-            return "\n".join(parts)
+            if len(parts) == len(header):
+                return None
+
+            parts.append(footer)
+            text = "\n".join(parts)
+
+            if not read_only and rendered_ids:
+                await self.memory_retriever.record_accesses(
+                    rendered_ids, self.agent_id
+                )
+
+            if return_details:
+                return RetrievedMemoryBlock(text=text, message_ids=tuple(rendered_ids))
+            return text
 
         except (ConnectionError, TimeoutError) as e:
             logger.error(f"Storage connection error during memory retrieval: {e}", exc_info=True)

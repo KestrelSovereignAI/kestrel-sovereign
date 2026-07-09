@@ -591,6 +591,48 @@ class TestRetrieveMemories:
         assert "Test memory" in result
 
     @pytest.mark.asyncio
+    async def test_retrieve_honors_token_budget_and_reports_rendered_ids(self):
+        storage = MagicMock()
+        memory_retriever = AsyncMock()
+        memory_retriever.retrieve.return_value = [
+            {
+                "id": 11,
+                "content": "short memory",
+                "metadata": {"importance": 0.5},
+                "created_at": "unknown",
+            },
+            {
+                "id": 12,
+                "content": "x" * 200,
+                "metadata": {"importance": 0.5},
+                "created_at": "unknown",
+            },
+        ]
+        counter = MagicMock()
+        counter.count.side_effect = len
+        mm = MemoryManager(storage, memory_retriever=memory_retriever)
+
+        details = await mm.retrieve_memories(
+            "query",
+            max_tokens=230,
+            counter=counter,
+            read_only=True,
+            return_details=True,
+        )
+
+        assert details is not None
+        assert details.message_ids == (11,)
+        assert "short memory" in details.text
+        assert "x" * 20 not in details.text
+        memory_retriever.retrieve.assert_awaited_once_with(
+            query="query",
+            agent_id=None,
+            emotional_context=None,
+            limit=5,
+            read_only=True,
+        )
+
+    @pytest.mark.asyncio
     async def test_retrieve_returns_none_when_no_retriever(self):
         """Should return None if memory_retriever not available."""
         storage = MagicMock()
