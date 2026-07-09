@@ -454,6 +454,39 @@ class TestMemoryRetriever:
         assert [row["id"] for row in results] == [8]
 
     @pytest.mark.asyncio
+    async def test_salient_candidate_outside_recent_window_can_surface(self):
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [
+            {
+                "id": index,
+                "role": "assistant",
+                "content": f"routine status row {index}",
+                "metadata": {},
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+            for index in range(2, 1002)
+        ]
+        old_important = {
+            "id": 1,
+            "role": "user",
+            "content": "Sailing on Lake Michigan is my defining hobby.",
+            "metadata": {"importance": 0.95, "decay_protected": True},
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }
+        store.get_salient_memory_candidates.return_value = [old_important]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="sailing hobby",
+            agent_id="test-agent",
+            min_score=0.0,
+            read_only=True,
+        )
+
+        assert 1 in {row["id"] for row in results}
+        store.get_salient_memory_candidates.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_retrieve_rejects_orthogonal_vector_at_default_relevance(self):
         store = AsyncMock()
         store.embedding_service = MagicMock()
@@ -974,6 +1007,37 @@ class TestMemoryConsolidatorEpisodeCreation:
             f"Expected at least 1 episode from 5 unenriched messages, "
             f"got {len(episodes)}; skipped={skipped}"
         )
+
+    @pytest.mark.asyncio
+    async def test_automatic_episode_summary_contains_conversation_topics(self, _now):
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(5, date=date)
+        rows = [
+            (
+                row[0],
+                "We discussed sailing on Lake Michigan and repairing the sailboat",
+                row[2],
+                row[3],
+                row[4],
+            )
+            for row in rows
+        ]
+        mock_db = AsyncMock()
+        mock_db.fetchall.return_value = rows
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
+
+        episodes, skipped = await MemoryConsolidator(
+            db=mock_db, agent_id="did:test:agent1"
+        )._create_episodes()
+
+        assert not skipped
+        assert len(episodes) == 1
+        searchable_text = f"{episodes[0].title} {episodes[0].summary}".lower()
+        assert "sailing" in searchable_text
+        assert "michigan" in searchable_text
 
     @pytest.mark.asyncio
     async def test_enriched_high_importance_messages_produce_episodes(self, _now):

@@ -193,6 +193,39 @@ class MemoryRetriever:
         # Note: AsyncConversationStore's get_conversation_history doesn't take agent_id
         # because it's already scoped via self.agent_id in the store
         history = await self.conversations.get_conversation_history(limit=1000)
+        query_embedding = await self._embed_query(query)
+
+        # Recent history is only one candidate source. Pinned and important
+        # rows must remain recallable after they age beyond that window.
+        try:
+            salient = await self.conversations.get_salient_memory_candidates(
+                limit=max(100, limit * 10)
+            )
+            if not isinstance(salient, list):
+                salient = []
+        except Exception as exc:  # noqa: BLE001 - optional candidate source
+            logger.debug("Salient memory candidate generation unavailable: %s", exc)
+            salient = []
+        lexical: List[Dict[str, Any]] = []
+        if query_embedding is None:
+            try:
+                # Encrypted content cannot use plaintext SQL FTS. The lexical
+                # fallback deliberately scans the corpus in bounded pages;
+                # vector-capable routes avoid that O(N) fallback entirely.
+                lexical = await self.conversations.get_lexical_memory_candidates(
+                    query, limit=max(100, limit * 10)
+                )
+                if not isinstance(lexical, list):
+                    lexical = []
+            except Exception as exc:  # noqa: BLE001 - lexical fallback is optional
+                logger.debug("Lexical memory candidate generation unavailable: %s", exc)
+                lexical = []
+        by_id = {
+            str(row.get("id")): row
+            for row in [*history, *salient, *lexical]
+            if row.get("id") is not None
+        }
+        history = list(by_id.values())
 
         if not history:
             return []
@@ -209,8 +242,6 @@ class MemoryRetriever:
         # pay an Ollama round-trip per row. Any failure → None, which
         # ``_score_semantic`` reads as "fall back to keyword overlap"
         # for every row in this call.
-        query_embedding = await self._embed_query(query)
-
         # #1477 — only compare rows stamped with the current embedding
         # profile id. Cross-profile rows return as absent from the vector
         # signal and naturally fall through to keyword overlap.
@@ -241,8 +272,27 @@ class MemoryRetriever:
                 query_embedding=query_embedding,
                 agent_id=agent_id,
                 current_profile_id=current_profile_id,
-                k=len(history),
+                k=max(200, limit * 20),
             )
+
+            # Vector kNN searches the whole live corpus. Hydrate older hits so
+            # reranking is not constrained to recent/salient seed rows.
+            missing_vector_ids = [
+                int(row_id) for row_id in semantic_similarities
+                if row_id not in by_id and str(row_id).isdigit()
+            ]
+            if missing_vector_ids:
+                try:
+                    vector_rows = await self.conversations.get_messages_by_ids(
+                        missing_vector_ids
+                    )
+                except Exception as exc:  # noqa: BLE001 - vector hydration fallback
+                    logger.debug("Could not hydrate vector memory candidates: %s", exc)
+                    vector_rows = []
+                if isinstance(vector_rows, list):
+                    for row in vector_rows:
+                        by_id[str(row.get("id"))] = row
+                    history = list(by_id.values())
 
         # SQLAlchemy/vector backend unavailable (in-memory SQLite, from_pool,
         # migration in progress, optional pgvector package missing, etc.) falls
@@ -640,6 +690,7 @@ class MemoryRetriever:
             filter_kwargs: Dict[str, Any] = {
                 "agent_id": agent_id,
                 "deleted_at": None,
+                "archived_at": None,
             }
             if current_profile_id is not None:
                 filter_kwargs["embedding_profile_id"] = current_profile_id

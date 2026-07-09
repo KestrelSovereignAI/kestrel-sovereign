@@ -2949,7 +2949,7 @@ class AsyncConversationStore:
         rows = await self.db.fetchall(
             f"SELECT id, role, content, metadata, created_at FROM conversation_history "
             f"WHERE id IN ({placeholders}) AND agent_id = ? "
-            f"AND deleted_at IS NULL ORDER BY id ASC",
+            f"AND deleted_at IS NULL AND archived_at IS NULL ORDER BY id ASC",
             (*message_ids, self.agent_id)
         )
 
@@ -2972,6 +2972,106 @@ class AsyncConversationStore:
             }
             history.append(entry)
         return history
+
+    async def get_salient_memory_candidates(
+        self, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Return pinned/high-importance rows from across the live corpus."""
+        if self.db.backend_type == "postgres":
+            salience_order = """
+                 CASE WHEN (metadata::jsonb ->> 'decay_protected')::boolean
+                      THEN 1 ELSE 0 END DESC,
+                 COALESCE((metadata::jsonb ->> 'importance')::double precision, 0) DESC,"""
+        else:
+            salience_order = """
+                 CASE WHEN json_extract(metadata, '$.decay_protected') = 1
+                      THEN 1 ELSE 0 END DESC,
+                 COALESCE(CAST(json_extract(metadata, '$.importance') AS REAL), 0) DESC,"""
+        rows = await self.db.fetchall(
+            f"""SELECT id, role, content, metadata, created_at, rendered_content
+               FROM conversation_history
+               WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL
+               ORDER BY {salience_order}
+                 id DESC
+               LIMIT ?""",
+            (self.agent_id, max(1, int(limit))),
+        )
+        candidates: List[Dict[str, Any]] = []
+        for row_id, role, encrypted_content, raw_meta, created_at, rendered in rows:
+            try:
+                meta = json.loads(raw_meta) if raw_meta else {}
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            content, _ = self._decrypt_with_fallback(encrypted_content, meta)
+            content, _ = await self._resolve_canonical(
+                row_id, role, meta, content, rendered
+            )
+            cleaned_meta = remove_enc_flag(meta)
+            cleaned_meta.pop("key_version", None)
+            candidates.append({
+                "id": row_id,
+                "role": role,
+                "content": content,
+                "metadata": cleaned_meta,
+                "created_at": created_at,
+            })
+        return candidates
+
+    async def get_lexical_memory_candidates(
+        self, query: str, limit: int = 100, page_size: int = 1000
+    ) -> List[Dict[str, Any]]:
+        """Return bounded lexical top-k while scanning the full live corpus."""
+        query_tokens = set(_tokenize_for_search(_strip_search_wrappers(query)))
+        if not query_tokens:
+            return []
+        ranked: List[Tuple[float, int, Dict[str, Any]]] = []
+        before_id: Optional[int] = None
+        while True:
+            cursor_clause = " AND id < ?" if before_id is not None else ""
+            params: Tuple[Any, ...] = (
+                (self.agent_id, before_id, page_size)
+                if before_id is not None
+                else (self.agent_id, page_size)
+            )
+            rows = await self.db.fetchall(
+                "SELECT id, role, content, metadata, created_at, rendered_content "
+                "FROM conversation_history WHERE agent_id = ? "
+                "AND deleted_at IS NULL AND archived_at IS NULL"
+                f"{cursor_clause} ORDER BY id DESC LIMIT ?",
+                params,
+            )
+            if not rows:
+                break
+            for row_id, role, encrypted_content, raw_meta, created_at, rendered in rows:
+                try:
+                    meta = json.loads(raw_meta) if raw_meta else {}
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+                content, _ = self._decrypt_with_fallback(encrypted_content, meta)
+                content, _ = await self._resolve_canonical(
+                    row_id, role, meta, content, rendered
+                )
+                candidate_tokens = set(
+                    _tokenize_for_search(_strip_search_wrappers(content or ""))
+                )
+                overlap = len(query_tokens & candidate_tokens) / len(query_tokens)
+                if overlap <= 0:
+                    continue
+                cleaned_meta = remove_enc_flag(meta)
+                cleaned_meta.pop("key_version", None)
+                ranked.append((overlap, int(row_id), {
+                    "id": row_id,
+                    "role": role,
+                    "content": content,
+                    "metadata": cleaned_meta,
+                    "created_at": created_at,
+                }))
+            ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            del ranked[max(1, int(limit)):]
+            before_id = int(rows[-1][0])
+            if len(rows) < page_size:
+                break
+        return [item[2] for item in ranked]
 
     async def search_messages_by_content(
         self,

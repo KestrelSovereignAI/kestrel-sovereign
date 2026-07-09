@@ -13,8 +13,9 @@ unimportant details fade.
 """
 import logging
 import json
+import re
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -29,6 +30,7 @@ _SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
 from .memory_models import MemoryEpisode, TemporalPattern
 from .async_database import AsyncDatabase
 from .memory_retriever import calculate_decay
+from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
 
@@ -225,8 +227,9 @@ class MemoryConsolidator:
         # down messages so nightly runs don't duplicate prior work (#1489 P2).
         covered_message_ids = await self._covered_message_ids()
 
-        # Group messages by date
-        by_date: Dict[str, List[Dict]] = defaultdict(list)
+        # Prefer explicit conversation sessions. Legacy rows without a session
+        # ID retain the date bucket as a bounded fallback.
+        clusters: Dict[str, List[Dict]] = defaultdict(list)
         for row in rows:
             msg_id, content, metadata, created_at, role = row
 
@@ -246,7 +249,10 @@ class MemoryConsolidator:
             except (ValueError, TypeError):
                 continue
 
-            by_date[date_key].append({
+            if metadata.get("type") in {"new_session", "compaction", "compression"}:
+                continue
+            cluster_key = str(metadata.get("session_id") or f"date:{date_key}")
+            clusters[cluster_key].append({
                 "id": msg_id,
                 "content": content,
                 "metadata": metadata,
@@ -254,8 +260,15 @@ class MemoryConsolidator:
                 "role": role,
             })
 
-        # For each day, check if there's a significant cluster
-        for date_key, day_messages in by_date.items():
+        # For each session/date fallback, check if there's a significant cluster
+        for cluster_key, day_messages in clusters.items():
+            first_created = day_messages[0].get("created_at")
+            try:
+                date_key = datetime.fromisoformat(
+                    str(first_created).replace("Z", "+00:00")
+                ).strftime("%Y-%m-%d")
+            except (TypeError, ValueError):
+                date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             original_count = len(day_messages)
             if original_count < self.MIN_EPISODE_MESSAGES:
                 report_skipped.append(
@@ -573,7 +586,8 @@ class MemoryConsolidator:
         elif avg_intensity > 0.6:
             return "An emotional conversation"
         else:
-            return "A memorable exchange"
+            topics = self._extract_episode_topics(messages, limit=3)
+            return f"Discussion of {', '.join(topics)}" if topics else "A memorable exchange"
 
     def _generate_episode_summary(
         self,
@@ -585,11 +599,48 @@ class MemoryConsolidator:
         message_count = len(messages)
         user_count = len(user_messages)
 
-        # Simple summary (could be LLM-generated for richer summaries)
+        topics = self._extract_episode_topics(messages, limit=8)
+        topic_sentence = (
+            f" Topics: {', '.join(topics)}." if topics else ""
+        )
         return (
             f"A conversation with {message_count} messages "
-            f"({user_count} from user). Emotional trajectory: {emotional_arc}."
+            f"({user_count} from user).{topic_sentence} "
+            f"Emotional trajectory: {emotional_arc}."
         )
+
+    @staticmethod
+    def _extract_episode_topics(messages: List[Dict], limit: int = 8) -> List[str]:
+        """Extract bounded topic terms without persisting rendered context.
+
+        Message IDs remain the provenance trail; summaries contain only
+        normalized terms from canonical content, avoiding transport wrappers
+        and verbatim prompt-injection text.
+        """
+        stop_words = {
+            "about", "after", "again", "also", "and", "are", "been", "but",
+            "can", "could", "did", "for", "from", "have", "her", "him", "his",
+            "how", "into", "just", "not", "our", "she", "that", "the", "their",
+            "them", "then", "there", "they", "this", "was", "were", "what",
+            "when", "where", "which", "with", "would", "you", "your", "context",
+            "conversation", "conversations", "document", "documents", "end",
+            "memories", "memory", "relevant", "retrieved",
+        }
+        counts: Counter[str] = Counter()
+        first_seen: Dict[str, int] = {}
+        position = 0
+        for message in messages:
+            content = str(message.get("content") or "")
+            if message.get("role") == "user":
+                content = extract_raw_user_content(content)
+            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9'-]{2,}", content.lower()):
+                if token in stop_words:
+                    continue
+                counts[token] += 1
+                first_seen.setdefault(token, position)
+                position += 1
+        ranked = sorted(counts, key=lambda term: (-counts[term], first_seen[term], term))
+        return ranked[:limit]
 
     async def _save_episode(self, episode: MemoryEpisode) -> None:
         """Save episode to database and optionally to the Knowledge Graph."""
