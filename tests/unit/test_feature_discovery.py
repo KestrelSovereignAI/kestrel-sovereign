@@ -382,6 +382,59 @@ class TestEntryPointDiscovery:
 
         assert len(classes) == 0
 
+    def test_duplicate_external_class_names_fail_with_owners(self):
+        """Enumeration order must never decide which distribution wins."""
+        from kestrel_sovereign.features import DuplicateFeatureEntryPointError
+
+        first = MagicMock()
+        first.name = "ReflectionFeature"
+        first.value = "kestrel_feature_reflection:ReflectionFeature"
+        first.dist.name = "kestrel-feature-reflection"
+        second = MagicMock()
+        second.name = "ReflectionFeature"
+        second.value = "kestrel_feature_intelligence:ReflectionFeature"
+        second.dist.name = "kestrel-feature-intelligence"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [second, first]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ), pytest.raises(DuplicateFeatureEntryPointError) as exc:
+            discover_entrypoint_feature_classes()
+
+        message = str(exc.value)
+        assert "ReflectionFeature" in message
+        assert "kestrel-feature-intelligence" in message
+        assert "kestrel-feature-reflection" in message
+        assert "uninstall" in message
+        first.load.assert_not_called()
+        second.load.assert_not_called()
+
+    def test_duplicate_metadata_for_same_owner_is_not_a_class_conflict(self):
+        """Layered/editable sys.path duplication must not impersonate two owners."""
+        class ExternalFeature(Feature):
+            @property
+            def tool_description(self):
+                return "External"
+
+            async def initialize(self):
+                pass
+
+        first = self._make_entry_point("ExternalFeature", ExternalFeature)
+        second = self._make_entry_point("ExternalFeature", ExternalFeature)
+        first.dist.name = second.dist.name = "one-distribution"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [first, second]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            classes = discover_entrypoint_feature_classes()
+
+        assert classes == {"ExternalFeature": ExternalFeature}
+
     def test_local_features_win_on_duplicate(self):
         """Test that local features take priority over entry_point features on name collision."""
         class DuplicateFeature(Feature):

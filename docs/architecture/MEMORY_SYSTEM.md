@@ -35,11 +35,9 @@ privacy: public
 >
 > Storage update: SQLAlchemy-backed vector storage exists for saved
 > items, document chunks, and conversation history `embedding_vec`
-> columns. Document RAG and saved-item search can use the shared vector
-> backend. The cognitive `MemoryRetriever` still uses keyword/concept
-> overlap for its semantic component in the current code; the
-> conversation-history vector column is storage groundwork for the
-> follow-up cosine path. Saved-item and RAG embedding generation now
+> columns. The cognitive `MemoryRetriever` uses profile-isolated cosine
+> similarity when embeddings are available and calibrated lexical/concept
+> overlap as its fallback. Saved-item and RAG embedding generation now
 > routes through the active LLM provider when it advertises embeddings
 > (OpenAI, Google/Gemini, Vertex, Ollama in tree) and falls back to
 > keyword/BM25/LIKE retrieval when the active route cannot embed.
@@ -409,9 +407,9 @@ below).
 ### Archive Threshold
 
 During consolidation, memories with strength below
-`DECAY_ARCHIVE_THRESHOLD` (10%) are marked as archived in their metadata.
-Archived memories are **not deleted** -- they are flagged with
-`archived: true`, `archived_at`, and `archived_strength`. They no longer
+`DECAY_ARCHIVE_THRESHOLD` (10%) receive an `archived_at` column value.
+Archived memories are **not deleted**. The column is the sole archive-state
+source of truth; metadata retains `archived_strength` as decay evidence. They no longer
 appear in normal retrieval but remain accessible for compliance, export,
 or explicit recall.
 
@@ -427,7 +425,7 @@ by total score.
 
 | Factor | Weight | What It Measures |
 |--------|--------|-----------------|
-| Semantic | **0.25** | Keyword overlap + concept match from associative linker |
+| Semantic | **0.25** | Profile-isolated cosine, or lexical overlap, plus concept expansion |
 | Emotional | **0.20** | Mood-congruent recall (valence matching) |
 | Importance | **0.20** | Importance score from metadata |
 | Recency | **0.15** | Ebbinghaus decay curve |
@@ -438,7 +436,8 @@ Total = `semantic * 0.25 + emotional * 0.20 + importance * 0.20 + recency * 0.15
 
 ### Semantic Score (25%)
 
-Combines keyword overlap with concept expansion:
+Uses positive cosine relevance when matching-profile embeddings are available,
+otherwise lexical overlap. Either core signal combines with concept expansion:
 
 ```
 semantic = keyword_score * 0.7 + concept_score * 0.3
@@ -451,10 +450,9 @@ semantic = keyword_score * 0.7 + concept_score * 0.3
   expanded with associated concepts from the knowledge graph. Matching
   concepts in the message content boost this score.
 
-The `conversation_history.embedding_vec` column and SQLAlchemy mapping
-are present for the staged vector/cosine implementation, but current
-`MemoryRetriever` scoring still uses keyword/concept overlap for this
-factor.
+Orthogonal and negative cosine values map to zero relevance. An independent
+semantic floor rejects unrelated candidates before emotion, importance,
+recency, access, and certainty rerank the eligible set.
 
 ### Emotional Score (20%)
 
@@ -600,7 +598,7 @@ during sleep. It performs three operations.
 Related messages are grouped into narrative episodes:
 
 - Scans the last 30 days of conversation history
-- Groups messages by date
+- Groups messages by explicit session, with date buckets only for legacy rows
 - Identifies clusters with high emotional intensity (>= 0.3) or high
   importance (>= 0.6)
 - Requires at least 3 messages per cluster (`MIN_EPISODE_MESSAGES`)
@@ -610,7 +608,7 @@ Each episode is assigned:
 | Field | Example |
 |-------|---------|
 | `title` | "A joyful moment", "Working through sadness", "Opening up" |
-| `summary` | "A conversation with 12 messages (5 from user). Emotional trajectory: difficult start -> positive resolution." |
+| `summary` | "A conversation with 12 messages (5 from user). Topics: sailing, michigan, repair. Emotional trajectory: difficult start -> positive resolution." |
 | `emotional_arc` | "generally positive", "challenging throughout", "emotional journey" |
 
 Episode titles are generated from emotional themes:
@@ -623,7 +621,7 @@ Episode titles are generated from emotional themes:
 | `sadness` with high intensity | "Working through sadness" |
 | `anxiety` detected | "Processing worries" |
 | High intensity (>0.6) | "An emotional conversation" |
-| Default | "A memorable exchange" |
+| Default | A normalized topic-bearing title, or "A memorable exchange" when no topic terms exist |
 
 Emotional arcs describe the trajectory across the conversation:
 
@@ -657,11 +655,10 @@ Scans all conversation history and archives messages where:
 - The message is not `decay_protected`
 - The message is not already archived
 
-Archived messages get metadata flags:
+Archived messages get `conversation_history.archived_at = <timestamp>` plus
+decay evidence in metadata:
 ```json
 {
-  "archived": true,
-  "archived_at": "2026-01-15T03:00:00+00:00",
   "archived_strength": 0.08
 }
 ```
