@@ -13,7 +13,7 @@ import json
 import logging
 import pytest
 import pytest_asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.tools.result import ToolResultStatus
@@ -1588,6 +1588,193 @@ class TestRunnerCronReload:
 # =========================================================================
 # github_pr_watch handler (#1618)
 # =========================================================================
+
+
+def _discovery_clean():
+    return {
+        "summary": "clean",
+        "findings": [],
+    }
+
+
+def _discovery_finding(**overrides):
+    base = {
+        "repo": "owner/name",
+        "kind": "red_ci",
+        "pr": 2281,
+        "branch": "feature/wake-discovery",
+        "check": "unit",
+        "severity": "high",
+        "status": "failure",
+        "title": "Unit tests are red",
+        "html_url": "https://github.com/owner/name/actions/runs/1",
+    }
+    base.update(overrides)
+    return {"summary": "1 finding", "findings": [base]}
+
+
+class TestEcosystemDiscoveryWatchHandler:
+
+    @pytest.mark.asyncio
+    async def test_clean_scan_does_not_signal(self, feature):
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_clean())
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        )
+
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["reason"] == "clean"
+        assert data["findings_count"] == 0
+        feature.agent.dispatcher.enqueue_signal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_default_scan_stale_work_resolves_loaded_talon_tool(self, feature):
+        from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
+
+        talon = TalonCoordinatorFeature(feature.agent)
+        talon._reload_persisted_jobs = MagicMock()
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        talon._jobs = {
+            "job-1": {
+                "status": "running",
+                "started_at": old,
+                "repo": "owner/name",
+                "issue": 2281,
+            },
+        }
+        feature.agent.features = {"TalonCoordinatorFeature": talon}
+        feature.agent.hooks_manager = None
+        feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+
+        out = await feature._run_ecosystem_discovery_watch({"repo": "owner/name"})
+
+        data = json.loads(out)
+        assert data["signaled"] is True
+        assert data["reason"] == "new_findings"
+        assert data["findings_count"] == 1
+        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+        findings = json.loads(signal.payload["findings"])
+        assert findings[0]["repo"] == "owner/name"
+        assert findings[0]["kind"] == "talon_job"
+        assert findings[0]["number"] == "2281"
+        assert findings[0]["suggested_gate"] == "govern_stalled_work_rescue"
+
+    @pytest.mark.asyncio
+    async def test_new_finding_emits_signal_with_payload(self, feature):
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_finding())
+        feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        )
+
+        data = json.loads(out)
+        assert data["signaled"] is True
+        assert data["reason"] == "new_findings"
+        assert data["findings_count"] == 1
+        feature.agent.dispatcher.enqueue_signal.assert_called_once()
+        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+        assert signal.source == "ecosystem.discovery_findings"
+        findings = json.loads(signal.payload["findings"])
+        assert findings[0]["repo"] == "owner/name"
+        assert findings[0]["number"] == "2281"
+        assert findings[0]["severity"] == "high"
+        assert findings[0]["suggested_gate"] == "verify_ci_then_dispatch_fix"
+        feature._save_ecosystem_discovery_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unchanged_finding_does_not_signal(self, feature):
+        from kestrel_sovereign.signals.sources.ecosystem_discovery import (
+            normalize_discovery_result,
+            state_to_json,
+        )
+
+        state = normalize_discovery_result(_discovery_finding())
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_finding())
+        feature._load_ecosystem_discovery_state = AsyncMock(
+            return_value=(state.fingerprint, json.loads(state_to_json(state)))
+        )
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        )
+
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["reason"] == "no_change"
+        feature.agent.dispatcher.enqueue_signal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_changed_finding_emits_signal(self, feature):
+        from kestrel_sovereign.signals.sources.ecosystem_discovery import (
+            normalize_discovery_result,
+            state_to_json,
+        )
+
+        previous = normalize_discovery_result(_discovery_finding(status="failure"))
+        feature._lookup_and_run_tool = AsyncMock(
+            return_value=_discovery_finding(status="timed_out", job="e2e")
+        )
+        feature._load_ecosystem_discovery_state = AsyncMock(
+            return_value=(previous.fingerprint, json.loads(state_to_json(previous)))
+        )
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        )
+
+        data = json.loads(out)
+        assert data["signaled"] is True
+        assert data["reason"] == "changed_findings"
+        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+        findings = json.loads(signal.payload["findings"])
+        assert findings[0]["status"] == "timed_out"
+        assert findings[0]["job"] == "e2e"
+
+    @pytest.mark.asyncio
+    async def test_resolved_finding_emits_one_resolution_signal(self, feature):
+        from kestrel_sovereign.signals.sources.ecosystem_discovery import (
+            normalize_discovery_result,
+            state_to_json,
+        )
+
+        previous = normalize_discovery_result(_discovery_finding())
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_clean())
+        feature._load_ecosystem_discovery_state = AsyncMock(
+            return_value=(previous.fingerprint, json.loads(state_to_json(previous)))
+        )
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+
+        out = await feature._run_ecosystem_discovery_watch(
+            {"tool": "scan_stale_work", "repo": "owner/name"}
+        )
+
+        data = json.loads(out)
+        assert data["signaled"] is True
+        assert data["reason"] == "resolved_findings"
+        assert data["findings_count"] == 0
+        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+        previous_findings = json.loads(signal.payload["previous_findings"])
+        assert previous_findings[0]["repo"] == "owner/name"
+        feature._save_ecosystem_discovery_state.assert_awaited_once()
 
 
 _GH_TOKEN = (

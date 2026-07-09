@@ -125,6 +125,12 @@ _DEFAULT_PERMISSION_BY_TOOL: Dict[str, Dict[str, PermissionLevel]] = {
         "delete_conversation": PermissionLevel.ALWAYS_ASK,
         "delete_message_by_id": PermissionLevel.ALWAYS_ASK,
     },
+    "TalonCoordinatorFeature": {
+        # Read-only discovery must run unattended from the scheduler so
+        # ecosystem_discovery_watch can wake cognition on stale work. Talon
+        # dispatch/claim/verification tools remain feature-level ASK.
+        "scan_stale_work": PermissionLevel.ALLOW,
+    },
 }
 
 

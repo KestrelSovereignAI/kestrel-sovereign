@@ -100,6 +100,7 @@ def test_all_cron_tasks_are_classified():
         "wait_reconcile",  # #1860 Wave 2 — generic wait→signal reconciler
         "restart_coordinator",  # #1512
         "github_pr_watch",  # #1618
+        "ecosystem_discovery_watch",  # #2281
     ])
 
 
@@ -121,6 +122,7 @@ def test_action_vs_artifact_split_matches_design():
         "wait_reconcile",  # #1860 Wave 2 — polls waitables, emits signals, no LLM
         "restart_coordinator",  # #1512 — scans, spawns subprocess
         "github_pr_watch",  # #1618 — polls a PR, emits signal on change
+        "ecosystem_discovery_watch",  # #2281 — polls discovery, emits signal on findings
     }
     assert by_mode[SignalMode.ARTIFACT] == {
         "morning_signal",
