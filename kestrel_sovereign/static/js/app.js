@@ -25,7 +25,7 @@ import { UI } from './ui-ext/registry.js';
 // (#2048) so identity.js can re-run it after agent selection / capability flips
 // without an app.js ⇄ identity.js import cycle — in multi-agent host mode the
 // boot call below 503s (no active agent) and must run again post-selection.
-import { loadFeatureUIContributions } from './ui-ext/feature-loader.js';
+import { loadFeatureUIContributions, loadHostFeatureUIContributions } from './ui-ext/feature-loader.js';
 // Voice UI is loaded via the manifest loader (#2043, ticket 05) — its core-bundled
 // manifest entry points at js/voice/boot.js, which imports voice/ui.js; that module
 // self-registers its slot contributions on import (#2038, ticket 04). No bare import
@@ -155,6 +155,15 @@ async function init() {
     // so this boot call does the real import.
     if (!bootConfig.multiAgentHost) {
         await loadFeatureUIContributions();
+    }
+
+    // Host-scoped UI surface (#2293): the multi-agent host serves host-feature
+    // panels at /api/host/ui/contributions, a surface distinct from the
+    // per-agent one above. It is NOT agent-bound, so it loads at host-console
+    // boot regardless of agent selection. Only meaningful in host mode — in
+    // standalone mode there is no host root and the endpoint 404s (swallowed).
+    if (bootConfig.multiAgentHost) {
+        await loadHostFeatureUIContributions();
     }
 
     // Initialize tasks component

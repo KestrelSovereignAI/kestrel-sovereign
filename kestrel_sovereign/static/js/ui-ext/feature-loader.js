@@ -119,3 +119,62 @@ export async function loadFeatureUIContributions() {
     })().finally(() => { _inFlight = null; });
     return _inFlight;
 }
+
+// ============================================================================
+// Host-scoped UI contributions loader (#2293)
+// ============================================================================
+//
+// The multi-agent host serves a DISTINCT host-scoped UI surface at
+// ``/api/host/ui/contributions`` (parallel to the per-agent
+// ``/api/ui/contributions`` above). Host-feature panels contribute here.
+//
+// Why a separate loader: in multi-agent host mode boot intentionally skips the
+// per-agent loader until an agent is selected (that path 503s with no agent).
+// Host-scoped panels are NOT agent-bound — their manifest and their static
+// assets (``/host/features/{slug}/static/…``) are served by the host itself, so
+// they must be loaded at host-console boot with NO agent pinning. Fetched via
+// ``API.requestHost`` so the call reaches the host root (never host-agent-
+// prefixed) and carries no CSRF token (this is a safe GET).
+const _hostImportedModules = new Set();
+let _hostInFlight = null;
+
+export async function loadHostFeatureUIContributions() {
+    if (_hostInFlight) return _hostInFlight;
+    _hostInFlight = (async () => {
+        let contributions = [];
+        try {
+            const requestHost = typeof API.requestHost === 'function'
+                ? API.requestHost.bind(API)
+                : API.request.bind(API);
+            const data = await requestHost('/api/host/ui/contributions');
+            if (data && Array.isArray(data.contributions)) {
+                contributions = data.contributions;
+            }
+        } catch (e) {
+            console.warn('[ui-ext] failed to fetch host UI contributions manifest:', e);
+            return;
+        }
+
+        for (const entry of contributions) {
+            if (entry.capability && !API.hasCapability(entry.capability)) continue;
+            for (const href of entry.css || []) {
+                // Host assets are host-served and root-relative — no agent pin.
+                injectFeatureStylesheet(href);
+            }
+            for (const mod of entry.modules || []) {
+                const modKey = `${entry.feature}::${mod}`;
+                if (_hostImportedModules.has(modKey)) continue;
+                try {
+                    await import(mod);
+                    _hostImportedModules.add(modKey);
+                } catch (e) {
+                    console.error(
+                        `[ui-ext] failed to import host feature module ${mod} (feature ${entry.feature}):`,
+                        e,
+                    );
+                }
+            }
+        }
+    })().finally(() => { _hostInFlight = null; });
+    return _hostInFlight;
+}

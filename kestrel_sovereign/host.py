@@ -153,6 +153,23 @@ def load_multi_agent_config() -> MultiAgentConfig:
     return config
 
 
+def _host_config_mapping(config: "MultiAgentConfig") -> dict:
+    """Read-only host config mapping handed to host features via HostContext.
+
+    Deliberately minimal for Phase 1: enough for a host feature to learn the
+    host's bind/port and agent roster without coupling to the full config
+    object shape.
+    """
+    try:
+        return {
+            "host_bind": config.host.bind,
+            "host_port": config.host.port,
+            "agents": list(config.agents.keys()),
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the host application lifecycle.
@@ -200,9 +217,55 @@ async def lifespan(app: FastAPI):
                 else:
                     logger.warning(f"  Agent '{name}' failed health check on :{ap.port}")
 
+    # --- Host-scoped features (issue #2293) ---
+    # Discover + mount host features at the host root (no agent prefix, no
+    # get_agent dependency), aggregate their host-scoped UI, build the fleet
+    # HostContext, and run their host lifecycle. Isolated in try/except so a
+    # host-feature failure never blocks the host from serving agents.
+    from kestrel_sovereign import host_features as _hf
+
+    app.state.host_features = []
+    app.state.host_context = None
+    app.state.host_ui_manifest = []
+    try:
+        # Resolve the host manifest from the same PROJECT_DIR the host uses for
+        # .env/config, NOT Path.cwd(). A service launched under KESTREL_HOME,
+        # systemd, cron, or a direct path may have a CWD that misses the real
+        # manifest — reading from CWD there would let a host-disabled feature
+        # still mount (issue #2293 P2).
+        features = _hf.instantiate_host_features(
+            manifest_path=PROJECT_DIR / _hf.HOST_MANIFEST_FILENAME,
+        )
+        app.state.host_features = features
+        if features:
+            ctx = await _hf.build_host_context(config=_host_config_mapping(config))
+            app.state.host_context = ctx
+            _hf.mount_host_feature_routers(app, features)
+            _hf.mount_host_feature_ui(app, features)
+            await _hf.start_host_features(features, ctx)
+            logger.info("Host features initialized: %d", len(features))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Host feature initialization failed: %s", exc)
+
     yield
 
     logger.info("Kestrel Host shutting down...")
+    # Stop host features first (mirror of startup), then agents.
+    try:
+        features = getattr(app.state, "host_features", []) or []
+        ctx = getattr(app.state, "host_context", None)
+        if features and ctx is not None:
+            await _hf.stop_host_features(features, ctx)
+        _hf.unmount_host_features(app)
+        # Close the host backend / session factory if opened.
+        sf = getattr(ctx, "session_factory", None) if ctx is not None else None
+        if sf is not None:
+            await sf.close()
+        db = getattr(ctx, "db", None) if ctx is not None else None
+        if db is not None and hasattr(db, "close"):
+            await db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Host feature shutdown failed: %s", exc)
     pm.stop_all()
     await app.state.http_client.aclose()
 
@@ -287,6 +350,12 @@ async def auth_middleware(request: Request, call_next):
     # feature *API* routes stay protected. See FEATURE_STATIC_ASSET_RE (#2048).
     if FEATURE_STATIC_ASSET_RE.match(request.url.path):
         return await call_next(request)
+    # Host-feature UI static assets (host-scoped surface, #2293) are loaded
+    # header-less too — bypass API-key auth, matched narrowly so host-feature
+    # *API* routes stay protected.
+    from kestrel_sovereign.host_features import HOST_FEATURE_STATIC_ASSET_RE
+    if HOST_FEATURE_STATIC_ASSET_RE.match(request.url.path):
+        return await call_next(request)
     # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth.
     # Matches the bare /webhooks/{name} AND the per-agent
     # /api/agents/{id}/webhooks/{name} form so an external caller can reach a
@@ -320,6 +389,13 @@ async def auth_middleware(request: Request, call_next):
     # Check OAuth session cookie
     user_email = request.session.get("user_email") if hasattr(request, "session") else None
     if user_email:
+        # CSRF: a cookie-authed state-changing request to a host-feature
+        # endpoint must present a matching double-submit token. API-key/bearer
+        # callers (handled above) are exempt — not CSRF-susceptible. Scoped to
+        # host-feature paths so per-agent proxy routes stay unchanged (#2293).
+        csrf_error = _enforce_host_csrf(request)
+        if csrf_error is not None:
+            return csrf_error
         return await call_next(request)
 
     # Check query parameter for endpoints a browser fetches without headers:
@@ -751,6 +827,57 @@ async def proxy_to_agent(request: Request, agent_id: str, path: str):
         config=config,
         client=client,
     )
+
+
+def _enforce_host_csrf(request: Request):
+    """Enforce double-submit CSRF on cookie-authed state-changing host-feature
+    requests. Returns a 403 ``JSONResponse`` on failure, else ``None``.
+
+    Only host-feature router paths are checked so per-agent proxy routes and the
+    existing host management endpoints keep their current behavior (#2293).
+    """
+    from kestrel_sovereign.security.csrf import CSRFError, enforce_csrf
+    from kestrel_sovereign.host_features import is_host_feature_path
+
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+    if not is_host_feature_path(request.app, request.url.path):
+        return None
+    try:
+        enforce_csrf(request, authed_via_cookie=True)
+    except CSRFError as exc:
+        return JSONResponse(content={"detail": exc.detail}, status_code=403)
+    return None
+
+
+@app.get("/api/host/ui/contributions")
+async def host_ui_contributions(request: Request):
+    """Host-scoped UI manifest (distinct from per-agent /api/ui/contributions).
+
+    Lists the ES modules each host feature contributes so the console can load
+    a host-scoped panel surface. Empty when no host feature ships UI (#2293).
+    """
+    manifest = getattr(request.app.state, "host_ui_manifest", []) or []
+    return {"contributions": manifest}
+
+
+@app.get("/api/host/csrf")
+async def host_csrf_token(request: Request):
+    """Issue (or refresh) the double-submit CSRF cookie and return its token.
+
+    The console reads the token from this response (or the cookie) and echoes it
+    in the ``X-CSRF-Token`` header on state-changing host-feature requests.
+    """
+    from kestrel_sovereign.security.csrf import (
+        CSRF_COOKIE_NAME,
+        generate_csrf_token,
+        issue_csrf_cookie,
+    )
+
+    token = request.cookies.get(CSRF_COOKIE_NAME) or generate_csrf_token()
+    response = JSONResponse(content={"csrf_token": token})
+    issue_csrf_cookie(response, token)
+    return response
 
 
 def build_auth_headers(request: Request) -> dict[str, str]:
