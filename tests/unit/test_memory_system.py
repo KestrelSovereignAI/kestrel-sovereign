@@ -98,6 +98,43 @@ class TestEmotionalTagger:
             "friday", "saturday", "sunday"
         ]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", [
+        "I tightened the saddle.",
+        "This was made yesterday.",
+    ])
+    async def test_substrings_do_not_create_emotions(self, tagger, text):
+        result = await tagger.analyze(text, "user")
+        assert result.emotional_valence == 0.0
+        assert result.emotional_intensity == 0.0
+        assert result.emotional_categories == []
+
+    @pytest.mark.asyncio
+    async def test_negated_emotion_is_not_positive(self, tagger):
+        result = await tagger.analyze("I am not happy about this", "user")
+        assert "joy" not in result.emotional_categories
+        assert result.emotional_valence <= 0.0
+
+    @pytest.mark.asyncio
+    async def test_third_party_emotion_has_low_confidence_attribution(self, tagger):
+        result = await tagger.analyze("She was sad after the meeting", "user")
+        assert "sadness" in result.emotional_categories
+        assert result.emotional_subject == "other"
+        assert result.emotional_confidence <= 0.4
+
+    @pytest.mark.asyncio
+    async def test_contracted_first_person_emotion_is_attributed_to_user(self, tagger):
+        result = await tagger.analyze("I'm happy about the result", "user")
+        assert result.emotional_subject == "user"
+        assert result.emotional_confidence > 0.5
+
+    @pytest.mark.asyncio
+    async def test_no_importance_signal_starts_at_zero(self, tagger):
+        result = await tagger.analyze("The build completed.", "assistant")
+        assert result.importance == 0.0
+        assert result.importance_reasons == []
+        assert result.emotional_tag_version == "heuristic-v2"
+
 
 class TestTemporalAnalyzer:
     """Tests for TemporalAnalyzer pattern detection."""

@@ -657,6 +657,14 @@ class MemoryRetriever:
             return 0.5  # Neutral if no context
 
         memory_valence = metadata.get("emotional_valence", 0.0)
+        # New tagger rows carry attribution confidence. Legacy rows omit it
+        # and retain their historical full-strength behavior.
+        confidence = metadata.get("emotional_confidence")
+        if confidence is not None:
+            try:
+                memory_valence *= max(0.0, min(1.0, float(confidence)))
+            except (TypeError, ValueError):
+                memory_valence = 0.0
         context_valence = emotional_context.emotional_valence
 
         # Same-direction valence is a match
