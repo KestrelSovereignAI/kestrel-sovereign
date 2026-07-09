@@ -151,6 +151,23 @@ class TalonExecution:
     skip_clarification: bool = True
     self_review: bool = True
     quality_checks: tuple[str, ...] = ()
+    demo_check: bool = False
+    eye_check: bool = False
+
+
+@dataclass(frozen=True)
+class TalonIterateExecution:
+    """PR-iteration options that become ``kestrel-talon iterate`` flags."""
+
+    repo: str
+    pr: int
+    repo_dir: Path
+    worktree_base: Path | None = None
+    worktree: bool = True
+    max_turns: int = 50
+    self_review: bool = True
+    demo_check: bool = False
+    eye_check: bool = False
 
 
 @dataclass(frozen=True)
@@ -475,9 +492,82 @@ def _build_claim_argv(
         argv.append("--skip-clarification")
     if execution.self_review:
         argv.append("--self-review")
+    if execution.demo_check:
+        argv.append("--demo-check")
+    if execution.eye_check:
+        argv.append("--eye-check")
     for check in execution.quality_checks:
         argv += ["--quality-check", check]
     return argv
+
+
+def build_talon_iterate_invocation(
+    request: TalonRuntimeRequest,
+    execution: TalonIterateExecution,
+    policy: TalonPolicy | None = None,
+    preference: TalonPreference | None = None,
+    base_env: Mapping[str, str] | None = None,
+) -> TalonInvocation:
+    """Launch-ready ``kestrel-talon iterate`` invocation, policy-enforced.
+
+    Same guardrails as a claim (F304): ``allow_background_jobs``,
+    ``allowed_backends``, and ``require_worktree`` are enforced, the
+    subprocess env is backend-sanitized, and the workspace clone is passed
+    via ``--repo-dir`` so iterate never operates on the running source
+    tree. kestrel-talon's ``iterate`` accepts ``--worktree`` (its common
+    args) and ``iterate_pr`` honors it — without it the PR branch is
+    checked out directly in the shared workspace clone, colliding with
+    concurrent worktree-isolated claims, so the worktree policy applies
+    here exactly as it does to a claim.
+    """
+    policy = policy or TalonPolicy()
+    preference = preference or TalonPreference()
+
+    if policy.require_worktree and not execution.worktree:
+        raise TalonRuntimeError("Talon policy requires worktree=true")
+    if not policy.allow_background_jobs:
+        raise TalonRuntimeError("Talon background jobs are disabled by policy")
+    if execution.max_turns < 1:
+        raise TalonRuntimeError("Talon max_turns must be >= 1")
+    try:
+        pr_number = int(execution.pr)
+    except (TypeError, ValueError):
+        raise TalonRuntimeError(
+            f"Talon iterate pr must be an integer, got {execution.pr!r}"
+        )
+    if pr_number < 1:
+        raise TalonRuntimeError("Talon iterate pr must be >= 1")
+
+    backend, model, auth_lane = resolve_runtime(request, preference, policy)
+    argv = [
+        "iterate",
+        "--repo", execution.repo,
+        "--pr", str(pr_number),
+        "--backend", backend,
+        "--repo-dir", str(execution.repo_dir),
+        "--max-turns", str(execution.max_turns),
+    ]
+    argv += _backend_model_flags(backend, model, auth_lane)
+    if execution.worktree:
+        argv.append("--worktree")
+        if execution.worktree_base is not None:
+            argv += ["--worktree-base", str(execution.worktree_base)]
+    if execution.self_review:
+        argv.append("--self-review")
+    if execution.demo_check:
+        argv.append("--demo-check")
+    if execution.eye_check:
+        argv.append("--eye-check")
+    env, stripped = sanitize_env_for_backend(backend, auth_lane, base_env)
+    return TalonInvocation(
+        argv=argv,
+        env=env,
+        backend=backend,
+        model=model,
+        auth_lane=auth_lane,
+        redacted_argv=list(argv),
+        stripped_env_keys=stripped,
+    )
 
 
 def _backend_model_flags(
