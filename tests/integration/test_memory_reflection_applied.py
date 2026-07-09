@@ -108,7 +108,7 @@ async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
         await memory_system.initialize()
 
         old_created_at = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
-        base_metadata = {"importance": 0.5}
+        base_metadata = {"importance": 0.5, "session_id": "decay-session"}
         await storage.conversation.add_conversation(
             "assistant",
             "Applied old memory that should survive because it was load-bearing.",
@@ -138,7 +138,7 @@ async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
         assert result["messages_archived"] == 1
 
         rows = await storage.db.fetchall(
-            "SELECT id, metadata FROM conversation_history WHERE id IN (?, ?)",
+            "SELECT id, metadata, archived_at FROM conversation_history WHERE id IN (?, ?)",
             (applied_id, unused_id),
         )
         metadata_by_id = {
@@ -146,6 +146,70 @@ async def test_applied_count_changes_archive_set_on_consolidation(tmp_path):
             for row in rows
         }
 
-        assert metadata_by_id[unused_id]["archived"] is True
+        assert "archived" not in metadata_by_id[unused_id]
+        assert "archived_at" not in metadata_by_id[unused_id]
+        assert "archived_strength" in metadata_by_id[unused_id]
         assert "archived" not in metadata_by_id[applied_id]
         assert metadata_by_id[applied_id]["applied_count"] == 3
+        archived_at_by_id = {row[0]: row[2] for row in rows}
+        assert archived_at_by_id[unused_id] is not None
+        assert archived_at_by_id[applied_id] is None
+
+        # Decay archival must remove the row from normal replay and weighted
+        # memory retrieval while preserving it in the explicit archive view.
+        normal = await storage.conversation.get_conversation_history(limit=10)
+        assert unused_id not in {row["id"] for row in normal}
+        recalled = await memory_system.retriever.retrieve(
+            "unused memory",
+            AGENT_ID,
+            min_score=0.0,
+            read_only=True,
+        )
+        assert unused_id not in {row["id"] for row in recalled}
+        archived = await storage.conversation.get_full_history_with_ids(
+            only_archived=True
+        )
+        assert unused_id in {row["id"] for row in archived}
+
+        # Manual unarchive clears the sole state column. Decay evidence stays
+        # metadata-only and does not wedge a later consolidation pass.
+        assert await storage.conversation.unarchive_conversation_session(
+            str(unused_id)
+        ) == 1
+        normal = await storage.conversation.get_conversation_history(limit=10)
+        assert unused_id in {row["id"] for row in normal}
+        result = await memory_system.consolidate()
+        assert result["messages_archived"] == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_metadata_only_archive_is_canonicalized(tmp_path):
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        memory_system = MemorySystem(storage, AGENT_ID)
+        await memory_system.initialize()
+        await storage.conversation.add_conversation(
+            "assistant",
+            "legacy archived memory",
+            metadata={
+                "archived": True,
+                "archived_at": "2025-01-02T03:04:05+00:00",
+                "archived_strength": 0.01,
+            },
+        )
+        row = (await storage.conversation.get_full_history_with_ids())[0]
+
+        result = await memory_system.consolidate()
+
+        assert result["messages_archived"] == 1
+        stored = await storage.db.fetchone(
+            "SELECT metadata, archived_at FROM conversation_history WHERE id = ?",
+            (row["id"],),
+        )
+        metadata = json.loads(stored[0])
+        assert stored[1] == "2025-01-02T03:04:05+00:00"
+        assert "archived" not in metadata
+        assert "archived_at" not in metadata
+        assert metadata["archived_strength"] == 0.01
+        normal = await storage.conversation.get_conversation_history(limit=10)
+        assert row["id"] not in {item["id"] for item in normal}

@@ -1387,7 +1387,9 @@ class AsyncConversationStore:
         """
         if session_id:
             # Session-aware retrieval: get messages from the specified session
-            rows = await self._get_session_messages(session_id, limit)
+            rows = await self._get_session_messages(
+                session_id, limit, include_archived=False
+            )
         else:
             # Default behavior: get most recent live messages.
             # rendered_content (#1402) appended at row[5] so existing
@@ -1396,7 +1398,7 @@ class AsyncConversationStore:
                 "SELECT id, role, content, metadata, created_at, rendered_content, "
                 "model, provider "
                 "FROM conversation_history "
-                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "ORDER BY id DESC LIMIT ?",
                 (self.agent_id, limit)
             )
@@ -1483,7 +1485,9 @@ class AsyncConversationStore:
         conversation endpoints) can resolve a session by either a UUID or a
         legacy row-id without reaching into a private method (#2012).
         """
-        return await self._get_session_messages(session_id, limit)
+        return await self._get_session_messages(
+            session_id, limit, include_archived=False
+        )
 
     async def _get_session_messages(
         self,
@@ -1491,6 +1495,7 @@ class AsyncConversationStore:
         limit: int,
         deleted_filter: str = "live",
         include_markers: bool = False,
+        include_archived: bool = True,
     ) -> List[tuple]:
         """Get messages belonging to a specific session.
 
@@ -1514,6 +1519,9 @@ class AsyncConversationStore:
                 a session's content leaves a live orphan marker that keeps the
                 session in the active list yet unresolvable by a later delete
                 (#2027).
+            include_archived: Include rows with ``archived_at`` set. Lifecycle
+                operations keep the default so archived sessions can be
+                unarchived/purged; normal conversation replay passes False.
 
         Returns:
             List of raw rows
@@ -1522,6 +1530,7 @@ class AsyncConversationStore:
             so existing positional accesses below don't shift.
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
+        archive_clause = "" if include_archived else " AND archived_at IS NULL"
         from datetime import datetime
         from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
 
@@ -1548,7 +1557,7 @@ class AsyncConversationStore:
                     f"""SELECT id, role, content, metadata, created_at,
                               rendered_content, model, provider
                        FROM conversation_history
-                       WHERE agent_id = ? AND created_at >= ?{del_clause}
+                       WHERE agent_id = ? AND created_at >= ?{del_clause}{archive_clause}
                        ORDER BY created_at ASC
                        LIMIT ?""",
                     (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
@@ -1564,7 +1573,7 @@ class AsyncConversationStore:
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
+               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
             (self.agent_id, f'%"session_id": "{esc}"%', limit)
@@ -1575,7 +1584,7 @@ class AsyncConversationStore:
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
+               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
             (self.agent_id, f'%"session_id":"{esc}"%', limit)
@@ -1671,14 +1680,14 @@ class AsyncConversationStore:
     async def get_full_history(self) -> List[Dict[str, Any]]:
         """Get complete live conversation history with automatic decryption.
 
-        Soft-deleted rows (#763) are filtered out — use
+        Soft-deleted and archived rows are filtered out — use
         ``get_full_history_with_ids(include_deleted=True)`` if you need
         to see Trash too.
         """
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata, rendered_content "
             "FROM conversation_history "
-            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
             "ORDER BY id ASC",
             (self.agent_id,)
         )
@@ -1750,7 +1759,7 @@ class AsyncConversationStore:
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, rendered_content "
                 "FROM conversation_history "
-                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
                 "ORDER BY id DESC LIMIT 5000",
                 (
@@ -1765,7 +1774,7 @@ class AsyncConversationStore:
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, rendered_content "
                 "FROM conversation_history "
-                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "ORDER BY id DESC LIMIT 5000",
                 (self.agent_id,)
             )

@@ -212,6 +212,7 @@ class MemoryConsolidator:
             """SELECT id, content, metadata, created_at, role
                FROM conversation_history
                WHERE agent_id = ? AND created_at > ?
+                 AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
             (self.agent_id, cutoff)
         )
@@ -939,6 +940,7 @@ class MemoryConsolidator:
             """SELECT content, metadata, created_at
                FROM conversation_history
                WHERE agent_id = ? AND created_at > ?
+                 AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
             (self.agent_id, cutoff)
         )
@@ -970,7 +972,8 @@ class MemoryConsolidator:
         """
         Mark fully decayed messages as archived.
 
-        Archived messages are not deleted, just marked in metadata.
+        Archived messages are not deleted; ``conversation_history.archived_at``
+        is the sole archive-state field. Metadata retains decay evidence only.
         They won't appear in normal retrieval but can still be
         accessed if specifically requested.
 
@@ -984,6 +987,7 @@ class MemoryConsolidator:
             """SELECT id, metadata, created_at
                FROM conversation_history
                WHERE agent_id = ?
+                 AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
             (self.agent_id,)
         )
@@ -997,8 +1001,24 @@ class MemoryConsolidator:
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
 
-            # Skip already archived
-            if metadata.get("archived"):
+            # Migrate the legacy dual-state representation. Older releases
+            # wrote metadata.archived without the dedicated column, making
+            # those rows visible to normal retrieval forever. Canonicalize
+            # them in-place and remove the redundant state keys.
+            legacy_archived = metadata.get("archived") in (True, 1, "true", "True")
+            if legacy_archived:
+                archived_at = metadata.pop("archived_at", None)
+                metadata.pop("archived", None)
+                if not archived_at:
+                    archived_at = datetime.now(timezone.utc).isoformat()
+                await self._db.execute(
+                    """UPDATE conversation_history
+                       SET metadata = ?, archived_at = ?
+                       WHERE id = ? AND agent_id = ?
+                         AND deleted_at IS NULL AND archived_at IS NULL""",
+                    (json.dumps(metadata), archived_at, msg_id, self.agent_id),
+                )
+                archived_count += 1
                 continue
 
             # decay_protected pins prevent ROUTINE archival only.
@@ -1026,15 +1046,15 @@ class MemoryConsolidator:
 
             # Archive if below threshold
             if strength < self.DECAY_ARCHIVE_THRESHOLD:
-                metadata["archived"] = True
-                metadata["archived_at"] = datetime.now(timezone.utc).isoformat()
+                archived_at = datetime.now(timezone.utc).isoformat()
                 metadata["archived_strength"] = strength
 
                 await self._db.execute(
                     """UPDATE conversation_history
-                       SET metadata = ?
-                       WHERE id = ?""",
-                    (json.dumps(metadata), msg_id)
+                       SET metadata = ?, archived_at = ?
+                       WHERE id = ? AND agent_id = ?
+                         AND deleted_at IS NULL AND archived_at IS NULL""",
+                    (json.dumps(metadata), archived_at, msg_id, self.agent_id)
                 )
                 archived_count += 1
 
@@ -1118,6 +1138,7 @@ class MemoryConsolidator:
                 """SELECT id, content, metadata, created_at, role
                    FROM conversation_history
                    WHERE agent_id = ? AND created_at > ?
+                     AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
                 (self.agent_id, cutoff)
             )
@@ -1130,6 +1151,7 @@ class MemoryConsolidator:
                 """SELECT id, content, metadata, created_at, role
                    FROM conversation_history
                    WHERE agent_id = ? AND created_at > ?
+                     AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
                 (self.agent_id, cutoff_time)
             )
