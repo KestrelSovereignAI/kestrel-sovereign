@@ -179,8 +179,8 @@ class MemoryRetriever:
             emotional_context: Current emotional context for matching
             limit: Max results to return
             min_score: Minimum score threshold
-            min_relevance: Independent semantic/lexical eligibility floor.
-                Salience signals cannot rescue a candidate below this value.
+            min_relevance: Independent semantic/lexical/associative eligibility
+                floor. Salience signals cannot rescue a candidate below it.
             read_only: When True, skip access-count update scheduling so
                 callers can estimate the memory block without rehearsal-effect
                 writes.

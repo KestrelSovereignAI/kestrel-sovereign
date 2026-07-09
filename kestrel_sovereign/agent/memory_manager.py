@@ -275,10 +275,9 @@ class MemoryManager:
                 )
                 candidate = "\n".join([*parts, rendered, footer])
                 candidate_tokens = counter.count(candidate)
-                if (
-                    isinstance(candidate_tokens, (int, float))
-                    and candidate_tokens > max_tokens
-                ):
+                if not isinstance(candidate_tokens, (int, float)):
+                    raise TypeError("token counter must return a numeric count")
+                if candidate_tokens > max_tokens:
                     continue
                 parts.append(rendered)
                 message_id = mem.get("id")

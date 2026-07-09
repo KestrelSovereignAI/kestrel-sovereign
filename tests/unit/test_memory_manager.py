@@ -549,6 +549,7 @@ class TestRetrieveMemories:
         }
 
         counter = MagicMock()
+        counter.count.return_value = 1
         result = await mm.retrieve_memories(
             query="cooking",
             max_tokens=1000,
@@ -581,6 +582,7 @@ class TestRetrieveMemories:
         )
 
         counter = MagicMock()
+        counter.count.return_value = 1
         result = await mm.retrieve_memories(
             query="test",
             max_tokens=1000,
@@ -633,6 +635,34 @@ class TestRetrieveMemories:
         )
 
     @pytest.mark.asyncio
+    async def test_default_path_records_only_ids_that_fit(self):
+        memory_retriever = AsyncMock()
+        memory_retriever.retrieve.return_value = [
+            {
+                "id": 21,
+                "content": "fits",
+                "metadata": {},
+                "created_at": "unknown",
+            },
+            {
+                "id": 22,
+                "content": "x" * 200,
+                "metadata": {},
+                "created_at": "unknown",
+            },
+        ]
+        counter = MagicMock()
+        counter.count.side_effect = len
+
+        result = await MemoryManager(
+            MagicMock(), memory_retriever=memory_retriever
+        ).retrieve_memories("query", 220, counter)
+
+        assert result is not None
+        await_args = memory_retriever.record_accesses.await_args.args
+        assert await_args[0] == [21]
+
+    @pytest.mark.asyncio
     async def test_retrieve_returns_none_when_no_retriever(self):
         """Should return None if memory_retriever not available."""
         storage = MagicMock()
@@ -662,6 +692,7 @@ class TestRetrieveMemories:
 
         mm = MemoryManager(storage, memory_retriever=memory_retriever)
         counter = MagicMock()
+        counter.count.return_value = 1
         result = await mm.retrieve_memories("test", 1000, counter)
 
         # Should be truncated to 200 chars + "..."
@@ -693,6 +724,7 @@ class TestRetrieveMemories:
 
         mm = MemoryManager(storage, memory_retriever=memory_retriever)
         counter = MagicMock()
+        counter.count.return_value = 1
         result = await mm.retrieve_memories("hobbies", 1000, counter)
 
         assert "User:" in result, f"Expected 'User:' role prefix; got: {result!r}"
@@ -728,6 +760,7 @@ class TestRetrieveMemories:
 
         mm = MemoryManager(storage, memory_retriever=memory_retriever)
         counter = MagicMock()
+        counter.count.return_value = 1
         result = await mm.retrieve_memories("hobbies", 1000, counter)
 
         # The raw delimiters must NOT appear in the rendered memory —
@@ -762,6 +795,7 @@ class TestRetrieveMemories:
 
         mm = MemoryManager(storage, memory_retriever=memory_retriever)
         counter = MagicMock()
+        counter.count.return_value = 1
         result = await mm.retrieve_memories("syntax", 1000, counter)
 
         # Assistant content rendered as-is — no escape.

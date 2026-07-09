@@ -432,6 +432,28 @@ class TestMemoryRetriever:
         assert results == []
 
     @pytest.mark.asyncio
+    async def test_relevant_old_important_row_clears_live_thresholds(self):
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [{
+            "role": "user",
+            "id": 8,
+            "content": "Sailing on Lake Michigan is my favorite hobby.",
+            "metadata": {"importance": 0.9, "decay_protected": True},
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="sailing hobby",
+            agent_id="test-agent",
+            min_score=0.3,
+            min_relevance=0.1,
+            read_only=True,
+        )
+
+        assert [row["id"] for row in results] == [8]
+
+    @pytest.mark.asyncio
     async def test_retrieve_rejects_orthogonal_vector_at_default_relevance(self):
         store = AsyncMock()
         store.embedding_service = MagicMock()
