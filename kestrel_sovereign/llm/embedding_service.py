@@ -311,7 +311,13 @@ class ProviderEmbeddingService:
     interchangeable and should be re-embedded before mixing in one index.
     """
 
-    def __init__(self, provider: dict[str, Any]):
+    def __init__(
+        self,
+        provider: dict[str, Any],
+        *,
+        space_id_override: Optional[str] = None,
+        normalized_override: Optional[bool] = None,
+    ):
         self.provider = provider
         self.adapter = provider["adapter"]
         self.client = provider["client"]
@@ -348,6 +354,18 @@ class ProviderEmbeddingService:
                 # stubs whose attribute access auto-vivifies a truthy object.
                 if isinstance(declared, str) and declared:
                     self._space_id = declared
+
+        # #2290 — a verified shared-space pin force-merges this member route
+        # into a single model-identity space (``<model>@<dim>``) shared with
+        # its sibling routes. Applied ONLY after the parity probe passes, so it
+        # wins over both the capability override and the adapter's own derived
+        # space id. ``normalized_override`` pins the normalization convention
+        # the pin declared so both members hash to the same profile id.
+        if space_id_override:
+            self._space_id = str(space_id_override)
+        self._normalized_override = normalized_override
+        if normalized_override is not None:
+            self._normalized = bool(normalized_override)
 
     async def aembed(self, text: str) -> Optional[List[float]]:
         return await self.adapter.aembed(

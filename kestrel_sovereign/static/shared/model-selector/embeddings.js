@@ -54,6 +54,10 @@ class EmbeddingSelector {
         this.routeSelect = options.routeSelectId ? document.getElementById(options.routeSelectId) : null;
         this.dimReadout = options.dimReadoutId ? document.getElementById(options.dimReadoutId) : null;
         this.warningEl = options.warningId ? document.getElementById(options.warningId) : null;
+        // #2290 — element that renders a shared local/cloud embedding space as
+        // ONE entry ("qwen3-embedding-0.6b — local + cloud") instead of two
+        // routes. Optional; absent in older popovers.
+        this.sharedSpaceEl = options.sharedSpaceId ? document.getElementById(options.sharedSpaceId) : null;
         this.getEmbeddingRoutes = options.getEmbeddingRoutes || (() => []);
         this.getAuthHeader = options.getAuthHeader || (() => ({}));
         this.onChange = options.onChange || (() => {});
@@ -100,6 +104,30 @@ class EmbeddingSelector {
         this._renderRoutes();
         this._syncModeUI();
         this._renderDimension();
+        this._renderSharedSpace();
+    }
+
+    /**
+     * Render a declared shared local/cloud embedding space (#2290) as a single
+     * entry — "qwen3-embedding-0.6b — local + cloud" — with a verified/unverified
+     * marker driven by the parity probe. When no pin covers the resolved route,
+     * the element is hidden. Never claims a space is shared before the probe
+     * passes: an unverified pin reads "parity unverified".
+     */
+    _renderSharedSpace() {
+        if (!this.sharedSpaceEl) return;
+        const space = this.settings && this.settings.shared_space;
+        if (!space) {
+            this.sharedSpaceEl.style.display = 'none';
+            this.sharedSpaceEl.textContent = '';
+            return;
+        }
+        const memberCount = (space.members || []).length;
+        // "local + cloud" reads better than "2 routes" for the common pairing.
+        const scope = memberCount === 2 ? 'local + cloud' : `${memberCount} routes`;
+        const status = space.verified ? 'shared' : 'parity unverified';
+        this.sharedSpaceEl.style.display = '';
+        this.sharedSpaceEl.textContent = `${space.model} — ${scope} (${status})`;
     }
 
     /** Populate the explicit route <select> from embedding-capable routes. */
@@ -216,6 +244,7 @@ class EmbeddingSelector {
                 embedding_model: data.embedding_model,
                 embedding_dim: data.embedding_dim,
                 kestrel_embedding_dim: data.kestrel_embedding_dim,
+                shared_space: data.shared_space,
             };
             this.mode = embeddingModeForRoute(this.settings.embedding_route);
             this._render();

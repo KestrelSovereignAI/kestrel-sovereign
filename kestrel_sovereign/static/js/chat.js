@@ -4255,6 +4255,7 @@ export async function loadModels() {
             routeSelectId: 'embedding-route-selector',
             dimReadoutId: 'embedding-dim-readout',
             warningId: 'embedding-dim-warning',
+            sharedSpaceId: 'embedding-shared-space',
             getAuthHeader: async () => await deps().api.applyAuth({}),
             getEmbeddingRoutes: () => {
                 const routes = (sharedModelSelector?.allModelsData?.routes) || [];

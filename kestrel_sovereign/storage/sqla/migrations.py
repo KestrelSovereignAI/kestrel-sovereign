@@ -671,6 +671,48 @@ async def migrate_create_embedding_profiles(db: "AsyncDatabase") -> None:
         logger.info("embedding_profiles created (SQLite, #1477).")
 
 
+async def migrate_embedding_profiles_add_parity(db: "AsyncDatabase") -> None:
+    """Add ``parity_cosine`` to ``embedding_profiles`` (#2290).
+
+    Records the measured worst-case pairwise cosine from the shared-space
+    parity probe on the pinned space's registry row, so operators can see how
+    far two servings of the same weights drifted before the alias was accepted.
+    Nullable and descriptive — not part of the profile-id hash and never read
+    by the kNN filter. Idempotent: skips when the column already exists.
+    """
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type == "postgres":
+        rows = await db.fetchall(
+            """SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'embedding_profiles'
+                 AND column_name = 'parity_cosine'""",
+            (),
+        )
+        if rows:
+            return
+        async with db.transaction():
+            await db.execute(
+                "ALTER TABLE embedding_profiles ADD COLUMN parity_cosine "
+                "DOUBLE PRECISION",
+                (),
+            )
+        logger.info("embedding_profiles.parity_cosine added (PG, #2290).")
+    elif backend_type == "sqlite":
+        cols = await db.fetchall(
+            "PRAGMA table_info(embedding_profiles)", ()
+        )
+        names = {row[1] for row in cols} if cols else set()
+        if not names or "parity_cosine" in names:
+            # No table yet (create migration will make it) or already migrated.
+            return
+        async with db.transaction():
+            await db.execute(
+                "ALTER TABLE embedding_profiles ADD COLUMN parity_cosine REAL",
+                (),
+            )
+        logger.info("embedding_profiles.parity_cosine added (SQLite, #2290).")
+
+
 async def _migrate_sqlite_greenfield(db: "AsyncDatabase", *, table: str) -> None:
     """SQLite greenfield migration — add ``embedding_vec BLOB`` to a
     table that has no existing embedding column.

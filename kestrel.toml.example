@@ -23,6 +23,25 @@ route_priority = ["ollama:local", "openai:api"]
 # A cloud embedding_route is refused for local-only privacy sessions.
 #embedding_route = "ollama:local"
 
+# Shared local/cloud embedding space (#2290). Privacy modes otherwise fracture
+# the memory space: a local-only session must embed locally while others may
+# embed via cloud, and because space_id is route-prefixed those rows live in
+# different spaces and are invisible to each other in kNN. Pin ONE open-weight
+# model served on BOTH sides (e.g. Qwen3-Embedding-0.6B on Ollama AND
+# qwen/qwen3-embedding-0.6b via OpenRouter — same weights, same space) so all
+# members share one model-identity space (``<model>@<dim>``). Both members MUST
+# pin the SAME dim. The alias is applied ONLY after a parity probe (embed K
+# canaries through each member, require pairwise cosine >= parity_threshold) —
+# run it via POST /api/embedding/space/verify. Existing rows join the shared
+# space only after a re-embed (`kestrel embeddings reindex`). Proprietary
+# cloud-only models (OpenAI text-embedding-3) can never participate.
+#[llm.embedding_spaces.qwen3]
+#model = "qwen3-embedding-0.6b"
+#dim = 768
+#members = ["ollama:local", "openrouter:api"]
+#normalized = false          # optional; both members must agree
+#parity_threshold = 0.98     # optional; pairwise-cosine floor to accept the alias
+
 # --- Ollama (local inference) — install from https://ollama.ai ---------------
 [llm.vendors.ollama]
 is_cloud = false
@@ -32,6 +51,12 @@ adapter        = "OllamaAdapter"
 host           = "http://localhost:11434"
 model          = "auto"
 selection_hints = ["llama3.2", "qwen", "gpt-oss"]
+# Optional embedding config (#2290). Defaults to nomic-embed-text@768. Pin an
+# open-weight model (e.g. qwen3-embedding-0.6b) to share a coordinate space with
+# the same weights served in the cloud — see [llm.embedding_spaces] above. The
+# dim is forwarded as the Matryoshka `dimensions` param and keys the space.
+# embedding_model = "qwen3-embedding-0.6b"
+# embedding_dim   = 768
 
 # --- OpenAI (cloud) — set OPENAI_API_KEY in .env -----------------------------
 [llm.vendors.openai]

@@ -351,6 +351,28 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 configured_embedding_route = "none"
         self._embedding_route: Optional[str] = configured_embedding_route
 
+        # Shared local/cloud embedding-space pins (#2290). ``[llm.embedding_spaces]``
+        # declares open-weight models served on BOTH a local and a cloud route so
+        # their rows share ONE model-identity space (``<model>@<dim>``) instead of
+        # fracturing by serving route. A pin is only APPLIED after its parity
+        # probe passes (see ``verify_embedding_space_parity``); until then members
+        # keep their own route-scoped space ids. Parse defensively so a malformed
+        # declaration degrades to "no shared space" rather than crashing init.
+        self._embedding_space_pins: List["EmbeddingSpacePin"] = []
+        try:
+            from .embedding_space import parse_embedding_space_pins
+
+            self._embedding_space_pins = parse_embedding_space_pins(self.config)
+        except Exception as exc:
+            logger.error(
+                "Invalid [llm.embedding_spaces] config; shared embedding spaces "
+                "are DISABLED until fixed: %s",
+                exc,
+            )
+        # Parity-probe results keyed by pin name; only a pin present here with
+        # ``passed=True`` has its shared space_id applied to member routes.
+        self._verified_space_pins: Dict[str, "ParityResult"] = {}
+
         # Remote GPU backend state (merged from BrainRouter)
         self._backend = BackendType.CLOUD
         self._default_backend = BackendType.CLOUD
@@ -625,12 +647,31 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         except Exception:  # pragma: no cover - defensive; never crash a GET
             deployment_dim = None
 
+        # #2290 — surface the shared local/cloud embedding space so the UI can
+        # render it as ONE entry ("qwen3-embedding-0.6b — local + cloud")
+        # instead of two routes. Only the pin covering the resolved route is
+        # reported, with its verification/drift state.
+        shared_space = None
+        pin = self._pin_for_provider(provider)
+        if pin is not None:
+            parity = self._verified_space_pins.get(pin.name)
+            shared_space = {
+                "name": pin.name,
+                "space_id": pin.space_id,
+                "model": pin.model,
+                "dim": pin.dim,
+                "members": list(pin.members),
+                "verified": bool(parity and parity.passed),
+                "parity": parity.to_dict() if parity else None,
+            }
+
         return {
             "embedding_route": configured,
             "resolved_route": resolved_route,
             "embedding_model": embedding_model,
             "embedding_dim": embedding_dim,
             "kestrel_embedding_dim": deployment_dim,
+            "shared_space": shared_space,
         }
 
     @staticmethod
@@ -1538,14 +1579,230 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         )
         return None
 
+    def _pin_for_provider(
+        self, provider: Optional[Dict[str, Any]]
+    ) -> Optional["EmbeddingSpacePin"]:
+        """Return the shared-space pin whose members include this provider.
+
+        Matches on the provider's ``"<vendor>:<route>"`` name (or bare vendor).
+        Returns ``None`` when no pin covers the route — the common case.
+        """
+        pins = getattr(self, "_embedding_space_pins", None)
+        if not provider or not pins:
+            return None
+        name = provider.get("name")
+        vendor = provider.get("vendor")
+        for pin in pins:
+            if pin.covers(name, vendor):
+                return pin
+        return None
+
     def get_embedding_service(self):
-        """Return a provider-backed embedding service for the active route."""
+        """Return a provider-backed embedding service for the active route.
+
+        When the resolved route is a member of a shared-space pin (#2290) whose
+        parity probe has PASSED, the pin's model-identity ``space_id`` is force-
+        applied so this route's rows land in the same coordinate space as its
+        sibling members (local ⇆ cloud). An unverified pin is NOT applied — the
+        route keeps its own route-scoped space id, so "detected" never becomes
+        "aliased" without the mandatory parity gate.
+        """
         provider = self.resolve_embedding_provider()
         if provider is None:
             return None
         from .embedding_service import ProviderEmbeddingService
 
+        pin = self._pin_for_provider(provider)
+        verified = (
+            pin is not None
+            and self._verified_space_pins.get(pin.name) is not None
+            and self._verified_space_pins[pin.name].passed
+        )
+        if pin is not None and verified:
+            return ProviderEmbeddingService(
+                provider,
+                space_id_override=pin.space_id,
+                normalized_override=pin.normalized,
+            )
         return ProviderEmbeddingService(provider)
+
+    async def verify_embedding_space_parity(
+        self,
+        pin_name: Optional[str] = None,
+        *,
+        record_to: Any = None,
+    ) -> Dict[str, "ParityResult"]:
+        """Run the mandatory parity probe for shared-space pins (#2290).
+
+        For each pin (or just ``pin_name``), embed K canary texts through every
+        pair of member routes and require pairwise cosine ``>=
+        parity_threshold``. On pass, the pin is cached in
+        ``self._verified_space_pins`` and its model-identity ``space_id`` starts
+        being applied by ``get_embedding_service``; on fail, the pin is left
+        unverified so members keep their route-scoped ids (the alias is
+        refused). Also enforces the dims pin: a member whose configured
+        ``embedding_dim`` differs from the pin's ``dim`` fails the probe — both
+        sides must pin the SAME dims value.
+
+        ``record_to`` (an ``AsyncDatabase``) is best-effort: when provided, the
+        measured drift is written onto the pinned space's ``embedding_profiles``
+        row so operators can see it. Failure to record never fails the probe.
+
+        Returns a ``{pin_name: ParityResult}`` map for the pins probed.
+        """
+        from .embedding_space import ParityResult, probe_parity
+        from .embedding_service import ProviderEmbeddingService
+
+        results: Dict[str, "ParityResult"] = {}
+        pins = self._embedding_space_pins
+        if pin_name is not None:
+            pins = [p for p in pins if p.name == pin_name]
+        for pin in pins:
+            member_services = []
+            dim_mismatch = None
+            for selector in pin.members:
+                candidates = self._lookup_embedding_route_candidates(selector)
+                target = next(
+                    (c for c in candidates if self._provider_supports_embeddings(c)),
+                    None,
+                )
+                if target is None:
+                    continue
+                caps = target.get("capabilities") or {}
+                member_dim = caps.get("embedding_dim")
+                if member_dim is not None and int(member_dim) != int(pin.dim):
+                    dim_mismatch = (
+                        f"member {selector} serves dim {member_dim} but pin "
+                        f"{pin.name!r} declares dim {pin.dim} — both sides must "
+                        "pin the SAME dims value"
+                    )
+                    break
+                member_services.append(ProviderEmbeddingService(target))
+
+            if dim_mismatch is not None:
+                result = ParityResult(
+                    passed=False, threshold=pin.parity_threshold,
+                    min_cosine=0.0, mean_cosine=0.0, n=0, error=dim_mismatch,
+                )
+            elif len(member_services) < 2:
+                result = ParityResult(
+                    passed=False, threshold=pin.parity_threshold,
+                    min_cosine=0.0, mean_cosine=0.0, n=0,
+                    error=(
+                        f"fewer than two embedding-capable member routes "
+                        f"available for pin {pin.name!r}"
+                    ),
+                )
+            else:
+                # Probe every member against the first — one hub is enough to
+                # transitively certify a shared space; the worst pair wins.
+                hub = member_services[0]
+                pair_results = []
+                for other in member_services[1:]:
+                    pair_results.append(
+                        await probe_parity(
+                            hub, other, threshold=pin.parity_threshold
+                        )
+                    )
+                worst = min(pair_results, key=lambda r: r.min_cosine)
+                result = worst
+
+            results[pin.name] = result
+            if result.passed:
+                self._verified_space_pins[pin.name] = result
+                logger.info(
+                    "Shared embedding space %r verified: %d members share "
+                    "space_id %s (min cosine %.4f >= %.2f).",
+                    pin.name, len(member_services), pin.space_id,
+                    result.min_cosine, pin.parity_threshold,
+                )
+                if record_to is not None:
+                    await self._record_space_parity(record_to, pin, result)
+            else:
+                self._verified_space_pins.pop(pin.name, None)
+                logger.warning(
+                    "Shared embedding space %r REFUSED (parity below "
+                    "threshold): %s. Member routes keep their own space ids.",
+                    pin.name, result.error or f"min cosine {result.min_cosine}",
+                )
+        return results
+
+    async def _record_space_parity(
+        self, db: Any, pin: "EmbeddingSpacePin", result: "ParityResult"
+    ) -> None:
+        """Best-effort: durably persist measured drift for the pinned space.
+
+        Upserts the canonical shared-space registry row so the parity survives
+        a restart (see :meth:`hydrate_verified_space_pins`), even though the
+        verify probe usually runs before any shared-space rows exist.
+        """
+        try:
+            from kestrel_sovereign.storage.sqla.embedding_profile import (
+                record_space_parity,
+            )
+
+            await record_space_parity(
+                db,
+                space_id=pin.space_id,
+                model=pin.model,
+                dim=pin.dim,
+                normalized=pin.normalized,
+                parity_cosine=result.min_cosine,
+            )
+        except Exception as exc:  # pragma: no cover - defensive, never fatal
+            logger.debug("Recording embedding-space parity failed: %s", exc)
+
+    async def hydrate_verified_space_pins(self, db: Any) -> None:
+        """Re-apply previously-verified shared spaces from persisted parity (#2290).
+
+        ``_verified_space_pins`` is process-local, so after a restart the pins
+        parse again but no shared ``space_id`` would be applied until an operator
+        re-POSTs the parity probe — silently stranding reindexed shared-space
+        rows outside kNN. This hydrates that state from the durable
+        ``embedding_profiles.parity_cosine`` written by :meth:`_record_space_parity`.
+
+        A pin is re-verified only when its persisted parity still clears the
+        pin's *current* ``parity_threshold`` — so raising the threshold (or
+        changing the model/dim, which changes ``space_id`` and therefore the
+        looked-up row) correctly invalidates a stale alias. Best-effort: any DB
+        error leaves the pin unverified rather than crashing startup.
+        """
+        pins = getattr(self, "_embedding_space_pins", None)
+        if db is None or not pins:
+            return
+        from .embedding_space import ParityResult
+
+        for pin in pins:
+            try:
+                row = await db.fetchone(
+                    "SELECT parity_cosine FROM embedding_profiles "
+                    "WHERE space_id = ? AND parity_cosine IS NOT NULL "
+                    "ORDER BY parity_cosine DESC LIMIT 1",
+                    (pin.space_id,),
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Hydrating parity for space %s failed: %s", pin.space_id, exc
+                )
+                continue
+            if not row or row[0] is None:
+                continue
+            parity_cosine = float(row[0])
+            if parity_cosine >= pin.parity_threshold:
+                self._verified_space_pins[pin.name] = ParityResult(
+                    passed=True,
+                    threshold=pin.parity_threshold,
+                    min_cosine=round(parity_cosine, 6),
+                    mean_cosine=round(parity_cosine, 6),
+                    n=0,
+                )
+                logger.info(
+                    "Shared embedding space %r rehydrated from persisted parity "
+                    "(cosine %.4f >= %.2f); shared space_id %s active.",
+                    pin.name, parity_cosine, pin.parity_threshold, pin.space_id,
+                )
+            else:
+                self._verified_space_pins.pop(pin.name, None)
 
     def _model_available_for_route(self, provider: Dict[str, Any], model_id: str) -> bool:
         """Return True iff the model is discoverable in this route's vendor catalog.
