@@ -159,3 +159,24 @@ test('tierBadgeHtml renders a badge with the tier text', async () => {
     assert.match(tierBadgeHtml('premium'), /premium/);
     assert.equal(tierBadgeHtml(null), '');
 });
+
+test('unsafe upgrade_href schemes are stripped before rendering (codex P2)', async () => {
+    const { extractUpgradeRequired, upgradeBannerHtml, upgradeToastHtml, sanitizeUpgradeHref } =
+        await import('../../kestrel_sovereign/static/js/upgrade-prompt.js');
+
+    for (const bad of ['javascript:alert(1)', 'data:text/html,x', 'vbscript:x', '//evil.example/upgrade', '  javascript:alert(1)']) {
+        const upgrade = extractUpgradeRequired({
+            status: 403,
+            body: { code: 'upgrade_required', message: 'Needs premium.', upgrade_href: bad },
+        });
+        assert.equal(upgrade.upgradeHref, null, `href must be stripped: ${bad}`);
+        assert.ok(!upgradeBannerHtml(upgrade).includes('<a '), 'banner renders no link');
+        assert.ok(!upgradeToastHtml(upgrade).includes('<a '), 'toast renders no link');
+        // Message still shows — the nudge survives, only the link is dropped.
+        assert.ok(upgradeBannerHtml(upgrade).includes('Needs premium.'));
+    }
+
+    for (const good of ['/upgrade.html', 'https://frinz.ai/upgrade', 'http://localhost:7779/upgrade.html']) {
+        assert.equal(sanitizeUpgradeHref(good), good, `href must survive: ${good}`);
+    }
+});

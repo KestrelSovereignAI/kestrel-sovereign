@@ -52,8 +52,26 @@ export function extractUpgradeRequired(error) {
         requiredTier: body.required_tier || null,
         currentTier: body.current_tier || null,
         message: body.message || 'This action requires an upgrade.',
-        upgradeHref: body.upgrade_href || null,
+        upgradeHref: sanitizeUpgradeHref(body.upgrade_href),
     };
+}
+
+/**
+ * Allow only safe link targets for the upgrade CTA: a same-origin relative
+ * path (`/upgrade.html`, but NOT scheme-relative `//host`) or an absolute
+ * http(s) URL. Everything else (javascript:, data:, vbscript:, malformed)
+ * returns null — renderers then omit the link but keep the message (codex
+ * P2 on #2280: the href is server-provided and lands in innerHTML).
+ */
+export function sanitizeUpgradeHref(href) {
+    if (!href || typeof href !== 'string') return null;
+    const trimmed = href.trim();
+    if (trimmed.startsWith('/') && !trimmed.startsWith('//')) return trimmed;
+    try {
+        const url = new URL(trimmed);
+        if (url.protocol === 'http:' || url.protocol === 'https:') return trimmed;
+    } catch (_) { /* not an absolute URL */ }
+    return null;
 }
 
 /**
