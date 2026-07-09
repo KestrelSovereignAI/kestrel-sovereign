@@ -625,9 +625,14 @@ class TalonCoordinatorFeature(Feature):
                 },
             )
 
-        # A2A dispatch only carries repo/issue today, so using it for a
-        # non-default runtime — or a run that needs the demo/eye quality
-        # gates — would silently ignore the agent's Talon controls.
+        # A2A dispatch only carries repo/issue today, so ANY explicitly
+        # provided per-run control — runtime (backend/model/auth_lane),
+        # iteration caps, clarification/self-review behavior, quality
+        # gates, or a worktree opt-out — would be silently dropped on that
+        # path and the daemon's defaults would apply instead (codex P2).
+        # Every explicit flag therefore forces the CLI invocation, which
+        # carries them all. Do NOT widen the A2A payload here — that is
+        # the daemon team's side of the contract.
         use_a2a = (
             resolved_backend == "claude"
             and resolved_model == "opus"
@@ -635,8 +640,13 @@ class TalonCoordinatorFeature(Feature):
             and backend is None
             and model is None
             and auth_lane is None
-            and not demo_check
-            and not eye_check
+            and max_iterations is None
+            and max_turns is None
+            and skip_clarification is None
+            and self_review is None
+            and worktree is True
+            and demo_check is None
+            and eye_check is None
         )
         if use_a2a:
             a2a_result = await self._dispatch_via_a2a(repo, issue)
