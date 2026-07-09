@@ -85,6 +85,7 @@ def reset_injection_tracking() -> None:
 # content still surfaces. Override via ``[retrieval]`` in kestrel.toml.
 _RETRIEVAL_DEFAULTS = {
     "memory_min_score": 0.3,
+    "memory_min_relevance": 0.1,
     "rag_min_score": 0.5,
 }
 _RETRIEVAL_CONFIG_CACHE: Optional[Dict[str, float]] = None
@@ -741,6 +742,7 @@ class ContextManager:
                     counter=self.counter,
                     emotional_context=emotional_context,
                     min_score=retrieval_cfg["memory_min_score"],
+                    min_relevance=retrieval_cfg["memory_min_relevance"],
                 )
                 if memories:
                     memory_tokens = self.counter.count(memories)

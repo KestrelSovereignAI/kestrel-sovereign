@@ -119,6 +119,7 @@ class MemoryManager:
         counter,
         emotional_context: Optional[Dict[str, Any]] = None,
         min_score: Optional[float] = None,
+        min_relevance: Optional[float] = None,
         read_only: bool = False,
     ) -> Optional[str]:
         """
@@ -166,6 +167,8 @@ class MemoryManager:
             }
             if min_score is not None:
                 retrieve_kwargs["min_score"] = min_score
+            if min_relevance is not None:
+                retrieve_kwargs["min_relevance"] = min_relevance
             if read_only:
                 retrieve_kwargs["read_only"] = True
             memories = await self.memory_retriever.retrieve(**retrieve_kwargs)

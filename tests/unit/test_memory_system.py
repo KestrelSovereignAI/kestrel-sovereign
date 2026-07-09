@@ -412,6 +412,48 @@ class TestMemoryRetriever:
         )
 
     @pytest.mark.asyncio
+    async def test_retrieve_rejects_fresh_unrelated_row_before_salience_rerank(self):
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [{
+            "role": "assistant",
+            "id": 9,
+            "content": "The garden gate is painted red.",
+            "metadata": {"importance": 1.0, "access_count": 50},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="database encryption",
+            agent_id="test-agent",
+            min_score=0.0,
+        )
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_retrieve_rejects_orthogonal_vector_at_default_relevance(self):
+        store = AsyncMock()
+        store.embedding_service = MagicMock()
+        store.embedding_service.aembed = AsyncMock(return_value=[1.0, 0.0])
+        store.get_conversation_history.return_value = [{
+            "role": "assistant",
+            "id": 10,
+            "content": "an unrelated but important event",
+            "metadata": {"importance": 1.0},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }]
+        store.get_message_embeddings.return_value = {10: [0.0, 1.0]}
+
+        results = await MemoryRetriever(store).retrieve(
+            query="database encryption",
+            agent_id="test-agent",
+            min_score=0.0,
+        )
+
+        assert results == []
+
+    @pytest.mark.asyncio
     async def test_retrieve_skips_exact_query_echo(self):
         """The exact-match echo guard at line 141 is the only echo-prevention
         layer now. Verify it still drops a row whose content exactly equals
@@ -546,8 +588,10 @@ class TestMemoryRetriever:
             f"Wrapped-content echo should still be dropped after unwrap; "
             f"got ids={ids!r}"
         )
-        # Row 2 (biographical fact, not the query) MUST still surface.
-        assert 2 in ids, f"Expected row 2 to surface; got ids={ids!r}"
+        # Row 2 is not an echo, but it is also unrelated to this query. The
+        # independent relevance gate correctly rejects it instead of letting
+        # freshness/salience turn it into context noise.
+        assert 2 not in ids
 
 
 class TestDecayCalculation:
