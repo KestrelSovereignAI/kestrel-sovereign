@@ -268,6 +268,9 @@ async def test_claim_dispatch_invocation_shape_no_wait():
         "self_review": True,
         "demo_check": False,
         "eye_check": False,
+        # Detached: the wait_ref must outlive this stage (and possibly the
+        # process), so the dispatch is forced onto the durable CLI path.
+        "force_cli": True,
     }]
     assert result["state"] == "dispatched"
     assert result["job_id"] == "job123"
@@ -293,11 +296,25 @@ async def test_iterate_dispatch_invocation_shape():
         "self_review": None,
         "demo_check": True,
         "eye_check": True,
+        # Attached (wait: true, the default): the in-process wait keeps the
+        # A2A-preferred path available — no CLI forcing.
+        "force_cli": False,
     }]
     assert coordinator.wait_registry.calls == [("talon:job123", 300)]
     assert result["state"] == "complete"
     assert result["status"] == "complete"
     assert result["returncode"] == 0
+
+
+@pytest.mark.asyncio
+async def test_claim_with_wait_keeps_a2a_preference():
+    """Attached claim (wait: true) must NOT force CLI — the A2A-preferred
+    path stays available because the wait is held in-process."""
+    coordinator = _FakeCoordinator(wait_result=_complete_wait())
+    handler = make_talon_pipeline_dispatch_handler(coordinator)
+    await handler({"repo": "org/repo", "issue": 42})
+    assert len(coordinator.dispatch_calls) == 1
+    assert coordinator.dispatch_calls[0]["force_cli"] is False
 
 
 @pytest.mark.asyncio

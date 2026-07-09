@@ -44,6 +44,15 @@ the workflows runner):
                 need to be watched longer use ``wait: false`` plus the
                 returned ``wait_ref`` on the signal-resume rail.
 
+Detached dispatches force the CLI transport: with ``wait: false`` the
+returned ``wait_ref`` (``talon:<job_id>``) is meant to outlive this stage —
+possibly across an agent restart — so the dispatch is forced onto the CLI
+path (``dispatch_pipeline(force_cli=True)``), whose ``cli_background`` jobs
+are durably persisted. A2A jobs live only in the coordinator's in-memory
+job map, so an A2A-shaped wait ref would resolve to an unknown job after a
+restart. ``wait: true`` keeps the A2A-preferred path: the wait is held
+in-process, and a restart simply fails that stage closed (see below).
+
 Known limitation: an A2A claim the talon daemon accepts on the wire but
 then drops (e.g. daemon crash before its task_store row reaches a terminal
 state) never resolves, so a waiting stage holds until
@@ -261,6 +270,10 @@ def make_talon_pipeline_dispatch_handler(coordinator: Any):
             self_review=params["self_review"],
             demo_check=bool(params["demo_check"]),
             eye_check=bool(params["eye_check"]),
+            # Detached (wait: false) hands the wait_ref back for later —
+            # possibly across an agent restart — so it must land a durable
+            # cli_background job, never an in-memory-only A2A task.
+            force_cli=not params["wait"],
         )
         if not isinstance(dispatch, dict) or not dispatch.get("dispatched"):
             error = (

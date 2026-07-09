@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -126,6 +127,23 @@ _TALON_RESERVED_LABELS = frozenset({
 OBSERVABILITY_ORCHESTRATOR_KEY = "KESTREL_OBSERVABILITY_ORCHESTRATOR"
 OBSERVABILITY_WORKFLOW_RUN_ID_KEY = "KESTREL_OBSERVABILITY_WORKFLOW_RUN_ID"
 OBSERVABILITY_STAGE_KEY = "KESTREL_OBSERVABILITY_STAGE"
+
+
+# Per-task suppression of the A2A-preferred claim path (codex P2, detached
+# waits). ``dispatch_pipeline(force_cli=True)`` sets this around its
+# delegated ``talon_claim`` call so a DETACHED dispatch (the caller keeps a
+# ``talon:<job_id>`` wait ref for later) always lands a durable
+# ``cli_background`` job: A2A jobs live only in the coordinator's in-memory
+# ``_jobs`` map (``_persist_jobs`` persists cli_background rows only), so an
+# A2A-shaped wait ref would resolve to an unknown job after an agent
+# restart. A ContextVar (not an instance flag) keeps concurrent dispatches
+# in the same event loop isolated, and — deliberately — this is NOT a
+# ``talon_claim`` tool parameter: the @tool decorator advertises every
+# signature param to the LLM, and transport selection is coordinator
+# plumbing, not an LLM control.
+_FORCE_CLI_DISPATCH: "ContextVar[bool]" = ContextVar(
+    "talon_force_cli_dispatch", default=False
+)
 
 
 # Discriminated reason codes for ``talon_file_and_claim`` failures.
@@ -647,6 +665,10 @@ class TalonCoordinatorFeature(Feature):
             and worktree is True
             and demo_check is None
             and eye_check is None
+            # Detached dispatches (dispatch_pipeline force_cli) need a
+            # durable cli_background job — A2A jobs are in-memory only
+            # and their wait refs die with the process.
+            and not _FORCE_CLI_DISPATCH.get()
         )
         if use_a2a:
             a2a_result = await self._dispatch_via_a2a(repo, issue)
@@ -802,6 +824,7 @@ class TalonCoordinatorFeature(Feature):
         self_review: Optional[bool] = None,
         demo_check: bool = False,
         eye_check: bool = False,
+        force_cli: bool = False,
     ) -> Dict[str, Any]:
         """Dispatch a full talon pipeline run (claim or iterate).
 
@@ -813,6 +836,14 @@ class TalonCoordinatorFeature(Feature):
         runtime policy layer and the same background-CLI funnel — which
         also stamps the observability keys (kestrel-talon#53).
 
+        ``force_cli=True`` suppresses the A2A-preferred claim path for this
+        call (via the task-local ``_FORCE_CLI_DISPATCH`` override). Callers
+        that hand back a ``talon:<job_id>`` wait ref for later use (the
+        source's detached ``wait: false`` mode) MUST set it: A2A jobs live
+        only in the in-memory ``_jobs`` map (``_persist_jobs`` persists
+        cli_background rows only), so an A2A wait ref would resolve to an
+        unknown job after an agent restart.
+
         Returns a plain dispatch dict (``{"dispatched": bool, ...}`` with
         ``job_id``/``task_id`` on success), never a ToolResult, so signal
         handlers can fail closed on it directly.
@@ -823,13 +854,18 @@ class TalonCoordinatorFeature(Feature):
                     "dispatched": False,
                     "error": "dispatch_pipeline: claim mode requires issue",
                 }
-            claim = await self.talon_claim(
-                repo=repo,
-                issue=int(issue),
-                self_review=self_review,
-                demo_check=demo_check or None,
-                eye_check=eye_check or None,
-            )
+            token = _FORCE_CLI_DISPATCH.set(True) if force_cli else None
+            try:
+                claim = await self.talon_claim(
+                    repo=repo,
+                    issue=int(issue),
+                    self_review=self_review,
+                    demo_check=demo_check or None,
+                    eye_check=eye_check or None,
+                )
+            finally:
+                if token is not None:
+                    _FORCE_CLI_DISPATCH.reset(token)
             data = dict(claim.data or {})
             if not data.get("dispatched") and claim.error:
                 data.setdefault("error", claim.error)

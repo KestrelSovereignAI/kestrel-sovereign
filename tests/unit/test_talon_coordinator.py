@@ -303,6 +303,92 @@ class TestTalonClaim:
         mock_bg.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_dispatch_pipeline_force_cli_skips_a2a(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P2 (detached waits): dispatch_pipeline(force_cli=True)
+        must land a durable cli_background job even when A2A is available —
+        A2A jobs are in-memory only, so their wait refs die with the
+        process."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            # A2A is AVAILABLE — riding it would succeed silently and hand
+            # back a wait ref that breaks after restart.
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "durable1", "pid": 1234,
+            }
+            result = await feature.dispatch_pipeline(
+                repo="org/repo", issue=42, mode="claim", force_cli=True,
+            )
+        mock_mesh.assert_not_awaited()
+        mock_bg.assert_awaited_once()
+        assert result["dispatched"] is True
+        assert result["method"] == "cli_background"
+        assert result["job_id"] == "durable1"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_pipeline_default_keeps_a2a_preference(
+        self, tmp_path, monkeypatch
+    ):
+        """Control: without force_cli a bare pipeline claim still prefers
+        A2A, and the ContextVar override does not leak between calls."""
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a",
+                "task_id": "t1", "repo": "org/repo", "issue": 42,
+            }
+            result = await feature.dispatch_pipeline(
+                repo="org/repo", issue=42, mode="claim",
+            )
+        assert result["dispatched"] is True
+        assert result["method"] == "a2a"
+        mock_mesh.assert_awaited_once_with("org/repo", 42)
+        mock_bg.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_pipeline_force_cli_does_not_leak(
+        self, tmp_path, monkeypatch
+    ):
+        """A force_cli call followed by a plain claim in the same task must
+        not leave the override set (token reset in finally)."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "durable1", "pid": 1234,
+            }
+            await feature.dispatch_pipeline(
+                repo="org/repo", issue=42, mode="claim", force_cli=True,
+            )
+            mock_mesh.assert_not_awaited()
+            result = await feature.talon_claim(repo="org/repo", issue=42)
+        assert result.data["method"] == "a2a"
+        mock_mesh.assert_awaited_once_with("org/repo", 42)
+        mock_bg.assert_awaited_once()  # only the force_cli call
+
+    @pytest.mark.asyncio
     async def test_talon_set_config_updates_preference_only(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         feature = TalonCoordinatorFeature(_make_agent())
