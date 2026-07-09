@@ -174,6 +174,52 @@ class TestObservabilityContext:
         assert ctx[OBSERVABILITY_WORKFLOW_RUN_ID_KEY] == "run-abc123"
         assert ctx[OBSERVABILITY_STAGE_KEY] == "dispatch_pipeline"
 
+    def test_real_kestrel_agent_shape_stamps_orchestrator(self):
+        """Agent shaped like the REAL KestrelAgent (codex P2).
+
+        KestrelAgent stores the friendly name on ``_agent_name`` and has NO
+        ``agent_name`` attribute; reading only ``agent_name`` left the
+        orchestrator key unset in production so every agent-driven dispatch
+        rendered as "Direct". A plain object (not MagicMock, which
+        auto-creates attributes) proves the ``_agent_name``-first read.
+        """
+        class _RealShapedAgent:
+            def __init__(self):
+                self._agent_name = "Emma"
+
+        agent = _RealShapedAgent()
+        assert not hasattr(agent, "agent_name")
+        feature = TalonCoordinatorFeature(agent)
+        ctx = feature._observability_context()
+        assert ctx[OBSERVABILITY_ORCHESTRATOR_KEY] == "Emma"
+
+    def test_underscore_attribute_wins_over_stub_fallback(self):
+        """When both are present, the real attribute (``_agent_name``) wins."""
+        class _BothNames:
+            _agent_name = "real-name"
+            agent_name = "stub-name"
+
+        feature = TalonCoordinatorFeature(_BothNames())
+        ctx = feature._observability_context()
+        assert ctx[OBSERVABILITY_ORCHESTRATOR_KEY] == "real-name"
+
+    def test_kestrel_agent_class_still_uses_underscore_attribute(self):
+        """Drift pin against the real class, not a hand-rolled fake.
+
+        If KestrelAgent ever renames the attribute the coordinator reads
+        first, this fails HERE instead of silently de-attributing every
+        talon dispatch to "Direct" in production.
+        """
+        import inspect
+
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        assert "self._agent_name" in inspect.getsource(KestrelAgent), (
+            "KestrelAgent no longer assigns self._agent_name — update "
+            "TalonCoordinatorFeature._observability_context's attribute "
+            "resolution order to match the new name"
+        )
+
 
 # ---------------------------------------------------------------------------
 # CLI transport: env vars on the spawned talon process

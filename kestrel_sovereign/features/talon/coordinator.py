@@ -2871,11 +2871,20 @@ class TalonCoordinatorFeature(Feature):
         ctx: Dict[str, str] = {}
 
         agent = getattr(self, "agent", None)
-        name = getattr(agent, "agent_name", None) if agent is not None else None
-        # Mock/stub agents can expose a non-string agent_name; only a real,
-        # non-empty string is a usable identity.
-        if isinstance(name, str) and name.strip():
-            ctx[OBSERVABILITY_ORCHESTRATOR_KEY] = name.strip()
+        # Real KestrelAgent instances store the friendly name on
+        # ``_agent_name`` (there is no ``agent_name`` property) — the same
+        # attribute the rest of the codebase reads first (SecurityFeature,
+        # approval_queue, lifecycle_checks, codex adapters). ``agent_name``
+        # is kept as a fallback for stubs/alternate agent shapes. Mock/stub
+        # agents can expose a non-string attribute; only a real, non-empty
+        # string is a usable identity — otherwise the key is omitted (never
+        # empty-string) and downstream renders "Direct".
+        if agent is not None:
+            for attr in ("_agent_name", "agent_name"):
+                candidate = getattr(agent, attr, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    ctx[OBSERVABILITY_ORCHESTRATOR_KEY] = candidate.strip()
+                    break
 
         try:
             from kestrel_sovereign.signals.context import get_current_signal
