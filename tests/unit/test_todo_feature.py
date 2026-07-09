@@ -514,3 +514,110 @@ class TestOperationalBlockTodoInjection:
         assert 'done when: "line1 line2"' in block
         # The raw title can't reproduce the boundary or break quoting.
         assert evil not in block
+
+
+class TestTodoPartEmission:
+    """#1894: a todo_* mutation emits a typed ``todo`` part (delta) so the
+    console renders the changed item as its own component bubble."""
+
+    def test_shape_todo_part_projects_only_card_fields(self):
+        from kestrel_sovereign.features.todo.feature import _shape_todo_part
+
+        props = {
+            "id": "todo:1",
+            "title": "Ship it",
+            "status": "in_progress",
+            "scope": "session",
+            "priority": "high",
+            "terminal_condition": "PR merged",
+            "updated_at": "2026-06-20T10:00:00+00:00",
+            "links": [
+                {
+                    "type": "github_issue",
+                    "target": "#1894",
+                    "title": "the ticket",
+                    "status": "open",
+                    "url": "https://github.com/x/y/issues/1894",
+                    "internal_only": "secret",
+                }
+            ],
+            # Rich internal props that must NOT travel to the client.
+            "source_turn": {"turn_id": "t", "session_id": "s"},
+            "next_check_at": "2026-06-20T11:00:00+00:00",
+            "completion_evidence": "proof",
+        }
+
+        shaped = _shape_todo_part(props)
+
+        assert set(shaped) == {
+            "id",
+            "title",
+            "status",
+            "scope",
+            "priority",
+            "terminal_condition",
+            "links",
+            "updated_at",
+        }
+        assert "source_turn" not in shaped
+        assert "next_check_at" not in shaped
+        # Links are trimmed to the fields the card paints.
+        assert set(shaped["links"][0]) == {"type", "target", "title", "status", "url"}
+        assert "internal_only" not in shaped["links"][0]
+
+    def test_shape_todo_part_tolerates_bad_links(self):
+        from kestrel_sovereign.features.todo.feature import _shape_todo_part
+
+        shaped = _shape_todo_part({"id": "todo:x", "links": ["not-a-dict", None, 5]})
+        assert shaped["links"] == []
+
+    @pytest.mark.asyncio
+    async def test_todo_add_emits_todo_part_on_active_turn(self):
+        from kestrel_sovereign.agent.parts import current_part_collector, part_collector
+
+        feature = await _make_feature()
+        with part_collector():
+            result = await feature.todo_add(
+                title="Ship the todo card", scope="session", priority="high"
+            )
+            assert result.status is ToolResultStatus.OK
+            parts = list(current_part_collector() or [])
+
+        assert len(parts) == 1
+        part = parts[0]
+        assert part["type"] == "todo"
+        assert part["data"]["title"] == "Ship the todo card"
+        assert part["data"]["status"] == "open"
+        # The part id is the todo id so a re-emit can key the same card.
+        assert part["id"] == part["data"]["id"]
+
+    @pytest.mark.asyncio
+    async def test_todo_update_and_complete_each_emit_a_part(self):
+        from kestrel_sovereign.agent.parts import current_part_collector, part_collector
+
+        agent = _make_agent()
+        feature = await _make_feature(agent)
+        agent.storage.graph.get_node = AsyncMock(return_value=_todo_node("todo:1"))
+
+        with part_collector():
+            upd = await feature.todo_update(todo_id="todo:1", status="in_progress")
+            assert upd.status is ToolResultStatus.OK
+            done = await feature.todo_complete(
+                todo_id="todo:1",
+                outcome="done",
+                evidence="PR merged and runtime checked",
+                terminal_condition_satisfied=True,
+            )
+            assert done.status is ToolResultStatus.OK
+            parts = list(current_part_collector() or [])
+
+        assert [p["type"] for p in parts] == ["todo", "todo"]
+        assert parts[0]["data"]["status"] == "in_progress"
+
+    @pytest.mark.asyncio
+    async def test_emit_is_a_noop_off_a_streaming_turn(self):
+        # No active part collector (background loop / CLI) → emission is a safe
+        # no-op and never fails the underlying mutation.
+        feature = await _make_feature()
+        result = await feature.todo_add(title="offline todo")
+        assert result.status is ToolResultStatus.OK
