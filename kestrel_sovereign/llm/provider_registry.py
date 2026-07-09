@@ -522,7 +522,31 @@ class ProviderRegistry:
             # duplicates (and contradicts) our llm/retry.py policy. One retry
             # owner only.
             client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
-            adapter = adapter_cls()
+            # Route-level embedding config (#2288). OpenRouter's unified
+            # OpenAI-compatible /v1/embeddings unlocks its whole embedding
+            # catalog through the key we already configure, but the adapter
+            # advertises embeddings ONLY when a route names a model — no
+            # meta-provider default. The upstream model id (e.g.
+            # ``qwen/qwen3-embedding-0.6b``) keys the embedding space, so two
+            # different upstream models through this one route are distinct
+            # spaces (see OpenRouterAdapter.embedding_space_id).
+            embedding_model = route_cfg.get("embedding_model")
+            embedding_dim = route_cfg.get("embedding_dim")
+            if embedding_dim is not None:
+                embedding_dim = int(embedding_dim)
+            supports_embeddings = route_cfg.get("supports_embeddings")
+            if isinstance(supports_embeddings, str):
+                supports_embeddings = supports_embeddings.lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            adapter = adapter_cls(
+                embedding_model=embedding_model,
+                embedding_dim=embedding_dim,
+                supports_embeddings=supports_embeddings,
+            )
             # The adapter constructs its own ``self.api_key`` from
             # OPENROUTER_API_KEY at __init__. Model discovery
             # (``list_models``) and its fallback ``_get_client`` use that

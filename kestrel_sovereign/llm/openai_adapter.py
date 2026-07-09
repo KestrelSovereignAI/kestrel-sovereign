@@ -259,12 +259,21 @@ class OpenAIAdapter(LLMAdapter):
         text: str,
         *,
         model: Optional[str] = None,
+        dimensions: Optional[int] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
+        create_kwargs: Dict[str, Any] = {
+            "model": model or self.DEFAULT_EMBEDDING_MODEL,
+            "input": text,
+        }
+        # Matryoshka-capable models (text-embedding-3-*, qwen3-embedding-*)
+        # accept a ``dimensions`` param to truncate the output vector. Only
+        # forward it when set so providers that don't support it are unaffected.
+        if dimensions is not None:
+            create_kwargs["dimensions"] = dimensions
         response = await with_retry(
             client.embeddings.create,
-            model=model or self.DEFAULT_EMBEDDING_MODEL,
-            input=text,
+            **create_kwargs,
         )
         data = getattr(response, "data", None) or []
         if not data:
@@ -278,14 +287,20 @@ class OpenAIAdapter(LLMAdapter):
         texts: List[str],
         *,
         model: Optional[str] = None,
+        dimensions: Optional[int] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         if not texts:
             return []
+        create_kwargs: Dict[str, Any] = {
+            "model": model or self.DEFAULT_EMBEDDING_MODEL,
+            "input": texts,
+        }
+        if dimensions is not None:
+            create_kwargs["dimensions"] = dimensions
         response = await with_retry(
             client.embeddings.create,
-            model=model or self.DEFAULT_EMBEDDING_MODEL,
-            input=texts,
+            **create_kwargs,
         )
         embeddings: List[Optional[List[float]]] = [None] * len(texts)
         for item in getattr(response, "data", None) or []:
