@@ -583,6 +583,31 @@ def test_embedding_settings_post_surfaces_validation_error():
         _restore_app(app, original)
 
 
+def test_embedding_settings_post_rejects_non_string_route():
+    """#2286 — a non-string ``embedding_route`` (int/list/dict) is bad input
+    and must return 400, not fall through to a 500. set_embedding_route must
+    never be reached with a non-string value."""
+    llm_service = MagicMock()
+    llm_service.set_embedding_route = MagicMock()
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                for bad in (42, ["ollama:local"], {"route": "ollama:local"}):
+                    resp = client.post(
+                        "/api/embedding/settings",
+                        headers=_api_headers(),
+                        json={"embedding_route": bad},
+                    )
+                    assert resp.status_code == 400, bad
+                    assert "must be a string or null" in resp.json()["detail"]
+        llm_service.set_embedding_route.assert_not_called()
+    finally:
+        _restore_app(app, original)
+
+
 # ---------------------------------------------------------------------------
 # Three-tier key panel endpoints (resources.js) — see #735
 # ---------------------------------------------------------------------------

@@ -1430,6 +1430,16 @@ async def set_embedding_settings(request: Request):
                 detail="'embedding_route' field is required (use null to clear).",
             )
         route = data.get("embedding_route")
+        # ``embedding_route`` must be a string selector or null (clear). A
+        # non-string (e.g. 42, a list, a dict) would raise AttributeError deep
+        # in set_embedding_route's ``route.strip()`` and surface as a 500 —
+        # reject it here as plain bad input, consistent with the unknown-route
+        # / no-embedding-support 400s below (#2286).
+        if route is not None and not isinstance(route, str):
+            raise HTTPException(
+                status_code=400,
+                detail="'embedding_route' must be a string or null.",
+            )
 
         agent = get_agent(request)
         if not hasattr(agent, "llm_service") or not agent.llm_service:
