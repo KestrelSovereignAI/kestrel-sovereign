@@ -39,6 +39,7 @@ import {
     positionFromEvent,
     closeKebabMenu,
 } from './kebab_menu.js';
+import { storeGet, storeSet } from './ui_state.mjs';
 
 // #1816: DB timestamps are UTC but conversation rows serialize naive (no tz
 // suffix). Date.parse() reads a naive string as LOCAL time, so pin tz-less
@@ -946,25 +947,10 @@ export function mountConversations(containerEl, config = {}) {
 // mountConversationsPane — the full collapsible pane unit (#2199)
 // ============================================================================
 
-// Best-effort localStorage: the console runs it, but embed hosts and jsdom
-// tests may not expose one. Every read/write is guarded so persistence
-// degrades to in-memory-less no-ops rather than throwing.
-function paneStorage() {
-    try {
-        if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
-    } catch (_) { /* access can throw under strict sandboxing */ }
-    return null;
-}
-function storeGet(key) {
-    const s = paneStorage();
-    if (!s) return null;
-    try { return s.getItem(key); } catch (_) { return null; }
-}
-function storeSet(key, value) {
-    const s = paneStorage();
-    if (!s) return;
-    try { s.setItem(key, value); } catch (_) { /* quota / disabled — ignore */ }
-}
+// Best-effort localStorage persistence now lives in the shared ui_state.mjs
+// module (#2298) — `storeGet`/`storeSet` are imported above. The raw-string
+// contract is unchanged, so the pane's on-disk format is byte-for-byte
+// identical (no stored state migrates or breaks).
 
 /**
  * Mount the full collapsible conversations PANE — the embeddable list surface
