@@ -9,9 +9,9 @@ single ``retrieve()`` call can mix both paths cleanly.
 
 Covers:
 
-- ``_cosine_unit`` returns ``None`` for unusable inputs, otherwise a
-  value in ``[0, 1]``. Identical vectors → 1.0, opposite → 0.0,
-  orthogonal → 0.5.
+- ``_cosine_unit`` returns ``None`` for unusable inputs, otherwise positive
+  relevance in ``[0, 1]``. Identical vectors → 1.0; opposite and orthogonal
+  vectors → 0.0.
 - ``_embed_query`` returns ``None`` when the conversation store has
   no service / on empty query / on aembed failure.
 - ``_score_semantic`` takes the cosine path when both embeddings are
@@ -53,13 +53,11 @@ def test_cosine_unit_opposite_vectors_is_zero():
     assert _cosine_unit(a, b) == pytest.approx(0.0)
 
 
-def test_cosine_unit_orthogonal_vectors_is_half():
-    """Perpendicular → cosine 0 → unit 0.5. (Neutral signal,
-    same as the keyword-path's "no meaningful query words"
-    return.)"""
+def test_cosine_unit_orthogonal_vectors_is_zero():
+    """Perpendicular vectors have no positive relevance."""
     a = [1.0, 0.0]
     b = [0.0, 1.0]
-    assert _cosine_unit(a, b) == pytest.approx(0.5)
+    assert _cosine_unit(a, b) == pytest.approx(0.0)
 
 
 def test_cosine_unit_returns_none_on_length_mismatch():

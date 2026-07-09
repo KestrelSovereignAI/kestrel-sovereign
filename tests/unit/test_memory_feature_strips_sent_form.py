@@ -78,7 +78,12 @@ async def test_recall_emotional_unknown_mood_is_partial():
 
     retriever = MagicMock()
     retriever.retrieve = AsyncMock(return_value=[
-        {"role": "assistant", "content": "remembered thing", "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "remembered thing",
+            "metadata": {},
+            "retrieval_score": 0.73,
+        },
     ])
     memory_system = MagicMock()
     memory_system.retriever = retriever
@@ -101,7 +106,12 @@ async def test_recall_emotional_known_mood_is_ok():
 
     retriever = MagicMock()
     retriever.retrieve = AsyncMock(return_value=[
-        {"role": "assistant", "content": "remembered thing", "metadata": {}},
+        {
+            "role": "assistant",
+            "content": "remembered thing",
+            "metadata": {},
+            "retrieval_score": 0.73,
+        },
     ])
     memory_system = MagicMock()
     memory_system.retriever = retriever
@@ -111,6 +121,7 @@ async def test_recall_emotional_known_mood_is_ok():
 
     assert out.status is ToolResultStatus.OK
     assert out.data["mood_context"] == "positive"
+    assert out.data["memories"][0]["score"] == 0.73
 
 
 @pytest.mark.asyncio

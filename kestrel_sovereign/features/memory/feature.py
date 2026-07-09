@@ -549,7 +549,8 @@ class MemoryFeature(Feature):
         self,
         query: str,
         mood: str = "neutral",
-        limit: int = 10
+        limit: int = 10,
+        min_relevance: float = 0.1,
     ) -> ToolResult:
         """
         Retrieve memories with human-like weighting.
@@ -566,6 +567,8 @@ class MemoryFeature(Feature):
             query: What you're trying to remember
             mood: Current emotional context (positive, negative, neutral)
             limit: Maximum memories to retrieve (the request).
+            min_relevance: Eligibility floor before emotional/importance
+                reranking. Use 0 for deliberately relevance-free mood recall.
         """
         try:
             limit_val = int(limit)
@@ -573,6 +576,12 @@ class MemoryFeature(Feature):
             return ToolResult.failed(f"limit must be an integer, got {limit!r}")
         if limit_val < 1:
             return ToolResult.failed("limit must be >= 1")
+        try:
+            min_relevance_val = float(min_relevance)
+        except (TypeError, ValueError):
+            return ToolResult.failed("min_relevance must be a number between 0 and 1")
+        if not 0.0 <= min_relevance_val <= 1.0:
+            return ToolResult.failed("min_relevance must be between 0 and 1")
 
         if not isinstance(mood, str):
             return ToolResult.failed(
@@ -635,6 +644,7 @@ class MemoryFeature(Feature):
                 agent_id=self.agent_id,
                 emotional_context=emotional_context,
                 limit=limit_val,
+                min_relevance=min_relevance_val,
             )
         except (AttributeError, TypeError, KeyError, ValueError) as e:
             logger.error(f"recall_emotional failed: {e}")
@@ -653,7 +663,7 @@ class MemoryFeature(Feature):
             formatted.append({
                 "content": content,
                 "role": role,
-                "score": mem.get("score", 0),
+                "score": mem.get("retrieval_score", mem.get("score", 0)),
                 "emotional_valence": meta.get("emotional_valence", 0),
                 "importance": meta.get("importance", 0.5),
                 "timestamp": mem.get("timestamp", ""),

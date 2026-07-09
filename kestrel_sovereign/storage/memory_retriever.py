@@ -37,7 +37,7 @@ import logging
 import math
 import struct
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional, Sequence, Tuple
+from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
 from .memory_models import MemoryMetadata
@@ -80,14 +80,15 @@ def _normalize_for_echo_check(text: str) -> str:
 
 
 def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
-    """Cosine similarity normalised into ``[0, 1]``.
+    """Return positive cosine relevance in ``[0, 1]``.
 
     Returns ``None`` when the inputs are unusable (empty, length
     mismatch, zero norm) so the caller can fall back to keyword
     overlap for THIS row without mistaking "no signal" for
-    "neutral score." Otherwise returns ``(cos + 1) / 2`` so the
-    output sits in the same ``[0, 1]`` band the rest of
-    ``_score_semantic`` uses.
+    "neutral score." Orthogonal and negatively-correlated vectors are
+    irrelevant, not half-relevant, so both clamp to zero. This makes the
+    vector signal comparable to lexical overlap, whose no-match value is
+    also zero.
 
     Pure-Python (no numpy) — the retriever rescores ~1000 rows
     per call and a numpy import here adds a few ms of cold-start
@@ -105,7 +106,7 @@ def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
     if norm_a <= 0.0 or norm_b <= 0.0:
         return None
     raw = dot / math.sqrt(norm_a * norm_b)
-    return max(0.0, min(1.0, (raw + 1.0) / 2.0))
+    return max(0.0, min(1.0, raw))
 
 
 def _pack_embedding(embedding: Sequence[float]) -> bytes:
@@ -114,8 +115,8 @@ def _pack_embedding(embedding: Sequence[float]) -> bytes:
 
 
 def _similarity_to_unit(similarity: float) -> float:
-    """Normalize backend cosine similarity from ``[-1, 1]`` to ``[0, 1]``."""
-    return max(0.0, min(1.0, (float(similarity) + 1.0) / 2.0))
+    """Normalize backend cosine to positive relevance in ``[0, 1]``."""
+    return max(0.0, min(1.0, float(similarity)))
 
 
 class MemoryRetriever:
@@ -166,6 +167,7 @@ class MemoryRetriever:
         emotional_context: Optional[MemoryMetadata] = None,
         limit: int = 10,
         min_score: float = 0.1,
+        min_relevance: float = 0.1,
         read_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
@@ -177,6 +179,8 @@ class MemoryRetriever:
             emotional_context: Current emotional context for matching
             limit: Max results to return
             min_score: Minimum score threshold
+            min_relevance: Independent semantic/lexical/associative eligibility
+                floor. Salience signals cannot rescue a candidate below it.
             read_only: When True, skip access-count update scheduling so
                 callers can estimate the memory block without rehearsal-effect
                 writes.
@@ -283,7 +287,7 @@ class MemoryRetriever:
         query_normalized = _normalize_for_echo_check(query)
 
         # Score each message
-        scored: List[Tuple[Dict[str, Any], float]] = []
+        scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]] = []
 
         for msg in history:
             content = msg.get("content", "")
@@ -309,7 +313,7 @@ class MemoryRetriever:
             if _normalize_for_echo_check(comparison_content) == query_normalized:
                 continue
 
-            score = self._calculate_score(
+            components = self._calculate_score_components(
                 content=content,
                 query=query,
                 metadata=msg.get("metadata", {}),
@@ -321,17 +325,29 @@ class MemoryRetriever:
                 semantic_similarity=semantic_similarities.get(str(msg.get("id"))),
             )
 
-            if score >= min_score:
-                scored.append((msg, score))
+            relevance = components["semantic"]
+            score = components["total"]
+            logger.debug(
+                "memory candidate id=%s relevance=%.4f total=%.4f "
+                "components=%s eligible=%s",
+                msg.get("id"), relevance, score, components,
+                relevance >= min_relevance and score >= min_score,
+            )
+            if relevance >= min_relevance and score >= min_score:
+                scored.append((msg, score, components))
 
         # Sort by score descending
         scored.sort(key=lambda x: x[1], reverse=True)
 
         # Return top results with scores
         results = []
-        for msg, score in scored[:limit]:
+        for msg, score, components in scored[:limit]:
             result = dict(msg)
             result["retrieval_score"] = round(score, 4)
+            result["relevance_score"] = round(components["semantic"], 4)
+            result["retrieval_components"] = {
+                key: round(value, 4) for key, value in components.items()
+            }
             results.append(result)
 
         if not read_only:
@@ -351,6 +367,11 @@ class MemoryRetriever:
         self._access_update_tasks.add(task)
         task.add_done_callback(self._access_update_tasks.discard)
         return task
+
+    async def record_accesses(self, message_ids: Iterable[int], agent_id: str) -> None:
+        """Record rehearsal only for memories a caller actually surfaced."""
+        for message_id in dict.fromkeys(message_ids):
+            self._schedule_access_update(message_id, agent_id)
 
     async def drain_access_updates(self, *, cancel: bool = False) -> None:
         """Wait for scheduled access-count updates before storage lifecycle changes."""
@@ -393,6 +414,31 @@ class MemoryRetriever:
         - certainty: 10% (epistemic weight)
         - access: 10% (rehearsal effect)
         """
+        return self._calculate_score_components(
+            content=content,
+            query=query,
+            metadata=metadata,
+            emotional_context=emotional_context,
+            created_at=created_at,
+            expanded_concepts=expanded_concepts,
+            query_embedding=query_embedding,
+            content_embedding=content_embedding,
+            semantic_similarity=semantic_similarity,
+        )["total"]
+
+    def _calculate_score_components(
+        self,
+        content: str,
+        query: str,
+        metadata: Dict[str, Any],
+        emotional_context: Optional[MemoryMetadata],
+        created_at: Optional[str],
+        expanded_concepts: List[str],
+        query_embedding: Optional[List[float]] = None,
+        content_embedding: Optional[List[float]] = None,
+        semantic_similarity: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """Return calibrated component scores and their weighted total."""
         # Parse metadata if string
         if isinstance(metadata, str):
             try:
@@ -442,7 +488,15 @@ class MemoryRetriever:
             certainty * self.WEIGHT_CERTAINTY
         )
 
-        return total
+        return {
+            "semantic": semantic,
+            "emotional": emotional,
+            "importance": importance,
+            "recency": recency,
+            "access": access,
+            "certainty": certainty,
+            "total": total,
+        }
 
     def _score_semantic(
         self,
@@ -474,7 +528,7 @@ class MemoryRetriever:
         Mixing both paths within a single ``retrieve()`` call is
         intentional: rows written before the Phase-2 migration / while
         Ollama was down get keyword scores; new rows get cosine. The
-        scores are normalised into the same 0..1 band so this doesn't
+        scores use the same no-match=0 and exact-match=1 calibration so this doesn't
         produce a discontinuity in the final ranking.
         """
         if semantic_similarity is not None:
@@ -518,7 +572,7 @@ class MemoryRetriever:
         content_words -= stop_words
 
         if not query_words:
-            return 0.5  # Neutral if no meaningful query words
+            return 0.0
 
         # Keyword overlap
         overlap = len(query_words & content_words)

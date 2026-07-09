@@ -279,7 +279,8 @@ class MemorySystem:
         self,
         query: str,
         limit: int = 10,
-        emotional_context: Optional[MemoryMetadata] = None
+        emotional_context: Optional[MemoryMetadata] = None,
+        min_relevance: float = 0.1,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve memories relevant to query with human-like weighting.
@@ -288,6 +289,8 @@ class MemorySystem:
             query: Search query
             limit: Max results
             emotional_context: Current emotional state for mood-congruent retrieval
+            min_relevance: Semantic/lexical/associative eligibility floor. Set
+                to 0 only for intentionally relevance-free emotional recall.
 
         Returns:
             List of message dicts with retrieval_score
@@ -300,7 +303,8 @@ class MemorySystem:
             query,
             self.agent_id,
             emotional_context=emotional_context,
-            limit=limit
+            limit=limit,
+            min_relevance=min_relevance,
         )
 
     async def retrieve_important(
