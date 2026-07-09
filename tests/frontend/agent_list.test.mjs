@@ -201,16 +201,22 @@ test('default adapter maps /api/agents fields and resolves avatar_hash', async (
     assert.equal(adapter.mode, 'multi_agent', 'adapter.mode mirrors the response');
 });
 
-test('source-contract: identity.js drives mountAgentList, no hand-rolled agent loop', () => {
+test('source-contract: identity.js drives mountAgentListPane, no hand-rolled agent loop', () => {
     const src = readFileSync(
         resolve(here, '../../kestrel_sovereign/static/js/identity.js'),
         'utf8',
     );
-    assert.match(src, /import \{ mountAgentList, createDefaultAgentAdapter \} from '\.\/agent_list\.js'/);
-    assert.match(src, /mountAgentList\(container, \{/, 'loadAgents mounts the component');
+    // #2279: the console now drives the PANE wrapper (chrome + "+ New"), which
+    // wraps the shared list surface.
+    assert.match(src, /import \{ mountAgentListPane, createDefaultAgentAdapter \} from '\.\/agent_list\.js'/);
+    assert.match(src, /mountAgentListPane\(container, \{/, 'loadAgents mounts the pane component');
     // The bespoke per-agent innerHTML loop is gone (the tell-tale inline markup).
     assert.ok(!src.includes('class="agent-status-dot'), 'no hand-rolled status-dot markup');
     assert.ok(!/for \(const agent of agents\)/.test(src), 'no hand-rolled agent loop');
+    // #2279: the bespoke agents-pane collapse/resize helpers were retired (the
+    // pane component owns that chrome now) — no double-binding.
+    assert.ok(!/function initPaneResize\(/.test(src), 'bespoke initPaneResize removed');
+    assert.ok(!/window\.togglePane = /.test(src), 'bespoke togglePane removed');
 });
 
 test('voice tagging reaches the card shell for CUSTOM renderers with nested anchors (codex P2)', async () => {

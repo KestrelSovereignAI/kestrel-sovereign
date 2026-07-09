@@ -368,3 +368,285 @@ export function mountAgentList(containerEl, config = {}) {
         destroy,
     };
 }
+
+// ============================================================================
+// mountAgentListPane — the full collapsible pane unit (design #2166 §4)
+// ============================================================================
+
+// Best-effort localStorage: the console runs it, but embed hosts and jsdom
+// tests may not expose one. Every read/write is guarded so persistence
+// degrades to in-memory-less no-ops rather than throwing (mirrors the
+// conversations pane's `paneStorage()`).
+function paneStorage() {
+    try {
+        if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
+    } catch (_) { /* access can throw under strict sandboxing */ }
+    return null;
+}
+function storeGet(key) {
+    const s = paneStorage();
+    if (!s) return null;
+    try { return s.getItem(key); } catch (_) { return null; }
+}
+function storeSet(key, value) {
+    const s = paneStorage();
+    if (!s) return;
+    try { s.setItem(key, value); } catch (_) { /* quota / disabled — ignore */ }
+}
+
+/**
+ * Mount the full collapsible agent/companion PANE — the embeddable list surface
+ * (`mountAgentList`) PLUS the surrounding pane chrome. This is the agent
+ * analogue of `mountConversationsPane`, sharing the SAME chrome contract (#2199
+ * / #2216) so the standalone console and any embed consume ONE pane
+ * implementation; a host provides only a container + config and gets:
+ *
+ *   - a `<` chevron that fully HIDES the pane (`display:none`, no leftover rail;
+ *     #2216) with `open()` / `close()` / `toggle()` and an `onToggle(collapsed)`
+ *     callback so a host toolbar trigger can reopen it;
+ *   - a drag-resize handle with min/max width + `localStorage` persistence
+ *     (width under `:width`, collapsed state under `:collapsed`), guarded to a
+ *     no-op when localStorage is unavailable;
+ *   - a component-owned "+ New" header action wired via `config.onNew` (Frinz →
+ *     Add-a-Companion; standalone console → new-agent / spawn flow, an
+ *     affordance it gains here, same-everywhere rule).
+ *
+ * Chrome is ADOPT-or-BUILD: when the container already looks like a pane (the
+ * console's static `#agents-pane` with its `.pane-header` / `.resize-handle`),
+ * those elements are reused; when the container is bare (the embedder contract —
+ * a host hands over just a `<div>`), the full chrome is built inside it.
+ * `destroy()` removes only chrome this mount built; adopted chrome is left.
+ *
+ * Config (all optional except where the list needs them):
+ *   - api, adapter, renderCard, showStatusDot, isThinking, onStop, onSelect,
+ *     onLoaded, onError, autoLoad, autoSelectFirst, selectedName, escapeHtml,
+ *     emptyText, errorText — forwarded verbatim to `mountAgentList`.
+ *   - onNew()          — the "+ New" header action (Add-a-Companion / new agent).
+ *                        The New button is only built/adopted when this is a fn.
+ *   - newLabel         — accessible label / tooltip for the New button.
+ *   - collapsed        — initial collapsed state (overridden by persistence).
+ *   - storageKey       — persistence namespace (default 'kestrel:agents-pane').
+ *   - title            — pane header title (default 'Agents').
+ *   - onToggle(bool)   — fired after every collapse/expand with the new state.
+ *   - minWidth/maxWidth — resize clamps (default 200 / 500, matching the CSS).
+ *
+ * Returns a handle:
+ *   `{ element, list, refresh, select, setActiveName, getActive,
+ *      open, close, toggle, collapsed, destroy }`
+ * where `list` is the inner `mountAgentList` handle.
+ */
+export function mountAgentListPane(containerEl, config = {}) {
+    if (!containerEl) throw new Error('mountAgentListPane requires a container element');
+    const doc = containerEl.ownerDocument
+        || (typeof document !== 'undefined' ? document : null);
+    if (!doc) throw new Error('mountAgentListPane requires a document');
+
+    const storageKey = config.storageKey || 'kestrel:agents-pane';
+    const KEY_WIDTH = `${storageKey}:width`;
+    const KEY_COLLAPSED = `${storageKey}:collapsed`;
+    const minWidth = Number.isFinite(config.minWidth) ? config.minWidth : 200;
+    const maxWidth = Number.isFinite(config.maxWidth) ? config.maxWidth : 500;
+
+    // The container IS the pane element; tag it so it inherits the pane-sidebar
+    // chrome CSS whether it was already a pane (adopt) or a bare div (build).
+    if (containerEl.classList) {
+        containerEl.classList.add('pane-sidebar', 'agent-list-pane');
+    }
+    const paneEl = containerEl;
+
+    // --- Header (adopt existing .pane-header, else build one) ---------------
+    let header = paneEl.querySelector('.pane-header');
+    let builtHeader = false;
+    if (!header) {
+        header = doc.createElement('div');
+        header.className = 'pane-header';
+        const h3 = doc.createElement('h3');
+        h3.className = 'agent-list-pane-title';
+        h3.textContent = config.title || 'Agents';
+        header.appendChild(h3);
+        paneEl.insertBefore(header, paneEl.firstChild);
+        builtHeader = true;
+    }
+
+    // --- Collapse rail (adopt existing .collapse-btn, else build one) -------
+    let collapseBtn = header.querySelector('.collapse-btn');
+    if (!collapseBtn) {
+        collapseBtn = doc.createElement('button');
+        collapseBtn.type = 'button';
+        collapseBtn.className = 'collapse-btn';
+        collapseBtn.title = 'Collapse';
+        collapseBtn.setAttribute('aria-label', 'Collapse agents pane');
+        collapseBtn.innerHTML = (typeof window !== 'undefined' && typeof window.kicon === 'function')
+            ? window.kicon('chevron-left')
+            : '<span class="ki ki-chevron-left" aria-hidden="true"></span>';
+        header.appendChild(collapseBtn);
+    }
+
+    // --- List body (adopt existing #agents-list / .pane-content) -----------
+    let body = paneEl.querySelector('#agents-list')
+        || paneEl.querySelector('.agent-list-pane-body');
+    if (!body) {
+        body = doc.createElement('div');
+        body.className = 'pane-content agent-list-pane-body';
+        // Insert before any existing resize handle so the handle stays last.
+        const existingHandle = paneEl.querySelector('.resize-handle');
+        if (existingHandle) paneEl.insertBefore(body, existingHandle);
+        else paneEl.appendChild(body);
+    }
+
+    // --- Resize handle (adopt existing .resize-handle, else build one) ------
+    let resizeHandle = paneEl.querySelector('.resize-handle');
+    if (!resizeHandle) {
+        resizeHandle = doc.createElement('div');
+        resizeHandle.className = 'resize-handle agent-list-resize-handle';
+        paneEl.appendChild(resizeHandle);
+    }
+
+    // --- Mount the shared list surface into the body -----------------------
+    const listHandle = mountAgentList(body, {
+        api: config.api,
+        adapter: config.adapter,
+        renderCard: config.renderCard,
+        showStatusDot: config.showStatusDot,
+        isThinking: config.isThinking,
+        onStop: config.onStop,
+        onSelect: config.onSelect,
+        onLoaded: config.onLoaded,
+        onError: config.onError,
+        autoLoad: config.autoLoad,
+        autoSelectFirst: config.autoSelectFirst,
+        selectedName: config.selectedName,
+        escapeHtml: config.escapeHtml,
+        emptyText: config.emptyText,
+        errorText: config.errorText,
+    });
+
+    // --- "+ New" header action (adopt existing, else build) ----------------
+    // Component-owned so embed hosts — which never run the console's
+    // DOMContentLoaded wiring — still get it, and so the standalone console
+    // GAINS a new-agent affordance it lacks today (same-everywhere rule). The
+    // action is entirely host-defined via `onNew`, so the button is only
+    // built/adopted when `onNew` is a function. The console's static
+    // `#new-agent-sidebar-btn` (if present) is adopted in place; otherwise a
+    // fresh `ki-plus` button is built. Same adopt-or-build pattern as the
+    // conversations pane's New button.
+    const hasNew = typeof config.onNew === 'function';
+    let newBtn = null;
+    let builtNewBtn = false;
+    let onNewClick = null;
+    if (hasNew) {
+        newBtn = header.querySelector('#new-agent-sidebar-btn')
+            || header.querySelector('.new-agent-btn');
+        if (!newBtn) {
+            newBtn = doc.createElement('button');
+            newBtn.type = 'button';
+            newBtn.className = 'new-agent-btn btn-icon';
+            newBtn.title = config.newLabel || 'New Agent';
+            newBtn.setAttribute('aria-label', config.newLabel || 'New agent');
+            newBtn.innerHTML = (typeof window !== 'undefined' && typeof window.kicon === 'function')
+                ? window.kicon('plus')
+                : '<span class="ki ki-plus" aria-hidden="true"></span>';
+            // Sit just after the title, before the collapse chevron.
+            const titleEl = header.querySelector('.agent-list-pane-title')
+                || header.querySelector('h3');
+            if (titleEl && titleEl.nextSibling) header.insertBefore(newBtn, titleEl.nextSibling);
+            else header.insertBefore(newBtn, header.firstChild);
+            builtNewBtn = true;
+        }
+        onNewClick = () => { config.onNew(); };
+        newBtn.addEventListener('click', onNewClick);
+    }
+
+    // ---- Collapse state ---------------------------------------------------
+    // #2216 two-state: open (full pane) and fully HIDDEN (`display:none`, zero
+    // width — NO collapsed chevron rail). The `.collapsed` class is kept in
+    // lock-step with `display:none` as the single state marker. Unlike the
+    // conversations pane, the agents pane is the primary navigation surface, so
+    // its first-run default is OPEN (a persisted value or explicit
+    // `config.collapsed` still wins).
+    function isCollapsed() {
+        return !!(paneEl.classList && paneEl.classList.contains('collapsed'));
+    }
+    function applyCollapsed(collapsed, persist) {
+        if (!paneEl.classList) return;
+        paneEl.classList.toggle('collapsed', collapsed);
+        paneEl.style.display = collapsed ? 'none' : '';
+        if (persist) storeSet(KEY_COLLAPSED, collapsed ? '1' : '0');
+        if (typeof config.onToggle === 'function') config.onToggle(collapsed);
+    }
+    function open() { if (isCollapsed()) applyCollapsed(false, true); }
+    function close() { if (!isCollapsed()) applyCollapsed(true, true); }
+    function toggle() { applyCollapsed(!isCollapsed(), true); }
+
+    // The chevron `<` CLOSES the pane (fully hides it); a host trigger reopens.
+    const onCollapseClick = () => close();
+    collapseBtn.addEventListener('click', onCollapseClick);
+
+    // Initial state: a persisted value wins; otherwise `config.collapsed`;
+    // otherwise OPEN. Always applied so the pane's `display` reflects the state
+    // from mount, whichever branch wins.
+    const persistedCollapsed = storeGet(KEY_COLLAPSED);
+    const startCollapsed = persistedCollapsed !== null
+        ? persistedCollapsed === '1'
+        : (config.collapsed !== undefined ? !!config.collapsed : false);
+    applyCollapsed(startCollapsed, false);
+
+    // ---- Resize (min/max + persistence) -----------------------------------
+    const persistedWidth = parseInt(storeGet(KEY_WIDTH), 10);
+    if (Number.isFinite(persistedWidth)) {
+        paneEl.style.width = `${Math.max(minWidth, Math.min(maxWidth, persistedWidth))}px`;
+    }
+    let startX = 0;
+    let startWidth = 0;
+    function onMouseMove(e) {
+        const diff = e.clientX - startX;
+        const w = Math.max(minWidth, Math.min(maxWidth, startWidth + diff));
+        paneEl.style.width = `${w}px`;
+    }
+    function onMouseUp() {
+        doc.removeEventListener('mousemove', onMouseMove);
+        doc.removeEventListener('mouseup', onMouseUp);
+        if (doc.body) {
+            doc.body.style.cursor = '';
+            doc.body.style.userSelect = '';
+        }
+        storeSet(KEY_WIDTH, String(paneEl.offsetWidth || parseInt(paneEl.style.width, 10) || startWidth));
+    }
+    function onResizeDown(e) {
+        startX = e.clientX;
+        startWidth = paneEl.offsetWidth || parseInt(paneEl.style.width, 10) || minWidth;
+        if (doc.body) {
+            doc.body.style.cursor = 'col-resize';
+            doc.body.style.userSelect = 'none';
+        }
+        doc.addEventListener('mousemove', onMouseMove);
+        doc.addEventListener('mouseup', onMouseUp);
+    }
+    resizeHandle.addEventListener('mousedown', onResizeDown);
+
+    function destroy() {
+        collapseBtn.removeEventListener('click', onCollapseClick);
+        if (newBtn && onNewClick) newBtn.removeEventListener('click', onNewClick);
+        resizeHandle.removeEventListener('mousedown', onResizeDown);
+        doc.removeEventListener('mousemove', onMouseMove);
+        doc.removeEventListener('mouseup', onMouseUp);
+        try { listHandle.destroy(); } catch (_) { /* best-effort */ }
+        // Remove only chrome this mount built; adopted chrome is left in place.
+        if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
+        if (builtNewBtn && newBtn) newBtn.remove();
+    }
+
+    return {
+        element: paneEl,
+        list: listHandle,
+        refresh: (...a) => listHandle.refresh(...a),
+        select: (...a) => listHandle.select(...a),
+        setActiveName: (...a) => listHandle.setActiveName(...a),
+        getActive: (...a) => listHandle.getActive(...a),
+        open,
+        close,
+        toggle,
+        get collapsed() { return isCollapsed(); },
+        destroy,
+    };
+}

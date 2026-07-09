@@ -16,6 +16,13 @@
 <body>
     <nav>
         <div class="nav-brand">
+            <!-- #2279: always-visible agents-pane trigger. The agents pane
+                 (#agents-pane, top-level left sidebar) collapses to fully hidden
+                 (display:none) via its own chevron; this button — which lives in
+                 the top nav, OUTSIDE the pane, so it survives the hide — is the
+                 sole reopen affordance. Mirrors the chat-header
+                 #conversations-toggle-btn for the conversations pane. -->
+            <button id="agents-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_toggle_agents" title="Agents" aria-label="Toggle agents pane" style="padding: 0.4rem 0.6rem; font-size: 0.85rem; margin-right: 0.5rem;"><span class="ki ki-users"></span></button>
             <span class="kestrel-icon" id="nav-agent-icon"><img src="/static/favicon.svg" alt="Kestrel"></span>
             <img id="nav-agent-avatar" src="" alt="" style="display: none; width: 32px; height: 32px; border-radius: 50%; object-fit: cover;">
             <h1 id="nav-agent-name">Kestrel</h1>
