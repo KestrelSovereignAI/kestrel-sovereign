@@ -212,3 +212,37 @@ test('source-contract: identity.js drives mountAgentList, no hand-rolled agent l
     assert.ok(!src.includes('class="agent-status-dot'), 'no hand-rolled status-dot markup');
     assert.ok(!/for \(const agent of agents\)/.test(src), 'no hand-rolled agent loop');
 });
+
+test('voice tagging reaches the card shell for CUSTOM renderers with nested anchors (codex P2)', async () => {
+    // A host renderCard nests ctx.actionsAnchor inside its own body layout.
+    // voice/ui.js tags the enclosing card via closest('.agent-card'), and its
+    // refresh selectors are attribute-only — so custom cards must (a) expose
+    // .agent-card on the shell and (b) be findable without .agent-item.
+    const { readFile } = await import('node:fs/promises');
+    const voiceSrc = await readFile(new URL('../../kestrel_sovereign/static/js/voice/ui.js', import.meta.url), 'utf8');
+    assert.ok(voiceSrc.includes(".closest('.agent-card, .agent-item')"),
+        'voice tags the enclosing card shell, not blind parentNode');
+    assert.ok(!voiceSrc.includes('.agent-item[data-voice-agent-key]'),
+        'voice refresh selectors must not require .agent-item');
+
+    // And the component side: a custom-rendered shell still carries .agent-card
+    // so closest() can find it from a nested anchor.
+    const { el: container, handle } = mountInto({
+        adapter: fakeAdapter([{ name: 'Sally', status: 'online' }]),
+        renderCard: (item, ctx) => {
+            const body = document.createElement('div');
+            const inner = document.createElement('div');
+            inner.appendChild(ctx.actionsAnchor);   // nested, not a direct child
+            body.appendChild(inner);
+            return body;
+        },
+    });
+    await tick();
+    const shell = container.querySelector('.agent-card');
+    assert.ok(shell, 'custom shell carries .agent-card');
+    assert.ok(!shell.classList.contains('agent-item'), 'custom shell is not .agent-item');
+    const anchor = shell.querySelector('.agent-card-actions');
+    assert.ok(anchor, 'nested anchor is inside the shell');
+    assert.equal(anchor.closest('.agent-card'), shell, 'closest() resolves the shell from the nested anchor');
+    handle.destroy();
+});
