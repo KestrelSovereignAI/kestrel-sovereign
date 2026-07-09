@@ -862,8 +862,10 @@ class AsyncDatabase:
             from .sqla.migrations import (
                 migrate_add_embedding_profile_id,
                 migrate_create_embedding_profiles,
+                migrate_embedding_profiles_add_parity,
             )
             await migrate_create_embedding_profiles(self)
+            await migrate_embedding_profiles_add_parity(self)
             for table in (
                 "conversation_history",
                 "saved_items",

@@ -876,6 +876,21 @@ class KestrelAgent(
             # Wrap storage with privacy-enforcing layer
             self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
+            # #2290 — re-apply any previously-verified shared embedding-space
+            # pins from the persisted parity record. ``_verified_space_pins`` is
+            # process-local, so without this a restart would silently drop the
+            # shared local/cloud space until an operator re-ran the parity probe,
+            # stranding reindexed rows outside kNN. Best-effort; never blocks init.
+            try:
+                if self.llm_service and hasattr(
+                    self.llm_service, "hydrate_verified_space_pins"
+                ):
+                    await self.llm_service.hydrate_verified_space_pins(
+                        getattr(self._raw_storage, "db", None)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Embedding-space pin hydration skipped: %s", exc)
+
             early_agent_node = None
             try:
                 early_agent_node = await self.storage.get_node(self.agent_id)

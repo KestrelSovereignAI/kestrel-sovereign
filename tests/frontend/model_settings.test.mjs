@@ -201,6 +201,7 @@ function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
     const routeSelect = createSelect();
     const dimReadout = { textContent: '', style: {} };
     const warningEl = { textContent: '', style: {} };
+    const sharedSpaceEl = { textContent: '', style: {} };
     const posts = [];
 
     const defaultFetch = async (url, opts) => {
@@ -225,6 +226,7 @@ function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
                 if (id === 'embedding-route-selector') return routeSelect;
                 if (id === 'embedding-dim-readout') return dimReadout;
                 if (id === 'embedding-dim-warning') return warningEl;
+                if (id === 'embedding-shared-space') return sharedSpaceEl;
                 return null;
             },
         },
@@ -240,9 +242,10 @@ function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
         routeSelectId: 'embedding-route-selector',
         dimReadoutId: 'embedding-dim-readout',
         warningId: 'embedding-dim-warning',
+        sharedSpaceId: 'embedding-shared-space',
         getEmbeddingRoutes: () => routes || [],
     });
-    return { embeddings, modeSelect, routeSelect, dimReadout, warningEl, posts };
+    return { embeddings, modeSelect, routeSelect, dimReadout, warningEl, sharedSpaceEl, posts };
 }
 
 test('embeddings defaults to Auto — follow chat provider', async () => {
@@ -262,6 +265,76 @@ test('embeddings defaults to Auto — follow chat provider', async () => {
     assert.equal(modeSelect.value, 'auto');
     // Explicit route select hidden while in auto.
     assert.equal(routeSelect.style.display, 'none');
+});
+
+test('embeddings render a verified shared local/cloud space as one entry (#2290)', async () => {
+    const { embeddings, sharedSpaceEl } = loadEmbeddings({
+        settings: {
+            embedding_route: null,
+            resolved_route: 'ollama:local',
+            embedding_model: 'qwen3-embedding-0.6b',
+            embedding_dim: 768,
+            kestrel_embedding_dim: 768,
+            shared_space: {
+                name: 'qwen3',
+                space_id: 'qwen3-embedding-0.6b@768',
+                model: 'qwen3-embedding-0.6b',
+                dim: 768,
+                members: ['ollama:local', 'openrouter:api'],
+                verified: true,
+                parity: { passed: true, min_cosine: 0.994 },
+            },
+        },
+        routes: [{ vendor: 'ollama', route: 'local' }, { vendor: 'openrouter', route: 'api' }],
+    });
+    await embeddings.init();
+
+    assert.equal(sharedSpaceEl.style.display, '');
+    assert.equal(sharedSpaceEl.textContent, 'qwen3-embedding-0.6b — local + cloud (shared)');
+});
+
+test('embeddings mark an unverified shared space as parity unverified (#2290)', async () => {
+    const { embeddings, sharedSpaceEl } = loadEmbeddings({
+        settings: {
+            embedding_route: null,
+            resolved_route: 'ollama:local',
+            embedding_model: 'qwen3-embedding-0.6b',
+            embedding_dim: 768,
+            kestrel_embedding_dim: 768,
+            shared_space: {
+                name: 'qwen3',
+                space_id: 'qwen3-embedding-0.6b@768',
+                model: 'qwen3-embedding-0.6b',
+                dim: 768,
+                members: ['ollama:local', 'openrouter:api'],
+                verified: false,
+                parity: null,
+            },
+        },
+        routes: [{ vendor: 'ollama', route: 'local' }, { vendor: 'openrouter', route: 'api' }],
+    });
+    await embeddings.init();
+
+    assert.equal(sharedSpaceEl.style.display, '');
+    assert.equal(sharedSpaceEl.textContent, 'qwen3-embedding-0.6b — local + cloud (parity unverified)');
+});
+
+test('embeddings hide the shared-space entry when no pin covers the route (#2290)', async () => {
+    const { embeddings, sharedSpaceEl } = loadEmbeddings({
+        settings: {
+            embedding_route: null,
+            resolved_route: 'ollama:local',
+            embedding_model: 'nomic-embed-text',
+            embedding_dim: 768,
+            kestrel_embedding_dim: 768,
+            shared_space: null,
+        },
+        routes: [{ vendor: 'ollama', route: 'local' }],
+    });
+    await embeddings.init();
+
+    assert.equal(sharedSpaceEl.style.display, 'none');
+    assert.equal(sharedSpaceEl.textContent, '');
 });
 
 test('embeddings explicit selection round-trips to the API', async () => {

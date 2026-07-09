@@ -87,6 +87,38 @@ class OllamaAdapter(LLMAdapter):
     - Vision models with base64 images
     """
 
+    DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+    DEFAULT_EMBEDDING_DIM = 768
+
+    def __init__(
+        self,
+        *,
+        embedding_model: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
+    ):
+        """Ollama is a local runtime; embeddings default to nomic-embed-text.
+
+        A route may pin a different open-weight model (#2290) — e.g.
+        ``qwen3-embedding-0.6b`` served locally to share a coordinate space
+        with the same weights served in the cloud. ``embedding_dim`` is
+        forwarded as the ``dimensions`` param for Matryoshka-capable models and
+        keys the model-identity embedding space (``<model>@<dim>``).
+        """
+        self._embedding_model = (
+            str(embedding_model) if embedding_model else self.DEFAULT_EMBEDDING_MODEL
+        )
+        self._embedding_dim = (
+            int(embedding_dim) if embedding_dim else self.DEFAULT_EMBEDDING_DIM
+        )
+        # Only forward the ``dimensions`` param when a route explicitly pinned an
+        # embedding model/dim (#2290). The bare default (nomic-embed-text) is a
+        # fixed-768 model with no Matryoshka truncation, and the native
+        # ``client.embed`` should not receive an unrequested ``dimensions``
+        # kwarg — so an unconfigured adapter behaves exactly as before.
+        self._embedding_configured = (
+            embedding_model is not None or embedding_dim is not None
+        )
+
     def provider_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             supports_tools=True,
@@ -98,8 +130,8 @@ class OllamaAdapter(LLMAdapter):
             structured_output_mode=StructuredOutputMode.SCHEMA_FORMAT,
             tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
             vision_input_mode=VisionInputMode.OLLAMA_IMAGES,
-            embedding_model="nomic-embed-text",
-            embedding_dim=768,
+            embedding_model=self._embedding_model,
+            embedding_dim=self._embedding_dim,
             raw_operations=("chat", "generate", "embed", "show", "list", "ps", "pull"),
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
@@ -213,16 +245,55 @@ class OllamaAdapter(LLMAdapter):
         except httpx.HTTPError:
             return False
 
+    def embedding_space_id(self) -> Optional[str]:
+        """Model-identity embedding-space key for this local route (#2290).
+
+        Keyed on the served open-weight model + dimension (``<model>@<dim>``),
+        NOT on ``"ollama"``. This is what lets a locally-served open-weight
+        model (e.g. ``qwen3-embedding-0.6b`` at 768 dims →
+        ``qwen3-embedding-0.6b@768``) share a coordinate space with the SAME
+        weights served in the cloud (OpenRouter emits the identical key).
+        Matryoshka truncation makes the same model at a different dimension a
+        different space, so the dim is part of the key. Returns ``None`` when no
+        embedding model / dimension is configured (nothing to stamp).
+        """
+        if not self._embedding_model or not self._embedding_dim:
+            return None
+        upstream = self._embedding_model.split("/", 1)[-1]
+        return f"{upstream}@{int(self._embedding_dim)}"
+
+    def _embed_kwargs(self, dimensions: Optional[int]) -> Dict[str, Any]:
+        """Build optional embed kwargs, forwarding ``dimensions`` for Matryoshka.
+
+        Ollama's OpenAI-compatible ``/v1/embeddings`` honors ``dimensions`` for
+        MRL-capable models (qwen3-embedding: 32 → native). Fall back to the
+        route-configured dim so a pinned local member truncates to the SAME
+        dimension its cloud sibling does. Only sent when known, so models that
+        don't support truncation are unaffected.
+        """
+        if dimensions is not None:
+            dim = dimensions
+        elif self._embedding_configured:
+            dim = self._embedding_dim
+        else:
+            dim = None
+        return {"dimensions": int(dim)} if dim else {}
+
     async def aembed(
         self,
         client: "ollama.AsyncClient",
         text: str,
         *,
         model: Optional[str] = None,
+        dimensions: Optional[int] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
         try:
-            response = await client.embed(model=model or "nomic-embed-text", input=text)
+            response = await client.embed(
+                model=model or self._embedding_model,
+                input=text,
+                **self._embed_kwargs(dimensions),
+            )
         except Exception as exc:
             logger.warning("Ollama embedding failed: %s", exc)
             return None
@@ -235,12 +306,17 @@ class OllamaAdapter(LLMAdapter):
         texts: List[str],
         *,
         model: Optional[str] = None,
+        dimensions: Optional[int] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         if not texts:
             return []
         try:
-            response = await client.embed(model=model or "nomic-embed-text", input=texts)
+            response = await client.embed(
+                model=model or self._embedding_model,
+                input=texts,
+                **self._embed_kwargs(dimensions),
+            )
         except Exception as exc:
             logger.warning("Ollama batch embedding failed: %s", exc)
             return [None] * len(texts)

@@ -566,7 +566,18 @@ class ProviderRegistry:
                 raise ImportError("ollama package not installed.")
             host = os.environ.get("OLLAMA_HOST") or route_cfg.get("host") or get_ollama_url()
             client = ollama.AsyncClient(host=host)
-            return client, adapter_cls()
+            # Route-level embedding config (#2290). A local route may pin an
+            # open-weight embedding model (e.g. qwen3-embedding-0.6b) so it
+            # shares a coordinate space with the same weights served in the
+            # cloud. Defaults to nomic-embed-text@768 when unset.
+            embedding_model = route_cfg.get("embedding_model")
+            embedding_dim = route_cfg.get("embedding_dim")
+            if embedding_dim is not None:
+                embedding_dim = int(embedding_dim)
+            return client, adapter_cls(
+                embedding_model=embedding_model,
+                embedding_dim=embedding_dim,
+            )
 
         # --- Google Gemini (maintained google-genai SDK) ---
         if adapter_cls is GoogleAdapter:

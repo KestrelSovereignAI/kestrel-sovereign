@@ -1503,6 +1503,48 @@ async def set_embedding_settings(request: Request):
         raise HTTPException(status_code=500, detail="Error setting embedding route.")
 
 
+@router.api_route("/api/embedding/space/verify", methods=["POST"])
+async def verify_embedding_space(request: Request):
+    """Run the shared-space parity probe and apply passing pins (#2290).
+
+    Embeds K canary texts through each declared shared space's member routes and
+    requires pairwise cosine ``>= parity_threshold`` before the pin's
+    model-identity ``space_id`` is applied. Optional JSON body
+    ``{"name": "<pin>"}`` limits to one pin. Measured drift is recorded on the
+    pinned space's ``embedding_profiles`` row when storage is available.
+    """
+    try:
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        pin_name = data.get("name") if isinstance(data, dict) else None
+
+        # Reach the raw DB handle (through the privacy wrapper) so measured
+        # drift can be recorded; best-effort, verification runs regardless.
+        storage = getattr(agent, "storage", None)
+        db = getattr(storage, "db", None) if storage else None
+        if db is None and storage is not None:
+            inner = getattr(storage, "_storage", None)
+            db = getattr(inner, "db", None) if inner else None
+
+        results = await agent.llm_service.verify_embedding_space_parity(
+            pin_name, record_to=db
+        )
+        return {
+            "success": True,
+            "results": {name: r.to_dict() for name, r in results.items()},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error verifying embedding space: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error verifying embedding space.")
+
+
 @router.get("/v1/models")
 def list_models_v1(request: Request):
     """Return a minimal models list for OpenAI-compatible clients.

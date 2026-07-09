@@ -2108,6 +2108,12 @@ a.todo-link:hover { text-decoration: underline; }
     padding: 0.4rem 0.5rem;
 }
 
+/* #2290 — shared local/cloud embedding space, rendered as one entry. */
+.embedding-shared-space {
+    font-size: 0.72rem;
+    color: var(--text-secondary, var(--text-primary));
+}
+
 /* Model Controls Container */
 .model-controls {
     display: flex;

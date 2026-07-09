@@ -27,7 +27,7 @@ import logging
 from datetime import datetime
 from typing import Any, Optional, Set
 
-from sqlalchemy import Boolean, Integer, Text
+from sqlalchemy import Boolean, Float, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import SovereignBase
@@ -134,3 +134,90 @@ class EmbeddingProfileRow(SovereignBase):
     space_id: Mapped[str] = mapped_column(Text, nullable=False)
     normalized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    # #2290 — measured worst-case pairwise cosine from the shared-space parity
+    # probe for this space (NULL for non-pinned spaces or unprobed pins).
+    parity_cosine: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+
+async def record_space_parity(
+    db: "Any",
+    *,
+    space_id: str,
+    model: str,
+    dim: int,
+    normalized: bool,
+    parity_cosine: float,
+) -> None:
+    """Persist the measured parity cosine for a shared embedding space (#2290).
+
+    This is durable, not merely descriptive: the recorded ``parity_cosine`` is
+    what :meth:`LLMService.hydrate_verified_space_pins` reads at startup to
+    re-apply a previously-verified shared space, so a restart doesn't silently
+    drop the alias until an operator re-runs the probe.
+
+    The verify endpoint normally runs *before* any shared-space rows exist
+    (reindex/new writes come later), so a plain ``UPDATE ... WHERE space_id``
+    would match nothing and the drift would be lost. We therefore **upsert a
+    canonical row** for the pinned space (its id is the same deterministic
+    ``profile_id`` member routes stamp, since the id hashes only
+    ``(space_id, dim, normalized)``), then stamp ``parity_cosine`` onto that row
+    and any member rows already written under this ``space_id``.
+
+    Best-effort: swallows and logs failures at DEBUG; recording drift must never
+    break the parity flow.
+    """
+    if not space_id:
+        return
+    try:
+        from kestrel_sovereign.llm.embedding_service import (
+            derive_embedding_profile,
+        )
+
+        profile = derive_embedding_profile(
+            # Provider is not part of the id hash; a synthetic marker keeps the
+            # canonical row self-describing without colliding with member rows.
+            provider=f"shared:{space_id}",
+            model=str(model),
+            dim=int(dim),
+            normalized=bool(normalized),
+            space_id=str(space_id),
+        )
+        pc = float(parity_cosine)
+        backend_type = getattr(db, "backend_type", None)
+
+        # 1. Ensure a canonical row for the pinned space exists (INSERT-IGNORE
+        #    so a member route that already wrote this id keeps its provider).
+        if backend_type == "postgres":
+            await db.execute(
+                """INSERT INTO embedding_profiles
+                       (id, provider, model, dim, space_id, normalized, parity_cosine)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (id) DO NOTHING""",
+                (
+                    profile.profile_id, profile.provider, profile.model,
+                    profile.dim, profile.space_id, bool(profile.normalized), pc,
+                ),
+            )
+        else:
+            await db.execute(
+                """INSERT OR IGNORE INTO embedding_profiles
+                       (id, provider, model, dim, space_id, normalized, parity_cosine)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    profile.profile_id, profile.provider, profile.model,
+                    profile.dim, profile.space_id,
+                    1 if profile.normalized else 0, pc,
+                ),
+            )
+
+        # 2. Stamp the measured parity onto the canonical row (INSERT-IGNORE
+        #    won't overwrite an existing one) and every member row for the space.
+        await db.execute(
+            "UPDATE embedding_profiles SET parity_cosine = ? WHERE space_id = ?",
+            (pc, str(space_id)),
+        )
+    except Exception as exc:
+        logger.debug(
+            "record_space_parity failed (non-fatal) for space %s: %s",
+            space_id, exc,
+        )
