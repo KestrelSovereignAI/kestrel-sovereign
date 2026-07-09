@@ -5,6 +5,13 @@
 import { Modal, Toast } from './ui.js';
 import API from './api.js';
 import { subscribeSSE } from './chat.js';
+import {
+    extractUpgradeRequired,
+    getApprovalScopeGates,
+    tierBadgeHtml,
+    upgradeBannerHtml,
+    upgradeToastHtml,
+} from './upgrade-prompt.js';
 
 export const Security = {
     pendingApprovals: new Map(),
@@ -160,25 +167,56 @@ export const Security = {
                     this.updatePendingBadge(this.pendingApprovals.size);
                     continue;
                 }
-                let decision;
-                try {
-                    decision = await this.showApprovalModal(data);
-                } catch (err) {
-                    console.error('Approval modal error:', err);
-                    decision = { approved: false, scope: 'once' };
+                // Gate context for the modal. Seeded proactively from any
+                // host-supplied scope gate map (capabilities.approvalScopes),
+                // and augmented reactively when a scope submit comes back with
+                // an ``upgrade_required`` 403 so the modal re-opens badged. #2232.
+                const gatedScopes = {};
+                for (const [scope, tier] of Object.entries(getApprovalScopeGates())) {
+                    gatedScopes[scope] = { tier };
                 }
+                const gateContext = { gatedScopes, upgrade: null };
 
-                // Withdrawal short-circuits the POST: the server already
-                // evicted the queue entry, so submitting would 404. The
-                // resolver flagged this with ``_withdrawn: true``. #877.
-                if (!decision._withdrawn) {
+                // Re-prompt loop: a tier-gated scope keeps the modal open with
+                // the upgrade message; once/deny stay actionable. #2232.
+                // eslint-disable-next-line no-constant-condition
+                while (true) {
+                    let decision;
                     try {
-                        await this.submitApproval(data.id, decision.approved, decision.scope, {
-                            suppressToast: decision.suppressToast
+                        decision = await this.showApprovalModal(data, gateContext);
+                    } catch (err) {
+                        console.error('Approval modal error:', err);
+                        decision = { approved: false, scope: 'once' };
+                    }
+
+                    // Withdrawal short-circuits the POST: the server already
+                    // evicted the queue entry, so submitting would 404. The
+                    // resolver flagged this with ``_withdrawn: true``. #877.
+                    if (decision._withdrawn) break;
+
+                    let result;
+                    try {
+                        result = await this.submitApproval(data.id, decision.approved, decision.scope, {
+                            suppressToast: decision.suppressToast,
+                            returnUpgrade: true,
                         });
                     } catch (err) {
                         console.error('Failed to submit approval:', err);
+                        break;
                     }
+
+                    if (result && result.upgradeRequired) {
+                        // Host tier-gated this scope. Badge + disable it and
+                        // re-show the modal with the upgrade banner. #2232.
+                        gateContext.gatedScopes[decision.scope] = {
+                            tier: result.upgrade.requiredTier,
+                            message: result.upgrade.message,
+                            href: result.upgrade.upgradeHref,
+                        };
+                        gateContext.upgrade = result.upgrade;
+                        continue;
+                    }
+                    break;
                 }
 
                 this.pendingApprovals.delete(data.id);
@@ -194,7 +232,27 @@ export const Security = {
         }
     },
 
-    async showApprovalModal(data) {
+    async showApprovalModal(data, gateContext = { gatedScopes: {}, upgrade: null }) {
+        const gatedScopes = (gateContext && gateContext.gatedScopes) || {};
+        const upgrade = (gateContext && gateContext.upgrade) || null;
+        // Build a per-scope approval button that is disabled + tier-badged when
+        // the host has gated that scope (either proactively or after a 403).
+        // #2232. `once`/`deny` are never gated so the request stays actionable.
+        const scopeButton = (scope, label, type) => {
+            const gate = gatedScopes[scope];
+            if (gate) {
+                return {
+                    label: `${label}${tierBadgeHtml(gate.tier)}`,
+                    type,
+                    disabled: true,
+                    title: gate.tier ? `Requires ${gate.tier}` : 'Upgrade required',
+                };
+            }
+            return {
+                label,
+                type,
+            };
+        };
         return new Promise((resolve) => {
             // Track the active modal so a withdrawal SSE can close it
             // proactively. The wrapper resolver clears the tracking before
@@ -242,6 +300,7 @@ export const Security = {
                             restart until you turn it off. Constitutional, honesty, and security
                             hooks can still flag or block.
                         </p>
+                        ${upgradeBannerHtml(upgrade)}
                     </div>
                 `,
                 buttons: [
@@ -262,16 +321,14 @@ export const Security = {
                         }
                     },
                     {
-                        label: 'This Session',
-                        type: 'primary',
+                        ...scopeButton('session', 'This Session', 'primary'),
                         onClick: () => {
                             Modal.hide();
                             wrappedResolve({ approved: true, scope: 'session' });
                         }
                     },
                     {
-                        label: `${kicon('checkmark')} Always`,
-                        type: 'primary',
+                        ...scopeButton('always', `${kicon('checkmark')} Always`, 'primary'),
                         onClick: () => {
                             Modal.hide();
                             wrappedResolve({ approved: true, scope: 'always' });
@@ -340,6 +397,18 @@ export const Security = {
 
             return response;
         } catch (error) {
+            // Host policy layer tier-gated this scope with a structured 403
+            // (#2232). Surface it as an upgrade prompt, not a generic failure.
+            // The caller (the modal drain loop) passes ``returnUpgrade`` to
+            // keep the modal open and badge the gated scope; other callers
+            // (Security panel quick-approve) fall back to an upgrade toast.
+            const upgrade = extractUpgradeRequired(error);
+            if (upgrade) {
+                if (!options.returnUpgrade && !options.suppressToast) {
+                    Toast.warning(upgradeToastHtml(upgrade));
+                }
+                return { success: false, upgradeRequired: true, upgrade };
+            }
             // 404 here means the server already evicted the queue entry —
             // either the calling task was cancelled (#877) or the request
             // timed out (5-minute default). Either way the user's decision
