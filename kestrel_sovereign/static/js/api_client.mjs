@@ -395,7 +395,14 @@ export function createApiClient({
 
         if (!response.ok) {
             const error = await response.json().catch(() => ({ detail: response.statusText }));
-            throw new Error(error.detail || `HTTP ${response.status}`);
+            // Preserve the HTTP status and the full parsed body on the thrown
+            // Error so callers can react to structured envelopes (e.g. a host
+            // policy layer's ``403 {code: 'upgrade_required', ...}`` tier gate,
+            // #2232) instead of only seeing a flattened message string.
+            const err = new Error(error.detail || `HTTP ${response.status}`);
+            err.status = response.status;
+            err.body = error;
+            throw err;
         }
         return response.json();
     }

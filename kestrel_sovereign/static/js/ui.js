@@ -389,14 +389,15 @@ export const Modal = {
                     gap: 0.75rem;
                 ">
                     ${buttons.map((btn, i) => `
-                        <button class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}" style="
+                        <button class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}"${btn.disabled ? ' disabled' : ''}${btn.title ? ` title="${String(btn.title).replace(/"/g, '&quot;')}"` : ''} style="
                             padding: 0.625rem 1.25rem;
                             border: none;
                             border-radius: 8px;
                             font-size: 0.875rem;
                             font-weight: 500;
-                            cursor: pointer;
+                            cursor: ${btn.disabled ? 'not-allowed' : 'pointer'};
                             transition: all 0.2s;
+                            ${btn.disabled ? 'opacity: 0.5;' : ''}
                             ${btn.type === 'primary' ? 'background: var(--accent-color); color: white;' : ''}
                             ${btn.type === 'danger' ? 'background: var(--error); color: white;' : ''}
                             ${btn.type === 'secondary' || !btn.type ? 'background: var(--bg-tertiary); color: var(--text-primary);' : ''}
@@ -421,6 +422,10 @@ export const Modal = {
         modal.querySelectorAll('.modal-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 const index = parseInt(btn.dataset.btnIndex);
+                // Disabled buttons (e.g. a tier-gated approval scope, #2232) are
+                // rendered but inert — the user should SEE the option, not act
+                // on it. Guard here as well as via the `disabled` attribute.
+                if (buttons[index] && buttons[index].disabled) return;
                 if (buttons[index] && buttons[index].onClick) {
                     buttons[index].onClick();
                 }
