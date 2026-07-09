@@ -559,6 +559,63 @@ def test_embedding_settings_endpoints_round_trip_and_expose_dims():
         _restore_app(app, original)
 
 
+def test_embedding_settings_post_round_trip_for_none_off_state():
+    """#2287 — POST ``embedding_route="none"`` is a first-class off-switch:
+    it round-trips through the endpoint (no ValueError), and GET reports the
+    off state (embedding_route == "none", null resolved fields) while still
+    exposing ``kestrel_embedding_dim``."""
+    _state = {"embedding_route": None}
+
+    def _set(route, persist=True):
+        _state["embedding_route"] = route
+
+    def _settings():
+        off = _state["embedding_route"] == "none"
+        return {
+            "embedding_route": _state["embedding_route"],
+            "resolved_route": None if off else (
+                _state["embedding_route"] or "openai:api"
+            ),
+            "embedding_model": None if off else "text-embedding-3-small",
+            "embedding_dim": None if off else 1536,
+            "kestrel_embedding_dim": 768,
+        }
+
+    llm_service = MagicMock()
+    llm_service.set_embedding_route = MagicMock(side_effect=_set)
+    llm_service.get_embedding_settings = MagicMock(side_effect=_settings)
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                set_response = client.post(
+                    "/api/embedding/settings",
+                    headers=_api_headers(),
+                    json={"embedding_route": "none"},
+                )
+                get_response = client.get(
+                    "/api/embedding/settings", headers=_api_headers()
+                )
+        assert set_response.status_code == 200
+        set_body = set_response.json()
+        assert set_body["embedding_route"] == "none"
+        assert set_body["resolved_route"] is None
+        assert set_body["embedding_dim"] is None
+        # Off does not erase the deployment's stored dimension.
+        assert set_body["kestrel_embedding_dim"] == 768
+        llm_service.set_embedding_route.assert_any_call("none")
+
+        assert get_response.status_code == 200
+        get_body = get_response.json()
+        assert get_body["embedding_route"] == "none"
+        assert get_body["resolved_route"] is None
+        assert get_body["kestrel_embedding_dim"] == 768
+    finally:
+        _restore_app(app, original)
+
+
 def test_embedding_settings_post_surfaces_validation_error():
     """#2263 — a ValueError from set_embedding_route (unknown/non-embedding
     route) becomes a 400 with the reason, not a 500."""

@@ -297,6 +297,68 @@ test('embeddings explicit selection round-trips to the API', async () => {
     assert.equal(embeddings.mode, 'auto');
 });
 
+test('embeddings Off — keyword search only commits the "none" sentinel (#2287)', async () => {
+    const offPosts = [];
+    const offFetch = async (url, opts) => {
+        if (opts && opts.method === 'POST') {
+            const route = JSON.parse(opts.body).embedding_route;
+            offPosts.push({ embedding_route: route });
+            // Server echoes the off state: route "none", null resolved fields,
+            // but the deployment dim is still reported.
+            const resolved = route === 'none'
+                ? { embedding_route: 'none', resolved_route: null, embedding_model: null, embedding_dim: null, kestrel_embedding_dim: 768 }
+                : { embedding_route: route || null, resolved_route: 'ollama:local', embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768 };
+            return { ok: true, json: async () => ({ success: true, ...resolved }) };
+        }
+        return {
+            ok: true,
+            json: async () => ({
+                embedding_route: null,
+                resolved_route: 'ollama:local',
+                embedding_model: 'nomic-embed-text',
+                embedding_dim: 768,
+                kestrel_embedding_dim: 768,
+            }),
+        };
+    };
+    const { embeddings, modeSelect, routeSelect, dimReadout } = loadEmbeddings({
+        routes: [{ vendor: 'openai', route: 'api' }, { vendor: 'ollama', route: 'local' }],
+        fetchImpl: offFetch,
+    });
+    await embeddings.init();
+    assert.equal(embeddings.mode, 'auto');
+
+    // Operator picks "Off — keyword search only".
+    modeSelect.value = 'off';
+    modeSelect._fire('change');
+    await new Promise(r => setTimeout(r, 0));
+
+    assert.equal(offPosts.length, 1);
+    assert.equal(offPosts[0].embedding_route, 'none');
+    assert.equal(embeddings.mode, 'off');
+    // Explicit route select stays hidden in off mode.
+    assert.equal(routeSelect.style.display, 'none');
+    // Readout communicates the deliberate off state, not degradation.
+    assert.ok(/Embeddings off/.test(dimReadout.textContent));
+});
+
+test('embeddings loads directly into Off mode when route is "none" (#2287)', async () => {
+    const { embeddings, modeSelect } = loadEmbeddings({
+        settings: {
+            embedding_route: 'none',
+            resolved_route: null,
+            embedding_model: null,
+            embedding_dim: null,
+            kestrel_embedding_dim: 768,
+        },
+        routes: [{ vendor: 'openai', route: 'api' }],
+    });
+    await embeddings.init();
+
+    assert.equal(embeddings.mode, 'off');
+    assert.equal(modeSelect.value, 'off');
+});
+
 test('embeddings renders a dimension-mismatch warning', async () => {
     const { embeddings, warningEl, dimReadout } = loadEmbeddings({
         settings: {

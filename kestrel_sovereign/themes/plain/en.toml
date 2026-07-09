@@ -77,6 +77,7 @@ model_settings_chat_section = "Chat"
 model_settings_embeddings_section = "Embeddings"
 model_settings_embeddings_auto = "Auto — follow chat provider"
 model_settings_embeddings_explicit = "Choose provider…"
+model_settings_embeddings_off = "Off — keyword search only"
 
 # Constitution panel
 constitution_title = "Kestrel Constitution"
