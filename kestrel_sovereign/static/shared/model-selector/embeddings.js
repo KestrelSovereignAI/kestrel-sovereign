@@ -5,19 +5,32 @@
  *   GET  /api/embedding/settings  → {embedding_route, resolved_route,
  *                                    embedding_model, embedding_dim,
  *                                    kestrel_embedding_dim}
- *   POST /api/embedding/settings  ← {embedding_route: "<vendor>:<route>"|null}
+ *   POST /api/embedding/settings  ← {embedding_route: "<vendor>:<route>"|"none"|null}
  *
  * Default state is "Auto — follow chat provider" (embedding_route == null).
  * The operator can expand to an explicit provider+route, chosen from the
- * embedding-CAPABLE routes only (openai:api, ollama:local, vertex/google…).
- * A dimension readout is always shown; a warning appears when the resolved
- * ``embedding_dim`` differs from the deployment's ``kestrel_embedding_dim``
- * (the size the stored vectors were written at) — because switching is NOT
- * free: existing memories fall back to keyword search until re-embedded.
+ * embedding-CAPABLE routes only (openai:api, ollama:local, vertex/google…),
+ * or turn embeddings off deliberately with "Off — keyword search only"
+ * (embedding_route == "none", #2287). A dimension readout is always shown; a
+ * warning appears when the resolved ``embedding_dim`` differs from the
+ * deployment's ``kestrel_embedding_dim`` (the size the stored vectors were
+ * written at) — because switching is NOT free: existing memories fall back to
+ * keyword search until re-embedded.
  */
 
 const DIM_MISMATCH_MESSAGE =
     'existing memories will use keyword search until re-embedded';
+
+// #2287 — first-class "embeddings off" sentinel. Distinct from ``null``
+// (auto/follow-chat): "none" is a deliberate operator choice, not a default.
+const EMBEDDING_OFF = 'none';
+
+/** Map an ``embedding_route`` value onto a UI mode. */
+function embeddingModeForRoute(route) {
+    if (route === EMBEDDING_OFF) return 'off';
+    if (route) return 'explicit';
+    return 'auto';
+}
 
 class EmbeddingSelector {
     /**
@@ -47,7 +60,8 @@ class EmbeddingSelector {
 
         this.settings = null;
         // 'auto' == follow chat provider (embedding_route null); 'explicit' ==
-        // a pinned provider:route.
+        // a pinned provider:route; 'off' == embeddings deliberately disabled
+        // (embedding_route "none", #2287).
         this.mode = 'auto';
     }
 
@@ -78,7 +92,7 @@ class EmbeddingSelector {
         } catch (e) {
             return;
         }
-        this.mode = this.settings && this.settings.embedding_route ? 'explicit' : 'auto';
+        this.mode = embeddingModeForRoute(this.settings && this.settings.embedding_route);
         this._render();
     }
 
@@ -127,6 +141,9 @@ class EmbeddingSelector {
             if (dim) {
                 const modelPart = model ? `${model} · ` : '';
                 this.dimReadout.textContent = `${modelPart}${dim} dimensions`;
+            } else if (this.mode === 'off') {
+                // Deliberate off (#2287) — a choice, not degradation.
+                this.dimReadout.textContent = 'Embeddings off — keyword search only';
             } else {
                 // No embedding-capable resolution — keyword search only.
                 this.dimReadout.textContent = 'No embedding provider — keyword search only';
@@ -153,6 +170,11 @@ class EmbeddingSelector {
             this._syncModeUI();
             // Auto == clear the pin.
             this._commit(null);
+        } else if (next === 'off') {
+            this.mode = 'off';
+            this._syncModeUI();
+            // Off == the deliberate "none" sentinel (#2287).
+            this._commit(EMBEDDING_OFF);
         } else {
             this.mode = 'explicit';
             this._syncModeUI();
@@ -195,7 +217,7 @@ class EmbeddingSelector {
                 embedding_dim: data.embedding_dim,
                 kestrel_embedding_dim: data.kestrel_embedding_dim,
             };
-            this.mode = this.settings.embedding_route ? 'explicit' : 'auto';
+            this.mode = embeddingModeForRoute(this.settings.embedding_route);
             this._render();
             this.onChange(this.settings);
             return true;
@@ -207,7 +229,12 @@ class EmbeddingSelector {
 
 // Export for ES modules / node --test
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { EmbeddingSelector, DIM_MISMATCH_MESSAGE };
+    module.exports = {
+        EmbeddingSelector,
+        DIM_MISMATCH_MESSAGE,
+        EMBEDDING_OFF,
+        embeddingModeForRoute,
+    };
 }
 
 // Export globally for script-tag usage

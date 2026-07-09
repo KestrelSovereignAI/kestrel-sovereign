@@ -208,6 +208,45 @@ async def test_add_conversation_with_service_writes_embedding_vec_postgres(
 
 
 @pytest.mark.asyncio
+async def test_add_conversation_skips_embedding_when_route_is_none(monkeypatch):
+    """#2287 — with the embedding route deliberately off
+    (``embedding_route == "none"``) the store's provider lookup resolves to no
+    embedding service, so the write path skips the embed call entirely and
+    lands the legacy (no ``embedding_vec``) INSERT. Distinct from an outage:
+    this is an operator choice, so there is no per-write embed attempt at all.
+    """
+    from kestrel_sovereign.llm.service import LLMService
+
+    # A bare LLMService with embeddings turned off. resolve_embedding_provider
+    # short-circuits to None → get_embedding_service() returns None.
+    off_service = LLMService.__new__(LLMService)
+    off_service.disabled = False
+    off_service._embedding_route = "none"
+    assert off_service.get_embedding_service() is None
+
+    # Wire it through the production lookup the store actually uses.
+    def fake_get_provider(llm_service):
+        return llm_service.get_embedding_service()
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.embedding_service.get_provider_embedding_service",
+        fake_get_provider,
+    )
+    db = MagicMock()
+    db.backend_type = "sqlite"
+    db.execute_commit = AsyncMock(return_value=1)
+    db.fetchone = AsyncMock(return_value=None)
+    db.fetchall = AsyncMock(return_value=[])
+    store = AsyncConversationStore(db=db, agent_id="a", llm_service=off_service)
+
+    assert store._lazy_embedding_service() is None
+    await store.add_conversation(role="assistant", content="hello world")
+
+    sql, _ = _insert_call(db)
+    assert "embedding_vec" not in sql
+
+
+@pytest.mark.asyncio
 async def test_add_conversation_falls_back_when_aembed_returns_none():
     """Provider service down → ``aembed`` returns ``None``. The row
     MUST still be inserted via the legacy path so chat persistence

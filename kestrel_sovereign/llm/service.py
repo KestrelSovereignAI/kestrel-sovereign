@@ -342,8 +342,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # ``embedding_route = "auto"`` means "follow chat" — storing the
         # literal would make resolve treat it as an explicit (nonexistent)
         # provider and silently keyword-fallback (codex P2 on #2270).
-        if configured_embedding_route and configured_embedding_route.lower() == "auto":
-            configured_embedding_route = None
+        # ``"none"`` is the deliberate off-switch (#2287) — canonicalize its
+        # casing so resolve's step-0 short-circuit recognizes it.
+        if configured_embedding_route:
+            if configured_embedding_route.lower() == "auto":
+                configured_embedding_route = None
+            elif configured_embedding_route.lower() == "none":
+                configured_embedding_route = "none"
         self._embedding_route: Optional[str] = configured_embedding_route
 
         # Remote GPU backend state (merged from BrainRouter)
@@ -459,8 +464,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """Return the configured top-level embedding_route (#2263).
 
         ``None`` means "auto — embedding follows the active chat route" (the
-        pre-#2263 default). Otherwise a ``"<vendor>"`` or ``"<vendor>:<route>"``
-        selector chosen deliberately by the operator.
+        pre-#2263 default). ``"none"`` means embeddings are deliberately off
+        (#2287). Otherwise a ``"<vendor>"`` or ``"<vendor>:<route>"`` selector
+        chosen deliberately by the operator.
         """
         return getattr(self, "_embedding_route", None)
 
@@ -469,14 +475,19 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         ``route`` is a ``"<vendor>"`` or ``"<vendor>:<route>"`` selector. An
         empty string or ``"auto"`` clears the knob (falls back to
-        follow-chat/auto). The route is validated against the configured
-        providers — an unknown route, or one that advertises no embedding
-        support, is refused so the setting can never silently degrade to
-        keyword search on the next storage write.
+        follow-chat/auto). The special value ``"none"`` (#2287) is a
+        first-class off-switch: embeddings are disabled deliberately, storage
+        writes skip embedding calls, and semantic search uses keyword fallback
+        with no per-write warnings. The route is validated against the
+        configured providers — an unknown route, or one that advertises no
+        embedding support, is refused so the setting can never silently degrade
+        to keyword search on the next storage write. ``"none"`` bypasses this
+        validation because it names no provider.
 
         Args:
-            route: The embedding route selector, or ``None``/``""``/``"auto"``
-                to clear.
+            route: The embedding route selector, ``"none"`` to disable
+                embeddings deliberately, or ``None``/``""``/``"auto"`` to clear
+                (auto/follow-chat).
             persist: When True (default) and a persistence callback is bound,
                 schedule the value to be persisted. Set False when applying a
                 value that was just loaded from storage.
@@ -489,11 +500,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             route = route.strip()
             if not route or route.lower() == "auto":
                 route = None
-        if route is not None:
+            elif route.lower() == "none":
+                # Canonicalize the deliberate off-switch (#2287) to the bare
+                # sentinel regardless of input casing/whitespace.
+                route = "none"
+
+        # ``"none"`` is a first-class off-switch (#2287): the operator has
+        # turned embeddings off on purpose. It names no provider, so skip
+        # validation — validating it would reject it as an unknown route.
+        if route is not None and route != "none":
             self._validate_embedding_route(route)
 
         self._embedding_route = route
-        if route:
+        if route == "none":
+            logger.info(
+                'Embeddings disabled by operator (embedding_route = "none"): '
+                "storage writes will skip embedding calls and semantic search "
+                "uses keyword fallback."
+            )
+        elif route:
             logger.info("Embedding route set: %s", route)
         else:
             logger.info(
@@ -562,9 +587,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """Return the resolved embedding-channel state for the active session (#2263).
 
         Shape (enough for a UI to render an "Auto — follow chat" default and a
-        dimension-mismatch warning):
+        dimension-mismatch warning). ``embedding_route`` distinguishes the
+        three states (#2287): ``None`` == auto/follow-chat, a
+        ``"<vendor>:<route>"`` selector == explicit, and ``"none"`` ==
+        deliberately off (keyword search only). In the off state
+        ``resolved_route``/``embedding_model``/``embedding_dim`` are ``None``
+        while ``kestrel_embedding_dim`` is still reported:
 
-            embedding_route:        the configured knob, or ``None`` == auto.
+            embedding_route:        the configured knob: ``None`` == auto,
+                                    ``"none"`` == off, else explicit selector.
             resolved_route:         the ``"<vendor>:<route>"`` actually resolved
                                     for the active session, or ``None`` when
                                     embedding is unavailable (keyword fallback).
@@ -1368,6 +1399,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         provider embedded this row?" predictable.
         """
         if getattr(self, "disabled", False):
+            return None
+
+        # --- 0. Deliberate off-switch: embedding_route == "none" (#2287) -----
+        # A first-class "embeddings off" set by the operator. Short-circuit to
+        # None (keyword fallback) with NO per-write warning — the single INFO
+        # was logged once at set time. This is distinct from the accidental
+        # no-provider state below, which KEEPS its warning because that IS
+        # degradation, not a choice.
+        if getattr(self, "_embedding_route", None) == "none":
             return None
 
         force_local_only = self._current_force_local_only()

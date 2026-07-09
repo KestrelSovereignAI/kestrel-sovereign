@@ -708,6 +708,46 @@ def test_set_embedding_route_validation_rejects_unknown_and_non_embedding():
     assert service.get_embedding_route() == "openai:api"
 
 
+# --- #2287 first-class "none" (embeddings deliberately off) ------------------
+
+
+def test_embedding_route_none_short_circuits_resolution():
+    """#2287 — ``embedding_route == "none"`` is a deliberate off-switch:
+    ``resolve_embedding_provider`` short-circuits to None at step 0, even when
+    the active chat route embeds natively. Routing must NOT be consulted."""
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service = _embedding_service([openai], embedding_route="none")
+
+    # The chat route (openai) embeds natively, yet "none" wins — and the
+    # terminal short-circuit means resolve_provider_routing (rigged to raise)
+    # is never reached.
+    assert service.resolve_embedding_provider() is None
+    assert service.get_embedding_service() is None
+
+
+def test_set_embedding_route_none_skips_validation_and_persists():
+    """#2287 — setting ``"none"`` bypasses provider validation (it names no
+    route) and round-trips through get_embedding_route. Casing/whitespace is
+    canonicalized to the bare sentinel."""
+    service = LLMService.__new__(LLMService)
+    # No embedding-capable route configured — an explicit selector would be
+    # refused, but "none" must still be accepted.
+    service.providers = [_route("anthropic:api", "anthropic", AnthropicAdapter())]
+    service._embedding_route = None
+    service._embedding_route_persistence_callback = None
+
+    service.set_embedding_route("none")
+    assert service.get_embedding_route() == "none"
+    # Canonicalization: mixed case / padding still lands on "none".
+    service._embedding_route = None
+    service.set_embedding_route("  NONE ")
+    assert service.get_embedding_route() == "none"
+
+    # Auto still clears back to None (distinct from off).
+    service.set_embedding_route("auto")
+    assert service.get_embedding_route() is None
+
+
 def test_get_embedding_settings_reports_resolved_state_and_dims():
     """#2263 — GET-settings surfaces configured route, resolved route, model,
     embedding_dim, and the deployment KESTREL_EMBEDDING_DIM."""
