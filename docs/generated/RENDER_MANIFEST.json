@@ -4144,6 +4144,22 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/endpoints/models.py",
+        "kestrel_sovereign/static/js/conversations.js",
+        "kestrel_sovereign/static/js/ui-ext/contract.js"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/proposals/agent-list-component/DESIGN.md",
+      "privacy": "",
+      "render": "public",
+      "status": "proposed",
+      "title": "Mountable, skinnable agent-list component",
+      "type": "Design Proposal"
+    },
+    {
+      "existing_code_refs": [
         "kestrel_sovereign/static/js/api_client.mjs",
         "kestrel_sovereign/static/js/app.js",
         "kestrel_sovereign/static/js/chat.js",
