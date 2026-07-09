@@ -252,3 +252,30 @@ test('the handle exposes list delegators (refresh/select/setActiveName/getActive
     assert.ok(handle.list, 'inner mountAgentList handle exposed');
     handle.destroy();
 });
+
+test('destroy() removes the BUILT resize handle from a bare container (codex P2)', async () => {
+    const el = document.createElement('div');   // bare embed container
+    document.body.appendChild(el);
+    const handle = mountAgentListPane(el, {
+        adapter: { mode: 'multi_agent', listAgents: async () => [] },
+        storageKey: 'test:dz-pane',
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(el.querySelector('.resize-handle'), 'bare mount builds a resize handle');
+    handle.destroy();
+    assert.equal(el.querySelector('.resize-handle'), null, 'built handle removed on destroy');
+
+    // Adopted chrome stays: pre-existing handle survives destroy.
+    const el2 = document.createElement('div');
+    const preHandle = document.createElement('div');
+    preHandle.className = 'resize-handle';
+    el2.appendChild(preHandle);
+    document.body.appendChild(el2);
+    const handle2 = mountAgentListPane(el2, {
+        adapter: { mode: 'multi_agent', listAgents: async () => [] },
+        storageKey: 'test:dz-pane2',
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    handle2.destroy();
+    assert.ok(el2.querySelector('.resize-handle'), 'adopted handle survives destroy');
+});

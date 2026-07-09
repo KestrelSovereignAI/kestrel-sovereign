@@ -496,10 +496,12 @@ export function mountAgentListPane(containerEl, config = {}) {
 
     // --- Resize handle (adopt existing .resize-handle, else build one) ------
     let resizeHandle = paneEl.querySelector('.resize-handle');
+    let builtResizeHandle = false;
     if (!resizeHandle) {
         resizeHandle = doc.createElement('div');
         resizeHandle.className = 'resize-handle agent-list-resize-handle';
         paneEl.appendChild(resizeHandle);
+        builtResizeHandle = true;
     }
 
     // --- Mount the shared list surface into the body -----------------------
@@ -634,6 +636,10 @@ export function mountAgentListPane(containerEl, config = {}) {
         // Remove only chrome this mount built; adopted chrome is left in place.
         if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
         if (builtNewBtn && newBtn) newBtn.remove();
+        // The built resize handle too (codex P2): a leaked absolutely-positioned
+        // .resize-handle overlays the container edge and gets ADOPTED by the
+        // next mount into the same container, doubling listeners over time.
+        if (builtResizeHandle && resizeHandle) resizeHandle.remove();
     }
 
     return {
