@@ -280,10 +280,13 @@ async def test_retrieve_uses_vector_backend_for_semantic_component(monkeypatch):
     )
 
     conv.get_message_embeddings.assert_not_awaited()
-    assert fake_backend.k == 2
+    # Whole-corpus candidate generation asks for a bounded top-k independent
+    # of the two recent seed rows.
+    assert fake_backend.k == 200
     assert fake_backend.filter == {
         "agent_id": "agent-a",
         "deleted_at": None,
+        "archived_at": None,
         "embedding_profile_id": "profile-a",
     }
     assert results[0]["id"] == 1
