@@ -309,6 +309,107 @@ test('isHostLevelEndpoint identifies fleet-wide routes that must not be wrapped'
     assert.equal(isHostLevelEndpoint('/api/agent/invoke'), false);
 });
 
+test('isHostLevelEndpoint treats host-scoped surfaces as host-root, never agent-prefixed (#2293)', () => {
+    assert.equal(isHostLevelEndpoint('/api/host/csrf'), true);
+    assert.equal(isHostLevelEndpoint('/api/host/ui/contributions'), true);
+    assert.equal(isHostLevelEndpoint('/host/features/fleet/static/panel.js'), true);
+    // Guard against false positives: an agent whose name starts with "host"
+    // must still be per-agent-prefixed.
+    assert.equal(isHostLevelEndpoint('/api/hostess/thing'), false);
+    assert.equal(isHostLevelEndpoint('/hosting/x'), false);
+});
+
+test('applyHostAgentPrefix leaves host-root paths untouched even with a selected agent (#2293)', () => {
+    assert.equal(applyHostAgentPrefix('/api/host/csrf', 'host-a'), '/api/host/csrf');
+    assert.equal(
+        applyHostAgentPrefix('/host/features/fleet/static/panel.js', 'host-a'),
+        '/host/features/fleet/static/panel.js',
+    );
+});
+
+// A cookie-authenticated caller (no API key) hits a host-feature state-changing
+// route. requestHost must fetch the CSRF token once and echo it in the
+// X-CSRF-Token header; the host root is never agent-prefixed.
+test('requestHost attaches the double-submit CSRF token on cookie-authed mutations (#2293)', async () => {
+    const cookieAuth = {
+        async ensureAuthenticated() {},
+        applyAuth(headers) { return headers; },
+        async onUnauthorized() { return 'failed'; },
+        getApiKey() { return null; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, { csrf_token: 'tok-123' }),   // GET /api/host/csrf
+        jsonResponse(200, { ok: true }),                // the POST
+    );
+    const { client } = createClient({ fetchFn, authProvider: cookieAuth });
+    client.setHostAgent('host-a');   // selected agent must NOT leak into host paths
+
+    const result = await client.requestHost('/api/demo-host/do', { method: 'POST' });
+    assert.deepEqual(result, { ok: true });
+
+    assert.equal(fetchFn.calls[0].url, '/api/host/csrf');
+    assert.equal(fetchFn.calls[1].url, '/api/demo-host/do');
+    assert.equal(fetchFn.calls[1].options.headers['X-CSRF-Token'], 'tok-123');
+    assert.equal(fetchFn.calls[1].options.method, 'POST');
+});
+
+test('requestHost caches the CSRF token across mutations (single /api/host/csrf fetch) (#2293)', async () => {
+    const cookieAuth = {
+        async ensureAuthenticated() {},
+        applyAuth(headers) { return headers; },
+        async onUnauthorized() { return 'failed'; },
+        getApiKey() { return null; },
+    };
+    const fetchFn = createFetchQueue(
+        jsonResponse(200, { csrf_token: 'tok-abc' }),
+        jsonResponse(200, { ok: 1 }),
+        jsonResponse(200, { ok: 2 }),
+    );
+    const { client } = createClient({ fetchFn, authProvider: cookieAuth });
+
+    await client.requestHost('/api/demo-host/a', { method: 'POST' });
+    await client.requestHost('/api/demo-host/b', { method: 'DELETE' });
+
+    const csrfFetches = fetchFn.calls.filter((c) => c.url === '/api/host/csrf');
+    assert.equal(csrfFetches.length, 1, 'the CSRF token must be fetched once and reused');
+    assert.equal(fetchFn.calls[2].options.headers['X-CSRF-Token'], 'tok-abc');
+});
+
+test('requestHost does NOT attach a CSRF token for API-key/machine callers (#2293)', async () => {
+    // Machine callers are CSRF-exempt server-side; the client must not fetch or
+    // attach a token (there may be no matching cookie, which would 403).
+    const fetchFn = createFetchQueue(jsonResponse(200, { ok: true }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'k-machine' },
+    });
+    await client.init();
+
+    const result = await client.requestHost('/api/demo-host/do', { method: 'POST' });
+    assert.deepEqual(result, { ok: true });
+    // Only the POST — no /api/host/csrf fetch.
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(fetchFn.calls[0].url, '/api/demo-host/do');
+    assert.equal(fetchFn.calls[0].options.headers['X-CSRF-Token'], undefined);
+    assert.equal(fetchFn.calls[0].options.headers['X-API-Key'], 'k-machine');
+});
+
+test('requestHost sends no CSRF token on safe (GET) host requests (#2293)', async () => {
+    const cookieAuth = {
+        async ensureAuthenticated() {},
+        applyAuth(headers) { return headers; },
+        async onUnauthorized() { return 'failed'; },
+        getApiKey() { return null; },
+    };
+    const fetchFn = createFetchQueue(jsonResponse(200, { contributions: [] }));
+    const { client } = createClient({ fetchFn, authProvider: cookieAuth });
+
+    await client.requestHost('/api/host/ui/contributions');
+    assert.equal(fetchFn.calls.length, 1, 'a safe GET must not trigger a CSRF token fetch');
+    assert.equal(fetchFn.calls[0].url, '/api/host/ui/contributions');
+    assert.equal(fetchFn.calls[0].options.headers['X-CSRF-Token'], undefined);
+});
+
 test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
     const { client } = createClient({ fetchFn: createFetchQueue() });
 

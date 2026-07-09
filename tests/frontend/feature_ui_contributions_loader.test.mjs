@@ -33,7 +33,7 @@ if (!globalThis.CSS || typeof globalThis.CSS.escape !== 'function') {
 }
 
 const API = (await import('../../kestrel_sovereign/static/js/api.js')).default;
-const { loadFeatureUIContributions } = await import(
+const { loadFeatureUIContributions, loadHostFeatureUIContributions } = await import(
     '../../kestrel_sovereign/static/js/ui-ext/feature-loader.js'
 );
 
@@ -205,6 +205,53 @@ test('concurrent invocations are coalesced onto a single fetch', async () => {
     assert.equal(fetches, 1, 'overlapping loads must share one in-flight manifest fetch');
 });
 
+// --- host-scoped UI loader (#2293) ---
+
+test('loadHostFeatureUIContributions fetches the host manifest via requestHost and imports host modules un-pinned', async () => {
+    // Host modules are host-served (root-relative /host/features/...); they must
+    // NOT be agent-pinned. The manifest is fetched via requestHost (host root),
+    // never the per-agent /api/ui/contributions.
+    let requestHostPath = null;
+    API.requestHost = async (path) => {
+        requestHostPath = path;
+        return {
+            contributions: [
+                {
+                    feature: 'fleet',
+                    capability: 'fleet',
+                    modules: [loaderModule('host-fleet-panel')],
+                    css: [],
+                },
+            ],
+        };
+    };
+    API.hasCapability = () => true;
+    // If the host loader ever agent-pinned a URL, this would fire — it must not.
+    const originalBuild = API.buildAgentUrl;
+    let pinned = false;
+    API.buildAgentUrl = (u) => { pinned = true; return u; };
+    try {
+        await loadHostFeatureUIContributions();
+    } finally {
+        API.buildAgentUrl = originalBuild;
+    }
+
+    assert.equal(requestHostPath, '/api/host/ui/contributions');
+    assert.deepEqual(globalThis.__featLoaded, ['host-fleet-panel']);
+    assert.equal(pinned, false, 'host modules must not be agent-pinned');
+});
+
+test('loadHostFeatureUIContributions skips capability-gated-off host panels', async () => {
+    API.requestHost = async () => ({
+        contributions: [
+            { feature: 'fleet', capability: 'fleet', modules: [loaderModule('host-gated-off')], css: [] },
+        ],
+    });
+    API.hasCapability = (cap) => cap !== 'fleet';
+    await loadHostFeatureUIContributions();
+    assert.deepEqual(globalThis.__featLoaded, [], 'a gated-off host panel must not import');
+});
+
 // --- wiring assertions: the re-runs are actually invoked ---
 
 const identitySrc = fs.readFileSync(
@@ -270,10 +317,29 @@ test('app.js skips the boot fetches when the render seeded multiAgentHost (#2048
     );
 });
 
-test('app.js imports the shared loader rather than defining it inline', () => {
+test('app.js loads the host-scoped UI surface at boot in multi-agent host mode (#2293)', () => {
+    // The host serves host-feature panels at /api/host/ui/contributions — a
+    // surface distinct from the per-agent loader. app.js must load it during
+    // host-console boot (gated on multiAgentHost), or host panels never render.
     assert.match(
         appSrc,
-        /import \{ loadFeatureUIContributions \} from '\.\/ui-ext\/feature-loader\.js'/,
+        /import \{[^}]*\bloadHostFeatureUIContributions\b[^}]*\} from '\.\/ui-ext\/feature-loader\.js'/,
+        'app.js must import the host-scoped loader',
+    );
+    assert.match(
+        appSrc,
+        /if \(bootConfig\.multiAgentHost\) \{\s*await loadHostFeatureUIContributions\(\);/,
+        'the host-scoped surface must load at boot in host mode',
+    );
+});
+
+test('app.js imports the shared loader rather than defining it inline', () => {
+    // The import may carry additional named exports (e.g. the host-scoped
+    // loader, #2293) — assert the loader is imported from the shared module,
+    // not that it is the ONLY named import.
+    assert.match(
+        appSrc,
+        /import \{[^}]*\bloadFeatureUIContributions\b[^}]*\} from '\.\/ui-ext\/feature-loader\.js'/,
     );
     assert.doesNotMatch(
         appSrc,

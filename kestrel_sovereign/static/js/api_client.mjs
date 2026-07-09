@@ -20,6 +20,22 @@ const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
 // ``/api/agents/{selected}/api/agents/{name}``.
 const HOST_LEVEL_AGENT_RESOURCE_RE = /^\/api\/agents\/[^/]+(\?.*)?$/;
 
+// Host-scoped surfaces (#2293): the multi-agent host serves host-feature routes
+// at the host ROOT (``/api/host/…`` for the host CSRF + UI-contributions
+// endpoints, ``/host/…`` for host-feature static assets). These must NEVER be
+// host-agent-prefixed — they belong to the host, not the selected agent — or
+// they'd be proxied into ``/api/agents/{selected}/api/host/…`` and 404.
+const HOST_ROOT_RE = /^\/(api\/host|host)(\/|\?|$)/;
+
+// HTTP methods that mutate state and therefore require a CSRF token when the
+// caller is cookie-authenticated. Mirrors the server's STATE_CHANGING_METHODS
+// (kestrel_sovereign/security/csrf.py). Safe methods carry no CSRF header.
+const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+// Header the console echoes the double-submit CSRF token in. Mirrors the
+// server's CSRF_HEADER_NAME.
+const CSRF_HEADER_NAME = 'X-CSRF-Token';
+
 // Canonical list of known UI capability keys (#879, #2041).
 //
 // Two classes live here:
@@ -69,6 +85,7 @@ export function isHostLevelEndpoint(endpoint) {
     if (endpoint === '/api/agents' || endpoint.startsWith('/api/agents?')) return true;
     if (HOST_LEVEL_AGENTS_RE.test(endpoint)) return true;
     if (HOST_LEVEL_AGENT_RESOURCE_RE.test(endpoint)) return true;
+    if (HOST_ROOT_RE.test(endpoint)) return true;
     if (endpoint === '/api/auth/key' || endpoint.startsWith('/api/auth/')) return true;
     if (endpoint === '/health') return true;
     return false;
@@ -79,6 +96,14 @@ export function applyHostAgentPrefix(endpoint, selectedHostAgent) {
         return endpoint;
     }
     return `/api/agents/${encodeURIComponent(selectedHostAgent)}${endpoint}`;
+}
+
+// Build a host-ROOT URL for a host-scoped endpoint (#2293). Host features and
+// host management routes are served by the host itself, so the path is used
+// verbatim — never host-agent-prefixed. Exported for symmetry with
+// applyHostAgentPrefix and for unit tests.
+export function buildHostUrl(endpoint) {
+    return endpoint;
 }
 
 export function createKestrelStandaloneAuthProvider({
@@ -370,7 +395,34 @@ export function createApiClient({
         // map existed the frontend pane never learned its durable
         // session id and stayed anchored on null indefinitely.
         effectiveSessionIds: new Map(),
+        // Cached double-submit CSRF token for host-scoped state-changing
+        // requests (#2293). Fetched lazily from GET /api/host/csrf (which also
+        // sets the matching cookie) and reused for the page's lifetime. Only
+        // cookie-authenticated callers attach it; API-key/bearer callers are
+        // CSRF-exempt (a browser never auto-attaches those headers).
+        csrfToken: null,
     };
+
+    // Fetch (once) and cache the host CSRF token. Returns null on failure so a
+    // caller degrades to sending no header (the server then 403s a genuinely
+    // cookie-authed mutation, surfacing the misconfig rather than masking it).
+    async function ensureCsrfToken() {
+        if (state.csrfToken) return state.csrfToken;
+        try {
+            const data = await performRequest(buildHostUrl('/api/host/csrf'), { method: 'GET' });
+            if (data && data.csrf_token) state.csrfToken = data.csrf_token;
+        } catch (e) {
+            log.warn?.('[csrf] failed to fetch host CSRF token', e);
+        }
+        return state.csrfToken;
+    }
+
+    // Whether the active auth is a machine credential (API key / bearer). Such
+    // callers are CSRF-exempt server-side, so we must NOT attach a CSRF header
+    // (there may be no cookie to match, which would 403 a valid request).
+    function isMachineAuthed() {
+        return typeof auth.getApiKey === 'function' && !!auth.getApiKey();
+    }
 
     // Single-source the fetch + auth + 401-retry pipeline so both
     // request() and requestForAgent() share it. Without this factor
@@ -427,6 +479,26 @@ export function createApiClient({
         async requestForAgent(endpoint, options = {}, agent, retried = false) {
             const url = applyHostAgentPrefix(endpoint, agent);
             return performRequest(url, options, retried, () => this.requestForAgent(endpoint, options, agent, true));
+        },
+
+        // Request a host-ROOT endpoint (#2293). Unlike request(), the URL is
+        // never host-agent-prefixed — it targets the host itself (host-feature
+        // routes, host CSRF/UI-contributions). For state-changing methods on a
+        // cookie-authenticated session it also attaches the double-submit CSRF
+        // token the host enforces; API-key/bearer callers are exempt.
+        async requestHost(endpoint, options = {}, retried = false) {
+            const url = buildHostUrl(endpoint);
+            const method = (options.method || 'GET').toUpperCase();
+            if (STATE_CHANGING_METHODS.has(method) && !isMachineAuthed()) {
+                const token = await ensureCsrfToken();
+                if (token) {
+                    options = {
+                        ...options,
+                        headers: { ...(options.headers || {}), [CSRF_HEADER_NAME]: token },
+                    };
+                }
+            }
+            return performRequest(url, options, retried, () => this.requestHost(endpoint, options, true));
         },
 
         health: () => client.request('/health'),
