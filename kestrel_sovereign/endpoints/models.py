@@ -1405,12 +1405,56 @@ async def get_embedding_settings(request: Request):
         agent = get_agent(request)
         if not hasattr(agent, "llm_service") or not agent.llm_service:
             raise HTTPException(status_code=503, detail="LLM service not available.")
-        return agent.llm_service.get_embedding_settings()
+        settings = agent.llm_service.get_embedding_settings()
+        # #2289 — surface how many stored rows are on a different (or no)
+        # embedding profile than the one currently resolved, so the UI can
+        # render "Re-embed N memories". ``None`` when no profile resolves
+        # (keyword-search fallback) or storage is unavailable.
+        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
+        return settings
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error getting embedding settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error getting embedding settings.")
+
+
+async def _count_stale_embedding_rows(agent) -> Optional[int]:
+    """Count stored rows whose embedding profile != the resolved profile (#2289).
+
+    Scoped to the agent for the per-agent tables (conversation_history,
+    saved_items); document_chunks is global. Returns ``None`` when no
+    embedding profile resolves or storage isn't available — the caller
+    treats that as "re-embed action not applicable".
+    """
+    try:
+        service = agent.llm_service.get_embedding_service()
+        if service is None:
+            return None
+        target = service.current_profile_id()
+        if not target:
+            return None
+        # ``agent.storage`` is usually a PrivacyEnforcingStorage wrapper
+        # (no ``.db`` of its own) around the real AsyncStorage, which owns
+        # the ``.db`` handle. Reach through the wrapper's ``_storage`` when
+        # the outer object doesn't expose ``db`` directly.
+        storage = getattr(agent, "storage", None)
+        db = getattr(storage, "db", None) if storage else None
+        if db is None and storage is not None:
+            inner = getattr(storage, "_storage", None)
+            db = getattr(inner, "db", None) if inner else None
+        if db is None:
+            return None
+        from kestrel_sovereign.storage.embedding_reindex import EmbeddingReindexer
+
+        reindexer = EmbeddingReindexer(db, service, target)
+        counts = await reindexer.count_all_stale(
+            agent_id=getattr(agent, "agent_id", None)
+        )
+        return sum(counts.values())
+    except Exception as e:  # pragma: no cover - defensive; never crash the GET
+        logger.debug("stale_rows count failed: %s", e)
+        return None
 
 
 @router.api_route("/api/embedding/settings", methods=["POST", "PUT"])
