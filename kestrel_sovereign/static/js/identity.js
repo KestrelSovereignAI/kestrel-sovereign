@@ -21,7 +21,7 @@ import { mountConversationsPane } from './conversations.js';
 // (Frinz's companion list). identity.js keeps NO bespoke agent loop; it wires
 // the console-specific policy (demo banner, demo-misconfig-gated auto-select,
 // standalone conversations-pane refresh) through the component's config hooks.
-import { mountAgentList, createDefaultAgentAdapter } from './agent_list.js';
+import { mountAgentListPane, createDefaultAgentAdapter } from './agent_list.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
@@ -770,12 +770,27 @@ function _renderHybridIdentityRow(identity) {
 // ============================================================================
 
 let selectedAgentName = null;
-// #2278: the mounted `mountAgentList` handle + its default `/api/agents`
-// adapter. Mounted once (into `#agents-list`) on the first `loadAgents`; later
-// calls just `refresh()`. The adapter is retained so `onLoaded` can read the
-// response `mode` / `server_demo_mode` back for the demo banner + misconfig gate.
+// #2278 / #2279: the mounted `mountAgentListPane` handle + its default
+// `/api/agents` adapter. Mounted once (into `#agents-pane`) on the first
+// `loadAgents`; later calls just `refresh()`. #2279 wraps the shared list in the
+// conversations-pane chrome (chevron collapse, drag-resize + persistence) and a
+// component-owned "+ New" header action. The adapter is retained so `onLoaded`
+// can read the response `mode` / `server_demo_mode` back for the demo banner +
+// misconfig gate. The inner `mountAgentList` handle is `agentListPaneHandle.list`.
 let agentListHandle = null;
+let agentListPaneHandle = null;
 let agentListDefaultAdapter = null;
+
+// The standalone console's new-agent affordance (#2279 — same-everywhere rule,
+// the console gains an affordance it lacked). The new-agent / spawn flow is a
+// feature-contributed panel (#2048, extracted out of core), so route the pane's
+// "+ New" action to its nav tab when the Spawn feature is installed; otherwise
+// surface a hint rather than silently no-op.
+function openNewAgentFlow() {
+    const spawnTab = document.querySelector('.nav-tab[data-panel="spawn"]');
+    if (spawnTab) { spawnTab.click(); return; }
+    Toast.info('Creating a new agent requires the Spawn feature.');
+}
 
 /**
  * Render the DEMO MODE banner from the /api/agents response (#868).
@@ -878,19 +893,29 @@ export async function loadAgents() {
     if (!API.hasCapability('multi_agent')) {
         const pane = document.getElementById('agents-pane');
         if (pane) pane.style.display = 'none';
+        // No agents pane → hide its nav reopen trigger too (#2279), so a host
+        // without the multi_agent flow doesn't show a dead toggle button.
+        const trigger = document.getElementById('agents-toggle-btn');
+        if (trigger) trigger.style.display = 'none';
         return;
     }
-    const container = document.getElementById('agents-list');
+    // #2279: mount the shared list wrapped in the pane chrome. The container is
+    // the static `#agents-pane` (whose `.pane-header` / `.collapse-btn` /
+    // `#agents-list` body / `.resize-handle` the pane ADOPTS); the pane owns the
+    // chevron collapse, drag-resize + persistence, and the "+ New" action.
+    const container = document.getElementById('agents-pane');
     if (!container) return;
 
-    // Mount the shared list surface once; later loadAgents() calls just refresh.
+    // Mount the shared pane once; later loadAgents() calls just refresh.
     // The default `/api/agents` adapter + default console-row renderer make the
     // standalone console behavior-identical to the pre-#2278 hand-rolled loop.
-    if (!agentListHandle) {
+    if (!agentListPaneHandle) {
         agentListDefaultAdapter = createDefaultAgentAdapter(API);
-        agentListHandle = mountAgentList(container, {
+        agentListPaneHandle = mountAgentListPane(container, {
             api: API,
             adapter: agentListDefaultAdapter,
+            storageKey: 'kestrel:agents-pane',
+            title: 'Agents',
             selectedName: selectedAgentName,
             // Per-agent thinking pulse is driven by `state.waitingAgents` (the
             // Set sendMessage adds to on dispatch); the stop control aborts that
@@ -902,10 +927,16 @@ export async function loadAgents() {
             // routing via setHostAgent before this fires.
             onSelect: (item) => window.selectAgent(item.name),
             onLoaded: (items) => handleAgentsLoaded(items),
+            // #2279: the console GAINS a new-agent affordance via the pane's
+            // component-owned "+ New" header action, routed to the Spawn flow.
+            onNew: () => openNewAgentFlow(),
             // Auto-select is host policy here (demo-misconfig gated); drive it
             // from onLoaded rather than the component's blanket autoSelectFirst.
             autoLoad: false,
         });
+        // Retain the inner list handle so the existing select/setActiveName
+        // call sites keep working unchanged.
+        agentListHandle = agentListPaneHandle.list;
     }
     // Await the load so routing is pinned (setHostAgent runs synchronously
     // inside the onLoaded auto-select) before app.js runs Security.init().
@@ -1545,44 +1576,12 @@ export function initTrashToggle() {
 // ============================================================================
 // Pane Collapse/Expand + Resize
 // ============================================================================
-
-window.togglePane = function(paneId) {
-    const pane = document.getElementById(paneId);
-    if (pane) {
-        pane.classList.toggle('collapsed');
-    }
-};
-
-function initPaneResize(handleId, paneId) {
-    const handle = document.getElementById(handleId);
-    const pane = document.getElementById(paneId);
-    if (!handle || !pane) return;
-
-    let startX, startWidth;
-
-    handle.addEventListener('mousedown', (e) => {
-        startX = e.clientX;
-        startWidth = pane.offsetWidth;
-        document.body.style.cursor = 'col-resize';
-        document.body.style.userSelect = 'none';
-
-        function onMouseMove(e) {
-            const diff = e.clientX - startX;
-            const newWidth = Math.max(200, Math.min(500, startWidth + diff));
-            pane.style.width = newWidth + 'px';
-        }
-
-        function onMouseUp() {
-            document.removeEventListener('mousemove', onMouseMove);
-            document.removeEventListener('mouseup', onMouseUp);
-            document.body.style.cursor = '';
-            document.body.style.userSelect = '';
-        }
-
-        document.addEventListener('mousemove', onMouseMove);
-        document.addEventListener('mouseup', onMouseUp);
-    });
-}
+//
+// #2279: both sidebar panes' collapse + drag-resize chrome are now owned by
+// their pane components (`mountAgentListPane` / `mountConversationsPane`), which
+// adopt the static `.collapse-btn` / `.resize-handle` on mount. The former
+// `window.togglePane` + `initPaneResize` helpers (only the agents pane still
+// used them) were retired here to avoid double-binding the adopted chrome.
 
 // #2199: the chat-header `ki-history` trigger (icon-only, tooltip + aria) opens
 // or collapses the conversations pane. It drives the SAME mount handle the
@@ -1609,11 +1608,33 @@ window.toggleConversationsPane = function() {
     handle.toggle();
 };
 
+// #2279: the agents pane's chevron only CLOSES it (to fully hidden, #2216
+// two-state), exactly like the conversations pane. That makes an external reopen
+// trigger mandatory — otherwise the collapse is a one-way trip (the chevron
+// vanishes with the pane and the state persists across reloads). This is the
+// agents-pane analogue of `toggleConversationsPane`: the always-visible top-nav
+// `#agents-toggle-btn` (which lives OUTSIDE #agents-pane, so it survives the
+// pane's display:none) drives the SAME mount handle the sidebar chevron uses.
+window.toggleAgentsPane = function() {
+    // The pane is only mounted for multi_agent hosts (loadAgents hides it and
+    // skips the mount otherwise), so the toggle must be a no-op elsewhere.
+    if (!API.hasCapability('multi_agent')) return;
+    if (!agentListPaneHandle) return;
+    agentListPaneHandle.toggle();
+};
+
 // Setup collapse buttons and resize handles
 document.addEventListener('DOMContentLoaded', () => {
-    const collapseAgentsBtn = document.getElementById('collapse-agents-btn');
-    if (collapseAgentsBtn) {
-        collapseAgentsBtn.addEventListener('click', () => togglePane('agents-pane'));
+    // #2279: the agents pane's collapse chevron + drag-resize handle are now
+    // owned by the `mountAgentListPane` export (it adopts the static
+    // `.collapse-btn` / `.resize-handle` inside `#agents-pane` when it mounts),
+    // so identity.js no longer wires them here — that would double-bind, exactly
+    // as it stopped wiring the conversations pane's chrome under #2199. What
+    // identity.js DOES still own is the external reopen trigger: the chevron
+    // only closes the pane, so without this the collapse is irreversible.
+    const agentsTriggerBtn = document.getElementById('agents-toggle-btn');
+    if (agentsTriggerBtn) {
+        agentsTriggerBtn.addEventListener('click', () => window.toggleAgentsPane());
     }
 
     // #2199: the conversations pane's collapse chevron + drag-resize handle are
@@ -1661,10 +1682,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // highlight, with the host-side chat wiring supplied via the
     // `onNewConversation` config. identity.js owns no new-conversation wiring.
 
-    // Initialize resize handles. The conversations pane's resize is owned by
-    // the mountConversationsPane export (#2199); only the agents pane keeps the
-    // bespoke handler here.
-    initPaneResize('resize-agents', 'agents-pane');
+    // #2279: both sidebar panes' resize handles are now owned by their pane
+    // components (`mountAgentListPane` / `mountConversationsPane`), which adopt
+    // the static `.resize-handle` on mount — so identity.js wires neither here.
     // Wire the Trash toggle in the conversations pane header (#765).
     initTrashToggle();
 });

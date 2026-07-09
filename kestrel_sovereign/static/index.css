@@ -617,14 +617,17 @@ nav {
     opacity: 1;
 }
 
-/* #2216: the conversations pane has exactly TWO states — open (full pane) and
-   fully HIDDEN. "Closed" is NOT the thin `.pane-sidebar.collapsed` chevron rail
-   (that idiom still serves the Agents pane); it is `display:none`, taking zero
-   width. mountConversationsPane sets `display:none` inline and toggles this
-   class in lock-step; this rule backs the inline hide so no rail can leak
-   through. The pane also lives inside #panel-chat, so it's scoped to the chat
-   tab automatically. */
-.conversations-pane.collapsed {
+/* #2216 / #2279: both sidebar panes now have exactly TWO states — open (full
+   pane) and fully HIDDEN. "Closed" is NOT the thin `.pane-sidebar.collapsed`
+   chevron rail (48px, see above); it is `display:none`, taking zero width.
+   mountConversationsPane / mountAgentListPane set `display:none` inline and
+   toggle `.collapsed` in lock-step; these rules back the inline hide so no rail
+   can leak through. The conversations pane lives inside #panel-chat (scoped to
+   the chat tab); the agents pane is a top-level nav surface reopened by the
+   nav's #agents-toggle-btn (identity.js toggleAgentsPane). The 48px
+   `.pane-sidebar.collapsed` rail above is no longer used by either pane. */
+.conversations-pane.collapsed,
+.agent-list-pane.collapsed {
     display: none;
 }
 
