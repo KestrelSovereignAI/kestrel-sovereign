@@ -1207,6 +1207,39 @@ class TestSurveyStalledTalonJobs:
         assert [j["id"] for j in stalled] == ["job-x"]
 
     @pytest.mark.asyncio
+    async def test_scan_stale_work_tool_wraps_live_survey(self):
+        from datetime import datetime, timedelta, timezone
+
+        feature = self._feature()
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        feature._jobs = {
+            "job-1": {
+                "status": "running",
+                "started_at": old,
+                "label": "issue-1",
+                "repo": "org/repo",
+                "issue": 1,
+            },
+            "job-2": {
+                "status": "running",
+                "started_at": old,
+                "repo": "other/repo",
+                "issue": 2,
+            },
+        }
+
+        result = await feature.scan_stale_work(stale_days=3, repo="org/repo")
+
+        assert result.status is ToolResultStatus.OK
+        findings = result.data["findings"]
+        assert len(findings) == 1
+        assert findings[0]["id"] == "job-1"
+        assert findings[0]["repo"] == "org/repo"
+        assert findings[0]["kind"] == "talon_job"
+        assert findings[0]["issue"] == 1
+        assert findings[0]["suggested_gate"] == "govern_stalled_work_rescue"
+
+    @pytest.mark.asyncio
     async def test_survey_is_registered_as_fleet_discover(self):
         # The coordinator binds its survey onto fleet_stalled_sweep so a
         # recurring tick observes real candidates without pre-seeding.

@@ -1588,6 +1588,35 @@ class TestSecurityFeature:
         ) == PermissionLevel.ALLOW
 
     @pytest.mark.asyncio
+    async def test_talon_scan_stale_work_registers_as_allow(self, tmp_path):
+        """The scheduler's ecosystem discovery watch must be able to run its
+        read-only Talon scan without an interactive approval gate, while Talon
+        dispatch tools keep the feature-level ASK default."""
+        from types import SimpleNamespace
+
+        talon = MagicMock()
+        talon.get_tools.return_value = [
+            SimpleNamespace(name="scan_stale_work"),
+            SimpleNamespace(name="talon_claim"),
+        ]
+        talon.tool_name = None
+        agent = MagicMock()
+        agent.features = {"TalonCoordinatorFeature": talon}
+        feature = SecurityFeature(agent)
+        feature.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feature.permission_store.initialize()
+
+        await feature._register_all_tools()
+
+        store = feature.permission_store
+        assert (
+            await store.get_permission("TalonCoordinatorFeature", "scan_stale_work")
+        ) == PermissionLevel.ALLOW
+        assert (
+            await store.get_permission("TalonCoordinatorFeature", "talon_claim")
+        ) == PermissionLevel.ASK
+
+    @pytest.mark.asyncio
     async def test_demo_override_does_not_downgrade_destructive_memory_tools(
         self, tmp_path, monkeypatch
     ):

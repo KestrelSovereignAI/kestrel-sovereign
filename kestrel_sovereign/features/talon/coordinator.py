@@ -417,6 +417,74 @@ class TalonCoordinatorFeature(Feature):
     # ------------------------------------------------------------------
 
     @tool(
+        name="scan_stale_work",
+        description=(
+            "Read-only ecosystem discovery scan for stale Talon work. "
+            "Returns actionable findings for scheduler discovery watches; "
+            "never dispatches repairs or closes issues."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!talon scan-stale-work",
+    )
+    async def scan_stale_work(
+        self,
+        stale_days: int = 3,
+        repo: Optional[str] = None,
+    ) -> ToolResult:
+        """Scan for stale work without taking action (#2281).
+
+        This is the scheduler-facing wrapper around Talon's existing live
+        stalled-job survey. It keeps ``ecosystem_discovery_watch`` wired to a
+        real in-tree tool while preserving the evidence boundary: discovery
+        returns findings only, and any repair/closure still needs a later gate.
+
+        Args:
+            stale_days: How many idle days mark Talon work as stalled.
+            repo: Optional ``owner/name`` filter.
+        """
+        stalled = await self._survey_stalled_talon_jobs(stale_days)
+        if repo:
+            stalled = [item for item in stalled if item.get("repo") == repo]
+
+        findings: List[Dict[str, Any]] = []
+        for item in stalled:
+            issue = item.get("issue")
+            repo_name = item.get("repo") or repo or ""
+            title_parts = ["Stalled Talon job", str(item.get("id") or "?")]
+            if repo_name and issue:
+                title_parts.append(f"for {repo_name}#{issue}")
+            findings.append({
+                "id": item.get("id"),
+                "repo": repo_name,
+                "kind": item.get("kind") or "talon_job",
+                "issue": issue,
+                "job": item.get("id"),
+                "status": item.get("status") or "stalled",
+                "severity": "high",
+                "title": " ".join(title_parts),
+                "started_at": item.get("started_at"),
+                "suggested_gate": "govern_stalled_work_rescue",
+                "actionable": True,
+            })
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Found {len(findings)} stale work item(s) "
+                f"older than {stale_days} day(s)."
+            ),
+            data={
+                "summary": (
+                    f"{len(findings)} stale work item(s)"
+                    if findings
+                    else "No actionable stale work findings."
+                ),
+                "findings": findings,
+                "stale_days": stale_days,
+                "repo": repo or "",
+            },
+        )
+
+    @tool(
         name="talon_claim",
         description=(
             "Dispatch a single issue to Talon for autonomous "
