@@ -181,6 +181,38 @@ def test_validate_accepts_self_and_ceiling_timeout():
     assert params["wait_timeout_seconds"] == 3600
 
 
+# Strict numeric typing (codex P2): {"pr": 12.9} must never silently
+# truncate to 12 and dispatch the irreversible pipeline against the wrong
+# PR. Only actual ints (bools excluded) or digit-only strings are accepted;
+# floats are rejected even when integral.
+
+
+@pytest.mark.parametrize("key", ["issue", "pr", "wait_timeout_seconds"])
+@pytest.mark.parametrize("bad", [12.9, 12.0, True, "12.9", "abc"])
+def test_numeric_params_reject_non_integers(key, bad):
+    payload = {"repo": "o/r", key: bad}
+    if key == "wait_timeout_seconds":
+        payload["issue"] = 1  # valid target so only the timeout is at fault
+    with pytest.raises(ValueError, match=key):
+        validate_pipeline_params(payload)
+
+
+@pytest.mark.parametrize("key,mode", [("issue", "claim"), ("pr", "iterate")])
+@pytest.mark.parametrize("good", [12, "12"])
+def test_numeric_params_accept_ints_and_digit_strings(key, mode, good):
+    params = validate_pipeline_params({"repo": "o/r", key: good})
+    assert params[key] == 12
+    assert params["mode"] == mode
+
+
+@pytest.mark.parametrize("good", [12, "12"])
+def test_wait_timeout_accepts_ints_and_digit_strings(good):
+    params = validate_pipeline_params(
+        {"repo": "o/r", "issue": 1, "wait_timeout_seconds": good}
+    )
+    assert params["wait_timeout_seconds"] == 12
+
+
 def test_validate_infers_claim_from_issue():
     params = validate_pipeline_params({"repo": "o/r", "issue": "42"})
     assert params["mode"] == "claim"

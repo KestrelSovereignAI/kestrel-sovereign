@@ -89,16 +89,34 @@ _REPO_RE = re.compile(
 
 
 def _coerce_number(value: Any, key: str) -> Optional[int]:
-    """Parse an int-like param; ``None``/missing passes through."""
+    """Parse a numeric param strictly; ``None``/missing passes through.
+
+    Accepts only actual ints (bools excluded — ``isinstance(True, int)``
+    is True) or digit-only ASCII strings. Floats are rejected even when
+    integral: ``int(12.9)`` would silently truncate and dispatch the
+    irreversible pipeline against the wrong issue/PR (codex P2), and
+    accepting 12.0 while rejecting 12.9 would make the boundary depend on
+    the payload's float noise — so the whole type is refused (fail closed).
+    """
     if value is None:
         return None
     if isinstance(value, bool):
         raise ValueError(f"{SOURCE_NAME}: {key} must be an integer, got a bool")
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not (text.isascii() and text.isdigit()):
+            raise ValueError(
+                f"{SOURCE_NAME}: {key} must be an integer or digit-only "
+                f"string, got {value!r} (fail closed)"
+            )
+        number = int(text)
+    else:
         raise ValueError(
-            f"{SOURCE_NAME}: {key} must be an integer, got {value!r}"
+            f"{SOURCE_NAME}: {key} must be an integer or digit-only string, "
+            f"got {type(value).__name__} {value!r} — floats are rejected to "
+            "prevent silent truncation (fail closed)"
         )
     if number < 1:
         raise ValueError(f"{SOURCE_NAME}: {key} must be >= 1, got {number}")
