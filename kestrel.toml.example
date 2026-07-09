@@ -65,6 +65,15 @@ adapter     = "OpenRouterAdapter"
 base_url    = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 model       = "auto"
+# Optional embedding config (#2288). OpenRouter's unified OpenAI-compatible
+# /v1/embeddings unlocks its whole embedding catalog through the same key. The
+# route advertises embedding support ONLY when embedding_model is set (no
+# meta-provider default). embedding_dim is forwarded as the API `dimensions`
+# param for Matryoshka-capable models (e.g. qwen3-embedding: 32 → native) and
+# keys the embedding space (upstream-model@dim), so re-embedding is needed if
+# you change either. Uncomment to route embeddings through OpenRouter:
+# embedding_model = "qwen/qwen3-embedding-0.6b"
+# embedding_dim   = 768
 
 [llm.ensemble]
 # The number of agent instances to run in the ensemble.

@@ -50,8 +50,28 @@ class OpenRouterAdapter(OpenAIAdapter):
         OPENROUTER_APP_NAME: Optional app name for leaderboard attribution
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        embedding_model: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
+        supports_embeddings: Optional[bool] = None,
+    ):
+        # Start from the base with embeddings OFF; OpenRouter must NOT inherit
+        # OpenAI's ``text-embedding-3-small`` default. As a meta-provider it
+        # only embeds when a route explicitly configures an embedding model
+        # (#2288) — advertising what the ROUTE serves, not what the vendor's
+        # catalog theoretically offers.
         super().__init__(name="openrouter", supports_embeddings=False)
+        self._embedding_model = str(embedding_model) if embedding_model else None
+        self._embedding_dim = int(embedding_dim) if embedding_dim else None
+        if supports_embeddings is None:
+            supports_embeddings = bool(self._embedding_model)
+        # A route can't claim embeddings without a model to serve them.
+        self._supports_embeddings = bool(supports_embeddings) and bool(
+            self._embedding_model
+        )
+
         self.base_url = get_openrouter_api_base()
 
         # Get API key
@@ -65,14 +85,87 @@ class OpenRouterAdapter(OpenAIAdapter):
         capabilities = super().provider_capabilities()
         return replace(
             capabilities,
-            supports_embeddings=False,
-            embedding_model=None,
-            embedding_dim=None,
+            # Truthful, ROUTE-scoped embedding advertisement (#2288): only when
+            # an embedding model is actually configured for this route.
+            supports_embeddings=self._supports_embeddings,
+            embedding_model=self._embedding_model,
+            embedding_dim=self._embedding_dim,
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
                 "OpenRouter forwards requests to many upstream providers; per-model support is authoritative.",
                 "The adapter can send OpenAI-compatible tools, images, and response_format payloads.",
             ),
+        )
+
+    def embedding_space_id(self) -> Optional[str]:
+        """Model-keyed embedding space id for the meta-provider route (#2288).
+
+        OpenRouter is a meta-provider, so the coordinate space a vector lives
+        in is determined by the *upstream* model, not by "openrouter". Two
+        different upstream models reached through the same route are different
+        spaces; the SAME upstream model reached through OpenRouter or directly
+        is the same space. Key on the upstream model id (stripped of the
+        ``vendor/`` routing prefix) plus the served dimension — e.g.
+        ``qwen/qwen3-embedding-0.6b`` at 768 dims → ``qwen3-embedding-0.6b@768``.
+        Matryoshka truncation makes the same model at a different dimension a
+        different space, so the dim is part of the key. Returns ``None`` when no
+        embedding model / dimension is configured (nothing to stamp).
+        """
+        if not self._embedding_model or not self._embedding_dim:
+            return None
+        upstream = self._embedding_model.split("/", 1)[-1]
+        return f"{upstream}@{int(self._embedding_dim)}"
+
+    async def aembed(
+        self,
+        client: openai.AsyncOpenAI,
+        text: str,
+        *,
+        model: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Optional[List[float]]:
+        """Embed one text via OpenRouter's OpenAI-compatible ``/v1/embeddings``.
+
+        No hardcoded default model: a meta-provider embedding call requires an
+        explicit model (route config ``embedding_model`` or the ``model`` arg).
+        Forwards the configured ``dimensions`` for Matryoshka-capable models.
+        """
+        model = model or self._embedding_model
+        if not model:
+            raise ValueError(
+                "OpenRouter embeddings require an explicit embedding model "
+                "(set route-level 'embedding_model', e.g. "
+                "'qwen/qwen3-embedding-0.6b'); no default is assumed for a "
+                "meta-provider."
+            )
+        if dimensions is None:
+            dimensions = self._embedding_dim
+        return await super().aembed(
+            client, text, model=model, dimensions=dimensions, **kwargs
+        )
+
+    async def aembed_batch(
+        self,
+        client: openai.AsyncOpenAI,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        **kwargs: Any,
+    ) -> List[Optional[List[float]]]:
+        model = model or self._embedding_model
+        if not model:
+            raise ValueError(
+                "OpenRouter embeddings require an explicit embedding model "
+                "(set route-level 'embedding_model', e.g. "
+                "'qwen/qwen3-embedding-0.6b'); no default is assumed for a "
+                "meta-provider."
+            )
+        if dimensions is None:
+            dimensions = self._embedding_dim
+        return await super().aembed_batch(
+            client, texts, model=model, dimensions=dimensions, **kwargs
         )
 
     def _get_client(self) -> openai.AsyncOpenAI:

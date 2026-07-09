@@ -328,6 +328,26 @@ class ProviderEmbeddingService:
         # the same upstream model (rare). Default profile uses
         # ``"<provider>:<model>"``.
         self._space_id = capabilities.get("embedding_space_id")
+        # Meta-providers (OpenRouter) key the space on the *upstream* model,
+        # not on the route vendor, so the same upstream model reached through
+        # different routes shares a coordinate space (#2288). When capabilities
+        # carry no explicit override, let the adapter declare its space id.
+        if not self._space_id:
+            adapter_space_id = getattr(self.adapter, "embedding_space_id", None)
+            if callable(adapter_space_id):
+                try:
+                    declared = adapter_space_id()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "adapter.embedding_space_id() failed for %s: %s",
+                        type(self.adapter).__name__,
+                        exc,
+                    )
+                    declared = None
+                # Only a non-empty string is a valid override — ignore mocks /
+                # stubs whose attribute access auto-vivifies a truthy object.
+                if isinstance(declared, str) and declared:
+                    self._space_id = declared
 
     async def aembed(self, text: str) -> Optional[List[float]]:
         return await self.adapter.aembed(
