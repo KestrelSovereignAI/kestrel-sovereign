@@ -361,6 +361,21 @@ nav {
     color: rgba(255, 255, 255, 0.85);
 }
 
+/* mountAgentList (#2278, design §3.2): the shared list surface budgets vertical
+   room for a per-card actions row by DEFAULT so a host's portrait-card renderer
+   has real space for buttons under the portrait — that budget is a component
+   responsibility, not a per-host CSS patch. The console row lays out
+   horizontally and its actions anchor is usually empty; `:not(:empty)` keeps
+   the budget from adding height to a bare console row, so the standalone list is
+   visually unchanged from the pre-#2278 hand-rolled loop. */
+.agent-list-component .agent-card-actions:not(:empty) {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 1.75rem;
+    margin-top: 0.25rem;
+}
+
 /* Per-agent chat pane element. Each agent owns one of these
    detached fragments; mountChatPane() attaches the visible
    agent's pane as the sole child of #chat-container (the scroll
