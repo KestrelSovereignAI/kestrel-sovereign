@@ -10,6 +10,9 @@ from typing import List, Dict, Any, Optional
 from enum import Enum
 
 
+EMOTIONAL_TAG_VERSION = "heuristic-v2"
+
+
 class EmotionalCategory(Enum):
     """Categories of emotions that can be detected in messages."""
     JOY = "joy"
@@ -38,9 +41,12 @@ class MemoryMetadata:
     emotional_valence: float = 0.0      # -1.0 (negative) to +1.0 (positive)
     emotional_intensity: float = 0.0    # 0.0 (neutral) to 1.0 (intense)
     emotional_categories: List[str] = field(default_factory=list)
+    emotional_confidence: float = 0.0   # confidence in heuristic attribution
+    emotional_subject: str = "unknown" # user | other | assistant | unknown
+    emotional_tag_version: str = EMOTIONAL_TAG_VERSION
 
     # Importance layer
-    importance: float = 0.5             # 0.0 to 1.0
+    importance: float = 0.5             # legacy/default read compatibility
     importance_reasons: List[str] = field(default_factory=list)
 
     # Temporal layer
@@ -87,6 +93,9 @@ class MemoryMetadata:
             "emotional_valence": self.emotional_valence,
             "emotional_intensity": self.emotional_intensity,
             "emotional_categories": self.emotional_categories,
+            "emotional_confidence": self.emotional_confidence,
+            "emotional_subject": self.emotional_subject,
+            "emotional_tag_version": self.emotional_tag_version,
             "importance": self.importance,
             "importance_reasons": self.importance_reasons,
             "time_of_day": self.time_of_day,
@@ -123,6 +132,9 @@ class MemoryMetadata:
             emotional_valence=data.get("emotional_valence", 0.0),
             emotional_intensity=data.get("emotional_intensity", 0.0),
             emotional_categories=data.get("emotional_categories", []),
+            emotional_confidence=data.get("emotional_confidence", 0.0),
+            emotional_subject=data.get("emotional_subject", "unknown"),
+            emotional_tag_version=data.get("emotional_tag_version", EMOTIONAL_TAG_VERSION),
             importance=data.get("importance", 0.5),
             importance_reasons=data.get("importance_reasons", []),
             time_of_day=data.get("time_of_day", ""),
