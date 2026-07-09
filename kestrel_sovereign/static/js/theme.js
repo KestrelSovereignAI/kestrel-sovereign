@@ -28,7 +28,25 @@
   let _currentLabels = {};
   let _currentFallbackKeys = [];
 
+  // #2298: delegate persistence to the shared ui_state module. theme.js is a
+  // plain (non-module) script loaded before the module graph runs, so it can't
+  // `import`; instead it reaches the same one implementation via the global
+  // KestrelUIState the module exposes (available by the time these run — at
+  // DOMContentLoaded and on user action). A guarded local try/catch remains as
+  // the fallback if the global isn't present. Key names + raw-string format are
+  // unchanged, so no stored theme/locale migrates or breaks.
+  function uiState() {
+    try {
+      if (typeof globalThis !== 'undefined' && globalThis.KestrelUIState) {
+        return globalThis.KestrelUIState;
+      }
+    } catch (_) { /* ignore */ }
+    return null;
+  }
+
   function readStoredTheme() {
+    const s = uiState();
+    if (s) return s.storeGet(STORAGE_THEME_KEY) || DEFAULT_THEME;
     try {
       return localStorage.getItem(STORAGE_THEME_KEY) || DEFAULT_THEME;
     } catch (_) {
@@ -37,6 +55,8 @@
   }
 
   function readStoredLocale() {
+    const s = uiState();
+    if (s) return s.storeGet(STORAGE_LOCALE_KEY) || DEFAULT_LOCALE;
     try {
       return localStorage.getItem(STORAGE_LOCALE_KEY) || DEFAULT_LOCALE;
     } catch (_) {
@@ -45,6 +65,8 @@
   }
 
   function writeStoredTheme(theme) {
+    const s = uiState();
+    if (s) { s.storeSet(STORAGE_THEME_KEY, theme); return; }
     try {
       localStorage.setItem(STORAGE_THEME_KEY, theme);
     } catch (_) {
@@ -53,6 +75,8 @@
   }
 
   function writeStoredLocale(locale) {
+    const s = uiState();
+    if (s) { s.storeSet(STORAGE_LOCALE_KEY, locale); return; }
     try {
       localStorage.setItem(STORAGE_LOCALE_KEY, locale);
     } catch (_) {

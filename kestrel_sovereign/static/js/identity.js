@@ -34,6 +34,10 @@ import { loadFeatureUIContributions } from './ui-ext/feature-loader.js';
 // path reused by the embeddable mountPanels host so there is a single activation
 // path (`Panels.activate`) for standalone and embed.
 import { registerCorePanels, makePanelActivator, attachDelegatedNav } from './ui-ext/mount-panels.js';
+// #2298: shared best-effort UI view-state persistence. The selected-agent
+// restore (below) and the privacy-mode cloud-model stash delegate here instead
+// of hand-rolling localStorage.
+import { uiStateGet, uiStateSet, storeGet, storeSet, storeRemove, UI_STATE_PREFIX } from './ui_state.mjs';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -41,6 +45,32 @@ import { registerCorePanels, makePanelActivator, attachDelegatedNav } from './ui
 
 // Local reference to current agent ID (for use in loadIdentity title update)
 let currentAgentId = null;
+
+// #2298: persist the multi-agent selection across a hard refresh. The value is
+// a validated soft preference — restored only when the agent still exists and
+// is online in the freshly-fetched /api/agents list (see handleAgentsLoaded);
+// a stale value never hard-fails, it just falls back to first-online.
+const SELECTED_AGENT_KEY = `${UI_STATE_PREFIX}selected-agent`;
+
+// #2298: decide which agent boot should auto-select, given the freshly-fetched
+// list. Pure so the restore contract is unit-testable in isolation. Precedence,
+// each candidate validated as still-online (a stale value never hard-fails):
+//   1. `?agent=` URL pin (embed/agent-mode) — keeps precedence over persisted;
+//   2. the persisted selection from a prior session (soft preference);
+//   3. current behavior — the first online agent.
+// Returns the chosen agent name, or null when the list has no online agent.
+export function pickInitialAgent({ items = [], urlAgent = null, persisted = null } = {}) {
+    const isOnline = (name) =>
+        !!name && items.some((i) => i.name === name && i.status !== 'offline');
+    if (urlAgent) {
+        // URL pin wins outright; the persisted value is ignored when it's set.
+        if (isOnline(urlAgent)) return urlAgent;
+    } else if (isOnline(persisted)) {
+        return persisted;
+    }
+    const firstOnline = items.find((i) => i.status !== 'offline');
+    return firstOnline ? firstOnline.name : null;
+}
 
 export function initAgentFromUrl() {
     const params = new URLSearchParams(window.location.search);
@@ -683,8 +713,8 @@ window.showPrivacySelector = function() {
                     // Save current cloud selection before switching to local
                     if (result.allows_cloud_llm === false) {
                         const current = window._sharedModelSelector.getSelection();
-                        localStorage.setItem('kestrel_saved_cloud_provider', current.provider);
-                        localStorage.setItem('kestrel_saved_cloud_model', current.model);
+                        storeSet('kestrel_saved_cloud_provider', current.provider);
+                        storeSet('kestrel_saved_cloud_model', current.model);
                     }
                     window._sharedModelSelector.setSelection(
                         result.model_switched.vendor,
@@ -693,13 +723,13 @@ window.showPrivacySelector = function() {
                     Toast.success(`Privacy: ${appliedLabel} — switched to ${result.model_switched.vendor} (local only)`);
                 } else if (result.allows_cloud_llm !== false) {
                     // Switching back to cloud-allowing mode — restore saved cloud selection
-                    const savedProvider = localStorage.getItem('kestrel_saved_cloud_provider');
-                    const savedModel = localStorage.getItem('kestrel_saved_cloud_model');
+                    const savedProvider = storeGet('kestrel_saved_cloud_provider');
+                    const savedModel = storeGet('kestrel_saved_cloud_model');
                     if (savedProvider && savedModel && window._sharedModelSelector) {
                         window._sharedModelSelector.setSelection(savedProvider, savedModel);
                         Toast.success(`Privacy: ${appliedLabel} — restored ${savedProvider} model`);
-                        localStorage.removeItem('kestrel_saved_cloud_provider');
-                        localStorage.removeItem('kestrel_saved_cloud_model');
+                        storeRemove('kestrel_saved_cloud_provider');
+                        storeRemove('kestrel_saved_cloud_model');
                     } else {
                         Toast.success(`Privacy mode set to ${appliedLabel}`);
                     }
@@ -864,15 +894,23 @@ function handleAgentsLoaded(items) {
     // click still routes to whichever agent auto-select would have picked.
     const hasLiveAgent = serverDemoMode && rawAgents.some((a) => a.is_demo !== true);
 
-    // Auto-select first online agent only in multi_agent mode (not standalone)
-    // and never when the demo server is in misconfig — the banner explicitly
-    // tells the operator the auto-select is disabled. Driven through the
-    // component's selection path (setHostAgent → onSelect → window.selectAgent).
-    if (!selectedAgentName && !isStandalone && !hasLiveAgent) {
-        const firstOnline = items.find((i) => i.status !== 'offline');
-        if (firstOnline && agentListHandle) {
-            agentListHandle.select(firstOnline.name);
-        }
+    // Auto-select an agent only in multi_agent mode (not standalone) and never
+    // when the demo server is in misconfig — the banner explicitly tells the
+    // operator the auto-select is disabled. Driven through the component's
+    // selection path (setHostAgent → onSelect → window.selectAgent).
+    //
+    // #2298: selection precedence, each candidate validated as still-online in
+    // the freshly-fetched list (a stale value never hard-fails):
+    //   1. the `?agent=` URL pin (embed/agent-mode) — keeps precedence;
+    //   2. the persisted selection from a prior session (soft preference);
+    //   3. current behavior — the first online agent.
+    if (!selectedAgentName && !isStandalone && !hasLiveAgent && agentListHandle) {
+        const target = pickInitialAgent({
+            items,
+            urlAgent: currentAgentId,
+            persisted: uiStateGet(SELECTED_AGENT_KEY, null),
+        });
+        if (target) agentListHandle.select(target);
     }
 
     // Standalone mode: mount + target the conversations pane so its list
@@ -946,6 +984,11 @@ export async function loadAgents() {
 window.selectAgent = async function(agentName) {
     const previousAgentName = selectedAgentName;
     selectedAgentName = agentName;
+
+    // #2298: persist the selection so a hard refresh restores it (validated
+    // against the live agent list on the next loadAgents). Best-effort — a
+    // disabled localStorage is a silent no-op.
+    uiStateSet(SELECTED_AGENT_KEY, agentName);
 
     // Set host agent routing in API layer
     API.setHostAgent(agentName);

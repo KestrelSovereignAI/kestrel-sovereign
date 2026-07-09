@@ -26,6 +26,7 @@
 import API from './api.js';
 import { escapeHtml as sharedEscapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
+import { storeGet, storeSet } from './ui_state.mjs';
 
 // ============================================================================
 // Default adapter — the standalone console's `/api/agents` data source
@@ -373,26 +374,10 @@ export function mountAgentList(containerEl, config = {}) {
 // mountAgentListPane — the full collapsible pane unit (design #2166 §4)
 // ============================================================================
 
-// Best-effort localStorage: the console runs it, but embed hosts and jsdom
-// tests may not expose one. Every read/write is guarded so persistence
-// degrades to in-memory-less no-ops rather than throwing (mirrors the
-// conversations pane's `paneStorage()`).
-function paneStorage() {
-    try {
-        if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
-    } catch (_) { /* access can throw under strict sandboxing */ }
-    return null;
-}
-function storeGet(key) {
-    const s = paneStorage();
-    if (!s) return null;
-    try { return s.getItem(key); } catch (_) { return null; }
-}
-function storeSet(key, value) {
-    const s = paneStorage();
-    if (!s) return;
-    try { s.setItem(key, value); } catch (_) { /* quota / disabled — ignore */ }
-}
+// Best-effort localStorage persistence now lives in the shared ui_state.mjs
+// module (#2298) — `storeGet`/`storeSet` are imported above. The raw-string
+// contract is unchanged, so the pane's collapse/width on-disk format is
+// byte-for-byte identical (no stored state migrates or breaks).
 
 /**
  * Mount the full collapsible agent/companion PANE — the embeddable list surface
