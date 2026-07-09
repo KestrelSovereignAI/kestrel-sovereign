@@ -45,6 +45,7 @@ from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
+    extract_raw_user_content,
     check_prompt_injection,
     append_security_addendum,
 )
@@ -3611,6 +3612,10 @@ Expected Duration: {expected_duration}
 
         # ── Phase 1: Inline emotional tagging (CPU-bound, safe) ─────────
         # Look up the two most recent messages (user + assistant just stored)
+        conv_store = None
+        user_msg = None
+        assistant_msg = None
+        tag_results = {"user": None, "assistant": None}
         try:
             conv_store = getattr(self._raw_storage, 'conversation', None)
             if not conv_store:
@@ -3620,20 +3625,37 @@ Expected Duration: {expected_duration}
             if len(recent) < 2:
                 return
 
-            # Find OUR user+assistant pair by content match (avoids race
-            # with concurrent requests that might insert between us)
-            user_msg = None
-            assistant_msg = None
+            canonical_session_id = None
+            if session_id:
+                canonical_session_id = await conv_store.resolve_session_id(
+                    session_id
+                )
+
+            # Find OUR user+assistant pair by canonical content. User turns are
+            # persisted in sent form, so compare their raw projection rather
+            # than the transport wrapper. Scope to the active session when one
+            # is available so identical text in another conversation cannot be
+            # selected.
             for msg in reversed(recent):
+                msg_meta = msg.get('metadata') or {}
+                if (
+                    canonical_session_id
+                    and str(msg_meta.get('session_id')) != str(canonical_session_id)
+                ):
+                    continue
                 if not assistant_msg and msg.get('role') == 'assistant' and msg.get('content') == response_text:
                     assistant_msg = msg
-                elif not user_msg and msg.get('role') == 'user' and msg.get('content') == user_input:
+                elif (
+                    not user_msg
+                    and msg.get('role') == 'user'
+                    and extract_raw_user_content(msg.get('content') or '') == user_input
+                ):
                     user_msg = msg
                 if user_msg and assistant_msg:
                     break
 
             if user_msg and assistant_msg:
-                await self.context_manager.memory_manager.tag_exchange(
+                tag_results = await self.context_manager.memory_manager.tag_exchange(
                     user_content=user_input,
                     assistant_content=response_text,
                     user_message_id=user_msg.get('id'),
@@ -3645,7 +3667,13 @@ Expected Duration: {expected_duration}
 
         # ── Phase 2: Background temporal + associative processing ───────
         # Snapshot IDs before spawning background work to avoid races
-        snapshot_user_msg_id = str(user_msg.get('id', '')) if user_msg else ""
+        snapshot_user_msg_id = user_msg.get('id') if user_msg else None
+        snapshot_user_metadata = dict((tag_results or {}).get("user") or {})
+
+        # Phase 1 can fail before a conversation store is acquired. Do not
+        # enqueue background work that is guaranteed to dereference None.
+        if conv_store is None:
+            return
 
         async def _background_memory_processing():
             try:
@@ -3665,16 +3693,22 @@ Expected Duration: {expected_duration}
                     except Exception as e:
                         logging.error(f"Post-response temporal analysis failed: {e}", exc_info=True)
 
-                # Associative linking (concept graph writes)
-                if self.memory_system.linker:
+                # Associative linking + schema routing share one canonical
+                # stored-message path and the real conversation row ID.
+                if snapshot_user_msg_id:
                     try:
-                        await self.memory_system.linker.extract_and_link(
+                        derived = await self.memory_system.link_and_route_message(
                             message_id=snapshot_user_msg_id,
                             content=user_input,
-                            agent_id=self.agent_id,
+                            role="user",
+                            metadata=snapshot_user_metadata,
                         )
+                        if derived:
+                            await conv_store.update_message_metadata(
+                                snapshot_user_msg_id, derived
+                            )
                     except Exception as e:
-                        logging.error(f"Post-response associative linking failed: {e}", exc_info=True)
+                        logging.error(f"Post-response memory graph processing failed: {e}", exc_info=True)
 
             except Exception as e:
                 logging.error(f"Post-response Phase 2 (background) failed: {e}", exc_info=True)

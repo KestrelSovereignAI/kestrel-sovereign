@@ -307,7 +307,8 @@ await memory.initialize()
 enriched_metadata = await memory.process_message(
     content="I just talked to mom about moving to Brooklyn",
     role="user",
-    metadata=existing_metadata
+    metadata=existing_metadata,
+    message_id=persisted_message_id,
 )
 
 # Retrieve with human-like weighting
@@ -512,12 +513,12 @@ class KestrelAgent:
         """Add conversation with emotional tagging."""
         meta = dict(metadata) if metadata else {}
 
-        # Enrich user messages with emotional/importance analysis
-        if role == "user":
-            enriched = await self.memory.process_message(content, role, meta)
-            meta.update(enriched)
-
         await self.storage.conversation.add_conversation(role, content, meta)
+
+        # The framework's post-response pipeline performs emotional tagging,
+        # graph linking, and schema routing after it resolves the persisted
+        # conversation row ID. Custom integrations must likewise pass that
+        # real row ID to MemorySystem.process_message; do not mint a second ID.
 
     async def get_context(self, query: str) -> List[Dict]:
         """Get relevant context using human-like retrieval."""
