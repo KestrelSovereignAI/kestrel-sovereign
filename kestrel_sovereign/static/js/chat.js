@@ -311,6 +311,100 @@ function noticePartRenderer(data) {
     return `<div class="part-notice part-notice-${level}">${titleHtml}${bodyHtml}</div>`;
 }
 
+// #1894: neutralize a free-form, (transitively) agent/user-influenceable todo
+// string before it is escaped and painted. Mirrors the pre-turn ``_inert``
+// treatment (agent/preturn_state.py): collapse whitespace, drop non-printable /
+// control chars (incl. the 0x1e stream-sentinel byte, so a title can never
+// smuggle wire framing back into the DOM), and collapse any run of 2+ dashes to
+// one so a value like ``--- END ---`` can't fake an operational-block boundary.
+// Length-capped. ``deps().escapeHtml`` still HTML-escapes on top of this.
+function _inertTodoText(text, maxLen = 200) {
+    let s = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+    // Drop C0/C1 control chars and DEL (incl. \x1e); keep printable text.
+    s = s.replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
+    s = s.replace(/-{2,}/g, '-');
+    return s.slice(0, maxLen);
+}
+
+// #1894: render a todo mutation (delta) as its own first-class component
+// bubble. The part carries the shaped item
+// ``{id,title,status,scope,priority,terminal_condition,links[],updated_at}``
+// emitted by ``TodoFeature._emit_todo_part``. The console owns sanitization:
+// free-form fields (title / terminal_condition / link titles) run through
+// ``_inertTodoText`` then ``escapeHtml``; status/scope/priority come from
+// controlled vocabularies but are still class-guarded before use in a
+// classname. Delta semantics — each mutation renders one card in stream order;
+// a cross-session rollup panel is a separate surface (a follow-up).
+const _TODO_STATUSES = ['open', 'in_progress', 'waiting', 'done', 'blocked', 'cancelled'];
+const _TODO_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+// Only these link URL schemes are safe to hyperlink; anything else (javascript:,
+// data:, …) renders as inert text so a crafted link can't inject a live URI.
+function _safeTodoUrl(url) {
+    const u = String(url == null ? '' : url).trim();
+    if (!u) return '';
+    if (/^https?:\/\//i.test(u) || u.startsWith('/')) return u;
+    return '';
+}
+function todoPartRenderer(data) {
+    const esc = deps().escapeHtml;
+    const d = (data && typeof data === 'object') ? data : {};
+
+    const status = _TODO_STATUSES.includes(d.status) ? d.status : 'open';
+    const priority = _TODO_PRIORITIES.includes(d.priority) ? d.priority : '';
+    const scope = typeof d.scope === 'string' && /^[a-z_]{1,32}$/.test(d.scope) ? d.scope : '';
+    const title = _inertTodoText(d.title || d.id || 'todo', 160);
+    const terminal = _inertTodoText(d.terminal_condition, 200);
+
+    const statusLabel = status.replace(/_/g, ' ');
+    const chipHtml =
+        `<span class="todo-status-chip todo-status-${status}">${esc(statusLabel)}</span>`;
+    const metaBits = [];
+    if (scope) metaBits.push(`<span class="todo-scope">${esc(scope)}</span>`);
+    if (priority) {
+        metaBits.push(
+            `<span class="todo-priority todo-priority-${priority}">${esc(priority)}</span>`,
+        );
+    }
+    const metaHtml = metaBits.length
+        ? `<div class="todo-meta">${metaBits.join('')}</div>`
+        : '';
+    const titleHtml = `<div class="todo-title">${esc(title)}</div>`;
+    const terminalHtml = terminal
+        ? `<div class="todo-terminal">done when: ${esc(terminal)}</div>`
+        : '';
+
+    let linksHtml = '';
+    const links = Array.isArray(d.links) ? d.links : [];
+    const linkChips = [];
+    for (const link of links) {
+        if (!link || typeof link !== 'object') continue;
+        const type = _inertTodoText(link.type, 32);
+        const target = _inertTodoText(link.target, 80);
+        const label = _inertTodoText(link.title, 80);
+        const text = label || (type && target ? `${type}: ${target}` : (type || target));
+        if (!text) continue;
+        const href = _safeTodoUrl(link.url);
+        if (href) {
+            linkChips.push(
+                `<a class="todo-link" href="${esc(href)}" target="_blank" ` +
+                `rel="noopener noreferrer">${esc(text)}</a>`,
+            );
+        } else {
+            linkChips.push(`<span class="todo-link">${esc(text)}</span>`);
+        }
+    }
+    if (linkChips.length) {
+        linksHtml = `<div class="todo-links">${linkChips.join('')}</div>`;
+    }
+
+    return (
+        `<div class="part-todo todo-status-${status}">` +
+        `<div class="todo-header">${chipHtml}${titleHtml}</div>` +
+        `${metaHtml}${terminalHtml}${linksHtml}` +
+        `</div>`
+    );
+}
+
 // #2081: a persisted, reference-based channel pairing card. The part carries
 // only ``{channel_type}`` (NOT the QR bytes), so it rides the turn that asked
 // for the link and persists in that conversation — surviving a hard refresh
@@ -521,6 +615,7 @@ function channelLinkPartRenderer(data, context) {
 export function registerCoreParts() {
     registerPartRenderer('notice', noticePartRenderer);
     registerPartRenderer('channel_link', channelLinkPartRenderer);
+    registerPartRenderer('todo', todoPartRenderer);
 }
 
 // ============================================================================

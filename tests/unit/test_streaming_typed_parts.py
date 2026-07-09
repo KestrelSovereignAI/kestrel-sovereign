@@ -397,5 +397,43 @@ async def test_post_response_hook_emitted_part_is_persisted():
     ]
 
 
+@pytest.mark.asyncio
+async def test_bang_command_emitted_part_reaches_stream():
+    """#1894: a ``!todo`` command delegates to the non-streaming handler, which
+    runs OUTSIDE the normal per-turn collector. The streaming layer must bind a
+    collector around the delegation so a todo tool's ``emit_part`` still surfaces
+    as a live PART sentinel; otherwise ``!todo add`` mutates the graph but the
+    typed bubble silently vanishes (``emit_part`` no-ops with no collector)."""
+    from kestrel_sovereign.agent.parts import current_part_collector, emit_part
+
+    add_convo_calls = []
+    agent = _make_agent(add_convo_calls)
+
+    async def fake_process_input(user_input, *args, **kwargs):
+        # Simulate the command handler running the todo_add tool, which emits a
+        # typed part. It only lands if the streaming layer bound a collector.
+        assert current_part_collector() is not None, "command path bound no collector"
+        emit_part("todo", {"title": "ship #1894", "status": "open"}, part_id="t9")
+        return "Added todo: ship #1894"
+
+    agent.process_input = fake_process_input
+    _bind(agent)
+
+    yielded = []
+    async for chunk in agent.process_input_streaming("!todo add ship #1894", session_id="s8"):
+        yielded.append(chunk)
+
+    # The command's text result and the emitted todo part both reach the client,
+    # with the PART sentinel following the command result.
+    assert any("Added todo: ship #1894" in c for c in yielded)
+    part_chunks = [c for c in yielded if "\x1eKESTREL:PART:" in c]
+    assert len(part_chunks) == 1
+    payload = part_chunks[0].split("\x1eKESTREL:PART:", 1)[1].rstrip("\x1e")
+    part = json.loads(payload)
+    assert part["type"] == "todo"
+    assert part["data"] == {"title": "ship #1894", "status": "open"}
+    assert part["id"] == "t9"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

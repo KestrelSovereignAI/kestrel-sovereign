@@ -1643,6 +1643,86 @@ nav {
     word-break: break-word;
 }
 
+/* #1894: a todo mutation (delta) rendered as its own component bubble —
+   status chip + title + terminal condition + external links. Accent reflects
+   the todo status. */
+.part-todo {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.5rem 0.65rem;
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    border-left: 3px solid var(--accent-color);
+}
+.part-todo.todo-status-in_progress { border-left-color: #3b82f6; }
+.part-todo.todo-status-waiting { border-left-color: #f59e0b; }
+.part-todo.todo-status-blocked { border-left-color: #ef4444; }
+.part-todo.todo-status-done { border-left-color: #22c55e; }
+.part-todo.todo-status-cancelled { border-left-color: #6b7280; }
+.todo-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+.todo-status-chip {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    white-space: nowrap;
+}
+.todo-status-chip.todo-status-in_progress { color: #3b82f6; }
+.todo-status-chip.todo-status-waiting { color: #f59e0b; }
+.todo-status-chip.todo-status-blocked { color: #ef4444; }
+.todo-status-chip.todo-status-done { color: #22c55e; }
+.todo-status-chip.todo-status-cancelled { color: #6b7280; }
+.todo-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+    word-break: break-word;
+}
+.todo-meta {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    font-size: 0.72rem;
+    opacity: 0.85;
+}
+.todo-scope,
+.todo-priority {
+    padding: 0.05rem 0.35rem;
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+}
+.todo-priority-high { color: #f59e0b; }
+.todo-priority-urgent { color: #ef4444; }
+.todo-terminal {
+    font-size: 0.78rem;
+    opacity: 0.9;
+    word-break: break-word;
+}
+.todo-links {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+.todo-link {
+    font-size: 0.72rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    text-decoration: none;
+}
+a.todo-link:hover { text-decoration: underline; }
+
 .tool-activity-expandable {
     display: block;
 }
