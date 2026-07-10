@@ -8,7 +8,7 @@ Provides in-memory caching and disk-based cache for fast startup.
 import asyncio
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Set, Tuple, TYPE_CHECKING
 
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service, ModelCatalogService
@@ -382,8 +382,19 @@ class ModelDiscoveryMixin:
                 vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
                 route_name = provider.get("name") or vendor
                 caps = provider.get("capabilities") or {}
-                pinned_model = provider.get("embedding_model") or caps.get("embedding_model")
-                pinned_dim = provider.get("embedding_dim") or caps.get("embedding_dim")
+                # A GENUINE operator pin is either config (``provider["embedding_model"]``
+                # / a route-level TOML capability) or a runtime override — both land
+                # in ``capabilities`` WITHOUT the auto-resolved marker. A default
+                # that ``resolve_route_embedding_model`` / ``reconcile_embedding_capabilities``
+                # wrote back into ``capabilities`` is NOT a pin (#2372): treating it
+                # as one after a cache invalidation would freeze the route on a stale
+                # model/dim and block the corpus/deployment fallback the resolver
+                # order promises.
+                auto_resolved = bool(caps.get("embedding_model_auto_resolved"))
+                caps_model = None if auto_resolved else caps.get("embedding_model")
+                caps_dim = None if auto_resolved else caps.get("embedding_dim")
+                pinned_model = provider.get("embedding_model") or caps_model
+                pinned_dim = provider.get("embedding_dim") or caps_dim
                 if not pinned_model:
                     continue
                 match = next(
@@ -707,10 +718,10 @@ class ModelDiscoveryMixin:
             if m.route:
                 by_route.setdefault(m.route, []).append(m)
 
-        # #2366 — bias auto-resolution toward the corpus the DB already holds so
-        # a fresh default doesn't silently move the agent into a new embedding
-        # space. Both signals are best-effort: a missing/unreadable corpus or
-        # dim just falls through to the prior hint/catalog behaviour.
+        # #2372 — the corpus/deployment continuity signals are route-independent,
+        # so resolve them ONCE for the whole sweep rather than once per route.
+        # The per-provider fan-out (one corpus DB lookup per route) regressed
+        # lifespan startup past the 5s test-fixture timeout.
         corpus_profile = await self._get_corpus_embedding_profile()
         deployment_dim = _resolve_deployment_embedding_dim()
 
@@ -721,29 +732,27 @@ class ModelDiscoveryMixin:
             # false-advertisement failure this per-route path prevents.
             if not route_name or route_name not in by_route:
                 continue
-            caps = provider.get("capabilities")
-            if not isinstance(caps, dict):
-                caps = {}
-                provider["capabilities"] = caps
-            caps["supports_embeddings"] = True
-            default = await self.resolve_default_embedding_model(
-                provider,
-                corpus_profile=corpus_profile,
-                deployment_dim=deployment_dim,
-            )
-            if default is not None:
-                if not caps.get("embedding_model"):
-                    caps["embedding_model"] = default.id
-                    logger.info(
-                        "Auto-resolved embedding model for %s: %s",
-                        route_name,
-                        default.id,
-                    )
-                    self._note_embedding_space_change(
-                        route_name, default, corpus_profile
-                    )
-                if not caps.get("embedding_dim") and default.native_dim:
-                    caps["embedding_dim"] = default.native_dim
+            # #2372 — funnel every discovering route through the SINGLE resolver
+            # so capability writes match the settings GET / route-model echo /
+            # reindex target exactly. It honours #2366's order (pin → corpus →
+            # deployment-dim → hints), computes the dim with corpus/deployment
+            # continuity (not just ``native_dim``), persists
+            # ``supports_embeddings``/``embedding_model``/``embedding_dim``, marks
+            # auto-resolved writes so they are never later mistaken for an
+            # operator pin, and records any space-change warning. A config/static
+            # pin is honoured verbatim (never downgraded).
+            try:
+                await self.resolve_route_embedding_model(
+                    provider,
+                    corpus_profile=corpus_profile,
+                    deployment_dim=deployment_dim,
+                )
+            except Exception as exc:  # pragma: no cover - never break init
+                logger.debug(
+                    "embedding capability resolve skipped for %s: %s",
+                    route_name,
+                    exc,
+                )
 
     def _note_embedding_space_change(
         self,
@@ -818,6 +827,116 @@ class ModelDiscoveryMixin:
         except Exception as exc:  # pragma: no cover - never break reconcile
             logger.debug("corpus embedding profile lookup failed: %s", exc)
             return None
+
+    async def resolve_route_embedding_model(
+        self,
+        provider: dict,
+        *,
+        corpus_profile: Optional[Dict[str, Any]] = None,
+        deployment_dim: Optional[int] = None,
+    ) -> Tuple[Optional[str], Optional[int]]:
+        """SINGLE source of truth for a route's ``(embedding_model, dim)`` (#2372).
+
+        Route → model → dim, honoring #2366's documented order (explicit pin →
+        corpus-dominant match by normalized id → deployment-dim match →
+        ``selection_hints`` → first discovered) and PERSISTING the resolution
+        into ``provider["capabilities"]`` so every reader agrees. The settings
+        GET, the route-model echo, and the reindex target resolver all funnel
+        through this instead of each re-deriving a model a different way — the
+        #2372 incoherence was exactly that divergence (a cleared pin surfaced as
+        ``None`` on the GET, as another route's slug on the echo, and as a third
+        stale profile on reindex).
+
+        Precedence:
+
+        - An explicit operator pin (runtime override or config) surfaces as the
+          ``is_pinned`` discovered candidate and is honoured verbatim, keeping
+          the pin's own dimension.
+        - A non-pinned route is (re)resolved on every call, so a stale
+          capability left behind by a prior route/pin state is corrected rather
+          than served.
+
+        Returns ``(None, None)`` only when discovery finds NO embedding model
+        for the route (a truthful "off") — never a silent ``None`` while capable
+        models are discovered. Writes ``supports_embeddings`` /
+        ``embedding_model`` / ``embedding_dim`` into the route's capabilities as
+        a side effect so the sync readers (``get_embedding_settings``,
+        ``ProviderEmbeddingService.describe``) observe the same answer.
+        """
+        if not isinstance(provider, dict):
+            return None, None
+        caps = provider.get("capabilities")
+        if not isinstance(caps, dict):
+            caps = {}
+            provider["capabilities"] = caps
+
+        # The corpus/deployment continuity signals are route-independent — a
+        # bulk caller (``reconcile_embedding_capabilities``) computes them ONCE
+        # and passes them in so startup doesn't issue one corpus DB lookup per
+        # route (#2372: that per-provider fan-out pushed lifespan startup over
+        # the 5s test timeout). Single-route callers omit them and we fetch.
+        if corpus_profile is None:
+            corpus_profile = await self._get_corpus_embedding_profile()
+        if deployment_dim is None:
+            deployment_dim = _resolve_deployment_embedding_dim()
+        chosen = await self.resolve_default_embedding_model(
+            provider,
+            corpus_profile=corpus_profile,
+            deployment_dim=deployment_dim,
+        )
+        if chosen is None:
+            # Nothing discovered for this route — never fabricate a model. Report
+            # whatever a static config pin already established (may be None).
+            return caps.get("embedding_model"), caps.get("embedding_dim")
+
+        dim = self._resolve_route_embedding_dim(
+            caps, chosen, corpus_profile, deployment_dim
+        )
+        caps["supports_embeddings"] = True
+        caps["embedding_model"] = chosen.id
+        if dim is not None:
+            caps["embedding_dim"] = int(dim)
+        if chosen.is_pinned:
+            # Operator intent — not an auto default. Drop any stale auto marker so
+            # the pin is honoured verbatim on subsequent discovery.
+            caps.pop("embedding_model_auto_resolved", None)
+        else:
+            # Mark the write as auto-resolved so a later discovery (e.g. after the
+            # reindex path clears the cache) does NOT mistake it for an operator
+            # pin (#2372) — it must stay re-resolvable through the corpus/deployment
+            # fallback order.
+            caps["embedding_model_auto_resolved"] = True
+            # A non-pin default that moves off the corpus space is a real recall
+            # split — record it loudly (the settings GET surfaces the banner).
+            self._note_embedding_space_change(
+                provider.get("name"), chosen, corpus_profile
+            )
+        return caps.get("embedding_model"), caps.get("embedding_dim")
+
+    @staticmethod
+    def _resolve_route_embedding_dim(
+        caps: Dict[str, Any],
+        chosen: "EmbeddingModelInfo",
+        corpus_profile: Optional[Dict[str, Any]],
+        deployment_dim: Optional[int],
+    ) -> Optional[int]:
+        """Pick the embedding dim to persist for a resolved model (#2372).
+
+        An explicit pin's own dim is authoritative — it was written into
+        ``capabilities`` at pin time, so keep it. Otherwise prefer a dim that
+        keeps the vector columns aligned and preserves the corpus space — the
+        deployment dim, then the corpus's dominant dim — when the model can
+        actually serve it (native size or a Matryoshka truncation option),
+        falling back to the model's native dim.
+        """
+        if chosen.is_pinned:
+            if caps.get("embedding_dim") is not None:
+                return caps.get("embedding_dim")
+            return chosen.native_dim
+        for candidate in (deployment_dim, (corpus_profile or {}).get("dim")):
+            if candidate and _model_offers_dim(chosen, int(candidate)):
+                return int(candidate)
+        return chosen.native_dim
 
     def clear_embedding_discovery_cache(self) -> None:
         """Drop the per-instance embedding-discovery cache to force rediscovery."""

@@ -8,6 +8,7 @@ Covers the embeddings-popover per-route model picker's backend contract:
   - persistence of the override map (mirrors the embedding_route knob store).
 """
 import asyncio
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 import pytest
@@ -221,6 +222,172 @@ async def test_clear_skips_probe(monkeypatch):
     monkeypatch.setattr(embedding_service_mod, "ProviderEmbeddingService", _boom)
     await service.aset_route_embedding_model("openrouter:api", None)
     assert service.get_route_embedding_model_overrides() == {}
+
+
+# --- #2372 echo does not cross routes ----------------------------------------
+
+
+async def test_route_model_echo_returns_pinned_routes_own_slug():
+    """The per-route echo must reflect the PINNED route's own model, not whatever
+    the globally-resolved embedding provider (embedding_route/chat) picks (#2372).
+
+    Global resolution here lands on the Ollama route (its own slug
+    ``qwen3-embedding:8b``); the echo for the just-pinned ``openrouter:api`` must
+    still come back with that route's own ``qwen/qwen3-embedding-8b``.
+    """
+    ollama = _route(
+        "ollama:local",
+        "ollama",
+        is_local=True,
+        capabilities={
+            "supports_embeddings": True,
+            "embedding_model": "qwen3-embedding:8b",
+            "embedding_dim": 768,
+        },
+    )
+    openrouter = _route(
+        "openrouter:api",
+        "openrouter",
+        capabilities={
+            "supports_embeddings": True,
+            "embedding_model": "qwen/qwen3-embedding-8b",
+            "embedding_dim": 768,
+        },
+    )
+    # An adapter that discovers the pinned openrouter model so the resolver folds
+    # the capability pin in as ``is_pinned`` and returns it.
+    from unittest.mock import AsyncMock
+    from kestrel_sovereign.llm.embedding_discovery import EmbeddingModelInfo
+
+    openrouter["adapter"] = SimpleNamespace(
+        list_embedding_models=AsyncMock(return_value=[
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=768),
+        ])
+    )
+    ollama["adapter"] = SimpleNamespace(
+        list_embedding_models=AsyncMock(return_value=[
+            EmbeddingModelInfo(id="qwen3-embedding:8b", provider="ollama",
+                               native_dim=768),
+        ])
+    )
+
+    service = _service([ollama, openrouter])
+    service._embedding_route = "ollama:local"
+    service._embedding_space_pins = None
+    service._verified_space_pins = {}
+    service._embedding_space_change_warnings = {}
+    service._embedding_discovery_cache = None
+    # Global embedding resolution crosses to the Ollama route.
+    service.resolve_embedding_provider = lambda: ollama
+
+    # Sanity: the base (global) settings echo Ollama's slug — the cross-route bug.
+    base = service.get_embedding_settings()
+    assert base["embedding_model"] == "qwen3-embedding:8b"
+
+    # The route-scoped echo returns the pinned route's OWN slug.
+    echo = await service.aget_embedding_settings_for_route("openrouter:api")
+    assert echo["resolved_route"] == "openrouter:api"
+    assert echo["embedding_model"] == "qwen/qwen3-embedding-8b"
+    assert echo["embedding_dim"] == 768
+
+
+async def test_route_model_echo_does_not_carry_global_route_fields():
+    """P2 (#2372): the per-route echo must NOT inherit the global route's
+    ``shared_space`` / ``space_change_warning``. Those are route-dependent; a
+    response resolving ``openrouter:api`` may not describe ``ollama:local``.
+    """
+    ollama = _route(
+        "ollama:local",
+        "ollama",
+        is_local=True,
+        capabilities={
+            "supports_embeddings": True,
+            "embedding_model": "qwen3-embedding:8b",
+            "embedding_dim": 768,
+        },
+    )
+    openrouter = _route(
+        "openrouter:api",
+        "openrouter",
+        capabilities={
+            "supports_embeddings": True,
+            "embedding_model": "qwen/qwen3-embedding-8b",
+            "embedding_dim": 768,
+        },
+    )
+    from unittest.mock import AsyncMock
+    from kestrel_sovereign.llm.embedding_discovery import EmbeddingModelInfo
+
+    for route_dict, slug in ((openrouter, "qwen/qwen3-embedding-8b"),
+                             (ollama, "qwen3-embedding:8b")):
+        route_dict["adapter"] = SimpleNamespace(
+            list_embedding_models=AsyncMock(return_value=[
+                EmbeddingModelInfo(id=slug, provider=route_dict["vendor"],
+                                   native_dim=768),
+            ])
+        )
+
+    service = _service([ollama, openrouter])
+    service._embedding_route = "ollama:local"
+    service._embedding_space_pins = None
+    service._verified_space_pins = {}
+    # The GLOBAL (ollama) route carries a space-change warning; the openrouter
+    # echo must report None for its own (unaffected) route.
+    service._embedding_space_change_warnings = {
+        "ollama:local": {"route": "ollama:local", "chosen_model": "x"}
+    }
+    service._embedding_discovery_cache = None
+    service.resolve_embedding_provider = lambda: ollama
+
+    # The base (global) echo carries the ollama warning — the cross-route leak.
+    base = service.get_embedding_settings()
+    assert base["space_change_warning"] is not None
+
+    echo = await service.aget_embedding_settings_for_route("openrouter:api")
+    assert echo["resolved_route"] == "openrouter:api"
+    # No global-route fields leaked into this route's echo.
+    assert echo["space_change_warning"] is None
+    assert echo["shared_space"] is None
+
+
+def test_get_embedding_service_for_route_is_route_scoped():
+    """P2 (#2372): a per-route embedding service is built for the NAMED route,
+    not the globally-active one, so stale-row counts don't cross routes."""
+    import kestrel_sovereign.llm.embedding_service as es_mod
+
+    ollama = _route(
+        "ollama:local", "ollama", is_local=True,
+        capabilities={"supports_embeddings": True,
+                      "embedding_model": "qwen3-embedding:8b", "embedding_dim": 768},
+    )
+    openrouter = _route(
+        "openrouter:api", "openrouter",
+        capabilities={"supports_embeddings": True,
+                      "embedding_model": "qwen/qwen3-embedding-8b", "embedding_dim": 768},
+    )
+    service = _service([ollama, openrouter])
+    service._embedding_space_pins = None
+    service._verified_space_pins = {}
+    service.resolve_embedding_provider = lambda: ollama
+
+    built = {}
+
+    class _FakeES:
+        def __init__(self, provider, **kw):
+            built["provider"] = provider
+
+    service_es = getattr(es_mod, "ProviderEmbeddingService")
+    es_mod.ProviderEmbeddingService = _FakeES
+    try:
+        svc = service.get_embedding_service_for_route("openrouter:api")
+    finally:
+        es_mod.ProviderEmbeddingService = service_es
+
+    assert svc is not None
+    assert built["provider"]["name"] == "openrouter:api"
+    # Unknown route → None (no fabricated service).
+    assert service.get_embedding_service_for_route("nope:missing") is None
 
 
 # --- persistence (same store as the embedding_route knob) --------------------
