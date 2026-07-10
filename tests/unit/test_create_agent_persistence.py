@@ -96,3 +96,47 @@ async def test_port_allocator_seeds_past_configured_ports(tmp_path):
     })
     await manager.load_from_config(config)   # loads nothing (autostart=False) but must seed
     assert manager._port_seq >= 8801, "allocator seeded past every configured port"
+
+
+@pytest.mark.asyncio
+async def test_port_allocator_accounts_for_the_host_port(tmp_path):
+    """codex P1 round 5: the HOST's own port must be reserved too — an agent
+    persisted onto it fails port-conflict validation on the next boot."""
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.multi_agent.config import HostConfig
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    config = MultiAgentConfig(
+        host=HostConfig(port=9001),
+        agents={
+            "Kestrel": LocalAgentConfig(
+                data_dir=Path("agent_data/Kestrel"), port=8801, autostart=False,
+            ),
+        },
+    )
+    await manager.load_from_config(config)
+    assert manager._port_seq >= 9001, "allocator seeded past the host port"
+
+
+def test_save_is_atomic_on_write_failure(tmp_path, monkeypatch):
+    """codex P2 round 5: a failed rewrite must never truncate the existing
+    registry — the original file survives byte-for-byte."""
+    import kestrel_sovereign.multi_agent.config as cfg_mod
+
+    config_path = tmp_path / "multi_agent.toml"
+    config = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+    })
+    config.save(config_path)
+    original = config_path.read_text()
+
+    def exploding_dump(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(cfg_mod.toml, "dump", exploding_dump)
+
+    config.agents["Newbie"] = LocalAgentConfig(data_dir=Path("agent_data/Newbie"), port=8802)
+    with pytest.raises(OSError):
+        config.save(config_path)
+    assert config_path.read_text() == original, "original registry untouched by the failed write"
+    leftovers = list(tmp_path.glob(".multi_agent.toml.*"))
+    assert leftovers == [], "no temp-file litter after failure"

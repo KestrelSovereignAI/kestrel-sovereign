@@ -159,10 +159,14 @@ class AgentManager:
         loaded = 0
         # Reset failure list — fresh load attempt.
         self._init_failures = []
-        # Seed the monotonic port allocator PAST every configured port
-        # (codex P1 on #2358): otherwise the first runtime-created agent gets
-        # a port an existing agent already owns, and once persisted the next
-        # boot fails MultiAgentConfig's port-conflict validation.
+        # Seed the monotonic port allocator PAST every configured port AND the
+        # host's own port (codex P1 rounds 4-5 on #2358): otherwise the first
+        # runtime-created agent gets a port something already owns, and once
+        # persisted the next boot fails MultiAgentConfig's port-conflict
+        # validation — bricking multi-agent startup.
+        host_port = getattr(getattr(config, "host", None), "port", None)
+        if isinstance(host_port, int) and host_port > self._port_seq:
+            self._port_seq = host_port
         for agent_cfg in config.agents.values():
             if isinstance(agent_cfg, LocalAgentConfig) and agent_cfg.port > self._port_seq:
                 self._port_seq = agent_cfg.port
@@ -281,6 +285,10 @@ class AgentManager:
             raise ValueError(f"Inception failed for '{name}': {e}")
 
         self._port_seq += 1
+        if self._port_seq > 65535:
+            # LocalAgentConfig validates le=65535 — better an explicit refusal
+            # here than persisting an out-of-range port that bricks reload.
+            raise ValueError("No free agent ports remain (allocator exhausted at 65535).")
         config = LocalAgentConfig(
             data_dir=Path("agent_data") / name,
             port=self._port_seq,  # monotonic — never reuses an unloaded agent's port

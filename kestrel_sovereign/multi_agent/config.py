@@ -357,9 +357,25 @@ class MultiAgentConfig(BaseModel):
                     "url": agent.url,
                 }
 
-        # Save to file
-        with open(path, "w", encoding="utf-8") as f:
-            toml.dump(data, f)
+        # Save ATOMICALLY (codex P2 on #2358): writing the target in place
+        # truncates it first — a failure mid-write (full disk, kill) leaves
+        # multi_agent.toml empty/partial and the whole fleet unregistered on
+        # the next boot. Write a sibling temp file and os.replace() it in.
+        import os
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                toml.dump(data, f)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
         logger.info(f"Saved multi_agent config to {path}")
 
