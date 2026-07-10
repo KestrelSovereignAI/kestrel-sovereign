@@ -54,8 +54,15 @@ class UsageTrackingMixin:
             logger.info(f"Model usage tracking configured: PostgreSQL")
         else:
             self._db_backend = "sqlite"
+            # Record the path but DON'T touch disk here. Constructing an
+            # LLMService must not eagerly create ``<KESTREL_DB_PATH>/`` — that
+            # left a junk usage DB dir behind for commands that go on to refuse,
+            # and raised a raw OSError on unwritable paths, before the caller's
+            # DB-selection guard could turn it into a clean refusal (#2362). The
+            # directory is created lazily in ``_ensure_db_initialized`` right
+            # before the connection is actually opened.
             db_path = os.environ.get("KESTREL_DB_PATH", "./agent_data")
-            os.makedirs(db_path, exist_ok=True)
+            self._usage_db_dir = db_path
             self._usage_db_path = os.path.join(db_path, "llm_usage.db")
             logger.info(f"Model usage tracking configured: SQLite at {self._usage_db_path}")
 
@@ -76,7 +83,15 @@ class UsageTrackingMixin:
                 self._usage_db = await AsyncDatabase.postgres(self._usage_database_url)
                 logger.info("Model usage database initialized: PostgreSQL")
             else:
-                # SQLite backend via abstract data layer
+                # SQLite backend via abstract data layer. Create the containing
+                # directory lazily, right before we actually open the DB, so an
+                # unwritable KESTREL_DB_PATH surfaces here (and is swallowed into
+                # the "usage tracking disabled" warning below) rather than as a
+                # path-touching side effect of merely constructing LLMService
+                # (#2362).
+                os.makedirs(getattr(self, "_usage_db_dir", None)
+                            or os.path.dirname(self._usage_db_path) or ".",
+                            exist_ok=True)
                 self._usage_db = await AsyncDatabase.sqlite(self._usage_db_path)
                 logger.info(f"Model usage database initialized: SQLite at {self._usage_db_path}")
             

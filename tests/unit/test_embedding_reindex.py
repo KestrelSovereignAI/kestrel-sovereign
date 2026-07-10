@@ -632,3 +632,84 @@ async def test_cli_service_honors_persisted_route_model_pin(db):
         provider="openrouter", model="qwen/qwen3-embedding-8b", dim=768
     ).profile_id
     assert target == expected
+
+
+# ------------------------------------- guard-before-side-effects (#2362)
+
+
+def _reindex_args():
+    import argparse
+
+    return argparse.Namespace(
+        embeddings_command="reindex",
+        table=None,
+        agent_id=None,
+        agent_name=None,
+        data_dir=None,
+        batch=10,
+        rate_limit=0.0,
+        dry_run=True,
+        yes=False,
+    )
+
+
+def test_reindex_guard_leaves_no_junk_dirs(monkeypatch, tmp_path, capsys):
+    # A writable-but-bogus KESTREL_DB_PATH + a multi-agent roster must refuse
+    # WITHOUT any path-touching side effect: no ``trusted_agents/`` dir and no
+    # ``llm_usage.db`` under the bogus path. The DB-selection guard has to fire
+    # before anything constructs against the resolved path (#2362).
+    from kestrel_sovereign import cli_embeddings
+
+    bogus = tmp_path / "bogus"
+    bogus.mkdir()
+    monkeypatch.setenv("KESTREL_DB_PATH", str(bogus))
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.setattr(
+        cli_embeddings,
+        "_discover_local_agents",
+        lambda: {"wren": str(tmp_path / "agent_data" / "wren")},
+    )
+
+    rc = cli_embeddings.run(_reindex_args())
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "KESTREL_DB_PATH is set" in err
+    # No junk written by a command that (correctly) refused to run.
+    assert not (bogus / "trusted_agents").exists()
+    assert not (bogus / "llm_usage.db").exists()
+    assert list(bogus.iterdir()) == []
+
+
+def test_reindex_guard_on_unwritable_path_refuses_cleanly(monkeypatch, tmp_path, capsys):
+    # An unwritable KESTREL_DB_PATH must exit with the clean refusal message,
+    # not a raw OSError traceback from an eager makedirs firing before the
+    # guard (#2362).
+    import os
+
+    from kestrel_sovereign import cli_embeddings
+
+    ro_parent = tmp_path / "ro"
+    ro_parent.mkdir()
+    unwritable = ro_parent / "claw"  # makedirs here would EACCES
+    os.chmod(ro_parent, 0o500)
+    monkeypatch.setenv("KESTREL_DB_PATH", str(unwritable))
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.setattr(
+        cli_embeddings,
+        "_discover_local_agents",
+        lambda: {"wren": str(tmp_path / "agent_data" / "wren")},
+    )
+
+    try:
+        rc = cli_embeddings.run(_reindex_args())
+    finally:
+        os.chmod(ro_parent, 0o700)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "KESTREL_DB_PATH is set" in err
+    assert not unwritable.exists()
