@@ -201,6 +201,90 @@ class TestTemporalAnalyzer:
         )
         assert late_night_pattern is not None
 
+    @pytest.mark.asyncio
+    async def test_save_patterns_binds_datetime_not_isostring(self):
+        """save_patterns must bind datetime objects, not ISO strings.
+
+        Regression for frinz #525: asyncpg rejects an ISO-8601 string for a
+        TIMESTAMP column ("expected a datetime.date or datetime.datetime
+        instance, got 'str'"), so the created_at/updated_at binds must be
+        real datetime instances.
+        """
+        mock_db = MagicMock()
+        mock_db.fetchone = AsyncMock(return_value=None)  # force INSERT path
+        mock_db.execute = AsyncMock(return_value=1)
+        analyzer = TemporalAnalyzer(mock_db)
+
+        pattern = TemporalPattern(
+            id="p1",
+            agent_id="agent-1",
+            pattern_type="time_preference",
+            description="active late at night",
+            trigger_conditions={"time_of_day": "late_night"},
+            confidence=0.9,
+            observations=5,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        saved = await analyzer.save_patterns([pattern])
+        assert saved == 1
+
+        params = mock_db.execute.call_args.args[1]
+        created_at, updated_at = params[-2], params[-1]
+        assert isinstance(created_at, datetime)
+        assert isinstance(updated_at, datetime)
+        assert not any(isinstance(p, str) and "T" in p and ":" in p for p in params[-2:])
+
+    @pytest.mark.asyncio
+    async def test_save_patterns_update_binds_datetime(self):
+        """The UPDATE path must also bind a datetime, not an ISO string."""
+        mock_db = MagicMock()
+        mock_db.fetchone = AsyncMock(return_value=("p1",))  # force UPDATE path
+        mock_db.execute = AsyncMock(return_value=1)
+        analyzer = TemporalAnalyzer(mock_db)
+
+        pattern = TemporalPattern(
+            id="p1",
+            agent_id="agent-1",
+            pattern_type="time_preference",
+            description="active late at night",
+            trigger_conditions={},
+            confidence=0.9,
+            observations=5,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        await analyzer.save_patterns([pattern])
+        params = mock_db.execute.call_args.args[1]
+        # UPDATE binds (..., updated_at, id); updated_at is second-to-last.
+        assert isinstance(params[-2], datetime)
+
+    @pytest.mark.asyncio
+    async def test_get_patterns_coerces_both_backends(self):
+        """get_patterns must accept datetime (asyncpg) and str (SQLite) rows."""
+        pg_row = (
+            "p1", "agent-1", "time_preference", "desc",
+            "{}", 0.9, 5,
+            datetime(2026, 7, 10, 15, 24, tzinfo=timezone.utc),  # asyncpg
+            datetime(2026, 7, 10, 15, 24, tzinfo=timezone.utc),
+        )
+        sqlite_row = (
+            "p2", "agent-1", "time_preference", "desc",
+            "{}", 0.8, 3,
+            "2026-07-10T15:24:57.421502+00:00",  # SQLite ISO string
+            "2026-07-10T15:24:57.421502+00:00",
+        )
+        mock_db = MagicMock()
+        mock_db.fetchall = AsyncMock(return_value=[pg_row, sqlite_row])
+        analyzer = TemporalAnalyzer(mock_db)
+
+        patterns = await analyzer.get_patterns("agent-1")
+        assert len(patterns) == 2
+        assert all(isinstance(p.created_at, datetime) for p in patterns)
+        assert all(isinstance(p.updated_at, datetime) for p in patterns)
+
     def test_get_time_of_day(self):
         """Should correctly classify times."""
         assert TemporalAnalyzer._get_time_of_day(

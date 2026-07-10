@@ -21,6 +21,20 @@ from .async_database import AsyncDatabase
 logger = logging.getLogger(__name__)
 
 
+def _coerce_datetime(value: Any) -> Optional[datetime]:
+    """Coerce a stored timestamp into a ``datetime`` for the DB boundary.
+
+    asyncpg requires a ``datetime`` instance for TIMESTAMP columns and
+    rejects ISO-8601 strings, while SQLite returns/accepts strings. Accept
+    either form so the temporal analyzer round-trips on both backends.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise TypeError(f"Cannot coerce {type(value).__name__} to datetime")
+
+
 class TemporalAnalyzer:
     """
     Detects patterns in when and how users communicate.
@@ -360,7 +374,7 @@ class TemporalAnalyzer:
                         json.dumps(pattern.trigger_conditions),
                         pattern.confidence,
                         pattern.observations,
-                        datetime.now(timezone.utc).isoformat(),
+                        datetime.now(timezone.utc),
                         pattern.id,
                     )
                 )
@@ -380,8 +394,8 @@ class TemporalAnalyzer:
                         json.dumps(pattern.trigger_conditions),
                         pattern.confidence,
                         pattern.observations,
-                        datetime.now(timezone.utc).isoformat(),
-                        datetime.now(timezone.utc).isoformat(),
+                        datetime.now(timezone.utc),
+                        datetime.now(timezone.utc),
                     )
                 )
             saved += 1
@@ -440,8 +454,8 @@ class TemporalAnalyzer:
                 trigger_conditions=trigger_conditions,
                 confidence=row[5],
                 observations=row[6],
-                created_at=datetime.fromisoformat(row[7]) if row[7] else None,
-                updated_at=datetime.fromisoformat(row[8]) if row[8] else None,
+                created_at=_coerce_datetime(row[7]),
+                updated_at=_coerce_datetime(row[8]),
             ))
 
         return patterns
