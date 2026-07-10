@@ -11,6 +11,7 @@ paths, so a `budget` was a no-op (later an interim rejection). These tests cover
 
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -137,14 +138,13 @@ async def test_create_refunds_parent_on_setup_failure():
 
 
 @pytest.mark.asyncio
-async def test_deposit_restores_budget_headroom():
-    """A refund into a delegated wallet (e.g. a released grandchild hold) reduces
-    the child's spent so the budget can be reused — and never below zero."""
+async def test_release_restores_parent_headroom():
+    """Releasing a budgeted grandchild restores its budgeted parent's headroom
+    (only the explicit release does this — see the deposit test below)."""
     real = FakeWallet(initial_balance=Decimal("100"))
     child_dw = DelegatedWallet(
         real, BudgetAllocation(child_did="c", amount=Decimal("50"))
     )
-    # Child spawns a grandchild with budget 20 (held through the child's ceiling).
     gc = await create_delegated_wallet(child_dw, "did:c", "did:gc", Decimal("20"))
     assert child_dw.spent == Decimal("20")
 
@@ -156,9 +156,20 @@ async def test_deposit_restores_budget_headroom():
     assert child_dw.spent == Decimal("5")
     assert child_dw.remaining == Decimal("45")
 
-    # An over-refund can't push spent below 0 (ceiling can't inflate).
-    await child_dw.deposit(Decimal("999"))
-    assert child_dw.spent == Decimal("0")
+
+@pytest.mark.asyncio
+async def test_normal_deposit_does_not_restore_headroom():
+    """A plain external top-up must NOT restore budget headroom, or a child could
+    spend past its ceiling after any deposit."""
+    real = FakeWallet(initial_balance=Decimal("100"))
+    dw = DelegatedWallet(real, BudgetAllocation(child_did="c", amount=Decimal("10")))
+    await dw.transfer(Decimal("6"), "spend")
+    assert dw.spent == Decimal("6")
+
+    await dw.deposit(Decimal("50"))                # external top-up, delegated
+    assert dw.spent == Decimal("6")                # unchanged
+    assert dw.remaining == Decimal("4")
+    assert dw.can_afford(Decimal("5")) is False    # ceiling still enforced
 
 
 @pytest.mark.asyncio
@@ -201,14 +212,17 @@ def _mgr_with_mock_child(child):
 
     mgr = AgentManager()
 
+    if not hasattr(child, "shutdown"):
+        child.shutdown = AsyncMock()
+
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
+        # Mimic load_agent registering the child, so the REAL remove_agent (the
+        # path that releases budget holds — #2113) finds and stops it.
+        mgr._agents[name] = child
+        mgr._agent_names[child.agent_id] = name
         return child
 
-    async def fake_remove_agent(name):
-        return True
-
     mgr.create_agent = fake_create_agent
-    mgr.remove_agent = fake_remove_agent
     return mgr
 
 

@@ -145,29 +145,20 @@ class DelegatedWallet:
             return min(wrapped, self.remaining)
         return wrapped
 
-    async def deposit(
-        self,
-        amount: Decimal,
-        currency: Any = None,
-        to_audit: bool = False,
-        memo: str = "",
-    ) -> bool:
-        """Credit the wrapped wallet AND restore that much budget headroom.
+    def restore_headroom(self, amount: Decimal) -> None:
+        """Reduce ``allocation.spent`` by *amount*, restoring budget headroom.
 
-        A deposit into a delegated wallet is a refund against the ceiling — most
-        importantly when a budgeted child spawns a budgeted grandchild and the
-        grandchild's unspent hold is released back into this child
-        (``release_delegated_wallet`` calls the parent's ``deposit``). Without
-        reducing ``allocation.spent`` the child would stay charged for funds it
-        got back. Bounded at 0 so a refund can never lift ``spent`` below zero and
-        inflate the ceiling beyond ``allocation.amount``.
-        """
-        ok = await self._wallet.deposit(amount, currency, to_audit, memo)
-        if ok:
-            self.allocation.spent = max(
-                Decimal("0"), self.allocation.spent - Decimal(amount)
-            )
-        return ok
+        Called ONLY for an explicit budget refund — when a budgeted grandchild's
+        unspent hold is released back into this (budgeted) child
+        (``release_delegated_wallet``). This is deliberately NOT wired into
+        ``deposit``: a normal external top-up must not restore budget headroom, or
+        the child could spend past its ceiling after any deposit. Bounded at 0 so
+        a refund can never lift ``spent`` below zero / inflate the ceiling beyond
+        ``allocation.amount``. ``deposit`` itself is delegated to the wrapped
+        wallet unchanged (via ``__getattr__``)."""
+        self.allocation.spent = max(
+            Decimal("0"), self.allocation.spent - Decimal(amount)
+        )
 
     def __getattr__(self, name: str) -> Any:
         """Delegate any attribute this wrapper doesn't define to the wrapped
@@ -385,6 +376,12 @@ async def release_delegated_wallet(
             to_audit=False,
             memo=f"budget release from child {delegated_wallet.allocation.child_did}",
         )
+        # If the parent is itself budgeted (a grandchild being released back into
+        # its budgeted parent), restore that parent's budget headroom for the
+        # refunded amount — its ceiling had counted the whole child hold as spent.
+        # Done here (not in deposit) so ONLY an explicit release adjusts spent.
+        if isinstance(parent_wallet, DelegatedWallet):
+            parent_wallet.restore_headroom(unspent)
 
     logger.info(
         "Released delegated wallet: child=%s, returned=%s %s, spent=%s %s",

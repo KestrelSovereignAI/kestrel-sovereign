@@ -215,25 +215,25 @@ class AgentManager:
         Returns:
             True if agent was found and removed.
         """
-        # Backstop budget release (#2113): remove_agent is also the generic
-        # delete path (DELETE /api/agents/{name}), which does NOT go through
-        # terminate_child. Release any outstanding budget hold here so a direct
-        # delete can't strand the parent's held funds. Idempotent — a no-op when
-        # terminate_child/shutdown_all already popped the entry. Done before the
-        # lock so wallet I/O doesn't hold the manager lock.
-        await self._release_child_budget(name)
         async with self._lock:
             agent = self._agents.pop(name, None)
-            if not agent:
-                return False
-            agent_id = agent.agent_id
-            self._agent_names.pop(agent_id, None)
-            try:
-                await asyncio.wait_for(agent.shutdown(), timeout=5.0)
-                logger.info(f"Agent '{name}' shut down")
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning(f"Agent '{name}' shutdown issue: {e}")
-            return True
+            if agent is not None:
+                self._agent_names.pop(agent.agent_id, None)
+                try:
+                    await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+                    logger.info(f"Agent '{name}' shut down")
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Agent '{name}' shutdown issue: {e}")
+
+        # Release any budget hold AFTER the child is stopped and out of service
+        # (#2113): releasing before shutdown would let a still-running child spend
+        # funds that were already refunded to the parent. This is also the generic
+        # delete path (DELETE /api/agents/{name}), which does NOT go through
+        # terminate_child, so it's the backstop that keeps a direct delete from
+        # stranding the hold. Idempotent — a no-op when terminate_child /
+        # shutdown_all already released. Outside the lock (wallet I/O).
+        await self._release_child_budget(name)
+        return agent is not None
 
     async def create_agent(
         self,
@@ -603,10 +603,9 @@ class AgentManager:
         if child_agent is not None:
             await self.terminate_children(child_agent.agent_id)
 
-        # Release any delegated budget hold back to the parent (#2113) before
-        # tearing the child down. Descendants released their own holds in the
-        # cascade above.
-        await self._release_child_budget(child_name)
+        # NB: the child's own budget hold is released inside remove_agent below
+        # (stop-then-release), after the cascade above has already stopped and
+        # released every descendant — so refunds flow up leaf-first (#2113).
 
         # Remove from parent tracking
         children.remove(child_name)
@@ -640,15 +639,14 @@ class AgentManager:
 
     async def shutdown_all(self) -> None:
         """Gracefully shutdown all agents."""
-        # Release every outstanding delegated budget hold back to its parent
-        # (#2113) so a graceful restart does not strand held funds. Release in
-        # REVERSE insertion order — a descendant is always spawned after its
-        # ancestor, so this is leaf-first: a budgeted grandchild's unspent hold is
-        # refunded into its (budgeted) parent's wallet BEFORE that parent is
-        # released to the root, matching terminate_child's cascade. (A follow-up
-        # covers durable reconciliation across an *ungraceful* crash.)
+        # Stop + release budgeted children leaf-first (#2113): reverse insertion
+        # order is leaf-first (a descendant is always spawned after its ancestor),
+        # so each is quiesced and its unspent hold refunded UP into its (budgeted)
+        # parent before that parent is released to the root. remove_agent does the
+        # stop-then-release. (A follow-up covers durable reconciliation across an
+        # *ungraceful* crash.)
         for child_name in reversed(list(self._child_budgets.keys())):
-            await self._release_child_budget(child_name)
+            await self.remove_agent(child_name)
 
         # Clear parent-child tracking
         self._parent_children.clear()
