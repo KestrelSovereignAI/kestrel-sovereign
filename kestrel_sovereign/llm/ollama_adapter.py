@@ -44,6 +44,7 @@ except ImportError:
 
 if TYPE_CHECKING:
     import ollama
+    from .embedding_discovery import EmbeddingModelInfo
 
 logger = logging.getLogger(__name__)
 
@@ -937,6 +938,89 @@ class OllamaAdapter(LLMAdapter):
             return []
         except Exception as e:
             logger.error(f"Failed to list Ollama models: {e}", exc_info=True)
+            return []
+
+    async def _check_embedding_support(
+        self, client: "ollama.AsyncClient", model_name: str
+    ) -> bool:
+        """Check if a local model serves embeddings via /api/show capabilities.
+
+        Ollama reports per-model ``capabilities`` (``/api/show``); an embedding
+        model lists ``"embedding"`` there (verified live 2026-07-10 for
+        nomic-embed-text, qwen3-embedding:*). Trusting that provider signal
+        replaces the name-substring heuristic in :meth:`list_models`, so a
+        differently-named embedding model is still discovered.
+        """
+        try:
+            info = await client.show(model_name)
+            if isinstance(info, dict):
+                capabilities = info.get("capabilities") or []
+            else:
+                capabilities = getattr(info, "capabilities", None) or []
+            return "embedding" in capabilities
+        except Exception as e:
+            logger.warning(f"Could not check embedding support for {model_name}: {e}")
+            return False
+
+    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+        """Discover locally-available embedding models (#2338).
+
+        ``/api/tags`` lists installed models, ``/api/show`` reports each model's
+        ``capabilities``; we keep only those advertising ``"embedding"``. This
+        is the local counterpart to OpenRouter's dedicated embedding endpoint,
+        and makes local models (nomic-embed-text, qwen3-embedding:*)
+        discoverable without a config pin.
+
+        Uses the caller-provided ``client`` (built during provider init from the
+        route's ``host``/``OLLAMA_HOST``) so discovery queries the SAME daemon
+        the route serves from. Only falls back to a default ``AsyncClient()``
+        when no client was passed — otherwise a route pointed at a remote or
+        non-default Ollama would be silently probed against localhost (#2338).
+        """
+        from .embedding_discovery import EmbeddingModelInfo
+
+        if not OLLAMA_AVAILABLE:
+            logger.warning(
+                "Ollama library not available, returning empty embedding model list"
+            )
+            return []
+
+        try:
+            if client is None:
+                client = ollama.AsyncClient()
+            response = await client.list()
+
+            if hasattr(response, "models"):
+                raw_models = response.models
+            elif isinstance(response, dict):
+                raw_models = response.get("models", [])
+            else:
+                raw_models = []
+
+            results: List[EmbeddingModelInfo] = []
+            for model_data in raw_models:
+                if hasattr(model_data, "model"):
+                    model_name = model_data.model or ""
+                elif hasattr(model_data, "name"):
+                    model_name = model_data.name or ""
+                elif isinstance(model_data, dict):
+                    model_name = model_data.get("model", "") or model_data.get("name", "")
+                else:
+                    continue
+                if not model_name:
+                    continue
+                if not await self._check_embedding_support(client, model_name):
+                    continue
+                results.append(EmbeddingModelInfo(
+                    id=model_name,
+                    provider="ollama",
+                    display_name=model_name.split(":")[0],
+                ))
+
+            logger.info(f"Ollama: discovered {len(results)} embedding models")
+            return results
+        except Exception as e:
+            logger.error(f"Failed to list Ollama embedding models: {e}", exc_info=True)
             return []
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------

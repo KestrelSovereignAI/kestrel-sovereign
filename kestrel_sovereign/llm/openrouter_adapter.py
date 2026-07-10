@@ -21,8 +21,11 @@ import os
 import logging
 from dataclasses import replace
 import httpx
-from typing import List, Optional, Dict, Any, Type, AsyncIterator, Union
+from typing import List, Optional, Dict, Any, Type, AsyncIterator, TYPE_CHECKING, Union
 import openai
+
+if TYPE_CHECKING:
+    from .embedding_discovery import EmbeddingModelInfo
 
 from pydantic import BaseModel
 
@@ -372,6 +375,95 @@ class OpenRouterAdapter(OpenAIAdapter):
         except Exception as e:
             logger.warning(f"OpenRouter model discovery failed: {e}")
             return []
+
+    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+        """Discover OpenRouter embedding models from the DEDICATED endpoint (#2338).
+
+        OpenRouter serves embedding models from ``GET /api/v1/embeddings/models``,
+        NOT the generic ``/models`` list (which omits them entirely, and
+        ``?category=embedding`` returns empty). Verified live 2026-07-10: 26
+        models with metadata (gemini-embedding-2, pplx-embed-v1,
+        qwen3-embedding-8b, gte, e5, ...).
+
+        ``client`` is accepted for contract symmetry; OpenRouter's catalog is
+        fetched with this adapter's own bearer-token ``httpx.AsyncClient``.
+        """
+        from .embedding_discovery import EmbeddingModelInfo
+
+        if not self.api_key:
+            logger.warning(
+                "OPENROUTER_API_KEY not set, returning empty embedding model list"
+            )
+            return []
+
+        url = f"{self.base_url}/embeddings/models"
+        try:
+            async with httpx.AsyncClient() as http_client:
+                response = await http_client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=HTTP_TIMEOUT_DEFAULT,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPError as e:
+            logger.warning(f"OpenRouter embedding discovery HTTP error: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"OpenRouter embedding discovery failed: {e}")
+            return []
+
+        results: List[EmbeddingModelInfo] = []
+        for m in payload.get("data", []):
+            model_id = m.get("id") or m.get("canonical_slug") or ""
+            if not model_id:
+                continue
+            native_dim, dim_options = self._parse_openrouter_embedding_dims(m)
+            results.append(EmbeddingModelInfo(
+                id=model_id,
+                provider="openrouter",
+                display_name=m.get("name") or model_id,
+                native_dim=native_dim,
+                dim_options=dim_options,
+                context_limit=m.get("context_length"),
+                description=m.get("description"),
+            ))
+
+        logger.info(f"OpenRouter: discovered {len(results)} embedding models")
+        return results
+
+    @staticmethod
+    def _parse_openrouter_embedding_dims(model_data: Dict[str, Any]):
+        """Extract (native_dim, dim_options) from an OpenRouter embedding entry.
+
+        The dedicated endpoint reports dimensions in a few shapes across models:
+        a scalar ``output_dimensions`` / ``dimensions`` for fixed-size models,
+        and a ``[min, max]`` (or explicit list) Matryoshka range for MRL models.
+        Missing dims are fine — the set-time probe (#2326) proves the served
+        size before use.
+        """
+        arch = model_data.get("architecture") or {}
+        raw = (
+            model_data.get("output_dimensions")
+            or model_data.get("dimensions")
+            or arch.get("output_dimensions")
+            or arch.get("dimensions")
+        )
+        native_dim: Optional[int] = None
+        dim_options: List[int] = []
+        if isinstance(raw, (int, float)):
+            native_dim = int(raw)
+        elif isinstance(raw, dict):
+            hi = raw.get("max") or raw.get("default")
+            if hi is not None:
+                native_dim = int(hi)
+            dim_options = [int(v) for v in raw.values() if isinstance(v, (int, float))]
+        elif isinstance(raw, (list, tuple)) and raw:
+            nums = [int(v) for v in raw if isinstance(v, (int, float))]
+            if nums:
+                native_dim = max(nums)
+                dim_options = sorted(set(nums))
+        return native_dim, dim_options
 
     def _extract_tags(self, model_data: Dict[str, Any]) -> List[str]:
         """Extract tags from OpenRouter model data."""

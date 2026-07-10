@@ -8,11 +8,14 @@ Provides in-memory caching and disk-based cache for fast startup.
 import asyncio
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, TYPE_CHECKING
 
 from .model_metadata import ModelInfo, ModelCategory
 from .model_catalog import get_catalog_service, ModelCatalogService
 from .model_cache import get_shared_model_cache
+
+if TYPE_CHECKING:
+    from .embedding_discovery import EmbeddingModelInfo
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,12 @@ class ModelDiscoveryMixin:
                 # miss — leaving it unresolved even when the cached snapshot
                 # already contains that vendor's models (#2247).
                 self._resolve_auto_providers(cached)
+                # Same reason applies to embedding capabilities (#2338): the
+                # early return would otherwise skip the reconcile pass that only
+                # runs on a cache miss, leaving a dynamically-discovered
+                # embedding route's ``supports_embeddings`` unset on this
+                # instance even though its embedding catalog is discoverable.
+                await self.reconcile_embedding_capabilities(use_cache=True)
                 return self._filter_models(
                     cached,
                     featured_only=featured_only,
@@ -175,6 +184,17 @@ class ModelDiscoveryMixin:
                         f"not found in discovery — may be deprecated"
                     )
 
+        # Fold embedding discovery into route capabilities in the SAME pass as
+        # chat ``auto`` resolution (#2338). This is the non-local warm-up path
+        # every chat/UI discovery funnels through, so a dynamically-discovered
+        # embedding route (e.g. OpenRouter with no TOML pin) has
+        # ``supports_embeddings`` set on its provider dict before the sync
+        # runtime path (``resolve_embedding_provider``, storage writes) reads
+        # it — not just before the UI list. Local-only turns never reach here
+        # (they use ``_resolve_local_auto_routes``), so cloud embedding
+        # endpoints are not contacted under a privacy-gated turn.
+        await self.reconcile_embedding_capabilities(use_cache=True)
+
         # Cache results in shared memory cache and on disk
         shared_cache.set(all_models)
         catalog.write_cache(all_models)
@@ -247,6 +267,295 @@ class ModelDiscoveryMixin:
             category=category,
             providers=None,
         )
+
+    async def discover_embedding_models(
+        self,
+        *,
+        vendor: Optional[str] = None,
+        route: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> List["EmbeddingModelInfo"]:
+        """Discover embedding models across configured routes (#2338).
+
+        The embedding facet of :meth:`discover_all_models`. Each vendor's
+        adapter exposes ``list_embedding_models`` (OpenRouter's dedicated
+        ``/embeddings/models`` endpoint, Ollama's ``/api/show`` capability
+        check, OpenAI's id-prefix filter); this aggregates them with the same
+        per-instance TTL cache semantics as chat discovery.
+
+        Config keys (``embedding_model`` / ``embedding_dim``) are folded in as an
+        OVERRIDE/pin (``is_pinned=True``) — surfaced even if the live catalog
+        omits them, and never a *prerequisite* for a route to be discovered.
+
+        Args:
+            vendor: restrict to this vendor (matches the discovered
+                ``provider`` field).
+            route: restrict to a single route. Embedding capability is
+                route-specific (``openai:api`` embeds, ``openai:plan`` does
+                not), so discovery tags each model with its originating
+                ``"<vendor>:<route>"`` name; passing ``route`` filters to
+                exactly that route (#2338).
+        """
+        cache = getattr(self, "_embedding_discovery_cache", None)
+        if use_cache and cache is not None:
+            models = list(cache)
+        else:
+            models = await self._discover_embedding_models_uncached()
+            self._embedding_discovery_cache = list(models)
+
+        if vendor:
+            models = [m for m in models if m.provider == vendor]
+        if route:
+            models = [m for m in models if m.route == route]
+        return models
+
+    async def _discover_embedding_models_uncached(self) -> List["EmbeddingModelInfo"]:
+        from .embedding_discovery import EmbeddingModelInfo
+
+        # Discover per ACTUAL route, not one-route-per-vendor: embedding
+        # capability is route-specific in production, so collapsing by vendor
+        # (as chat catalog discovery does) would let one route's embeddings be
+        # attributed to a sibling route that can't embed — e.g. openai:api's
+        # models leaking onto openai:plan/codex (#2338). Subscription adapters
+        # (codex/claude-max) simply lack ``list_embedding_models`` and return
+        # []; the ``hasattr`` guard in ``_discover_embedding_for_route`` makes
+        # querying every route cheap and correct.
+        providers = getattr(self, "providers", None)
+        if not isinstance(providers, list):
+            providers = []
+
+        tasks = []
+        for provider in providers:
+            vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
+            tasks.append(self._discover_embedding_for_route(vendor, provider))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        discovered: List[EmbeddingModelInfo] = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"Embedding discovery failed: {result}")
+            elif isinstance(result, list):
+                discovered.extend(result)
+
+        # Fold config pins in as overrides. A pin is declared on a specific
+        # ROUTE, so match/synthesize with route identity (#2338) — otherwise a
+        # pin on ``openai:api`` would attach to whichever same-vendor route
+        # discovery happened to return first. A pinned model that discovery also
+        # returned is marked pinned (operator-featured); a pin discovery missed
+        # is added synthetically so the settings UI still offers it.
+        seen = {(m.route, m.id) for m in discovered}
+        if hasattr(self, "providers") and isinstance(self.providers, list):
+            for provider in self.providers:
+                vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
+                route_name = provider.get("name") or vendor
+                caps = provider.get("capabilities") or {}
+                pinned_model = provider.get("embedding_model") or caps.get("embedding_model")
+                pinned_dim = provider.get("embedding_dim") or caps.get("embedding_dim")
+                if not pinned_model:
+                    continue
+                match = next(
+                    (
+                        m for m in discovered
+                        if m.route == route_name and m.id == pinned_model
+                    ),
+                    None,
+                )
+                if match is not None:
+                    match.is_pinned = True
+                    if pinned_dim and match.native_dim is None:
+                        match.native_dim = int(pinned_dim)
+                elif (route_name, pinned_model) not in seen:
+                    discovered.append(EmbeddingModelInfo(
+                        id=pinned_model,
+                        provider=vendor,
+                        route=route_name,
+                        native_dim=int(pinned_dim) if pinned_dim else None,
+                        is_pinned=True,
+                    ))
+                    seen.add((route_name, pinned_model))
+
+        return discovered
+
+    async def _discover_embedding_for_route(
+        self, vendor: str, route: dict
+    ) -> List["EmbeddingModelInfo"]:
+        """Call one route's adapter embedding facet with error tolerance."""
+        adapter = route.get("adapter")
+        client = route.get("client")
+        route_name = route.get("name") or vendor
+        if adapter is None or not hasattr(adapter, "list_embedding_models"):
+            return []
+        try:
+            models = await adapter.list_embedding_models(client)
+            # Retag to the vendor key so aggregation/filtering is consistent
+            # even if an adapter reports its own name, AND stamp the originating
+            # route so capability advertisement stays route-specific (#2338).
+            for m in models:
+                m.provider = vendor
+                m.route = route_name
+            logger.debug("%s: discovered %d embedding models", route_name, len(models))
+            return models or []
+        except NotImplementedError:
+            return []
+        except Exception as e:
+            logger.warning("%s: embedding discovery failed: %s", vendor, e)
+            return []
+
+    async def route_advertises_embeddings(self, provider: dict) -> bool:
+        """True when discovery finds ≥1 embedding model for ``provider``'s route (#2338).
+
+        Capability is advertised because embeddings were DISCOVERED, not because
+        an operator pinned a model. A config pin still counts (it's folded into
+        discovery as an override), so a pinned route stays truthful too.
+
+        Matching is ROUTE-specific: only models discovered on THIS exact
+        ``"<vendor>:<route>"`` count, so a vendor's embedding-capable route
+        (``openai:api``) never flips capability on for a sibling route that
+        can't embed (``openai:plan``/codex). Falls back to a vendor match only
+        when the provider carries no ``name`` to key on.
+        """
+        route_name = provider.get("name")
+        if route_name:
+            models = await self.discover_embedding_models(route=route_name)
+            return len(models) > 0
+        vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
+        models = await self.discover_embedding_models(vendor=vendor)
+        return len(models) > 0
+
+    async def shared_embedding_space_candidates(self) -> List["EmbeddingModelInfo"]:
+        """Compute shared local+cloud embedding models by intersection (#2290/#2337).
+
+        The "Universal" shared-space option must be COMPUTED, not hardcoded to
+        qwen3: intersect the normalized ids of discovered LOCAL embedding models
+        with discovered CLOUD embedding models. A model present on both sides
+        (same weights local and in the cloud) can share one coordinate space.
+        """
+        from .embedding_discovery import normalize_embedding_model_id
+
+        if not hasattr(self, "providers") or not isinstance(self.providers, list):
+            return []
+
+        local_vendors = {
+            (p.get("vendor") or p.get("name", "").split(":", 1)[0])
+            for p in self.providers
+            if p.get("is_local")
+        }
+
+        all_models = await self.discover_embedding_models()
+        local_norm: Dict[str, "EmbeddingModelInfo"] = {}
+        cloud_norm: set = set()
+        for m in all_models:
+            norm = normalize_embedding_model_id(m.id)
+            if m.provider in local_vendors:
+                local_norm[norm] = m
+            else:
+                cloud_norm.add(norm)
+
+        return [m for norm, m in local_norm.items() if norm in cloud_norm]
+
+    async def resolve_default_embedding_model(
+        self, provider: dict
+    ) -> Optional["EmbeddingModelInfo"]:
+        """Pick a route's default embedding model, mirroring chat ``auto`` (#2338).
+
+        Resolution order matches chat auto-selection
+        (:meth:`_select_auto_model_for_route`): an explicit config pin wins, then
+        the route's ``selection_hints`` (substring patterns from config, no
+        hardcoded ids), then the first discovered model. Returns ``None`` when
+        discovery found nothing for the route — the caller then has no embedding
+        capability to advertise, which is truthful.
+        """
+        route_name = provider.get("name")
+        vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
+        if route_name:
+            candidates = await self.discover_embedding_models(route=route_name)
+        else:
+            candidates = await self.discover_embedding_models(vendor=vendor)
+        if not candidates:
+            return None
+
+        # A config pin is operator intent — honour it before hint matching.
+        pinned = next((m for m in candidates if m.is_pinned), None)
+        if pinned is not None:
+            return pinned
+
+        for hint in provider.get("selection_hints") or []:
+            hint_lower = str(hint).lower()
+            match = next(
+                (
+                    m for m in candidates
+                    if hint_lower in m.id.lower()
+                    or hint_lower in (m.display_name or "").lower()
+                ),
+                None,
+            )
+            if match is not None:
+                return match
+
+        return candidates[0]
+
+    async def reconcile_embedding_capabilities(self, *, use_cache: bool = True) -> None:
+        """Fold live embedding discovery into each route's static capabilities (#2338).
+
+        The embedding counterpart to :meth:`_resolve_auto_providers`. The
+        runtime embedding path (``resolve_embedding_provider`` /
+        ``_validate_embedding_route``) and the storage embedding resolver read
+        the SYNC ``provider["capabilities"]["supports_embeddings"]`` flag — they
+        can't await discovery on every write. Chat solves this by resolving
+        ``model="auto"`` into ``provider["model"]`` once, post-discovery; this
+        does the same for embeddings: every route whose discovery returned ≥1
+        embedding model gets ``supports_embeddings=True`` (plus a default
+        ``embedding_model``/``embedding_dim`` when none was pinned) written into
+        its capabilities, so a dynamically-discovered route (e.g. OpenRouter
+        with no TOML pin) becomes selectable via ``/api/embedding/settings`` and
+        usable by storage — not just visible in ``/api/models``.
+
+        Route-specific: capability is only turned ON for the exact route that
+        discovered embeddings (never a same-vendor sibling), and it is only ever
+        turned ON — a config pin / prior TOML capability is never downgraded
+        here (the #2326 set-time probe owns dead-model detection).
+        """
+        providers = getattr(self, "providers", None)
+        if not isinstance(providers, list):
+            return
+        try:
+            discovered = await self.discover_embedding_models(use_cache=use_cache)
+        except Exception as e:  # pragma: no cover - never break init on discovery
+            logger.debug("embedding capability reconcile skipped: %s", e)
+            return
+
+        by_route: Dict[str, list] = {}
+        for m in discovered:
+            if m.route:
+                by_route.setdefault(m.route, []).append(m)
+
+        for provider in providers:
+            route_name = provider.get("name")
+            # Only advertise where THIS route actually discovered embeddings —
+            # do not fall back to a vendor match, which is the exact
+            # false-advertisement failure this per-route path prevents.
+            if not route_name or route_name not in by_route:
+                continue
+            caps = provider.get("capabilities")
+            if not isinstance(caps, dict):
+                caps = {}
+                provider["capabilities"] = caps
+            caps["supports_embeddings"] = True
+            default = await self.resolve_default_embedding_model(provider)
+            if default is not None:
+                if not caps.get("embedding_model"):
+                    caps["embedding_model"] = default.id
+                    logger.info(
+                        "Auto-resolved embedding model for %s: %s",
+                        route_name,
+                        default.id,
+                    )
+                if not caps.get("embedding_dim") and default.native_dim:
+                    caps["embedding_dim"] = default.native_dim
+
+    def clear_embedding_discovery_cache(self) -> None:
+        """Drop the per-instance embedding-discovery cache to force rediscovery."""
+        self._embedding_discovery_cache = None
 
     async def _resolve_local_auto_routes(self) -> None:
         """Resolve ``model="auto"`` LOCAL routes WITHOUT contacting cloud.
