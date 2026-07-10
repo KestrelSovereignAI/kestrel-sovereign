@@ -292,6 +292,52 @@ async def test_route_model_echo_returns_pinned_routes_own_slug():
     assert echo["embedding_dim"] == 768
 
 
+async def test_aget_settings_cleared_pin_explicit_route_is_never_silent_off():
+    """Round-4 #2372: with an explicit ``embedding_route`` set and that route's
+    per-route pin CLEARED, the async settings read must resolve corpus/catalog —
+    never surface ``embedding_model: null`` (embeddings silently off).
+
+    The cleared pin drops the route's ``supports_embeddings`` flag, and
+    ``resolve_embedding_provider`` gates the explicit-route branch on that flag,
+    so a naive read returns None before ever resolving. ``aget_embedding_settings``
+    re-advertises capability through the single resolver first, breaking the
+    circular gate.
+    """
+    from unittest.mock import AsyncMock
+    from kestrel_sovereign.llm.embedding_discovery import EmbeddingModelInfo
+
+    openrouter = _route("openrouter:api", "openrouter", capabilities={})
+    openrouter["adapter"] = SimpleNamespace(
+        list_embedding_models=AsyncMock(return_value=[
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=4096, dim_options=[768, 4096]),
+        ])
+    )
+    service = _service([openrouter])
+    service._embedding_route = "openrouter:api"
+    service._embedding_space_pins = None
+    service._verified_space_pins = {}
+    service._embedding_space_change_warnings = {}
+    service._embedding_discovery_cache = None
+    service._disabled_routes = {}
+    service.disabled = False
+    service._force_local_only_provider = None
+    service._corpus_embedding_profile_provider = None
+
+    # Simulate the operator having pinned then CLEARED the route's model — this is
+    # the exact state the round-4 dogfood hit (caps carry no supports_embeddings).
+    service.set_route_embedding_model("openrouter:api", "qwen/qwen3-embedding-8b", 768)
+    service.set_route_embedding_model("openrouter:api", None)
+    assert "supports_embeddings" not in openrouter["capabilities"]
+
+    # Without the round-4 fix, resolve_embedding_provider() returns None here and
+    # the read is silent-off. With it, the read self-heals to the discovered model.
+    settings = await service.aget_embedding_settings()
+    assert settings["resolved_route"] == "openrouter:api"
+    assert settings["embedding_model"] == "qwen/qwen3-embedding-8b"
+    assert settings["embedding_dim"] == 768
+
+
 async def test_route_model_echo_does_not_carry_global_route_fields():
     """P2 (#2372): the per-route echo must NOT inherit the global route's
     ``shared_space`` / ``space_change_warning``. Those are route-dependent; a

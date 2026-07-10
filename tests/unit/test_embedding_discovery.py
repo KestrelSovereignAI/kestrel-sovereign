@@ -750,6 +750,87 @@ async def test_resolve_route_embedding_model_preserves_explicit_pin():
     assert dim == 768
 
 
+async def test_stale_space_change_warning_cleared_when_corpus_realigns(monkeypatch):
+    # Round-4 #2372 "stale readout": a space-change warning recorded when the
+    # auto default did not match the corpus must be CLEARED once a later resolve
+    # lands back on the corpus space (e.g. after a re-embed changed the dominant
+    # profile) — it must not outlive the condition that produced it.
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=768),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    svc._embedding_space_change_warnings = {}
+
+    # Corpus dominant is (stale) nomic → qwen changes the space → warning recorded.
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value={
+        "provider": "ollama", "model": "nomic-embed-text",
+        "dim": 768, "space_id": "s", "row_count": 24,
+    })
+    await svc.resolve_route_embedding_model(provider)
+    assert svc._embedding_space_change_warnings.get("openrouter:api") is not None
+
+    # A re-embed moved the corpus onto qwen; the next resolve is coherent, so the
+    # stale warning must be gone (not surfaced by the settings GET forever).
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value={
+        "provider": "openrouter", "model": "qwen3-embedding-8b",
+        "dim": 768, "space_id": "s", "row_count": 24,
+    })
+    svc.clear_embedding_discovery_cache()
+    await svc.resolve_route_embedding_model(provider)
+    assert svc._embedding_space_change_warnings.get("openrouter:api") is None
+
+
+async def test_explicit_pin_clears_stale_space_change_warning(monkeypatch):
+    # A deliberate operator pin is not an accidental space split — pinning must
+    # clear any warning a prior auto-resolve recorded for the route (#2372).
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter",
+                               native_dim=3072),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    svc._embedding_space_change_warnings = {}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value={
+        "provider": "ollama", "model": "nomic-embed-text",
+        "dim": 768, "space_id": "s", "row_count": 24,
+    })
+    await svc.resolve_route_embedding_model(provider)
+    assert svc._embedding_space_change_warnings.get("openrouter:api") is not None
+
+    # Operator pins gemini deliberately → the warning for this route is cleared.
+    # A genuine pin carries NO auto-resolved marker (``set_route_embedding_model``
+    # drops it), which is exactly how discovery tells a pin from an auto default.
+    provider["capabilities"].update({
+        "supports_embeddings": True,
+        "embedding_model": "google/gemini-embedding-2",
+        "embedding_dim": 3072,
+    })
+    provider["capabilities"].pop("embedding_model_auto_resolved", None)
+    svc.clear_embedding_discovery_cache()
+    await svc.resolve_route_embedding_model(provider)
+    assert svc._embedding_space_change_warnings.get("openrouter:api") is None
+
+
 async def test_auto_resolved_capability_is_not_a_pin_after_cache_clear(monkeypatch):
     # P1 (#2372): a default written back into capabilities by the resolver must
     # NOT be re-read as an operator pin after the reindex path clears the cache.
