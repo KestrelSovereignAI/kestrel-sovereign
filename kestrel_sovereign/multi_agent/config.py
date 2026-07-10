@@ -369,6 +369,19 @@ class MultiAgentConfig(BaseModel):
         # followed the link. Resolve to the real target and replace that.
         if path.exists():
             path = path.resolve()
+        # Ownership (codex P2 rounds 8-11): os.replace transfers the temp
+        # file's owner onto the target, and uid can't be preserved without
+        # root. When the file exists but ISN'T ours, write IN PLACE — that
+        # keeps the inode, so owner/group/mode/ACLs all survive untouched;
+        # the atomic strategy is reserved for files we own.
+        try:
+            if path.exists() and hasattr(os, "getuid") and path.stat().st_uid != os.getuid():
+                with open(path, "w", encoding="utf-8") as f:
+                    toml.dump(data, f)
+                logger.info(f"Saved multi_agent config to {path} (in-place: preserving foreign ownership)")
+                return
+        except OSError:
+            pass  # stat/uid unavailable — fall through to the atomic path
         try:
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"

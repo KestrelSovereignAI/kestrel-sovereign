@@ -179,6 +179,17 @@ async def create_agent(request: Request, body: CreateAgentRequest):
                 status_code=409,
                 detail=f"An agent named '{name}' is already registered in the multi-agent config.",
             )
+        # Reserve every port the CURRENT config knows about (codex P1 round
+        # 11): an agent or host-port added to the file after startup isn't in
+        # the manager's boot-time reservations, and allocating it would
+        # persist a port conflict that fails validation on the next boot.
+        from kestrel_sovereign.multi_agent.config import LocalAgentConfig as _LAC
+        host_port = getattr(getattr(ma_config_pre, 'host', None), 'port', None)
+        if isinstance(host_port, int):
+            agent_manager._reserved_ports.add(host_port)
+        for _cfg in getattr(ma_config_pre, 'agents', {}).values():
+            if isinstance(_cfg, _LAC):
+                agent_manager._reserved_ports.add(_cfg.port)
 
     try:
         agent = await agent_manager.create_agent(name)
@@ -198,6 +209,11 @@ async def create_agent(request: Request, body: CreateAgentRequest):
                 created_cfg = agent_manager._created_configs.get(name)
                 if created_cfg is not None:
                     ma_config.agents[name] = created_cfg
+                    # Mutating .agents doesn't rerun the model validator —
+                    # re-validate the merged config so a conflict is surfaced
+                    # HERE (persisted:false + intact file) instead of bricking
+                    # the next boot (codex P1 round 11).
+                    type(ma_config).model_validate(ma_config.model_dump())
                     ma_config.save(config_path)
                     # Keep the app-state snapshot current for the next reader.
                     request.app.state.multi_agent_config = ma_config

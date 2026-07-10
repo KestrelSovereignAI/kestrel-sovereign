@@ -272,3 +272,43 @@ def test_save_falls_back_to_in_place_when_parent_dir_unwritable(tmp_path):
         assert "Two" in reloaded.agents, "in-place fallback persisted the update"
     finally:
         os.chmod(subdir, 0o755)
+
+
+@pytest.mark.asyncio
+async def test_create_reserves_ports_from_the_current_file_and_validates_merge(tmp_path):
+    """codex P1 round 11: an agent/host-port added to the toml AFTER startup
+    isn't in the boot-time reservations — creation must reserve from the
+    CURRENT file, and the merged config must re-validate before saving."""
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    config_path = tmp_path / "multi_agent.toml"
+    startup = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+    })
+    startup.save(config_path)
+    manager = AgentManager(base_data_dir=tmp_path)
+    await manager.load_from_config(startup)
+
+    # Operator adds an agent on 8802 AFTER startup.
+    edited = MultiAgentConfig.from_file(config_path)
+    edited.agents["LateAdd"] = LocalAgentConfig(data_dir=Path("agent_data/LateAdd"), port=8802)
+    edited.save(config_path)
+
+    async def fake_create(name, **kw):
+        port = manager._allocate_port()
+        manager._created_configs[name] = LocalAgentConfig(
+            data_dir=Path("agent_data") / name, port=port)
+        return SimpleNamespace(agent_id=f"did:x:{name}")
+    manager.create_agent = fake_create
+
+    req = _request_with_state(
+        agent_manager=manager,
+        multi_agent_config=startup,
+        multi_agent_config_path=config_path,
+    )
+    result = await create_agent.__wrapped__(req, CreateAgentRequest(name="Newbie"))
+    assert result["persisted"] is True
+    reloaded = MultiAgentConfig.from_file(config_path)   # from_file validates conflicts
+    ports = [c.port for c in reloaded.agents.values() if isinstance(c, LocalAgentConfig)]
+    assert len(ports) == len(set(ports)), "no port conflicts persisted"
+    assert reloaded.agents["Newbie"].port not in (8801, 8802)

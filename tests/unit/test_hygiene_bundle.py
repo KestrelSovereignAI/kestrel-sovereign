@@ -158,15 +158,18 @@ class TestSpawnCaps:
         # Clamped to parent (2) - 1 = 1.
         assert child_mandate.max_child_depth == 1
 
-    def test_port_allocation_is_monotonic(self):
+    def test_port_allocation_never_reuses(self):
         from kestrel_sovereign.multi_agent.agent_manager import AgentManager
         m = AgentManager()
-        # Two consecutive allocations never collide even if agents unload between.
-        m._port_seq += 1
-        p1 = m._port_seq
-        m._port_seq += 1
-        p2 = m._port_seq
-        assert p2 == p1 + 1 and p2 > 8800
+        # The #1729 guarantee, now via the reserved-set allocator (#2358):
+        # consecutive allocations never collide, reservations never release —
+        # an unloaded agent's port stays taken.
+        p1 = m._allocate_port()
+        p2 = m._allocate_port()
+        assert p1 != p2 and p1 > 8800 and p2 > 8800
+        assert p1 in m._reserved_ports and p2 in m._reserved_ports
+        # Even after simulating an unload (reservations don't shrink):
+        assert m._allocate_port() not in (p1, p2)
 
 
 # ---------------------------------------------------------------------------
