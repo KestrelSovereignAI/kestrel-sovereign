@@ -514,7 +514,8 @@ def test_embedding_settings_endpoints_round_trip_and_expose_dims():
         }
 
     llm_service = MagicMock()
-    llm_service.set_embedding_route = MagicMock(side_effect=_set)
+    # The endpoint now uses the async, live-probing setter (#2326).
+    llm_service.aset_embedding_route = AsyncMock(side_effect=_set)
     llm_service.get_embedding_settings = MagicMock(side_effect=_settings)
     agent = MagicMock(llm_service=llm_service)
 
@@ -548,11 +549,11 @@ def test_embedding_settings_endpoints_round_trip_and_expose_dims():
 
         assert set_response.status_code == 200
         assert set_response.json()["embedding_route"] == "ollama:local"
-        llm_service.set_embedding_route.assert_any_call("ollama:local")
+        llm_service.aset_embedding_route.assert_any_call("ollama:local")
 
         assert clear_response.status_code == 200
         assert clear_response.json()["embedding_route"] is None
-        llm_service.set_embedding_route.assert_any_call(None)
+        llm_service.aset_embedding_route.assert_any_call(None)
 
         assert missing_response.status_code == 400
     finally:
@@ -582,7 +583,7 @@ def test_embedding_settings_post_round_trip_for_none_off_state():
         }
 
     llm_service = MagicMock()
-    llm_service.set_embedding_route = MagicMock(side_effect=_set)
+    llm_service.aset_embedding_route = AsyncMock(side_effect=_set)
     llm_service.get_embedding_settings = MagicMock(side_effect=_settings)
     agent = MagicMock(llm_service=llm_service)
 
@@ -605,7 +606,7 @@ def test_embedding_settings_post_round_trip_for_none_off_state():
         assert set_body["embedding_dim"] is None
         # Off does not erase the deployment's stored dimension.
         assert set_body["kestrel_embedding_dim"] == 768
-        llm_service.set_embedding_route.assert_any_call("none")
+        llm_service.aset_embedding_route.assert_any_call("none")
 
         assert get_response.status_code == 200
         get_body = get_response.json()
@@ -617,10 +618,10 @@ def test_embedding_settings_post_round_trip_for_none_off_state():
 
 
 def test_embedding_settings_post_surfaces_validation_error():
-    """#2263 — a ValueError from set_embedding_route (unknown/non-embedding
-    route) becomes a 400 with the reason, not a 500."""
+    """#2263/#2326 — a ValueError from the (async) setter (unknown/non-embedding
+    route, or a failed live probe) becomes a 400 with the reason, not a 500."""
     llm_service = MagicMock()
-    llm_service.set_embedding_route = MagicMock(
+    llm_service.aset_embedding_route = AsyncMock(
         side_effect=ValueError("no configured route matches 'gemini:api'.")
     )
     agent = MagicMock(llm_service=llm_service)
@@ -642,10 +643,10 @@ def test_embedding_settings_post_surfaces_validation_error():
 
 def test_embedding_settings_post_rejects_non_string_route():
     """#2286 — a non-string ``embedding_route`` (int/list/dict) is bad input
-    and must return 400, not fall through to a 500. set_embedding_route must
+    and must return 400, not fall through to a 500. The setter must
     never be reached with a non-string value."""
     llm_service = MagicMock()
-    llm_service.set_embedding_route = MagicMock()
+    llm_service.aset_embedding_route = AsyncMock()
     agent = MagicMock(llm_service=llm_service)
 
     app, original = _prepare_app(agent)
@@ -660,7 +661,7 @@ def test_embedding_settings_post_rejects_non_string_route():
                     )
                     assert resp.status_code == 400, bad
                     assert "must be a string or null" in resp.json()["detail"]
-        llm_service.set_embedding_route.assert_not_called()
+        llm_service.aset_embedding_route.assert_not_called()
     finally:
         _restore_app(app, original)
 

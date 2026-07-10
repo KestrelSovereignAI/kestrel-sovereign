@@ -551,6 +551,121 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if persist and self._embedding_route_persistence_callback:
             self._schedule_embedding_route_persistence(route)
 
+    async def aset_embedding_route(
+        self, route: Optional[str], *, persist: bool = True
+    ) -> None:
+        """Set the embedding_route, adding a live upstream probe (#2326).
+
+        ``set_embedding_route`` only runs *static* validation: the route is
+        known and advertises embedding support. That is not enough for cloud
+        meta-providers (OpenRouter et al.) which list models whose serving
+        provider pool can be empty — the route passes static validation yet
+        every real embed 404s and rows silently persist with NULL vectors.
+
+        For an explicit **cloud** route, this async variant embeds one canary
+        string through the resolved provider after static validation passes and
+        refuses the set (``ValueError``) on any upstream failure, so the knob can
+        never be accepted in a state that degrades to keyword search on the next
+        storage write. Local routes and the ``"none"``/auto sentinels are not
+        probed. Use this on explicit sets (the settings endpoint); the boot-time
+        persisted-value load stays on the sync, probe-free
+        :meth:`set_embedding_route`.
+
+        Raises:
+            ValueError: if static validation fails, or the live canary embed
+                against a cloud route fails / returns no vector.
+        """
+        # Normalize identically to set_embedding_route so the probe resolves the
+        # canonical selector (and "auto"/"" clear, "none" off-switch, are seen).
+        normalized = route
+        if normalized is not None:
+            normalized = normalized.strip()
+            if not normalized or normalized.lower() == "auto":
+                normalized = None
+            elif normalized.lower() == "none":
+                normalized = "none"
+
+        if normalized is not None and normalized != "none":
+            # Static validation first (unknown route / no embedding support).
+            self._validate_embedding_route(normalized)
+            # Then the live probe for cloud routes (#2326).
+            await self._probe_embedding_route_live(normalized)
+
+        # Commit through the sync setter (re-runs the cheap static validation,
+        # owns logging + persistence).
+        self.set_embedding_route(route, persist=persist)
+
+    async def _probe_embedding_route_live(self, route: str) -> None:
+        """Embed one canary through a cloud embedding route to prove it's live (#2326).
+
+        Static validation only proves the route is known and advertises
+        embedding support; a meta-provider can list a model whose provider pool
+        is empty (dead upstream), so every real embed 404s. Probe the resolved
+        provider with a single canary — reusing the #2290 parity canaries — and
+        raise ``ValueError`` on failure so the set is refused with the upstream
+        error surfaced to the operator.
+
+        Local routes are skipped: the empty-pool failure mode is a live-catalog
+        property of cloud meta-providers, and a missing local model is a
+        separate, already-handled setup issue. When no embedding-capable
+        provider resolves (pre-init / bare harness), there is nothing live to
+        probe, so this is a no-op.
+        """
+        candidates = self._lookup_embedding_route_candidates(route)
+        target = next(
+            (c for c in candidates if self._provider_supports_embeddings(c)),
+            None,
+        )
+        if target is None:
+            # Static validation (against ``self.providers``) already passed, but
+            # the live probe resolves through ``_available_providers()``, which
+            # filters out routes in ``_disabled_routes``. If the route statically
+            # matches an embedding-capable provider yet none is *available*, the
+            # route is disabled in this service — committing it would degrade
+            # every subsequent write to keyword fallback with no probe. Refuse
+            # the set rather than silently accepting a dead route.
+            providers = getattr(self, "providers", None) or []
+            if providers:
+                static_matching = self._filter_providers_by_selector(
+                    providers, route
+                )
+                if any(
+                    self._provider_supports_embeddings(p) for p in static_matching
+                ):
+                    disabled = self._disabled_routes.get(route)
+                    reason = f" ({disabled})" if disabled else ""
+                    raise ValueError(
+                        f"Cannot set embedding_route '{route}': the route is "
+                        f"configured but not currently available"
+                        f"{reason}, so it cannot be probed and would fall back "
+                        f"to keyword search on the next storage write."
+                    )
+            # Otherwise no providers are initialized (pre-init / bare harness):
+            # nothing live to probe, so this is a legitimate no-op.
+            return
+        if target.get("is_local") or not target.get("is_cloud", True):
+            return
+
+        from .embedding_service import ProviderEmbeddingService
+        from .embedding_space import DEFAULT_PARITY_CANARIES
+
+        service = ProviderEmbeddingService(target)
+        canary = DEFAULT_PARITY_CANARIES[0]
+        try:
+            vector = await service.aembed(canary)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot set embedding_route '{route}': live embedding probe "
+                f"failed against the upstream provider ({exc}). The route may "
+                f"list a model that is not currently served."
+            ) from exc
+        if not vector:
+            raise ValueError(
+                f"Cannot set embedding_route '{route}': the upstream provider "
+                f"returned no embedding for a canary probe. The route may list "
+                f"a model that is not currently served."
+            )
+
     def clear_embedding_route(self) -> None:
         """Clear the embedding_route knob, returning to auto/follow-chat (#2263)."""
         self.set_embedding_route(None)
