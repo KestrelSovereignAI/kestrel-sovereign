@@ -779,8 +779,12 @@ class MemoryRetriever:
             match_strength = min(abs(memory_valence), abs(context_valence))
             return 0.5 + match_strength * 0.5
         elif memory_valence * context_valence < 0:
-            # Opposite valence - lower score
-            return 0.3
+            # Opposite valence lowers recall in proportion to reliable
+            # evidence. Confidence has already attenuated memory_valence;
+            # using only the sign here would give a 1%-confidence third-party
+            # emotion the same full penalty as a certain first-person one.
+            mismatch_strength = min(abs(memory_valence), abs(context_valence))
+            return 0.5 - mismatch_strength * 0.2
         else:
             # One or both neutral
             return 0.5

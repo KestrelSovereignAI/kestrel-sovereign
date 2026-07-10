@@ -428,9 +428,21 @@ class EmotionalTagger:
     @staticmethod
     def _infer_emotional_subject(content: str, role: str) -> str:
         """Conservatively identify whose affect the message describes."""
-        if role != "user":
-            return "assistant" if role == "assistant" else "unknown"
         lower = content.lower()
+        if role == "assistant":
+            if re.search(
+                r"\bi(?:['’]m|\s+(?:am|feel|felt|was|have been))\b", lower
+            ):
+                return "assistant"
+            if re.search(
+                r"\b(?:you(?:['’]re|\s+(?:are|feel|felt|were|seem|sound))|"
+                r"he|she|they|your\s+\w+)\b",
+                lower,
+            ):
+                return "other"
+            return "unknown"
+        if role != "user":
+            return "unknown"
         if re.search(
             r"\bi(?:['’]m|\s+(?:am|feel|felt|was|have been))\b", lower
         ):
@@ -474,29 +486,31 @@ class EmotionalTagger:
         reasons: List[str] = []
         content_lower = content.lower()
 
-        # Personal disclosure patterns (high importance)
-        for pattern in self.DISCLOSURE_PATTERNS:
-            if re.search(pattern, content_lower, re.I):
-                score += 0.7
-                if "personal_disclosure" not in reasons:
-                    reasons.append("personal_disclosure")
-                break
+        # Disclosure/life-event/remember heuristics describe user evidence.
+        # Applying them to the assistant's acknowledgement duplicates the
+        # user's event as a second, highly-important assistant memory (e.g.
+        # "I'm sorry your sister died" became an assistant life event).
+        if role == "user":
+            for pattern in self.DISCLOSURE_PATTERNS:
+                if re.search(pattern, content_lower, re.I):
+                    score += 0.7
+                    if "personal_disclosure" not in reasons:
+                        reasons.append("personal_disclosure")
+                    break
 
-        # Life event patterns (highest importance)
-        for pattern in self.LIFE_EVENT_PATTERNS:
-            if re.search(pattern, content_lower, re.I):
-                score += 0.75
-                if "life_event" not in reasons:
-                    reasons.append("life_event")
-                break
+            for pattern in self.LIFE_EVENT_PATTERNS:
+                if re.search(pattern, content_lower, re.I):
+                    score += 0.75
+                    if "life_event" not in reasons:
+                        reasons.append("life_event")
+                    break
 
-        # Explicit memory markers (user directly asks to remember)
-        for pattern in self.EXPLICIT_MARKERS:
-            if re.search(pattern, content_lower, re.I):
-                score += 0.75
-                if "explicit_marker" not in reasons:
-                    reasons.append("explicit_marker")
-                break
+            for pattern in self.EXPLICIT_MARKERS:
+                if re.search(pattern, content_lower, re.I):
+                    score += 0.75
+                    if "explicit_marker" not in reasons:
+                        reasons.append("explicit_marker")
+                    break
 
         # Emotional intensity adds importance
         valence, intensity = self._analyze_sentiment(content)

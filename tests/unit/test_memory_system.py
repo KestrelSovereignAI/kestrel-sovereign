@@ -135,6 +135,22 @@ class TestEmotionalTagger:
         assert result.importance_reasons == []
         assert result.emotional_tag_version == "heuristic-v2"
 
+    @pytest.mark.asyncio
+    async def test_assistant_acknowledgement_is_not_a_second_life_event(self, tagger):
+        """#2333: user-event language in a reply must not duplicate importance."""
+        result = await tagger.analyze(
+            "I'm so sad that your sister died yesterday.", "assistant"
+        )
+
+        assert "sadness" in result.emotional_categories
+        assert "life_event" not in result.importance_reasons
+        assert result.importance <= 0.2
+
+    @pytest.mark.asyncio
+    async def test_second_person_assistant_affect_is_attributed_to_other(self, tagger):
+        result = await tagger.analyze("You sound devastated today.", "assistant")
+        assert result.emotional_subject == "other"
+
 
 class TestTemporalAnalyzer:
     """Tests for TemporalAnalyzer pattern detection."""
@@ -281,6 +297,20 @@ class TestMemoryRetriever:
         )
 
         assert score_match > score_mismatch
+
+    def test_emotional_mismatch_penalty_scales_with_confidence(self):
+        """#2333: weak attribution cannot receive a full opposite-mood penalty."""
+        retriever = MemoryRetriever(MagicMock())
+        context = MemoryMetadata(emotional_valence=0.8)
+
+        certain = retriever._score_emotional(
+            {"emotional_valence": -1.0, "emotional_confidence": 1.0}, context
+        )
+        uncertain = retriever._score_emotional(
+            {"emotional_valence": -1.0, "emotional_confidence": 0.01}, context
+        )
+
+        assert 0.3 <= certain < uncertain < 0.5
 
     def test_recency_score_decay(self):
         """Recent memories should score higher than old ones."""
