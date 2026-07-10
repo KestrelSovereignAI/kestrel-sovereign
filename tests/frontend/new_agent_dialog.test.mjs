@@ -136,3 +136,29 @@ test('the spawn link is absent when the spawn capability is not present', async 
     assert.equal(document.getElementById('create-agent-spawn-link'), null, 'no spawn link without the capability');
     Modal.hide();
 });
+
+test('a pending create resolved AFTER dismissal never hides an unrelated modal or paints stale errors (codex P2)', async () => {
+    Modal.hide();
+    let rejectCreate;
+    const api = {
+        createAgent: () => new Promise((_, rej) => { rejectCreate = rej; }),
+    };
+    openCreateAgentDialog({ modal: Modal, api, onCreated: () => {} });
+    await tick();
+    typeName('Kestrel');
+    clickCreate();          // submit hangs on the pending promise
+    Modal.hide();           // user dismisses mid-flight...
+    Modal.show({ title: 'Unrelated', content: '<p id="unrelated-marker">other</p>', buttons: [] });
+    assert.ok(document.getElementById('unrelated-marker'), 'unrelated modal open');
+
+    // The stale request fails now — it must NOT touch the unrelated modal.
+    rejectCreate(new Error('boom'));
+    await tick();
+    await tick();
+    assert.ok(document.getElementById('unrelated-marker'),
+        'unrelated modal untouched by the stale failure');
+    const err = document.getElementById('create-agent-error');
+    assert.ok(!err || err.textContent === '',
+        'no stale error painted into a foreign modal');
+    Modal.hide();
+});

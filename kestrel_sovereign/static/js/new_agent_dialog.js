@@ -105,16 +105,29 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         }
         submitting = true;
         clearError();
+        // Scope the async completion to THIS dialog instance (codex P2): the
+        // user can dismiss the dialog while createAgent is in flight and open
+        // another modal — the eventual resolution must not hide that unrelated
+        // modal or paint errors into a reopened Create Agent. The name input
+        // element is unique to this render; if it's gone or detached, the
+        // dialog this request belonged to no longer exists.
+        const dialogInput = input;
+        const stillCurrent = () => !!(dialogInput && dialogInput.isConnected
+            && document.getElementById(INPUT_ID) === dialogInput);
         try {
             await api.createAgent(name);
             // Success: close the dialog first, then let the host refresh the list
-            // and select the freshly-minted agent.
-            modal.hide();
+            // and select the freshly-minted agent. The refresh/select still runs
+            // even if the user dismissed the dialog mid-flight — the agent WAS
+            // created; only the modal.hide() must be scoped.
+            if (stillCurrent()) modal.hide();
             if (onCreated) await onCreated(name);
         } catch (err) {
             // Surface the 409/400 (or any) failure inline — never a toast, so the
-            // user can correct the name in place without losing the dialog.
+            // user can correct the name in place without losing the dialog. But
+            // only into the SAME dialog instance that submitted.
             submitting = false;
+            if (!stillCurrent()) return;
             const detail = (err && ((err.body && err.body.detail) || err.message)) || 'Failed to create agent.';
             showError(detail);
         }
