@@ -234,6 +234,7 @@ class Feature(_SdkFeature):
         messages: list,
         tools: List[Dict[str, Any]],
         tool_executor: Optional[Any] = None,
+        model_override: Optional[str] = None,
     ) -> Any:
         """Give a feature subagent one more step when it narrates but emits no tool.
 
@@ -254,6 +255,7 @@ class Feature(_SdkFeature):
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
             tool_executor=tool_executor,
+            model_override=model_override,
         )
 
     # =========================================================================
@@ -640,6 +642,7 @@ class Feature(_SdkFeature):
         context: Optional[str] = None,
         max_iterations: Optional[int] = None,
         denied_tools: Optional[set] = None,
+        model_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute this feature as a subagent with its own LLM context.
@@ -656,6 +659,14 @@ class Feature(_SdkFeature):
             task: What the orchestrator wants this feature to do
             context: Optional conversation context from the orchestrator
             denied_tools: Tool names denied by security policy (stripped from palette)
+            model_override: The route/model the orchestrator resolved for THIS
+                turn (``vendor:route/model``). Threaded in so the subagent's own
+                reasoning call targets the exact route the main turn used, instead
+                of falling back to default route_priority resolution — which set
+                ``provider=unknown`` and rejected valid model+route combinations
+                on the subagent path (#2352). ``None`` preserves the legacy
+                default-resolution behaviour for callers that don't have a
+                resolved model (e.g. some external transports).
 
         Returns:
             Dict with success status and result
@@ -710,6 +721,7 @@ class Feature(_SdkFeature):
                 user_prompt=user_prompt,
                 tools=feature_tools if feature_tools else None,
                 tool_executor=tool_executor,
+                model_override=model_override,
             )
 
             # Log what we got back
@@ -732,6 +744,7 @@ class Feature(_SdkFeature):
                 max_iterations=max_iterations,
                 user_prompt=user_prompt,
                 tool_executor=tool_executor,
+                model_override=model_override,
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -954,6 +967,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         max_iterations: int = None,
         user_prompt: Optional[str] = None,
         tool_executor: Optional[Any] = None,
+        model_override: Optional[str] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -993,6 +1007,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 messages,
                 tools,
                 tool_executor=tool_executor,
+                model_override=model_override,
             )
             if isinstance(response, str):
                 return response
@@ -1054,6 +1069,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 messages=messages,
                 tools=tools if tools else None,
                 tool_executor=tool_executor,
+                model_override=model_override,
             )
 
             # If response is string or has no more tool calls, we're done
@@ -1066,6 +1082,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     messages,
                     tools,
                     tool_executor=tool_executor,
+                    model_override=model_override,
                 )
                 if isinstance(response, str):
                     return response

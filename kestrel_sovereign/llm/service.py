@@ -2656,6 +2656,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         start_time: float,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
+        explicit_selection: bool = False,
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
@@ -2669,10 +2670,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
           * callers mistakenly targeting a vendor that doesn't serve the model.
         Skipping raises ``ModelNotAvailableForRoute`` so the outer fallback
         loop can move on to the next provider.
+
+        The catalog gate only guards **blind fallback**. When the caller has
+        explicitly pinned this route (``explicit_selection=True`` — a
+        ``vendor:route/model`` override or a route-qualified mandate, as feature
+        subagents produce), the streaming chat path (``streaming.py`` never calls
+        ``_model_available_for_route``) already trusts the selection and calls the
+        route directly. This non-streaming path must match that contract, or a
+        valid model the route genuinely serves — but which discovery hasn't
+        cached (e.g. a brand-new OpenRouter slug, or a paginated/capped catalog) —
+        gets a false-negative ``ModelNotAvailableForRoute`` and the whole call
+        fails with "All providers failed". That asymmetry is what broke feature
+        subagent dispatch (#2352): the same ``openrouter:api/openai/...`` route
+        that streamed fine on the chat path was rejected here. There is no
+        cross-vendor cascade risk when the route is explicitly pinned, so honour
+        it exactly as streaming does.
         """
         messages = messages_for(provider["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
-        if target_model and target_model != "auto":
+        if target_model and target_model != "auto" and not explicit_selection:
             if not self._model_available_for_route(provider, target_model):
                 raise ModelNotAvailableForRoute(
                     vendor=provider.get("vendor"),
@@ -3012,6 +3028,7 @@ No other text or formatting.
                         start_time=start_time,
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
+                        explicit_selection=explicit_selection,
                     )
                     if llm_span and isinstance(result, LLMResponse):
                         if result.input_tokens is not None:

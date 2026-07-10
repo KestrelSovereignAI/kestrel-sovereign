@@ -1341,6 +1341,7 @@ class OrchestratorEngineMixin:
         tool_results: Optional[list] = None,
         streaming: bool = False,
         session_id: str = "orchestrator",
+        effective_model: Optional[str] = None,
     ):
         """
         Dispatch a single tool call — used by both streaming and non-streaming loops.
@@ -1459,6 +1460,7 @@ class OrchestratorEngineMixin:
                 tool_call, feature, args, dispatch_start, dispatch_event_id,
                 user_message, tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
+                effective_model=effective_model,
             )
         elif tool_name in self._direct_tools:
             result = await self._dispatch_direct_tool(
@@ -1612,9 +1614,14 @@ class OrchestratorEngineMixin:
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
         user_message, *, tool_events=None, streaming=False, session_id="orchestrator",
-        dispatch_meta=None,
+        dispatch_meta=None, effective_model=None,
     ):
-        """Dispatch to a feature subagent with hook enforcement."""
+        """Dispatch to a feature subagent with hook enforcement.
+
+        ``effective_model`` is the route/model the orchestrator resolved for
+        this turn; it's forwarded into ``execute_as_subagent`` so the subagent's
+        own reasoning call targets the same route the main turn used (#2352).
+        """
         tool_name = tool_call.name
         hook_feature_name = type(feature).__name__
 
@@ -1669,7 +1676,7 @@ class OrchestratorEngineMixin:
         if denied_tools:
             logging.info(f"[SECURITY] Stripping denied tools from {hook_feature_name}: {denied_tools}")
 
-        async def _exec_feature(effective_args, f=feature, dt=denied_tools):
+        async def _exec_feature(effective_args, f=feature, dt=denied_tools, em=effective_model):
             task = effective_args.get("task", "")
             context = effective_args.get("context")
             if not context and user_message:
@@ -1677,7 +1684,9 @@ class OrchestratorEngineMixin:
             log_tag = "[STREAM] " if streaming else ""
             logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
             with optional_span("agent.feature_dispatch", {"feature.name": f.tool_name}):
-                r = await f.execute_as_subagent(task=task, context=context, denied_tools=dt)
+                r = await f.execute_as_subagent(
+                    task=task, context=context, denied_tools=dt, model_override=em,
+                )
             self._register_explored_feature_tools(f)
             return r
 
@@ -1954,6 +1963,7 @@ class OrchestratorEngineMixin:
         streaming: bool = False,
         session_id: str = "orchestrator",
         part_emit_buffer: Optional[list] = None,
+        effective_model: Optional[str] = None,
     ):
         """
         Execute a batch of tool calls, using parallelism where safe.
