@@ -354,6 +354,8 @@ export const Modal = {
             width: 100%;
             max-height: 90vh;
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
             animation: modalSlideIn 0.2s ease-out;
         `;
 
@@ -377,7 +379,12 @@ export const Modal = {
                     transition: color 0.2s;
                 ">&times;</button>
             </div>
-            <div class="modal-body" style="padding: 1.5rem;">
+            <div class="modal-body" style="
+                padding: 1.5rem;
+                overflow-y: auto;
+                min-height: 0;
+                flex: 1 1 auto;
+            ">
                 ${content}
             </div>
             ${buttons.length > 0 ? `
@@ -385,8 +392,10 @@ export const Modal = {
                     padding: 1rem 1.5rem;
                     border-top: 1px solid var(--border-color);
                     display: flex;
+                    flex-wrap: wrap;
                     justify-content: flex-end;
                     gap: 0.75rem;
+                    flex: 0 0 auto;
                 ">
                     ${buttons.map((btn, i) => `
                         <button class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}"${btn.disabled ? ' disabled' : ''}${btn.title ? ` title="${String(btn.title).replace(/"/g, '&quot;')}"` : ''} style="
@@ -395,6 +404,8 @@ export const Modal = {
                             border-radius: 8px;
                             font-size: 0.875rem;
                             font-weight: 500;
+                            min-width: 0;
+                            white-space: nowrap;
                             cursor: ${btn.disabled ? 'not-allowed' : 'pointer'};
                             transition: all 0.2s;
                             ${btn.disabled ? 'opacity: 0.5;' : ''}
