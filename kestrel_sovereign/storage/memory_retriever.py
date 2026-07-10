@@ -2,10 +2,11 @@
 Human-like memory retrieval with weighted scoring.
 
 Retrieves memories using human-like weighting:
-- Semantic relevance (30%)
-- Emotional congruence (25%)
+- Semantic relevance (25%)
+- Emotional congruence (20%)
 - Importance (20%)
 - Recency with decay (15%)
+- Epistemic certainty (10%)
 - Access frequency (10%)
 
 This creates retrieval that feels like human memory:
