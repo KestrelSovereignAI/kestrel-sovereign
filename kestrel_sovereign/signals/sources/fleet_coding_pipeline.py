@@ -105,9 +105,14 @@ FLEET_CODING_APPROVAL = "fleet_coding_approval"
 FLEET_CI_PROBE = "fleet_ci_probe"
 SOURCE_NAMES = (FLEET_CODING_APPROVAL, FLEET_CI_PROBE)
 
-# Fields that carry an explicit consent decision through to the gate. Mirrors
-# the workflow-rescue governance source so an already-approved run threads its
-# marker to the consent_collect gate unchanged.
+# Approval-decision fields the ``consent_collect`` gate reads off an ACTION
+# result. These carry NO provenance when they arrive in caller-supplied run
+# params, so the approval handler must strip them before returning — an
+# orchestrator that can invoke ``workflow_run`` must never be able to satisfy
+# its own consent gate by putting ``{approved: true}`` in the params (#2303).
+# Real approval flows only through the runner's ``consent_collect_provider``
+# (the agent's permission / ApprovalQueue system), consulted when the handler
+# carries no marker of its own.
 CONSENT_MARKER_FIELDS = frozenset(
     {
         "approved",
@@ -139,12 +144,27 @@ async def fleet_coding_approval_handler(payload: Dict[str, Any]) -> Dict[str, An
     Like ``governance_review`` in ``stalled_work_rescue``, this only *registers*
     the intent; it never authorizes it. Authorization is the workflow's
     ``consent_collect`` gate, evaluated separately through the agent's permission
-    system. An explicit consent marker carried on the payload (an already-approved
-    run) is threaded to the gate unchanged.
+    system (the runner's ``consent_collect_provider``, which routes to the
+    ApprovalQueue / a human in the kestrel-claws Approvals tab).
+
+    **Caller-supplied approval markers are NOT honored (#2303).** The workflow
+    runner merges run params into every stage payload, so any ``approved`` /
+    ``consent`` / ``status`` / ... field a caller put in the run params arrives
+    here with no provenance from the approval system. Threading it into the
+    result would let an orchestrator that can invoke ``workflow_run`` satisfy its
+    own consent gate and approve its own irreversible ``talon_run`` dispatch —
+    breaking the default-closed contract. So this handler deliberately builds a
+    fresh, marker-free result: it never carries a consent decision, forcing the
+    gate down the ``consent_collect_missing_approval`` path where the real
+    approval provider decides (default-closed, parking the run in WAITING until a
+    human approves).
     """
     scope = payload.get("scope", CONSENT_SCOPE)
     repo = payload.get("repo")
-    result: Dict[str, Any] = {
+    # Fresh result with only descriptive/observational fields. No key from
+    # CONSENT_MARKER_FIELDS is copied off the (caller-influenced) payload, so the
+    # gate can never read a self-granted approval marker from this result.
+    return {
         "source": FLEET_CODING_APPROVAL,
         "scope": scope,
         "repo": repo,
@@ -155,10 +175,6 @@ async def fleet_coding_approval_handler(payload: Dict[str, Any]) -> Dict[str, An
         "authorized": False,
         "observation": _quote(FLEET_CODING_APPROVAL, "scope", scope),
     }
-    for field in CONSENT_MARKER_FIELDS:
-        if field in payload:
-            result[field] = payload[field]
-    return result
 
 
 async def fleet_ci_probe_handler(payload: Dict[str, Any]) -> Dict[str, Any]:

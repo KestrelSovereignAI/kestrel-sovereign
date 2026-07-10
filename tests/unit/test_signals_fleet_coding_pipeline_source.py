@@ -244,18 +244,34 @@ async def test_approval_records_intent_not_authorization(dispatcher):
     assert data["scope"] == CONSENT_SCOPE
 
 
-async def test_approval_threads_explicit_consent_marker(dispatcher):
+async def test_approval_ignores_caller_supplied_consent_markers(dispatcher):
+    # A caller who can start the workflow must NOT be able to self-approve by
+    # putting approval-ish fields in the run params (which the runner merges into
+    # the stage payload). The handler strips every consent-marker field, so none
+    # can reach the consent_collect gate as a self-granted approval (#2303).
+    from kestrel_sovereign.signals.sources.fleet_coding_pipeline import (
+        CONSENT_MARKER_FIELDS,
+    )
+
     result = await dispatcher.dispatch_signal(
         _signal(
             FLEET_CODING_APPROVAL,
-            {"repo": "org/repo", "issue": 5, "approved": True,
-             "approved_by": "did:web:k.operator"},
+            {
+                "repo": "org/repo",
+                "issue": 5,
+                "approved": True,
+                "consent": "granted",
+                "status": "approved",
+                "approved_by": "did:web:k.orchestrator",
+            },
         )
     )
     data = result.action_result
-    assert data["approved"] is True
-    assert data["approved_by"] == "did:web:k.operator"
-    # Still never self-authorizes.
+    # None of the caller-supplied approval markers survived into the result.
+    for field in CONSENT_MARKER_FIELDS:
+        assert field not in data, field
+    # It still records the intent, never authorization.
+    assert data["intent"] == "request_consent"
     assert data["authorized"] is False
 
 
@@ -406,6 +422,41 @@ async def test_consent_gate_parks_run_in_waiting(tmp_path):
         )
         assert result.status == RunStatus.WAITING
         # Default-closed: the irreversible talon run never fired.
+        assert coord.calls == []
+    finally:
+        await backend.close()
+
+
+async def test_caller_supplied_approval_params_cannot_self_approve(tmp_path):
+    from kestrel_feature_workflows.models import RunStatus
+
+    # The consent provider (the real approval system) routes to a human and
+    # returns PENDING. A malicious/self-serving caller stuffs approval markers
+    # into the run params; the runner merges those into the approve stage
+    # payload, but the handler strips them, so the gate still consults the
+    # provider and parks the run in WAITING — the caller cannot approve its own
+    # irreversible talon_run dispatch (#2303).
+    def pending_provider(gate, run, stage, link):
+        return {"status": "pending", "scope": gate.params["scope"]}
+
+    registry, coord = _registry_with_sources()
+    runner, store, identity, backend = await _make_runner(
+        tmp_path, registry, consent_provider=pending_provider
+    )
+    try:
+        await _define_builtin(store, identity)
+        result = await runner.run_to_completion(
+            name=WORKFLOW_NAME,
+            params={
+                "repo": "org/repo",
+                "issue": 5,
+                "approved": True,
+                "consent": "granted",
+                "status": "approved",
+            },
+        )
+        assert result.status == RunStatus.WAITING
+        # Default-closed held: the irreversible talon run never fired.
         assert coord.calls == []
     finally:
         await backend.close()
