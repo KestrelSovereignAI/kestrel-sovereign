@@ -1667,6 +1667,31 @@ window.toggleAgentsPane = function() {
 };
 
 // Setup collapse buttons and resize handles
+// Turn-end / voice staleness → conversations pane sync (#2250/#2254).
+// Registered at MODULE SCOPE, not inside the DOMContentLoaded block: embedding
+// hosts (Frinz) dynamically import this module long after DOMContentLoaded has
+// fired, so a listener wired there never attaches in an embed — the tile
+// counts refreshed only via the host's own listener and the ORGANIC-session
+// highlight sync never ran at all (user report: selected conversation card not
+// highlighted in the embed). The event carries `{ sessionId, agent }`; adopt it
+// into the per-agent active-id map (and the live highlight when it's the
+// current host agent) BEFORE the refresh repaints.
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('kestrel:conversations-stale', (event) => {
+        const detail = event && event.detail;
+        if (detail && detail.sessionId && detail.agent) {
+            activeConversationIdsByAgent.set(detail.agent, detail.sessionId);
+            if (currentAgentMatches(detail.agent)) {
+                activeConversationId = detail.sessionId;
+                if (conversationsHandle) {
+                    conversationsHandle.setActiveSessionId(activeConversationId);
+                }
+            }
+        }
+        if (conversationsHandle) conversationsHandle.refresh();
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     // #2279: the agents pane's collapse chevron + drag-resize handle are now
     // owned by the `mountAgentListPane` export (it adopts the static
@@ -1691,32 +1716,9 @@ document.addEventListener('DOMContentLoaded', () => {
         historyTriggerBtn.addEventListener('click', () => window.toggleConversationsPane());
     }
 
-    // A realtime/pipeline voice session persists its turns server-side as a
-    // new conversation, but the sidebar never hears about it (the browser
-    // talks straight to OpenAI). voice/ui.js fires this when a call ends with
-    // real turns; reload the list so the new conversation shows up without a
-    // manual page refresh.
-    window.addEventListener('kestrel:conversations-stale', (event) => {
-        // #2254: an ORGANIC session (the user just types) learns its effective
-        // session id from the X-Session-Id header onto `pane.sessionId`, but
-        // never told identity.js — so `activeConversationId` stayed null and no
-        // row highlighted, even after the #2250 turn-end refresh repainted. The
-        // turn-end event now carries `{ sessionId, agent }`; adopt it into the
-        // per-agent active-id map (and the live highlight when it's the current
-        // host agent) BEFORE the refresh repaints, so the matching row survives:
-        // organic first message, pane opened later, and companion/agent switch.
-        const detail = event && event.detail;
-        if (detail && detail.sessionId && detail.agent) {
-            activeConversationIdsByAgent.set(detail.agent, detail.sessionId);
-            if (currentAgentMatches(detail.agent)) {
-                activeConversationId = detail.sessionId;
-                if (conversationsHandle) {
-                    conversationsHandle.setActiveSessionId(activeConversationId);
-                }
-            }
-        }
-        if (conversationsHandle) conversationsHandle.refresh();
-    });
+    // (#2254 stale-event listener moved to MODULE SCOPE below — embeds import
+    // this module long after DOMContentLoaded, so wiring it here meant the
+    // highlight sync never ran in a mounted host. See the top-level listener.)
 
     // #2222: the New-conversation button is now component-owned. The pane mount
     // (`mountConversationsPane`) adopts the static `#new-conversation-sidebar-btn`
