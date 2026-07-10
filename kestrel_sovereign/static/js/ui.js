@@ -385,6 +385,7 @@ export const Modal = {
                     padding: 1rem 1.5rem;
                     border-top: 1px solid var(--border-color);
                     display: flex;
+                    flex-wrap: wrap;
                     justify-content: flex-end;
                     gap: 0.75rem;
                 ">
@@ -395,6 +396,8 @@ export const Modal = {
                             border-radius: 8px;
                             font-size: 0.875rem;
                             font-weight: 500;
+                            min-width: 0;
+                            white-space: nowrap;
                             cursor: ${btn.disabled ? 'not-allowed' : 'pointer'};
                             transition: all 0.2s;
                             ${btn.disabled ? 'opacity: 0.5;' : ''}

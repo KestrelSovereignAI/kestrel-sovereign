@@ -273,7 +273,10 @@ export const Security = {
                     padding: 0.75rem;
                     border-radius: 8px;
                     font-size: 0.8rem;
+                    white-space: pre-wrap;
+                    word-break: break-word;
                     overflow-x: auto;
+                    overflow-y: auto;
                     max-height: 150px;
                     margin-top: 0.75rem;
                 ">${this._escapeHtml(JSON.stringify(data.args, null, 2))}</pre>`
