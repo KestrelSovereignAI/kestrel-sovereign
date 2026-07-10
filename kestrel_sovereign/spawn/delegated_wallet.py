@@ -303,27 +303,44 @@ async def create_delegated_wallet(
     if not success:
         raise ValueError("Failed to debit parent wallet for budget hold")
 
-    # Create child wallet with the delegated budget (all goes to main, no 90/10
-    # split). Construct from the CONCRETE wallet class: when the parent's wallet
-    # is itself a DelegatedWallet (a budgeted child spawning a budgeted
-    # grandchild), unwrap to the underlying funded wallet — DelegatedWallet's
-    # constructor is (wallet, allocation), not the funded-wallet constructor, so
-    # nested budgeted spawns would otherwise raise (#2113). The hold above still
-    # went through the parent's (delegated) ceiling.
-    base_wallet = (
-        parent_wallet._wallet
-        if isinstance(parent_wallet, DelegatedWallet)
-        else parent_wallet
-    )
-    wallet_cls = type(base_wallet)
-    child_wallet = wallet_cls(
-        agent_id=child_did,
-        initial_balance=Decimal("0"),
-        initial_currency=currency,
-    )
-    await child_wallet.initialize()
-    # Deposit full budget to main (bypass the 90/10 split used for normal deposits)
-    child_wallet._balances[currency]["main"] = budget
+    # Transactional after the debit: if child-wallet construction/init fails, the
+    # parent has already been debited, so refund the hold before propagating —
+    # otherwise the funds are stranded (#2113, codex).
+    try:
+        # Construct from the CONCRETE wallet class: when the parent's wallet is
+        # itself a DelegatedWallet (a budgeted child spawning a budgeted
+        # grandchild), unwrap to the underlying funded wallet — DelegatedWallet's
+        # constructor is (wallet, allocation), not the funded-wallet constructor,
+        # so nested budgeted spawns would otherwise raise. The hold above still
+        # went through the parent's (delegated) ceiling.
+        base_wallet = (
+            parent_wallet._wallet
+            if isinstance(parent_wallet, DelegatedWallet)
+            else parent_wallet
+        )
+        wallet_cls = type(base_wallet)
+        child_wallet = wallet_cls(
+            agent_id=child_did,
+            initial_balance=Decimal("0"),
+            initial_currency=currency,
+        )
+        await child_wallet.initialize()
+        # Deposit full budget to main (bypass the 90/10 split used for deposits)
+        child_wallet._balances[currency]["main"] = budget
+    except Exception:
+        try:
+            await parent_wallet.deposit(
+                budget,
+                currency,
+                to_audit=False,
+                memo=f"budget hold refund (child wallet setup failed) for {child_did}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "CRITICAL: budget hold for child %s could not be refunded after a "
+                "setup failure — parent funds may be stranded.", child_did,
+            )
+        raise
 
     allocation = BudgetAllocation(
         child_did=child_did,

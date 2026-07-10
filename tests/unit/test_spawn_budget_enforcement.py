@@ -121,6 +121,21 @@ async def test_nested_budgeted_spawn_unwraps_delegated_parent():
     assert isinstance(gc._wallet, FakeWallet)      # not a nested DelegatedWallet
 
 
+class _InitFailWallet(FakeWallet):
+    async def initialize(self):
+        raise RuntimeError("wallet provider init failed")
+
+
+@pytest.mark.asyncio
+async def test_create_refunds_parent_on_setup_failure():
+    """If child-wallet setup fails AFTER the parent is debited, the hold is
+    refunded rather than stranded."""
+    parent = _InitFailWallet(initial_balance=Decimal("100"))
+    with pytest.raises(RuntimeError, match="provider init"):
+        await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert parent.get_balance() == Decimal("100")  # debit refunded
+
+
 @pytest.mark.asyncio
 async def test_deposit_restores_budget_headroom():
     """A refund into a delegated wallet (e.g. a released grandchild hold) reduces
