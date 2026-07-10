@@ -169,10 +169,15 @@ test('SOURCE CONTRACT: identity.js listener syncs the active id from the event d
 
     const start = identity.indexOf("addEventListener('kestrel:conversations-stale'");
     assert.ok(start > -1, 'the stale listener exists');
-    const block = identity.slice(start, start + 1400);
+    const block = identity.slice(start, start + 1800);
     assert.match(block, /event\s*&&\s*event\.detail/, 'the listener reads event.detail');
-    assert.match(block, /activeConversationIdsByAgent\.set\(\s*detail\.agent\s*,\s*detail\.sessionId\s*\)/,
-        'the listener records the id in the per-agent active map');
+    // The guard must be sessionId-only: gating on `detail.agent` truthiness
+    // skipped the sync in the SINGLE-AGENT console, where getHostAgent() (and
+    // therefore chat.js's dispatchAgent) is null by definition.
+    assert.match(block, /if\s*\(detail\s*&&\s*detail\.sessionId\)/,
+        'the sync gates on sessionId only — a null agent is the single-agent console');
+    assert.match(block, /activeConversationIdsByAgent\.set\(\s*agentKey\s*,\s*detail\.sessionId\s*\)/,
+        'the listener records the id in the per-agent active map (null key = single-agent)');
     assert.match(block, /setActiveSessionId\(activeConversationId\)/,
         'the listener drives the component highlight before the refresh repaints');
 });
