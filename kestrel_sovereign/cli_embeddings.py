@@ -29,7 +29,12 @@ agent/server open — ``KESTREL_DATABASE_URL`` for Postgres, otherwise
 ``KESTREL_DB_PATH/kestrel_prime.db`` (or the ``--agent-name`` /
 ``--data-dir`` selected agent's ``kestrel_prime.db``). In a
 multi-agent checkout with more than one agent they refuse to guess and
-require ``--agent-name`` / ``--data-dir``. The audit subcommand never
+require ``--agent-name`` / ``--data-dir`` — and, since #2327, so does a
+checkout whose ``multi_agent.toml`` defines agents while ``KESTREL_DB_PATH``
+is also set (rather than let the env var silently win against the wrong
+database). A resolved SQLite file that doesn't exist is a hard error: these
+verbs operate on an existing corpus and never create an empty one. The audit
+subcommand never
 touches the LLM stack, so it works without credentials. The reindex
 subcommand needs the LLM stack to resolve the target embedding profile,
 applying the agent's persisted runtime ``embedding_route`` (#2263)
@@ -78,19 +83,48 @@ def _add_db_target_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _project_root() -> str:
+    """The Kestrel project/home dir (``KESTREL_HOME`` → marker walk → default).
+
+    Agent discovery must anchor here, not on ``os.getcwd()``: the rest of the
+    CLI resolves the home through :func:`kestrel_sovereign.paths.project_dir`,
+    so an operator running ``kestrel embeddings reindex`` from outside the
+    project root (with ``KESTREL_HOME`` set) must find the same
+    ``multi_agent.toml`` / ``agent_data`` the agent/server would — otherwise
+    the multi-agent guard is silently bypassed (#2327).
+    """
+    try:
+        from kestrel_sovereign.paths import project_dir
+
+        return str(project_dir())
+    except Exception:  # pragma: no cover - defensive
+        return os.getcwd()
+
+
+def _resolve_data_dir(data_dir: Any, root: str) -> str:
+    """Resolve a roster ``data_dir`` (possibly relative) against ``root``."""
+    text = str(data_dir)
+    if os.path.isabs(text):
+        return text
+    return os.path.normpath(os.path.join(root, text))
+
+
 def _agent_data_dir_for(agent_name: str) -> Optional[str]:
     """Resolve an agent name to its data directory (``multi_agent.toml`` first)."""
+    root = _project_root()
     try:
         from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
-        cfg = MultiAgentConfig.load()
+        cfg = MultiAgentConfig.load(
+            config_path=os.path.join(root, "multi_agent.toml"),
+        )
         agent = cfg.agents.get(agent_name)
         data_dir = getattr(agent, "data_dir", None) if agent is not None else None
         if data_dir:
-            return str(data_dir)
+            return _resolve_data_dir(data_dir, root)
     except Exception:  # pragma: no cover - defensive
         pass
-    candidate = os.path.join(os.getcwd(), "agent_data", agent_name)
+    candidate = os.path.join(root, "agent_data", agent_name)
     if os.path.isdir(candidate):
         return candidate
     return None
@@ -100,24 +134,30 @@ def _discover_local_agents() -> Dict[str, str]:
     """Return ``{agent_name: data_dir}`` for agents in this checkout.
 
     Prefers a ``multi_agent.toml`` roster; otherwise scans
-    ``agent_data/*/kestrel_prime.db``. Used to refuse to guess which DB to
-    open when the checkout hosts more than one agent (#2289).
+    ``agent_data/*/kestrel_prime.db``. Anchored on
+    :func:`kestrel_sovereign.paths.project_dir` (``KESTREL_HOME``-aware), not
+    ``os.getcwd()``, so the multi-agent guard holds even when the command is
+    run from outside the project root (#2327). Used to refuse to guess which
+    DB to open when the checkout hosts more than one agent (#2289).
     """
+    root = _project_root()
     agents: Dict[str, str] = {}
     try:
-        if os.path.exists(os.path.join(os.getcwd(), "multi_agent.toml")):
+        if os.path.exists(os.path.join(root, "multi_agent.toml")):
             from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
-            cfg = MultiAgentConfig.load()
+            cfg = MultiAgentConfig.load(
+                config_path=os.path.join(root, "multi_agent.toml"),
+            )
             for name, agent in cfg.agents.items():
                 data_dir = getattr(agent, "data_dir", None)
                 if data_dir:
-                    agents[name] = str(data_dir)
+                    agents[name] = _resolve_data_dir(data_dir, root)
     except Exception:  # pragma: no cover - defensive
         agents = {}
     if agents:
         return agents
-    base = os.path.join(os.getcwd(), "agent_data")
+    base = os.path.join(root, "agent_data")
     if os.path.isdir(base):
         for entry in sorted(os.listdir(base)):
             if os.path.exists(os.path.join(base, entry, "kestrel_prime.db")):
@@ -185,6 +225,24 @@ def _resolve_db_target(
 
     db_path_dir = os.environ.get("KESTREL_DB_PATH")
     if db_path_dir:
+        # KESTREL_DB_PATH must NOT silently override a multi-agent roster
+        # (#2327). Production hosts set KESTREL_DB_PATH in .env; in a home
+        # whose multi_agent.toml defines agents, honouring it blindly opens
+        # the wrong DB (or creates an empty one) and reports a confident
+        # false success against the wrong database. Refuse and require an
+        # explicit selector rather than guessing which corpus is meant.
+        roster = _discover_local_agents()
+        if roster:
+            names = ", ".join(sorted(roster))
+            return (
+                f"KESTREL_DB_PATH is set ({db_path_dir}) but this checkout "
+                f"defines agent(s): {names}. Refusing to let KESTREL_DB_PATH "
+                "silently choose the database — pass --agent-name <name> or "
+                "--data-dir <dir> to select which agent's corpus to operate "
+                "on.",
+                None,
+                None,
+            )
         return (None, None, os.path.join(db_path_dir, "kestrel_prime.db"))
 
     agents = _discover_local_agents()
@@ -201,7 +259,7 @@ def _resolve_db_target(
             None,
         )
 
-    return (None, None, os.path.join(os.getcwd(), "kestrel_prime.db"))
+    return (None, None, os.path.join(_project_root(), "kestrel_prime.db"))
 
 
 async def _load_persisted_embedding_route(
@@ -625,6 +683,20 @@ def run(args: argparse.Namespace) -> int:
         err, pg_url, sqlite_path = _resolve_db_target(args)
         if err is not None:
             print(f"ERROR: {err}", file=sys.stderr)
+            return 2
+        # reindex/audit are maintenance verbs over an EXISTING corpus. If the
+        # resolved SQLite file doesn't exist, refuse rather than let the driver
+        # create a brand-new empty DB and truthfully count its zero rows —
+        # that is the "confident false success against the wrong database" this
+        # command must never produce (#2327).
+        if not pg_url and (not sqlite_path or not os.path.exists(sqlite_path)):
+            print(
+                f"ERROR: no database found at {sqlite_path!r} — reindex/audit "
+                "operate on an existing agent corpus and will not create a new "
+                "empty database. Point --data-dir / --agent-name (or "
+                "KESTREL_DB_PATH) at an existing kestrel_prime.db.",
+                file=sys.stderr,
+            )
             return 2
         try:
             if pg_url:
