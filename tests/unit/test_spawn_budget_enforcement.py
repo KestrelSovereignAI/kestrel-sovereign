@@ -240,6 +240,28 @@ async def test_spawn_holds_budget_and_terminate_releases():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_releases_nested_budgets_leaf_first():
+    """Graceful shutdown releases a budgeted grandchild before its budgeted
+    parent, so ALL unspent funds flow back to the root (not stranded in an
+    already-released parent wallet)."""
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    root = FakeWallet(initial_balance=Decimal("100"))
+    child_dw = await create_delegated_wallet(root, "did:root", "did:child", Decimal("30"))
+    gc_dw = await create_delegated_wallet(child_dw, "did:child", "did:gc", Decimal("20"))
+    assert root.get_balance() == Decimal("70")   # 30 held from root
+    assert child_dw.spent == Decimal("20")        # 20 held for grandchild
+
+    mgr = AgentManager()
+    # Insertion order = spawn order (ancestor before descendant).
+    mgr._child_budgets = {"child": (child_dw, root), "gc": (gc_dw, child_dw)}
+    await mgr.shutdown_all()
+
+    # gc released first (refunds child) → child released → full 30 back to root.
+    assert root.get_balance() == Decimal("100")
+
+
+@pytest.mark.asyncio
 async def test_budget_refused_without_funded_parent_wallet():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 

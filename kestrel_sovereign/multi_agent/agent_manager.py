@@ -634,9 +634,13 @@ class AgentManager:
     async def shutdown_all(self) -> None:
         """Gracefully shutdown all agents."""
         # Release every outstanding delegated budget hold back to its parent
-        # (#2113) so a graceful restart does not strand held funds. (A follow-up
+        # (#2113) so a graceful restart does not strand held funds. Release in
+        # REVERSE insertion order — a descendant is always spawned after its
+        # ancestor, so this is leaf-first: a budgeted grandchild's unspent hold is
+        # refunded into its (budgeted) parent's wallet BEFORE that parent is
+        # released to the root, matching terminate_child's cascade. (A follow-up
         # covers durable reconciliation across an *ungraceful* crash.)
-        for child_name in list(self._child_budgets.keys()):
+        for child_name in reversed(list(self._child_budgets.keys())):
             await self._release_child_budget(child_name)
 
         # Clear parent-child tracking
