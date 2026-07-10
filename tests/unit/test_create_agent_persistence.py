@@ -184,3 +184,19 @@ def test_atomic_save_preserves_file_mode(tmp_path):
     config.agents["Two"] = LocalAgentConfig(data_dir=Path("agent_data/Two"), port=8802)
     config.save(config_path)
     assert (config_path.stat().st_mode & 0o777) == 0o664, "existing mode preserved across atomic replace"
+
+
+def test_new_config_files_respect_the_process_umask(tmp_path):
+    """codex P2 round 8: a hardcoded 0644 on NEW files bypassed restrictive
+    umasks (077 deployments keep their configs private, like open('w') did)."""
+    import os
+    old_umask = os.umask(0o077)
+    try:
+        config_path = tmp_path / "multi_agent.toml"
+        config = MultiAgentConfig(agents={
+            "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+        })
+        config.save(config_path)
+        assert (config_path.stat().st_mode & 0o777) == 0o600, "umask 077 -> private new config"
+    finally:
+        os.umask(old_umask)

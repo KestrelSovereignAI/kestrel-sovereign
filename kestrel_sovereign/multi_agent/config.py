@@ -369,13 +369,28 @@ class MultiAgentConfig(BaseModel):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 toml.dump(data, f)
-            # mkstemp minted 0600 — carrying that onto the target would strip
-            # group/other readability an operator granted (a config another
-            # service account reads). Preserve the existing mode; default new
-            # files to the conventional 0644 (codex P2 round 7).
+            # mkstemp minted 0600 owned by this process — carrying that onto
+            # the target would strip metadata an operator deliberately set
+            # (codex P2 rounds 7-8):
+            #   - EXISTING file: preserve its mode AND its group (another
+            #     service account may read the config via group access);
+            #     chown is best-effort — group changes need membership.
+            #   - NEW file: derive from the process umask exactly like the
+            #     plain open(..., 'w') this replaced (0666 & ~umask) — a
+            #     hardcoded 0644 would bypass restrictive umasks and expose
+            #     fleet topology / remote-agent URLs to other local users.
             try:
-                mode = path.stat().st_mode & 0o7777 if path.exists() else 0o644
-                os.chmod(tmp_path, mode)
+                if path.exists():
+                    st = path.stat()
+                    os.chmod(tmp_path, st.st_mode & 0o7777)
+                    try:
+                        os.chown(tmp_path, -1, st.st_gid)
+                    except (OSError, AttributeError):
+                        pass  # non-POSIX or not a member of the group
+                else:
+                    current_umask = os.umask(0)
+                    os.umask(current_umask)
+                    os.chmod(tmp_path, 0o666 & ~current_umask)
             except OSError:
                 pass  # never fail the save over metadata
             os.replace(tmp_path, path)
