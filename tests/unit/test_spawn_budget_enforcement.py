@@ -318,6 +318,30 @@ async def test_direct_remove_agent_releases_budget():
 
 
 @pytest.mark.asyncio
+async def test_direct_remove_parent_cascades_descendant_budgets():
+    """Directly removing a budgeted parent (DELETE path, no terminate_child
+    cascade) releases its budgeted grandchild first, so ALL held funds reach the
+    root rather than stranding in the released parent wallet."""
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    root = FakeWallet(initial_balance=Decimal("100"))
+    child_dw = await create_delegated_wallet(root, "did:root", "did:child", Decimal("30"))
+    gc_dw = await create_delegated_wallet(child_dw, "did:child", "did:gc", Decimal("20"))
+    assert root.get_balance() == Decimal("70")
+
+    mgr = AgentManager()
+    mgr._agents = {
+        "child": SimpleNamespace(agent_id="did:child", shutdown=AsyncMock()),
+        "gc": SimpleNamespace(agent_id="did:gc", shutdown=AsyncMock()),
+    }
+    mgr._parent_children = {"did:child": ["gc"]}
+    mgr._child_budgets = {"child": (child_dw, root), "gc": (gc_dw, child_dw)}
+
+    await mgr.remove_agent("child")
+    assert root.get_balance() == Decimal("100")   # grandchild + child both flow to root
+
+
+@pytest.mark.asyncio
 async def test_budget_refused_without_funded_parent_wallet():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
