@@ -279,8 +279,19 @@ async def create_delegated_wallet(
     if not success:
         raise ValueError("Failed to debit parent wallet for budget hold")
 
-    # Create child wallet with the delegated budget (all goes to main, no 90/10 split)
-    wallet_cls = type(parent_wallet)
+    # Create child wallet with the delegated budget (all goes to main, no 90/10
+    # split). Construct from the CONCRETE wallet class: when the parent's wallet
+    # is itself a DelegatedWallet (a budgeted child spawning a budgeted
+    # grandchild), unwrap to the underlying funded wallet — DelegatedWallet's
+    # constructor is (wallet, allocation), not the funded-wallet constructor, so
+    # nested budgeted spawns would otherwise raise (#2113). The hold above still
+    # went through the parent's (delegated) ceiling.
+    base_wallet = (
+        parent_wallet._wallet
+        if isinstance(parent_wallet, DelegatedWallet)
+        else parent_wallet
+    )
+    wallet_cls = type(base_wallet)
     child_wallet = wallet_cls(
         agent_id=child_did,
         initial_balance=Decimal("0"),

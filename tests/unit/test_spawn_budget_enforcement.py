@@ -104,6 +104,24 @@ async def test_delegates_unoverridden_attrs():
 # ----------------------------- hold / release ---------------------------------
 
 @pytest.mark.asyncio
+async def test_nested_budgeted_spawn_unwraps_delegated_parent():
+    """A budgeted child (its wallet already a DelegatedWallet) spawning a
+    budgeted grandchild: the hold goes through the child's ceiling, and the
+    grandchild's funded wallet is built from the concrete class, not
+    DelegatedWallet."""
+    real = FakeWallet(initial_balance=Decimal("100"))
+    parent_dw = DelegatedWallet(
+        real, BudgetAllocation(child_did="c", amount=Decimal("50"))
+    )
+    gc = await create_delegated_wallet(parent_dw, "did:c", "did:gc", Decimal("20"))
+
+    assert parent_dw.spent == Decimal("20")        # held through child's ceiling
+    assert real.get_balance() == Decimal("80")
+    assert gc.remaining == Decimal("20")
+    assert isinstance(gc._wallet, FakeWallet)      # not a nested DelegatedWallet
+
+
+@pytest.mark.asyncio
 async def test_create_holds_and_release_returns_unspent():
     parent = FakeWallet(initial_balance=Decimal("100"))
     dw = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
@@ -153,6 +171,7 @@ async def test_spawn_holds_budget_and_terminate_releases():
     assert result is child
     assert isinstance(child.wallet, DelegatedWallet)
     assert child.wallet_agent is child.wallet
+    assert child._delegated_wallet is child.wallet          # spawn-status endpoint reads this
     assert parent.wallet.get_balance() == Decimal("70")     # held
 
     await child.wallet.transfer(Decimal("10"), "work")       # spend within ceiling

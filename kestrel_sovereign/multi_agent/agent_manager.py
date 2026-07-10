@@ -388,6 +388,9 @@ class AgentManager:
             raise
         child.wallet = delegated
         child.wallet_agent = delegated
+        # Also expose it as ``_delegated_wallet`` so the spawn-status endpoint
+        # reports live budget_spent / budget_remaining (#2113).
+        child._delegated_wallet = delegated
         self._child_budgets[name] = (delegated, parent_wallet)
         logger.info(
             "Applied delegated budget %s to child '%s' — spend now ceiling'd (#2113).",
