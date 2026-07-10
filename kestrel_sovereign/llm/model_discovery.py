@@ -767,17 +767,26 @@ class ModelDiscoveryMixin:
         embedding space than the existing ones. That is a real (if contained)
         recall split, so we log a warning and stash a structured record that the
         settings GET surfaces (the UI's mismatch banner renders it).
+
+        The warning is re-evaluated on EVERY resolve, so a route that later
+        resolves back onto the corpus space (a re-embed changed the dominant
+        profile, or a pin was set) has its stale warning CLEARED rather than
+        surfaced forever — the round-4 #2372 "stale readout" was exactly a
+        warning that outlived the condition that produced it.
         """
-        if not corpus_profile:
-            return
         from .embedding_discovery import normalize_embedding_model_id
 
-        dominant_model = corpus_profile.get("model")
-        if not dominant_model:
-            return
-        if normalize_embedding_model_id(chosen.id) == normalize_embedding_model_id(
-            dominant_model
-        ):
+        dominant_model = (corpus_profile or {}).get("model")
+        no_space_change = (
+            not corpus_profile
+            or not dominant_model
+            or normalize_embedding_model_id(chosen.id)
+            == normalize_embedding_model_id(dominant_model)
+        )
+        if no_space_change:
+            # Coherent now — drop any warning a prior (mismatched) resolve left
+            # so the settings GET stops surfacing a banner that no longer holds.
+            self._clear_embedding_space_change_warning(route_name)
             return
         warning = {
             "route": route_name,
@@ -804,6 +813,12 @@ class ModelDiscoveryMixin:
             warnings = {}
             self._embedding_space_change_warnings = warnings
         warnings[route_name] = warning
+
+    def _clear_embedding_space_change_warning(self, route_name: Optional[str]) -> None:
+        """Drop a stale space-change warning for *route_name* if one is recorded."""
+        warnings = getattr(self, "_embedding_space_change_warnings", None)
+        if isinstance(warnings, dict) and route_name in warnings:
+            warnings.pop(route_name, None)
 
     async def _get_corpus_embedding_profile(self) -> Optional[Dict[str, Any]]:
         """Return the DB's dominant existing embedding profile, or ``None`` (#2366).
@@ -898,8 +913,12 @@ class ModelDiscoveryMixin:
             caps["embedding_dim"] = int(dim)
         if chosen.is_pinned:
             # Operator intent — not an auto default. Drop any stale auto marker so
-            # the pin is honoured verbatim on subsequent discovery.
+            # the pin is honoured verbatim on subsequent discovery, and clear any
+            # space-change warning a prior auto-resolve left (a deliberate pin is
+            # not an accidental space split) so the settings GET stops surfacing
+            # a banner that no longer holds (#2372 round-4 stale readout).
             caps.pop("embedding_model_auto_resolved", None)
+            self._clear_embedding_space_change_warning(provider.get("name"))
         else:
             # Mark the write as auto-resolved so a later discovery (e.g. after the
             # reindex path clears the cache) does NOT mistake it for an operator

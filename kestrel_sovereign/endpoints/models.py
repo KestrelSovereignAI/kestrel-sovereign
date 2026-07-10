@@ -1977,8 +1977,14 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
 
     llm_service = agent.llm_service
 
-    # (1) Apply the persisted embedding_route so we resolve the profile the
-    # live agent actually uses (route changes since boot included).
+    # (1) Load the persisted embedding_route so we resolve the profile the
+    # live agent actually uses (route changes since boot included). Applying it
+    # is deferred until AFTER capabilities are reconciled (step 3): a cleared
+    # per-route pin drops ``supports_embeddings``, and ``set_embedding_route``'s
+    # sync validator (``_validate_embedding_route``) would reject the route as
+    # "does not advertise embedding support" if it ran against the stale flag —
+    # 409'ing before the fix could re-advertise capability (#2372).
+    found, route = False, None
     if db is not None:
         try:
             found, route = await cli_embeddings._load_persisted_embedding_route(
@@ -1987,23 +1993,6 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
         except Exception as exc:
             logger.debug("could not load persisted embedding_route: %s", exc)
             found, route = False, None
-        if found:
-            # If the persisted route can't be applied, REFUSE — continuing would
-            # silently reindex production rows into whatever route was already
-            # active (the wrong embedding profile). Mirrors the CLI, which exits
-            # non-zero here (cli_embeddings._reindex ~line 566) rather than
-            # falling through to the previously-active route.
-            try:
-                llm_service.set_embedding_route(route, persist=False)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"the persisted embedding_route {route!r} is no longer "
-                        f"valid ({exc}); fix the embedding route (via the "
-                        "settings API/UI or config) before reindexing."
-                    ),
-                )
 
     # (2) Bypass whatever the embedding resolver cached so a changed route /
     # re-pinned model is re-discovered instead of served stale.
@@ -2013,7 +2002,42 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
         except Exception:  # pragma: no cover - defensive
             pass
 
-    # (3) Resolve the active route's (model, dim) through the SINGLE #2372
+    # (3) Re-advertise capability across every discovering route BEFORE applying
+    # the persisted route: a cleared per-route pin drops ``supports_embeddings``,
+    # and both ``set_embedding_route``'s validator and
+    # ``resolve_embedding_provider`` gate on that sync flag — so without this the
+    # cleared-pin route is rejected (409) or resolves to None here (the wrong /
+    # stale profile the settings GET now avoids) rather than the corpus/catalog
+    # default. Mirrors the settings POST + ``aget_embedding_settings`` ordering so
+    # the reindex target and the settings GET agree in the cleared-pin state
+    # (#2372).
+    if hasattr(llm_service, "reconcile_embedding_capabilities"):
+        try:
+            await llm_service.reconcile_embedding_capabilities(use_cache=True)
+        except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            logger.debug("reindex embedding capability reconcile skipped: %s", exc)
+
+    # (4) Now apply the persisted route — capability has been re-advertised, so a
+    # cleared-pin route that legitimately discovers embedding models validates
+    # instead of 409'ing on the stale flag. If it still can't be applied, REFUSE:
+    # continuing would silently reindex production rows into whatever route was
+    # already active (the wrong embedding profile). Mirrors the CLI, which exits
+    # non-zero here (cli_embeddings._reindex ~line 566) rather than falling
+    # through to the previously-active route.
+    if found:
+        try:
+            llm_service.set_embedding_route(route, persist=False)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"the persisted embedding_route {route!r} is no longer "
+                    f"valid ({exc}); fix the embedding route (via the "
+                    "settings API/UI or config) before reindexing."
+                ),
+            )
+
+    # (5) Resolve the active route's (model, dim) through the SINGLE #2372
     # resolver so the reindex target matches the settings GET and the route-model
     # echo — the #2372 failure was three surfaces resolving three different
     # profiles (including a stale one) for the same cleared-pin state.

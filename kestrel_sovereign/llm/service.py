@@ -1076,7 +1076,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         through the single :meth:`resolve_route_embedding_model` (the #2366 order
         with normalized matching) BEFORE the sync read, so the GET falls through
         corpus-match → catalog fallback instead of reporting ``None``.
+
+        Round-4 (#2372): a cleared per-route pin drops the route's
+        ``supports_embeddings`` flag, and ``resolve_embedding_provider`` GATES
+        the explicit-route branch on that sync flag — so it returned ``None``
+        (silent-off) before we ever got a provider to resolve, even though the
+        route could still discover a capable model. The capability advertise and
+        the resolution are circular (can't advertise without resolving, won't
+        resolve the provider ``resolve_embedding_provider`` gates away). Break the
+        cycle by re-advertising capability across every discovering route FIRST
+        (the single resolver, funnelled through ``reconcile_embedding_capabilities``)
+        so the read is self-sufficient regardless of whether the caller
+        pre-reconciled. Best-effort — a discovery hiccup must never fail the read.
         """
+        if hasattr(self, "reconcile_embedding_capabilities"):
+            try:
+                await self.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as exc:  # pragma: no cover - never fail the read
+                logger.debug("embedding capability reconcile skipped in aget: %s", exc)
         provider = self.resolve_embedding_provider()
         if provider is not None:
             try:
