@@ -162,3 +162,18 @@ test('a pending create resolved AFTER dismissal never hides an unrelated modal o
         'unrelated modal untouched by the stale success');
     Modal.hide();
 });
+
+test('names beyond the server 64-char bound are rejected client-side (codex P3)', async () => {
+    Modal.hide();
+    const posted = [];
+    const api = { createAgent: async (n) => { posted.push(n); return { success: true }; } };
+    openCreateAgentDialog({ modal: Modal, api, onCreated: () => {} });
+    await tick();
+    typeName('a'.repeat(65));
+    clickCreate();
+    await tick();
+    assert.deepEqual(posted, [], 'no POST for an over-length name');
+    const err = document.getElementById('create-agent-error');
+    assert.ok(err && err.textContent.length > 0, 'inline validation error shown');
+    Modal.hide();
+});

@@ -15,7 +15,7 @@
 
 // Client-side mirror of the server's `_AGENT_NAME_RE`
 // (endpoints/models.py) so a bad name gives instant feedback before the POST.
-const AGENT_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+const AGENT_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;  // mirrors the server's 64-char bound
 
 const INPUT_ID = 'create-agent-name-input';
 const ERROR_ID = 'create-agent-error';

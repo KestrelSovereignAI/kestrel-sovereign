@@ -827,6 +827,16 @@ function goToSpawnTab() {
 
 function openNewAgentFlow() {
     const spawnAvailable = !!document.querySelector('.nav-tab[data-panel="spawn"]');
+    // POST /api/agents needs the multi-agent manager — in a standalone
+    // (single-agent) console it unconditionally 400s, so the Create dialog
+    // would be a primary action that can never succeed (codex P2). Route
+    // straight to the legacy Spawn flow there instead.
+    const isStandalone = !!(agentListDefaultAdapter
+        && agentListDefaultAdapter.mode === 'standalone');
+    if (isStandalone) {
+        if (!goToSpawnTab()) Toast.info('Creating a new agent requires the Spawn feature.');
+        return;
+    }
     openCreateAgentDialog({
         modal: Modal,
         api: API,
