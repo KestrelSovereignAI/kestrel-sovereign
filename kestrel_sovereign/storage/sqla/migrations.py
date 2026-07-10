@@ -511,6 +511,46 @@ async def _migrate_pg_greenfield(db: "AsyncDatabase", *, table: str) -> None:
 
 # --- #1477 embedding_profile_id stamping ------------------------------------
 
+async def migrate_conversation_lexical_index(db: "AsyncDatabase") -> None:
+    """Create the #2339 keyed blind-token index on both storage backends."""
+    async with db.transaction():
+        if db.backend_type == "postgres":
+            await db.execute(
+                "ALTER TABLE conversation_history ADD COLUMN IF NOT EXISTS "
+                "lexical_index_id TEXT"
+            )
+            await db.execute(
+                "ALTER TABLE conversation_history ADD COLUMN IF NOT EXISTS "
+                "lexical_index_version TEXT"
+            )
+        else:
+            for column in ("lexical_index_id", "lexical_index_version"):
+                exists = await db.fetchone(
+                    "SELECT COUNT(*) FROM pragma_table_info('conversation_history') "
+                    "WHERE name = ?",
+                    (column,),
+                )
+                if not exists or not exists[0]:
+                    await db.execute(
+                        f"ALTER TABLE conversation_history ADD COLUMN {column} TEXT"
+                    )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS conversation_lexical_tokens ("
+            "agent_id TEXT NOT NULL, lexical_index_id TEXT NOT NULL, "
+            "token_hash TEXT NOT NULL, "
+            "PRIMARY KEY (agent_id, lexical_index_id, token_hash))"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_lexical_token_lookup "
+            "ON conversation_lexical_tokens(agent_id, token_hash)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_lexical_coverage "
+            "ON conversation_history(agent_id, lexical_index_version, "
+            "lexical_index_id)"
+        )
+
+
 async def migrate_add_embedding_profile_id(
     db: "AsyncDatabase", *, table: str
 ) -> None:

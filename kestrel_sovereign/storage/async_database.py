@@ -59,10 +59,22 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     model TEXT DEFAULT NULL,
     provider TEXT DEFAULT NULL,
     metadata TEXT,
+    lexical_index_id TEXT DEFAULT NULL,
+    lexical_index_version TEXT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP DEFAULT NULL,
     archived_at TIMESTAMP DEFAULT NULL
 );
+
+CREATE TABLE IF NOT EXISTS conversation_lexical_tokens (
+    agent_id TEXT NOT NULL,
+    lexical_index_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    PRIMARY KEY (agent_id, lexical_index_id, token_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_lexical_token_lookup
+    ON conversation_lexical_tokens(agent_id, token_hash);
 
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_id ON conversation_history(agent_id);
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_created_at
@@ -879,6 +891,19 @@ class AsyncDatabase:
                 "filtered kNN reads will skip those rows. Operators "
                 "should re-run ``kestrel-sovereign embeddings reindex`` "
                 "once the underlying cause is fixed.", e, exc_info=True,
+            )
+
+        # #2339 — keyed blind-token index for exact recall over encrypted
+        # conversation rows. Missing coverage remains on the full-scan fallback,
+        # so migration failure degrades performance rather than correctness.
+        try:
+            from .sqla.migrations import migrate_conversation_lexical_index
+            await migrate_conversation_lexical_index(self)
+        except Exception as e:
+            logger.error(
+                "conversation lexical-index migration failed: %s. Exact "
+                "legacy recall will keep using the decrypt-scan bridge until "
+                "the next successful migration.", e, exc_info=True,
             )
 
         # compress → compact terminology rename: rewrite persisted
