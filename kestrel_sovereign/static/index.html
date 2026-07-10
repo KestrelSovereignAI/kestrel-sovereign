@@ -189,12 +189,18 @@
                                 </div>
                                 <div class="model-settings-section">
                                     <div class="model-settings-section-title" data-label-key="model_settings_embeddings_section">Embeddings</div>
+                                    <!-- #2337 — featured "Universal" option, pinned at the top:
+                                         local + cloud, one search space; works in every privacy mode. -->
+                                    <button id="embedding-universal" class="btn btn-secondary text-sm embedding-universal" type="button" style="display: none;" title="Recommended: one searchable memory space across local and cloud sessions."></button>
+                                    <div id="embedding-setup-status" class="embedding-setup-status" style="display: none;"></div>
                                     <select id="embedding-mode-selector" class="model-selector" title="Embedding provider mode">
                                         <option value="auto" data-label-key="model_settings_embeddings_auto">Auto — follow chat provider</option>
                                         <option value="explicit" data-label-key="model_settings_embeddings_explicit">Choose provider…</option>
                                         <option value="off" data-label-key="model_settings_embeddings_off">Off — keyword search only</option>
                                     </select>
                                     <select id="embedding-route-selector" class="model-selector" title="Embedding provider:route" style="display: none;"></select>
+                                    <!-- #2337 — per-route embedding-model picker (runtime equivalent of the TOML embedding_model key). -->
+                                    <select id="embedding-model-selector" class="model-selector" title="Embedding model for this route" style="display: none;"></select>
                                     <div id="embedding-dim-readout" class="embedding-dim-readout"></div>
                                     <div id="embedding-dim-warning" class="embedding-dim-warning" style="display: none;"></div>
                                     <!-- #2336 — actionable "Re-embed N memories" when stale_rows > 0 -->

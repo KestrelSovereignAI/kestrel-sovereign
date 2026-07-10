@@ -453,6 +453,79 @@ class ModelDiscoveryMixin:
 
         return [m for norm, m in local_norm.items() if norm in cloud_norm]
 
+    async def universal_embedding_space_options(self) -> List[dict]:
+        """Featured "Universal" options: shared models WITH member routes (#2337).
+
+        :meth:`shared_embedding_space_candidates` proves a model is usable both
+        locally and in the cloud, but returns only the LOCAL entry — not enough
+        for the embeddings UI's featured "Universal — <model> (local + cloud,
+        one search space)" option, which on selection must pin the model on
+        EVERY member route. This enriches each shared candidate with its member
+        routes, each carrying that route's OWN model id (the same weights are
+        ``qwen3-embedding-0.6b`` on Ollama but ``qwen/qwen3-embedding-0.6b`` on
+        OpenRouter — guided setup must pin each route's real slug, not one id
+        forced across both). Computed by intersection, never hardcoded to qwen3.
+
+        Each option::
+
+            {"model": "<display id>", "display_name": str,
+             "dim": int|None, "dim_options": [int, ...],
+             "members": [{"route": "<vendor>:<route>", "model": "<route slug>",
+                          "provider": str, "is_local": bool,
+                          "native_dim": int|None, "dim_options": [int, ...]}, ...]}
+        """
+        from .embedding_discovery import normalize_embedding_model_id
+
+        shared = await self.shared_embedding_space_candidates()
+        if not shared:
+            return []
+
+        all_models = await self.discover_embedding_models()
+        by_norm: Dict[str, List["EmbeddingModelInfo"]] = {}
+        for m in all_models:
+            by_norm.setdefault(normalize_embedding_model_id(m.id), []).append(m)
+
+        # Map route name -> is_local so members can be labelled without a second
+        # discovery pass.
+        local_routes = {
+            p.get("name")
+            for p in (self.providers if isinstance(self.providers, list) else [])
+            if p.get("is_local")
+        }
+
+        options: List[dict] = []
+        for cand in shared:
+            norm = normalize_embedding_model_id(cand.id)
+            members = []
+            seen_routes: set = set()
+            for m in by_norm.get(norm, []):
+                if not m.route or m.route in seen_routes:
+                    continue
+                seen_routes.add(m.route)
+                members.append(
+                    {
+                        "route": m.route,
+                        "model": m.id,
+                        "provider": m.provider,
+                        "is_local": m.route in local_routes,
+                        "native_dim": m.native_dim,
+                        "dim_options": list(m.dim_options),
+                    }
+                )
+            # Only a model reachable on at least two DISTINCT routes is universal.
+            if len(members) < 2:
+                continue
+            options.append(
+                {
+                    "model": cand.id,
+                    "display_name": cand.display_name,
+                    "dim": cand.native_dim,
+                    "dim_options": list(cand.dim_options),
+                    "members": members,
+                }
+            )
+        return options
+
     async def resolve_default_embedding_model(
         self, provider: dict
     ) -> Optional["EmbeddingModelInfo"]:

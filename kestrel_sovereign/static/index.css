@@ -2125,6 +2125,21 @@ a.todo-link:hover { text-decoration: underline; }
     color: var(--text-secondary, var(--text-primary));
 }
 
+/* #2337 — featured "Universal" option pinned at the top of the section. */
+.embedding-universal {
+    align-self: stretch;
+    text-align: left;
+    font-size: 0.75rem;
+    line-height: 1.3;
+    border-color: var(--accent-color, #2563eb);
+}
+
+.embedding-setup-status {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--text-secondary, var(--text-primary));
+}
+
 /* Model Controls Container */
 .model-controls {
     display: flex;
