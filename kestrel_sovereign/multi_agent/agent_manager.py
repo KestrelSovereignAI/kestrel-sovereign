@@ -359,6 +359,21 @@ class AgentManager:
         budget = self._mandate_budget(mandate)
         if budget <= 0:
             return
+        # Budgets are enforced IN-PROCESS only: the ceiling + hold live in memory
+        # and are released on termination/shutdown. A persistent (non-TTL) child
+        # could outlive the process and be reloaded WITHOUT the delegated wrapper,
+        # bypassing the cap — so restrict budgets to ephemeral (TTL-bounded)
+        # children, which are torn down within the process and never reloaded.
+        # Durable budgets for persistent children (persist `spent` + rehydrate on
+        # load + crash reconciliation) are tracked in #2348.
+        ttl = getattr(mandate, "ttl_seconds", 0) or 0
+        if ttl <= 0:
+            raise ValueError(
+                "Spawn refused: a per-child budget requires an ephemeral child "
+                "(ttl_seconds > 0). Budgets are enforced in-process and are not yet "
+                "durable across a reload of a persistent child (#2348). Set a TTL, "
+                "or spawn without a budget."
+            )
         parent_wallet = getattr(parent_agent, "wallet", None)
         if parent_wallet is None:
             raise ValueError(

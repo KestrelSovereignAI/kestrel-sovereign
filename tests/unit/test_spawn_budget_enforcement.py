@@ -369,6 +369,26 @@ async def test_direct_remove_parent_tears_down_budgeted_subtree():
 
 
 @pytest.mark.asyncio
+async def test_budget_refused_for_persistent_child():
+    """Budgets are in-process only, so they're restricted to ephemeral (TTL)
+    children that can't be reloaded uncapped; a persistent spawn is refused."""
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    parent = SimpleNamespace(
+        _private_key=None, identity=None, agent_id="did:p", features={},
+        wallet=FakeWallet(initial_balance=Decimal("100")),
+    )
+    child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
+    mgr = _mgr_with_mock_child(child)
+
+    mandate = SpawnMandate(
+        parent_did="did:p", purpose="x", budget_allocation=Decimal("30"), ttl_seconds=0,
+    )
+    with pytest.raises(ValueError, match="ephemeral"):
+        await mgr.spawn_agent("Kid", parent, mandate)
+
+
+@pytest.mark.asyncio
 async def test_budget_refused_without_funded_parent_wallet():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
