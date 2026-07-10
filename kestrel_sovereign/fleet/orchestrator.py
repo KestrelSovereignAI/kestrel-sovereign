@@ -22,10 +22,16 @@ The Fleet Orchestrator needs three narrowings that the coarse ``multi_agent.toml
    ``WorkflowsFeature`` mixes ``workflow_run`` with mutating tools
    (``workflow_cancel`` …); ``GitHubFeature`` mixes reads with issue/PR writes;
    ``SchedulerFeature`` mixes status reads with cron-mutating tools
-   (``schedule_add`` …). A feature-class allowlist cannot keep the reads while
-   denying the mutations, so the split is expressed as a tool-level deny-list
-   derived from the tool names those features actually load — see
-   :data:`RESTRICTED_TOOLS`.
+   (``schedule_add`` …); ``MemoryFeature`` mixes recall/search reads with
+   destructive delete/purge/restore tools; ``ReflectionFeature`` mixes the
+   ``reflect`` triage sweep + read tools with self-model/training mutations. A
+   feature-class allowlist cannot keep the reads while denying the mutations, so
+   the split is expressed as a tool-level deny-list **derived from the tool names
+   those features actually load** — see :data:`RESTRICTED_TOOLS`. The derivation
+   is audited: :func:`unclassified_tool_names` reconciles every ceiling feature's
+   registered @tool names (via :data:`FEATURE_TOOL_MODULES`) against the
+   allow/deny classification, and the unit tests fail closed on any tool a future
+   feature version adds that is neither allowed nor denied.
 2b. **An intra-tool argument deny-list** — ``workflow_run`` must be *kept* (it is
    the dispatch surface) but scoped to a single workflow. A tool-name allowlist
    cannot express "``workflow_run`` but only for ``fleet_coding_pipeline``", so
@@ -118,6 +124,29 @@ FEATURE_ALLOWLIST = frozenset(
     }
 )
 
+# Where each ceiling feature class is imported from — the source of truth for the
+# derived deny-list audit (test_fleet_orchestrator_definition). Every ceiling
+# feature's registered @tool names must be reconciled against the allow/deny
+# classification here: a name that is neither allowed nor denied fails the audit,
+# so a future feature version adding a tool can never silently widen the agent's
+# reach. In-tree features are always importable; external feature packages are
+# skipped by the audit when not installed (they are covered wherever installed).
+FEATURE_TOOL_MODULES: Dict[str, Tuple[str, str]] = {
+    "WorkflowsFeature": ("kestrel_feature_workflows", "WorkflowsFeature"),
+    "TalonCoordinatorFeature": (
+        "kestrel_sovereign.features.talon.coordinator",
+        "TalonCoordinatorFeature",
+    ),
+    "GitHubFeature": ("kestrel_feature_github", "GitHubFeature"),
+    "SchedulerFeature": (
+        "kestrel_sovereign.features.scheduler.feature",
+        "SchedulerFeature",
+    ),
+    "ReflectionFeature": ("kestrel_feature_reflection", "ReflectionFeature"),
+    "MemoryFeature": ("kestrel_sovereign.features.memory.feature", "MemoryFeature"),
+}
+
+
 # Feature classes that MUST NOT be in the ceiling — asserted by the tests as the
 # structural "no write/edit/file tools" guarantee (their tools never load).
 FORBIDDEN_FEATURES = frozenset(
@@ -140,6 +169,7 @@ WORKFLOW_TOOLS = frozenset(
         "workflow_list_runs",
         "workflow_history",
         "workflow_list_definitions",
+        "workflow_list_builtin",
         "workflow_load_builtin",
     }
 )
@@ -178,7 +208,59 @@ GITHUB_READ_TOOLS = frozenset(
     }
 )
 
-TOOL_ALLOWLIST = WORKFLOW_TOOLS | TALON_READ_TOOLS | GITHUB_READ_TOOLS
+# Scheduler READ / status tools (verified against features/scheduler/feature.py
+# @tool names). SchedulerFeature is in the ceiling for these (they feed the
+# kestrel-claws Signals tab); its cron-mutating tools are denied below.
+SCHEDULER_READ_TOOLS = frozenset(
+    {
+        "schedule_list",
+        "schedule_history",
+        "schedule_engagement",
+    }
+)
+
+# Memory READ / recall tools (verified against features/memory/feature.py @tool
+# names). MemoryFeature is in the ceiling because the reflection sweep rides the
+# sleep/consolidation cycle; the orchestrator itself only reads memory for triage
+# context. Its delete/purge/restore/update tools are denied below.
+MEMORY_READ_TOOLS = frozenset(
+    {
+        "search_memory",
+        "search_documents",
+        "search_case_law",
+        "recall_recent",
+        "recall_interactions",
+        "recall_decisions",
+        "recall_action_items",
+        "recall_emotional",
+        "get_episodes",
+        "list_conversations",
+        "list_trashed_messages",
+        "memory_status",
+    }
+)
+
+# Reflection READ tools + the `reflect` triage sweep (verified against
+# kestrel_feature_reflection @tool names). `reflect` is the orchestrator's core
+# triage loop (see REFLECTION_SCHEDULE); the self-model/improvement/training
+# mutation tools are denied below.
+REFLECTION_READ_TOOLS = frozenset(
+    {
+        "reflect",
+        "get_behavior_rules",
+        "get_insights",
+        "get_self_model",
+    }
+)
+
+TOOL_ALLOWLIST = (
+    WORKFLOW_TOOLS
+    | TALON_READ_TOOLS
+    | GITHUB_READ_TOOLS
+    | SCHEDULER_READ_TOOLS
+    | MEMORY_READ_TOOLS
+    | REFLECTION_READ_TOOLS
+)
 
 
 # ---------------------------------------------------------------------------
@@ -269,11 +351,51 @@ WRITE_EDIT_FILE_TOOLS = frozenset(
     }
 )
 
+# Memory mutation tools (verified against features/memory/feature.py @tool
+# names). MemoryFeature is in the ceiling for its read/recall surface, but it
+# also bundles destructive tools that delete/purge/restore conversations and
+# messages, mutate claim nodes, resolve person identities, and run the
+# consolidation pipeline. None are needed for fleet triage and all mutate the
+# agent's own memory, so they are hard-denied. (`memory_consolidate` still runs
+# as its built-in scheduled task; denying the tool only blocks the agent from
+# invoking it directly.)
+MEMORY_MUTATION_TOOLS = frozenset(
+    {
+        "delete_conversation",
+        "delete_message_by_id",
+        "delete_messages",
+        "purge_conversation",
+        "purge_message_by_id",
+        "restore_conversation",
+        "restore_message_by_id",
+        "mark_superseded",
+        "update_action_item",
+        "confirm_person_match",
+        "memory_consolidate",
+    }
+)
+
+# Reflection mutation tools (verified against kestrel_feature_reflection @tool
+# names). ReflectionFeature is in the ceiling for the `reflect` triage sweep and
+# its read tools; the tools that mutate the self-model, file improvement
+# tickets/proposals, or kick off a training cycle are denied — the orchestrator
+# commissions all change through fleet_coding_pipeline, never by self-modifying.
+REFLECTION_MUTATION_TOOLS = frozenset(
+    {
+        "update_self_model",
+        "propose_improvement",
+        "create_improvement_ticket",
+        "training_cycle",
+    }
+)
+
 RESTRICTED_TOOLS = (
     TALON_DISPATCH_TOOLS
     | WORKFLOW_MUTATION_TOOLS
     | GITHUB_WRITE_TOOLS
     | SCHEDULER_MUTATION_TOOLS
+    | MEMORY_MUTATION_TOOLS
+    | REFLECTION_MUTATION_TOOLS
     | WRITE_EDIT_FILE_TOOLS
 )
 
@@ -374,6 +496,34 @@ def additional_constraints() -> Dict[str, Any]:
             for tool, spec in RESTRICTED_TOOL_ARGS.items()
         },
     }
+
+
+def registered_tool_names(feature_cls: Any) -> frozenset:
+    """Enumerate the @tool names a :class:`Feature` class actually registers.
+
+    Reads the ``_tool_schema["name"]`` the SDK ``@tool`` decorator stamps on each
+    decorated method (no instantiation required), so it reflects the tool names
+    the feature *actually* loads at runtime — the enumeration the derived-deny
+    audit reconciles against the allow/deny classification.
+    """
+    names = set()
+    for attr in dir(feature_cls):
+        try:
+            member = getattr(feature_cls, attr)
+        except Exception:  # noqa: BLE001 — skip descriptors that error on access
+            continue
+        schema = getattr(member, "_tool_schema", None)
+        if isinstance(schema, dict) and schema.get("name"):
+            names.add(schema["name"])
+    return frozenset(names)
+
+
+def unclassified_tool_names(feature_cls: Any) -> frozenset:
+    """The registered tool names of ``feature_cls`` that are neither allowed nor
+    denied. A non-empty result means the deny-list has drifted from what the
+    feature loads — the audit fails so the new tool is classified explicitly."""
+    classified = TOOL_ALLOWLIST | RESTRICTED_TOOLS | frozenset(RESTRICTED_TOOL_ARGS)
+    return registered_tool_names(feature_cls) - classified
 
 
 def is_tool_allowed(tool_name: str) -> bool:

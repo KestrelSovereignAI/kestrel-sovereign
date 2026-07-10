@@ -136,6 +136,81 @@ def test_allowlist_and_denylist_are_disjoint():
     assert not (fo.TOOL_ALLOWLIST & fo.RESTRICTED_TOOLS)
 
 
+# ---------------------------------------------------------------------------
+# Derived-not-hand-maintained deny-list audit (P2 #2321).
+#
+# For EVERY feature in the ceiling, enumerate the tool names it actually
+# registers (the same @tool `_tool_schema["name"]` the runtime loads) and assert
+# each is classified — allowed (read) OR denied (mutation) OR arg-restricted.
+# A tool that is neither fails the audit, so a future feature version adding a
+# tool can never silently widen the agent's reach: the test breaks until someone
+# classifies it. In-tree features are always importable; external feature
+# packages are skipped when not installed (covered wherever they ARE installed).
+# ---------------------------------------------------------------------------
+
+
+def _load_feature_cls(feature_name):
+    module_path, cls_name = fo.FEATURE_TOOL_MODULES[feature_name]
+    module = pytest.importorskip(
+        module_path, reason=f"{feature_name} not installed in this environment"
+    )
+    return getattr(module, cls_name)
+
+
+@pytest.mark.parametrize("feature_name", sorted(fo.FEATURE_ALLOWLIST))
+def test_every_ceiling_feature_tool_is_classified(feature_name):
+    """Fail-closed audit: no registered tool of a ceiling feature may be left
+    unclassified. This is what makes the deny-list derived, not hand-maintained
+    against intent — a new mutating tool in a feature upgrade trips this test."""
+    cls = _load_feature_cls(feature_name)
+    registered = fo.registered_tool_names(cls)
+    assert registered, f"{feature_name} registered no @tool names — enumeration broke"
+    unclassified = fo.unclassified_tool_names(cls)
+    assert not unclassified, (
+        f"{feature_name} exposes tool(s) that are neither allowed nor denied: "
+        f"{sorted(unclassified)}. Classify each as a read (TOOL_ALLOWLIST) or a "
+        f"mutation (RESTRICTED_TOOLS)."
+    )
+
+
+def test_memory_destructive_tools_are_denied():
+    """Regression for the P2 audit gap: MemoryFeature bundles delete/purge tools
+    the orchestrator must never invoke directly. They ARE in the deny-list."""
+    for tool in (
+        "delete_conversation",
+        "delete_message_by_id",
+        "delete_messages",
+        "purge_conversation",
+        "purge_message_by_id",
+        "restore_conversation",
+        "restore_message_by_id",
+        "mark_superseded",
+        "update_action_item",
+        "confirm_person_match",
+        "memory_consolidate",
+    ):
+        assert fo.is_tool_denied(tool), f"{tool} must be denied"
+    # Reads stay available.
+    for tool in ("search_memory", "recall_recent", "memory_status", "get_episodes"):
+        assert fo.is_tool_allowed(tool)
+        assert not fo.is_tool_denied(tool)
+
+
+def test_reflection_mutation_tools_are_denied():
+    """ReflectionFeature is in the ceiling for the `reflect` triage sweep + reads;
+    its self-model/training mutation tools are hard-denied."""
+    for tool in (
+        "update_self_model",
+        "propose_improvement",
+        "create_improvement_ticket",
+        "training_cycle",
+    ):
+        assert fo.is_tool_denied(tool), f"{tool} must be denied"
+    for tool in ("reflect", "get_behavior_rules", "get_insights", "get_self_model"):
+        assert fo.is_tool_allowed(tool)
+        assert not fo.is_tool_denied(tool)
+
+
 def test_talon_read_and_dispatch_tools_do_not_overlap():
     assert not (fo.TALON_READ_TOOLS & fo.TALON_DISPATCH_TOOLS)
 

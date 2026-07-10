@@ -11,6 +11,7 @@ from kestrel_sovereign.fleet.orchestrator import (
     FLEET_ORCHESTRATOR_NAME,
     FLEET_ORCHESTRATOR_SLUG,
     FEATURE_ALLOWLIST,
+    FEATURE_TOOL_MODULES,
     TOOL_ALLOWLIST,
     RESTRICTED_TOOLS,
     RESTRICTED_TOOL_ARGS,
@@ -24,12 +25,15 @@ from kestrel_sovereign.fleet.orchestrator import (
     is_tool_allowed,
     is_tool_call_allowed,
     is_tool_denied,
+    registered_tool_names,
+    unclassified_tool_names,
 )
 
 __all__ = [
     "FLEET_ORCHESTRATOR_NAME",
     "FLEET_ORCHESTRATOR_SLUG",
     "FEATURE_ALLOWLIST",
+    "FEATURE_TOOL_MODULES",
     "TOOL_ALLOWLIST",
     "RESTRICTED_TOOLS",
     "RESTRICTED_TOOL_ARGS",
@@ -43,4 +47,6 @@ __all__ = [
     "is_tool_allowed",
     "is_tool_call_allowed",
     "is_tool_denied",
+    "registered_tool_names",
+    "unclassified_tool_names",
 ]
