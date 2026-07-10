@@ -342,6 +342,7 @@ class EmbeddingReindexer:
                 pending.append((row_id, text))
 
             if pending:
+                batch_failed = False
                 try:
                     embeddings = await self.service.aembed_batch(
                         [t for _, t in pending]
@@ -351,12 +352,14 @@ class EmbeddingReindexer:
                         "aembed_batch failed for %s batch (%s); skipping batch.",
                         table, exc,
                     )
-                    stats.failed += len(pending)
+                    batch_failed = True
                     embeddings = [None] * len(pending)
 
+                empty_in_batch = 0
                 for (row_id, _text), embedding in zip(pending, embeddings):
                     if not embedding:
                         stats.failed += 1
+                        empty_in_batch += 1
                         continue
                     if self.column_dim is not None and len(embedding) != self.column_dim:
                         stats.skipped_dim_mismatch += 1
@@ -370,6 +373,19 @@ class EmbeddingReindexer:
                             table, row_id, exc,
                         )
                         stats.failed += 1
+
+                # A dead / mis-resolved embedding service returns empty vectors
+                # for every row with no exception — the exact silent
+                # scanned-N/reembedded-0 failure of #2360. Make it loud: without
+                # this log an operator sees only "0 re-embedded, error: null".
+                if empty_in_batch and not batch_failed:
+                    logger.warning(
+                        "reindex %s: embedding service returned empty vectors "
+                        "for %d/%d rows in this batch (nothing written). The "
+                        "resolved embedding service is likely dead or "
+                        "mis-configured — check the active embedding route.",
+                        table, empty_in_batch, len(pending),
+                    )
 
             if progress is not None:
                 progress(stats)

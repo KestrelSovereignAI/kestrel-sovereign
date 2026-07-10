@@ -1780,7 +1780,8 @@ async def set_route_embedding_model(request: Request):
 
 # In-memory registry of in-flight / recently-finished reindex jobs (#2336).
 # Keyed by opaque ``job_id``. A UI POSTs to start a job and then polls
-# ``GET /api/embedding/reindex/{job_id}`` until ``status`` is ``done``/``error``.
+# ``GET /api/embedding/reindex/{job_id}`` until ``status`` is a terminal state
+# (``done`` / ``partial`` / ``error``).
 # Re-embedding is idempotent + resumable (see storage.embedding_reindex), so a
 # lost job registry (process restart) loses no data — the operator just re-runs.
 _REINDEX_JOBS: Dict[str, Dict] = {}
@@ -1798,10 +1799,67 @@ def _reindex_job_public(job: Dict) -> Dict:
         "total_stale": job["total_stale"],
         "reembedded": dict(job["reembedded"]),
         "scanned": dict(job["scanned"]),
+        # Full per-table stats so failed / skipped_empty / skipped_dim_mismatch
+        # are visible instead of vanishing (#2360).
+        "stats": {t: dict(s) for t, s in job.get("stats", {}).items()},
         "total_reembedded": job["total_reembedded"],
+        "total_failed": job.get("total_failed", 0),
+        "total_skipped_empty": job.get("total_skipped_empty", 0),
+        "total_skipped_dim_mismatch": job.get("total_skipped_dim_mismatch", 0),
         "error": job["error"],
         "updated_at": job["updated_at"],
     }
+
+
+def _finalize_reindex_status(job: Dict) -> None:
+    """Set the terminal ``status``/``error`` from the accumulated stats (#2360).
+
+    ``done`` with ``total_reembedded == 0`` while rows were stale — or any
+    ``failed`` rows — is NOT success: a dead/mis-resolved embedding service
+    returns empty vectors for every row with no exception, which the old code
+    reported as ``status: done, error: null``. Classify honestly:
+
+    - ``error``   — stale rows existed but nothing was re-embedded (total wipe-
+      out; almost always a dead embedding service), or every attempt failed.
+    - ``partial`` — some rows re-embedded but some failed / were skipped for a
+      dimension mismatch (empty source text is expected and not counted here).
+    - ``done``    — all stale rows re-embedded, no failures.
+    """
+    total_reembedded = job["total_reembedded"]
+    total_failed = job.get("total_failed", 0)
+    total_dim_mismatch = job.get("total_skipped_dim_mismatch", 0)
+    total_stale = job.get("total_stale", 0)
+
+    if total_stale > 0 and total_reembedded == 0:
+        job["status"] = "error"
+        job["error"] = (
+            f"re-embedded 0 of {total_stale} stale row(s) "
+            f"({total_failed} failed, {total_dim_mismatch} dim-mismatch). "
+            "The resolved embedding service returned no usable vectors — it is "
+            "likely dead or mis-configured; check the active embedding route."
+        )
+        return
+    if total_failed or total_dim_mismatch:
+        job["status"] = "partial"
+        job["error"] = (
+            f"re-embedded {total_reembedded} row(s) but {total_failed} failed "
+            f"and {total_dim_mismatch} were skipped for a dimension mismatch."
+        )
+        return
+    job["status"] = "done"
+
+
+def _accumulate_reindex_stats(job: Dict) -> None:
+    """Recompute the job's roll-up totals from its per-table ``stats``."""
+    stats = job.get("stats", {})
+    job["total_reembedded"] = sum(job["reembedded"].values())
+    job["total_failed"] = sum(int(s.get("failed", 0)) for s in stats.values())
+    job["total_skipped_empty"] = sum(
+        int(s.get("skipped_empty", 0)) for s in stats.values()
+    )
+    job["total_skipped_dim_mismatch"] = sum(
+        int(s.get("skipped_dim_mismatch", 0)) for s in stats.values()
+    )
 
 
 async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
@@ -1811,7 +1869,8 @@ async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
             def _progress(stats, _tname=tname):
                 job["reembedded"][_tname] = stats.reembedded
                 job["scanned"][_tname] = stats.scanned
-                job["total_reembedded"] = sum(job["reembedded"].values())
+                job["stats"][_tname] = stats.as_dict()
+                _accumulate_reindex_stats(job)
                 job["updated_at"] = time.time()
 
             stats = await reindexer.reindex_table(
@@ -1819,8 +1878,9 @@ async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
             )
             job["reembedded"][tname] = stats.reembedded
             job["scanned"][tname] = stats.scanned
-        job["total_reembedded"] = sum(job["reembedded"].values())
-        job["status"] = "done"
+            job["stats"][tname] = stats.as_dict()
+        _accumulate_reindex_stats(job)
+        _finalize_reindex_status(job)
     except Exception as e:  # pragma: no cover - defensive; surfaced via status
         logger.error("reindex job %s failed: %s", job["job_id"], e, exc_info=True)
         job["status"] = "error"
@@ -1834,15 +1894,32 @@ def _prune_reindex_jobs() -> None:
     if len(_REINDEX_JOBS) <= _REINDEX_JOBS_MAX:
         return
     finished = sorted(
-        (j for j in _REINDEX_JOBS.values() if j["status"] in ("done", "error")),
+        (
+            j
+            for j in _REINDEX_JOBS.values()
+            if j["status"] in ("done", "error", "partial")
+        ),
         key=lambda j: j["updated_at"],
     )
     while len(_REINDEX_JOBS) > _REINDEX_JOBS_MAX and finished:
         _REINDEX_JOBS.pop(finished.pop(0)["job_id"], None)
 
 
-async def _resolve_reindex_target(agent):
+async def _resolve_reindex_target(agent, db=None, agent_id=None):
     """Resolve ``(embedding_service, target_profile_id, target_dim, column_dim)``.
+
+    Resolves the embedding service **fresh** from the currently-resolved route
+    so a route change made after the agent booted (or via the settings API) is
+    honoured — the #2360 live-dogfood failure was a stale/cached embedding
+    service that no longer matched the persisted route, producing scanned-N /
+    reembedded-0 with no error. Two things guarantee freshness, mirroring the
+    CLI's ``_reindex`` path:
+
+    1. Apply the agent's persisted runtime ``embedding_route`` (#2263) to the
+       live ``llm_service`` before resolving, so the endpoint targets the same
+       profile the live agent (and the CLI) resolve — not the config default.
+    2. Invalidate the per-instance embedding discovery cache so a re-pinned /
+       changed model is reflected instead of a stale resolution.
 
     Raises :class:`HTTPException` (409) with the same refusal reasons the CLI
     prints when reindexing can't proceed: no embedding provider resolves,
@@ -1851,7 +1928,45 @@ async def _resolve_reindex_target(agent):
     """
     from kestrel_sovereign import cli_embeddings
 
-    err, embedding_service, target = cli_embeddings._resolve_target(agent.llm_service)
+    llm_service = agent.llm_service
+
+    # (1) Apply the persisted embedding_route so we resolve the profile the
+    # live agent actually uses (route changes since boot included).
+    if db is not None:
+        try:
+            found, route = await cli_embeddings._load_persisted_embedding_route(
+                db, agent_id
+            )
+        except Exception as exc:
+            logger.debug("could not load persisted embedding_route: %s", exc)
+            found, route = False, None
+        if found:
+            # If the persisted route can't be applied, REFUSE — continuing would
+            # silently reindex production rows into whatever route was already
+            # active (the wrong embedding profile). Mirrors the CLI, which exits
+            # non-zero here (cli_embeddings._reindex ~line 566) rather than
+            # falling through to the previously-active route.
+            try:
+                llm_service.set_embedding_route(route, persist=False)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"the persisted embedding_route {route!r} is no longer "
+                        f"valid ({exc}); fix the embedding route (via the "
+                        "settings API/UI or config) before reindexing."
+                    ),
+                )
+
+    # (2) Bypass whatever the embedding resolver cached so a changed route /
+    # re-pinned model is re-discovered instead of served stale.
+    if hasattr(llm_service, "_embedding_discovery_cache"):
+        try:
+            llm_service._embedding_discovery_cache = None
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    err, embedding_service, target = cli_embeddings._resolve_target(llm_service)
     if err is not None:
         raise HTTPException(status_code=409, detail=err)
 
@@ -1933,15 +2048,16 @@ async def reindex_embeddings(request: Request):
         else:
             tables = REINDEX_TABLES
 
-        embedding_service, target, target_dim, column_dim = (
-            await _resolve_reindex_target(agent)
-        )
-
         db = _agent_raw_db(agent)
         if db is None:
             raise HTTPException(status_code=503, detail="Storage not available.")
 
         agent_id = getattr(agent, "agent_id", None)
+
+        embedding_service, target, target_dim, column_dim = (
+            await _resolve_reindex_target(agent, db=db, agent_id=agent_id)
+        )
+
         reindexer = EmbeddingReindexer(
             db, embedding_service, target, column_dim=column_dim
         )
@@ -1986,7 +2102,15 @@ async def reindex_embeddings(request: Request):
             "total_stale": total_stale,
             "reembedded": {t: 0 for t in tables},
             "scanned": {t: 0 for t in tables},
+            # Full per-table ReindexStats (#2360): failed / skipped_empty /
+            # skipped_dim_mismatch were previously computed but never surfaced,
+            # so 63 rows could vanish into invisible buckets while the job
+            # reported "done, error: null".
+            "stats": {t: {} for t in tables},
             "total_reembedded": 0,
+            "total_failed": 0,
+            "total_skipped_empty": 0,
+            "total_skipped_dim_mismatch": 0,
             "error": None,
             "updated_at": time.time(),
         }
