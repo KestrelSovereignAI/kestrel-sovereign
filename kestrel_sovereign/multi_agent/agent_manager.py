@@ -306,6 +306,10 @@ class AgentManager:
                 spawn_mandate=mandate,
             )
         except Exception as e:
+            # No agent came into being — release the reservation so repeated
+            # failures can't drain the allocator (codex P3 round 12). Ports of
+            # agents that EXISTED keep their never-reuse guarantee (#1729).
+            self._reserved_ports.discard(port)
             raise ValueError(f"Inception failed for '{name}': {e}")
 
         config = LocalAgentConfig(

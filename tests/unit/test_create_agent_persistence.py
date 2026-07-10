@@ -312,3 +312,27 @@ async def test_create_reserves_ports_from_the_current_file_and_validates_merge(t
     ports = [c.port for c in reloaded.agents.values() if isinstance(c, LocalAgentConfig)]
     assert len(ports) == len(set(ports)), "no port conflicts persisted"
     assert reloaded.agents["Newbie"].port not in (8801, 8802)
+
+
+@pytest.mark.asyncio
+async def test_persist_fails_closed_when_the_config_cannot_reload(tmp_path):
+    """codex P2 round 12: a malformed/unreadable toml must never be replaced
+    by the startup snapshot — persisted:false, file untouched."""
+    config_path = tmp_path / "multi_agent.toml"
+    config_path.write_text("this is [not valid toml ===")
+    original = config_path.read_text()
+    startup = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+    })
+    manager = MagicMock()
+    manager.create_agent = AsyncMock(return_value=SimpleNamespace(agent_id="did:x:n"))
+    manager._created_configs = {"Newbie": LocalAgentConfig(data_dir=Path("agent_data/Newbie"), port=8802)}
+    manager._reserved_ports = set()
+    req = _request_with_state(
+        agent_manager=manager,
+        multi_agent_config=startup,
+        multi_agent_config_path=config_path,
+    )
+    result = await create_agent.__wrapped__(req, CreateAgentRequest(name="Newbie"))
+    assert result["persisted"] is False, "refused the stale rewrite"
+    assert config_path.read_text() == original, "unreadable file left untouched for repair"

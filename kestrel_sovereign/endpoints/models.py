@@ -159,19 +159,24 @@ async def create_agent(request: Request, body: CreateAgentRequest):
     # every external change (codex P1 round 10). Case-insensitive: the toml is
     # the routing namespace and case-folded collisions are operator error.
     def _current_config():
+        """(config, path, reload_ok). For CONFIG-DRIVEN deployments a reload
+        failure fails CLOSED (codex P2 round 12): writing the startup
+        snapshot over a file we couldn't read would discard operator edits —
+        or clobber a malformed file mid-repair."""
         cfg_path = getattr(request.app.state, 'multi_agent_config_path', None)
         if cfg_path:
             from kestrel_sovereign.multi_agent.config import MultiAgentConfig as _MAC
             try:
-                return _MAC.from_file(cfg_path), cfg_path
+                return _MAC.from_file(cfg_path), cfg_path, True
             except Exception as reload_err:
-                logger.warning(
-                    f"Could not reload {cfg_path} ({reload_err}); "
-                    "using the startup-time config for this operation."
+                logger.error(
+                    f"Could not reload {cfg_path} ({reload_err}); refusing to "
+                    "persist over a file that can't be read (fail closed)."
                 )
-        return getattr(request.app.state, 'multi_agent_config', None), cfg_path
+                return getattr(request.app.state, 'multi_agent_config', None), cfg_path, False
+        return getattr(request.app.state, 'multi_agent_config', None), cfg_path, True
 
-    ma_config_pre, _ = _current_config()
+    ma_config_pre, _, _reload_ok_pre = _current_config()
     if ma_config_pre is not None:
         taken = {existing.lower() for existing in getattr(ma_config_pre, 'agents', {})}
         if name.lower() in taken:
@@ -203,8 +208,12 @@ async def create_agent(request: Request, body: CreateAgentRequest):
         # RE-read the on-disk config for the merge (codex P1 round 10): the
         # inception above awaited, so even our own pre-check snapshot may be
         # stale. The fresh object carries every external edit forward.
-        ma_config, config_path = _current_config()
-        if config_path and ma_config is not None:
+        ma_config, config_path, reload_ok = _current_config()
+        if config_path and not reload_ok:
+            # Agent is live but we refuse the stale rewrite — surfaced to the
+            # dialog exactly like a write failure.
+            persisted = False
+        elif config_path and ma_config is not None:
             try:
                 created_cfg = agent_manager._created_configs.get(name)
                 if created_cfg is not None:
