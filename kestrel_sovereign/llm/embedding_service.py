@@ -438,11 +438,29 @@ class ProviderEmbeddingService:
         if normalized_override is not None:
             self._normalized = bool(normalized_override)
 
+    def _embed_kwargs(self) -> dict[str, Any]:
+        """Adapter kwargs that carry the embedding-space identity.
+
+        ``embedding_dim`` is half of an embedding profile's identity
+        (``<model>@<dim>``), so it must ride EVERY embed request as the
+        Matryoshka ``dimensions`` param — not be left to whatever ambient
+        default the calling path happened to configure. Omitting it caused
+        the reindex endpoint to receive native-dim vectors (4096) that the
+        column guard then rejected as dim-mismatch even under an explicit
+        768 pin (#2371). Only forwarded when a dim is actually pinned;
+        adapters that don't support the param must truthfully not advertise
+        dim options rather than silently dropping it.
+        """
+        if self.embedding_dim is not None:
+            return {"dimensions": int(self.embedding_dim)}
+        return {}
+
     async def aembed(self, text: str) -> Optional[List[float]]:
         return await self.adapter.aembed(
             self.client,
             text,
             model=self.model,
+            **self._embed_kwargs(),
         )
 
     async def aembed_query(
@@ -467,6 +485,7 @@ class ProviderEmbeddingService:
             self.client,
             texts,
             model=self.model,
+            **self._embed_kwargs(),
         )
 
     def describe(self) -> Optional[EmbeddingProfile]:

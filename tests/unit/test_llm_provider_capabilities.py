@@ -723,12 +723,12 @@ class _ProbeAdapter:
     def provider_capabilities(self):
         return OpenAIAdapter().provider_capabilities()
 
-    async def aembed(self, client, text, model=None):
+    async def aembed(self, client, text, model=None, dimensions=None, **kwargs):
         if self._raise_exc is not None:
             raise self._raise_exc
         return self._vector
 
-    async def aembed_batch(self, client, texts, model=None):
+    async def aembed_batch(self, client, texts, model=None, dimensions=None, **kwargs):
         return [self._vector for _ in texts]
 
 
@@ -986,9 +986,13 @@ async def test_provider_embedding_service_uses_common_batch_contract():
 
     assert await service.aembed("hello") == [1.0, 2.0]
     assert await service.aembed_batch(["a", "b"]) == [[1.0, 2.0], None]
-    adapter.aembed.assert_awaited_once_with(client, "hello", model="embed-model")
+    # The pinned embedding_dim rides every embed as the Matryoshka
+    # ``dimensions`` param (#2371).
+    adapter.aembed.assert_awaited_once_with(
+        client, "hello", model="embed-model", dimensions=2
+    )
     adapter.aembed_batch.assert_awaited_once_with(
-        client, ["a", "b"], model="embed-model"
+        client, ["a", "b"], model="embed-model", dimensions=2
     )
 
 
