@@ -282,5 +282,11 @@ _PACKAGE_DIR = os.path.dirname(__file__)
 CONSTITUTION_PATH = os.path.join(_PACKAGE_DIR, 'data', 'KESTREL_CONSTITUTION.md')
 
 # --- Inception Service ---
-# Ensure the directory for trusted agents' keys exists
-os.makedirs(TRUSTED_AGENTS_DIR, exist_ok=True)
+# NOTE: the directory for trusted agents' keys is created lazily by the only
+# writer (KestrelAgent._create_agent_identity, which os.makedirs before writing
+# the .pem). Creating it here at import time was an eager, path-touching side
+# effect: it left a junk ``<KESTREL_DB_PATH>/trusted_agents/`` behind for
+# commands that go on to refuse (e.g. ``kestrel embeddings`` under a bogus
+# KESTREL_DB_PATH), and raised a raw OSError traceback from import when
+# KESTREL_DB_PATH pointed at an unwritable path — before any guard could turn
+# it into a clean refusal (#2362).
