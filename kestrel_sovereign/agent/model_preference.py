@@ -196,6 +196,30 @@ class ModelPreferenceMixin:
         except Exception as e:
             logging.warning(f"Failed to persist embedding_route: {e}")
 
+    async def _dominant_embedding_profile(self) -> Optional[Dict[str, Any]]:
+        """Return the DB's dominant existing embedding profile, or ``None`` (#2366).
+
+        Wired into the LLM service as the corpus-profile provider so auto
+        embedding-model resolution prefers a model that keeps new memories in
+        the same coordinate space the existing corpus already uses. Best-effort:
+        an empty corpus, an unreadable table, or a missing DB handle yields
+        ``None`` and resolution falls back to hint/catalog order.
+        """
+        try:
+            db = getattr(self._raw_storage, "db", None)
+            if db is None:
+                return None
+            from kestrel_sovereign.storage.embedding_reindex import (
+                dominant_embedding_profile,
+            )
+
+            return await dominant_embedding_profile(
+                db, agent_id=getattr(self, "agent_id", None)
+            )
+        except Exception as e:  # pragma: no cover - never break resolution
+            logging.debug(f"dominant embedding profile lookup failed: {e}")
+            return None
+
     async def _load_route_embedding_models(self) -> None:
         """Load persisted per-route embedding_model overrides (#2337).
 

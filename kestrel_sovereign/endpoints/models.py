@@ -1566,6 +1566,18 @@ async def get_embedding_settings(request: Request):
         agent = get_agent(request)
         if not hasattr(agent, "llm_service") or not agent.llm_service:
             raise HTTPException(status_code=503, detail="LLM service not available.")
+        # Fold live embedding discovery into route capabilities before reading
+        # settings (#2366). ``get_embedding_settings`` surfaces the corpus
+        # space-change warning from ``_embedding_space_change_warnings``, but that
+        # record is only produced by ``reconcile_embedding_capabilities`` (the
+        # POST/PUT paths reconcile; a fresh GET after startup would otherwise
+        # report stale/empty capability state and no warning). Best-effort — a
+        # discovery hiccup must not fail the read.
+        if hasattr(agent.llm_service, "reconcile_embedding_capabilities"):
+            try:
+                await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as e:  # pragma: no cover - never fail the GET
+                logger.debug(f"embedding capability reconcile skipped in GET: {e}")
         settings = agent.llm_service.get_embedding_settings()
         # #2289 — surface how many stored rows are on a different (or no)
         # embedding profile than the one currently resolved, so the UI can

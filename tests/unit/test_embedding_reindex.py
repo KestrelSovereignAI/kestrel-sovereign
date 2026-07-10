@@ -22,6 +22,7 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.embedding_reindex import (
     REINDEX_TABLES,
     EmbeddingReindexer,
+    dominant_embedding_profile,
 )
 
 TARGET = "targetprofile"
@@ -138,6 +139,64 @@ async def _profiles(database: AsyncDatabase, table: str, id_col: str):
         (),
     )
     return rows
+
+
+# ---------------------------------------------------- #2366 dominant profile
+
+
+async def _register_profile(
+    database: AsyncDatabase, pid: str, *, provider: str, model: str, dim: int,
+    space_id: str,
+) -> None:
+    await database.execute_commit(
+        "INSERT OR IGNORE INTO embedding_profiles "
+        "(id, provider, model, dim, space_id, normalized) VALUES (?, ?, ?, ?, ?, ?)",
+        (pid, provider, model, dim, space_id, 0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_dominant_embedding_profile_picks_majority(db):
+    await _seed(db)  # OTHER dominates: 3 conv + 1 saved + 1 chunk vs TARGET's 1.
+    await _register_profile(
+        db, OTHER, provider="ollama", model="qwen3-embedding-8b", dim=768,
+        space_id="qwen3-embedding-8b@768",
+    )
+    await _register_profile(
+        db, TARGET, provider="google", model="gemini-embedding-2", dim=3072,
+        space_id="google:gemini-embedding-2",
+    )
+    prof = await dominant_embedding_profile(db)
+    assert prof is not None
+    assert prof["profile_id"] == OTHER
+    assert prof["model"] == "qwen3-embedding-8b"
+    assert prof["dim"] == 768
+    # OTHER rows: conv a1(1)+a2(1) + saved(1) + chunk(1) = 4 (NULLs excluded).
+    assert prof["row_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_dominant_embedding_profile_agent_scoped(db):
+    await _seed(db)
+    await _register_profile(
+        db, OTHER, provider="ollama", model="qwen3-embedding-8b", dim=768,
+        space_id="s",
+    )
+    prof = await dominant_embedding_profile(db, agent_id="a1")
+    assert prof is not None
+    # a1's OTHER rows: conv(1) + saved(1) + global chunk(1) = 3 (a2 excluded).
+    assert prof["row_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_dominant_embedding_profile_none_when_empty(db):
+    assert await dominant_embedding_profile(db) is None
+
+
+@pytest.mark.asyncio
+async def test_dominant_embedding_profile_none_without_registry_row(db):
+    await _seed(db)  # rows exist but no embedding_profiles descriptor registered.
+    assert await dominant_embedding_profile(db) is None
 
 
 # ------------------------------------------------------------------- tests

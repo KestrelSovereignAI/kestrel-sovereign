@@ -339,6 +339,137 @@ async def test_resolve_default_none_when_no_discovery():
     assert await svc.resolve_default_embedding_model(provider) is None
 
 
+# --- #2366 corpus-first auto resolution --------------------------------------
+
+
+async def test_resolve_default_prefers_corpus_dominant_profile():
+    # Catalog order puts gemini first; the corpus is entirely qwen3.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter"),
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter"),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    corpus = {"provider": "openrouter", "model": "qwen3-embedding-8b",
+              "dim": 768, "space_id": "s", "row_count": 63}
+    chosen = await svc.resolve_default_embedding_model(provider, corpus_profile=corpus)
+    assert chosen.id == "qwen/qwen3-embedding-8b"
+
+
+async def test_resolve_default_corpus_matches_cross_route_identity():
+    # The corpus model was written on Ollama (bare id); the route serves the
+    # same weights under an OpenRouter vendor/ prefix — must still match.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter"),
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-0.6b", provider="openrouter"),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    corpus = {"provider": "ollama", "model": "qwen3-embedding:0.6b",
+              "dim": 768, "space_id": "s", "row_count": 10}
+    chosen = await svc.resolve_default_embedding_model(provider, corpus_profile=corpus)
+    assert chosen.id == "qwen/qwen3-embedding-0.6b"
+
+
+async def test_resolve_default_prefers_deployment_dim_when_no_corpus_match():
+    # Corpus model is absent from the catalog; fall to deployment-dim match
+    # before catalog order (gemini@3072 sorts first).
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter",
+                               native_dim=3072),
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=4096, dim_options=[768, 1024]),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    chosen = await svc.resolve_default_embedding_model(provider, deployment_dim=768)
+    assert chosen.id == "qwen/qwen3-embedding-8b"
+
+
+async def test_resolve_default_empty_corpus_falls_through_to_hints():
+    # Empty DB (corpus_profile=None) → prior hint/catalog behaviour is intact.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter"),
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter"),
+        ]),
+        "client": None,
+        "selection_hints": ["qwen3"],
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    chosen = await svc.resolve_default_embedding_model(provider, corpus_profile=None)
+    assert chosen.id == "qwen/qwen3-embedding-8b"
+
+
+async def test_reconcile_records_space_change_warning_on_new_space():
+    # Corpus is qwen3; the only discovered model is gemini — the auto default
+    # necessarily changes the space, which must be recorded loudly.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter",
+                               native_dim=3072),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    corpus = {"provider": "openrouter", "model": "qwen3-embedding-8b",
+              "dim": 768, "space_id": "s", "row_count": 63}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus)
+    svc._embedding_space_change_warnings = {}
+
+    await svc.reconcile_embedding_capabilities(use_cache=False)
+
+    assert provider["capabilities"]["embedding_model"] == "google/gemini-embedding-2"
+    warning = svc._embedding_space_change_warnings.get("openrouter:api")
+    assert warning is not None
+    assert warning["chosen_model"] == "google/gemini-embedding-2"
+    assert warning["corpus_model"] == "qwen3-embedding-8b"
+
+
+async def test_reconcile_no_warning_when_corpus_matches():
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=768),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    corpus = {"provider": "openrouter", "model": "qwen3-embedding-8b",
+              "dim": 768, "space_id": "s", "row_count": 63}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus)
+    svc._embedding_space_change_warnings = {}
+
+    await svc.reconcile_embedding_capabilities(use_cache=False)
+
+    assert provider["capabilities"]["embedding_model"] == "qwen/qwen3-embedding-8b"
+    assert svc._embedding_space_change_warnings.get("openrouter:api") is None
+
+
 # --- shared-space candidates -------------------------------------------------
 
 async def test_shared_space_candidates_intersect_local_and_cloud():

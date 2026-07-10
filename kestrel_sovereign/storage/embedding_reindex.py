@@ -137,6 +137,77 @@ class ReindexStats:
         }
 
 
+async def dominant_embedding_profile(
+    db: Any, agent_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Return the corpus's dominant existing embedding profile, or ``None`` (#2366).
+
+    Surveys the ``embedding_profile_id`` stamped on the three embedded tables
+    (``conversation_history``, ``saved_items``, ``document_chunks``), tallies
+    rows per profile, and returns the human-readable descriptor of the profile
+    with the most rows joined from the ``embedding_profiles`` registry:
+
+        {"profile_id", "provider", "model", "dim", "space_id",
+         "normalized", "row_count"}
+
+    Auto embedding-model resolution consults this so a fresh default prefers a
+    model that keeps new memories in the same coordinate space old memories
+    already live in (continuity beats catalog order). Best-effort: any read
+    failure, an empty corpus, or a dominant profile with no registry row yields
+    ``None`` and the caller falls back to hint/catalog order.
+    """
+    counts: Dict[str, int] = {}
+    for table, spec in _TABLE_SPECS.items():
+        where = "embedding_profile_id IS NOT NULL"
+        params: List[Any] = []
+        if spec.agent_col and agent_id:
+            where += f" AND {spec.agent_col} = ?"
+            params.append(agent_id)
+        try:
+            rows = await db.fetchall(
+                f"SELECT embedding_profile_id, COUNT(*) FROM {spec.name} "
+                f"WHERE {where} GROUP BY embedding_profile_id",
+                tuple(params),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("dominant profile scan of %s failed: %s", table, exc)
+            continue
+        for row in rows or []:
+            pid, n = row[0], row[1]
+            if not pid:
+                continue
+            counts[pid] = counts.get(pid, 0) + int(n or 0)
+
+    if not counts:
+        return None
+    dominant_id = max(counts, key=lambda pid: counts[pid])
+
+    try:
+        prof_rows = await db.fetchall(
+            "SELECT provider, model, dim, space_id, normalized "
+            "FROM embedding_profiles WHERE id = ?",
+            (dominant_id,),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("embedding_profiles lookup failed for %s: %s", dominant_id, exc)
+        return None
+    if not prof_rows or not prof_rows[0]:
+        # Rows exist under this profile id but the registry has no descriptor
+        # (pre-registry write). Nothing to match a discovered model against.
+        return None
+
+    provider, model, dim, space_id, normalized = prof_rows[0]
+    return {
+        "profile_id": dominant_id,
+        "provider": provider,
+        "model": model,
+        "dim": int(dim) if dim is not None else None,
+        "space_id": space_id,
+        "normalized": bool(normalized),
+        "row_count": counts[dominant_id],
+    }
+
+
 class EmbeddingReindexer:
     """Rewrite stored vectors into the resolved embedding profile.
 
