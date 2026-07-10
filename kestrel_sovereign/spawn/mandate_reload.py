@@ -107,9 +107,15 @@ def register_restriction_hook(hooks_manager: Any, mandate: Any) -> int:
     """
     constraints = getattr(mandate, "additional_constraints", None) or {}
     restricted = constraints.get("restricted_tools") or []
-    if not restricted or hooks_manager is None:
+    restricted_args = constraints.get("restricted_tool_args") or {}
+    if (not restricted and not restricted_args) or hooks_manager is None:
         return 0
-    hooks_manager.register(MandateRestrictionHook(restricted))
-    count = len(set(restricted))
-    logger.info("Registered MandateRestrictionHook for %d restricted tool(s) (#2137).", count)
+    hooks_manager.register(
+        MandateRestrictionHook(restricted, restricted_tool_args=restricted_args)
+    )
+    count = len(set(restricted)) + len(restricted_args)
+    logger.info(
+        "Registered MandateRestrictionHook for %d restricted tool(s)/arg-scope(s) (#2137, #2321).",
+        count,
+    )
     return count
