@@ -159,6 +159,13 @@ class AgentManager:
         loaded = 0
         # Reset failure list — fresh load attempt.
         self._init_failures = []
+        # Seed the monotonic port allocator PAST every configured port
+        # (codex P1 on #2358): otherwise the first runtime-created agent gets
+        # a port an existing agent already owns, and once persisted the next
+        # boot fails MultiAgentConfig's port-conflict validation.
+        for agent_cfg in config.agents.values():
+            if isinstance(agent_cfg, LocalAgentConfig) and agent_cfg.port > self._port_seq:
+                self._port_seq = agent_cfg.port
         for name, agent_cfg in config.agents.items():
             if not isinstance(agent_cfg, LocalAgentConfig):
                 logger.info(f"Skipping remote agent '{name}' (not supported in-process)")

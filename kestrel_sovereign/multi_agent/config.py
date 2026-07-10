@@ -340,11 +340,18 @@ class MultiAgentConfig(BaseModel):
 
         for name, agent in self.agents.items():
             if isinstance(agent, LocalAgentConfig):
-                data["agents"][name] = {
+                entry = {
                     "data_dir": str(agent.data_dir),
                     "port": agent.port,
                     "autostart": agent.autostart,
                 }
+                # A missing features key means "all features" on reload —
+                # dropping a configured allowlist here would silently LIFT an
+                # agent's feature restriction on the next boot (codex P1 on
+                # #2358: the create-agent endpoint rewrites the whole file).
+                if agent.features is not None:
+                    entry["features"] = list(agent.features)
+                data["agents"][name] = entry
             elif isinstance(agent, RemoteAgentConfig):
                 data["agents"][name] = {
                     "url": agent.url,

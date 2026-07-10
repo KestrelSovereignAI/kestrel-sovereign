@@ -62,3 +62,37 @@ async def test_create_agent_skips_persistence_for_auto_discovered_deployments():
     result = await create_agent.__wrapped__(req, CreateAgentRequest(name="Auto"))
     assert result["success"] is True
     assert result["persisted"] is None, "auto-discovered deployments need no write"
+
+
+def test_save_round_trips_feature_allowlists(tmp_path):
+    """codex P1 round 4: save() dropped `features` — rewriting the toml on a
+    create would silently LIFT existing agents' feature restrictions."""
+    config_path = tmp_path / "multi_agent.toml"
+    config = MultiAgentConfig(agents={
+        "Restricted": LocalAgentConfig(
+            data_dir=Path("agent_data/Restricted"), port=8801,
+            features=["MemoryFeature", "SecurityFeature"],
+        ),
+        "Open": LocalAgentConfig(data_dir=Path("agent_data/Open"), port=8802),
+    })
+    config.save(config_path)
+    reloaded = MultiAgentConfig.from_file(config_path)
+    assert reloaded.agents["Restricted"].features == ["MemoryFeature", "SecurityFeature"]
+    assert reloaded.agents["Open"].features is None
+
+
+@pytest.mark.asyncio
+async def test_port_allocator_seeds_past_configured_ports(tmp_path):
+    """codex P1 round 4: _port_seq started at 8800 regardless of configured
+    ports — the first runtime creation collided with an existing agent's port
+    and the PERSISTED conflict failed validation on the next boot."""
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    config = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(
+            data_dir=Path("agent_data/Kestrel"), port=8801, autostart=False,
+        ),
+    })
+    await manager.load_from_config(config)   # loads nothing (autostart=False) but must seed
+    assert manager._port_seq >= 8801, "allocator seeded past every configured port"

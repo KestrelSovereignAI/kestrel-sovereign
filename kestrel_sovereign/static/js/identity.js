@@ -856,6 +856,7 @@ function openNewAgentFlow() {
     openCreateAgentDialog({
         modal: Modal,
         api: API,
+        toast: Toast,
         spawnAvailable,
         onSpawn: () => goToSpawnTab(),
         onCreated: async (name) => {

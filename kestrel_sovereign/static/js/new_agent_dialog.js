@@ -34,7 +34,7 @@ const SPAWN_LINK_ID = 'create-agent-spawn-link';
  * @param {Function} [deps.onSpawn]      - cb() invoked when the spawn link is
  *                                          clicked (routes to the Spawn tab).
  */
-export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = false, onSpawn } = {}) {
+export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = false, onSpawn, toast = null } = {}) {
     if (!modal || !api) {
         throw new Error('openCreateAgentDialog requires { modal, api }');
     }
@@ -115,12 +115,24 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         const stillCurrent = () => !!(dialogInput && dialogInput.isConnected
             && document.getElementById(INPUT_ID) === dialogInput);
         try {
-            await api.createAgent(name);
+            const result = await api.createAgent(name);
             // Success: close the dialog first, then let the host refresh the list
             // and select the freshly-minted agent. The refresh/select still runs
             // even if the user dismissed the dialog mid-flight — the agent WAS
             // created; only the modal.hide() must be scoped.
             if (stillCurrent()) modal.hide();
+            // Partial failure (codex P2): HTTP 200 with persisted:false means
+            // the agent EXISTS but its registration didn't reach
+            // multi_agent.toml — it will vanish from the fleet on the next
+            // restart. That must never masquerade as full success.
+            if (result && result.persisted === false && toast && typeof toast.warning === 'function') {
+                toast.warning(
+                    `Agent "${name}" was created but could NOT be saved to the server's `
+                    + 'multi_agent config — it will disappear on the next restart. '
+                    + 'Check the server logs.',
+                    12000,
+                );
+            }
             if (onCreated) await onCreated(name);
         } catch (err) {
             // Surface the 409/400 (or any) failure inline — never a toast, so the
