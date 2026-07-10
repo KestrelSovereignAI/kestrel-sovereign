@@ -61,6 +61,55 @@ class DeadEmbeddingService:
         return None
 
 
+class _DimHonoringAdapter:
+    """Fake adapter that only returns column-width vectors when ``dimensions``
+    is forwarded — otherwise it returns its NATIVE (wider) dimension.
+
+    Models a Matryoshka embedding model (e.g. qwen3-embedding-8b, native 4096)
+    reached through a route pinned to a narrower dim. If the service forgets to
+    forward ``dimensions`` (the #2371 bug), the adapter hands back native-dim
+    vectors the reindexer's column guard then rejects as dim-mismatch — the
+    exact "scanned 24, skipped_dim_mismatch 24" failure. When the fix forwards
+    ``dimensions``, vectors come back at the pinned width and rows flip.
+    """
+
+    NATIVE_DIM = DIM * 2
+
+    def __init__(self):
+        self.seen_dimensions: list = []
+
+    def _one(self, text: str, dimensions):
+        width = int(dimensions) if dimensions is not None else self.NATIVE_DIM
+        base = float(len(text) % 7) + 1.0
+        return [base + i for i in range(width)]
+
+    async def aembed(self, client, text, *, model=None, dimensions=None, **kwargs):
+        self.seen_dimensions.append(dimensions)
+        return self._one(text, dimensions)
+
+    async def aembed_batch(self, client, texts, *, model=None, dimensions=None, **kwargs):
+        self.seen_dimensions.append(dimensions)
+        return [self._one(t, dimensions) for t in texts]
+
+
+def _provider_service(dim: int = DIM):
+    """A real ``ProviderEmbeddingService`` over a dimension-honoring adapter."""
+    from kestrel_sovereign.llm.embedding_service import ProviderEmbeddingService
+
+    adapter = _DimHonoringAdapter()
+    provider = {
+        "adapter": adapter,
+        "client": object(),
+        "vendor": "ollama",
+        "name": "ollama:local",
+        "capabilities": {
+            "embedding_model": "qwen3-embedding:8b",
+            "embedding_dim": dim,
+        },
+    }
+    return ProviderEmbeddingService(provider), adapter
+
+
 class _FakeLLM:
     """Minimal LLM service exposing the embedding-resolution surface."""
 
@@ -213,6 +262,58 @@ async def test_reindex_execute_empty_corpus_reports_done_inline(seeded_db):
     assert result["status"] == "done"
     assert result["total_stale"] == 0
     assert "job_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_reindex_pinned_dim_forwarded_rows_flip_profile(seeded_db):
+    # #2371: the resolved service carries a pinned embedding_dim (768 in prod).
+    # It MUST forward that as the Matryoshka ``dimensions`` param on every embed,
+    # or the adapter returns native-dim vectors the column guard rejects — every
+    # row skipped_dim_mismatch even though the pin was accepted. With the fix the
+    # dim reaches the adapter, vectors match the column, and rows flip profile.
+    service, adapter = _provider_service(dim=DIM)
+    target = service.current_profile_id()
+    assert target  # a real profile id resolves from the pinned model@dim
+    request = _FakeRequest(_agent(seeded_db, service), {"dry_run": False})
+
+    started = await model_endpoints.reindex_embeddings(request)
+    # 6 seeded stale rows for a1 + the one row seeded under the placeholder
+    # "targetprofile" id, which is stale relative to this real model@dim target.
+    assert started["total_stale"] == 7
+    job_id = started["job_id"]
+
+    job = None
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        job = await model_endpoints.get_reindex_job(job_id, request)
+        if job["status"] in ("done", "error"):
+            break
+    assert job is not None and job["status"] == "done", job
+    assert job["total_reembedded"] == 7, job
+    # Nothing was rejected as a dim mismatch — the pin was honoured.
+    assert sum(s.get("skipped_dim_mismatch", 0) for s in job["stats"].values()) == 0
+    # The adapter actually received the pinned dimension on every call.
+    assert adapter.seen_dimensions, "adapter was never called"
+    assert all(d == DIM for d in adapter.seen_dimensions), adapter.seen_dimensions
+
+    # Every stale row for a1 is now on the target profile.
+    remaining = EmbeddingReindexer(seeded_db, service, target, column_dim=DIM)
+    assert sum((await remaining.count_all_stale(agent_id="a1")).values()) == 0
+
+
+@pytest.mark.asyncio
+async def test_reindex_without_dim_forwarding_would_dim_mismatch(seeded_db):
+    # Guardrail proving the fix is load-bearing: the same dimension-honoring
+    # adapter, when NOT handed a pinned dim, returns native-width vectors that
+    # the column guard rejects — reproducing the pre-#2371 all-skipped outcome.
+    service, adapter = _provider_service(dim=DIM)
+    service.embedding_dim = None  # simulate the pin never reaching the service
+    target = "targetprofile"
+    reindexer = EmbeddingReindexer(seeded_db, service, target, column_dim=DIM)
+    stats = await reindexer.reindex_table("conversation_history", agent_id="a1")
+    assert stats.reembedded == 0
+    assert stats.skipped_dim_mismatch == stats.scanned - stats.skipped_empty
+    assert all(d is None for d in adapter.seen_dimensions)
 
 
 @pytest.mark.asyncio

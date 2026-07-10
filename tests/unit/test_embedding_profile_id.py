@@ -218,6 +218,7 @@ async def test_qwen3_query_uses_documented_instruction_format():
         "<Instruct>: Retrieve conversation memories that are relevant to the query\n"
         "<Query>: unusual aquatic pet",
         model="qwen3-embedding:0.6b",
+        dimensions=1024,
     )
     assert service.retrieval_similarity_floor() == pytest.approx(0.2)
 
@@ -234,6 +235,7 @@ async def test_symmetric_model_keeps_retrieval_query_unchanged():
         provider["client"],
         "literal query",
         model="text-embedding-3-small",
+        dimensions=1536,
     )
     assert service.retrieval_similarity_floor() == 0.0
 
@@ -256,8 +258,51 @@ async def test_provider_can_disable_qwen_client_side_query_formatting():
         provider["client"],
         "server formats this",
         model="qwen3-embedding-8b",
+        dimensions=4096,
     )
     assert service.retrieval_similarity_floor() == pytest.approx(0.31)
+
+
+@pytest.mark.asyncio
+async def test_aembed_forwards_pinned_dimension():  # 2371
+    # The pinned embedding_dim is half the embedding-space identity
+    # (``<model>@<dim>``), so it must ride every embed as the Matryoshka
+    # ``dimensions`` param — not be left to the calling path (#2371).
+    provider = _stub_provider(dim=768)
+    provider["adapter"].aembed = AsyncMock(return_value=[0.1])
+    provider["adapter"].aembed_batch = AsyncMock(return_value=[[0.1]])
+    service = ProviderEmbeddingService(provider)
+
+    await service.aembed("doc text")
+    provider["adapter"].aembed.assert_awaited_once_with(
+        provider["client"], "doc text", model="text-embedding-3-small", dimensions=768
+    )
+
+    await service.aembed_batch(["a", "b"])
+    provider["adapter"].aembed_batch.assert_awaited_once_with(
+        provider["client"], ["a", "b"], model="text-embedding-3-small", dimensions=768
+    )
+
+
+@pytest.mark.asyncio
+async def test_aembed_omits_dimensions_when_unpinned():  # 2371
+    # No pinned dim → no ``dimensions`` kwarg (adapters that don't support the
+    # param must not receive it; the model returns its native width).
+    provider = _stub_provider()
+    provider["capabilities"]["embedding_dim"] = None
+    provider["adapter"].aembed = AsyncMock(return_value=[0.1])
+    provider["adapter"].aembed_batch = AsyncMock(return_value=[[0.1]])
+    service = ProviderEmbeddingService(provider)
+
+    await service.aembed("doc text")
+    provider["adapter"].aembed.assert_awaited_once_with(
+        provider["client"], "doc text", model="text-embedding-3-small"
+    )
+
+    await service.aembed_batch(["a"])
+    provider["adapter"].aembed_batch.assert_awaited_once_with(
+        provider["client"], ["a"], model="text-embedding-3-small"
+    )
 
 
 # --- EmbeddingService (legacy Ollama) describe --------------------------------
