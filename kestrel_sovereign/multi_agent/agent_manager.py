@@ -215,6 +215,20 @@ class AgentManager:
         Returns:
             True if agent was found and removed.
         """
+        # Refuse to remove an agent that still has budgeted descendants (#2113):
+        # remove_agent is a single-agent primitive, so releasing this agent's hold
+        # while a budgeted grandchild still holds from its (about-to-be-removed)
+        # wallet would strand the grandchild's unspent budget on its later
+        # release. Such teardown must go through terminate_child, which cascades
+        # and releases nested budgets leaf-first. terminate_child/shutdown_all
+        # remove descendants BEFORE the parent, so they never trip this.
+        if self._has_budgeted_descendants(name):
+            raise ValueError(
+                f"Cannot remove '{name}' directly: it has budgeted child agents. "
+                f"Use terminate_child, which cascades and releases nested budgets "
+                f"leaf-first (#2113)."
+            )
+
         async with self._lock:
             agent = self._agents.pop(name, None)
             if agent is not None:
@@ -419,6 +433,32 @@ class AgentManager:
             "Applied delegated budget %s to child '%s' — spend now ceiling'd (#2113).",
             budget, name,
         )
+
+    def _has_budgeted_descendants(self, name: str) -> bool:
+        """True if any descendant of ``name`` still holds a budget (#2113).
+
+        Keys on ``_child_budgets`` membership (not just the parent-child graph),
+        so an already-released descendant — remove_agent pops its budget but not
+        its ``_parent_children`` entry — no longer counts.
+        """
+        seen: set = set()
+
+        def visit(n: str) -> bool:
+            agent = self._agents.get(n)
+            did = getattr(agent, "agent_id", None) if agent is not None else None
+            if not did:
+                return False
+            for child in self._parent_children.get(did, []):
+                if child in seen:
+                    continue
+                seen.add(child)
+                if child in self._child_budgets:
+                    return True
+                if visit(child):
+                    return True
+            return False
+
+        return visit(name)
 
     async def _release_child_budget(self, child_name: str) -> None:
         """Credit a terminated child's unspent budget back to its parent (#2113).

@@ -362,6 +362,28 @@ async def test_remove_agent_is_single_agent_release():
 
 
 @pytest.mark.asyncio
+async def test_remove_agent_refuses_budgeted_parent():
+    """remove_agent (single-agent primitive) refuses to delete an agent that has
+    budgeted descendants — that would strand their holds; use terminate_child."""
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+    root = FakeWallet(initial_balance=Decimal("100"))
+    child_dw = await create_delegated_wallet(root, "did:root", "did:child", Decimal("30"))
+    gc_dw = await create_delegated_wallet(child_dw, "did:child", "did:gc", Decimal("20"))
+
+    mgr = AgentManager()
+    mgr._agents = {
+        "child": SimpleNamespace(agent_id="did:child", shutdown=AsyncMock()),
+        "gc": SimpleNamespace(agent_id="did:gc", shutdown=AsyncMock()),
+    }
+    mgr._parent_children = {"did:child": ["gc"]}
+    mgr._child_budgets = {"child": (child_dw, root), "gc": (gc_dw, child_dw)}
+
+    with pytest.raises(ValueError, match="budgeted child agents"):
+        await mgr.remove_agent("child")
+
+
+@pytest.mark.asyncio
 async def test_budget_refused_for_persistent_child():
     """Budgets are in-process only, so they're restricted to ephemeral (TTL)
     children that can't be reloaded uncapped; a persistent spawn is refused."""
