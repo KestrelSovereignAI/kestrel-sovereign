@@ -71,6 +71,9 @@ class AgentManager:
         # the FastAPI lifespan can surface them via /health (#377 lifecycle
         # hardening for multi-agent boot).
         self._init_failures: list[tuple[str, Exception]] = []
+        # LocalAgentConfig per agent created at runtime via create_agent —
+        # consumed by the create-agent endpoint to persist registrations.
+        self._created_configs: dict[str, "LocalAgentConfig"] = {}
 
     async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
         """Create and initialize a KestrelAgent from a multi_agent config entry.
@@ -277,6 +280,11 @@ class AgentManager:
             autostart=True,
             features=features,
         )
+        # Retain the created config so callers (the create-agent endpoint) can
+        # PERSIST the registration into multi_agent.toml — without that, a
+        # config-file-driven deployment silently loses UI-created agents on
+        # the next restart (codex P1 on #2358).
+        self._created_configs[name] = config
         return await self.load_agent(name, config)
 
     def _parent_feature_names(self, parent_agent: KestrelAgent) -> set[str]:

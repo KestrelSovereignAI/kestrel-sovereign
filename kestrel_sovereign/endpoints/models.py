@@ -100,6 +100,11 @@ async def get_agents(request: Request):
             "agents": agents_list,
             "mode": "multi_agent",
             "server_demo_mode": server_demo_mode,
+            # POST /api/agents works on THIS host (in-process manager). The
+            # subprocess host serves its own /api/agents without this flag —
+            # clients must treat absence as false (codex P2 on #2358: its
+            # POST route doesn't exist and every create 405'd).
+            "can_create_agents": True,
         }
 
     # Single-agent mode
@@ -114,6 +119,7 @@ async def get_agents(request: Request):
             "agents": [card_dict],
             "mode": "standalone",
             "server_demo_mode": server_demo_mode,
+            "can_create_agents": False,
         }
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
@@ -146,6 +152,28 @@ async def create_agent(request: Request, body: CreateAgentRequest):
 
     try:
         agent = await agent_manager.create_agent(name)
+        # Persist the registration when the deployment is config-file-driven
+        # (codex P1 on #2358): startup loads multi_agent.toml whenever it
+        # exists, so an unpersisted runtime creation silently vanishes on the
+        # next restart. Auto-discovered deployments (no toml) re-discover from
+        # agent_data/ and need no write. Best-effort: a persistence failure is
+        # SURFACED in the response, never a rollback of the live agent.
+        persisted = None
+        config_path = getattr(request.app.state, 'multi_agent_config_path', None)
+        ma_config = getattr(request.app.state, 'multi_agent_config', None)
+        if config_path and ma_config is not None:
+            try:
+                created_cfg = agent_manager._created_configs.get(name)
+                if created_cfg is not None:
+                    ma_config.agents[name] = created_cfg
+                    ma_config.save(config_path)
+                    persisted = True
+            except Exception as persist_err:
+                logger.error(
+                    f"Agent '{name}' created but NOT persisted to {config_path}: {persist_err}",
+                    exc_info=True,
+                )
+                persisted = False
         return {
             "success": True,
             "agent": {
@@ -153,6 +181,9 @@ async def create_agent(request: Request, body: CreateAgentRequest):
                 "name": name,
                 "status": "online",
             },
+            # None = auto-discovered deployment (no write needed);
+            # True/False = toml-driven write outcome.
+            "persisted": persisted,
         }
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))

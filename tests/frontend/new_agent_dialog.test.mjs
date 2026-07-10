@@ -211,3 +211,18 @@ test('the create flow FAILS CLOSED before server classification loads (codex P1 
     assert.match(block, /classificationLoaded[\s\S]{0,220}?return;/,
         'unclassified server refuses the create flow (fail closed)');
 });
+
+test('creation is gated on the server-advertised can_create_agents capability (codex P2 round 2 + P1 round 3)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const adapterSrc = readFileSync(new URL('../../kestrel_sovereign/static/js/agent_list.js', import.meta.url), 'utf8');
+    assert.match(adapterSrc, /canCreateAgents:\s*false/,
+        'adapter defaults can_create_agents to false (absence on subprocess hosts = false)');
+    assert.match(adapterSrc, /data\.can_create_agents === true/,
+        'flag mirrored strictly from the payload');
+    const identitySrc = readFileSync(new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
+    const start = identitySrc.indexOf('function openNewAgentFlow()');
+    const block = identitySrc.slice(start, start + 1600);
+    assert.match(block, /canCreateAgents/, 'openNewAgentFlow gates on the capability');
+    assert.doesNotMatch(block, /mode === 'standalone'/,
+        'mode-only inference replaced by the explicit capability');
+});

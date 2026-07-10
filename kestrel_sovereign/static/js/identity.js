@@ -835,13 +835,12 @@ function openNewAgentFlow() {
         Toast.info('Agent list is still loading — try again in a moment.');
         return;
     }
-    // POST /api/agents needs the multi-agent manager — in a standalone
-    // (single-agent) console it unconditionally 400s, so the Create dialog
-    // would be a primary action that can never succeed (codex P2). Route
-    // straight to the legacy Spawn flow there instead.
-    const isStandalone = !!(agentListDefaultAdapter
-        && agentListDefaultAdapter.mode === 'standalone');
-    if (isStandalone) {
+    // POST /api/agents must actually exist AND work on this host: standalone
+    // consoles 400 it (no manager) and the subprocess host doesn't route it at
+    // all (405) — the server advertises `can_create_agents` and the client
+    // treats absence as false (codex P2 rounds 1-2). Those consoles route to
+    // the legacy Spawn flow instead.
+    if (!agentListDefaultAdapter.canCreateAgents) {
         if (!goToSpawnTab()) Toast.info('Creating a new agent requires the Spawn feature.');
         return;
     }

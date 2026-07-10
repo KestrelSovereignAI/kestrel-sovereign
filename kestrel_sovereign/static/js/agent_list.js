@@ -45,6 +45,9 @@ export function createDefaultAgentAdapter(api = API) {
     const adapter = {
         mode: 'multi_agent',
         serverDemoMode: false,
+        // POST /api/agents support, mirrored from the response — ABSENT on
+        // hosts (subprocess) whose payload predates the flag: treat as false.
+        canCreateAgents: false,
         // False until a /api/agents payload has actually been parsed —
         // consumers gating SAFETY decisions (demo rail, create-agent flow)
         // must fail CLOSED while this is false rather than trust the
@@ -56,6 +59,7 @@ export function createDefaultAgentAdapter(api = API) {
             adapter.lastPayload = data;
             adapter.mode = data.mode === 'standalone' ? 'standalone' : 'multi_agent';
             adapter.serverDemoMode = data.server_demo_mode === true;
+            adapter.canCreateAgents = data.can_create_agents === true;
             adapter.classificationLoaded = true;
             const agents = data.agents || [];
             return agents.map((a) => ({

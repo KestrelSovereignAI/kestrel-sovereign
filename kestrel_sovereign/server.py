@@ -424,6 +424,15 @@ async def lifespan(app: FastAPI):
             manager = AgentManager(base_data_dir=Path.cwd())
             loaded = await manager.load_from_config(config)
             app.state.agent_manager = manager
+            # Persistence context for runtime agent creation (#2358): when the
+            # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent
+            # must be appended there or it vanishes on restart (startup loads
+            # the file whenever it exists). Auto-discovered deployments need no
+            # write — their agents re-discover from agent_data/ on boot.
+            app.state.multi_agent_config = config
+            app.state.multi_agent_config_path = (
+                multi_agent_path if multi_agent_path.exists() else None
+            )
             app.state.agent = None  # No single default agent
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
 
