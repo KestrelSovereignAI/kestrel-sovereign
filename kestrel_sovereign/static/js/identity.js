@@ -22,6 +22,7 @@ import { mountConversationsPane } from './conversations.js';
 // the console-specific policy (demo banner, demo-misconfig-gated auto-select,
 // standalone conversations-pane refresh) through the component's config hooks.
 import { mountAgentListPane, createDefaultAgentAdapter } from './agent_list.js';
+import { openCreateAgentDialog } from './new_agent_dialog.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
@@ -812,14 +813,37 @@ let agentListPaneHandle = null;
 let agentListDefaultAdapter = null;
 
 // The standalone console's new-agent affordance (#2279 — same-everywhere rule,
-// the console gains an affordance it lacked). The new-agent / spawn flow is a
-// feature-contributed panel (#2048, extracted out of core), so route the pane's
-// "+ New" action to its nav tab when the Spawn feature is installed; otherwise
-// surface a hint rather than silently no-op.
-function openNewAgentFlow() {
+// the console gains an affordance it lacked). #2351: the pane's "+ New" opens a
+// Create Agent dialog that POSTs to `/api/agents` (the multi-agent manager's
+// native top-level inception). Creating a parentless agent is a DIFFERENT intent
+// than Spawn (which creates a CHILD of an existing parent), so the Spawn tab —
+// when its feature-contributed panel is installed — is offered as a SECONDARY
+// link inside the dialog rather than being the whole affordance.
+function goToSpawnTab() {
     const spawnTab = document.querySelector('.nav-tab[data-panel="spawn"]');
-    if (spawnTab) { spawnTab.click(); return; }
-    Toast.info('Creating a new agent requires the Spawn feature.');
+    if (spawnTab) { spawnTab.click(); return true; }
+    return false;
+}
+
+function openNewAgentFlow() {
+    const spawnAvailable = !!document.querySelector('.nav-tab[data-panel="spawn"]');
+    openCreateAgentDialog({
+        modal: Modal,
+        api: API,
+        spawnAvailable,
+        onSpawn: () => goToSpawnTab(),
+        onCreated: async (name) => {
+            // Refresh the list so the freshly-minted agent appears, then select
+            // it — the full product wiring runs through the component's select().
+            try {
+                if (agentListHandle) await agentListHandle.refresh();
+            } catch (_) { /* best-effort refresh */ }
+            try {
+                if (agentListHandle) agentListHandle.select(name);
+                else if (window.selectAgent) await window.selectAgent(name);
+            } catch (_) { /* selection is best-effort */ }
+        },
+    });
 }
 
 /**
