@@ -40,6 +40,12 @@ class EmbeddingSelector {
      * @param {string} options.routeSelectId  Explicit provider:route <select>.
      * @param {string} [options.dimReadoutId] Element for the dimension readout.
      * @param {string} [options.warningId]    Element for the mismatch warning.
+     * @param {string} [options.reindexButtonId] Button that re-embeds stale
+     *        memories (#2336). Shown only when ``stale_rows > 0``; disabled
+     *        when embeddings are off/unresolved (nothing to re-embed to).
+     * @param {string} [options.reindexStatusId] Element for reindex progress text.
+     * @param {string} [options.reindexEndpoint='/api/embedding/reindex']
+     * @param {Function} [options.confirm] Confirmation prompt (msg) => bool.
      * @param {Function} [options.getEmbeddingRoutes] Returns the list of
      *        embedding-capable routes: ``[{vendor, route}, …]``. Typically
      *        derived from ``/api/models`` ``routes`` filtered by
@@ -58,9 +64,16 @@ class EmbeddingSelector {
         // ONE entry ("qwen3-embedding-0.6b — local + cloud") instead of two
         // routes. Optional; absent in older popovers.
         this.sharedSpaceEl = options.sharedSpaceId ? document.getElementById(options.sharedSpaceId) : null;
+        // #2336 — actionable re-embed control + progress readout.
+        this.reindexButton = options.reindexButtonId ? document.getElementById(options.reindexButtonId) : null;
+        this.reindexStatus = options.reindexStatusId ? document.getElementById(options.reindexStatusId) : null;
+        this.reindexEndpoint = options.reindexEndpoint || '/api/embedding/reindex';
+        this.confirm = options.confirm || ((msg) => (typeof window !== 'undefined' && window.confirm ? window.confirm(msg) : true));
         this.getEmbeddingRoutes = options.getEmbeddingRoutes || (() => []);
         this.getAuthHeader = options.getAuthHeader || (() => ({}));
         this.onChange = options.onChange || (() => {});
+        // True while a reindex job is running — guards the button re-entrancy.
+        this._reindexing = false;
 
         this.settings = null;
         // 'auto' == follow chat provider (embedding_route null); 'explicit' ==
@@ -80,6 +93,9 @@ class EmbeddingSelector {
         }
         if (this.routeSelect) {
             this.routeSelect.addEventListener('change', () => this._handleRouteChange());
+        }
+        if (this.reindexButton) {
+            this.reindexButton.addEventListener('click', () => this._handleReindexClick());
         }
     }
 
@@ -105,6 +121,141 @@ class EmbeddingSelector {
         this._syncModeUI();
         this._renderDimension();
         this._renderSharedSpace();
+        this._renderReindex();
+    }
+
+    /**
+     * Render the "Re-embed N memories" control (#2336). The dimension-mismatch
+     * warning already tells the operator their memories fell back to keyword
+     * search; this turns that into an action. Shown only when the backend
+     * reports ``stale_rows > 0``. Disabled (with an explanatory title) when
+     * embeddings are off or no provider resolves — there is nothing to
+     * re-embed to. While a job runs, the button is disabled and its label
+     * reflects progress via ``reindexStatus``.
+     */
+    _renderReindex() {
+        if (!this.reindexButton) return;
+        const s = this.settings || {};
+        const stale = s.stale_rows;
+        const hasStale = typeof stale === 'number' && stale > 0;
+        const resolvable = this.mode !== 'off' && s.embedding_dim != null;
+
+        if (!hasStale) {
+            this.reindexButton.style.display = 'none';
+            this.reindexButton.disabled = false;
+            if (this.reindexStatus && !this._reindexing) {
+                this.reindexStatus.textContent = '';
+                this.reindexStatus.style.display = 'none';
+            }
+            return;
+        }
+
+        this.reindexButton.style.display = '';
+        const noun = stale === 1 ? 'memory' : 'memories';
+        this.reindexButton.textContent = `Re-embed ${stale} ${noun}`;
+        // Disable while unresolvable (off/no provider) or a job is in flight.
+        this.reindexButton.disabled = !resolvable || this._reindexing;
+        this.reindexButton.title = resolvable
+            ? `Re-embed ${stale} stale ${noun} into the current embedding provider.`
+            : 'No embedding provider resolves — nothing to re-embed to.';
+    }
+
+    _setReindexStatus(text) {
+        if (!this.reindexStatus) return;
+        this.reindexStatus.textContent = text || '';
+        this.reindexStatus.style.display = text ? '' : 'none';
+    }
+
+    /**
+     * Dry-run → confirm → execute → progress → refresh (#2336).
+     * A dry-run first fetches authoritative counts; on confirm it kicks off
+     * the (possibly backgrounded) job and polls until it finishes, then
+     * reloads settings so ``stale_rows`` and the warning refresh.
+     */
+    async _handleReindexClick() {
+        if (this._reindexing) return;
+        const dry = await this._postReindex({ dry_run: true });
+        if (!dry) {
+            this._setReindexStatus('Re-embed failed — could not read counts.');
+            return;
+        }
+        const n = dry.total_stale || 0;
+        if (!n) {
+            await this.load();
+            return;
+        }
+        const noun = n === 1 ? 'memory' : 'memories';
+        if (!this.confirm(`Re-embed ${n} ${noun} into the current embedding provider? Stored vectors will be rewritten.`)) {
+            return;
+        }
+
+        this._reindexing = true;
+        this._renderReindex();
+        this._setReindexStatus(`Re-embedding ${n} ${noun}…`);
+        try {
+            const started = await this._postReindex({ dry_run: false });
+            if (!started) {
+                this._setReindexStatus('Re-embed failed to start.');
+                return;
+            }
+            let job = started;
+            if (started.job_id && started.status === 'running') {
+                job = await this._pollReindex(started.job_id);
+            }
+            if (job && job.status === 'error') {
+                this._setReindexStatus(`Re-embed failed: ${job.error || 'unknown error'}`);
+            } else {
+                const done = (job && job.total_reembedded) || 0;
+                this._setReindexStatus(`Re-embedded ${done} ${done === 1 ? 'memory' : 'memories'}.`);
+            }
+        } finally {
+            this._reindexing = false;
+            // Reload authoritative settings (stale_rows/warning refresh).
+            await this.load();
+        }
+    }
+
+    /** POST the reindex body and return the parsed JSON, or null on failure. */
+    async _postReindex(body) {
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(await this.getAuthHeader()),
+            };
+            const response = await fetch(this.reindexEndpoint, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+            });
+            if (!response.ok) return null;
+            return await response.json();
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /** Poll a background reindex job until it reaches a terminal state. */
+    async _pollReindex(jobId, { intervalMs = 1000, maxPolls = 3600 } = {}) {
+        const url = `${this.reindexEndpoint}/${encodeURIComponent(jobId)}`;
+        for (let i = 0; i < maxPolls; i++) {
+            await new Promise(r => setTimeout(r, intervalMs));
+            let job;
+            try {
+                const headers = { ...(await this.getAuthHeader()) };
+                const response = await fetch(url, { headers });
+                if (!response.ok) return null;
+                job = await response.json();
+            } catch (e) {
+                return null;
+            }
+            if (job && typeof job.total_reembedded === 'number') {
+                this._setReindexStatus(`Re-embedded ${job.total_reembedded}/${job.total_stale}…`);
+            }
+            if (job && (job.status === 'done' || job.status === 'error')) {
+                return job;
+            }
+        }
+        return null;
     }
 
     /**
@@ -245,6 +396,10 @@ class EmbeddingSelector {
                 embedding_dim: data.embedding_dim,
                 kestrel_embedding_dim: data.kestrel_embedding_dim,
                 shared_space: data.shared_space,
+                // Changing the route can create stale memories; the POST echoes
+                // the authoritative count so the "Re-embed N memories" button
+                // renders immediately without waiting for a full reload (#2338).
+                stale_rows: data.stale_rows,
             };
             this.mode = embeddingModeForRoute(this.settings.embedding_route);
             this._render();

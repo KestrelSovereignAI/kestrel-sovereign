@@ -202,6 +202,8 @@ function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
     const dimReadout = { textContent: '', style: {} };
     const warningEl = { textContent: '', style: {} };
     const sharedSpaceEl = { textContent: '', style: {} };
+    const reindexButton = { textContent: '', title: '', disabled: false, style: {}, addEventListener() {} };
+    const reindexStatus = { textContent: '', style: {} };
     const posts = [];
 
     const defaultFetch = async (url, opts) => {
@@ -227,6 +229,8 @@ function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
                 if (id === 'embedding-dim-readout') return dimReadout;
                 if (id === 'embedding-dim-warning') return warningEl;
                 if (id === 'embedding-shared-space') return sharedSpaceEl;
+                if (id === 'embedding-reindex-button') return reindexButton;
+                if (id === 'embedding-reindex-status') return reindexStatus;
                 return null;
             },
         },
@@ -243,9 +247,13 @@ function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
         dimReadoutId: 'embedding-dim-readout',
         warningId: 'embedding-dim-warning',
         sharedSpaceId: 'embedding-shared-space',
+        reindexButtonId: 'embedding-reindex-button',
+        reindexStatusId: 'embedding-reindex-status',
+        reindexEndpoint: '/api/embedding/reindex',
+        confirm: () => true,
         getEmbeddingRoutes: () => routes || [],
     });
-    return { embeddings, modeSelect, routeSelect, dimReadout, warningEl, sharedSpaceEl, posts };
+    return { embeddings, modeSelect, routeSelect, dimReadout, warningEl, sharedSpaceEl, reindexButton, reindexStatus, posts };
 }
 
 test('embeddings defaults to Auto — follow chat provider', async () => {
@@ -335,6 +343,122 @@ test('embeddings hide the shared-space entry when no pin covers the route (#2290
 
     assert.equal(sharedSpaceEl.style.display, 'none');
     assert.equal(sharedSpaceEl.textContent, '');
+});
+
+test('re-embed button is hidden when stale_rows is 0 (#2336)', async () => {
+    const { embeddings, reindexButton } = loadEmbeddings({
+        settings: {
+            embedding_route: null,
+            resolved_route: 'ollama:local',
+            embedding_model: 'nomic-embed-text',
+            embedding_dim: 768,
+            kestrel_embedding_dim: 768,
+            stale_rows: 0,
+        },
+        routes: [{ vendor: 'ollama', route: 'local' }],
+    });
+    await embeddings.init();
+
+    assert.equal(reindexButton.style.display, 'none');
+});
+
+test('re-embed button shows "Re-embed N memories" when stale_rows > 0 (#2336)', async () => {
+    const { embeddings, reindexButton } = loadEmbeddings({
+        settings: {
+            embedding_route: 'openai:api',
+            resolved_route: 'openai:api',
+            embedding_model: 'text-embedding-3-small',
+            embedding_dim: 1536,
+            kestrel_embedding_dim: 1536,
+            stale_rows: 42,
+        },
+        routes: [{ vendor: 'openai', route: 'api' }],
+    });
+    await embeddings.init();
+
+    assert.equal(reindexButton.style.display, '');
+    assert.equal(reindexButton.textContent, 'Re-embed 42 memories');
+    assert.equal(reindexButton.disabled, false);
+});
+
+test('re-embed button is singular for a single stale memory (#2336)', async () => {
+    const { embeddings, reindexButton } = loadEmbeddings({
+        settings: {
+            embedding_route: 'openai:api',
+            resolved_route: 'openai:api',
+            embedding_model: 'text-embedding-3-small',
+            embedding_dim: 1536,
+            kestrel_embedding_dim: 1536,
+            stale_rows: 1,
+        },
+        routes: [{ vendor: 'openai', route: 'api' }],
+    });
+    await embeddings.init();
+
+    assert.equal(reindexButton.textContent, 'Re-embed 1 memory');
+});
+
+test('re-embed button is disabled when embeddings are off (#2336)', async () => {
+    const { embeddings, reindexButton } = loadEmbeddings({
+        settings: {
+            embedding_route: 'none',
+            resolved_route: null,
+            embedding_model: null,
+            embedding_dim: null,
+            kestrel_embedding_dim: 768,
+            stale_rows: 5,
+        },
+        routes: [{ vendor: 'ollama', route: 'local' }],
+    });
+    await embeddings.init();
+
+    // Shown (there ARE stale rows) but disabled — nothing to re-embed to.
+    assert.equal(reindexButton.style.display, '');
+    assert.equal(reindexButton.disabled, true);
+});
+
+test('re-embed button dry-runs, confirms, executes, and refreshes (#2336)', async () => {
+    let staleRows = 3;
+    const calls = [];
+    const fetchImpl = async (url, opts) => {
+        const method = (opts && opts.method) || 'GET';
+        calls.push({ url, method });
+        if (url === '/api/embedding/reindex' && method === 'POST') {
+            const body = JSON.parse(opts.body);
+            if (body.dry_run) {
+                return { ok: true, json: async () => ({ dry_run: true, total_stale: 3 }) };
+            }
+            // Execute completes inline (empty/small corpus path).
+            staleRows = 0;
+            return { ok: true, json: async () => ({ dry_run: false, status: 'done', total_stale: 3, total_reembedded: 3 }) };
+        }
+        // GET /api/embedding/settings
+        return {
+            ok: true,
+            json: async () => ({
+                embedding_route: 'openai:api',
+                resolved_route: 'openai:api',
+                embedding_model: 'text-embedding-3-small',
+                embedding_dim: 1536,
+                kestrel_embedding_dim: 1536,
+                stale_rows: staleRows,
+            }),
+        };
+    };
+    const { embeddings, reindexButton } = loadEmbeddings({
+        routes: [{ vendor: 'openai', route: 'api' }],
+        fetchImpl,
+    });
+    await embeddings.init();
+    assert.equal(reindexButton.textContent, 'Re-embed 3 memories');
+
+    await embeddings._handleReindexClick();
+
+    // A dry-run POST and an execute POST both happened.
+    const posts = calls.filter(c => c.method === 'POST' && c.url === '/api/embedding/reindex');
+    assert.equal(posts.length, 2);
+    // After the refresh load, stale_rows dropped to 0 → button hidden again.
+    assert.equal(reindexButton.style.display, 'none');
 });
 
 test('embeddings explicit selection round-trips to the API', async () => {
