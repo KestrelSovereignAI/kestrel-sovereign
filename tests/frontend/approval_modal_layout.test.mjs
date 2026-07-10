@@ -69,3 +69,31 @@ test('JSON args preview wraps + scrolls and is never truncated', () => {
     Modal.hide();
     p.catch(() => {});
 });
+
+test('the modal is a bounded flex column with a SCROLLABLE body — wrapped footers stay reachable (codex P1)', async () => {
+    // Six wrapped action rows + an upgrade banner on a short viewport must
+    // never push the footer past max-height:90vh with overflow:hidden — the
+    // body scrolls instead, and header/footer are non-shrinking flex items.
+    const { Modal } = await import('../../kestrel_sovereign/static/js/ui.js');
+    Modal.show({
+        title: 'Layout probe',
+        content: '<div style="height: 4000px">tall body</div>',
+        buttons: [
+            { label: 'Deny', type: 'secondary', onClick: () => {} },
+            { label: 'Once', type: 'primary', onClick: () => {} },
+            { label: 'Always', type: 'primary', onClick: () => {} },
+            { label: 'Auto: Session', type: 'danger', onClick: () => {} },
+            { label: 'Auto: Always', type: 'danger', onClick: () => {} },
+        ],
+    });
+    const container = document.querySelector('.modal-container');
+    assert.ok(container, 'modal rendered');
+    assert.equal(container.style.display, 'flex');
+    assert.equal(container.style.flexDirection, 'column');
+    const body = container.querySelector('.modal-body');
+    assert.equal(body.style.overflowY, 'auto', 'body scrolls when content exceeds the bound');
+    assert.equal(body.style.minHeight, '0px', 'body may shrink so the footer stays in view');
+    const footer = container.querySelector('.modal-footer');
+    assert.match(footer.style.flex, /0 0 auto/, 'footer never shrinks/clips');
+    Modal.hide();
+});
