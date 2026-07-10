@@ -193,7 +193,14 @@ export function initNavigation() {
     // revealed state persists across reloads so an operator who lives in
     // Advanced isn't re-collapsed every load.
     const advancedToggle = document.getElementById('advanced-toggle-btn');
-    if (navEl && advancedToggle) {
+    // Chat-first reveal only makes sense when there IS a chat to be first:
+    // a `chat`-disabled console is an ALL-PANELS console. Before #2350 this
+    // fell out structurally (the toggle lived inside #panel-chat and was
+    // pruned with it); now the toggle survives in the app nav bar, so gate
+    // it explicitly — hide the toggle and show the strip permanently
+    // (codex P2 on #2355, same lockout class as #2231's P2).
+    const chatEnabled = API.hasCapability('chat');
+    if (navEl && advancedToggle && chatEnabled) {
         Panels.initReveal({
             navEl,
             activate: activatePanel,
@@ -201,12 +208,10 @@ export function initNavigation() {
             storageKey: 'kestrel:console-advanced',
         });
     } else if (navEl) {
-        // Defensive fallback for a console with a nav strip but no Advanced
-        // toggle (e.g. a custom build that dropped #advanced-toggle-btn). With
-        // no surviving reveal control, show the strip permanently instead of
-        // leaving every panel unreachable behind a hidden nav (codex P2 on
-        // #2231). Since #2350 the toggle lives in the app nav bar, so it no
-        // longer disappears when a `chat`-disabled host prunes #panel-chat.
+        // All-panels fallback: chat disabled, or a custom build dropped the
+        // toggle. Show the strip permanently instead of leaving every panel
+        // unreachable behind a hidden nav (codex P2 on #2231).
+        if (advancedToggle) advancedToggle.style.display = 'none';
         navEl.style.display = '';
     }
 

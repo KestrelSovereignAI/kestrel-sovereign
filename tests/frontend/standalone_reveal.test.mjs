@@ -319,9 +319,26 @@ test('SOURCE CONTRACT: a chat-disabled console falls back to a visible strip (co
     // unreachable behind a hidden nav with no reveal control.
     const identity = readFileSync(
         resolve(here, '../../kestrel_sovereign/static/js/identity.js'), 'utf8');
-    const guard = identity.match(/const advancedToggle = document\.getElementById\('advanced-toggle-btn'\);[\s\S]{0,900}/);
+    const guard = identity.match(/const advancedToggle = document\.getElementById\('advanced-toggle-btn'\);[\s\S]{0,1600}/);
     assert.ok(guard, 'reveal wiring guard present');
     assert.match(guard[0], /else if \(navEl\)/, 'fallback branch exists for a missing toggle');
     assert.match(guard[0], /navEl\.style\.display = ''/,
         'fallback unhides the strip so remaining panels stay reachable');
+});
+
+test('chat-disabled console: reveal is BYPASSED — nav strip permanent, Advanced toggle hidden (codex P2 on #2355)', async () => {
+    // Since #2350 the toggle lives in the app nav bar and SURVIVES the
+    // pruning of #panel-chat — reveal must be explicitly capability-gated or
+    // a chat-less console boots with every panel hidden behind a collapsed
+    // strip (the #2231 lockout, resurfaced by placement).
+    const identitySrc = readFileSync(
+        new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
+    const start = identitySrc.indexOf('const advancedToggle');
+    const block = identitySrc.slice(start, start + 1200);
+    assert.match(block, /hasCapability\(\s*['"]chat['"]\s*\)/,
+        'reveal init is gated on the chat capability');
+    assert.match(block, /advancedToggle\.style\.display\s*=\s*'none'/,
+        'the surviving toggle is hidden on the all-panels path');
+    assert.match(block, /navEl\.style\.display\s*=\s*''/,
+        'the nav strip shows permanently on the all-panels path');
 });
