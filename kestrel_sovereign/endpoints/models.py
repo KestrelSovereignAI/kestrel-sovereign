@@ -1273,8 +1273,24 @@ async def list_agent_models(
         # the UI can show a per-vendor route selector without extra round-trips.
         routes = []
         if hasattr(agent, 'llm_service') and agent.llm_service:
+            # #2338: a route advertises embedding capability when discovery
+            # finds ≥1 embedding model FOR THAT ROUTE — not only when a config
+            # pin set ``supports_embeddings``, and NOT collapsed by vendor (an
+            # embedding-capable openai:api must not flip capability on for a
+            # non-embedding openai:plan/codex sibling). Key the discovered set by
+            # the model's originating route.
+            embedding_routes: set = set()
+            try:
+                discovered = await agent.llm_service.discover_embedding_models()
+                embedding_routes = {m.route for m in discovered if m.route}
+            except Exception as e:  # pragma: no cover - never fail the list
+                logger.debug(f"embedding discovery skipped in /api/models: {e}")
             for p in agent.llm_service.providers:
                 capabilities = p.get("capabilities") or {}
+                route_name = p.get("name")
+                supports_embeddings = bool(
+                    capabilities.get("supports_embeddings")
+                ) or (route_name in embedding_routes)
                 routes.append({
                     "vendor": p.get("vendor"),
                     "route": p.get("route"),
@@ -1283,7 +1299,9 @@ async def list_agent_models(
                     # Whether this route can serve embeddings — lets the model
                     # settings popover's Embeddings section list only
                     # embedding-capable routes without a second round-trip (#2264).
-                    "supports_embeddings": bool(capabilities.get("supports_embeddings")),
+                    # Discovery flips this on for routes with a discovered
+                    # embedding model even without a TOML pin (#2338).
+                    "supports_embeddings": supports_embeddings,
                 })
 
         return {
@@ -1394,6 +1412,46 @@ async def set_current_model(request: Request):
         raise HTTPException(status_code=500, detail="Error setting model.")
 
 
+@router.get("/api/embedding/models")
+async def get_embedding_models(request: Request):
+    """Return dynamically-discovered embedding models per vendor (#2338).
+
+    Chat models are discovered dynamically; embedding models must be too. This
+    reads the discovered catalog (OpenRouter's dedicated ``/embeddings/models``
+    endpoint, Ollama's ``/api/show`` capability check, OpenAI's id-prefix
+    filter) so the embeddings settings UI (#2337) populates its provider
+    dropdown and model picker with NO TOML editing. Config pins are folded in
+    as overrides (``is_pinned``), not prerequisites.
+
+    ``shared_space_candidates`` are models discovered on BOTH a local and a
+    cloud route (#2290/#2337 "Universal" option), computed by intersection
+    rather than hardcoded to qwen3.
+    """
+    try:
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+
+        discovered = await agent.llm_service.discover_embedding_models()
+        shared = await agent.llm_service.shared_embedding_space_candidates()
+
+        by_vendor: Dict[str, list] = {}
+        for m in discovered:
+            by_vendor.setdefault(m.provider, []).append(m.to_dict())
+
+        return {
+            "by_vendor": by_vendor,
+            "all": [m.to_dict() for m in discovered],
+            "shared_space_candidates": [m.to_dict() for m in shared],
+            "count": len(discovered),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing embedding models: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error listing embedding models.")
+
+
 @router.get("/api/embedding/settings")
 async def get_embedding_settings(request: Request):
     """Return the resolved embedding-channel state for the active session (#2263).
@@ -1500,6 +1558,19 @@ async def set_embedding_settings(request: Request):
         if not hasattr(agent, "llm_service") or not agent.llm_service:
             raise HTTPException(status_code=503, detail="LLM service not available.")
 
+        # Fold live embedding discovery into route capabilities BEFORE the sync
+        # validator runs (#2338). ``set_embedding_route`` → ``_validate_embedding_route``
+        # reads the static ``supports_embeddings`` capability; without this a
+        # dynamically-discovered route (e.g. OpenRouter with no TOML pin) would
+        # be rejected as "does not advertise embedding support" even though the
+        # embeddings UI just listed it. Best-effort — a discovery hiccup must
+        # not block clearing/setting a route that already has a static pin.
+        if route not in (None, "", "auto", "none"):
+            try:
+                await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as e:  # pragma: no cover - never block the setter
+                logger.debug(f"embedding capability reconcile skipped in setter: {e}")
+
         try:
             # Async set (#2326): after static validation, a cloud route is
             # live-probed with a canary embed so a listed-but-dead upstream
@@ -1510,6 +1581,12 @@ async def set_embedding_settings(request: Request):
             raise HTTPException(status_code=400, detail=str(ve))
 
         settings = agent.llm_service.get_embedding_settings()
+        # Echo the authoritative stale-row count alongside the resolved settings
+        # (#2338): changing the route can create stale memories, and the UI's
+        # ``_renderReindex`` hides the "Re-embed N memories" button whenever
+        # ``stale_rows`` is absent. Mirror the GET endpoint so the button state
+        # is correct immediately after a route change without a second reload.
+        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
         return {"success": True, **settings}
     except HTTPException:
         raise

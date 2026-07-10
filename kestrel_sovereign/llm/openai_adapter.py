@@ -12,9 +12,12 @@ import os
 import openai
 import logging
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
+from typing import Any, Dict, List, Optional, AsyncIterator, Type, TYPE_CHECKING, Union
 
 import httpx
+
+if TYPE_CHECKING:
+    from .embedding_discovery import EmbeddingModelInfo
 from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
@@ -1156,6 +1159,48 @@ class OpenAIAdapter(LLMAdapter):
             return []
         except Exception as e:
             logger.error(f"Failed to list OpenAI models: {e}", exc_info=True)
+            return []
+
+    #: Substrings that mark an OpenAI ``/v1/models`` id as an embedding model.
+    #: OpenAI's model list carries no category, so discovery filters by id.
+    _EMBEDDING_ID_TOKENS = ("text-embedding", "embedding", "embed")
+
+    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+        """Discover embedding models by id-prefix filtering ``/v1/models`` (#2338).
+
+        OpenAI's model list reports no category, so the embedding facet filters
+        the same ``client.models.list()`` payload chat discovery uses down to
+        ``text-embedding-*`` ids. OpenAI-compatible routes (Azure, etc.) that
+        pass their own client get their own embedding catalog.
+        """
+        from .embedding_discovery import EmbeddingModelInfo
+
+        try:
+            if client is None:
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if not api_key:
+                    logger.warning(
+                        "OpenAIAdapter.list_embedding_models called with client=None "
+                        "and no OPENAI_API_KEY; returning empty list"
+                    )
+                    return []
+                client = openai.AsyncOpenAI(api_key=api_key)
+
+            response = await client.models.list()
+            results: List[EmbeddingModelInfo] = []
+            for model in response.data:
+                low = model.id.lower()
+                if not any(tok in low for tok in self._EMBEDDING_ID_TOKENS):
+                    continue
+                results.append(EmbeddingModelInfo(
+                    id=model.id,
+                    provider=getattr(self, "name", "openai") or "openai",
+                    display_name=model.id,
+                ))
+            logger.info(f"OpenAI: discovered {len(results)} embedding models")
+            return results
+        except Exception as e:
+            logger.error(f"Failed to list OpenAI embedding models: {e}", exc_info=True)
             return []
 
     @staticmethod

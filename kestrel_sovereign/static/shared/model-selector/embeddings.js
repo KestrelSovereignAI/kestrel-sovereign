@@ -396,6 +396,10 @@ class EmbeddingSelector {
                 embedding_dim: data.embedding_dim,
                 kestrel_embedding_dim: data.kestrel_embedding_dim,
                 shared_space: data.shared_space,
+                // Changing the route can create stale memories; the POST echoes
+                // the authoritative count so the "Re-embed N memories" button
+                // renders immediately without waiting for a full reload (#2338).
+                stale_rows: data.stale_rows,
             };
             this.mode = embeddingModeForRoute(this.settings.embedding_route);
             this._render();
