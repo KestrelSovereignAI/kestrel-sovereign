@@ -176,7 +176,13 @@ async def delete_agent(request: Request, agent_name: str):
             detail="Agent management is only available in multi-agent mode.",
         )
 
-    removed = await agent_manager.remove_agent(agent_name)
+    try:
+        removed = await agent_manager.remove_agent(agent_name)
+    except ValueError as e:
+        # remove_agent refuses to delete an agent that still has budgeted child
+        # agents (#2113) — that teardown must go through terminate_child. Surface
+        # it as a controlled 409, not a 500.
+        raise HTTPException(status_code=409, detail=str(e))
     if not removed:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found.")
 
