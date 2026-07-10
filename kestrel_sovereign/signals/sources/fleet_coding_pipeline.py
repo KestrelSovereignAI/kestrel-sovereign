@@ -71,16 +71,24 @@ and verifies that PR's head — never run params.
 Wait strategy (spec item #3 — ONE approach, documented here)
 ============================================================
 ``talon_pipeline_dispatch`` caps its held-wait at 3600s
-(``MAX_HANDLE_WAIT_SECONDS``). Real coding runs routinely exceed an hour, so
-holding the dispatch stage in-process would time out the common case. This
-pipeline therefore dispatches with ``wait: false``: the source returns right
-after dispatch, and per #2302's contract ``wait: false`` forces the durable
-``cli_background`` path so the returned ``wait_ref`` (``talon:<job_id>``,
-carried in the stage result) survives an agent restart. The long wait for the
-run to finish (and its PR to open) then lives in the ``verify_ci`` stage:
-``verify_pipeline_ci`` awaits the dispatched job's completion on the same
-durable wait rail before resolving and polling its PR head CI, rather than
-holding the dispatch stage on the in-process wait ceiling.
+(``MAX_HANDLE_WAIT_SECONDS``). Holding the *dispatch* stage in-process for the
+whole run would time out on a long job, so this pipeline dispatches with
+``wait: false``: the source returns right after dispatch, and per #2302's
+contract ``wait: false`` forces the durable ``cli_background`` path so the
+returned ``wait_ref`` (``talon:<job_id>``, carried in the stage result)
+survives an agent restart.
+
+The wait for the run to finish (and its PR to open) is absorbed by
+``verify_ci`` itself, NOT by any workflow "waiting stage": the workflows runner
+has no primitive that parks a ``signal_status_ok`` stage on an arbitrary
+waitable (only ``consent_collect`` / ``council_approve`` gates induce WAITING),
+so the SEQUENTIAL edge fires ``verify_ci`` seconds after the ``wait: false``
+dispatch returns, while the job is still running. ``verify_pipeline_ci``
+therefore reaps the job (fast path for one that already finished, incl. across
+a restart) and, if still running, waits on that same durable ``talon:<job_id>``
+rail up to the held-turn ceiling before reading its final status. It fails
+closed only if the job never goes terminal within the ceiling (the run can be
+re-verified), and otherwise resolves and polls the dispatched PR's head CI.
 """
 
 from __future__ import annotations

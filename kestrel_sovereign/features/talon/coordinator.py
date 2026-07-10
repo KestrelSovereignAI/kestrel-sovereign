@@ -60,6 +60,7 @@ from kestrel_sovereign.features.talon.verification import (
     VerificationEvidence,
     VerificationState,
 )
+from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +147,10 @@ _FORCE_CLI_DISPATCH: "ContextVar[bool]" = ContextVar(
 )
 
 # Terminal talon job states — a job in one of these has finished (and, on
-# success, opened its PR). ``verify_pipeline_ci`` waits until a job reaches one
-# before trying to bind to the PR it produced.
+# success, opened its PR). ``verify_pipeline_ci`` requires a job to be in one
+# — settling it first with a fast point-in-time reap, then a bounded wait on
+# the durable ``talon:<job_id>`` rail if still running — before binding to the
+# PR it produced.
 _TERMINAL_TALON_STATES = frozenset(
     {"complete", "failed", "reject", "finished_unknown"}
 )
@@ -1043,22 +1046,39 @@ class TalonCoordinatorFeature(Feature):
         return run_id if isinstance(run_id, str) and run_id else None
 
     def _record_pipeline_run_job(self, dispatch: Any) -> None:
-        """Bind the current workflow run to the talon job it just dispatched."""
+        """Bind the current workflow run to the talon job it just dispatched.
+
+        Durable with the same guarantees as the job registry (#2303, fifth
+        pass): besides the in-memory ``_pipeline_run_jobs`` map, the binding is
+        stamped onto the persisted job record (``workflow_run_id``) and flushed
+        via :meth:`_persist_jobs`. :meth:`_reload_persisted_jobs` reconstructs
+        the map from those records on boot, so a restart between the
+        ``talon_run`` and ``verify_ci`` stages still resolves this run's own job
+        instead of failing closed on a lost in-memory map.
+        """
         if not isinstance(dispatch, dict) or not dispatch.get("dispatched"):
             return
         job_id = dispatch.get("job_id") or dispatch.get("task_id")
         run_id = self._current_workflow_run_id()
-        if isinstance(job_id, str) and job_id and run_id:
-            self._pipeline_run_jobs[run_id] = job_id
+        if not (isinstance(job_id, str) and job_id and run_id):
+            return
+        self._pipeline_run_jobs[run_id] = job_id
+        info = self._jobs.get(job_id)
+        if isinstance(info, dict):
+            # Persist the binding on the job record so it survives a restart
+            # (only cli_background rows are persisted — exactly the durable
+            # ``wait: false`` dispatch path this pipeline uses).
+            info["workflow_run_id"] = run_id
+            self._persist_jobs()
 
     async def verify_pipeline_ci(
         self,
         *,
         repo: Optional[str] = None,
         run_id: Optional[str] = None,
-        wait_timeout_seconds: int = 3600,
         poll_interval_seconds: int = 15,
         max_ci_wait_seconds: int = 1800,
+        max_job_wait_seconds: int = MAX_HANDLE_WAIT_SECONDS,
         required_checks: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Confirm the CI of the PR THIS pipeline's talon run produced is green.
@@ -1071,9 +1091,25 @@ class TalonCoordinatorFeature(Feature):
         by the workflow run's ``session_id``. The workflows runner sets that
         ``session_id`` to the run id, and the caller cannot control it — so no
         payload field can redirect verification to a different job. It then
-        waits for that job to open its PR, resolves the PR's head branch from
-        GitHub, and polls the PR head's CI (reusing the workflows ``ci_green``
-        gate machinery).
+        resolves that job's PR, reads the PR's head branch from GitHub, and
+        polls the PR head's CI (reusing the workflows ``ci_green`` gate
+        machinery).
+
+        This method absorbs the wait for the coding run to finish (#2303,
+        sixth pass). The ``talon_run`` stage dispatches ``wait: false`` and
+        returns within seconds; the workflows runner has **no** primitive that
+        parks a ``signal_status_ok`` stage on the ``talon:<job_id>`` waitable
+        the dispatch hands back (only ``consent_collect`` / ``council_approve``
+        gates induce WAITING), so the SEQUENTIAL edge fires ``verify_ci``
+        immediately, while the (hour-plus) coding job is still running. This
+        method therefore first does a fast point-in-time reap (settling a job
+        that already finished — including one recovered across a restart from
+        its exit sidecar), and if the job is still non-terminal it waits on the
+        durable ``talon:<job_id>`` rail (the same rail ``wait('talon:...')``
+        uses) up to ``max_job_wait_seconds`` before reading its final status.
+        Only after the ceiling elapses without the job going terminal does it
+        fail closed (the run can be re-verified) — it never claims CI state for
+        an unfinished job.
 
         Every verification fact (repo, PR number, claim/iterate mode) is read
         from the resolved **job record** the coordinator itself established at
@@ -1083,7 +1119,8 @@ class TalonCoordinatorFeature(Feature):
         ignored for binding (#2303, fourth-pass structural directive).
 
         Fail-closed: returns ``{"ci_green": False, "reason": ...}`` whenever the
-        run has no bound job in the map, the job did not COMPLETE, the PR/branch
+        run has no bound job in the map, the job never reached a terminal state
+        within ``max_job_wait_seconds``, the job did not COMPLETE, the PR/branch
         cannot be resolved, or CI is not observably green.
         """
 
@@ -1128,27 +1165,49 @@ class TalonCoordinatorFeature(Feature):
                 **extra,
             }
 
-        # 2. Wait for the job to reach a terminal state so its PR exists.
         from kestrel_sovereign.signals.sources.talon_pipeline import (
             _await_completion,
             _find_pr_url,
         )
 
+        # 2. Ensure the talon job is terminal before verifying its PR's CI
+        # (#2303, sixth pass). Fast path: a point-in-time reap settles a job
+        # that already finished (reaping its process handle / exit sidecar —
+        # this also recovers a job whose process finished across a restart).
+        if self._reap_cli_job(info):
+            self._persist_jobs()
         final_status = info.get("status")
+
         if final_status not in _TERMINAL_TALON_STATES:
+            # Still running. The ``talon_run`` stage dispatched ``wait: false``
+            # and the workflows runner has no primitive that parks a
+            # ``signal_status_ok`` stage on the ``talon:<job_id>`` waitable, so
+            # ``verify_ci`` fires seconds after dispatch while the (hour-plus)
+            # coding job is still going. Absorb the wait HERE, on the durable
+            # rail the dispatch handed back — the same one ``wait('talon:...')``
+            # drives — up to the held-turn ceiling. Failing closed instead
+            # would make the pipeline never go green for any real run.
             try:
-                wait_result = await _await_completion(
-                    self, target_id, wait_timeout_seconds
-                )
-            except Exception as exc:  # noqa: BLE001 - a wait failure fails closed
+                await _await_completion(self, target_id, max_job_wait_seconds)
+            except Exception as exc:  # noqa: BLE001 - fail closed on wait error
                 return _fail(f"job_wait_error:{exc}", job_id=target_id)
-            # ``_await_completion`` returns a failed/partial ToolResult rather
-            # than raising, so read the terminal status off it (falling back to
-            # the freshly-updated job map).
-            wait_data = dict(getattr(wait_result, "data", None) or {})
-            final_status = wait_data.get("status") or (
-                self._jobs.get(target_id) or {}
-            ).get("status")
+            # The wait rail reaps + persists in place (and may reload the job
+            # dict across a restart), so re-read the record for its final state.
+            info = self._jobs.get(target_id) or info
+            final_status = info.get("status")
+
+        if final_status not in _TERMINAL_TALON_STATES:
+            # The job outlasted the ceiling. Fail closed — the run can be
+            # re-verified — rather than claim CI state for an unfinished job.
+            return _fail(
+                f"job_still_running:{final_status or 'unknown'}",
+                job_id=target_id,
+                detail=(
+                    f"talon job did not reach a terminal state within "
+                    f"{max_job_wait_seconds}s; watch it via "
+                    f"wait('talon:{target_id}') (fail closed)"
+                ),
+            )
 
         # 2b. Require the talon job to have SUCCEEDED before polling CI. A job
         # that ended terminal-failed (``failed`` / ``reject`` /
@@ -3687,6 +3746,12 @@ class TalonCoordinatorFeature(Feature):
             # Reloaded jobs have no live process handle.
             info.pop("process", None)
             self._jobs[jid] = info
+            # Reconstruct the workflow run→job binding (#2303, fifth pass) so a
+            # restart between the talon_run and verify_ci stages still resolves
+            # this run's own job. In-process bindings win (setdefault).
+            run_id = info.get("workflow_run_id")
+            if isinstance(run_id, str) and run_id:
+                self._pipeline_run_jobs.setdefault(run_id, jid)
 
     async def _survey_stalled_talon_jobs(
         self, stale_days: Any = 3,
