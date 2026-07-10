@@ -122,6 +122,50 @@ async def test_nested_budgeted_spawn_unwraps_delegated_parent():
 
 
 @pytest.mark.asyncio
+async def test_deposit_restores_budget_headroom():
+    """A refund into a delegated wallet (e.g. a released grandchild hold) reduces
+    the child's spent so the budget can be reused — and never below zero."""
+    real = FakeWallet(initial_balance=Decimal("100"))
+    child_dw = DelegatedWallet(
+        real, BudgetAllocation(child_did="c", amount=Decimal("50"))
+    )
+    # Child spawns a grandchild with budget 20 (held through the child's ceiling).
+    gc = await create_delegated_wallet(child_dw, "did:c", "did:gc", Decimal("20"))
+    assert child_dw.spent == Decimal("20")
+
+    await gc.transfer(Decimal("5"), "gc work")
+    returned = await release_delegated_wallet(gc, child_dw)
+    assert returned == Decimal("15")
+
+    # The 15 refunded restores the child's budget: net spent 20 - 15 = 5.
+    assert child_dw.spent == Decimal("5")
+    assert child_dw.remaining == Decimal("45")
+
+    # An over-refund can't push spent below 0 (ceiling can't inflate).
+    await child_dw.deposit(Decimal("999"))
+    assert child_dw.spent == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_shutdown_all_releases_outstanding_holds():
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    parent = SimpleNamespace(
+        _private_key=None, identity=None, agent_id="did:p", features={},
+        wallet=FakeWallet(initial_balance=Decimal("100")),
+    )
+    child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
+    mgr = _mgr_with_mock_child(child)
+
+    mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("30"))
+    await mgr.spawn_agent("Kid", parent, mandate)
+    assert parent.wallet.get_balance() == Decimal("70")
+
+    await mgr.shutdown_all()
+    assert parent.wallet.get_balance() == Decimal("100")   # hold released on shutdown
+
+
+@pytest.mark.asyncio
 async def test_create_holds_and_release_returns_unspent():
     parent = FakeWallet(initial_balance=Decimal("100"))
     dw = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))

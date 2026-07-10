@@ -633,6 +633,12 @@ class AgentManager:
 
     async def shutdown_all(self) -> None:
         """Gracefully shutdown all agents."""
+        # Release every outstanding delegated budget hold back to its parent
+        # (#2113) so a graceful restart does not strand held funds. (A follow-up
+        # covers durable reconciliation across an *ungraceful* crash.)
+        for child_name in list(self._child_budgets.keys()):
+            await self._release_child_budget(child_name)
+
         # Clear parent-child tracking
         self._parent_children.clear()
         self._child_mandates.clear()

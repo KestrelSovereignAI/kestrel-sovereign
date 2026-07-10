@@ -145,6 +145,30 @@ class DelegatedWallet:
             return min(wrapped, self.remaining)
         return wrapped
 
+    async def deposit(
+        self,
+        amount: Decimal,
+        currency: Any = None,
+        to_audit: bool = False,
+        memo: str = "",
+    ) -> bool:
+        """Credit the wrapped wallet AND restore that much budget headroom.
+
+        A deposit into a delegated wallet is a refund against the ceiling — most
+        importantly when a budgeted child spawns a budgeted grandchild and the
+        grandchild's unspent hold is released back into this child
+        (``release_delegated_wallet`` calls the parent's ``deposit``). Without
+        reducing ``allocation.spent`` the child would stay charged for funds it
+        got back. Bounded at 0 so a refund can never lift ``spent`` below zero and
+        inflate the ceiling beyond ``allocation.amount``.
+        """
+        ok = await self._wallet.deposit(amount, currency, to_audit, memo)
+        if ok:
+            self.allocation.spent = max(
+                Decimal("0"), self.allocation.spent - Decimal(amount)
+            )
+        return ok
+
     def __getattr__(self, name: str) -> Any:
         """Delegate any attribute this wrapper doesn't define to the wrapped
         wallet, so DelegatedWallet is a transparent drop-in (deposit, _balances,
