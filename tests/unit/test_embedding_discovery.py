@@ -371,6 +371,71 @@ async def test_shared_space_candidates_intersect_local_and_cloud():
     assert [normalize_embedding_model_id(m.id) for m in shared] == ["qwen3-embedding-0.6b"]
 
 
+async def test_universal_options_carry_member_routes_with_own_slugs():
+    """The featured "Universal" option enriches a shared model with member
+    routes, each carrying THAT route's own slug (#2337)."""
+    cloud = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-0.6b", provider="openrouter", native_dim=768),
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter"),
+        ]),
+        "client": None,
+        "is_local": False,
+        "capabilities": {},
+    }
+    local = {
+        "vendor": "ollama",
+        "name": "ollama:local",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen3-embedding:0.6b", provider="ollama", native_dim=768),
+            EmbeddingModelInfo(id="nomic-embed-text", provider="ollama"),
+        ]),
+        "client": None,
+        "is_local": True,
+        "capabilities": {},
+    }
+    svc = _FakeService([cloud, local])
+
+    options = await svc.universal_embedding_space_options()
+    assert len(options) == 1
+    opt = options[0]
+    # Members span both routes, each with its own upstream slug and locality.
+    members = {m["route"]: m for m in opt["members"]}
+    assert set(members) == {"openrouter:api", "ollama:local"}
+    assert members["openrouter:api"]["model"] == "qwen/qwen3-embedding-0.6b"
+    assert members["openrouter:api"]["is_local"] is False
+    assert members["ollama:local"]["model"] == "qwen3-embedding:0.6b"
+    assert members["ollama:local"]["is_local"] is True
+
+
+async def test_universal_options_empty_without_a_shared_model():
+    """No model on both sides → no Universal option (never hardcoded)."""
+    cloud = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter"),
+        ]),
+        "client": None,
+        "is_local": False,
+        "capabilities": {},
+    }
+    local = {
+        "vendor": "ollama",
+        "name": "ollama:local",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="nomic-embed-text", provider="ollama"),
+        ]),
+        "client": None,
+        "is_local": True,
+        "capabilities": {},
+    }
+    svc = _FakeService([cloud, local])
+    assert await svc.universal_embedding_space_options() == []
+
+
 # --- per-route capability (no vendor collapse, #2338) ------------------------
 
 async def test_advertisement_is_route_specific_not_vendor_collapsed():

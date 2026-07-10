@@ -56,8 +56,27 @@ class EmbeddingSelector {
      */
     constructor(options = {}) {
         this.settingsEndpoint = options.settingsEndpoint || '/api/embedding/settings';
+        // #2338/#2337 — the dynamically-discovered embedding catalog (per-route
+        // models + the computed "Universal" shared-space options). Read once on
+        // load; drives the featured Universal option and the per-route model
+        // picker so the operator never hand-edits TOML.
+        this.modelsEndpoint = options.modelsEndpoint || '/api/embedding/models';
+        // #2337 — per-route embedding_model pin (the runtime equivalent of the
+        // TOML embedding_model/embedding_dim keys), with a probe-on-save.
+        this.routeModelEndpoint = options.routeModelEndpoint || '/api/embedding/route-model';
+        // #2290 — the shared-space parity probe used by guided Universal setup.
+        this.verifyEndpoint = options.verifyEndpoint || '/api/embedding/space/verify';
         this.modeSelect = options.modeSelectId ? document.getElementById(options.modeSelectId) : null;
         this.routeSelect = options.routeSelectId ? document.getElementById(options.routeSelectId) : null;
+        // #2337 — featured "Universal — <model> (local + cloud, one search
+        // space)" option, pinned at the top and rendered even when not yet
+        // configured ("needs setup"). Clicking it runs guided setup.
+        this.universalEl = options.universalId ? document.getElementById(options.universalId) : null;
+        // #2337 — per-route embedding-model <select>, shown alongside the route
+        // picker in explicit mode. Populated from the discovered catalog.
+        this.modelSelect = options.modelSelectId ? document.getElementById(options.modelSelectId) : null;
+        // #2337 — status readout for guided Universal setup (fails loudly).
+        this.setupStatus = options.setupStatusId ? document.getElementById(options.setupStatusId) : null;
         this.dimReadout = options.dimReadoutId ? document.getElementById(options.dimReadoutId) : null;
         this.warningEl = options.warningId ? document.getElementById(options.warningId) : null;
         // #2290 — element that renders a shared local/cloud embedding space as
@@ -76,6 +95,11 @@ class EmbeddingSelector {
         this._reindexing = false;
 
         this.settings = null;
+        // The discovered embedding catalog ({all, by_vendor,
+        // shared_space_candidates, universal}); null until loaded / on failure.
+        this.catalog = null;
+        // Guards guided-setup re-entrancy.
+        this._settingUp = false;
         // 'auto' == follow chat provider (embedding_route null); 'explicit' ==
         // a pinned provider:route; 'off' == embeddings deliberately disabled
         // (embedding_route "none", #2287).
@@ -97,6 +121,12 @@ class EmbeddingSelector {
         if (this.reindexButton) {
             this.reindexButton.addEventListener('click', () => this._handleReindexClick());
         }
+        if (this.universalEl && this.universalEl.addEventListener) {
+            this.universalEl.addEventListener('click', () => this._handleUniversalClick());
+        }
+        if (this.modelSelect && this.modelSelect.addEventListener) {
+            this.modelSelect.addEventListener('change', () => this._handleModelChange());
+        }
     }
 
     /** Fetch the current settings and render. */
@@ -112,12 +142,41 @@ class EmbeddingSelector {
         } catch (e) {
             return;
         }
+        // Best-effort: the discovered catalog powers the featured Universal
+        // option and per-route model picker. A failure here degrades to the
+        // route-only UI rather than blocking the settings render.
+        await this._loadCatalog();
         this.mode = embeddingModeForRoute(this.settings && this.settings.embedding_route);
         this._render();
     }
 
+    /** Fetch the discovered embedding catalog (#2338/#2337); best-effort. */
+    async _loadCatalog() {
+        if (!this.modelsEndpoint) return;
+        // Only worth fetching when the UI can actually use it.
+        if (!this.universalEl && !this.modelSelect) return;
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(await this.getAuthHeader()),
+            };
+            const response = await fetch(this.modelsEndpoint, { headers });
+            if (!response.ok) return;
+            const data = await response.json();
+            // Guard: only accept a real catalog shape (a settings object served
+            // by a mis-pointed endpoint must not masquerade as a catalog).
+            if (data && (Array.isArray(data.universal) || Array.isArray(data.all))) {
+                this.catalog = data;
+            }
+        } catch (e) {
+            /* keep the route-only UI */
+        }
+    }
+
     _render() {
+        this._renderUniversal();
         this._renderRoutes();
+        this._renderModelPicker();
         this._syncModeUI();
         this._renderDimension();
         this._renderSharedSpace();
@@ -258,6 +317,252 @@ class EmbeddingSelector {
         return null;
     }
 
+    // --- Featured "Universal" option (#2337) --------------------------------
+
+    /**
+     * The featured Universal candidate: an open-weight model discovered on BOTH
+     * a local and a cloud route (one searchable space in every privacy mode).
+     * Prefers the candidate matching the currently-resolved shared space, else
+     * the first the backend computed. Never hardcoded to qwen3 — it is whatever
+     * the intersection produced. Returns null when the catalog has none.
+     */
+    _universalOption() {
+        const options = (this.catalog && this.catalog.universal) || [];
+        if (!options.length) return null;
+        const space = this.settings && this.settings.shared_space;
+        if (space && space.model) {
+            const match = options.find(o => o.model === space.model);
+            if (match) return match;
+        }
+        return options[0];
+    }
+
+    /** True when the resolved shared space is configured AND parity-verified. */
+    _universalConfigured(option) {
+        const space = this.settings && this.settings.shared_space;
+        return !!(space && option && space.model === option.model && space.verified);
+    }
+
+    /**
+     * Render the featured "Universal — <model> (local + cloud, one search
+     * space)" option, pinned at the top. Rendered even when not yet configured,
+     * marked "needs setup"; when configured + verified it reads "active". This
+     * is THE recommended choice: it works in every privacy mode and keeps one
+     * searchable memory space, so it leads the section rather than sitting as a
+     * peer of the cloud-only routes (#2337 scope amendment).
+     */
+    _renderUniversal() {
+        if (!this.universalEl) return;
+        const option = this._universalOption();
+        if (!option) {
+            this.universalEl.style.display = 'none';
+            this.universalEl.textContent = '';
+            return;
+        }
+        const configured = this._universalConfigured(option);
+        const state = this._settingUp
+            ? 'setting up…'
+            : (configured ? 'active' : 'needs setup');
+        this.universalEl.style.display = '';
+        this.universalEl.textContent =
+            `Universal — ${option.model} (local + cloud, one search space) · ${state}`;
+        this.universalEl.title =
+            'Recommended: works in every privacy mode and keeps one searchable ' +
+            'memory space. Local + cloud sessions share the same coordinates. ' +
+            (configured ? 'Active.' : 'Click to set up.');
+        if ('disabled' in this.universalEl) this.universalEl.disabled = this._settingUp;
+    }
+
+    _handleUniversalClick() {
+        if (this._settingUp) return;
+        const option = this._universalOption();
+        if (!option) return;
+        return this._setupUniversal(option);
+    }
+
+    /**
+     * Guided Universal setup (#2337): pin the shared model on EVERY member
+     * route (each with its own slug), run the #2290 parity probe, then reload
+     * so the shared-space readout + #2336 re-embed offer refresh. Fails loudly
+     * at any step — a dead/misspelled upstream slug is rejected by the
+     * route-model probe (#2326); a below-threshold parity shows the measured
+     * cosine rather than silently claiming a shared space.
+     */
+    async _setupUniversal(option) {
+        if (this._settingUp) return;
+        const members = (option && option.members) || [];
+        if (members.length < 2) {
+            this._setSetupStatus('Universal setup needs a local and a cloud member route.');
+            return;
+        }
+        this._settingUp = true;
+        this._renderUniversal();
+        try {
+            for (const member of members) {
+                this._setSetupStatus(`Configuring ${member.route} → ${member.model}…`);
+                const res = await this._postRouteModel(member.route, member.model, option.dim);
+                if (!res.ok) {
+                    this._setSetupStatus(
+                        `Setup failed on ${member.route}: ${res.detail || 'the model could not be configured (not served / not pulled).'}`
+                    );
+                    return;
+                }
+            }
+            this._setSetupStatus('Verifying local ↔ cloud parity…');
+            const verify = await this._postVerify();
+            const parity = this._summarizeParity(verify);
+            if (parity && !parity.passed) {
+                this._setSetupStatus(
+                    `Parity below threshold (min cosine ${parity.minCosine}). ` +
+                    'Local and cloud embeddings drift too far to share one space.'
+                );
+            } else if (parity) {
+                this._setSetupStatus(
+                    `Universal active — parity verified (min cosine ${parity.minCosine}).`
+                );
+            } else {
+                this._setSetupStatus('Universal configured.');
+            }
+        } finally {
+            this._settingUp = false;
+            // Authoritative reload refreshes shared_space + stale_rows.
+            await this.load();
+        }
+    }
+
+    /** Collapse a /space/verify response into {passed, minCosine} or null. */
+    _summarizeParity(verify) {
+        if (!verify || !verify.results) return null;
+        const rows = Object.values(verify.results);
+        if (!rows.length) return null;
+        let passed = true;
+        let minCosine = null;
+        for (const r of rows) {
+            if (r && r.passed === false) passed = false;
+            const c = r && (r.min_cosine != null ? r.min_cosine : r.minCosine);
+            if (typeof c === 'number' && (minCosine === null || c < minCosine)) {
+                minCosine = c;
+            }
+        }
+        return { passed, minCosine: minCosine === null ? 'n/a' : minCosine };
+    }
+
+    _setSetupStatus(text) {
+        if (!this.setupStatus) return;
+        this.setupStatus.textContent = text || '';
+        this.setupStatus.style.display = text ? '' : 'none';
+    }
+
+    // --- Per-route embedding-model picker (#2337) ---------------------------
+
+    /** Discovered embedding models for a given "<vendor>:<route>". */
+    _modelsForRoute(route) {
+        const all = (this.catalog && this.catalog.all) || [];
+        return all.filter(m => m.route === route);
+    }
+
+    /**
+     * Populate the per-route embedding-model <select> (#2337) for the currently
+     * selected explicit route, so the operator picks WHICH model that route
+     * embeds with — the runtime equivalent of the TOML ``embedding_model`` key,
+     * with no TOML editing. Hidden unless an explicit route with a discovered
+     * catalog is selected; a route with no discovered models offers nothing to
+     * pick (free-text pinning stays a config/CLI concern).
+     */
+    _renderModelPicker() {
+        if (!this.modelSelect) return;
+        const route = this.mode === 'explicit' && this.routeSelect ? this.routeSelect.value : null;
+        const models = route ? this._modelsForRoute(route) : [];
+        if (this.mode !== 'explicit' || !models.length) {
+            this.modelSelect.style.display = 'none';
+            this.modelSelect.innerHTML = '';
+            return;
+        }
+        const pins = (this.settings && this.settings.route_embedding_models) || {};
+        const pinned = pins[route] && pins[route].model;
+        const resolved = this.settings && this.settings.embedding_model;
+        const selected = pinned || resolved;
+        this.modelSelect.innerHTML = models.map(m => {
+            const label = m.display_name || m.id;
+            const dim = m.native_dim ? ` · ${m.native_dim}d` : '';
+            return `<option value="${m.id}">${label}${dim}</option>`;
+        }).join('');
+        if (selected && models.some(m => m.id === selected)) {
+            this.modelSelect.value = selected;
+        }
+        this.modelSelect.style.display = '';
+    }
+
+    /** Commit a per-route model pin from the picker (probe-on-save, #2337). */
+    async _handleModelChange() {
+        if (this.mode !== 'explicit' || !this.routeSelect || !this.modelSelect) return;
+        const route = this.routeSelect.value;
+        const model = this.modelSelect.value;
+        if (!route || !model) return;
+        const models = this._modelsForRoute(route);
+        const chosen = models.find(m => m.id === model);
+        const dim = chosen ? chosen.native_dim : null;
+        this._setSetupStatus(`Pinning ${route} → ${model}…`);
+        const res = await this._postRouteModel(route, model, dim);
+        if (!res.ok) {
+            this._setSetupStatus(
+                `Could not pin ${model} on ${route}: ${res.detail || 'the model may not be served upstream.'}`
+            );
+            return;
+        }
+        this._setSetupStatus('');
+        // Reload so the dimension readout / shared space reflect the new pin.
+        await this.load();
+    }
+
+    /**
+     * POST a per-route embedding_model pin (or clear). Returns
+     * ``{ok, data, detail}`` — ``detail`` carries the server's rejection
+     * message (e.g. a dead-slug 400) so callers can fail loudly.
+     */
+    async _postRouteModel(route, model, dim) {
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(await this.getAuthHeader()),
+            };
+            const body = { route, embedding_model: model || null };
+            if (dim != null) body.embedding_dim = dim;
+            const response = await fetch(this.routeModelEndpoint, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+            });
+            let data = null;
+            try { data = await response.json(); } catch (e) { /* no body */ }
+            if (!response.ok) {
+                return { ok: false, data, detail: data && data.detail };
+            }
+            return { ok: true, data };
+        } catch (e) {
+            return { ok: false, detail: String(e) };
+        }
+    }
+
+    /** POST the shared-space parity probe (#2290); returns the parsed result. */
+    async _postVerify(name) {
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(await this.getAuthHeader()),
+            };
+            const response = await fetch(this.verifyEndpoint, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(name ? { name } : {}),
+            });
+            if (!response.ok) return null;
+            return await response.json();
+        } catch (e) {
+            return null;
+        }
+    }
+
     /**
      * Render a declared shared local/cloud embedding space (#2290) as a single
      * entry — "qwen3-embedding-0.6b — local + cloud" — with a verified/unverified
@@ -281,14 +586,40 @@ class EmbeddingSelector {
         this.sharedSpaceEl.textContent = `${space.model} — ${scope} (${status})`;
     }
 
+    /**
+     * Label a non-universal route with its hidden tradeoff (#2337). A cloud-only
+     * model silently degrades ``force_local_only`` / private sessions to keyword
+     * search; a local-only model gives cloud sessions nothing. The UI must state
+     * this, not bury it. Returns '' when the route is a member of a shared
+     * (universal) space — no tradeoff to warn about — or when locality is
+     * unknown.
+     */
+    _routeTradeoff(route) {
+        const option = this._universalOption();
+        const members = (option && option.members) || [];
+        if (members.some(m => m.route === route.id)) return '';
+        if (route.is_local === true) {
+            return 'local only — cloud sessions fall back to keyword search';
+        }
+        if (route.is_local === false || route.is_cloud === true) {
+            return 'cloud only — private/local sessions fall back to keyword search';
+        }
+        return '';
+    }
+
     /** Populate the explicit route <select> from embedding-capable routes. */
     _renderRoutes() {
         if (!this.routeSelect) return;
-        const routes = this.getEmbeddingRoutes() || [];
+        const routes = (this.getEmbeddingRoutes() || []).map(r => ({
+            ...r,
+            id: `${r.vendor}:${r.route}`,
+        }));
         const configured = this.settings && this.settings.embedding_route;
         this.routeSelect.innerHTML = routes.map(r => {
-            const id = `${r.vendor}:${r.route}`;
-            const label = r.label || id;
+            const id = r.id;
+            const tradeoff = this._routeTradeoff(r);
+            const base = r.label || id;
+            const label = tradeoff ? `${base} — ${tradeoff}` : base;
             return `<option value="${id}">${label}</option>`;
         }).join('');
         if (configured && routes.some(r => `${r.vendor}:${r.route}` === configured)) {
@@ -303,6 +634,12 @@ class EmbeddingSelector {
         if (this.modeSelect) this.modeSelect.value = this.mode;
         if (this.routeSelect) {
             this.routeSelect.style.display = this.mode === 'explicit' ? '' : 'none';
+        }
+        // The per-route model picker only makes sense in explicit mode; its
+        // population/visibility (needs a discovered catalog) is finalized in
+        // _renderModelPicker, but hide it eagerly outside explicit mode.
+        if (this.modelSelect && this.mode !== 'explicit') {
+            this.modelSelect.style.display = 'none';
         }
     }
 

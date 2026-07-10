@@ -17,6 +17,7 @@ class ModelPreferenceMixin:
 
     MODEL_PREFERENCE_KEY = "model_preference"
     EMBEDDING_ROUTE_KEY = "embedding_route"
+    EMBEDDING_MODEL_OVERRIDES_KEY = "embedding_model_overrides"
 
     async def list_available_models(self, use_cache: bool = True) -> List[Dict[str, Any]]:
         """
@@ -194,6 +195,67 @@ class ModelPreferenceMixin:
             )
         except Exception as e:
             logging.warning(f"Failed to persist embedding_route: {e}")
+
+    async def _load_route_embedding_models(self) -> None:
+        """Load persisted per-route embedding_model overrides (#2337).
+
+        Mirrors ``_load_embedding_route``: a persisted runtime map in
+        agent_metadata (``{"<vendor>:<route>": {"model": str, "dim": int|None}}``)
+        re-applies the operator's UI-chosen model pins over the config/discovery
+        default. Applied WITHOUT the live probe explicit sets run — probing at
+        boot could fail startup on a transient upstream outage; the write path
+        still degrades gracefully to keyword search if a pinned model is dead.
+        """
+        try:
+            result = await self._raw_storage.db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (self.agent_id, self.EMBEDDING_MODEL_OVERRIDES_KEY),
+            )
+            if not result:
+                return
+            overrides = json.loads(result[0][0])
+            if not isinstance(overrides, dict):
+                return
+            for route, spec in overrides.items():
+                if not isinstance(spec, dict):
+                    continue
+                model = spec.get("model")
+                dim = spec.get("dim")
+                if not model:
+                    continue
+                try:
+                    self.llm_service.set_route_embedding_model(
+                        route, model, dim, persist=False
+                    )
+                    logging.info(
+                        "Loaded persisted embedding_model pin for %s: %s%s",
+                        route,
+                        model,
+                        f" @ {dim}" if dim is not None else "",
+                    )
+                except Exception as e:  # pragma: no cover - never block boot
+                    logging.warning(
+                        "Skipping persisted embedding_model pin for %s: %s", route, e
+                    )
+        except Exception as e:
+            logging.warning(f"Failed to load embedding_model overrides: {e}")
+
+    async def _persist_route_embedding_models(self, overrides: dict) -> None:
+        """Persist per-route embedding_model overrides to agent_metadata (#2337)."""
+        try:
+            value = json.dumps(overrides or {})
+            await self._raw_storage.db.execute(
+                """INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    self.agent_id,
+                    self.EMBEDDING_MODEL_OVERRIDES_KEY,
+                    value,
+                    datetime.now(timezone.utc),
+                ),
+            )
+        except Exception as e:
+            logging.warning(f"Failed to persist embedding_model overrides: {e}")
 
     def _get_local_model_fallback(self) -> str:
         """Get the configured local (ollama) model for economy/solvency fallback."""

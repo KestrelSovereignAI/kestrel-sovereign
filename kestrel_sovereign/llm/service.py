@@ -418,6 +418,19 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # preference persistence mechanism so a runtime change survives restart.
         self._embedding_route_persistence_callback = None
 
+        # Per-route embedding_model overrides chosen at runtime (#2337). Keyed by
+        # exact route name ("<vendor>:<route>") -> {"model": str, "dim": int|None}.
+        # These mirror the config-file ``embedding_model``/``embedding_dim`` keys
+        # under a route but are set from the UI (no TOML editing), and persist the
+        # same way as the embedding_route knob (agent_metadata) — NOT a new store.
+        self._route_embedding_model_overrides: Dict[str, Dict[str, Any]] = {}
+        # Snapshot of each route's capability keys BEFORE its first runtime
+        # override, so clearing restores the pre-override (config/discovery) state
+        # exactly instead of leaving a stale pin behind.
+        self._route_embedding_caps_backup: Dict[str, Dict[str, Any]] = {}
+        # Persistence callback for the per-route embedding_model overrides (#2337).
+        self._route_embedding_model_persistence_callback = None
+
         # Routes that have failed with a permanent auth error (401/403 or
         # the equivalent "User not found" / "invalid api key" message). Once
         # a route lands here, subsequent fallback iterations skip it for the
@@ -720,6 +733,235 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         task.add_done_callback(self._handle_preference_persistence_done)
         return task
 
+    # --- Per-route embedding_model overrides (#2337) -------------------------
+
+    def set_route_embedding_model_persistence_callback(self, callback) -> None:
+        """Set the persistence callback for per-route embedding_model pins (#2337).
+
+        The callback is ``async (overrides: dict) -> None`` and is invoked
+        whenever a per-route embedding_model override is set or cleared, so the
+        caller can persist the whole override map the same way the embedding_route
+        knob and model preference persist (agent_metadata row) — not a new store.
+        """
+        self._route_embedding_model_persistence_callback = callback
+        logger.info("Per-route embedding_model persistence enabled")
+
+    def get_route_embedding_model_overrides(self) -> Dict[str, Dict[str, Any]]:
+        """Return a copy of the runtime per-route embedding_model overrides (#2337)."""
+        overrides = getattr(self, "_route_embedding_model_overrides", None) or {}
+        return {route: dict(spec) for route, spec in overrides.items()}
+
+    def _find_route_provider(self, route: str) -> Optional[Dict[str, Any]]:
+        """Return the configured provider whose ``name`` matches ``route`` exactly."""
+        providers = getattr(self, "providers", None) or []
+        return next((p for p in providers if p.get("name") == route), None)
+
+    def set_route_embedding_model(
+        self,
+        route: str,
+        model: Optional[str],
+        dim: Optional[int] = None,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Pin (or clear) a route's embedding model at runtime (#2337).
+
+        Config pins ``embedding_model``/``embedding_dim`` under a route in
+        kestrel.toml; this is the runtime equivalent set from the embeddings UI
+        so the operator never hand-edits TOML. Writing the pin into the route's
+        ``capabilities`` re-advertises embedding support for that exact route
+        (mirrors :meth:`reconcile_embedding_capabilities`), making it selectable
+        and usable by storage immediately. Passing ``model`` as ``None``/``""``
+        clears the override and restores the route's pre-override
+        (config/discovery) capability state.
+
+        Route-specific by design: a pin on ``openai:api`` never flips capability
+        on for a sibling ``openai:plan``. ``route`` must name an exact configured
+        route (``"<vendor>:<route>"``).
+
+        Args:
+            route: Exact route name to pin the model on.
+            model: The embedding model id, or ``None``/``""`` to clear.
+            dim: Optional embedding dimension forwarded as the Matryoshka
+                ``dimensions`` param and used to key the embedding space.
+            persist: When True (default) and a persistence callback is bound,
+                schedule the override map to be persisted.
+
+        Raises:
+            ValueError: if ``route`` names no configured route.
+        """
+        if not route or not isinstance(route, str):
+            raise ValueError("A route name is required to pin an embedding model.")
+        route = route.strip()
+
+        provider = self._find_route_provider(route)
+        # Permissive about UNKNOWN state (mirrors _validate_embedding_route):
+        # pre-init / bare harness has no providers to validate against.
+        providers = getattr(self, "providers", None) or []
+        if providers and provider is None:
+            known = sorted({p.get("name") for p in providers if p.get("name")})
+            raise ValueError(
+                f"Cannot set embedding_model: no configured route matches "
+                f"'{route}'. Known routes: {known or '(none)'}."
+            )
+
+        clearing = model is None or (isinstance(model, str) and not model.strip())
+
+        if provider is not None:
+            caps = provider.get("capabilities")
+            if not isinstance(caps, dict):
+                caps = {}
+                provider["capabilities"] = caps
+            # Snapshot the pre-override capability keys once, so a later clear
+            # restores exactly what config/discovery had established.
+            if route not in self._route_embedding_caps_backup:
+                self._route_embedding_caps_backup[route] = {
+                    key: caps[key]
+                    for key in ("embedding_model", "embedding_dim", "supports_embeddings")
+                    if key in caps
+                }
+
+            if clearing:
+                backup = self._route_embedding_caps_backup.pop(route, {})
+                for key in ("embedding_model", "embedding_dim", "supports_embeddings"):
+                    if key in backup:
+                        caps[key] = backup[key]
+                    else:
+                        caps.pop(key, None)
+            else:
+                caps["embedding_model"] = model.strip()
+                if dim is not None:
+                    caps["embedding_dim"] = int(dim)
+                caps["supports_embeddings"] = True
+
+        if clearing:
+            self._route_embedding_model_overrides.pop(route, None)
+            logger.info("Cleared runtime embedding_model override for %s", route)
+        else:
+            spec: Dict[str, Any] = {"model": model.strip()}
+            if dim is not None:
+                spec["dim"] = int(dim)
+            self._route_embedding_model_overrides[route] = spec
+            logger.info(
+                "Pinned embedding_model for %s: %s%s",
+                route,
+                spec["model"],
+                f" @ {spec['dim']}" if spec.get("dim") is not None else "",
+            )
+
+        # Discovery results are cached per instance; invalidate so the newly
+        # pinned/cleared model is reflected on the next discover call.
+        self._embedding_discovery_cache = None
+
+        if persist and self._route_embedding_model_persistence_callback:
+            self._schedule_route_embedding_model_persistence()
+
+    async def aset_route_embedding_model(
+        self,
+        route: str,
+        model: Optional[str],
+        dim: Optional[int] = None,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Set a per-route embedding_model, adding a live probe on save (#2337/#2326).
+
+        Mirrors :meth:`aset_embedding_route`: a cloud route's candidate model is
+        embedded once (a canary) BEFORE the pin is committed, so a dead/misspelled
+        upstream slug is refused with a ``ValueError`` at configuration time rather
+        than silently 404'ing to keyword fallback on the next storage write. Local
+        routes and the clear path skip the probe.
+
+        Raises:
+            ValueError: if ``route`` is unknown, or the live canary embed against
+                a cloud route with the candidate model fails / returns no vector.
+        """
+        clearing = model is None or (isinstance(model, str) and not model.strip())
+        if not clearing:
+            # Validate the route exists before probing (raises on unknown route).
+            if not route or not isinstance(route, str):
+                raise ValueError("A route name is required to pin an embedding model.")
+            provider = self._find_route_provider(route.strip())
+            providers = getattr(self, "providers", None) or []
+            if providers and provider is None:
+                known = sorted({p.get("name") for p in providers if p.get("name")})
+                raise ValueError(
+                    f"Cannot set embedding_model: no configured route matches "
+                    f"'{route.strip()}'. Known routes: {known or '(none)'}."
+                )
+            await self._probe_route_embedding_model_live(route.strip(), model.strip(), dim)
+
+        self.set_route_embedding_model(route, model, dim, persist=persist)
+
+    async def _probe_route_embedding_model_live(
+        self, route: str, model: str, dim: Optional[int]
+    ) -> None:
+        """Embed one canary through ``route`` using ``model`` to prove it's live (#2337).
+
+        Reuses the #2326 canary machinery, but against a candidate model that is
+        not yet committed to the route's capabilities: builds a throwaway provider
+        copy whose capabilities carry the candidate model/dim and embeds a single
+        canary. Cloud routes only — a local route's missing model is a separate
+        (already-handled) setup problem, and a bare harness with no live provider
+        has nothing to probe.
+        """
+        provider = self._find_route_provider(route)
+        if provider is None:
+            # No providers initialized (pre-init / bare harness) — nothing live.
+            return
+        if provider.get("is_local") or not provider.get("is_cloud", True):
+            return
+
+        # Shallow-copy the provider and overlay the candidate model/dim onto a
+        # copied capabilities dict so the real route config is untouched if the
+        # probe fails.
+        probe_provider = dict(provider)
+        caps = dict(provider.get("capabilities") or {})
+        caps["embedding_model"] = model
+        if dim is not None:
+            caps["embedding_dim"] = int(dim)
+        probe_provider["capabilities"] = caps
+
+        from .embedding_service import ProviderEmbeddingService
+        from .embedding_space import DEFAULT_PARITY_CANARIES
+
+        service = ProviderEmbeddingService(probe_provider)
+        canary = DEFAULT_PARITY_CANARIES[0]
+        try:
+            vector = await service.aembed(canary)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot pin embedding_model '{model}' on '{route}': live "
+                f"embedding probe failed against the upstream provider ({exc}). "
+                f"The model may not be currently served."
+            ) from exc
+        if not vector:
+            raise ValueError(
+                f"Cannot pin embedding_model '{model}' on '{route}': the upstream "
+                f"provider returned no embedding for a canary probe. The model may "
+                f"not be currently served."
+            )
+
+    def _schedule_route_embedding_model_persistence(
+        self,
+    ) -> Optional["asyncio.Task[None]"]:
+        """Own per-route embedding_model persistence so close() can await it (#2337)."""
+        if not self._route_embedding_model_persistence_callback:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(
+            self._route_embedding_model_persistence_callback(
+                self.get_route_embedding_model_overrides()
+            ),
+            name="llm-route-embedding-model-persistence",
+        )
+        self._preference_persistence_tasks.add(task)
+        task.add_done_callback(self._handle_preference_persistence_done)
+        return task
+
     def get_embedding_settings(self) -> Dict[str, Any]:
         """Return the resolved embedding-channel state for the active session (#2263).
 
@@ -787,6 +1029,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             "embedding_dim": embedding_dim,
             "kestrel_embedding_dim": deployment_dim,
             "shared_space": shared_space,
+            # #2337 — the runtime per-route embedding_model pins the UI's model
+            # picker reflects (keyed by "<vendor>:<route>"). Empty when none set.
+            "route_embedding_models": self.get_route_embedding_model_overrides(),
         }
 
     @staticmethod

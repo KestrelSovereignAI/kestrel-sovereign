@@ -590,6 +590,256 @@ test('embeddings shows no warning when dimensions match', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Featured "Universal" option + per-route model picker + tradeoff labels (#2337)
+// ---------------------------------------------------------------------------
+
+function createButton() {
+    const handlers = {};
+    return {
+        textContent: '', title: '', disabled: false, style: {},
+        addEventListener(t, fn) { (handlers[t] = handlers[t] || []).push(fn); },
+        _fire(t) { (handlers[t] || []).forEach(fn => fn()); },
+    };
+}
+
+function loadEmbeddingsUniversal({ settings, routes, catalog, fetchImpl } = {}) {
+    const modeSelect = createSelect();
+    const routeSelect = createSelect();
+    const modelSelect = createSelect();
+    const universalEl = createButton();
+    const setupStatus = { textContent: '', style: {} };
+    const dimReadout = { textContent: '', style: {} };
+    const warningEl = { textContent: '', style: {} };
+    const sharedSpaceEl = { textContent: '', style: {} };
+    const reindexButton = createButton();
+    const reindexStatus = { textContent: '', style: {} };
+    const calls = [];
+
+    const defaultFetch = async (url, opts) => {
+        const method = (opts && opts.method) || 'GET';
+        calls.push({ url, method, body: opts && opts.body ? JSON.parse(opts.body) : null });
+        if (url.includes('/api/embedding/models')) {
+            return { ok: true, json: async () => catalog || { all: [], universal: [] } };
+        }
+        if (url.includes('/api/embedding/route-model')) {
+            return { ok: true, json: async () => ({ success: true, ...settings }) };
+        }
+        if (url.includes('/api/embedding/space/verify')) {
+            return { ok: true, json: async () => ({ success: true, results: { qwen3: { passed: true, min_cosine: 0.98 } } }) };
+        }
+        // GET /api/embedding/settings
+        return { ok: true, json: async () => settings };
+    };
+
+    const context = {
+        console: { warn() {}, error() {}, log() {} },
+        window: {},
+        document: {
+            getElementById(id) {
+                if (id === 'embedding-mode-selector') return modeSelect;
+                if (id === 'embedding-route-selector') return routeSelect;
+                if (id === 'embedding-model-selector') return modelSelect;
+                if (id === 'embedding-universal') return universalEl;
+                if (id === 'embedding-setup-status') return setupStatus;
+                if (id === 'embedding-dim-readout') return dimReadout;
+                if (id === 'embedding-dim-warning') return warningEl;
+                if (id === 'embedding-shared-space') return sharedSpaceEl;
+                if (id === 'embedding-reindex-button') return reindexButton;
+                if (id === 'embedding-reindex-status') return reindexStatus;
+                return null;
+            },
+        },
+        fetch: fetchImpl || defaultFetch,
+        setTimeout, clearTimeout,
+    };
+
+    vm.runInNewContext(embeddingsSource, context, { filename: 'model-selector/embeddings.js' });
+    const EmbeddingSelector = context.window.EmbeddingSelector;
+    const embeddings = new EmbeddingSelector({
+        settingsEndpoint: '/api/embedding/settings',
+        modelsEndpoint: '/api/embedding/models',
+        routeModelEndpoint: '/api/embedding/route-model',
+        verifyEndpoint: '/api/embedding/space/verify',
+        modeSelectId: 'embedding-mode-selector',
+        routeSelectId: 'embedding-route-selector',
+        modelSelectId: 'embedding-model-selector',
+        universalId: 'embedding-universal',
+        setupStatusId: 'embedding-setup-status',
+        dimReadoutId: 'embedding-dim-readout',
+        warningId: 'embedding-dim-warning',
+        sharedSpaceId: 'embedding-shared-space',
+        reindexButtonId: 'embedding-reindex-button',
+        reindexStatusId: 'embedding-reindex-status',
+        reindexEndpoint: '/api/embedding/reindex',
+        confirm: () => true,
+        getEmbeddingRoutes: () => routes || [],
+    });
+    return { embeddings, modeSelect, routeSelect, modelSelect, universalEl, setupStatus, sharedSpaceEl, calls };
+}
+
+const UNIVERSAL_CATALOG = {
+    all: [
+        { id: 'qwen3-embedding-0.6b', provider: 'ollama', route: 'ollama:local', display_name: 'qwen3-embedding-0.6b', native_dim: 768 },
+        { id: 'qwen/qwen3-embedding-0.6b', provider: 'openrouter', route: 'openrouter:api', display_name: 'qwen3-embedding-0.6b', native_dim: 768 },
+        { id: 'text-embedding-3-small', provider: 'openai', route: 'openai:api', display_name: 'text-embedding-3-small', native_dim: 1536 },
+    ],
+    universal: [
+        {
+            model: 'qwen3-embedding-0.6b',
+            display_name: 'qwen3-embedding-0.6b',
+            dim: 768,
+            dim_options: [768],
+            members: [
+                { route: 'ollama:local', model: 'qwen3-embedding-0.6b', provider: 'ollama', is_local: true, native_dim: 768 },
+                { route: 'openrouter:api', model: 'qwen/qwen3-embedding-0.6b', provider: 'openrouter', is_local: false, native_dim: 768 },
+            ],
+        },
+    ],
+};
+
+test('featured Universal option renders "needs setup" when not configured (#2337)', async () => {
+    const { embeddings, universalEl } = loadEmbeddingsUniversal({
+        settings: {
+            embedding_route: null, resolved_route: 'ollama:local',
+            embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768,
+            shared_space: null,
+        },
+        routes: [{ vendor: 'ollama', route: 'local', is_local: true }, { vendor: 'openrouter', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+
+    assert.equal(universalEl.style.display, '');
+    assert.ok(/Universal — qwen3-embedding-0.6b/.test(universalEl.textContent));
+    assert.ok(/one search space/.test(universalEl.textContent));
+    assert.ok(/needs setup/.test(universalEl.textContent));
+});
+
+test('featured Universal option reads "active" when configured + verified (#2337)', async () => {
+    const { embeddings, universalEl } = loadEmbeddingsUniversal({
+        settings: {
+            embedding_route: null, resolved_route: 'ollama:local',
+            embedding_model: 'qwen3-embedding-0.6b', embedding_dim: 768, kestrel_embedding_dim: 768,
+            shared_space: { name: 'qwen3', model: 'qwen3-embedding-0.6b', dim: 768, members: ['ollama:local', 'openrouter:api'], verified: true },
+        },
+        routes: [{ vendor: 'ollama', route: 'local', is_local: true }, { vendor: 'openrouter', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+    assert.ok(/active/.test(universalEl.textContent));
+});
+
+test('clicking Universal pins both member routes then verifies parity (#2337)', async () => {
+    const { embeddings, universalEl, calls, setupStatus } = loadEmbeddingsUniversal({
+        settings: {
+            embedding_route: null, resolved_route: 'ollama:local',
+            embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768,
+            shared_space: null,
+        },
+        routes: [{ vendor: 'ollama', route: 'local', is_local: true }, { vendor: 'openrouter', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+
+    await embeddings._handleUniversalClick();
+
+    const routeModelPosts = calls.filter(c => c.method === 'POST' && c.url.includes('/route-model'));
+    assert.equal(routeModelPosts.length, 2);
+    // Each member pinned with its OWN slug.
+    const byRoute = Object.fromEntries(routeModelPosts.map(p => [p.body.route, p.body.embedding_model]));
+    assert.equal(byRoute['ollama:local'], 'qwen3-embedding-0.6b');
+    assert.equal(byRoute['openrouter:api'], 'qwen/qwen3-embedding-0.6b');
+    // Parity probe ran.
+    assert.ok(calls.some(c => c.method === 'POST' && c.url.includes('/space/verify')));
+    assert.ok(/parity verified/.test(setupStatus.textContent));
+});
+
+test('guided setup fails loudly when a member route probe rejects the slug (#2337)', async () => {
+    const settings = {
+        embedding_route: null, resolved_route: 'ollama:local',
+        embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768, shared_space: null,
+    };
+    const fetchImpl = async (url, opts) => {
+        const method = (opts && opts.method) || 'GET';
+        if (url.includes('/api/embedding/models')) return { ok: true, json: async () => UNIVERSAL_CATALOG };
+        if (url.includes('/route-model')) {
+            // openrouter's slug is dead upstream → 400.
+            const body = JSON.parse(opts.body);
+            if (body.route === 'openrouter:api') {
+                return { ok: false, json: async () => ({ detail: 'live embedding probe failed' }) };
+            }
+            return { ok: true, json: async () => ({ success: true, ...settings }) };
+        }
+        if (url.includes('/space/verify')) throw new Error('verify must not run after a failed pin');
+        return { ok: true, json: async () => settings };
+    };
+    const { embeddings, setupStatus, calls } = loadEmbeddingsUniversal({
+        settings,
+        routes: [{ vendor: 'ollama', route: 'local', is_local: true }, { vendor: 'openrouter', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+        fetchImpl,
+    });
+    await embeddings.init();
+    await embeddings._handleUniversalClick();
+
+    assert.ok(/Setup failed on openrouter:api/.test(setupStatus.textContent));
+    assert.ok(/live embedding probe failed/.test(setupStatus.textContent));
+    // Never reached the parity probe.
+    assert.ok(!calls.some(c => c.url.includes('/space/verify')));
+});
+
+test('non-universal cloud route is labeled with its tradeoff (#2337)', async () => {
+    const { embeddings, modeSelect, routeSelect } = loadEmbeddingsUniversal({
+        settings: {
+            embedding_route: null, resolved_route: 'ollama:local',
+            embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768, shared_space: null,
+        },
+        routes: [
+            { vendor: 'openai', route: 'api', is_local: false },
+            { vendor: 'ollama', route: 'local', is_local: true },
+            { vendor: 'openrouter', route: 'api', is_local: false },
+        ],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+
+    // openai:api is cloud-only and NOT a universal member → tradeoff labeled.
+    assert.ok(/openai:api — cloud only — private\/local sessions fall back to keyword search/.test(routeSelect.innerHTML));
+    // openrouter:api IS a universal member → no tradeoff warning appended.
+    assert.ok(!/openrouter:api — cloud only/.test(routeSelect.innerHTML));
+});
+
+test('per-route model picker lists discovered models and pins on change (#2337)', async () => {
+    const settings = {
+        embedding_route: 'openai:api', resolved_route: 'openai:api',
+        embedding_model: 'text-embedding-3-small', embedding_dim: 1536, kestrel_embedding_dim: 1536,
+        shared_space: null, route_embedding_models: {},
+    };
+    const { embeddings, modeSelect, routeSelect, modelSelect, calls } = loadEmbeddingsUniversal({
+        settings,
+        routes: [{ vendor: 'openai', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+
+    // In explicit mode with a discovered catalog, the model picker is populated.
+    embeddings.mode = 'explicit';
+    routeSelect.value = 'openai:api';
+    embeddings._renderModelPicker();
+    assert.equal(modelSelect.style.display, '');
+    assert.ok(/text-embedding-3-small/.test(modelSelect.innerHTML));
+
+    // Changing the model commits a per-route pin.
+    modelSelect.value = 'text-embedding-3-small';
+    await embeddings._handleModelChange();
+    const pins = calls.filter(c => c.method === 'POST' && c.url.includes('/route-model'));
+    assert.equal(pins.length, 1);
+    assert.equal(pins[0].body.route, 'openai:api');
+    assert.equal(pins[0].body.embedding_model, 'text-embedding-3-small');
+    assert.equal(pins[0].body.embedding_dim, 1536);
+});
+
+// ---------------------------------------------------------------------------
 // Popover open/close
 // ---------------------------------------------------------------------------
 

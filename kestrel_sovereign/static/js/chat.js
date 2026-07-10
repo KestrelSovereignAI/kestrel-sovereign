@@ -4251,8 +4251,14 @@ export async function loadModels() {
     if (EmbeddingSelectorCtor && el('embedding-mode-selector')) {
         embeddingSelector = new EmbeddingSelectorCtor({
             settingsEndpoint: deps().api.buildAgentUrl('/api/embedding/settings'),
+            modelsEndpoint: deps().api.buildAgentUrl('/api/embedding/models'),
+            routeModelEndpoint: deps().api.buildAgentUrl('/api/embedding/route-model'),
+            verifyEndpoint: deps().api.buildAgentUrl('/api/embedding/space/verify'),
             modeSelectId: 'embedding-mode-selector',
             routeSelectId: 'embedding-route-selector',
+            universalId: 'embedding-universal',
+            modelSelectId: 'embedding-model-selector',
+            setupStatusId: 'embedding-setup-status',
             dimReadoutId: 'embedding-dim-readout',
             warningId: 'embedding-dim-warning',
             sharedSpaceId: 'embedding-shared-space',
@@ -4264,7 +4270,14 @@ export async function loadModels() {
                 const routes = (sharedModelSelector?.allModelsData?.routes) || [];
                 return routes
                     .filter(r => r.supports_embeddings)
-                    .map(r => ({ vendor: r.vendor, route: r.route }));
+                    // #2337 — carry locality so the section can label each route's
+                    // hidden tradeoff (cloud-only degrades private sessions).
+                    .map(r => ({
+                        vendor: r.vendor,
+                        route: r.route,
+                        is_local: r.is_local,
+                        is_cloud: r.is_cloud,
+                    }));
             },
         });
         await embeddingSelector.init();

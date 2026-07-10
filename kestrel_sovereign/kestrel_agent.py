@@ -1705,6 +1705,15 @@ class KestrelAgent(
             await self._load_embedding_route()
             self.llm_service.set_embedding_route_persistence_callback(self._persist_embedding_route)
 
+            # Load persisted per-route embedding_model pins and register
+            # persistence (#2337) — the runtime equivalent of the TOML
+            # embedding_model/embedding_dim keys, set from the embeddings UI.
+            if hasattr(self.llm_service, "set_route_embedding_model_persistence_callback"):
+                await self._load_route_embedding_models()
+                self.llm_service.set_route_embedding_model_persistence_callback(
+                    self._persist_route_embedding_models
+                )
+
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
 

@@ -1434,6 +1434,10 @@ async def get_embedding_models(request: Request):
 
         discovered = await agent.llm_service.discover_embedding_models()
         shared = await agent.llm_service.shared_embedding_space_candidates()
+        # #2337 — the featured "Universal" options: shared models enriched with
+        # their member routes (each carrying that route's own slug) so the UI can
+        # render the pinned-at-top option and run guided setup across both members.
+        universal = await agent.llm_service.universal_embedding_space_options()
 
         by_vendor: Dict[str, list] = {}
         for m in discovered:
@@ -1443,6 +1447,7 @@ async def get_embedding_models(request: Request):
             "by_vendor": by_vendor,
             "all": [m.to_dict() for m in discovered],
             "shared_space_candidates": [m.to_dict() for m in shared],
+            "universal": universal,
             "count": len(discovered),
         }
     except HTTPException:
@@ -1593,6 +1598,88 @@ async def set_embedding_settings(request: Request):
     except Exception as e:
         logger.error(f"Error setting embedding route: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting embedding route.")
+
+
+@router.api_route("/api/embedding/route-model", methods=["POST", "PUT"])
+async def set_route_embedding_model(request: Request):
+    """Pin (or clear) a route's embedding model at runtime (#2337).
+
+    The embeddings UI's per-route model picker persists here instead of
+    demanding a hand-edited ``embedding_model``/``embedding_dim`` under the route
+    in kestrel.toml. Accepts JSON:
+
+        {"route": "<vendor>:<route>",
+         "embedding_model": "qwen/qwen3-embedding-8b",   # null/"" to clear
+         "embedding_dim": 768}                            # optional
+
+    Setting a cloud route's model runs a live canary probe (#2326) so a dead or
+    misspelled upstream slug is refused with a 400 at configuration time rather
+    than silently degrading to keyword search on the next write. Clearing
+    restores the route's config/discovery default. The pin persists the same way
+    the embedding_route knob does (agent_metadata) — not a new store. The
+    response echoes the resolved embedding settings.
+    """
+    try:
+        data = await request.json()
+        route = data.get("route")
+        if not route or not isinstance(route, str):
+            raise HTTPException(
+                status_code=400,
+                detail="'route' field is required (a '<vendor>:<route>' selector).",
+            )
+        model = data.get("embedding_model")
+        if model is not None and not isinstance(model, str):
+            raise HTTPException(
+                status_code=400,
+                detail="'embedding_model' must be a string or null (to clear).",
+            )
+        dim = data.get("embedding_dim")
+        if dim is not None:
+            try:
+                dim = int(dim)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="'embedding_dim' must be an integer or null.",
+                )
+
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+        if not hasattr(agent.llm_service, "aset_route_embedding_model"):
+            raise HTTPException(
+                status_code=501,
+                detail="Per-route embedding model configuration is not supported.",
+            )
+
+        # Fold live embedding discovery into route capabilities first (#2338), so
+        # a dynamically-discovered route (e.g. OpenRouter with no TOML pin) is
+        # recognized when its model is being pinned. Best-effort.
+        setting = model is not None and str(model).strip() != ""
+        if setting:
+            try:
+                await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as e:  # pragma: no cover - never block the setter
+                logger.debug(
+                    f"embedding capability reconcile skipped in model setter: {e}"
+                )
+
+        try:
+            # Live probe-on-save for cloud routes rejects a dead slug (#2337/#2326).
+            await agent.llm_service.aset_route_embedding_model(route, model, dim)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+        settings = agent.llm_service.get_embedding_settings()
+        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
+        return {"success": True, **settings}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting route embedding model: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Error setting route embedding model."
+        )
 
 
 # In-memory registry of in-flight / recently-finished reindex jobs (#2336).
