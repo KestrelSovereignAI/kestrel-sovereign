@@ -88,12 +88,12 @@ def test_spec_stage_shape():
     assert talon.params["wait"] is False
     assert talon.params["self_review"] is True
 
-    # Verify — the PR's CI is green; repo/branch materialized per-run.
+    # Verify — the talon PR's CI is green. A plain signal_status_ok gate over
+    # the coordinator-bound probe, which binds to the dispatched run's own
+    # output (never a caller-supplied branch, #2303).
     verify = by_name[VERIFY_CI_STAGE]
     assert verify.signal_source == FLEET_CI_PROBE
-    assert verify.gate.type == "ci_green"
-    assert verify.gate.params["repo_param"] == "repo"
-    assert verify.gate.params["branch_param"] == "branch"
+    assert verify.gate.type == "signal_status_ok"
     assert verify.read_only is True
 
 
@@ -203,7 +203,8 @@ async def dispatcher(tmp_path):
     store = SignalLogStore(backend)
     await store.initialize()
     registry = SourceRegistry()
-    register_fleet_coding_pipeline_sources(registry)
+    coordinator = _FakeCoordinator()
+    register_fleet_coding_pipeline_sources(registry, coordinator=coordinator)
     agent = _FakeAgent()
     disp = SignalDispatcher(
         agent=agent,
@@ -275,15 +276,50 @@ async def test_approval_ignores_caller_supplied_consent_markers(dispatcher):
     assert data["authorized"] is False
 
 
-async def test_ci_probe_is_read_only_ok(dispatcher):
+async def test_ci_probe_binds_to_dispatch_ignoring_caller_branch(dispatcher):
+    # The probe verifies the talon PR the dispatch produced. Even though the
+    # caller stuffs ``branch: attacker`` into the payload, the probe never
+    # forwards it — verification uses the talon PR head the coordinator reports.
     result = await dispatcher.dispatch_signal(
-        _signal(FLEET_CI_PROBE, {"repo": "org/repo", "branch": "talon/x", "pr": 9})
+        _signal(
+            FLEET_CI_PROBE,
+            {"repo": "org/repo", "issue": 9, "branch": "attacker-branch"},
+        )
     )
     assert result.status == Status.OK
     data = result.action_result
-    assert data["repo"] == "org/repo"
-    assert data["branch"] == "talon/x"
-    assert data["state"] == "probed"
+    assert data["state"] == "green"
+    # The verified branch is the talon PR head, NOT the caller-supplied branch.
+    assert data["branch"] == "talon/fix"
+    assert data["branch"] != "attacker-branch"
+
+
+async def test_ci_probe_fails_closed_when_ci_not_green(tmp_path):
+    # A verdict that is not green must make the probe fail closed (raise), so the
+    # signal_status_ok gate never passes on an unverified PR.
+    coord = _FakeCoordinator(
+        ci_verdict={"ci_green": False, "reason": "pr_not_found"}
+    )
+    registry = SourceRegistry()
+    register_fleet_coding_pipeline_sources(registry, coordinator=coord)
+    agent = _FakeAgent()
+    backend = SQLiteBackend(str(tmp_path / "probe.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    disp = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    try:
+        result = await disp.dispatch_signal(
+            _signal(FLEET_CI_PROBE, {"repo": "org/repo", "issue": 9})
+        )
+        assert result.status != Status.OK
+    finally:
+        await backend.close()
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +328,29 @@ async def test_ci_probe_is_read_only_ok(dispatcher):
 
 
 class _FakeCoordinator:
-    """Records dispatch_pipeline kwargs; returns a dispatched cli_background job."""
+    """Records dispatch_pipeline kwargs; returns a dispatched cli_background job.
 
-    def __init__(self):
+    Also stubs ``verify_pipeline_ci`` — the seam ``fleet_ci_probe`` delegates to.
+    It records the kwargs it was called with (so a test can assert the probe
+    never forwards a caller-supplied ``branch``) and returns a canned verdict
+    whose ``branch`` is the talon PR head the dispatch produced, NOT any caller
+    input (#2303).
+    """
+
+    def __init__(self, *, ci_verdict=None):
         self.calls: list = []
+        self.verify_calls: list = []
+        # Default: CI verified green against the talon PR head branch.
+        self._ci_verdict = ci_verdict or {
+            "ci_green": True,
+            "repo": "org/repo",
+            "pr": 4242,
+            "pr_url": "https://github.com/org/repo/pull/4242",
+            "branch": "talon/fix",
+            "head_sha": "deadbeef",
+            "job_id": "job-fleet-1",
+            "reason": None,
+        }
 
     async def dispatch_pipeline(self, **kwargs):
         self.calls.append(kwargs)
@@ -305,6 +360,12 @@ class _FakeCoordinator:
             "method": "cli_background",
             "log_path": None,
         }
+
+    async def verify_pipeline_ci(self, **kwargs):
+        # Signature deliberately accepts no ``branch`` kwarg — if the probe ever
+        # tried to forward a caller-supplied branch this would TypeError.
+        self.verify_calls.append(kwargs)
+        return dict(self._ci_verdict)
 
 
 async def _make_runner(tmp_path, registry, *, consent_provider=None):
@@ -365,10 +426,10 @@ async def _define_builtin(store, identity):
     await store.put_definition(signed)
 
 
-def _registry_with_sources():
+def _registry_with_sources(coord=None):
     registry = SourceRegistry()
-    register_fleet_coding_pipeline_sources(registry)
-    coord = _FakeCoordinator()
+    coord = coord or _FakeCoordinator()
+    register_fleet_coding_pipeline_sources(registry, coordinator=coord)
     register_talon_pipeline_source(registry, coord)
     return registry, coord
 
@@ -475,8 +536,9 @@ async def test_args_thread_through_to_talon_source_params(tmp_path):
     )
     try:
         await _define_builtin(store, identity)
-        # ci verify may fail closed (no branch/ci provider); we only assert the
-        # irreversible dispatch received the threaded args.
+        # The coordinator-bound verify stage confirms green via verify_pipeline_ci
+        # (the fake returns green); we assert the irreversible dispatch received
+        # the threaded args.
         await runner.run_to_completion(
             name=WORKFLOW_NAME, params={"repo": "org/repo", "issue": 5}
         )
@@ -488,6 +550,100 @@ async def test_args_thread_through_to_talon_source_params(tmp_path):
         assert call["self_review"] is True
         # wait: false forces the durable cli_background path (force_cli).
         assert call["force_cli"] is True
+    finally:
+        await backend.close()
+
+
+async def test_verify_binds_to_dispatch_branch_ignoring_caller_branch(tmp_path):
+    from kestrel_feature_workflows.models import RunStatus
+
+    # Reviewer test (a): a claim-mode run whose params carry an unrelated
+    # ``branch`` verifies the branch/PR bound to the DISPATCH — never the caller
+    # branch. The consent gate is granted so the run reaches verify.
+    def approve_provider(gate, run, stage, link):
+        return {"approved": True, "scope": gate.params["scope"]}
+
+    coord = _FakeCoordinator(
+        ci_verdict={
+            "ci_green": True,
+            "repo": "org/repo",
+            "pr": 4242,
+            "pr_url": "https://github.com/org/repo/pull/4242",
+            "branch": "talon/issue-5-fix",
+            "head_sha": "abc123",
+            "reason": None,
+        }
+    )
+    registry, coord = _registry_with_sources(coord)
+    runner, store, identity, backend = await _make_runner(
+        tmp_path, registry, consent_provider=approve_provider
+    )
+    try:
+        await _define_builtin(store, identity)
+        result = await runner.run_to_completion(
+            name=WORKFLOW_NAME,
+            params={"repo": "org/repo", "issue": 5, "branch": "main"},
+        )
+        # Dispatch happened, then verify bound to the talon PR → run completed.
+        assert result.status == RunStatus.COMPLETED
+        # Verify was called with the run target — and NEVER the caller's branch.
+        assert len(coord.verify_calls) == 1
+        vc = coord.verify_calls[0]
+        assert vc["repo"] == "org/repo"
+        assert vc["issue"] == 5
+        assert vc["mode"] == "claim"
+        assert "branch" not in vc  # caller-supplied branch:main was ignored
+    finally:
+        await backend.close()
+
+
+async def test_issue_only_run_verifies_talon_pr_not_fail_closed(tmp_path):
+    from kestrel_feature_workflows.models import RunStatus
+
+    # Reviewer test (b): an issue-only run (no ``branch`` param) does NOT fail
+    # closed — it verifies the talon PR the dispatch produced.
+    def approve_provider(gate, run, stage, link):
+        return {"approved": True, "scope": gate.params["scope"]}
+
+    registry, coord = _registry_with_sources()
+    runner, store, identity, backend = await _make_runner(
+        tmp_path, registry, consent_provider=approve_provider
+    )
+    try:
+        await _define_builtin(store, identity)
+        result = await runner.run_to_completion(
+            name=WORKFLOW_NAME, params={"repo": "org/repo", "issue": 5}
+        )
+        assert result.status == RunStatus.COMPLETED
+        assert len(coord.verify_calls) == 1
+        assert coord.verify_calls[0]["mode"] == "claim"
+        assert "branch" not in coord.verify_calls[0]
+    finally:
+        await backend.close()
+
+
+async def test_verify_fails_closed_when_pr_ci_not_green(tmp_path):
+    from kestrel_feature_workflows.models import RunStatus
+
+    # When the talon PR's CI cannot be verified green, verify raises → the run
+    # does not complete green, even though a caller supplied ``branch: main``.
+    def approve_provider(gate, run, stage, link):
+        return {"approved": True, "scope": gate.params["scope"]}
+
+    coord = _FakeCoordinator(
+        ci_verdict={"ci_green": False, "reason": "pr_not_found"}
+    )
+    registry, coord = _registry_with_sources(coord)
+    runner, store, identity, backend = await _make_runner(
+        tmp_path, registry, consent_provider=approve_provider
+    )
+    try:
+        await _define_builtin(store, identity)
+        result = await runner.run_to_completion(
+            name=WORKFLOW_NAME,
+            params={"repo": "org/repo", "issue": 5, "branch": "main"},
+        )
+        assert result.status != RunStatus.COMPLETED
     finally:
         await backend.close()
 

@@ -40,10 +40,29 @@ Stages (manual trigger)
    irreversibility posture. ``KESTREL_OBSERVABILITY_WORKFLOW_RUN_ID`` / ``_STAGE``
    / ``_ORCHESTRATOR`` are stamped end-to-end by the coordinator's dispatch
    funnels (#2302) because this stage routes through them.
-3. ``verify_ci`` — ``ci_green`` gate confirming the talon PR's CI went green.
-   ``repo`` / ``branch`` are materialized per-run from the run params via the
-   gate's ``repo_param`` / ``branch_param`` (the runner's ``_materialize_ci_gate``
-   substitution), because the PR is only known at run time.
+3. ``verify_ci`` — ``signal_status_ok`` gate over the coordinator-bound
+   ``fleet_ci_probe`` source, which confirms the CI of the PR the ``talon_run``
+   stage actually produced went green. The probe binds verification to the
+   *dispatched run's own output* — it never trusts a caller-supplied ``branch``
+   (#2303). It calls ``coordinator.verify_pipeline_ci(repo, issue|pr, mode)``,
+   which locates the talon job this run dispatched, waits for it to open its PR,
+   resolves that PR's head branch from GitHub, and polls the PR head's CI
+   (reusing the workflows ``ci_green`` gate machinery). Fail-closed: the probe
+   raises (so ``signal_status_ok`` fails) whenever the PR/branch cannot be bound
+   to the dispatch or CI is not observably green.
+
+Why the branch is NOT read from run params (#2303)
+==================================================
+An earlier design materialized the ``ci_green`` gate's ``branch`` from the run
+params (``branch_param``). But the runner merges caller-supplied run params into
+every stage payload, so a caller could pass ``branch: main`` and get a
+CI-green verdict for a branch the talon PR never touched (or, omitting it, fail
+closed on the common issue-only path). Verification therefore ignores any
+caller ``branch`` entirely and binds to the talon PR discovered from the
+dispatch. In claim mode the PR head is only known after ``talon_pipeline_dispatch``
+runs, so ``verify_pipeline_ci`` correlates the dispatched job by (repo, issue)
+[claim] / (repo, pr) [iterate], reads the PR the job opened from its output, and
+verifies that PR's head — not run params.
 
 Wait strategy (spec item #3 — ONE approach, documented here)
 ============================================================
@@ -53,17 +72,11 @@ holding the dispatch stage in-process would time out the common case. This
 pipeline therefore dispatches with ``wait: false``: the source returns right
 after dispatch, and per #2302's contract ``wait: false`` forces the durable
 ``cli_background`` path so the returned ``wait_ref`` (``talon:<job_id>``,
-carried in the stage result) survives an agent restart. Run completion is then
-gated by the ``verify_ci`` ``ci_green`` stage polling the PR's CI (its own
-``poll_interval_seconds`` / ``max_wait_seconds`` are not bounded by the
-held-wait ceiling), rather than by holding a stage on the in-process wait rail.
-
-Note: threading the talon run's PR head ``branch`` automatically into
-``verify_ci`` needs ``talon_pipeline_dispatch`` output-forwarding in the
-workflows runner (``_stage_output_run_params`` only forwards ``feature_features.*``
-sources today). Until that lands, supply ``branch`` in the run params; the
-``ci_green`` gate fails closed if it is absent, so the pipeline never claims a
-green CI it could not check.
+carried in the stage result) survives an agent restart. The long wait for the
+run to finish (and its PR to open) then lives in the ``verify_ci`` stage:
+``verify_pipeline_ci`` awaits the dispatched job's completion on the same
+durable wait rail before resolving and polling its PR head CI, rather than
+holding the dispatch stage on the in-process wait ceiling.
 """
 
 from __future__ import annotations
@@ -177,25 +190,60 @@ async def fleet_coding_approval_handler(payload: Dict[str, Any]) -> Dict[str, An
     }
 
 
-async def fleet_ci_probe_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Read-only probe for the ``verify_ci`` ``ci_green`` gate.
+async def _run_fleet_ci_probe(
+    coordinator: Any, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Verify the CI of the PR the ``talon_run`` stage produced went green.
 
-    The ``ci_green`` gate does the actual CI polling through the runner's
-    ``ci_green_provider``; this ACTION source just returns OK (echoing the target
-    repo/branch/PR it was asked about) so the gate can evaluate. It writes
-    nothing and claims nothing about CI state itself.
+    Bound to the coordinator so it can consult the dispatched run's own output.
+    **A caller-supplied ``branch`` is deliberately never read** (#2303): the
+    branch to verify is bound to the talon PR, not to run params. This delegates
+    to ``coordinator.verify_pipeline_ci`` (which locates the dispatched job,
+    resolves its PR head branch, and polls that head's CI) and fails closed —
+    raising, so the ``signal_status_ok`` gate fails — whenever CI is not
+    verified green against the talon PR head.
     """
     repo = payload.get("repo")
-    branch = payload.get("branch")
+    issue = payload.get("issue")
     pr = payload.get("pr")
+    # Derive mode the same way ``talon_pipeline_dispatch`` does: an explicit
+    # ``mode`` wins, else a ``pr`` (without an ``issue``) means iterate.
+    mode = payload.get("mode") or ("iterate" if pr and not issue else "claim")
+
+    verify = getattr(coordinator, "verify_pipeline_ci", None)
+    if verify is None:
+        raise ValueError(
+            f"{FLEET_CI_PROBE}: no coordinator bound to verify the talon PR's "
+            "CI (fail closed)"
+        )
+    verdict = await verify(repo=repo, issue=issue, pr=pr, mode=mode)
+    if not isinstance(verdict, dict) or not verdict.get("ci_green"):
+        reason = verdict.get("reason") if isinstance(verdict, dict) else repr(verdict)
+        raise ValueError(
+            f"{FLEET_CI_PROBE}: talon PR CI not verified green "
+            f"(reason={reason!r}) (fail closed)"
+        )
+    branch = verdict.get("branch")
     return {
         "source": FLEET_CI_PROBE,
-        "repo": repo,
+        "repo": verdict.get("repo", repo),
         "branch": branch,
-        "pr": pr,
-        "state": "probed",
-        "observation": _quote(FLEET_CI_PROBE, "repo", repo),
+        "pr": verdict.get("pr", pr),
+        "pr_url": verdict.get("pr_url"),
+        "job_id": verdict.get("job_id"),
+        "head_sha": verdict.get("head_sha"),
+        "state": "green",
+        "observation": _quote(FLEET_CI_PROBE, "branch", branch),
     }
+
+
+def make_fleet_ci_probe_handler(coordinator: Any):
+    """Build the ``fleet_ci_probe`` ACTION handler bound to a coordinator."""
+
+    async def handler(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await _run_fleet_ci_probe(coordinator, payload)
+
+    return handler
 
 
 # --------------------------------------------------------------------------
@@ -244,21 +292,33 @@ def _passthrough_schema(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def build_fleet_coding_pipeline_registrations() -> List[SourceRegistration]:
+def build_fleet_coding_pipeline_registrations(
+    coordinator: Any = None,
+) -> List[SourceRegistration]:
     """The two support sources the ``fleet_coding_pipeline`` workflow names.
 
     ``talon_pipeline_dispatch`` is registered separately (it is bound to the
-    coordinator); these two are pure functions of their payload.
+    coordinator). ``fleet_coding_approval`` is a pure function of its payload;
+    ``fleet_ci_probe`` is bound to ``coordinator`` so it can verify the CI of
+    the PR the dispatch produced (#2303). Without a coordinator the probe is
+    still registered but fails closed on every call — it never trusts a
+    caller-supplied branch as a substitute.
     """
     return [
         _action_registration(FLEET_CODING_APPROVAL, fleet_coding_approval_handler),
-        _action_registration(FLEET_CI_PROBE, fleet_ci_probe_handler),
+        _action_registration(
+            FLEET_CI_PROBE, make_fleet_ci_probe_handler(coordinator)
+        ),
     ]
 
 
-def register_fleet_coding_pipeline_sources(registry: Any) -> List[str]:
+def register_fleet_coding_pipeline_sources(
+    registry: Any, coordinator: Any = None
+) -> List[str]:
     """Register the support sources on ``registry``, idempotently.
 
+    ``coordinator`` binds the ``fleet_ci_probe`` verify source so it can consult
+    the dispatched run's output; the coordinator passes itself at init time.
     Returns the names newly registered (already-present sources are skipped so a
     second call — or a host that registered a richer implementation — is safe).
     A single source's failure is logged and does not abort the rest.
@@ -267,7 +327,7 @@ def register_fleet_coding_pipeline_sources(registry: Any) -> List[str]:
     if registry is None or not hasattr(registry, "register"):
         return registered
     has_get = hasattr(registry, "get")
-    for registration in build_fleet_coding_pipeline_registrations():
+    for registration in build_fleet_coding_pipeline_registrations(coordinator):
         if has_get and registry.get(registration.name) is not None:
             continue
         try:
@@ -343,25 +403,19 @@ def build_fleet_coding_pipeline_spec(autonomous: bool = False):
         )
     )
 
-    # Verify — confirm the talon PR's CI went green. repo/branch are materialized
-    # per-run from the run params (repo_param/branch_param), because the PR is
-    # only known at run time. The static repo/branch are schema-valid placeholders
-    # the runner overwrites before the gate polls.
+    # Verify — confirm the talon PR's CI went green. The coordinator-bound
+    # fleet_ci_probe binds verification to the dispatched run's own output (it
+    # locates the talon job, resolves its PR head branch, and polls that head's
+    # CI), so a plain signal_status_ok gate over the probe is the whole gate:
+    # the probe raises unless CI is verified green against the talon PR head. A
+    # caller-supplied ``branch`` is never read (#2303).
     stages.append(
         Stage(
             name=VERIFY_CI_STAGE,
             signal_source=FLEET_CI_PROBE,
             signal_mode=SignalMode.ACTION,
             params={},
-            gate=Gate(
-                type="ci_green",
-                params={
-                    "repo": "owner/name",
-                    "branch": "main",
-                    "repo_param": "repo",
-                    "branch_param": "branch",
-                },
-            ),
+            gate=Gate(type="signal_status_ok"),
             read_only=True,
             compensate="noop_idempotent",
         )
@@ -391,7 +445,8 @@ def build_fleet_coding_pipeline_spec(autonomous: bool = False):
                 "issue": {"type": "integer", "minimum": 1},
                 "pr": {"type": "integer", "minimum": 1},
                 "mode": {"type": "string", "enum": ["claim", "iterate"]},
-                "branch": {"type": "string"},
+                # No ``branch``: verification binds to the talon PR the dispatch
+                # produces, never a caller-supplied branch (#2303).
                 "self_review": {"type": "boolean"},
                 "demo_check": {"type": "boolean"},
                 "eye_check": {"type": "boolean"},

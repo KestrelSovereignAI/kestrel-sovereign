@@ -145,6 +145,23 @@ _FORCE_CLI_DISPATCH: "ContextVar[bool]" = ContextVar(
     "talon_force_cli_dispatch", default=False
 )
 
+# Terminal talon job states — a job in one of these has finished (and, on
+# success, opened its PR). ``verify_pipeline_ci`` waits until a job reaches one
+# before trying to bind to the PR it produced.
+_TERMINAL_TALON_STATES = frozenset(
+    {"complete", "failed", "reject", "finished_unknown"}
+)
+
+_PR_NUMBER_FROM_URL_RE = re.compile(r"/pull/(\d+)")
+
+
+def _pr_number_from_url(url: Optional[str]) -> Optional[int]:
+    """Parse the PR number out of a ``.../pull/<n>`` GitHub URL, or None."""
+    if not url:
+        return None
+    match = _PR_NUMBER_FROM_URL_RE.search(url)
+    return int(match.group(1)) if match else None
+
 
 # Discriminated reason codes for ``talon_file_and_claim`` failures.
 # Each one names a distinct fix path the agent (or the operator) can act
@@ -418,7 +435,9 @@ class TalonCoordinatorFeature(Feature):
                 register_fleet_coding_pipeline_builtin,
                 register_fleet_coding_pipeline_sources,
             )
-            fleet_registered = register_fleet_coding_pipeline_sources(registry)
+            fleet_registered = register_fleet_coding_pipeline_sources(
+                registry, coordinator=self
+            )
             if fleet_registered:
                 logger.info(
                     "TalonCoordinatorFeature registered fleet-coding-pipeline "
@@ -991,6 +1010,195 @@ class TalonCoordinatorFeature(Feature):
                 **invocation.metadata(),
             },
         )
+
+    async def verify_pipeline_ci(
+        self,
+        *,
+        repo: str,
+        issue: Optional[int] = None,
+        pr: Optional[int] = None,
+        mode: str = "claim",
+        job_id: Optional[str] = None,
+        wait_timeout_seconds: int = 3600,
+        poll_interval_seconds: int = 15,
+        max_ci_wait_seconds: int = 1800,
+        required_checks: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Confirm the CI of the PR THIS pipeline's talon run produced is green.
+
+        The verify seam behind the ``fleet_ci_probe`` signal source (#2303).
+        Verification is bound to the *dispatched run's own output* — never a
+        caller-supplied branch. Given the workflow run's ``repo`` and
+        ``issue``/``pr``, it locates the talon job the pipeline dispatched,
+        waits for that job to open its PR, resolves the PR's head branch from
+        GitHub, and polls the PR head's CI (reusing the workflows ``ci_green``
+        gate machinery).
+
+        Fail-closed: returns ``{"ci_green": False, "reason": ...}`` whenever the
+        PR/branch cannot be bound to the dispatch or CI is not observably green.
+        It never claims a green CI it could not check against the talon PR head,
+        and any caller-supplied ``branch`` is deliberately ignored.
+        """
+        repo_resolved = self._resolve_repo(repo)
+
+        def _fail(reason: str, **extra: Any) -> Dict[str, Any]:
+            return {
+                "ci_green": False,
+                "repo": repo_resolved,
+                "issue": issue,
+                "pr": pr,
+                "reason": reason,
+                **extra,
+            }
+
+        # 1. Locate the talon job this pipeline dispatched (most recent match).
+        target_id = job_id if (job_id and job_id in self._jobs) else None
+        if target_id is None:
+            target_id = self._find_pipeline_job_id(
+                repo_resolved, issue=issue, pr=pr, mode=mode
+            )
+        if target_id is None:
+            return _fail("no_dispatched_job")
+
+        # 2. Wait for the job to reach a terminal state so its PR exists.
+        from kestrel_sovereign.signals.sources.talon_pipeline import (
+            _await_completion,
+            _find_pr_url,
+        )
+
+        info = self._jobs.get(target_id) or {}
+        if info.get("status") not in _TERMINAL_TALON_STATES:
+            try:
+                await _await_completion(self, target_id, wait_timeout_seconds)
+            except Exception as exc:  # noqa: BLE001 - a wait failure fails closed
+                return _fail(f"job_wait_error:{exc}", job_id=target_id)
+
+        # 3. Resolve the PR the talon job opened (iterate already knows it).
+        pr_url = _find_pr_url(self, target_id)
+        target_pr = int(pr) if (mode == "iterate" and pr) else None
+        if target_pr is None:
+            target_pr = _pr_number_from_url(pr_url)
+        if target_pr is None:
+            return _fail("pr_not_found", job_id=target_id, pr_url=pr_url)
+
+        # 4. Resolve the PR's head branch from GitHub — never a caller branch.
+        head = self._github_pr_head(repo_resolved, target_pr)
+        if not head or not head.get("ref"):
+            return _fail("pr_head_unresolved", job_id=target_id, pr=target_pr)
+        branch = str(head["ref"])
+
+        # 5. Poll the PR head branch's CI, reusing the workflows ci_green gate.
+        try:
+            from kestrel_feature_workflows.models import Gate
+            from kestrel_feature_workflows.runner import (
+                _ci_marker_green,
+                _default_ci_green_provider,
+            )
+        except Exception as exc:  # noqa: BLE001 - workflows feature is optional
+            return _fail(
+                f"ci_green_unavailable:{exc}",
+                job_id=target_id,
+                pr=target_pr,
+                branch=branch,
+            )
+
+        gate_params: Dict[str, Any] = {
+            "repo": repo_resolved,
+            "branch": branch,
+            "poll_interval_seconds": poll_interval_seconds,
+            "max_wait_seconds": max_ci_wait_seconds,
+        }
+        if required_checks:
+            gate_params["required_checks"] = list(required_checks)
+        gate = Gate(type="ci_green", params=gate_params)
+        marker = await _default_ci_green_provider(gate, None)
+        green = _ci_marker_green(gate, marker)
+        marker_status = marker.get("status") if isinstance(marker, dict) else None
+        return {
+            "ci_green": bool(green),
+            "repo": repo_resolved,
+            "issue": issue,
+            "pr": target_pr,
+            "pr_url": pr_url,
+            "branch": branch,
+            "head_sha": head.get("sha"),
+            "job_id": target_id,
+            "marker_status": marker_status,
+            "reason": None if green else (marker_status or "ci_not_green"),
+        }
+
+    def _find_pipeline_job_id(
+        self,
+        repo: str,
+        *,
+        issue: Optional[int] = None,
+        pr: Optional[int] = None,
+        mode: str = "claim",
+    ) -> Optional[str]:
+        """Most-recently-started talon job matching this pipeline's target.
+
+        Correlates by (repo, issue) for claim runs and (repo, pr) for iterate
+        runs — the only stable keys the verify stage has, since the dispatched
+        ``job_id`` is not threaded through the workflow run params. Returns None
+        when nothing matches (the caller then fails closed).
+        """
+        want_issue = int(issue) if issue is not None else None
+        want_pr = int(pr) if pr is not None else None
+        best_id: Optional[str] = None
+        best_started = ""
+        for jid, info in self._jobs.items():
+            if info.get("repo") != repo:
+                continue
+            job_issue = info.get("issue")
+            job_pr = info.get("pr")
+            if mode == "iterate":
+                if want_pr is None or job_pr is None or int(job_pr) != want_pr:
+                    continue
+            else:
+                if (
+                    want_issue is None
+                    or job_issue is None
+                    or int(job_issue) != want_issue
+                ):
+                    continue
+            started = str(info.get("started_at") or "")
+            if best_id is None or started >= best_started:
+                best_id = jid
+                best_started = started
+        return best_id
+
+    def _github_pr_head(self, repo: str, pr: int) -> Optional[Dict[str, Any]]:
+        """Fetch a PR's head ``{ref, sha}`` from GitHub (read-only).
+
+        Uses the same token env as the git/clone paths. Returns None on any
+        error so the caller fails closed rather than trusting stale data.
+        """
+        token = (
+            os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GH_TOKEN")
+            or os.environ.get("GITHUB_PAT")
+        )
+        if not token:
+            return None
+        url = f"https://api.github.com/repos/{repo.strip()}/pulls/{int(pr)}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "kestrel-fleet-ci-probe",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310
+                doc = json.loads(response.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - fail closed on any GitHub error
+            return None
+        head = doc.get("head") if isinstance(doc, dict) else None
+        if not isinstance(head, dict):
+            return None
+        return {"ref": head.get("ref"), "sha": head.get("sha")}
 
     @tool(
         name="talon_file_and_claim",
