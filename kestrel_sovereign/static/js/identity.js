@@ -182,9 +182,10 @@ export function initNavigation() {
     // doesn't open onto a vanished panel.
     promoteActiveTabIfNeeded();
 
-    // #2229: the standalone console is chat-first, exactly like every embed.
-    // The tab strip starts hidden (index.html) and the chat-header "Advanced"
-    // toggle reveals the capability-gated strip through the SAME reveal
+    // #2229/#2350: the standalone console is chat-first, exactly like every
+    // embed. The tab strip starts hidden (index.html) and the app-level
+    // "Advanced" toggle (top nav bar `.nav-status`, frinz-placement parity per
+    // #2350) reveals the capability-gated strip through the SAME reveal
     // implementation the embeddable mountPanels host uses (Panels.initReveal).
     // Collapsed = chat only; revealing shows the gated strip (Chat first);
     // collapsing returns to the Chat tab; the toggle hides when only one tab is
@@ -200,11 +201,12 @@ export function initNavigation() {
             storageKey: 'kestrel:console-advanced',
         });
     } else if (navEl) {
-        // A host that disables the `chat` capability had #panel-chat pruned —
-        // and the Advanced toggle lives in the chat header, so it went with it.
-        // A chat-less console is all-panels: show the strip permanently instead
-        // of leaving every remaining panel unreachable behind a hidden nav with
-        // no surviving reveal control (codex P2 on #2231).
+        // Defensive fallback for a console with a nav strip but no Advanced
+        // toggle (e.g. a custom build that dropped #advanced-toggle-btn). With
+        // no surviving reveal control, show the strip permanently instead of
+        // leaving every panel unreachable behind a hidden nav (codex P2 on
+        // #2231). Since #2350 the toggle lives in the app nav bar, so it no
+        // longer disappears when a `chat`-disabled host prunes #panel-chat.
         navEl.style.display = '';
     }
 
