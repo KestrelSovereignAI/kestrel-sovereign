@@ -2731,6 +2731,14 @@ Expected Duration: {expected_duration}
                 else:
                     bootstrap_response = await self._handle_bootstrap(user_input, session_id)
                     if bootstrap_response:
+                        # Bootstrap persists real conversation rows and must
+                        # enter the same privacy-gated memory ingestion path as
+                        # every later exchange. Returning here without this
+                        # call leaves first-turn importance, emotion, concepts,
+                        # and schema routing permanently absent (#2331).
+                        await self._post_response_pipeline(
+                            user_input, bootstrap_response, session_id
+                        )
                         return bootstrap_response
 
             # Handle explicit commands first (using the CommandHandler)
@@ -3621,7 +3629,10 @@ Expected Duration: {expected_duration}
             if not conv_store:
                 return
 
-            recent = await conv_store.get_full_history_with_ids()
+            # Only rows written around this serialized turn can be our pair.
+            # Never decrypt/materialize an agent's entire lifetime merely to
+            # locate two canonical IDs.
+            recent = await conv_store.get_full_history_with_ids(limit=20)
             if len(recent) < 2:
                 return
 
@@ -3680,9 +3691,7 @@ Expected Duration: {expected_duration}
                 # Temporal pattern detection on recent history window
                 if self.memory_system.analyzer:
                     try:
-                        recent_msgs = await conv_store.get_full_history_with_ids()
-                        # Use last 50 messages as the detection window
-                        window = recent_msgs[-50:] if len(recent_msgs) > 50 else recent_msgs
+                        window = await conv_store.get_full_history_with_ids(limit=50)
                         patterns = await self.memory_system.analyzer.detect_patterns(
                             messages=window,
                             agent_id=self.agent_id,

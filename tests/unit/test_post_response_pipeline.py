@@ -226,16 +226,12 @@ class TestUpdateMessageMetadataAtomicMerge:
 
     @pytest.mark.asyncio
     async def test_sqlite_merge_preserves_existing_fields(self):
-        """SQLite path: SELECT + UPDATE should merge, not overwrite."""
+        """SQLite path uses one json_set UPDATE, not a stale pre-read."""
         from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 
         db = AsyncMock()
         db.backend_type = "sqlite"
-        # Existing metadata has enc and session_id
-        db.fetchone = AsyncMock(
-            return_value=(json.dumps({"enc": True, "session_id": "abc", "old_field": 1}),)
-        )
-        db.execute_commit = AsyncMock()
+        db.execute_commit = AsyncMock(return_value=1)
 
         store = AsyncConversationStore(db, agent_id="test")
         # Patch out encryption
@@ -247,13 +243,15 @@ class TestUpdateMessageMetadataAtomicMerge:
             metadata_updates={"emotional_valence": 0.8, "importance": 0.9},
         )
         assert result is True
-        # Verify the merged metadata was written
-        written_meta = json.loads(db.execute_commit.call_args[0][1][0])
-        assert written_meta["enc"] is True  # preserved
-        assert written_meta["session_id"] == "abc"  # preserved
-        assert written_meta["old_field"] == 1  # preserved
-        assert written_meta["emotional_valence"] == 0.8  # added
-        assert written_meta["importance"] == 0.9  # added
+        sql, params = db.execute_commit.await_args.args
+        assert "json_set(COALESCE(metadata" in sql
+        assert "SELECT" not in sql
+        assert params[:-2] == (
+            '$."emotional_valence"', "0.8",
+            '$."importance"', "0.9",
+        )
+        assert params[-2:] == (42, "test")
+        db.fetchone.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sqlite_returns_false_on_missing_message(self):
@@ -262,7 +260,7 @@ class TestUpdateMessageMetadataAtomicMerge:
 
         db = AsyncMock()
         db.backend_type = "sqlite"
-        db.fetchone = AsyncMock(return_value=None)
+        db.execute_commit = AsyncMock(return_value=0)
 
         store = AsyncConversationStore(db, agent_id="test")
         store._global_fernet = None
@@ -270,6 +268,21 @@ class TestUpdateMessageMetadataAtomicMerge:
 
         result = await store.update_message_metadata(99, {"foo": "bar"})
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_sqlite_merge_preserves_json_null_semantics(self):
+        from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+
+        db = AsyncMock()
+        db.backend_type = "sqlite"
+        db.execute_commit = AsyncMock(return_value=1)
+        store = AsyncConversationStore(db, agent_id="test")
+
+        assert await store.update_message_metadata(1, {"last_accessed": None})
+
+        sql, params = db.execute_commit.await_args.args
+        assert "json_set" in sql
+        assert params[:2] == ('$.' + '"last_accessed"', "null")
 
     @pytest.mark.asyncio
     async def test_postgres_uses_jsonb_merge(self):
@@ -401,6 +414,9 @@ class TestPostResponsePipeline:
         )
 
         mock_agent.context_manager.memory_manager.tag_exchange.assert_awaited_once()
+        mock_agent._raw_storage.conversation.get_full_history_with_ids.assert_any_await(
+            limit=20
+        )
         call_kwargs = mock_agent.context_manager.memory_manager.tag_exchange.call_args[1]
         assert call_kwargs["user_message_id"] == 100
         assert call_kwargs["assistant_message_id"] == 101
@@ -542,6 +558,9 @@ class TestPostResponsePipeline:
         await asyncio.sleep(0.1)
 
         mock_agent.memory_system.analyzer.detect_patterns.assert_awaited_once()
+        mock_agent._raw_storage.conversation.get_full_history_with_ids.assert_any_await(
+            limit=50
+        )
 
     @pytest.mark.asyncio
     async def test_pipeline_phase2_error_isolation(self, mock_agent):
