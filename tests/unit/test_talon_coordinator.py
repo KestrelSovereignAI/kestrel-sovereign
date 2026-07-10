@@ -1504,3 +1504,314 @@ class TestSurveyStalledTalonJobs:
         result = await reg.handler({"stale_days": 3, "recurring": True})
         assert result["discovered"] is True
         assert [j["id"] for j in result["stalled_items"]] == ["job-1"]
+
+
+class TestVerifyPipelineCI:
+    """The ``fleet_ci_probe`` verify seam bound to the dispatched job (#2303)."""
+
+    def _feature(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = MagicMock()
+        return feature
+
+    @staticmethod
+    def _stub_green_ci(monkeypatch, feature):
+        """Stub the GitHub PR-head lookup + workflows ci_green machinery green.
+
+        Returns the ``talon_pipeline`` module so the caller can also stub
+        ``_find_pr_url`` / ``_await_completion`` (both imported inside
+        ``verify_pipeline_ci``).
+        """
+        import kestrel_sovereign.signals.sources.talon_pipeline as tp
+
+        wfr = pytest.importorskip("kestrel_feature_workflows.runner")
+
+        monkeypatch.setattr(
+            feature,
+            "_github_pr_head",
+            lambda repo, pr: {"ref": f"talon/pr-{pr}", "sha": f"sha-{pr}"},
+        )
+
+        async def _provider(gate, link):
+            return {"status": "green"}
+
+        monkeypatch.setattr(wfr, "_default_ci_green_provider", _provider)
+        monkeypatch.setattr(wfr, "_ci_marker_green", lambda gate, marker: True)
+        return tp
+
+    @pytest.mark.asyncio
+    async def test_run_binding_selects_own_job_exclusively(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # Two COMPLETE jobs for the same repo/issue; B started later, so a bare
+        # (repo, issue) correlation would pick B. The run→job map binds THIS run
+        # to A, and that is the ONLY thing consulted — B is never read.
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-01-01T00:00:00",
+            },
+            "B": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-02-01T00:00:00",
+            },
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        read: list = []
+
+        def _find_pr_url(coord, jid):
+            read.append(jid)
+            return f"https://github.com/org/repo/pull/{101 if jid == 'A' else 202}"
+
+        monkeypatch.setattr(tp, "_find_pr_url", _find_pr_url)
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["job_id"] == "A"
+        assert verdict["pr"] == 101
+        assert "B" not in read  # job B was never read
+
+    @pytest.mark.asyncio
+    async def test_no_run_bound_job_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # A completed green job exists, but THIS run has no entry in the run→job
+        # map. There is no correlation fallback: the verify must fail closed and
+        # never touch the unrelated job.
+        feature._jobs = {
+            "B": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-02-01T00:00:00",
+            }
+        }
+        tp = self._stub_green_ci(monkeypatch, feature)
+        read: list = []
+        monkeypatch.setattr(
+            tp, "_find_pr_url", lambda coord, jid: read.append(jid) or None
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"] == "no_run_bound_job"
+        assert read == []  # never resolved a PR for any job
+
+    @pytest.mark.asyncio
+    async def test_no_workflow_run_id_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        # No run_id passed and no signal context → cannot bind → fail closed.
+        monkeypatch.setattr(feature, "_current_workflow_run_id", lambda: None)
+        verdict = await feature.verify_pipeline_ci(repo="org/repo")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"] == "no_workflow_run_id"
+
+    @pytest.mark.asyncio
+    async def test_iterate_pr_read_from_job_record_not_param(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # An iterate job records its target PR (55). Verification reads the PR
+        # off the job record, not from any caller param.
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "pr": 55, "status": "complete",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        monkeypatch.setattr(tp, "_find_pr_url", lambda coord, jid: None)
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["pr"] == 55
+
+    @pytest.mark.asyncio
+    async def test_terminal_failed_job_never_reports_green(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # The job ended terminal-FAILED but still opened a green-CI PR. It must
+        # NOT be accepted as ci_green (the P2 gate: require job success first).
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "failed",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"].startswith("job_not_complete")
+
+    @pytest.mark.asyncio
+    async def test_reap_to_terminal_failed_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        feature._persist_jobs = MagicMock()
+        # A cli_background job whose live process finished with rc!=0. The
+        # point-in-time reap resolves it to ``failed`` (no hold), and a
+        # terminal-failed job never reports green even if its PR is green.
+        class _Proc:
+            returncode = 2
+
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "running",
+                "method": "cli_background", "process": _Proc(),
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert "job_not_complete:failed" in verdict["reason"]
+
+    @pytest.mark.asyncio
+    async def test_still_running_job_waits_then_verifies(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # A job still running at verify time (a2a → _reap_cli_job is a no-op, so
+        # the fast path leaves it running). The workflows runner has no
+        # waiting-stage primitive that parks a signal_status_ok stage on
+        # talon:<job_id>, so verify_ci itself absorbs the wait on the durable
+        # rail; once the job completes it verifies the PR's CI green (#2303,
+        # sixth pass — the real dispatch(wait:false)→verify production path).
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "running",
+                "method": "a2a",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+
+        waited: list = []
+
+        async def _await(coord, jid, timeout):  # the rail reaps job → complete
+            waited.append((jid, timeout))
+            feature._jobs[jid]["status"] = "complete"
+            return MagicMock(data={"status": "complete"})
+
+        monkeypatch.setattr(tp, "_await_completion", _await, raising=False)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["job_id"] == "A"
+        # Waited on THIS run's own job, up to the held-turn ceiling.
+        assert waited and waited[0][0] == "A"
+
+    @pytest.mark.asyncio
+    async def test_still_running_past_ceiling_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # The job never reaches a terminal state within the wait ceiling: the
+        # rail returns still-running. verify_ci fails closed (the run can be
+        # re-verified) and never advances to PR resolution — it must not claim
+        # CI state for an unfinished job.
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "running",
+                "method": "a2a",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+
+        async def _await(coord, jid, timeout):  # times out; job still running
+            return MagicMock(data={"status": "running", "timed_out": True})
+
+        monkeypatch.setattr(tp, "_await_completion", _await, raising=False)
+        read: list = []
+        monkeypatch.setattr(
+            tp, "_find_pr_url", lambda coord, jid: read.append(jid) or None
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"].startswith("job_still_running")
+        assert read == []  # never advanced to PR resolution
+
+    @pytest.mark.asyncio
+    async def test_run_binding_survives_restart(self, monkeypatch, tmp_path):
+        pytest.importorskip("kestrel_feature_workflows")
+
+        def _agent():
+            agent = _make_agent()
+            agent.storage_path = str(tmp_path / "kestrel_prime.db")
+            return agent
+
+        import kestrel_sovereign.signals.context as ctx
+
+        sig = MagicMock()
+        sig.session_id = "run-1"
+        monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
+
+        # --- process 1: dispatch stamps the run→job binding on the persisted
+        # cli_background job record and flushes the durable registry.
+        f1 = TalonCoordinatorFeature(_agent())
+        f1._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "method": "cli_background",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        f1._record_pipeline_run_job({"dispatched": True, "job_id": "A"})
+        assert f1._pipeline_run_jobs["run-1"] == "A"
+
+        # --- process 2 (simulated restart): a fresh instance over the same
+        # registry reloads BOTH the job AND the run→job binding, even though the
+        # in-memory map was lost on restart.
+        f2 = TalonCoordinatorFeature(_agent())
+        assert "A" in f2._jobs
+        assert f2._pipeline_run_jobs.get("run-1") == "A"
+
+        tp = self._stub_green_ci(monkeypatch, f2)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+        verdict = await f2.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["job_id"] == "A"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_records_run_to_job_binding(self, monkeypatch):
+        feature = self._feature()
+        # Simulate being inside a workflow.stage signal dispatch.
+        import kestrel_sovereign.signals.context as ctx
+
+        sig = MagicMock()
+        sig.session_id = "run-42"
+        monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
+
+        feature._record_pipeline_run_job({"dispatched": True, "job_id": "job-99"})
+        assert feature._pipeline_run_jobs["run-42"] == "job-99"
+        # A non-dispatched result records nothing.
+        feature._record_pipeline_run_job({"dispatched": False, "job_id": "x"})
+        assert "x" not in feature._pipeline_run_jobs.values()
