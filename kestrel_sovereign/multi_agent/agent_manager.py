@@ -215,14 +215,6 @@ class AgentManager:
         Returns:
             True if agent was found and removed.
         """
-        # Compute the budget-release order (this agent + any budgeted descendants,
-        # leaf-first) BEFORE popping anything, while the parent-child graph is
-        # intact (#2113). remove_agent is also the generic delete path (DELETE
-        # /api/agents/{name}) which does NOT cascade like terminate_child, so a
-        # direct delete of a parent with budgeted descendants would otherwise
-        # release only the parent and strand the descendants' holds.
-        release_order = self._budget_release_order(name)
-
         async with self._lock:
             agent = self._agents.pop(name, None)
             if agent is not None:
@@ -233,14 +225,14 @@ class AgentManager:
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.warning(f"Agent '{name}' shutdown issue: {e}")
 
-        # Release budget holds AFTER the child is stopped (#2113): releasing before
-        # shutdown would let a still-running child spend already-refunded funds.
-        # Leaf-first so a nested grandchild refunds up into its parent before the
-        # parent releases to the root. Each _release_child_budget is idempotent —
-        # a no-op when terminate_child/shutdown_all already released. Outside the
-        # lock (wallet I/O).
-        for child_name in release_order:
-            await self._release_child_budget(child_name)
+        # Release THIS agent's own budget hold AFTER it is stopped (#2113):
+        # releasing before shutdown would let a still-running child spend
+        # already-refunded funds. remove_agent is a single-agent primitive — it
+        # does NOT cascade to descendants; correct nested release is provided by
+        # terminate_child (cascade) and shutdown_all (leaf-first order), which are
+        # the paths budgeted children are torn down through. Idempotent — a no-op
+        # when those paths already released this entry. Outside the lock (I/O).
+        await self._release_child_budget(name)
         return agent is not None
 
     async def create_agent(
@@ -411,31 +403,6 @@ class AgentManager:
             "Applied delegated budget %s to child '%s' — spend now ceiling'd (#2113).",
             budget, name,
         )
-
-    def _budget_release_order(self, name: str) -> list:
-        """Post-order (leaf-first) list of ``name`` and its descendants (#2113).
-
-        Computed from the live parent-child graph so a direct ``remove_agent``
-        of a parent releases budgeted descendants' holds before the parent's —
-        otherwise a grandchild's later refund would land in an already-released
-        parent wallet and never reach the root.
-        """
-        order: list = []
-        seen: set = set()
-
-        def visit(n: str) -> None:
-            if n in seen:
-                return
-            seen.add(n)
-            agent = self._agents.get(n)
-            did = getattr(agent, "agent_id", None) if agent is not None else None
-            if did:
-                for child_name in list(self._parent_children.get(did, [])):
-                    visit(child_name)
-            order.append(n)  # self after children → leaf-first
-
-        visit(name)
-        return order
 
     async def _release_child_budget(self, child_name: str) -> None:
         """Credit a terminated child's unspent budget back to its parent (#2113).
