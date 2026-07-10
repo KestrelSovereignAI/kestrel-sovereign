@@ -293,6 +293,112 @@ async def _load_persisted_embedding_route(
         return (False, None)
 
 
+async def _load_persisted_route_embedding_models(
+    db: "Any", agent_id: Optional[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Read the runtime per-route ``embedding_model`` pins from agent_metadata.
+
+    Mirrors ``ModelPreferenceMixin._load_route_embedding_models`` (#2337): the
+    embeddings UI persists ``{"<vendor>:<route>": {"model": str, "dim": int|None}}``
+    here, and re-applying it re-advertises embedding support for the pinned route
+    the same way the live agent does at boot. Returns the override map (possibly
+    empty). When ``agent_id`` is None a single stored row is used (the common
+    single-agent DB); an ambiguous multi-row case returns empty and leaves the
+    config/discovery default.
+    """
+    try:
+        if agent_id:
+            rows = await db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (agent_id, "embedding_model_overrides"),
+            )
+        else:
+            rows = await db.fetchall(
+                "SELECT value FROM agent_metadata WHERE key = ?",
+                ("embedding_model_overrides",),
+            )
+        if not rows or len(rows) != 1:
+            return {}
+        overrides = json.loads(rows[0][0])
+        return overrides if isinstance(overrides, dict) else {}
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("could not read persisted embedding_model_overrides: %s", exc)
+        return {}
+
+
+async def _apply_persisted_embedding_config(
+    llm_service: "Any", db: "Any", agent_id: Optional[str]
+) -> Optional[str]:
+    """Apply the live agent's persisted embedding resolution order to a service.
+
+    A freshly-constructed CLI-context ``LLMService`` validates a persisted
+    ``embedding_route`` against **static config only** — it neither loads the
+    runtime per-route model pins (#2337) nor runs embedding-model discovery
+    (#2338) that the serving process applies at boot. Net effect (#2361): a route
+    the server resolves fine (e.g. ``openrouter:api`` pinned via the UI) is
+    rejected here as "does not advertise embedding support". This reproduces the
+    boot path (``ModelPreferenceMixin._load_route_embedding_models`` →
+    ``_load_embedding_route``) so the CLI and server agree about the same
+    persisted state:
+
+    1. Re-apply persisted per-route ``embedding_model`` pins — each pin
+       re-advertises embedding support for that exact route (#2337).
+    2. Fold live embedding discovery into route capabilities (#2338).
+    3. Apply the persisted ``embedding_route`` knob (#2263).
+
+    Returns ``None`` on success, or an operator-facing error string when the
+    persisted route still can't be applied (caller refuses rather than reindex
+    into the wrong profile).
+    """
+    # (1) Re-apply persisted per-route embedding_model pins (#2337). Each pin
+    # writes embedding capability onto its exact route, so a route whose support
+    # is only advertised via a UI-set model pin is recognised before validation.
+    overrides = await _load_persisted_route_embedding_models(db, agent_id)
+    for route, spec in overrides.items():
+        if not isinstance(spec, dict):
+            continue
+        model = spec.get("model")
+        if not model:
+            continue
+        try:
+            llm_service.set_route_embedding_model(
+                route, model, spec.get("dim"), persist=False
+            )
+            print(f"# using persisted embedding_model pin: {route} -> {model}")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "skipping persisted embedding_model pin for %s: %s", route, exc
+            )
+
+    # (2) Fold live embedding discovery into route capabilities BEFORE the sync
+    # validator runs (#2338), mirroring the settings endpoint and the boot path.
+    # A route discovered dynamically (e.g. OpenRouter with no TOML pin) advertises
+    # embedding support only after reconciliation; without this the persisted
+    # route would be rejected as "does not advertise embedding support".
+    if hasattr(llm_service, "reconcile_embedding_capabilities"):
+        try:
+            await llm_service.reconcile_embedding_capabilities(use_cache=True)
+        except Exception as exc:  # pragma: no cover - discovery must not fail CLI
+            logger.debug("embedding capability reconcile skipped: %s", exc)
+
+    # (3) Apply the persisted embedding_route (#2263). If it still can't be
+    # applied, REFUSE — continuing would silently reindex production rows into
+    # whatever route was already active (the wrong embedding profile).
+    found, route = await _load_persisted_embedding_route(db, agent_id)
+    if found:
+        try:
+            llm_service.set_embedding_route(route, persist=False)
+            if route:
+                print(f"# using persisted embedding_route: {route}")
+        except Exception as exc:
+            return (
+                f"the persisted embedding_route {route!r} is no longer valid "
+                f"({exc}). Fix the embedding route (via the settings API/UI or "
+                "config) before reindexing."
+            )
+    return None
+
+
 def add_embeddings_subparser(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``embeddings`` subcommand under the top-level CLI parser."""
     parser = subparsers.add_parser(
@@ -540,10 +646,14 @@ async def _reindex(
 
     # Resolve the target profile unless the caller injected one.
     if target_profile_id is None or embedding_service is None:
-        # Apply the agent's persisted runtime embedding_route (#2263) BEFORE
-        # resolving the target, so the CLI re-embeds to the profile the live
-        # agent actually resolves — not the config/default route. Mirrors
-        # ModelPreferenceMixin._load_embedding_route on the agent boot path.
+        # Apply the agent's persisted runtime embedding config (#2263/#2337/#2338)
+        # BEFORE resolving the target, so the CLI re-embeds to the profile the
+        # live agent actually resolves — not the config/default route. Mirrors
+        # ModelPreferenceMixin._load_route_embedding_models → _load_embedding_route
+        # on the agent boot path: re-apply per-route model pins, run embedding
+        # discovery, then set the persisted route. Without this a UI-created route
+        # the server resolves fine (e.g. openrouter:api pinned at runtime) is
+        # rejected here as "does not advertise embedding support" (#2361).
         # Only done when we construct the LLMService (production path); an
         # injected service is presumed already configured (tests).
         if llm_service is None:
@@ -557,20 +667,10 @@ async def _reindex(
                     file=sys.stderr,
                 )
                 return 2
-            found, route = await _load_persisted_embedding_route(db, agent_id)
-            if found:
-                try:
-                    llm_service.set_embedding_route(route, persist=False)
-                    if route:
-                        print(f"# using persisted embedding_route: {route}")
-                except Exception as exc:
-                    print(
-                        f"ERROR: the persisted embedding_route {route!r} is no "
-                        f"longer valid ({exc}). Fix the embedding route (via the "
-                        "settings API/UI or config) before reindexing.",
-                        file=sys.stderr,
-                    )
-                    return 2
+            err = await _apply_persisted_embedding_config(llm_service, db, agent_id)
+            if err is not None:
+                print(f"ERROR: {err}", file=sys.stderr)
+                return 2
         err, embedding_service, target_profile_id = _resolve_target(llm_service)
         if err is not None:
             print(f"ERROR: {err}", file=sys.stderr)

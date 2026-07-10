@@ -540,3 +540,95 @@ async def test_load_persisted_embedding_route(db):
         True,
         "openai:api",
     )
+
+
+def _cli_context_service(provider):
+    """A freshly-constructed process-local ``LLMService`` (CLI context).
+
+    Mirrors the ``__new__`` build used by ``test_embedding_route_model`` — no
+    boot-time pin-load or embedding discovery has run, so a route with empty
+    static capabilities advertises no embedding support (the #2361 starting
+    state).
+    """
+    from kestrel_sovereign.llm.service import LLMService
+
+    service = LLMService.__new__(LLMService)
+    service.providers = [provider]
+    service._route_embedding_model_overrides = {}
+    service._route_embedding_caps_backup = {}
+    service._route_embedding_model_persistence_callback = None
+    service._embedding_route_persistence_callback = None
+    service._embedding_discovery_cache = []  # empty → discovery is a no-op
+    service._force_local_only_provider = None
+    service._embedding_space_pins = None
+    service._verified_space_pins = {}
+    service._embedding_route = None
+    service.disabled = False
+    return service
+
+
+@pytest.mark.asyncio
+async def test_cli_service_honors_persisted_route_model_pin(db):
+    """A route the server resolves via a runtime pin must resolve in the CLI too (#2361).
+
+    Persist a per-route ``embedding_model`` pin (#2337) + ``embedding_route``
+    (#2263) the way the settings API/UI does, then construct a CLI-context
+    ``LLMService`` whose STATIC config advertises no embedding support for that
+    route. Applying the persisted config must re-advertise the route (via the
+    pin) so ``_resolve_target`` succeeds and targets the pinned model's profile —
+    instead of refusing with "does not advertise embedding support".
+    """
+    import json
+
+    from kestrel_sovereign import cli_embeddings
+    from kestrel_sovereign.llm.embedding_service import derive_embedding_profile
+
+    provider = {
+        "name": "openrouter:api",
+        "vendor": "openrouter",
+        "route": "api",
+        "adapter": object(),
+        "client": object(),
+        "model": "auto",
+        "is_local": False,
+        "is_cloud": True,
+        "capabilities": {},
+    }
+    service = _cli_context_service(provider)
+
+    # Baseline: the route advertises no embedding support — the exact CLI refusal
+    # #2361 reports.
+    with pytest.raises(ValueError, match="does not advertise embedding support"):
+        service.set_embedding_route("openrouter:api", persist=False)
+
+    # Persist a runtime model pin (#2337) + embedding_route (#2263), as the
+    # settings path would.
+    await db.execute_commit(
+        "INSERT OR REPLACE INTO agent_metadata (agent_id, key, value) "
+        "VALUES (?, ?, ?)",
+        (
+            "a1",
+            "embedding_model_overrides",
+            json.dumps(
+                {"openrouter:api": {"model": "qwen/qwen3-embedding-8b", "dim": 768}}
+            ),
+        ),
+    )
+    await db.execute_commit(
+        "INSERT OR REPLACE INTO agent_metadata (agent_id, key, value) "
+        "VALUES (?, ?, ?)",
+        ("a1", "embedding_route", json.dumps("openrouter:api")),
+    )
+
+    err = await cli_embeddings._apply_persisted_embedding_config(service, db, "a1")
+    assert err is None
+
+    # The pin re-advertised embedding support, so _resolve_target now succeeds
+    # and targets the pinned model's profile — not a refusal.
+    resolve_err, embedding_service, target = cli_embeddings._resolve_target(service)
+    assert resolve_err is None
+    assert embedding_service is not None
+    expected = derive_embedding_profile(
+        provider="openrouter", model="qwen/qwen3-embedding-8b", dim=768
+    ).profile_id
+    assert target == expected
