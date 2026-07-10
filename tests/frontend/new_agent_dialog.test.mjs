@@ -143,6 +143,8 @@ test('a pending create resolved AFTER dismissal never hides an unrelated modal o
     const api = {
         createAgent: () => new Promise((_, rej) => { rejectCreate = rej; }),
     };
+    let resolveCreate;
+    api.createAgent = () => new Promise((res, rej) => { resolveCreate = res; rejectCreate = rej; });
     openCreateAgentDialog({ modal: Modal, api, onCreated: () => {} });
     await tick();
     typeName('Kestrel');
@@ -151,14 +153,12 @@ test('a pending create resolved AFTER dismissal never hides an unrelated modal o
     Modal.show({ title: 'Unrelated', content: '<p id="unrelated-marker">other</p>', buttons: [] });
     assert.ok(document.getElementById('unrelated-marker'), 'unrelated modal open');
 
-    // The stale request fails now — it must NOT touch the unrelated modal.
-    rejectCreate(new Error('boom'));
+    // The stale request SUCCEEDS now — the harmful path is the unscoped
+    // modal.hide() on success, which closed whatever modal was open.
+    resolveCreate({ success: true, agent: { name: 'Kestrel' } });
     await tick();
     await tick();
     assert.ok(document.getElementById('unrelated-marker'),
-        'unrelated modal untouched by the stale failure');
-    const err = document.getElementById('create-agent-error');
-    assert.ok(!err || err.textContent === '',
-        'no stale error painted into a foreign modal');
+        'unrelated modal untouched by the stale success');
     Modal.hide();
 });
