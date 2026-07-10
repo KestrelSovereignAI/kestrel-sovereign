@@ -1667,6 +1667,34 @@ class TestEcosystemDiscoveryWatchHandler:
         assert findings[0]["suggested_gate"] == "govern_stalled_work_rescue"
 
     @pytest.mark.asyncio
+    async def test_roster_args_forwarded_to_scan_tool(self, feature):
+        """Scheduler forwards org/allowlist/prefix roster args to the tool (#2269)."""
+        feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_clean())
+        feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
+        feature._save_ecosystem_discovery_state = AsyncMock()
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+
+        out = await feature._run_ecosystem_discovery_watch({
+            "tool": "scan_stale_work",
+            "org": "KestrelSovereignAI",
+            "repos": ["KestrelSovereignAI/kestrel-feature-*"],
+            "repo_prefix": "KestrelSovereignAI/kestrel-",
+            "watch_key": "ecosystem-roster",
+        })
+
+        data = json.loads(out)
+        assert data["watch_key"] == "ecosystem-roster"
+        tool_name, tool_args = feature._lookup_and_run_tool.call_args.args
+        assert tool_name == "scan_stale_work"
+        assert tool_args["org"] == "KestrelSovereignAI"
+        assert tool_args["repos"] == ["KestrelSovereignAI/kestrel-feature-*"]
+        assert tool_args["repo_prefix"] == "KestrelSovereignAI/kestrel-"
+        # Watcher control keys are never leaked into the tool kwargs.
+        assert "watch_key" not in tool_args
+        assert "tool" not in tool_args
+
+    @pytest.mark.asyncio
     async def test_new_finding_emits_signal_with_payload(self, feature):
         feature._lookup_and_run_tool = AsyncMock(return_value=_discovery_finding())
         feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))

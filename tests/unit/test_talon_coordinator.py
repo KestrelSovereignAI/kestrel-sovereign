@@ -1506,6 +1506,127 @@ class TestSurveyStalledTalonJobs:
         assert [j["id"] for j in result["stalled_items"]] == ["job-1"]
 
 
+class TestScanStaleWorkRoster:
+    """Roster-mode scan_stale_work: org/allowlist/prefix expansion (#2269)."""
+
+    def _feature(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = MagicMock()
+        return feature
+
+    def _stalled_jobs(self):
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        return {
+            "job-a": {"status": "running", "started_at": old,
+                      "repo": "KestrelSovereignAI/kestrel-feature-github", "issue": 1},
+            "job-b": {"status": "running", "started_at": old,
+                      "repo": "KestrelSovereignAI/kestrel-sovereign", "issue": 2},
+        }
+
+    @pytest.mark.asyncio
+    async def test_prefix_wildcard_is_not_treated_as_repo_name(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = self._stalled_jobs()
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            {
+                "KestrelSovereignAI/kestrel-feature-github",
+                "KestrelSovereignAI/kestrel-feature-voice",
+                "KestrelSovereignAI/kestrel-sovereign",
+            },
+            None,
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, repos=["KestrelSovereignAI/kestrel-feature-*"],
+        )
+        assert result.status is ToolResultStatus.OK
+        scanned = set(result.data["scanned_repos"])
+        assert scanned == {
+            "KestrelSovereignAI/kestrel-feature-github",
+            "KestrelSovereignAI/kestrel-feature-voice",
+        }
+        # Only the stalled job in a rostered repo becomes a finding.
+        repos = {f["repo"] for f in result.data["findings"]}
+        assert repos == {"KestrelSovereignAI/kestrel-feature-github"}
+        assert result.data["scan_failures"] == []
+
+    @pytest.mark.asyncio
+    async def test_tekspear_repos_excluded(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = {}
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            {
+                "KestrelSovereignAI/kestrel-sovereign",
+                "KestrelSovereignAI/tekspear-core",
+            },
+            None,
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, org="KestrelSovereignAI",
+        )
+        assert "KestrelSovereignAI/tekspear-core" not in result.data["scanned_repos"]
+        assert "KestrelSovereignAI/tekspear-core" in result.data["excluded_repos"]
+
+    @pytest.mark.asyncio
+    async def test_inaccessible_explicit_repo_is_scan_failure(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = {}
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            {"KestrelSovereignAI/kestrel-sovereign"},
+            None,
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, repos=["KestrelSovereignAI/does-not-exist"],
+        )
+        failures = result.data["scan_failures"]
+        assert len(failures) == 1
+        assert failures[0]["target"] == "KestrelSovereignAI/does-not-exist"
+        assert failures[0]["kind"] == "scan_failure"
+        # Failures also surface as actionable findings (never silently skipped).
+        assert any(f.get("kind") == "scan_failure" for f in result.data["findings"])
+
+    @pytest.mark.asyncio
+    async def test_discovery_failure_reports_all_targets(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = {}
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            set(), "HTTPException: 503 No GITHUB_TOKEN configured",
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, org="KestrelSovereignAI",
+        )
+        assert result.data["scanned_repos"] == []
+        assert len(result.data["scan_failures"]) == 1
+        assert "503" in result.data["scan_failures"][0]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_single_repo_mode_unchanged(self):
+        feature = self._feature()
+        feature._jobs = self._stalled_jobs()
+
+        result = await feature.scan_stale_work(
+            stale_days=3, repo="KestrelSovereignAI/kestrel-sovereign",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert "scan_failures" not in result.data
+        assert [f["repo"] for f in result.data["findings"]] == [
+            "KestrelSovereignAI/kestrel-sovereign"
+        ]
+
+
 class TestVerifyPipelineCI:
     """The ``fleet_ci_probe`` verify seam bound to the dispatched job (#2303)."""
 
