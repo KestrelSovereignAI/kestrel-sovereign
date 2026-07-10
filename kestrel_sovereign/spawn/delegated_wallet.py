@@ -106,6 +106,59 @@ class DelegatedWallet:
         """Check whether *cost* fits within the remaining budget."""
         return self.allocation.spent + cost <= self.allocation.amount
 
+    # ------------------------------------------------------------------
+    # WalletProtocol drop-in surface (#2113).
+    #
+    # A child's spend paths (backups/anchoring in ``agent/backup.py`` and
+    # ``features/sovereignty``, metered LLM cost, etc.) call the wallet's
+    # ``can_afford`` / ``transfer`` — NOT ``spend``. So for the budget to be
+    # enforced, ``child.wallet`` is set to this DelegatedWallet and it must be a
+    # drop-in: override the spend-affecting methods with the ceiling check and
+    # delegate everything else (``deposit``/``_balances``/``initialize``/…) to the
+    # wrapped funded wallet via ``__getattr__``.
+    # ------------------------------------------------------------------
+
+    def can_afford(self, amount: Decimal, currency: Any = None) -> bool:
+        """True only if *amount* is within BOTH the remaining budget ceiling and
+        the wrapped wallet's funds."""
+        if not self.can_spend(amount):
+            return False
+        currency = currency or _default_currency_for(self._wallet)
+        return self._wallet.can_afford(amount, currency)
+
+    async def transfer(
+        self, amount: Decimal, memo: str = "", currency: Any = None
+    ) -> bool:
+        """Ceiling-enforced transfer — the drop-in for ``WalletAgent.transfer``.
+
+        Routes through :meth:`spend`, so an overspend raises
+        ``BudgetExceededError`` and a successful debit advances ``allocation.spent``.
+        """
+        return await self.spend(amount, memo, currency)
+
+    def get_balance(self, currency: Any = None, balance_type: str = "main") -> Decimal:
+        """Spendable balance = the smaller of the wrapped wallet's balance and the
+        remaining budget, so a child never appears to hold more than its ceiling."""
+        currency = currency or _default_currency_for(self._wallet)
+        wrapped = self._wallet.get_balance(currency, balance_type)
+        if balance_type == "main":
+            return min(wrapped, self.remaining)
+        return wrapped
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate any attribute this wrapper doesn't define to the wrapped
+        wallet, so DelegatedWallet is a transparent drop-in (deposit, _balances,
+        initialize, provider-specific helpers, …). Only ``transfer`` /
+        ``can_afford`` / ``get_balance`` are overridden above to enforce the
+        ceiling. ``_wallet`` itself is a real instance attribute set in __init__,
+        so this never recurses on it."""
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        wallet = self.__dict__.get("_wallet")
+        if wallet is None:
+            raise AttributeError(name)
+        return getattr(wallet, name)
+
     async def spend(
         self,
         cost: Decimal,

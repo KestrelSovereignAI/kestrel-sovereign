@@ -220,20 +220,12 @@ class SpawnFeature(Feature):
                 error="No AgentManager available — agent is not running in a multi_agent"
             )
 
-        # A per-child budget CEILING is not yet enforced (#F278): the
-        # DelegatedWallet machinery exists but the child's spend paths are not
-        # routed through it, so a budget would be an advertised-but-nonexistent
-        # control. Reject a positive budget clearly rather than silently
-        # accepting one that enforces nothing (the previous no-op). Tracked as a
-        # follow-up feature (delegated-wallet spend routing + release).
-        if budget and budget > 0:
-            return ToolResult.failed(
-                error=(
-                    "per-child budget enforcement is not yet implemented — a "
-                    "budget here would not actually cap the child's spend. Spawn "
-                    "without a budget for now."
-                )
-            )
+        # A positive budget is now ENFORCED (#2113): AgentManager holds it from
+        # the parent's funded wallet and routes the child's spend through a
+        # ceiling'd DelegatedWallet, releasing the unspent hold on termination. A
+        # budget with no funded parent wallet is refused by
+        # AgentManager._validate_budget_precondition and surfaced as the spawn
+        # failure below — so no advertised-but-unenforced control ships.
 
         # Parse comma-separated 'key=value' / bare-flag items into the mandate's
         # additional_constraints dict. Values are coerced to their natural type:

@@ -230,10 +230,11 @@ class TestSpawnFeatureWithManager:
         manager.terminate_child.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_spawn_positive_budget_is_rejected(self):
-        """#F278: a per-child budget CEILING is not yet enforced, so a positive
-        budget is rejected clearly rather than silently accepted as a no-op
-        control."""
+    async def test_spawn_forwards_budget_to_mandate(self):
+        """#2113: a per-child budget is now ENFORCED by AgentManager (hold from
+        the parent wallet + ceiling'd DelegatedWallet), so the feature forwards it
+        on the mandate rather than rejecting it. Refusal of an unbacked budget is
+        the manager's job (validated in test_spawn_budget_enforcement)."""
         parent = _make_mock_agent("did:parent")
         manager = MagicMock()
         manager.spawn_agent = AsyncMock(return_value=_make_mock_agent("did:child"))
@@ -241,9 +242,10 @@ class TestSpawnFeatureWithManager:
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
         envelope = await feature.spawn_agent(name="helper", purpose="x", budget=5.0)
 
-        assert envelope.status is ToolResultStatus.ERROR
-        assert "budget" in envelope.error.lower()
-        manager.spawn_agent.assert_not_awaited()  # rejected before spawning
+        assert envelope.status is ToolResultStatus.OK
+        manager.spawn_agent.assert_awaited_once()
+        mandate = manager.spawn_agent.call_args.kwargs["mandate"]
+        assert mandate.budget_allocation == 5.0
 
     @pytest.mark.asyncio
     async def test_delegate_task_not_our_child(self):
@@ -429,10 +431,12 @@ class TestAgentManagerSpawn:
 
         manager = AgentManager()
 
+        # No budget here — this test covers spawn tracking, not budget
+        # enforcement (which requires a funded parent wallet; see
+        # test_spawn_budget_enforcement). #2113.
         mandate = SpawnMandate(
             parent_did="did:parent",
             purpose="test spawning",
-            budget_allocation=5.0,
             ttl_seconds=600,
         )
 

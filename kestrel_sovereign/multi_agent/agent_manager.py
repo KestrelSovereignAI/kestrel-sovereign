@@ -12,10 +12,16 @@ available for local dev (separate OS processes per agent).
 import asyncio
 import logging
 import os
+from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.spawn.delegated_wallet import (
+    _default_currency_for,
+    create_delegated_wallet,
+    release_delegated_wallet,
+)
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.storage.async_storage import AsyncStorage
@@ -55,6 +61,9 @@ class AgentManager:
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
         self._child_mandates: dict[str, SpawnMandate] = {}  # child_name -> mandate
+        # child_name -> (DelegatedWallet, parent_wallet) for budgeted children, so
+        # termination can release the unspent hold back to the parent (#2113).
+        self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = base_data_dir or Path.cwd()
         self._lock = asyncio.Lock()
         # MONOTONIC port allocator (#1729). ``8800 + len(self._agents) + 1``
@@ -314,6 +323,99 @@ class AgentManager:
         if not ok:
             raise ValueError(f"Spawn refused: {msg}")
 
+    # ------------------------------------------------------------------
+    # Per-child spawn budgets (#2113): hold from the parent on spawn, route the
+    # child's spend through a ceiling'd DelegatedWallet, release the unspent hold
+    # on termination.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mandate_budget(mandate: SpawnMandate) -> Decimal:
+        """The mandate's requested budget as a Decimal (0 when unset/invalid)."""
+        raw = getattr(mandate, "budget_allocation", 0) or 0
+        try:
+            return Decimal(str(raw))
+        except Exception:  # noqa: BLE001 — a malformed budget is treated as none
+            return Decimal("0")
+
+    def _validate_budget_precondition(
+        self, parent_agent: KestrelAgent, mandate: SpawnMandate
+    ) -> None:
+        """Refuse a positive budget the parent can't back (#2113), before spawn."""
+        budget = self._mandate_budget(mandate)
+        if budget <= 0:
+            return
+        parent_wallet = getattr(parent_agent, "wallet", None)
+        if parent_wallet is None:
+            raise ValueError(
+                "Spawn refused: a per-child budget requires the parent to have a "
+                "funded wallet (enable the wallet feature). Spawn without a budget "
+                "or fund the parent's wallet."
+            )
+        currency = _default_currency_for(parent_wallet)
+        if not parent_wallet.can_afford(budget, currency):
+            raise ValueError(
+                f"Spawn refused: parent wallet cannot afford the requested budget "
+                f"of {budget}."
+            )
+
+    async def _apply_delegated_budget(
+        self,
+        name: str,
+        parent_agent: KestrelAgent,
+        child: KestrelAgent,
+        mandate: SpawnMandate,
+    ) -> None:
+        """Hold the budget from the parent and point the child's wallet at a
+        ceiling'd DelegatedWallet (#2113). No-op for budget<=0."""
+        budget = self._mandate_budget(mandate)
+        if budget <= 0:
+            return
+        parent_wallet = getattr(parent_agent, "wallet", None)
+        if parent_wallet is None:
+            return  # precondition already refused this; defensive.
+        try:
+            delegated = await create_delegated_wallet(
+                parent_wallet=parent_wallet,
+                parent_did=parent_agent.agent_id,
+                child_did=child.agent_id,
+                budget=budget,
+            )
+        except Exception:
+            # The hold failed AFTER the child was created (e.g. a concurrent
+            # spend drained the parent). Don't leave an uncapped child running.
+            await self.remove_agent(name)
+            raise
+        child.wallet = delegated
+        child.wallet_agent = delegated
+        self._child_budgets[name] = (delegated, parent_wallet)
+        logger.info(
+            "Applied delegated budget %s to child '%s' — spend now ceiling'd (#2113).",
+            budget, name,
+        )
+
+    async def _release_child_budget(self, child_name: str) -> None:
+        """Credit a terminated child's unspent budget back to its parent (#2113).
+
+        Best-effort: a wallet error must not block termination/cleanup. The
+        cascade case (a budgeted child with budgeted descendants) is handled by
+        ``terminate_child`` recursing — each descendant releases its own hold.
+        """
+        entry = self._child_budgets.pop(child_name, None)
+        if entry is None:
+            return
+        delegated, parent_wallet = entry
+        try:
+            returned = await release_delegated_wallet(delegated, parent_wallet)
+            logger.info(
+                "Released delegated budget for '%s': returned %s to parent (#2113).",
+                child_name, returned,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to release delegated budget for '%s': %s", child_name, e
+            )
+
     async def spawn_agent(
         self,
         name: str,
@@ -342,6 +444,12 @@ class AgentManager:
         # before any inception work, so an over-broad mandate is refused rather
         # than silently producing a child with more authority than its parent.
         self._validate_mandate_subset(parent_agent, mandate)
+
+        # Budget precondition (#2113): a positive budget requires a funded parent
+        # wallet to hold from, or the ceiling would be advertised-but-unenforced.
+        # Validated before any inception work so it is refused rather than
+        # producing an uncapped child.
+        self._validate_budget_precondition(parent_agent, mandate)
 
         # Spawn caps (#1729): bound runaway spawning. The check + reservation run
         # under the manager lock so concurrent spawn_agent calls can't all read
@@ -429,6 +537,12 @@ class AgentManager:
 
         # Fill in child DID on the mandate
         mandate.child_did = child.agent_id
+
+        # Per-child budget (#2113): hold from the parent and route the child's
+        # spend through a ceiling'd DelegatedWallet. On hold failure this removes
+        # the just-created child and re-raises (no uncapped orphan).
+        await self._apply_delegated_budget(name, parent_agent, child, mandate)
+
         # Runtime enforcement (spawn_mandate attach + restricted_tools hook) is
         # applied uniformly in load_agent from the persisted delegation edge
         # (#2137), which already ran for this child inside create_agent — so it
@@ -478,6 +592,11 @@ class AgentManager:
         child_agent = self.get_agent(child_name)
         if child_agent is not None:
             await self.terminate_children(child_agent.agent_id)
+
+        # Release any delegated budget hold back to the parent (#2113) before
+        # tearing the child down. Descendants released their own holds in the
+        # cascade above.
+        await self._release_child_budget(child_name)
 
         # Remove from parent tracking
         children.remove(child_name)
