@@ -1054,11 +1054,7 @@ class TalonCoordinatorFeature(Feature):
     async def verify_pipeline_ci(
         self,
         *,
-        repo: str,
-        issue: Optional[int] = None,
-        pr: Optional[int] = None,
-        mode: str = "claim",
-        job_id: Optional[str] = None,
+        repo: Optional[str] = None,
         run_id: Optional[str] = None,
         wait_timeout_seconds: int = 3600,
         poll_interval_seconds: int = 15,
@@ -1069,52 +1065,68 @@ class TalonCoordinatorFeature(Feature):
 
         The verify seam behind the ``fleet_ci_probe`` signal source (#2303).
         Verification is bound to the *dispatched run's own output* — never a
-        caller-supplied branch. It locates the talon job the pipeline
-        dispatched, waits for that job to open its PR, resolves the PR's head
-        branch from GitHub, and polls the PR head's CI (reusing the workflows
-        ``ci_green`` gate machinery).
+        caller-supplied branch, job id, or repo/issue correlation. It resolves
+        the talon job **exclusively** from the coordinator's run_id→job_id map
+        (recorded at dispatch time by :meth:`_record_pipeline_run_job`), keyed
+        by the workflow run's ``session_id``. The workflows runner sets that
+        ``session_id`` to the run id, and the caller cannot control it — so no
+        payload field can redirect verification to a different job. It then
+        waits for that job to open its PR, resolves the PR's head branch from
+        GitHub, and polls the PR head's CI (reusing the workflows ``ci_green``
+        gate machinery).
 
-        The job is bound in priority order: an explicit ``job_id`` (this run's
-        own talon job, threaded from the dispatch stage), then the job recorded
-        for this workflow ``run_id`` at dispatch time, then a (repo, issue|pr)
-        correlation as a last resort. The first two protect against a concurrent
-        run for the same repo/issue whose (newer) job correlation would
-        otherwise select — a run must verify its OWN dispatch, never a sibling's
-        (#2303).
+        Every verification fact (repo, PR number, claim/iterate mode) is read
+        from the resolved **job record** the coordinator itself established at
+        dispatch — never from caller-influenceable payload. This categorically
+        ends the untrusted-payload pattern: approval markers, branch, job id,
+        and repo/issue correlation were all caller-influenceable and are all now
+        ignored for binding (#2303, fourth-pass structural directive).
 
         Fail-closed: returns ``{"ci_green": False, "reason": ...}`` whenever the
-        PR/branch cannot be bound to the dispatch, the job did not COMPLETE, or
-        CI is not observably green. It never claims a green CI it could not check
-        against the talon PR head, and any caller-supplied ``branch`` is ignored.
+        run has no bound job in the map, the job did not COMPLETE, the PR/branch
+        cannot be resolved, or CI is not observably green.
         """
-        repo_resolved = self._resolve_repo(repo)
+
+        # 1. Resolve the talon job THIS run dispatched — EXCLUSIVELY from the
+        # run_id→job_id map keyed by the workflow run's session_id. No
+        # caller-supplied job_id, no (repo, issue|pr) correlation fallback: if
+        # the map has no entry for this run_id, fail closed (#2303).
+        effective_run_id = run_id or self._current_workflow_run_id()
+        if not effective_run_id:
+            return {
+                "ci_green": False,
+                "repo": self._resolve_repo(repo) if repo else repo,
+                "reason": "no_workflow_run_id",
+            }
+        target_id = self._pipeline_run_jobs.get(effective_run_id)
+        if not target_id or target_id not in self._jobs:
+            return {
+                "ci_green": False,
+                "repo": self._resolve_repo(repo) if repo else repo,
+                "run_id": effective_run_id,
+                "reason": "no_run_bound_job",
+            }
+
+        # Every verification fact is read from the job record the coordinator
+        # established at dispatch, never from caller payload.
+        info = self._jobs.get(target_id) or {}
+        repo_resolved = self._resolve_repo(info.get("repo") or repo or "")
+        job_issue = info.get("issue")
+        job_pr = info.get("pr")
+        # A job dispatched in iterate mode records its target ``pr``; a claim
+        # job records its ``issue``. Derive the mode from the job, not payload.
+        job_mode = "iterate" if job_pr is not None else "claim"
 
         def _fail(reason: str, **extra: Any) -> Dict[str, Any]:
             return {
                 "ci_green": False,
                 "repo": repo_resolved,
-                "issue": issue,
-                "pr": pr,
+                "issue": job_issue,
+                "pr": job_pr,
+                "job_id": target_id,
                 "reason": reason,
                 **extra,
             }
-
-        # 1. Locate the talon job THIS run dispatched. Explicit job_id wins;
-        # else the job recorded for this workflow run (bound at dispatch);
-        # else fall back to (repo, issue|pr) correlation.
-        target_id = job_id if (job_id and job_id in self._jobs) else None
-        if target_id is None:
-            bound = self._pipeline_run_jobs.get(
-                run_id or self._current_workflow_run_id() or ""
-            )
-            if bound and bound in self._jobs:
-                target_id = bound
-        if target_id is None:
-            target_id = self._find_pipeline_job_id(
-                repo_resolved, issue=issue, pr=pr, mode=mode
-            )
-        if target_id is None:
-            return _fail("no_dispatched_job")
 
         # 2. Wait for the job to reach a terminal state so its PR exists.
         from kestrel_sovereign.signals.sources.talon_pipeline import (
@@ -1122,7 +1134,6 @@ class TalonCoordinatorFeature(Feature):
             _find_pr_url,
         )
 
-        info = self._jobs.get(target_id) or {}
         final_status = info.get("status")
         if final_status not in _TERMINAL_TALON_STATES:
             try:
@@ -1149,9 +1160,11 @@ class TalonCoordinatorFeature(Feature):
                 f"job_not_complete:{final_status or 'unknown'}", job_id=target_id
             )
 
-        # 3. Resolve the PR the talon job opened (iterate already knows it).
+        # 3. Resolve the PR the talon job opened. In iterate mode the job record
+        # already carries its target ``pr``; else parse it from the PR the job
+        # opened. Both come from the job the coordinator dispatched, not payload.
         pr_url = _find_pr_url(self, target_id)
-        target_pr = int(pr) if (mode == "iterate" and pr) else None
+        target_pr = int(job_pr) if (job_mode == "iterate" and job_pr) else None
         if target_pr is None:
             target_pr = _pr_number_from_url(pr_url)
         if target_pr is None:
@@ -1193,7 +1206,7 @@ class TalonCoordinatorFeature(Feature):
         return {
             "ci_green": bool(green),
             "repo": repo_resolved,
-            "issue": issue,
+            "issue": job_issue,
             "pr": target_pr,
             "pr_url": pr_url,
             "branch": branch,
@@ -1202,46 +1215,6 @@ class TalonCoordinatorFeature(Feature):
             "marker_status": marker_status,
             "reason": None if green else (marker_status or "ci_not_green"),
         }
-
-    def _find_pipeline_job_id(
-        self,
-        repo: str,
-        *,
-        issue: Optional[int] = None,
-        pr: Optional[int] = None,
-        mode: str = "claim",
-    ) -> Optional[str]:
-        """Most-recently-started talon job matching this pipeline's target.
-
-        Correlates by (repo, issue) for claim runs and (repo, pr) for iterate
-        runs — the only stable keys the verify stage has, since the dispatched
-        ``job_id`` is not threaded through the workflow run params. Returns None
-        when nothing matches (the caller then fails closed).
-        """
-        want_issue = int(issue) if issue is not None else None
-        want_pr = int(pr) if pr is not None else None
-        best_id: Optional[str] = None
-        best_started = ""
-        for jid, info in self._jobs.items():
-            if info.get("repo") != repo:
-                continue
-            job_issue = info.get("issue")
-            job_pr = info.get("pr")
-            if mode == "iterate":
-                if want_pr is None or job_pr is None or int(job_pr) != want_pr:
-                    continue
-            else:
-                if (
-                    want_issue is None
-                    or job_issue is None
-                    or int(job_issue) != want_issue
-                ):
-                    continue
-            started = str(info.get("started_at") or "")
-            if best_id is None or started >= best_started:
-                best_id = jid
-                best_started = started
-        return best_id
 
     def _github_pr_head(self, repo: str, pr: int) -> Optional[Dict[str, Any]]:
         """Fetch a PR's head ``{ref, sha}`` from GitHub (read-only).

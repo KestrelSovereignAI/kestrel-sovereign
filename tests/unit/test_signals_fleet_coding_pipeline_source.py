@@ -294,11 +294,13 @@ async def test_ci_probe_binds_to_dispatch_ignoring_caller_branch(dispatcher):
     assert data["branch"] != "attacker-branch"
 
 
-async def test_ci_probe_forwards_dispatched_job_id(tmp_path):
-    # The dispatch stage's job_id flows here in the verify payload; the probe
-    # must forward it to verify_pipeline_ci so verification binds to THIS run's
-    # own talon job, not a (repo, issue) correlation a concurrent run could
-    # poison (#2303).
+async def test_ci_probe_never_forwards_caller_supplied_job_id(tmp_path):
+    # A caller who can start the workflow can stuff ANY older-green talon job's
+    # ``job_id`` into the run params (the runner merges it into the verify
+    # payload). The probe must NEVER forward it — verification binds the job
+    # exclusively coordinator-side from the run→job map keyed by session_id
+    # (#2303, fourth-pass structural directive). So no binding field reaches
+    # verify_pipeline_ci; the probe passes only ``repo`` (a display fallback).
     coord = _FakeCoordinator()
     registry = SourceRegistry()
     register_fleet_coding_pipeline_sources(registry, coordinator=coord)
@@ -317,12 +319,25 @@ async def test_ci_probe_forwards_dispatched_job_id(tmp_path):
         result = await disp.dispatch_signal(
             _signal(
                 FLEET_CI_PROBE,
-                {"repo": "org/repo", "issue": 9, "job_id": "job-abc"},
+                {
+                    "repo": "org/repo",
+                    "issue": 9,
+                    "job_id": "attacker-job",
+                    "branch": "attacker-branch",
+                    "mode": "iterate",
+                    "pr": 999,
+                },
             )
         )
         assert result.status == Status.OK
         assert len(coord.verify_calls) == 1
-        assert coord.verify_calls[0]["job_id"] == "job-abc"
+        vc = coord.verify_calls[0]
+        # NONE of the caller-influenceable binding fields were forwarded.
+        assert "job_id" not in vc
+        assert "branch" not in vc
+        assert "issue" not in vc
+        assert "pr" not in vc
+        assert "mode" not in vc
     finally:
         await backend.close()
 
@@ -619,13 +634,16 @@ async def test_verify_binds_to_dispatch_branch_ignoring_caller_branch(tmp_path):
         )
         # Dispatch happened, then verify bound to the talon PR → run completed.
         assert result.status == RunStatus.COMPLETED
-        # Verify was called with the run target — and NEVER the caller's branch.
+        # Verify was called with only the display ``repo`` — never the caller's
+        # branch, issue, pr, mode, or job_id. Binding is resolved coordinator-
+        # side from the run→job map keyed by session_id (#2303).
         assert len(coord.verify_calls) == 1
         vc = coord.verify_calls[0]
         assert vc["repo"] == "org/repo"
-        assert vc["issue"] == 5
-        assert vc["mode"] == "claim"
         assert "branch" not in vc  # caller-supplied branch:main was ignored
+        assert "issue" not in vc
+        assert "mode" not in vc
+        assert "job_id" not in vc
     finally:
         await backend.close()
 
@@ -649,8 +667,8 @@ async def test_issue_only_run_verifies_talon_pr_not_fail_closed(tmp_path):
         )
         assert result.status == RunStatus.COMPLETED
         assert len(coord.verify_calls) == 1
-        assert coord.verify_calls[0]["mode"] == "claim"
         assert "branch" not in coord.verify_calls[0]
+        assert "mode" not in coord.verify_calls[0]
     finally:
         await backend.close()
 

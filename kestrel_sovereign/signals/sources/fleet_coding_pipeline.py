@@ -43,13 +43,16 @@ Stages (manual trigger)
 3. ``verify_ci`` — ``signal_status_ok`` gate over the coordinator-bound
    ``fleet_ci_probe`` source, which confirms the CI of the PR the ``talon_run``
    stage actually produced went green. The probe binds verification to the
-   *dispatched run's own output* — it never trusts a caller-supplied ``branch``
-   (#2303). It calls ``coordinator.verify_pipeline_ci(repo, issue|pr, mode)``,
-   which locates the talon job this run dispatched, waits for it to open its PR,
-   resolves that PR's head branch from GitHub, and polls the PR head's CI
-   (reusing the workflows ``ci_green`` gate machinery). Fail-closed: the probe
-   raises (so ``signal_status_ok`` fails) whenever the PR/branch cannot be bound
-   to the dispatch or CI is not observably green.
+   *dispatched run's own output* — it never trusts any caller-influenceable
+   payload field (``branch``, ``job_id``, or repo/issue correlation) (#2303).
+   It calls ``coordinator.verify_pipeline_ci()``, which resolves the talon job
+   this run dispatched **exclusively** from the coordinator's run_id→job_id map
+   (keyed by the run's ``session_id``), reads the repo/PR/mode off that job
+   record, waits for the job to open its PR, resolves that PR's head branch from
+   GitHub, and polls the PR head's CI (reusing the workflows ``ci_green`` gate
+   machinery). Fail-closed: the probe raises (so ``signal_status_ok`` fails)
+   whenever the run has no bound job, the PR/branch cannot be resolved, or CI is
+   not observably green.
 
 Why the branch is NOT read from run params (#2303)
 ==================================================
@@ -60,9 +63,10 @@ CI-green verdict for a branch the talon PR never touched (or, omitting it, fail
 closed on the common issue-only path). Verification therefore ignores any
 caller ``branch`` entirely and binds to the talon PR discovered from the
 dispatch. In claim mode the PR head is only known after ``talon_pipeline_dispatch``
-runs, so ``verify_pipeline_ci`` correlates the dispatched job by (repo, issue)
-[claim] / (repo, pr) [iterate], reads the PR the job opened from its output, and
-verifies that PR's head — not run params.
+runs, so ``verify_pipeline_ci`` resolves the dispatched job from the coordinator's
+run_id→job_id map (keyed by the run's session id — caller-uncontrollable), reads
+the repo/PR/mode off that job record, reads the PR the job opened from its output,
+and verifies that PR's head — never run params.
 
 Wait strategy (spec item #3 — ONE approach, documented here)
 ============================================================
@@ -196,31 +200,27 @@ async def _run_fleet_ci_probe(
     """Verify the CI of the PR the ``talon_run`` stage produced went green.
 
     Bound to the coordinator so it can consult the dispatched run's own output.
-    **A caller-supplied ``branch`` is deliberately never read** (#2303): the
-    branch to verify is bound to the talon PR, not to run params. This delegates
-    to ``coordinator.verify_pipeline_ci`` (which locates the dispatched job,
-    resolves its PR head branch, and polls that head's CI) and fails closed —
-    raising, so the ``signal_status_ok`` gate fails — whenever CI is not
-    verified green against the talon PR head.
+    **No caller-influenceable payload field is trusted for binding** (#2303,
+    fourth-pass structural directive): not ``branch``, not ``job_id``, not
+    (repo, issue) correlation. ``verify_pipeline_ci`` resolves the talon job
+    this workflow run dispatched **exclusively** from the coordinator's
+    run_id→job_id map, keyed by the run's ``session_id`` (which the workflows
+    runner sets to the run id — the caller cannot control it). It then reads
+    every verification fact (repo, PR, claim/iterate mode) off that job record,
+    resolves its PR head branch, and polls that head's CI.
 
-    When the dispatched ``job_id`` is present in the payload it is forwarded so
-    verification binds to *this run's own* talon job. The generic workflows
-    runner does not thread arbitrary source output between stages, so this path
-    is a best-effort; the load-bearing binding is coordinator-side —
-    ``verify_pipeline_ci`` resolves the job this workflow run dispatched from the
-    run→job map the ``talon_run`` stage recorded (keyed by the run's session id).
-    Either way a concurrent ``fleet_coding_pipeline`` run targeting the same
-    repo/issue can never make the probe read a different (newer) job's CI
-    (#2303). Only if neither binds does the coordinator fall back to
-    (repo, issue|pr) correlation.
+    This probe therefore forwards **no** binding field — it does not read or
+    pass ``job_id``, ``branch``, ``issue``, ``pr``, or ``mode`` as facts. The
+    only payload field it touches is ``repo``, and only as a display fallback in
+    the fail/return path; the load-bearing binding is entirely coordinator-side.
+    A concurrent ``fleet_coding_pipeline`` run targeting the same repo/issue can
+    never make the probe read a different (newer) job's CI, and the run fails
+    closed (the source raises, so the ``signal_status_ok`` gate fails) whenever
+    the run has no bound job or CI is not observably green against the talon PR
+    head.
     """
     repo = payload.get("repo")
-    issue = payload.get("issue")
     pr = payload.get("pr")
-    job_id = payload.get("job_id")
-    # Derive mode the same way ``talon_pipeline_dispatch`` does: an explicit
-    # ``mode`` wins, else a ``pr`` (without an ``issue``) means iterate.
-    mode = payload.get("mode") or ("iterate" if pr and not issue else "claim")
 
     verify = getattr(coordinator, "verify_pipeline_ci", None)
     if verify is None:
@@ -228,7 +228,10 @@ async def _run_fleet_ci_probe(
             f"{FLEET_CI_PROBE}: no coordinator bound to verify the talon PR's "
             "CI (fail closed)"
         )
-    verdict = await verify(repo=repo, issue=issue, pr=pr, mode=mode, job_id=job_id)
+    # No binding field is passed: ``verify_pipeline_ci`` resolves the job from
+    # the run's own session_id via the coordinator's run→job map. ``repo`` is a
+    # display-only fallback for the fail path.
+    verdict = await verify(repo=repo)
     if not isinstance(verdict, dict) or not verdict.get("ci_green"):
         reason = verdict.get("reason") if isinstance(verdict, dict) else repr(verdict)
         raise ValueError(
