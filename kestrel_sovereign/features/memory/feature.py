@@ -15,6 +15,7 @@ Integrates with the human-like memory system:
 kestrel-sovereign #1042 narration-honesty contract (see #1061).
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -112,6 +113,8 @@ class MemoryFeature(Feature):
         self._memory_system = None
         # Agent identity (DID is the canonical source of truth)
         self.agent_id = self.agent.did
+        self._lexical_backfill_task: Optional[asyncio.Task] = None
+        self._lexical_backfill_result: Dict[str, Any] = {"status": "idle"}
         logger.info(f"MemoryFeature initialized for agent: {self.agent_id[:30]}...")
 
     async def post_all_features_loaded(self, agent):
@@ -471,13 +474,35 @@ class MemoryFeature(Feature):
     async def memory_status(self) -> ToolResult:
         """Get memory system status and statistics."""
         try:
-            history = await self.storage.get_conversation_history(limit=10000)
-            total_messages = len(history)
-
             conv_store = self._get_conversation_store()
+            storage_agent_id = getattr(conv_store, "agent_id", self.agent_id)
+            count_result = await self._db.fetchone(
+                "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ? "
+                "AND deleted_at IS NULL AND archived_at IS NULL",
+                (storage_agent_id,),
+            )
+            total_messages = int(count_result[0]) if count_result else 0
             encryption_enabled = (
                 getattr(conv_store, 'encryption_enabled', False) if conv_store else False
             )
+
+            lexical_index: Dict[str, Any] = {"available": False}
+            embedding_profiles: Dict[str, Any] = {"available": False}
+            if conv_store and hasattr(conv_store, "get_lexical_index_health"):
+                try:
+                    lexical_index = await conv_store.get_lexical_index_health()
+                    lexical_index["available"] = True
+                    lexical_index["backfill"] = dict(self._lexical_backfill_result)
+                except Exception as exc:  # noqa: BLE001 - status must degrade
+                    logger.warning("Lexical index health unavailable: %s", exc)
+                    lexical_index["error"] = str(exc)
+            if conv_store and hasattr(conv_store, "get_embedding_profile_health"):
+                try:
+                    embedding_profiles = await conv_store.get_embedding_profile_health()
+                    embedding_profiles["available"] = True
+                except Exception as exc:  # noqa: BLE001 - status must degrade
+                    logger.warning("Embedding profile health unavailable: %s", exc)
+                    embedding_profiles["error"] = str(exc)
 
             rag_stats: Dict[str, Any] = {}
             if hasattr(self.storage, 'rag'):
@@ -519,12 +544,17 @@ class MemoryFeature(Feature):
         agent_id_short = (
             (self.agent_id[:30] + "...") if len(self.agent_id) > 30 else self.agent_id
         )
+        lexical_summary = (
+            f"{lexical_index['coverage']:.1%}"
+            if lexical_index.get("available") else "unavailable"
+        )
         return ToolResult.ok(
             confirmation=(
                 f"Memory status: {total_messages} message(s), "
                 f"{episode_count} episode(s), "
                 f"{file_count} file(s), "
-                f"encryption={'on' if encryption_enabled else 'off'}"
+                f"encryption={'on' if encryption_enabled else 'off'}, "
+                f"lexical-index={lexical_summary}"
             ),
             data={
                 "total_messages": total_messages,
@@ -536,7 +566,71 @@ class MemoryFeature(Feature):
                 "retriever_available": self.memory_retriever is not None,
                 "memory_system": memory_system_info,
                 "rag": rag_stats,
+                "lexical_index": lexical_index,
+                "embedding_profiles": embedding_profiles,
             },
+        )
+
+    async def shutdown(self) -> None:
+        """Cancel and join the feature-owned background backfill task."""
+        task = getattr(self, "_lexical_backfill_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    @tool(
+        name="memory_index_backfill",
+        description=(
+            "Start or resume the privacy-preserving lexical memory index "
+            "backfill. Runs in the background; use memory_status for durable "
+            "coverage and completion health."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!memory index-backfill",
+    )
+    async def memory_index_backfill(self, batch_size: int = 500) -> ToolResult:
+        """Start the resumable blind-token backfill without blocking a turn."""
+        size, error = _coerce_int(batch_size, "batch_size", lo=1, hi=5000)
+        if error:
+            return ToolResult.failed(error)
+        if self._lexical_backfill_task and not self._lexical_backfill_task.done():
+            return ToolResult.ok(
+                confirmation="Lexical memory index backfill is already running.",
+                data=dict(self._lexical_backfill_result),
+            )
+        conv_store = self._get_conversation_store()
+        if not conv_store or not hasattr(conv_store, "backfill_lexical_index"):
+            return ToolResult.failed("Conversation lexical index is unavailable")
+
+        self._lexical_backfill_result = {
+            "status": "running",
+            "batch_size": size,
+        }
+
+        async def _run() -> None:
+            try:
+                result = await conv_store.backfill_lexical_index(batch_size=size)
+            except Exception as exc:  # noqa: BLE001 - captured for status surface
+                logger.error("Lexical memory index backfill failed: %s", exc)
+                self._lexical_backfill_result = {
+                    "status": "error",
+                    "error": str(exc),
+                }
+            else:
+                self._lexical_backfill_result = {"status": "done", **result}
+
+        self._lexical_backfill_task = asyncio.create_task(
+            _run(), name=f"memory-lexical-backfill-{self.agent_id[:12]}"
+        )
+        return ToolResult.ok(
+            confirmation=(
+                "Started lexical memory index backfill in the background. "
+                "Use memory_status to monitor coverage."
+            ),
+            data=dict(self._lexical_backfill_result),
         )
 
     @tool(

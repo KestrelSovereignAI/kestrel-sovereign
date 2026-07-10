@@ -41,6 +41,8 @@ def _make_store(
     db = MagicMock()
     db.backend_type = backend_type
     db.execute_commit = AsyncMock(return_value=1)
+    db.execute_many = AsyncMock(return_value=1)
+    db.execute = AsyncMock(return_value=1)
     db.fetchone = AsyncMock(return_value=None)  # no prior history → new session
     db.fetchall = AsyncMock(return_value=[])
     store = AsyncConversationStore(db=db, agent_id=agent_id)
@@ -107,9 +109,56 @@ async def test_add_conversation_without_service_uses_legacy_insert():
     assert "embedding_vec" not in sql, (
         f"legacy path must omit embedding_vec column, got: {sql!r}"
     )
-    # 7 bound positional params:
-    # agent_id, role, content, rendered_content, model, provider, metadata.
-    assert len(params) == 7
+    # 9 bound positional params: the seven legacy fields plus the opaque
+    # lexical-index id and durable completion version.
+    assert len(params) == 9
+    assert params[-2]
+    assert params[-1].startswith("v1:")
+
+
+@pytest.mark.asyncio
+async def test_non_schema_insert_failure_is_not_masked_by_legacy_retry():
+    store, db = _make_store(embedding_service=None)
+    db.execute_commit = AsyncMock(side_effect=RuntimeError("disk I/O error"))
+
+    with pytest.raises(RuntimeError, match="disk I/O error"):
+        await store.add_conversation(role="assistant", content="hello world")
+
+    insert_calls = [
+        call for call in db.execute_commit.call_args_list
+        if "INSERT INTO conversation_history" in call.args[0]
+    ]
+    assert len(insert_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_lexical_columns_preserve_vector_profile_stamp(
+    small_embedding_dim,
+):
+    svc = MagicMock()
+    svc.aembed = AsyncMock(return_value=[0.1, 0.2, 0.3, 0.4])
+    svc.current_profile_id = MagicMock(return_value="active-profile")
+    svc.describe = MagicMock(return_value=None)
+    store, db = _make_store(embedding_service=svc)
+
+    async def execute_commit(sql, _params):
+        if "lexical_index_id" in sql:
+            raise RuntimeError("no such column: lexical_index_id")
+        return 1
+
+    db.execute_commit = AsyncMock(side_effect=execute_commit)
+    await store.add_conversation(role="assistant", content="hello world")
+
+    insert_calls = [
+        call for call in db.execute_commit.call_args_list
+        if "INSERT INTO conversation_history" in call.args[0]
+    ]
+    assert len(insert_calls) == 2
+    fallback_sql, fallback_params = insert_calls[1].args
+    assert "lexical_index_id" not in fallback_sql
+    assert "embedding_vec" in fallback_sql
+    assert "embedding_profile_id" in fallback_sql
+    assert fallback_params[-1] == "active-profile"
 
 
 @pytest.mark.asyncio
@@ -351,10 +400,9 @@ async def test_add_conversation_falls_back_when_migration_not_run(
     """A live deployment where Phase-2 migration hasn't completed yet
     (``embedding_vec`` column missing) raises on the embedding INSERT.
 
-    With #1477 the write path tries three shapes in order:
-    1. ``embedding_vec`` + ``embedding_profile_id`` — fails (no vec col).
-    2. ``embedding_vec`` only — also fails (no vec col).
-    3. non-vector column list — succeeds.
+    The compatibility write path tries four shapes in order: the two modern
+    lexical-marker shapes (with and without profile id), then legacy-schema
+    vector and finally legacy-schema non-vector.
 
     The row must still land regardless."""
     embedding = [0.1, 0.2, 0.3, 0.4]
@@ -375,15 +423,20 @@ async def test_add_conversation_falls_back_when_migration_not_run(
         c for c in db.execute_commit.call_args_list
         if "INSERT INTO conversation_history" in c.args[0]
     ]
-    assert len(insert_calls) == 3
+    assert len(insert_calls) == 4
     assert "embedding_vec" in insert_calls[0].args[0]
     assert "embedding_profile_id" in insert_calls[0].args[0]
     # Middle attempt is vec-only (no profile_id).
     assert "embedding_vec" in insert_calls[1].args[0]
     assert "embedding_profile_id" not in insert_calls[1].args[0]
-    # Final fallback omits both new columns.
-    assert "embedding_vec" not in insert_calls[2].args[0]
+    # Third attempt retains the vector but drops all newer schema columns.
+    assert "embedding_vec" in insert_calls[2].args[0]
     assert "embedding_profile_id" not in insert_calls[2].args[0]
+    assert "lexical_index_id" not in insert_calls[2].args[0]
+    # Final fallback omits vector, profile, and lexical marker columns.
+    assert "embedding_vec" not in insert_calls[3].args[0]
+    assert "embedding_profile_id" not in insert_calls[3].args[0]
+    assert "lexical_index_id" not in insert_calls[3].args[0]
 
 
 @pytest.mark.asyncio

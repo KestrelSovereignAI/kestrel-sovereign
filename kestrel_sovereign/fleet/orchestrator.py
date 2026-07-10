@@ -372,6 +372,7 @@ MEMORY_MUTATION_TOOLS = frozenset(
         "update_action_item",
         "confirm_person_match",
         "memory_consolidate",
+        "memory_index_backfill",
     }
 )
 

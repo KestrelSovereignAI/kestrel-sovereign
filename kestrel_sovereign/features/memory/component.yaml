@@ -10,6 +10,7 @@ tools:
   - search_case_law
   - get_episodes
   - memory_status
+  - memory_index_backfill
   - recall_emotional
   - delete_messages
   - memory_consolidate
