@@ -22,6 +22,7 @@ import { mountConversationsPane } from './conversations.js';
 // the console-specific policy (demo banner, demo-misconfig-gated auto-select,
 // standalone conversations-pane refresh) through the component's config hooks.
 import { mountAgentListPane, createDefaultAgentAdapter } from './agent_list.js';
+import { openCreateAgentDialog } from './new_agent_dialog.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
@@ -819,14 +820,69 @@ let agentListPaneHandle = null;
 let agentListDefaultAdapter = null;
 
 // The standalone console's new-agent affordance (#2279 — same-everywhere rule,
-// the console gains an affordance it lacked). The new-agent / spawn flow is a
-// feature-contributed panel (#2048, extracted out of core), so route the pane's
-// "+ New" action to its nav tab when the Spawn feature is installed; otherwise
-// surface a hint rather than silently no-op.
-function openNewAgentFlow() {
+// the console gains an affordance it lacked). #2351: the pane's "+ New" opens a
+// Create Agent dialog that POSTs to `/api/agents` (the multi-agent manager's
+// native top-level inception). Creating a parentless agent is a DIFFERENT intent
+// than Spawn (which creates a CHILD of an existing parent), so the Spawn tab —
+// when its feature-contributed panel is installed — is offered as a SECONDARY
+// link inside the dialog rather than being the whole affordance.
+function goToSpawnTab() {
     const spawnTab = document.querySelector('.nav-tab[data-panel="spawn"]');
-    if (spawnTab) { spawnTab.click(); return; }
-    Toast.info('Creating a new agent requires the Spawn feature.');
+    if (spawnTab) { spawnTab.click(); return true; }
+    return false;
+}
+
+function openNewAgentFlow() {
+    const spawnAvailable = !!document.querySelector('.nav-tab[data-panel="spawn"]');
+    // FAIL CLOSED until the server has classified itself (codex P1 round 2):
+    // before the first /api/agents payload parses — or forever, if it keeps
+    // failing — the adapter still holds fail-OPEN defaults (multi_agent,
+    // serverDemoMode false), which would bypass both gates below.
+    if (!agentListDefaultAdapter || !agentListDefaultAdapter.classificationLoaded) {
+        Toast.info('Agent list is still loading — try again in a moment.');
+        return;
+    }
+    // POST /api/agents must actually exist AND work on this host: standalone
+    // consoles 400 it (no manager) and the subprocess host doesn't route it at
+    // all (405) — the server advertises `can_create_agents` and the client
+    // treats absence as false (codex P2 rounds 1-2). Those consoles route to
+    // the legacy Spawn flow instead.
+    if (!agentListDefaultAdapter.canCreateAgents) {
+        if (!goToSpawnTab()) Toast.info('Creating a new agent requires the Spawn feature.');
+        return;
+    }
+    // Demo rail (#868, codex P1): AgentManager.create_agent mints a LIVE
+    // (non-demo-scoped) agent, and on a demo-classified server the dialog's
+    // post-create select() would install a host-agent prefix targeting it —
+    // the exact routing precondition the misconfig gate exists to refuse.
+    // Creation is an operator action for real servers; refuse it here.
+    if (agentListDefaultAdapter && agentListDefaultAdapter.serverDemoMode) {
+        Toast.warning('This server is in demo mode — creating live agents is disabled.');
+        return;
+    }
+    openCreateAgentDialog({
+        modal: Modal,
+        api: API,
+        toast: Toast,
+        spawnAvailable,
+        onSpawn: () => goToSpawnTab(),
+        onCreated: async (name) => {
+            // Refresh the list so the freshly-minted agent appears, then select
+            // it — the full product wiring runs through the component's select().
+            try {
+                if (agentListHandle) await agentListHandle.refresh();
+            } catch (_) { /* best-effort refresh */ }
+            try {
+                // Defense in depth for the demo rail: if the refresh above
+                // reclassified the server into misconfig (demo server + live
+                // agent — which a freshly-minted agent IS), selection must
+                // honor the same refusal handleAgentsLoaded applies.
+                if (agentListDefaultAdapter && agentListDefaultAdapter.serverDemoMode) return;
+                if (agentListHandle) agentListHandle.select(name);
+                else if (window.selectAgent) await window.selectAgent(name);
+            } catch (_) { /* selection is best-effort */ }
+        },
+    });
 }
 
 /**

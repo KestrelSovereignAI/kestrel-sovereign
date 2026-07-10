@@ -100,6 +100,11 @@ async def get_agents(request: Request):
             "agents": agents_list,
             "mode": "multi_agent",
             "server_demo_mode": server_demo_mode,
+            # POST /api/agents works on THIS host (in-process manager). The
+            # subprocess host serves its own /api/agents without this flag —
+            # clients must treat absence as false (codex P2 on #2358: its
+            # POST route doesn't exist and every create 405'd).
+            "can_create_agents": True,
         }
 
     # Single-agent mode
@@ -114,6 +119,7 @@ async def get_agents(request: Request):
             "agents": [card_dict],
             "mode": "standalone",
             "server_demo_mode": server_demo_mode,
+            "can_create_agents": False,
         }
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
@@ -144,8 +150,89 @@ async def create_agent(request: Request, body: CreateAgentRequest):
             detail="Agent name must start with a letter and contain only letters, numbers, hyphens, or underscores.",
         )
 
+    # A name can be REGISTERED without being LOADED (remote agents,
+    # autostart=false locals) — the manager's duplicate check only sees loaded
+    # agents, so creation would silently REPLACE that registration in
+    # multi_agent.toml (codex P2 round 7). Check against the CURRENT ON-DISK
+    # config, not the startup-time snapshot: an operator can edit the file
+    # while the server runs, and saving the stale snapshot back would discard
+    # every external change (codex P1 round 10). Case-insensitive: the toml is
+    # the routing namespace and case-folded collisions are operator error.
+    def _current_config():
+        """(config, path, reload_ok). For CONFIG-DRIVEN deployments a reload
+        failure fails CLOSED (codex P2 round 12): writing the startup
+        snapshot over a file we couldn't read would discard operator edits —
+        or clobber a malformed file mid-repair."""
+        cfg_path = getattr(request.app.state, 'multi_agent_config_path', None)
+        if cfg_path:
+            from kestrel_sovereign.multi_agent.config import MultiAgentConfig as _MAC
+            try:
+                return _MAC.from_file(cfg_path), cfg_path, True
+            except Exception as reload_err:
+                logger.error(
+                    f"Could not reload {cfg_path} ({reload_err}); refusing to "
+                    "persist over a file that can't be read (fail closed)."
+                )
+                return getattr(request.app.state, 'multi_agent_config', None), cfg_path, False
+        return getattr(request.app.state, 'multi_agent_config', None), cfg_path, True
+
+    ma_config_pre, _, _reload_ok_pre = _current_config()
+    if ma_config_pre is not None:
+        taken = {existing.lower() for existing in getattr(ma_config_pre, 'agents', {})}
+        if name.lower() in taken:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An agent named '{name}' is already registered in the multi-agent config.",
+            )
+        # Reserve every port the CURRENT config knows about (codex P1 round
+        # 11): an agent or host-port added to the file after startup isn't in
+        # the manager's boot-time reservations, and allocating it would
+        # persist a port conflict that fails validation on the next boot.
+        from kestrel_sovereign.multi_agent.config import LocalAgentConfig as _LAC
+        host_port = getattr(getattr(ma_config_pre, 'host', None), 'port', None)
+        if isinstance(host_port, int):
+            agent_manager._reserved_ports.add(host_port)
+        for _cfg in getattr(ma_config_pre, 'agents', {}).values():
+            if isinstance(_cfg, _LAC):
+                agent_manager._reserved_ports.add(_cfg.port)
+
     try:
         agent = await agent_manager.create_agent(name)
+        # Persist the registration when the deployment is config-file-driven
+        # (codex P1 on #2358): startup loads multi_agent.toml whenever it
+        # exists, so an unpersisted runtime creation silently vanishes on the
+        # next restart. Auto-discovered deployments (no toml) re-discover from
+        # agent_data/ and need no write. Best-effort: a persistence failure is
+        # SURFACED in the response, never a rollback of the live agent.
+        persisted = None
+        # RE-read the on-disk config for the merge (codex P1 round 10): the
+        # inception above awaited, so even our own pre-check snapshot may be
+        # stale. The fresh object carries every external edit forward.
+        ma_config, config_path, reload_ok = _current_config()
+        if config_path and not reload_ok:
+            # Agent is live but we refuse the stale rewrite — surfaced to the
+            # dialog exactly like a write failure.
+            persisted = False
+        elif config_path and ma_config is not None:
+            try:
+                created_cfg = agent_manager._created_configs.get(name)
+                if created_cfg is not None:
+                    ma_config.agents[name] = created_cfg
+                    # Mutating .agents doesn't rerun the model validator —
+                    # re-validate the merged config so a conflict is surfaced
+                    # HERE (persisted:false + intact file) instead of bricking
+                    # the next boot (codex P1 round 11).
+                    type(ma_config).model_validate(ma_config.model_dump())
+                    ma_config.save(config_path)
+                    # Keep the app-state snapshot current for the next reader.
+                    request.app.state.multi_agent_config = ma_config
+                    persisted = True
+            except Exception as persist_err:
+                logger.error(
+                    f"Agent '{name}' created but NOT persisted to {config_path}: {persist_err}",
+                    exc_info=True,
+                )
+                persisted = False
         return {
             "success": True,
             "agent": {
@@ -153,6 +240,9 @@ async def create_agent(request: Request, body: CreateAgentRequest):
                 "name": name,
                 "status": "online",
             },
+            # None = auto-discovered deployment (no write needed);
+            # True/False = toml-driven write outcome.
+            "persisted": persisted,
         }
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))

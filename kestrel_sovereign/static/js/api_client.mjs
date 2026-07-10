@@ -504,6 +504,17 @@ export function createApiClient({
         health: () => client.request('/health'),
         getAgentInfo: () => client.request('/api/agent/info'),
         getAgents: () => client.request('/api/agents'),
+        // Create a fresh top-level (parentless) agent (#2351) — the
+        // multi-agent manager's ``POST /api/agents`` (see
+        // endpoints/models.py::create_agent). Runs inception + load and returns
+        // 409 on a duplicate name / 400 on a bad name; the standalone console's
+        // Create Agent dialog surfaces those details inline. Host-level endpoint
+        // — never host-agent-prefixed.
+        createAgent: (name) => client.request('/api/agents', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+        }),
         // Native agent deletion (#2208) — the multi-agent manager's
         // ``DELETE /api/agents/{name}`` (see endpoints/models.py). Only meaningful
         // when the server runs in multi-agent mode; the danger-zone section gates

@@ -66,10 +66,14 @@ class AgentManager:
         self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = base_data_dir or Path.cwd()
         self._lock = asyncio.Lock()
-        # MONOTONIC port allocator (#1729). ``8800 + len(self._agents) + 1``
-        # collides after an agent is unloaded — len shrinks and the next spawn
-        # reuses a live port. A counter that only ever increases avoids reuse.
-        self._port_seq = 8800
+        # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
+        # monotonic counter avoided unload-reuse but couldn't express "this
+        # port is taken by the HOST" without starving every port below it.
+        # Reservations are NEVER removed (an unloaded agent's port stays
+        # reserved — the #1729 guarantee); allocation scans for the first
+        # free in-range port instead of incrementing.
+        self._reserved_ports: set[int] = set()
+        self._port_scan_start = 8801
         # Hard cap on dynamically-spawned agents so a runaway spawn loop can't
         # exhaust ports / resources (#1729).
         self._max_spawned_agents = int(os.environ.get("KESTREL_MAX_SPAWNED_AGENTS", "64"))
@@ -80,6 +84,9 @@ class AgentManager:
         # the FastAPI lifespan can surface them via /health (#377 lifecycle
         # hardening for multi-agent boot).
         self._init_failures: list[tuple[str, Exception]] = []
+        # LocalAgentConfig per agent created at runtime via create_agent —
+        # consumed by the create-agent endpoint to persist registrations.
+        self._created_configs: dict[str, "LocalAgentConfig"] = {}
 
     async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
         """Create and initialize a KestrelAgent from a multi_agent config entry.
@@ -165,6 +172,17 @@ class AgentManager:
         loaded = 0
         # Reset failure list — fresh load attempt.
         self._init_failures = []
+        # RESERVE every configured port and the host's own port (codex P1
+        # rounds 4-5 on #2358): a runtime-created agent must never take a port
+        # something already owns — once persisted, the next boot fails
+        # MultiAgentConfig's port-conflict validation and bricks startup. A
+        # high host port must NOT starve the range below it (round 6).
+        host_port = getattr(getattr(config, "host", None), "port", None)
+        if isinstance(host_port, int):
+            self._reserved_ports.add(host_port)
+        for agent_cfg in config.agents.values():
+            if isinstance(agent_cfg, LocalAgentConfig):
+                self._reserved_ports.add(agent_cfg.port)
         for name, agent_cfg in config.agents.items():
             if not isinstance(agent_cfg, LocalAgentConfig):
                 logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
@@ -250,6 +268,22 @@ class AgentManager:
         await self._release_child_budget(name)
         return agent is not None
 
+    def _allocate_port(self) -> int:
+        """Pick the first FREE in-range agent port and reserve it.
+
+        Reservations cover configured agents, the host itself, and every
+        prior runtime allocation — and are never released (an unloaded
+        agent's port stays reserved, the #1729 guarantee). Scanning instead
+        of incrementing means a high host port can't starve the range.
+        """
+        candidate = self._port_scan_start
+        while candidate in self._reserved_ports:
+            candidate += 1
+            if candidate > 65535:
+                raise ValueError("No free agent ports remain in 8801-65535.")
+        self._reserved_ports.add(candidate)
+        return candidate
+
     async def create_agent(
         self,
         name: str,
@@ -286,6 +320,10 @@ class AgentManager:
         if self.get_agent(name) is not None:
             raise ValueError(f"Agent '{name}' already exists")
 
+        # Allocate the port BEFORE inception (codex round 6): failing the
+        # allocation after inception leaves an orphaned identity directory.
+        port = self._allocate_port()
+
         from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
         agent_dir = self._base_data_dir / "agent_data" / name
@@ -299,15 +337,23 @@ class AgentManager:
                 spawn_mandate=mandate,
             )
         except Exception as e:
+            # No agent came into being — release the reservation so repeated
+            # failures can't drain the allocator (codex P3 round 12). Ports of
+            # agents that EXISTED keep their never-reuse guarantee (#1729).
+            self._reserved_ports.discard(port)
             raise ValueError(f"Inception failed for '{name}': {e}")
 
-        self._port_seq += 1
         config = LocalAgentConfig(
             data_dir=Path("agent_data") / name,
-            port=self._port_seq,  # monotonic — never reuses an unloaded agent's port
+            port=port,  # reserved — never reused, never colliding (see _allocate_port)
             autostart=True,
             features=features,
         )
+        # Retain the created config so callers (the create-agent endpoint) can
+        # PERSIST the registration into multi_agent.toml — without that, a
+        # config-file-driven deployment silently loses UI-created agents on
+        # the next restart (codex P1 on #2358).
+        self._created_configs[name] = config
         return await self.load_agent(name, config)
 
     def _parent_feature_names(self, parent_agent: KestrelAgent) -> set[str]:
