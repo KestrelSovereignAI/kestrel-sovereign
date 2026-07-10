@@ -5,9 +5,11 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 import aiohttp
 import httpx
+import asyncio
 import os
 import re
 import time
+import uuid
 import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
@@ -1419,6 +1421,23 @@ async def get_embedding_settings(request: Request):
         raise HTTPException(status_code=500, detail="Error getting embedding settings.")
 
 
+def _agent_raw_db(agent):
+    """Return the raw ``AsyncDatabase`` handle behind the agent's storage.
+
+    ``agent.storage`` is usually a PrivacyEnforcingStorage wrapper (no
+    ``.db`` of its own) around the real AsyncStorage, which owns the
+    ``.db`` handle. Reach through the wrapper's ``_storage`` when the outer
+    object doesn't expose ``db`` directly. Returns ``None`` when no handle
+    is reachable.
+    """
+    storage = getattr(agent, "storage", None)
+    db = getattr(storage, "db", None) if storage else None
+    if db is None and storage is not None:
+        inner = getattr(storage, "_storage", None)
+        db = getattr(inner, "db", None) if inner else None
+    return db
+
+
 async def _count_stale_embedding_rows(agent) -> Optional[int]:
     """Count stored rows whose embedding profile != the resolved profile (#2289).
 
@@ -1434,15 +1453,7 @@ async def _count_stale_embedding_rows(agent) -> Optional[int]:
         target = service.current_profile_id()
         if not target:
             return None
-        # ``agent.storage`` is usually a PrivacyEnforcingStorage wrapper
-        # (no ``.db`` of its own) around the real AsyncStorage, which owns
-        # the ``.db`` handle. Reach through the wrapper's ``_storage`` when
-        # the outer object doesn't expose ``db`` directly.
-        storage = getattr(agent, "storage", None)
-        db = getattr(storage, "db", None) if storage else None
-        if db is None and storage is not None:
-            inner = getattr(storage, "_storage", None)
-            db = getattr(inner, "db", None) if inner else None
+        db = _agent_raw_db(agent)
         if db is None:
             return None
         from kestrel_sovereign.storage.embedding_reindex import EmbeddingReindexer
@@ -1507,6 +1518,254 @@ async def set_embedding_settings(request: Request):
         raise HTTPException(status_code=500, detail="Error setting embedding route.")
 
 
+# In-memory registry of in-flight / recently-finished reindex jobs (#2336).
+# Keyed by opaque ``job_id``. A UI POSTs to start a job and then polls
+# ``GET /api/embedding/reindex/{job_id}`` until ``status`` is ``done``/``error``.
+# Re-embedding is idempotent + resumable (see storage.embedding_reindex), so a
+# lost job registry (process restart) loses no data — the operator just re-runs.
+_REINDEX_JOBS: Dict[str, Dict] = {}
+_REINDEX_JOBS_MAX = 32
+
+
+def _reindex_job_public(job: Dict) -> Dict:
+    """The subset of a job record that is safe to return to a client."""
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "target_profile": job["target_profile"],
+        "embedding_dim": job["embedding_dim"],
+        "tables": list(job["tables"]),
+        "total_stale": job["total_stale"],
+        "reembedded": dict(job["reembedded"]),
+        "scanned": dict(job["scanned"]),
+        "total_reembedded": job["total_reembedded"],
+        "error": job["error"],
+        "updated_at": job["updated_at"],
+    }
+
+
+async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
+    """Background worker: re-embed each table, streaming progress into *job*."""
+    try:
+        for tname in tables:
+            def _progress(stats, _tname=tname):
+                job["reembedded"][_tname] = stats.reembedded
+                job["scanned"][_tname] = stats.scanned
+                job["total_reembedded"] = sum(job["reembedded"].values())
+                job["updated_at"] = time.time()
+
+            stats = await reindexer.reindex_table(
+                tname, agent_id=agent_id, progress=_progress
+            )
+            job["reembedded"][tname] = stats.reembedded
+            job["scanned"][tname] = stats.scanned
+        job["total_reembedded"] = sum(job["reembedded"].values())
+        job["status"] = "done"
+    except Exception as e:  # pragma: no cover - defensive; surfaced via status
+        logger.error("reindex job %s failed: %s", job["job_id"], e, exc_info=True)
+        job["status"] = "error"
+        job["error"] = str(e)
+    finally:
+        job["updated_at"] = time.time()
+
+
+def _prune_reindex_jobs() -> None:
+    """Bound the registry: drop the oldest finished jobs past the cap."""
+    if len(_REINDEX_JOBS) <= _REINDEX_JOBS_MAX:
+        return
+    finished = sorted(
+        (j for j in _REINDEX_JOBS.values() if j["status"] in ("done", "error")),
+        key=lambda j: j["updated_at"],
+    )
+    while len(_REINDEX_JOBS) > _REINDEX_JOBS_MAX and finished:
+        _REINDEX_JOBS.pop(finished.pop(0)["job_id"], None)
+
+
+async def _resolve_reindex_target(agent):
+    """Resolve ``(embedding_service, target_profile_id, target_dim, column_dim)``.
+
+    Raises :class:`HTTPException` (409) with the same refusal reasons the CLI
+    prints when reindexing can't proceed: no embedding provider resolves,
+    ``embedding_route = "none"``, the service can't describe itself, or the
+    resolved embedding dimension doesn't match the vector-column width.
+    """
+    from kestrel_sovereign import cli_embeddings
+
+    err, embedding_service, target = cli_embeddings._resolve_target(agent.llm_service)
+    if err is not None:
+        raise HTTPException(status_code=409, detail=err)
+
+    target_dim = getattr(embedding_service, "embedding_dim", None)
+    column_dim = cli_embeddings._resolve_column_dim()
+    if target_dim and column_dim and int(target_dim) != int(column_dim):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"resolved embedding dimension ({target_dim}) does not match the "
+                f"vector-column width ({column_dim}); re-embedding at the new "
+                "dimension requires a column migration first (set "
+                f"KESTREL_EMBEDDING_DIM={target_dim}, drop + recreate the "
+                "embedding_vec columns, restart, then re-embed)."
+            ),
+        )
+    return embedding_service, target, target_dim, column_dim
+
+
+@router.post("/api/embedding/reindex")
+async def reindex_embeddings(request: Request):
+    """Re-embed stored vectors to the resolved embedding profile from the UI (#2336).
+
+    Wraps the same checkpointed/resumable core the CLI's ``kestrel embeddings
+    reindex`` uses. JSON body:
+
+    - ``dry_run`` (default ``true``): report per-table stale counts only — no
+      writes. Mirrors the CLI's dry-run scope.
+    - ``dry_run: false``: execute. Small/empty corpora complete inline; a
+      non-empty corpus is re-embedded in a background job and the response
+      carries a ``job_id`` the caller polls via
+      ``GET /api/embedding/reindex/{job_id}`` so a big corpus never blocks the
+      request for minutes.
+    - ``tables``: optional list restricting the sweep (default: all three
+      embedding-bearing tables).
+
+    Agent scoping comes from the request's agent context (per-agent tables are
+    filtered to ``agent.agent_id``; ``document_chunks`` is global), so there is
+    no ``KESTREL_DB_PATH`` ambiguity (#2327). Refuses with 409 when no embedding
+    provider resolves, ``embedding_route = "none"``, or on a dimension mismatch.
+    """
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        dry_run = bool(data.get("dry_run", True))
+        tables_req = data.get("tables")
+
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+
+        from kestrel_sovereign.storage.embedding_reindex import (
+            REINDEX_TABLES,
+            EmbeddingReindexer,
+        )
+
+        if tables_req is not None:
+            if not isinstance(tables_req, list) or not all(
+                isinstance(t, str) for t in tables_req
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="'tables' must be a list of table names.",
+                )
+            unknown = [t for t in tables_req if t not in REINDEX_TABLES]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"unknown table(s): {', '.join(unknown)}. "
+                        f"Valid: {', '.join(REINDEX_TABLES)}."
+                    ),
+                )
+            tables = tuple(tables_req) or REINDEX_TABLES
+        else:
+            tables = REINDEX_TABLES
+
+        embedding_service, target, target_dim, column_dim = (
+            await _resolve_reindex_target(agent)
+        )
+
+        db = _agent_raw_db(agent)
+        if db is None:
+            raise HTTPException(status_code=503, detail="Storage not available.")
+
+        agent_id = getattr(agent, "agent_id", None)
+        reindexer = EmbeddingReindexer(
+            db, embedding_service, target, column_dim=column_dim
+        )
+
+        counts = await reindexer.count_all_stale(agent_id=agent_id, tables=tables)
+        total_stale = sum(counts.values())
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "target_profile": target,
+                "embedding_dim": target_dim,
+                "stale_rows": counts,
+                "total_stale": total_stale,
+            }
+
+        # Execute. Nothing stale → report done inline (no job needed).
+        if not total_stale:
+            return {
+                "dry_run": False,
+                "status": "done",
+                "target_profile": target,
+                "embedding_dim": target_dim,
+                "stale_rows": counts,
+                "total_stale": 0,
+                "reembedded": {t: 0 for t in tables},
+                "total_reembedded": 0,
+            }
+
+        # Non-empty corpus: run in the background so the request never blocks
+        # for minutes. The caller polls GET /api/embedding/reindex/{job_id}.
+        job_id = uuid.uuid4().hex[:16]
+        job = {
+            "job_id": job_id,
+            # Owner scoping (#2336): the job is readable only by the agent
+            # context that created it. Never surfaced via _reindex_job_public.
+            "owner_agent_id": agent_id,
+            "status": "running",
+            "target_profile": target,
+            "embedding_dim": target_dim,
+            "tables": list(tables),
+            "total_stale": total_stale,
+            "reembedded": {t: 0 for t in tables},
+            "scanned": {t: 0 for t in tables},
+            "total_reembedded": 0,
+            "error": None,
+            "updated_at": time.time(),
+        }
+        _REINDEX_JOBS[job_id] = job
+        _prune_reindex_jobs()
+        asyncio.create_task(_run_reindex_job(job, reindexer, tables, agent_id))
+        return {"dry_run": False, **_reindex_job_public(job)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting embedding reindex: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error starting embedding reindex.")
+
+
+@router.get("/api/embedding/reindex/{job_id}")
+async def get_reindex_job(job_id: str, request: Request):
+    """Return progress for a background reindex job started via POST (#2336).
+
+    Scoped to the creating agent context (#2336): a job is readable only by the
+    agent that started it. Any other routed agent gets 404 (not 403 — the job's
+    existence is not disclosed across agents).
+    """
+    try:
+        agent = get_agent(request)  # auth / agent-context gate
+        job = _REINDEX_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="reindex job not found.")
+        requester_agent_id = getattr(agent, "agent_id", None)
+        if job.get("owner_agent_id") != requester_agent_id:
+            # Do not leak existence of another agent's job.
+            raise HTTPException(status_code=404, detail="reindex job not found.")
+        return _reindex_job_public(job)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reading reindex job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error reading reindex job.")
+
+
 @router.api_route("/api/embedding/space/verify", methods=["POST"])
 async def verify_embedding_space(request: Request):
     """Run the shared-space parity probe and apply passing pins (#2290).
@@ -1529,11 +1788,7 @@ async def verify_embedding_space(request: Request):
 
         # Reach the raw DB handle (through the privacy wrapper) so measured
         # drift can be recorded; best-effort, verification runs regardless.
-        storage = getattr(agent, "storage", None)
-        db = getattr(storage, "db", None) if storage else None
-        if db is None and storage is not None:
-            inner = getattr(storage, "_storage", None)
-            db = getattr(inner, "db", None) if inner else None
+        db = _agent_raw_db(agent)
 
         results = await agent.llm_service.verify_embedding_space_parity(
             pin_name, record_to=db

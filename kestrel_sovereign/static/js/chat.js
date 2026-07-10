@@ -4256,6 +4256,9 @@ export async function loadModels() {
             dimReadoutId: 'embedding-dim-readout',
             warningId: 'embedding-dim-warning',
             sharedSpaceId: 'embedding-shared-space',
+            reindexButtonId: 'embedding-reindex-button',
+            reindexStatusId: 'embedding-reindex-status',
+            reindexEndpoint: deps().api.buildAgentUrl('/api/embedding/reindex'),
             getAuthHeader: async () => await deps().api.applyAuth({}),
             getEmbeddingRoutes: () => {
                 const routes = (sharedModelSelector?.allModelsData?.routes) || [];
