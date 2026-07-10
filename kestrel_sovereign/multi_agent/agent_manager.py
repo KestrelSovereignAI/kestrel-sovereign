@@ -215,6 +215,13 @@ class AgentManager:
         Returns:
             True if agent was found and removed.
         """
+        # Backstop budget release (#2113): remove_agent is also the generic
+        # delete path (DELETE /api/agents/{name}), which does NOT go through
+        # terminate_child. Release any outstanding budget hold here so a direct
+        # delete can't strand the parent's held funds. Idempotent — a no-op when
+        # terminate_child/shutdown_all already popped the entry. Done before the
+        # lock so wallet I/O doesn't hold the manager lock.
+        await self._release_child_budget(name)
         async with self._lock:
             agent = self._agents.pop(name, None)
             if not agent:

@@ -262,6 +262,33 @@ async def test_shutdown_releases_nested_budgets_leaf_first():
 
 
 @pytest.mark.asyncio
+async def test_direct_remove_agent_releases_budget():
+    """A budgeted child deleted through the generic remove_agent path (DELETE
+    /api/agents/{name}) — not terminate_child — still releases its hold."""
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    parent = SimpleNamespace(
+        _private_key=None, identity=None, agent_id="did:p", features={},
+        wallet=FakeWallet(initial_balance=Decimal("100")),
+    )
+    child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
+    mgr = AgentManager()
+
+    async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
+        return child
+
+    mgr.create_agent = fake_create_agent  # real remove_agent (the path under test)
+
+    mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("30"))
+    await mgr.spawn_agent("Kid", parent, mandate)
+    assert parent.wallet.get_balance() == Decimal("70")
+
+    await mgr.remove_agent("Kid")
+    assert parent.wallet.get_balance() == Decimal("100")   # hold released on delete
+
+
+@pytest.mark.asyncio
 async def test_budget_refused_without_funded_parent_wallet():
     from kestrel_sovereign.spawn.mandate import SpawnMandate
 
