@@ -326,6 +326,12 @@ async def create_delegated_wallet(
                 to_audit=False,
                 memo=f"budget hold refund (child wallet setup failed) for {child_did}",
             )
+            # If the parent is itself budgeted, the failed hold incremented its
+            # allocation.spent — restore that headroom too, mirroring the normal
+            # release path (otherwise a failed nested spawn permanently shrinks
+            # the parent's budget until termination).
+            if isinstance(parent_wallet, DelegatedWallet):
+                parent_wallet.restore_headroom(budget)
         except Exception:  # noqa: BLE001
             logger.error(
                 "CRITICAL: budget hold for child %s could not be refunded after a "

@@ -138,6 +138,21 @@ async def test_create_refunds_parent_on_setup_failure():
 
 
 @pytest.mark.asyncio
+async def test_failed_nested_setup_restores_parent_headroom():
+    """A failed budgeted grandchild spawn refunds the money AND restores the
+    budgeted parent's headroom (not just the wrapped balance)."""
+    real = _InitFailWallet(initial_balance=Decimal("100"))
+    child_dw = DelegatedWallet(
+        real, BudgetAllocation(child_did="c", amount=Decimal("50"))
+    )
+    with pytest.raises(RuntimeError, match="provider init"):
+        await create_delegated_wallet(child_dw, "did:c", "did:gc", Decimal("20"))
+
+    assert child_dw.spent == Decimal("0")          # headroom restored
+    assert real.get_balance() == Decimal("100")    # funds refunded
+
+
+@pytest.mark.asyncio
 async def test_release_restores_parent_headroom():
     """Releasing a budgeted grandchild restores its budgeted parent's headroom
     (only the explicit release does this — see the deposit test below)."""
