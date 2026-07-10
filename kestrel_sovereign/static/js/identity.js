@@ -1679,9 +1679,18 @@ window.toggleAgentsPane = function() {
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
     window.addEventListener('kestrel:conversations-stale', (event) => {
         const detail = event && event.detail;
-        if (detail && detail.sessionId && detail.agent) {
-            activeConversationIdsByAgent.set(detail.agent, detail.sessionId);
-            if (currentAgentMatches(detail.agent)) {
+        // A NULL agent is the single-agent console: getHostAgent() is null by
+        // definition there (isMultiAgentMode = selectedHostAgent !== null), so
+        // chat.js's dispatchAgent — and this event's `agent` — is null for
+        // every turn. The old `detail.agent` truthiness guard therefore
+        // skipped the highlight sync in exactly the most common standalone
+        // setup. Gate on sessionId only; currentAgentMatches(null) is true
+        // precisely when the console is single-agent, so the match check
+        // below stays correct in both modes.
+        if (detail && detail.sessionId) {
+            const agentKey = detail.agent !== undefined ? detail.agent : null;
+            activeConversationIdsByAgent.set(agentKey, detail.sessionId);
+            if (currentAgentMatches(agentKey)) {
                 activeConversationId = detail.sessionId;
                 if (conversationsHandle) {
                     conversationsHandle.setActiveSessionId(activeConversationId);

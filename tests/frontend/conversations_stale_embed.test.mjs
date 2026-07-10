@@ -85,3 +85,36 @@ test('embed context: the turn-end event syncs the organic highlight WITHOUT DOMC
         'the turn-end event synced the highlight with NO DOMContentLoaded — the embed path',
     );
 });
+
+test('SINGLE-AGENT console: a null agent in the event detail still syncs the highlight', async () => {
+    // getHostAgent() is null by definition in single-agent standalone
+    // (isMultiAgentMode = selectedHostAgent !== null), so chat.js dispatches
+    // every turn-end event with agent: null. The old `detail.agent` truthiness
+    // guard skipped the sync in exactly that (most common) setup.
+    API.getConversations = async () => ({
+        conversations: [{
+            session_id: 'sess-single-1',
+            preview: 'single agent organic',
+            started_at: '2026-07-10T16:00:00Z',
+            last_message_at: '2026-07-10T16:00:00Z',
+            message_count: 2,
+        }],
+    });
+    API.setHostAgent(null);   // single-agent mode
+    refreshConversationsPane();
+    await tick();
+
+    window.dispatchEvent(new dom.window.CustomEvent('kestrel:conversations-stale', {
+        detail: { sessionId: 'sess-single-1', agent: null },
+    }));
+    await tick();
+    await tick();
+
+    const row = Array.from(document.querySelectorAll('.conversation-item'))
+        .find((r) => r.dataset.sessionId === 'sess-single-1');
+    assert.ok(row, 'row rendered');
+    assert.ok(
+        row.classList.contains('active'),
+        'null-agent (single-agent console) turn-end event synced the highlight',
+    );
+});
