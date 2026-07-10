@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -65,6 +66,38 @@ async def test_keyword_recall_when_no_embedding_provider(db):
     found = await c.search_episodes("sailing", limit=5)
 
     assert [e.id for e in found] == ["sail"]
+
+
+async def test_keyword_recall_accepts_natural_language_topic_query(db):
+    """#2330: PG/legacy fallback must not require the whole question verbatim."""
+    c = MemoryConsolidator(db, "agent-p2", llm_service=None)
+    await _insert_episode(
+        db, "compass", "North observatory compass",
+        "We discussed the ancient zirconium compass and navigation.",
+    )
+    await _insert_episode(db, "coffee", "Coffee roast", "Ethiopian beans at home.")
+
+    found = await c.search_episodes(
+        "what did we discuss about zirconium", limit=5
+    )
+
+    assert [episode.id for episode in found] == ["compass"]
+
+
+async def test_keyword_recall_ranks_full_overlap_before_recent_partial_hits(db):
+    """Common recent tokens cannot crowd an older full-topic match out."""
+    c = MemoryConsolidator(db, "agent-p2", llm_service=None)
+    await _insert_episode(
+        db, "full", "Zirconium observatory compass", "Navigation discussion."
+    )
+    for index in range(30):
+        await _insert_episode(
+            db, f"partial-{index}", f"Routine compass note {index}", "Maintenance."
+        )
+
+    found = await c.search_episodes("zirconium compass", limit=2)
+
+    assert found[0].id == "full"
 
 
 async def test_recall_increments_access_count(db):
@@ -163,6 +196,44 @@ async def test_recall_scoped_to_agent(db):
 
     found = await c.search_episodes("sailing", limit=5)
     assert [e.id for e in found] == ["mine"]
+
+
+async def test_episode_vector_query_uses_episode_instruction(db, monkeypatch):
+    class QueryAwareService:
+        async def aembed_query(self, text, *, instruction):
+            self.call = (text, instruction)
+            return [1.0, 0.0]
+
+        def current_profile_id(self):
+            return "episode-profile"
+
+    class Backend:
+        knn = AsyncMock(return_value=[("episode-1", 0.9)])
+
+    service = QueryAwareService()
+    backend = Backend()
+    consolidator = MemoryConsolidator(db, "agent-p2")
+    consolidator._get_embedding_service = lambda: service
+    consolidator._get_vector_session_factory = lambda: object()
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.vector.get_vector_backend",
+        lambda session_factory, spec: backend,
+    )
+
+    found = await consolidator._knn_episode_ids("remember the observatory", 3)
+
+    from kestrel_sovereign.llm.embedding_service import (
+        EPISODE_RETRIEVAL_INSTRUCTION,
+    )
+
+    assert found == ["episode-1"]
+    assert service.call == (
+        "remember the observatory",
+        EPISODE_RETRIEVAL_INSTRUCTION,
+    )
+    assert backend.knn.await_args.kwargs["filter"]["embedding_profile_id"] == (
+        "episode-profile"
+    )
 
 
 # --------------------------------------------------------------------------

@@ -3069,9 +3069,19 @@ class AsyncConversationStore:
         return candidates
 
     async def get_lexical_memory_candidates(
-        self, query: str, limit: int = 100, page_size: int = 1000
+        self,
+        query: str,
+        limit: int = 100,
+        page_size: int = 1000,
+        excluded_embedding_profile_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Return bounded lexical top-k while scanning the full live corpus."""
+        """Return bounded lexical top-k while scanning eligible live rows.
+
+        When ``excluded_embedding_profile_id`` is supplied, scan only rows
+        outside that vector space (NULL/legacy or a different profile). This
+        is the mixed-corpus bridge: active-profile rows arrive through kNN,
+        while exact legacy matches remain recallable during backfill/migration.
+        """
         query_tokens = set(_tokenize_for_search(_strip_search_wrappers(query)))
         if not query_tokens:
             return []
@@ -3079,17 +3089,23 @@ class AsyncConversationStore:
         before_id: Optional[int] = None
         while True:
             cursor_clause = " AND id < ?" if before_id is not None else ""
-            params: Tuple[Any, ...] = (
-                (self.agent_id, before_id, page_size)
-                if before_id is not None
-                else (self.agent_id, page_size)
-            )
+            profile_clause = ""
+            params_list: List[Any] = [self.agent_id]
+            if excluded_embedding_profile_id is not None:
+                profile_clause = (
+                    " AND (embedding_profile_id IS NULL "
+                    "OR embedding_profile_id != ?)"
+                )
+                params_list.append(excluded_embedding_profile_id)
+            if before_id is not None:
+                params_list.append(before_id)
+            params_list.append(page_size)
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, created_at, rendered_content "
                 "FROM conversation_history WHERE agent_id = ? "
                 "AND deleted_at IS NULL AND archived_at IS NULL"
-                f"{cursor_clause} ORDER BY id DESC LIMIT ?",
-                params,
+                f"{profile_clause}{cursor_clause} ORDER BY id DESC LIMIT ?",
+                tuple(params_list),
             )
             if not rows:
                 break
