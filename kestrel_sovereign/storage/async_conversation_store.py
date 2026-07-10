@@ -2669,8 +2669,9 @@ class AsyncConversationStore:
         include_deleted: bool = False,
         only_deleted: bool = False,
         only_archived: bool = False,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Get complete conversation history with message IDs.
+        """Get conversation history with message IDs, optionally bounded.
 
         Args:
             include_excluded: If True, include messages marked as excluded from context.
@@ -2681,6 +2682,9 @@ class AsyncConversationStore:
                 the Trash UI (#765). Implies ``include_deleted``.
             only_archived: If True, return ONLY archived rows that are not
                 soft-deleted. Used by the Archive UI (#2149).
+            limit: When provided, fetch only the newest N matching database
+                rows while still returning them oldest-first. Filtering
+                excluded/stashed rows are filtered in SQL before the bound.
 
         Returns:
             List of message dicts with 'id', 'role', 'content', 'metadata',
@@ -2696,12 +2700,50 @@ class AsyncConversationStore:
         else:
             del_clause = " AND deleted_at IS NULL"
 
-        rows = await self.db.fetchall(
-            f"SELECT id, role, content, metadata, created_at, deleted_at, archived_at "
-            f"FROM conversation_history "
-            f"WHERE agent_id = ?{del_clause} ORDER BY id ASC",
-            (self.agent_id,)
+        visibility_clause = ""
+        if not include_excluded or not include_stashed:
+            if self.db.backend_type == "postgres":
+                if not include_excluded:
+                    visibility_clause += (
+                        " AND COALESCE((metadata::jsonb ->> "
+                        "'excluded_from_context')::boolean, false) = false"
+                    )
+                if not include_stashed:
+                    visibility_clause += (
+                        " AND COALESCE((metadata::jsonb ->> "
+                        "'stashed')::boolean, false) = false"
+                    )
+            else:
+                if not include_excluded:
+                    visibility_clause += (
+                        " AND COALESCE(json_extract(metadata, "
+                        "'$.excluded_from_context'), 0) != 1"
+                    )
+                if not include_stashed:
+                    visibility_clause += (
+                        " AND COALESCE(json_extract(metadata, '$.stashed'), 0) != 1"
+                    )
+
+        columns = (
+            "id, role, content, metadata, created_at, deleted_at, archived_at"
         )
+        if limit is None:
+            sql = (
+                f"SELECT {columns} FROM conversation_history "
+                f"WHERE agent_id = ?{del_clause}{visibility_clause} ORDER BY id ASC"
+            )
+            params: Tuple[Any, ...] = (self.agent_id,)
+        else:
+            bounded_limit = max(1, int(limit))
+            sql = (
+                f"SELECT {columns} FROM ("
+                f"SELECT {columns} FROM conversation_history "
+                f"WHERE agent_id = ?{del_clause}{visibility_clause} "
+                f"ORDER BY id DESC LIMIT ?"
+                f") AS recent_history ORDER BY id ASC"
+            )
+            params = (self.agent_id, bounded_limit)
+        rows = await self.db.fetchall(sql, params)
         history = []
         for row in rows:
             row_id = row[0]
@@ -2746,9 +2788,9 @@ class AsyncConversationStore:
     ) -> bool:
         """Update metadata for a specific message using atomic JSON merge.
 
-        Uses SQL-level json_patch (PostgreSQL) or a SELECT-then-UPDATE with
-        optimistic locking (SQLite) to avoid race conditions when multiple
-        callers update metadata on the same message concurrently.
+        Uses one SQL JSON merge statement on both backends so concurrent
+        rehearsal, reflection, tagging, and routing writes cannot be erased by
+        a stale Python read-modify-write cycle.
 
         Args:
             message_id: The message ID to update
@@ -2757,9 +2799,8 @@ class AsyncConversationStore:
         Returns:
             True if message was found and updated, False otherwise
         """
-        updates_json = json.dumps(metadata_updates)
-
         if self.db.backend_type == "postgres":
+            updates_json = json.dumps(metadata_updates)
             # PostgreSQL: atomic JSON merge via || operator
             # COALESCE handles NULL metadata columns gracefully
             result = await self.db.execute_commit(
@@ -2773,23 +2814,33 @@ class AsyncConversationStore:
                 logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
             return updated
         else:
-            # SQLite: SELECT-then-UPDATE (single-writer, no true race condition)
-            row = await self.db.fetchone(
-                "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
-                (message_id, self.agent_id)
-            )
-            if not row:
+            # json_patch implements MergePatch, where a JSON null DELETES a
+            # key. Python dict.update (and PostgreSQL ||) stores null, so use
+            # variadic json_set with parsed JSON values to preserve the public
+            # contract for None/list/dict/bool as well as scalar values.
+            if metadata_updates:
+                assignments = ", ".join("?, json(?)" for _ in metadata_updates)
+                merge_params: List[Any] = []
+                for key, value in metadata_updates.items():
+                    escaped_key = str(key).replace('"', '\\"')
+                    merge_params.extend((f'$."{escaped_key}"', json.dumps(value)))
+                sql = (
+                    "UPDATE conversation_history SET metadata = "
+                    f"json_set(COALESCE(metadata, '{{}}'), {assignments}) "
+                    "WHERE id = ? AND agent_id = ?"
+                )
+                params = (*merge_params, message_id, self.agent_id)
+            else:
+                sql = (
+                    "UPDATE conversation_history SET metadata = "
+                    "COALESCE(metadata, '{}') WHERE id = ? AND agent_id = ?"
+                )
+                params = (message_id, self.agent_id)
+            result = await self.db.execute_commit(sql, params)
+            updated = _rows_affected(result) > 0
+            if not updated:
                 logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
-                return False
-
-            current_meta = json.loads(row[0]) if row[0] else {}
-            current_meta.update(metadata_updates)
-
-            await self.db.execute_commit(
-                "UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ?",
-                (json.dumps(current_meta), message_id, self.agent_id)
-            )
-            return True
+            return updated
 
     async def atomic_increment_metadata_counter(
         self,
