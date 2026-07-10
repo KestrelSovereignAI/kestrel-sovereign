@@ -200,3 +200,23 @@ def test_new_config_files_respect_the_process_umask(tmp_path):
         assert (config_path.stat().st_mode & 0o777) == 0o600, "umask 077 -> private new config"
     finally:
         os.umask(old_umask)
+
+
+def test_atomic_save_writes_through_symlinks(tmp_path):
+    """codex P2 round 9: a symlinked multi_agent.toml (operator-managed
+    config) must stay a symlink — the save updates the TARGET, exactly like
+    the in-place open('w') it replaced."""
+    real = tmp_path / "real-config.toml"
+    link = tmp_path / "multi_agent.toml"
+    config = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+    })
+    config.save(real)
+    link.symlink_to(real)
+
+    config.agents["Two"] = LocalAgentConfig(data_dir=Path("agent_data/Two"), port=8802)
+    config.save(link)
+
+    assert link.is_symlink(), "the symlink survives the save"
+    reloaded = MultiAgentConfig.from_file(real)
+    assert "Two" in reloaded.agents, "the TARGET received the update"

@@ -363,6 +363,12 @@ class MultiAgentConfig(BaseModel):
         # the next boot. Write a sibling temp file and os.replace() it in.
         import os
         import tempfile
+        # Write THROUGH symlinks (codex P2 round 9): os.replace on the link
+        # path would swap the SYMLINK for a regular file, silently severing an
+        # operator-managed config link — the in-place open('w') this replaced
+        # followed the link. Resolve to the real target and replace that.
+        if path.exists():
+            path = path.resolve()
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
         )
