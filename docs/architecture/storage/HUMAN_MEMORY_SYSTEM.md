@@ -439,10 +439,11 @@ await feature.recall_emotional(
     limit=10
 )
 # Uses human-like weighting:
-# - 30% semantic relevance
-# - 25% emotional congruence (mood-matching)
+# - 25% semantic relevance
+# - 20% emotional congruence (mood-matching)
 # - 20% importance
 # - 15% recency (with decay)
+# - 10% epistemic certainty
 # - 10% access frequency
 ```
 

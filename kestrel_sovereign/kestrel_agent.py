@@ -3152,11 +3152,12 @@ Expected Duration: {expected_duration}
         # assembly (below).
         constitution = await self._get_governing_constitution()
         try:
-            logging.info(f"[SESSION-DEBUG] Fetching history with session_id={session_id}")
             history = await self.privacy_agent.get_conversation_history(limit=50, session_id=session_id)
-            logging.info(f"[SESSION-DEBUG] Got {len(history)} messages for session_id={session_id}")
-            if history:
-                logging.info(f"[SESSION-DEBUG] First message: {history[0].get('content', '')[:50]}...")
+            logging.debug(
+                "Conversation history loaded: count=%d session_scoped=%s",
+                len(history),
+                session_id is not None,
+            )
         except DecryptionError as e:
             logging.error(f"DecryptionError retrieving history: {e}")
             # Return empty history but allow query to proceed
@@ -3438,7 +3439,10 @@ Expected Duration: {expected_duration}
         if has_tool_calls:
             logging.info(f"[AGENTIC] Tool calls: {[tc.name for tc in response.tool_calls]}")
         elif isinstance(response, LLMResponse) and response.content:
-            logging.info(f"[AGENTIC] LLM returned TEXT (no tool calls): {response.content[:150]}...")
+            logging.debug(
+                "[AGENTIC] LLM returned text (no tool calls): chars=%d",
+                len(response.content),
+            )
 
         await self.observability_store.log_tool_response(
             event_id=llm_event_id,

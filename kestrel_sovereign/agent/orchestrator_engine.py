@@ -1503,7 +1503,11 @@ class OrchestratorEngineMixin:
             result_json = _build_persisted_preview(result_json, tool_name, original_len)
             logging.info(f"{log_prefix} Large tool result ({original_len} chars) replaced with preview")
         else:
-            logging.info(f"{log_prefix} Tool result ({len(result_json)} chars): {result_json[:200]}...")
+            logging.debug(
+                "%s Tool result: chars=%d",
+                log_prefix,
+                len(result_json),
+            )
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
@@ -2171,7 +2175,10 @@ class OrchestratorEngineMixin:
             )
 
             if isinstance(response, str):
-                logging.info(f"[ORCHESTRATOR] Final response (string): {response[:300]}...")
+                logging.debug(
+                    "[ORCHESTRATOR] Final response (string): chars=%d",
+                    len(response),
+                )
                 return response
 
             if not response.has_tool_calls:
@@ -2185,13 +2192,19 @@ class OrchestratorEngineMixin:
                         session_id=session_id,
                     )
                     if isinstance(response, str):
-                        logging.info(f"[ORCHESTRATOR] Final response after repair (string): {response[:300]}...")
+                        logging.debug(
+                            "[ORCHESTRATOR] Final response after repair: chars=%d",
+                            len(response),
+                        )
                         return response
                     if response.has_tool_calls:
                         messages.append(self._build_assistant_tool_history_msg(response))
                         continue
                 final_content = response.content or ""
-                logging.info(f"[ORCHESTRATOR] Final response (no more tool calls): {final_content[:300]}...")
+                logging.debug(
+                    "[ORCHESTRATOR] Final response (no more tool calls): chars=%d",
+                    len(final_content),
+                )
                 return final_content
 
             # Track diminishing returns on this response before continuing

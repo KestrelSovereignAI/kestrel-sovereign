@@ -1705,6 +1705,18 @@
       "type": "Audit Ledger"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/audit/MEMORY_SYSTEM_ROUND_2_2026-07-10.md",
+      "privacy": "public",
+      "render": "internal",
+      "status": "active",
+      "title": "Memory System Deep Dive \u2014 Round 2",
+      "type": "Audit Report"
+    },
+    {
       "existing_code_refs": [
         "KESTREL_FEATURES.md",
         "QUICKSTART.md",

@@ -79,3 +79,9 @@ def test_root_model_catalog_is_manual_overrides_only():
 
 def test_package_local_model_catalog_duplicate_is_removed():
     assert not (PROJECT_ROOT / "kestrel_sovereign/model_catalog.toml").exists()
+
+
+def test_example_documents_both_memory_retrieval_floors():
+    text = (PROJECT_ROOT / "kestrel.toml.example").read_text(encoding="utf-8")
+    assert "# memory_min_score = 0.3" in text
+    assert "# memory_min_relevance = 0.1" in text

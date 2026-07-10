@@ -136,10 +136,11 @@ class MemoryManager:
         Retrieve emotionally-weighted memories.
 
         Uses MemoryRetriever for human-like recall with:
-        - Semantic matching (30%)
-        - Emotional congruence (25%)
+        - Semantic matching (25%)
+        - Emotional congruence (20%)
         - Importance weighting (20%)
         - Recency with decay (15%)
+        - Epistemic certainty (10%)
         - Access frequency (10%)
 
         Args:
