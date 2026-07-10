@@ -152,6 +152,11 @@ _TERMINAL_TALON_STATES = frozenset(
     {"complete", "failed", "reject", "finished_unknown"}
 )
 
+# The one terminal state that means the run actually succeeded (opened its PR
+# through a passing pipeline). Every other terminal state is a FAILURE — a PR it
+# left behind must not be accepted as CI-green (#2303).
+_SUCCESSFUL_TALON_STATE = "complete"
+
 _PR_NUMBER_FROM_URL_RE = re.compile(r"/pull/(\d+)")
 
 
@@ -344,6 +349,11 @@ class TalonCoordinatorFeature(Feature):
         # message_id -> {pid, started_at, log_path, command, repo,
         # issue, status, returncode, completed_at, process}
         self._jobs: Dict[str, Dict[str, Any]] = {}
+        # workflow run_id -> the talon job_id THAT run's talon_run stage
+        # dispatched. Lets ``verify_pipeline_ci`` bind CI verification to this
+        # run's own job instead of a repo/issue correlation that a concurrent
+        # run (e.g. a retry for the same issue) could poison (#2303).
+        self._pipeline_run_jobs: Dict[str, str] = {}
         # Eager reload so a fresh feature instance immediately sees
         # jobs from a previous process — dispatch-then-persist would
         # otherwise truncate the registry to the new job alone.
@@ -911,6 +921,7 @@ class TalonCoordinatorFeature(Feature):
             data = dict(claim.data or {})
             if not data.get("dispatched") and claim.error:
                 data.setdefault("error", claim.error)
+            self._record_pipeline_run_job(data)
             return data
 
         if mode != "iterate":
@@ -999,7 +1010,7 @@ class TalonCoordinatorFeature(Feature):
                 "error": str(e),
             }
 
-        return await self._dispatch_via_cli_background(
+        dispatch = await self._dispatch_via_cli_background(
             invocation.argv,
             label=f"iterate:{repo_resolved}#{pr}",
             env=invocation.env,
@@ -1010,6 +1021,35 @@ class TalonCoordinatorFeature(Feature):
                 **invocation.metadata(),
             },
         )
+        self._record_pipeline_run_job(dispatch)
+        return dispatch
+
+    def _current_workflow_run_id(self) -> Optional[str]:
+        """The in-flight workflow run id (the driving Signal's ``session_id``).
+
+        Both the ``talon_run`` and ``verify_ci`` stages of a
+        ``fleet_coding_pipeline`` run dispatch through this coordinator inside
+        that run's signal context, so this is a stable key for pairing the CI
+        verification with the job the run's own dispatch produced (#2303).
+        Returns None outside a signal dispatch.
+        """
+        try:
+            from kestrel_sovereign.signals.context import get_current_signal
+
+            signal = get_current_signal()
+        except Exception:  # pragma: no cover - defensive import guard
+            return None
+        run_id = getattr(signal, "session_id", None) if signal is not None else None
+        return run_id if isinstance(run_id, str) and run_id else None
+
+    def _record_pipeline_run_job(self, dispatch: Any) -> None:
+        """Bind the current workflow run to the talon job it just dispatched."""
+        if not isinstance(dispatch, dict) or not dispatch.get("dispatched"):
+            return
+        job_id = dispatch.get("job_id") or dispatch.get("task_id")
+        run_id = self._current_workflow_run_id()
+        if isinstance(job_id, str) and job_id and run_id:
+            self._pipeline_run_jobs[run_id] = job_id
 
     async def verify_pipeline_ci(
         self,
@@ -1019,6 +1059,7 @@ class TalonCoordinatorFeature(Feature):
         pr: Optional[int] = None,
         mode: str = "claim",
         job_id: Optional[str] = None,
+        run_id: Optional[str] = None,
         wait_timeout_seconds: int = 3600,
         poll_interval_seconds: int = 15,
         max_ci_wait_seconds: int = 1800,
@@ -1028,16 +1069,23 @@ class TalonCoordinatorFeature(Feature):
 
         The verify seam behind the ``fleet_ci_probe`` signal source (#2303).
         Verification is bound to the *dispatched run's own output* — never a
-        caller-supplied branch. Given the workflow run's ``repo`` and
-        ``issue``/``pr``, it locates the talon job the pipeline dispatched,
-        waits for that job to open its PR, resolves the PR's head branch from
-        GitHub, and polls the PR head's CI (reusing the workflows ``ci_green``
-        gate machinery).
+        caller-supplied branch. It locates the talon job the pipeline
+        dispatched, waits for that job to open its PR, resolves the PR's head
+        branch from GitHub, and polls the PR head's CI (reusing the workflows
+        ``ci_green`` gate machinery).
+
+        The job is bound in priority order: an explicit ``job_id`` (this run's
+        own talon job, threaded from the dispatch stage), then the job recorded
+        for this workflow ``run_id`` at dispatch time, then a (repo, issue|pr)
+        correlation as a last resort. The first two protect against a concurrent
+        run for the same repo/issue whose (newer) job correlation would
+        otherwise select — a run must verify its OWN dispatch, never a sibling's
+        (#2303).
 
         Fail-closed: returns ``{"ci_green": False, "reason": ...}`` whenever the
-        PR/branch cannot be bound to the dispatch or CI is not observably green.
-        It never claims a green CI it could not check against the talon PR head,
-        and any caller-supplied ``branch`` is deliberately ignored.
+        PR/branch cannot be bound to the dispatch, the job did not COMPLETE, or
+        CI is not observably green. It never claims a green CI it could not check
+        against the talon PR head, and any caller-supplied ``branch`` is ignored.
         """
         repo_resolved = self._resolve_repo(repo)
 
@@ -1051,8 +1099,16 @@ class TalonCoordinatorFeature(Feature):
                 **extra,
             }
 
-        # 1. Locate the talon job this pipeline dispatched (most recent match).
+        # 1. Locate the talon job THIS run dispatched. Explicit job_id wins;
+        # else the job recorded for this workflow run (bound at dispatch);
+        # else fall back to (repo, issue|pr) correlation.
         target_id = job_id if (job_id and job_id in self._jobs) else None
+        if target_id is None:
+            bound = self._pipeline_run_jobs.get(
+                run_id or self._current_workflow_run_id() or ""
+            )
+            if bound and bound in self._jobs:
+                target_id = bound
         if target_id is None:
             target_id = self._find_pipeline_job_id(
                 repo_resolved, issue=issue, pr=pr, mode=mode
@@ -1067,11 +1123,31 @@ class TalonCoordinatorFeature(Feature):
         )
 
         info = self._jobs.get(target_id) or {}
-        if info.get("status") not in _TERMINAL_TALON_STATES:
+        final_status = info.get("status")
+        if final_status not in _TERMINAL_TALON_STATES:
             try:
-                await _await_completion(self, target_id, wait_timeout_seconds)
+                wait_result = await _await_completion(
+                    self, target_id, wait_timeout_seconds
+                )
             except Exception as exc:  # noqa: BLE001 - a wait failure fails closed
                 return _fail(f"job_wait_error:{exc}", job_id=target_id)
+            # ``_await_completion`` returns a failed/partial ToolResult rather
+            # than raising, so read the terminal status off it (falling back to
+            # the freshly-updated job map).
+            wait_data = dict(getattr(wait_result, "data", None) or {})
+            final_status = wait_data.get("status") or (
+                self._jobs.get(target_id) or {}
+            ).get("status")
+
+        # 2b. Require the talon job to have SUCCEEDED before polling CI. A job
+        # that ended terminal-failed (``failed`` / ``reject`` /
+        # ``finished_unknown``) may still have opened a PR whose checks are
+        # green; treating that as ``ci_green`` would greenlight a failed run.
+        # Only ``complete`` proceeds to CI verification (#2303, fail closed).
+        if final_status != _SUCCESSFUL_TALON_STATE:
+            return _fail(
+                f"job_not_complete:{final_status or 'unknown'}", job_id=target_id
+            )
 
         # 3. Resolve the PR the talon job opened (iterate already knows it).
         pr_url = _find_pr_url(self, target_id)

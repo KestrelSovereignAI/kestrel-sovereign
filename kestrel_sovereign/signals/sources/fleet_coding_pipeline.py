@@ -202,10 +202,22 @@ async def _run_fleet_ci_probe(
     resolves its PR head branch, and polls that head's CI) and fails closed —
     raising, so the ``signal_status_ok`` gate fails — whenever CI is not
     verified green against the talon PR head.
+
+    When the dispatched ``job_id`` is present in the payload it is forwarded so
+    verification binds to *this run's own* talon job. The generic workflows
+    runner does not thread arbitrary source output between stages, so this path
+    is a best-effort; the load-bearing binding is coordinator-side —
+    ``verify_pipeline_ci`` resolves the job this workflow run dispatched from the
+    run→job map the ``talon_run`` stage recorded (keyed by the run's session id).
+    Either way a concurrent ``fleet_coding_pipeline`` run targeting the same
+    repo/issue can never make the probe read a different (newer) job's CI
+    (#2303). Only if neither binds does the coordinator fall back to
+    (repo, issue|pr) correlation.
     """
     repo = payload.get("repo")
     issue = payload.get("issue")
     pr = payload.get("pr")
+    job_id = payload.get("job_id")
     # Derive mode the same way ``talon_pipeline_dispatch`` does: an explicit
     # ``mode`` wins, else a ``pr`` (without an ``issue``) means iterate.
     mode = payload.get("mode") or ("iterate" if pr and not issue else "claim")
@@ -216,7 +228,7 @@ async def _run_fleet_ci_probe(
             f"{FLEET_CI_PROBE}: no coordinator bound to verify the talon PR's "
             "CI (fail closed)"
         )
-    verdict = await verify(repo=repo, issue=issue, pr=pr, mode=mode)
+    verdict = await verify(repo=repo, issue=issue, pr=pr, mode=mode, job_id=job_id)
     if not isinstance(verdict, dict) or not verdict.get("ci_green"):
         reason = verdict.get("reason") if isinstance(verdict, dict) else repr(verdict)
         raise ValueError(

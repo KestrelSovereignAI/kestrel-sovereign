@@ -294,6 +294,39 @@ async def test_ci_probe_binds_to_dispatch_ignoring_caller_branch(dispatcher):
     assert data["branch"] != "attacker-branch"
 
 
+async def test_ci_probe_forwards_dispatched_job_id(tmp_path):
+    # The dispatch stage's job_id flows here in the verify payload; the probe
+    # must forward it to verify_pipeline_ci so verification binds to THIS run's
+    # own talon job, not a (repo, issue) correlation a concurrent run could
+    # poison (#2303).
+    coord = _FakeCoordinator()
+    registry = SourceRegistry()
+    register_fleet_coding_pipeline_sources(registry, coordinator=coord)
+    agent = _FakeAgent()
+    backend = SQLiteBackend(str(tmp_path / "jobid.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    disp = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    try:
+        result = await disp.dispatch_signal(
+            _signal(
+                FLEET_CI_PROBE,
+                {"repo": "org/repo", "issue": 9, "job_id": "job-abc"},
+            )
+        )
+        assert result.status == Status.OK
+        assert len(coord.verify_calls) == 1
+        assert coord.verify_calls[0]["job_id"] == "job-abc"
+    finally:
+        await backend.close()
+
+
 async def test_ci_probe_fails_closed_when_ci_not_green(tmp_path):
     # A verdict that is not green must make the probe fail closed (raise), so the
     # signal_status_ok gate never passes on an unverified PR.
