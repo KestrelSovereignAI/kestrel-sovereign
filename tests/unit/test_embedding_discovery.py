@@ -653,6 +653,190 @@ async def test_reconcile_never_downgrades_a_static_pin():
     assert provider["capabilities"]["embedding_model"] == "pinned-model"
 
 
+# --- #2372 single resolver: route → (model, dim), used by all surfaces -------
+
+
+async def test_resolve_route_embedding_model_falls_through_to_catalog(monkeypatch):
+    # Cleared-pin state: capabilities carry no embedding_model, but discovery
+    # finds one for the route. The single resolver must return that model — a
+    # cleared pin can NEVER be silent-None while a capable model is discovered.
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=4096, dim_options=[768, 1024, 4096]),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    model, dim = await svc.resolve_route_embedding_model(provider)
+    assert model == "qwen/qwen3-embedding-8b"
+    # Side-effect: the resolution is persisted into capabilities so the sync
+    # readers (get_embedding_settings / ProviderEmbeddingService) agree.
+    assert provider["capabilities"]["embedding_model"] == "qwen/qwen3-embedding-8b"
+    assert provider["capabilities"]["supports_embeddings"] is True
+
+
+async def test_resolve_route_embedding_model_prefers_corpus_cross_route(monkeypatch):
+    # The corpus was written on Ollama (qwen3-embedding:8b); the route serves the
+    # same weights under an OpenRouter vendor/ prefix. A cleared pin must resolve
+    # to the corpus-continuous model via normalized matching — never gemini,
+    # never None — and adopt the corpus dim the model can serve (not native).
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter",
+                               native_dim=3072),
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=4096, dim_options=[768, 4096]),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    corpus = {"provider": "ollama", "model": "qwen3-embedding:8b",
+              "dim": 768, "space_id": "s", "row_count": 63}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus)
+    model, dim = await svc.resolve_route_embedding_model(provider)
+    assert model == "qwen/qwen3-embedding-8b"
+    assert dim == 768
+
+
+async def test_resolve_route_embedding_model_none_only_when_no_discovery():
+    # Truthful "off": nothing discovered for the route → (None, None), not a
+    # fabricated model.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    assert await svc.resolve_route_embedding_model(provider) == (None, None)
+
+
+async def test_resolve_route_embedding_model_preserves_explicit_pin():
+    # A pinned route keeps its own slug AND its own pinned dim — the resolver
+    # honours operator intent verbatim.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=4096, dim_options=[768, 4096]),
+        ]),
+        "client": None,
+        "capabilities": {
+            "supports_embeddings": True,
+            "embedding_model": "qwen/qwen3-embedding-8b",
+            "embedding_dim": 768,
+        },
+    }
+    svc = _FakeService([provider])
+    model, dim = await svc.resolve_route_embedding_model(provider)
+    assert model == "qwen/qwen3-embedding-8b"
+    assert dim == 768
+
+
+async def test_auto_resolved_capability_is_not_a_pin_after_cache_clear(monkeypatch):
+    # P1 (#2372): a default written back into capabilities by the resolver must
+    # NOT be re-read as an operator pin after the reindex path clears the cache.
+    # Otherwise the route freezes on the stale auto model/dim and the corpus
+    # fallback (which should follow a corpus change) is blocked.
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=768),
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter",
+                               native_dim=3072),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+
+    # First resolve against a qwen corpus → auto-resolves to the qwen model and
+    # marks the capability as auto-resolved (not a pin).
+    corpus_qwen = {"provider": "openrouter", "model": "qwen3-embedding-8b",
+                   "dim": 768, "space_id": "s", "row_count": 10}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus_qwen)
+    svc._embedding_space_change_warnings = {}
+    model, _ = await svc.resolve_route_embedding_model(provider)
+    assert model == "qwen/qwen3-embedding-8b"
+    assert provider["capabilities"]["embedding_model_auto_resolved"] is True
+
+    # The corpus changes to gemini; the reindex path clears the cache. The
+    # stale auto default must NOT be honoured as a pin — re-resolution follows
+    # the new corpus.
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value={
+        "provider": "openrouter", "model": "gemini-embedding-2",
+        "dim": 3072, "space_id": "s2", "row_count": 40,
+    })
+    svc.clear_embedding_discovery_cache()
+    model2, _ = await svc.resolve_route_embedding_model(provider)
+    assert model2 == "google/gemini-embedding-2"
+
+    # And a discovered candidate for the auto value is not flagged is_pinned.
+    models = await svc.discover_embedding_models()
+    assert all(not m.is_pinned for m in models)
+
+
+async def test_explicit_config_pin_survives_cache_clear(monkeypatch):
+    # The mirror of the above: a GENUINE config pin (no auto marker) is still a
+    # pin after a cache clear and wins over the corpus.
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=768),
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter",
+                               native_dim=3072),
+        ]),
+        "client": None,
+        "capabilities": {
+            "supports_embeddings": True,
+            "embedding_model": "google/gemini-embedding-2",
+            "embedding_dim": 3072,
+        },
+    }
+    svc = _FakeService([provider])
+    corpus_qwen = {"provider": "openrouter", "model": "qwen3-embedding-8b",
+                   "dim": 768, "space_id": "s", "row_count": 10}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus_qwen)
+    svc._embedding_space_change_warnings = {}
+
+    model, dim = await svc.resolve_route_embedding_model(provider)
+    assert model == "google/gemini-embedding-2"  # pin beats corpus
+    assert dim == 3072
+    svc.clear_embedding_discovery_cache()
+    model2, dim2 = await svc.resolve_route_embedding_model(provider)
+    assert model2 == "google/gemini-embedding-2"
+    assert "embedding_model_auto_resolved" not in provider["capabilities"]
+
+
 async def test_discovery_cache_reused_until_cleared():
     adapter = _adapter_returning([
         EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter"),

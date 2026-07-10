@@ -1578,7 +1578,14 @@ async def get_embedding_settings(request: Request):
                 await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
             except Exception as e:  # pragma: no cover - never fail the GET
                 logger.debug(f"embedding capability reconcile skipped in GET: {e}")
-        settings = agent.llm_service.get_embedding_settings()
+        # Resolve the active route's model/dim through the single #2372 resolver
+        # so a cleared pin falls through to corpus-match/catalog rather than
+        # surfacing ``None`` (silent-off). Falls back to the sync read if the
+        # service predates the async resolver.
+        if hasattr(agent.llm_service, "aget_embedding_settings"):
+            settings = await agent.llm_service.aget_embedding_settings()
+        else:
+            settings = agent.llm_service.get_embedding_settings()
         # #2289 — surface how many stored rows are on a different (or no)
         # embedding profile than the one currently resolved, so the UI can
         # render "Re-embed N memories". ``None`` when no profile resolves
@@ -1609,16 +1616,22 @@ def _agent_raw_db(agent):
     return db
 
 
-async def _count_stale_embedding_rows(agent) -> Optional[int]:
+async def _count_stale_embedding_rows(agent, service=None) -> Optional[int]:
     """Count stored rows whose embedding profile != the resolved profile (#2289).
 
     Scoped to the agent for the per-agent tables (conversation_history,
     saved_items); document_chunks is global. Returns ``None`` when no
     embedding profile resolves or storage isn't available — the caller
     treats that as "re-embed action not applicable".
+
+    ``service`` pins the count to a SPECIFIC route's embedding profile (#2372):
+    the route-model echo passes the just-configured route's service so the
+    stale-row count matches the echoed ``resolved_route`` instead of the globally
+    active route's. Defaults to the active-route embedding service.
     """
     try:
-        service = agent.llm_service.get_embedding_service()
+        if service is None:
+            service = agent.llm_service.get_embedding_service()
         if service is None:
             return None
         target = service.current_profile_id()
@@ -1693,7 +1706,10 @@ async def set_embedding_settings(request: Request):
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
-        settings = agent.llm_service.get_embedding_settings()
+        if hasattr(agent.llm_service, "aget_embedding_settings"):
+            settings = await agent.llm_service.aget_embedding_settings()
+        else:
+            settings = agent.llm_service.get_embedding_settings()
         # Echo the authoritative stale-row count alongside the resolved settings
         # (#2338): changing the route can create stale memories, and the UI's
         # ``_renderReindex`` hides the "Re-embed N memories" button whenever
@@ -1778,8 +1794,27 @@ async def set_route_embedding_model(request: Request):
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
-        settings = agent.llm_service.get_embedding_settings()
-        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
+        # Echo the settings for the PINNED route through the single #2372
+        # resolver so the response reflects THIS route's own slug — not whatever
+        # the globally-resolved embedding provider (embedding_route/chat) picks
+        # (the cross-route echo the issue flagged).
+        if hasattr(agent.llm_service, "aget_embedding_settings_for_route"):
+            settings = await agent.llm_service.aget_embedding_settings_for_route(route)
+        else:
+            settings = agent.llm_service.get_embedding_settings()
+        # Count stale rows against the ECHOED route's own embedding profile, not
+        # the globally-active route's (#2372) — else a response that resolves
+        # ``openrouter:api`` could report ``ollama:local``'s stale counts.
+        route_service = None
+        getter = getattr(agent.llm_service, "get_embedding_service_for_route", None)
+        if callable(getter):
+            try:
+                route_service = getter(route)
+            except Exception as e:  # pragma: no cover - defensive; fall back to active
+                logger.debug(f"route embedding service build failed for {route}: {e}")
+        settings["stale_rows"] = await _count_stale_embedding_rows(
+            agent, service=route_service
+        )
         return {"success": True, **settings}
     except HTTPException:
         raise
@@ -1977,6 +2012,18 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
             llm_service._embedding_discovery_cache = None
         except Exception:  # pragma: no cover - defensive
             pass
+
+    # (3) Resolve the active route's (model, dim) through the SINGLE #2372
+    # resolver so the reindex target matches the settings GET and the route-model
+    # echo — the #2372 failure was three surfaces resolving three different
+    # profiles (including a stale one) for the same cleared-pin state.
+    if hasattr(llm_service, "resolve_route_embedding_model"):
+        try:
+            active = llm_service.resolve_embedding_provider()
+            if active is not None:
+                await llm_service.resolve_route_embedding_model(active)
+        except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            logger.debug("reindex active-route embedding resolve skipped: %s", exc)
 
     err, embedding_service, target = cli_embeddings._resolve_target(llm_service)
     if err is not None:

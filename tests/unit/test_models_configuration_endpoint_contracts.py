@@ -517,6 +517,9 @@ def test_embedding_settings_endpoints_round_trip_and_expose_dims():
     # The endpoint now uses the async, live-probing setter (#2326).
     llm_service.aset_embedding_route = AsyncMock(side_effect=_set)
     llm_service.get_embedding_settings = MagicMock(side_effect=_settings)
+    # The endpoints now resolve the active route through the async single
+    # resolver (#2372) before reading; mirror the sync stub for it.
+    llm_service.aget_embedding_settings = AsyncMock(side_effect=_settings)
     agent = MagicMock(llm_service=llm_service)
 
     app, original = _prepare_app(agent)
@@ -585,6 +588,7 @@ def test_embedding_settings_post_round_trip_for_none_off_state():
     llm_service = MagicMock()
     llm_service.aset_embedding_route = AsyncMock(side_effect=_set)
     llm_service.get_embedding_settings = MagicMock(side_effect=_settings)
+    llm_service.aget_embedding_settings = AsyncMock(side_effect=_settings)
     agent = MagicMock(llm_service=llm_service)
 
     app, original = _prepare_app(agent)

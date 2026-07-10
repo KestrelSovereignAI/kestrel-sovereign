@@ -856,11 +856,17 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                         caps[key] = backup[key]
                     else:
                         caps.pop(key, None)
+                # Drop any auto-resolved marker left by a prior default; the next
+                # resolve re-adds it if the restored state is still auto (#2372).
+                caps.pop("embedding_model_auto_resolved", None)
             else:
                 caps["embedding_model"] = model.strip()
                 if dim is not None:
                     caps["embedding_dim"] = int(dim)
                 caps["supports_embeddings"] = True
+                # A runtime pin is operator intent, not an auto default — clear
+                # the marker so discovery folds it in as ``is_pinned`` (#2372).
+                caps.pop("embedding_model_auto_resolved", None)
 
         if clearing:
             self._route_embedding_model_overrides.pop(route, None)
@@ -1036,19 +1042,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # render it as ONE entry ("qwen3-embedding-0.6b — local + cloud")
         # instead of two routes. Only the pin covering the resolved route is
         # reported, with its verification/drift state.
-        shared_space = None
-        pin = self._pin_for_provider(provider)
-        if pin is not None:
-            parity = self._verified_space_pins.get(pin.name)
-            shared_space = {
-                "name": pin.name,
-                "space_id": pin.space_id,
-                "model": pin.model,
-                "dim": pin.dim,
-                "members": list(pin.members),
-                "verified": bool(parity and parity.passed),
-                "parity": parity.to_dict() if parity else None,
-            }
+        shared_space = self._shared_space_payload(provider)
 
         # #2366 — surface an auto-default that moved the resolved route into a
         # NEW embedding space (away from the corpus's dominant profile). The UI
@@ -1071,6 +1065,64 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # #2366 — non-null when the auto default changed the corpus space.
             "space_change_warning": space_change_warning,
         }
+
+    async def aget_embedding_settings(self) -> Dict[str, Any]:
+        """Async settings read that RESOLVES the active route's model/dim first (#2372).
+
+        ``get_embedding_settings`` (sync) reads whatever is in the resolved
+        route's capabilities; if a cleared pin left them empty it surfaced
+        ``embedding_model: null`` — embeddings silently off — even while a
+        corpus-matching model was discoverable. This resolves the active route
+        through the single :meth:`resolve_route_embedding_model` (the #2366 order
+        with normalized matching) BEFORE the sync read, so the GET falls through
+        corpus-match → catalog fallback instead of reporting ``None``.
+        """
+        provider = self.resolve_embedding_provider()
+        if provider is not None:
+            try:
+                await self.resolve_route_embedding_model(provider)
+            except Exception as exc:  # pragma: no cover - never fail the read
+                logger.debug("active-route embedding resolve skipped: %s", exc)
+        return self.get_embedding_settings()
+
+    async def aget_embedding_settings_for_route(
+        self, route: str
+    ) -> Dict[str, Any]:
+        """Settings echo for a SPECIFIC route (#2372) — never crosses routes.
+
+        The route-model POST echoes the settings the operator just configured.
+        Reading the globally-resolved embedding provider crossed routes — a pin
+        on ``openrouter:api`` echoed whatever the active ``embedding_route`` /
+        chat route resolved (e.g. an Ollama slug). This resolves the NAMED route
+        through the single :meth:`resolve_route_embedding_model` and overlays its
+        own ``resolved_route`` / ``embedding_model`` / ``embedding_dim`` so the
+        echo reflects the pinned route's own slug.
+        """
+        settings = self.get_embedding_settings()
+        provider = self._find_route_provider(route)
+        if provider is not None:
+            try:
+                model, dim = await self.resolve_route_embedding_model(provider)
+            except Exception as exc:  # pragma: no cover - never fail the echo
+                logger.debug("route embedding resolve skipped for %s: %s", route, exc)
+            else:
+                route_name = provider.get("name")
+                settings["resolved_route"] = route_name
+                settings["embedding_model"] = model
+                settings["embedding_dim"] = dim
+                # #2372 — the base echo started from ``get_embedding_settings()``,
+                # which resolves the GLOBAL active provider, so its
+                # ``shared_space``/``space_change_warning`` describe that route,
+                # not the one being echoed. Overlay the route-scoped values so no
+                # field crosses routes.
+                settings["shared_space"] = self._shared_space_payload(provider)
+                warnings = getattr(self, "_embedding_space_change_warnings", None)
+                settings["space_change_warning"] = (
+                    warnings.get(route_name)
+                    if isinstance(warnings, dict)
+                    else None
+                )
+        return settings
 
     @staticmethod
     def _is_permanent_auth_error(exc: Exception) -> bool:
@@ -1995,6 +2047,28 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 return pin
         return None
 
+    def _shared_space_payload(
+        self, provider: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Build the #2290 shared-space echo for ``provider``'s route, or ``None``.
+
+        Route-scoped: only the pin covering THIS provider is described, so a
+        per-route echo (#2372) never reports the globally-active route's space.
+        """
+        pin = self._pin_for_provider(provider)
+        if pin is None:
+            return None
+        parity = self._verified_space_pins.get(pin.name)
+        return {
+            "name": pin.name,
+            "space_id": pin.space_id,
+            "model": pin.model,
+            "dim": pin.dim,
+            "members": list(pin.members),
+            "verified": bool(parity and parity.passed),
+            "parity": parity.to_dict() if parity else None,
+        }
+
     def get_embedding_service(self):
         """Return a provider-backed embedding service for the active route.
 
@@ -2006,6 +2080,29 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         "aliased" without the mandatory parity gate.
         """
         provider = self.resolve_embedding_provider()
+        return self._build_embedding_service(provider)
+
+    def get_embedding_service_for_route(self, route: str):
+        """Return a provider-backed embedding service for a SPECIFIC route (#2372).
+
+        The route-model echo must count stale rows against the route the operator
+        just configured, not the globally-resolved active route — a response that
+        says ``resolved_route: openrouter:api`` must never report
+        ``ollama:local``'s stale-row counts. Applies the same shared-space pin
+        logic as :meth:`get_embedding_service`. Returns ``None`` when the route is
+        unknown / not configured.
+        """
+        provider = self._find_route_provider(route) if route else None
+        return self._build_embedding_service(provider)
+
+    def _build_embedding_service(self, provider: Optional[Dict[str, Any]]):
+        """Construct a :class:`ProviderEmbeddingService` for a resolved provider.
+
+        Shared by the active-route and per-route (#2372) accessors so the pin /
+        parity-gate handling stays identical. A verified #2290 shared-space pin
+        force-applies its model-identity ``space_id``; an unverified pin is not
+        applied. Returns ``None`` when ``provider`` is ``None``.
+        """
         if provider is None:
             return None
         from .embedding_service import ProviderEmbeddingService
