@@ -261,10 +261,23 @@ class EmbeddingSelector {
             if (started.job_id && started.status === 'running') {
                 job = await this._pollReindex(started.job_id);
             }
-            if (job && job.status === 'error') {
+            if (!job) {
+                // Poll timed out / dropped before a terminal state — don't
+                // report "Re-embedded 0 memories." as if it succeeded (#2360).
+                this._setReindexStatus('Re-embed status unavailable — check the embedding route and retry.');
+            } else if (job.status === 'error') {
                 this._setReindexStatus(`Re-embed failed: ${job.error || 'unknown error'}`);
+            } else if (job.status === 'partial') {
+                // Some rows re-embedded, some failed/skipped — surface both the
+                // count and the reason instead of a bare success line (#2360).
+                const done = job.total_reembedded || 0;
+                const failed = job.total_failed || 0;
+                const dim = job.total_skipped_dim_mismatch || 0;
+                this._setReindexStatus(
+                    `Re-embedded ${done} of ${job.total_stale || 0} — ${failed} failed, ` +
+                    `${dim} dimension-mismatch. ${job.error || ''}`.trim());
             } else {
-                const done = (job && job.total_reembedded) || 0;
+                const done = job.total_reembedded || 0;
                 this._setReindexStatus(`Re-embedded ${done} ${done === 1 ? 'memory' : 'memories'}.`);
             }
         } finally {
@@ -310,7 +323,11 @@ class EmbeddingSelector {
             if (job && typeof job.total_reembedded === 'number') {
                 this._setReindexStatus(`Re-embedded ${job.total_reembedded}/${job.total_stale}…`);
             }
-            if (job && (job.status === 'done' || job.status === 'error')) {
+            // Terminal states: done / partial / error. 'partial' means some rows
+            // re-embedded but some failed or hit a dimension mismatch — it is
+            // finished, not still running, so stop polling and let the caller
+            // surface job.error + the failed/skipped counters (#2360).
+            if (job && (job.status === 'done' || job.status === 'partial' || job.status === 'error')) {
                 return job;
             }
         }
