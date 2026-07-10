@@ -215,32 +215,26 @@ class AgentManager:
         Returns:
             True if agent was found and removed.
         """
-        # Tear down the budgeted subtree leaf-first (#2113). For a plain childless
-        # agent this is just [name]. For a budgeted parent removed directly
-        # (DELETE /api/agents/{name}, which does NOT go through terminate_child)
-        # this also stops+releases its budgeted descendants FIRST — so we never
-        # (a) release a still-live child's hold (release-before-stop race), nor
-        # (b) release a parent while a live budgeted grandchild's later refund
-        # would strand in the already-released parent wallet. The order is
-        # computed up front while the parent-child graph is intact.
-        order = self._budget_release_order(name)
-        target_found = False
-        for n in order:
-            async with self._lock:
-                agent = self._agents.pop(n, None)
-                if agent is not None:
-                    self._agent_names.pop(agent.agent_id, None)
-                    try:
-                        await asyncio.wait_for(agent.shutdown(), timeout=5.0)
-                        logger.info(f"Agent '{n}' shut down")
-                    except (asyncio.TimeoutError, Exception) as e:
-                        logger.warning(f"Agent '{n}' shutdown issue: {e}")
-            # Release the hold AFTER the agent is stopped and out of service.
-            # Idempotent — a no-op when terminate_child/shutdown_all already did.
-            await self._release_child_budget(n)
-            if n == name:
-                target_found = agent is not None
-        return target_found
+        async with self._lock:
+            agent = self._agents.pop(name, None)
+            if agent is not None:
+                self._agent_names.pop(agent.agent_id, None)
+                try:
+                    await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+                    logger.info(f"Agent '{name}' shut down")
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Agent '{name}' shutdown issue: {e}")
+
+        # Release THIS agent's own budget hold AFTER it is stopped (#2113):
+        # releasing before shutdown would let a still-running child spend
+        # already-refunded funds. remove_agent is a SINGLE-AGENT primitive — it
+        # does not cascade. Budgeted subtrees are torn down via terminate_child
+        # (cascade) or shutdown_all (leaf-first), which release nested holds in
+        # the correct order; directly remove_agent-ing a budgeted PARENT is not a
+        # supported budget teardown (folded into #2348 with reload durability).
+        # Idempotent — a no-op when those paths already released this entry.
+        await self._release_child_budget(name)
+        return agent is not None
 
     async def create_agent(
         self,
@@ -425,32 +419,6 @@ class AgentManager:
             "Applied delegated budget %s to child '%s' — spend now ceiling'd (#2113).",
             budget, name,
         )
-
-    def _budget_release_order(self, name: str) -> list:
-        """Post-order (leaf-first) list of ``name`` and its descendants (#2113).
-
-        Computed from the live parent-child graph so a direct ``remove_agent`` of
-        a parent tears down (stop + release) budgeted descendants before the
-        parent — a grandchild refunds up into its parent before that parent
-        releases to the root, and no live child is released. A childless agent
-        yields just ``[name]``.
-        """
-        order: list = []
-        seen: set = set()
-
-        def visit(n: str) -> None:
-            if n in seen:
-                return
-            seen.add(n)
-            agent = self._agents.get(n)
-            did = getattr(agent, "agent_id", None) if agent is not None else None
-            if did:
-                for child_name in list(self._parent_children.get(did, [])):
-                    visit(child_name)
-            order.append(n)  # self after children → leaf-first
-
-        visit(name)
-        return order
 
     async def _release_child_budget(self, child_name: str) -> None:
         """Credit a terminated child's unspent budget back to its parent (#2113).

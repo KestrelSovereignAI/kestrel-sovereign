@@ -343,29 +343,22 @@ async def test_terminate_child_cascade_releases_nested_to_root():
 
 
 @pytest.mark.asyncio
-async def test_direct_remove_parent_tears_down_budgeted_subtree():
-    """Directly removing a budgeted parent (DELETE path) stops AND releases its
-    budgeted grandchild first, so all held funds reach the root — no stranding,
-    no releasing a still-live descendant."""
+async def test_remove_agent_is_single_agent_release():
+    """remove_agent is a leaf primitive: it releases only the NAMED agent's hold
+    and does not cascade (nested teardown is terminate_child's job). A childless
+    budgeted agent's hold returns to its parent."""
     from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
-    root = FakeWallet(initial_balance=Decimal("100"))
-    child_dw = await create_delegated_wallet(root, "did:root", "did:child", Decimal("30"))
-    gc_dw = await create_delegated_wallet(child_dw, "did:child", "did:gc", Decimal("20"))
-    assert root.get_balance() == Decimal("70")
+    parent = FakeWallet(initial_balance=Decimal("100"))
+    dw = await create_delegated_wallet(parent, "did:p", "did:c", Decimal("30"))
+    assert parent.get_balance() == Decimal("70")
 
-    gc_agent = SimpleNamespace(agent_id="did:gc", shutdown=AsyncMock())
     mgr = AgentManager()
-    mgr._agents = {
-        "child": SimpleNamespace(agent_id="did:child", shutdown=AsyncMock()),
-        "gc": gc_agent,
-    }
-    mgr._parent_children = {"did:child": ["gc"]}
-    mgr._child_budgets = {"child": (child_dw, root), "gc": (gc_dw, child_dw)}
+    mgr._agents = {"c": SimpleNamespace(agent_id="did:c", shutdown=AsyncMock())}
+    mgr._child_budgets = {"c": (dw, parent)}
 
-    await mgr.remove_agent("child")
-    assert root.get_balance() == Decimal("100")        # both holds flow to root
-    assert "gc" not in mgr._agents                       # descendant stopped too
+    await mgr.remove_agent("c")
+    assert parent.get_balance() == Decimal("100")   # own hold released
 
 
 @pytest.mark.asyncio
