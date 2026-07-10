@@ -718,6 +718,13 @@ class ModelDiscoveryMixin:
             if m.route:
                 by_route.setdefault(m.route, []).append(m)
 
+        # #2372 — the corpus/deployment continuity signals are route-independent,
+        # so resolve them ONCE for the whole sweep rather than once per route.
+        # The per-provider fan-out (one corpus DB lookup per route) regressed
+        # lifespan startup past the 5s test-fixture timeout.
+        corpus_profile = await self._get_corpus_embedding_profile()
+        deployment_dim = _resolve_deployment_embedding_dim()
+
         for provider in providers:
             route_name = provider.get("name")
             # Only advertise where THIS route actually discovered embeddings —
@@ -735,7 +742,11 @@ class ModelDiscoveryMixin:
             # operator pin, and records any space-change warning. A config/static
             # pin is honoured verbatim (never downgraded).
             try:
-                await self.resolve_route_embedding_model(provider)
+                await self.resolve_route_embedding_model(
+                    provider,
+                    corpus_profile=corpus_profile,
+                    deployment_dim=deployment_dim,
+                )
             except Exception as exc:  # pragma: no cover - never break init
                 logger.debug(
                     "embedding capability resolve skipped for %s: %s",
@@ -818,7 +829,11 @@ class ModelDiscoveryMixin:
             return None
 
     async def resolve_route_embedding_model(
-        self, provider: dict
+        self,
+        provider: dict,
+        *,
+        corpus_profile: Optional[Dict[str, Any]] = None,
+        deployment_dim: Optional[int] = None,
     ) -> Tuple[Optional[str], Optional[int]]:
         """SINGLE source of truth for a route's ``(embedding_model, dim)`` (#2372).
 
@@ -855,8 +870,15 @@ class ModelDiscoveryMixin:
             caps = {}
             provider["capabilities"] = caps
 
-        corpus_profile = await self._get_corpus_embedding_profile()
-        deployment_dim = _resolve_deployment_embedding_dim()
+        # The corpus/deployment continuity signals are route-independent — a
+        # bulk caller (``reconcile_embedding_capabilities``) computes them ONCE
+        # and passes them in so startup doesn't issue one corpus DB lookup per
+        # route (#2372: that per-provider fan-out pushed lifespan startup over
+        # the 5s test timeout). Single-route callers omit them and we fetch.
+        if corpus_profile is None:
+            corpus_profile = await self._get_corpus_embedding_profile()
+        if deployment_dim is None:
+            deployment_dim = _resolve_deployment_embedding_dim()
         chosen = await self.resolve_default_embedding_model(
             provider,
             corpus_profile=corpus_profile,
