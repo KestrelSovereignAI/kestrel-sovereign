@@ -827,6 +827,14 @@ function goToSpawnTab() {
 
 function openNewAgentFlow() {
     const spawnAvailable = !!document.querySelector('.nav-tab[data-panel="spawn"]');
+    // FAIL CLOSED until the server has classified itself (codex P1 round 2):
+    // before the first /api/agents payload parses — or forever, if it keeps
+    // failing — the adapter still holds fail-OPEN defaults (multi_agent,
+    // serverDemoMode false), which would bypass both gates below.
+    if (!agentListDefaultAdapter || !agentListDefaultAdapter.classificationLoaded) {
+        Toast.info('Agent list is still loading — try again in a moment.');
+        return;
+    }
     // POST /api/agents needs the multi-agent manager — in a standalone
     // (single-agent) console it unconditionally 400s, so the Create dialog
     // would be a primary action that can never succeed (codex P2). Route

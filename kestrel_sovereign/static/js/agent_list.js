@@ -45,12 +45,18 @@ export function createDefaultAgentAdapter(api = API) {
     const adapter = {
         mode: 'multi_agent',
         serverDemoMode: false,
+        // False until a /api/agents payload has actually been parsed —
+        // consumers gating SAFETY decisions (demo rail, create-agent flow)
+        // must fail CLOSED while this is false rather than trust the
+        // defaults above (codex P1 on #2358).
+        classificationLoaded: false,
         lastPayload: null,
         async listAgents() {
             const data = await api.getAgents();
             adapter.lastPayload = data;
             adapter.mode = data.mode === 'standalone' ? 'standalone' : 'multi_agent';
             adapter.serverDemoMode = data.server_demo_mode === true;
+            adapter.classificationLoaded = true;
             const agents = data.agents || [];
             return agents.map((a) => ({
                 name: a.name,

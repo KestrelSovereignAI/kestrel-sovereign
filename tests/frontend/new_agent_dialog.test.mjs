@@ -194,3 +194,20 @@ test('demo-classified servers refuse the Create flow entirely — the #868 rail 
     assert.match(block.slice(created), /serverDemoMode/,
         'post-create selection re-checks the demo rail');
 });
+
+test('the create flow FAILS CLOSED before server classification loads (codex P1 round 2)', async () => {
+    const { readFileSync } = await import('node:fs');
+    // Adapter contract: classificationLoaded starts false, set only after a
+    // parsed payload.
+    const adapterSrc = readFileSync(new URL('../../kestrel_sovereign/static/js/agent_list.js', import.meta.url), 'utf8');
+    assert.match(adapterSrc, /classificationLoaded:\s*false/,
+        'adapter starts unclassified');
+    assert.match(adapterSrc, /adapter\.classificationLoaded\s*=\s*true/,
+        'classification set on successful payload parse');
+    // Gate contract: openNewAgentFlow refuses before classification.
+    const identitySrc = readFileSync(new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
+    const start = identitySrc.indexOf('function openNewAgentFlow()');
+    const block = identitySrc.slice(start, start + 1200);
+    assert.match(block, /classificationLoaded[\s\S]{0,220}?return;/,
+        'unclassified server refuses the create flow (fail closed)');
+});
