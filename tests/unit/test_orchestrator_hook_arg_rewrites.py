@@ -89,6 +89,9 @@ async def test_dispatch_feature_tool_executes_with_pre_tool_use_rewrite():
         task="SANITIZED",
         context="clean context",
         denied_tools=set(),
+        # No effective_model was resolved for this dispatch, so the subagent
+        # falls back to default route resolution (#2352).
+        model_override=None,
     )
     assert hooks_manager.post_tool_inputs[0].tool_input == {
         "task": "SANITIZED",

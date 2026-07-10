@@ -471,6 +471,104 @@ class TestCoreGeneration:
                 user_prompt="Test prompt",
             )
 
+    @pytest.mark.asyncio
+    async def test_explicit_route_not_gated_by_catalog(self, llm_service, mock_adapter):
+        """Regression for #2352: feature-subagent dispatch on an explicitly
+        pinned ``vendor:route/model`` must NOT be rejected by the vendor-catalog
+        gate just because discovery hasn't cached the model.
+
+        The streaming chat path never calls ``_model_available_for_route``, so a
+        brand-new OpenRouter slug (``openai/gpt-5.4-mini``) streams fine there.
+        The non-streaming ``get_response`` path (used by
+        ``Feature.execute_as_subagent`` via ``generate``) used to gate on the
+        catalog, raise ``ModelNotAvailableForRoute``, and surface it as
+        "All providers failed / Provider unknown" for the exact same route. When
+        the route is explicitly pinned there is no blind-cascade risk, so the
+        call must go through and hit the adapter.
+        """
+        from unittest.mock import MagicMock, patch
+        from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
+
+        # Wire an OpenRouter route into the service. Its configured model is a
+        # DIFFERENT slug, and discovery only knows about that other slug — so
+        # the catalog gate WOULD reject ``openai/gpt-5.4-mini`` if consulted.
+        llm_service.providers.append({
+            "name": "openrouter:api",
+            "vendor": "openrouter",
+            "route": "api",
+            "client": AsyncMock(),
+            "adapter": mock_adapter,
+            "model": "openai/gpt-5-mini",
+            "is_cloud": True,
+            "is_local": False,
+            "base_url": None,
+            "selection_hints": [],
+        })
+
+        warm_cache = MagicMock()
+        warm_cache.get_any = MagicMock(return_value=[
+            ModelInfo(
+                id="openai/gpt-5-mini", provider="openrouter",
+                display_name="openai/gpt-5-mini", category=ModelCategory.CHAT,
+                supports_tools=True,
+            ),
+        ])
+
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=warm_cache,
+        ):
+            response = await llm_service.get_response(
+                system_prompt="You are the visual identity subagent.",
+                user_prompt="Task: send a selfie",
+                model_override="openrouter:api/openai/gpt-5.4-mini",
+            )
+
+        # The adapter was actually called with the pinned model — no
+        # ModelNotAvailableForRoute / "All providers failed" fallthrough.
+        assert isinstance(response, str)
+        mock_adapter.get_response.assert_awaited()
+        called_model = mock_adapter.get_response.await_args.kwargs["model"]
+        assert called_model == "openai/gpt-5.4-mini"
+
+    @pytest.mark.asyncio
+    async def test_blind_fallback_still_gated_by_catalog(self, llm_service, mock_adapter):
+        """The catalog gate must STILL fire on non-explicit (blind fallback)
+        routing — the #2352 fix only relaxes it for explicitly pinned routes.
+
+        A bare model override with no vendor/route prefix is not an explicit
+        selection, so a model that no configured route serves must be skipped
+        (the cross-vendor cheap-model cascade guard), ending in
+        ``LLMAllProvidersFailedError`` rather than a wrong-vendor call.
+        """
+        from unittest.mock import MagicMock, patch
+        from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
+
+        warm_cache = MagicMock()
+        warm_cache.get_any = MagicMock(return_value=[
+            ModelInfo(
+                id="gpt-5-mini", provider="openai",
+                display_name="gpt-5-mini", category=ModelCategory.CHAT,
+                supports_tools=True,
+            ),
+            ModelInfo(
+                id="claude-sonnet-4-5", provider="anthropic",
+                display_name="claude-sonnet-4-5", category=ModelCategory.CHAT,
+                supports_tools=True,
+            ),
+        ])
+
+        with patch(
+            "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
+            return_value=warm_cache,
+        ):
+            with pytest.raises(LLMAllProvidersFailedError):
+                await llm_service.get_response(
+                    system_prompt="Test",
+                    user_prompt="Test prompt",
+                    model_override="model-no-route-serves",
+                )
+
     @staticmethod
     def _plan_paid_pair():
         """Build a [openai:plan(raises 429), openai:api(records+ok)] provider
