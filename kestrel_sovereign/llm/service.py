@@ -437,6 +437,16 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Persistence callback for the per-route embedding_model overrides (#2337).
         self._route_embedding_model_persistence_callback = None
 
+        # Corpus embedding-profile provider (#2366). An ``async () -> dict|None``
+        # callback wired by the agent that returns the DB's DOMINANT existing
+        # embedding profile ({"provider", "model", "dim", "space_id",
+        # "row_count"}). Auto-resolution prefers a model matching it so a fresh
+        # default doesn't silently move the agent into a new embedding space.
+        self._corpus_embedding_profile_provider = None
+        # Per-route records of an auto-default that changed the corpus embedding
+        # space (#2366). Keyed by route name; surfaced in get_embedding_settings.
+        self._embedding_space_change_warnings: Dict[str, Dict[str, Any]] = {}
+
         # Routes that have failed with a permanent auth error (401/403 or
         # the equivalent "User not found" / "invalid api key" message). Once
         # a route lands here, subsequent fallback iterations skip it for the
@@ -757,6 +767,18 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         overrides = getattr(self, "_route_embedding_model_overrides", None) or {}
         return {route: dict(spec) for route, spec in overrides.items()}
 
+    def set_corpus_embedding_profile_provider(self, callback) -> None:
+        """Wire the DB's dominant embedding-profile provider (#2366).
+
+        ``callback`` is ``async () -> dict|None`` returning the corpus's
+        dominant embedding profile (``{"provider", "model", "dim", "space_id",
+        "row_count"}``) or ``None`` for an empty/unreadable corpus. Auto
+        embedding-model resolution consults it so a fresh default prefers
+        continuity with the existing corpus over catalog order.
+        """
+        self._corpus_embedding_profile_provider = callback
+        logger.info("Corpus embedding-profile provider enabled")
+
     def _find_route_provider(self, route: str) -> Optional[Dict[str, Any]]:
         """Return the configured provider whose ``name`` matches ``route`` exactly."""
         providers = getattr(self, "providers", None) or []
@@ -1028,6 +1050,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "parity": parity.to_dict() if parity else None,
             }
 
+        # #2366 — surface an auto-default that moved the resolved route into a
+        # NEW embedding space (away from the corpus's dominant profile). The UI
+        # mismatch banner renders this so the operator can re-embed or pin.
+        space_change_warning = None
+        warnings = getattr(self, "_embedding_space_change_warnings", None)
+        if isinstance(warnings, dict) and resolved_route:
+            space_change_warning = warnings.get(resolved_route)
+
         return {
             "embedding_route": configured,
             "resolved_route": resolved_route,
@@ -1038,6 +1068,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             # #2337 — the runtime per-route embedding_model pins the UI's model
             # picker reflects (keyed by "<vendor>:<route>"). Empty when none set.
             "route_embedding_models": self.get_route_embedding_model_overrides(),
+            # #2366 — non-null when the auto default changed the corpus space.
+            "space_change_warning": space_change_warning,
         }
 
     @staticmethod

@@ -1701,6 +1701,20 @@ class KestrelAgent(
             await self._load_model_preference()
             self.llm_service.set_preference_persistence_callback(self._persist_model_preference)
 
+            # Wire the corpus dominant-embedding-profile provider (#2366) so auto
+            # embedding-model resolution prefers continuity with the DB's
+            # existing embedding space over catalog order. This MUST be registered
+            # BEFORE any path that reconciles embedding capabilities
+            # (``_load_embedding_route`` / ``_load_route_embedding_models`` below
+            # both call ``reconcile_embedding_capabilities``): reconcile only
+            # writes ``caps["embedding_model"]`` when it is empty, so a reconcile
+            # that ran without the corpus provider would latch the catalog-first
+            # default and later corpus-aware reconciles could not correct it.
+            if hasattr(self.llm_service, "set_corpus_embedding_profile_provider"):
+                self.llm_service.set_corpus_embedding_profile_provider(
+                    self._dominant_embedding_profile
+                )
+
             # Load persisted embedding_route knob and register persistence (#2263)
             await self._load_embedding_route()
             self.llm_service.set_embedding_route_persistence_callback(self._persist_embedding_route)

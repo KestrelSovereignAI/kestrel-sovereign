@@ -20,6 +20,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _model_offers_dim(model: "EmbeddingModelInfo", dim: int) -> bool:
+    """True when a discovered model can serve vectors of width ``dim`` (#2366).
+
+    Matches the model's native dimension or any of its offered truncation
+    options (Matryoshka range), so a qwen3-embedding model that truncates to
+    768 satisfies a 768-wide deployment column.
+    """
+    try:
+        target = int(dim)
+    except (TypeError, ValueError):
+        return False
+    if model.native_dim == target:
+        return True
+    return target in (model.dim_options or [])
+
+
+def _resolve_deployment_embedding_dim() -> Optional[int]:
+    """Return the deployment's effective embedding dim (``KESTREL_EMBEDDING_DIM``).
+
+    Best-effort — returns ``None`` when the value can't be resolved so the
+    caller simply skips the dim-preference branch (#2366).
+    """
+    try:
+        from kestrel_sovereign.storage.sqla.conversation_message import (
+            resolve_embedding_dim,
+        )
+
+        dim = resolve_embedding_dim()
+        return int(dim) if dim else None
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 class ModelDiscoveryMixin:
     """
     Mixin class providing model discovery methods for LLMService.
@@ -527,16 +560,33 @@ class ModelDiscoveryMixin:
         return options
 
     async def resolve_default_embedding_model(
-        self, provider: dict
+        self,
+        provider: dict,
+        *,
+        corpus_profile: Optional[Dict[str, Any]] = None,
+        deployment_dim: Optional[int] = None,
     ) -> Optional["EmbeddingModelInfo"]:
         """Pick a route's default embedding model, mirroring chat ``auto`` (#2338).
 
-        Resolution order matches chat auto-selection
-        (:meth:`_select_auto_model_for_route`): an explicit config pin wins, then
-        the route's ``selection_hints`` (substring patterns from config, no
-        hardcoded ids), then the first discovered model. Returns ``None`` when
-        discovery found nothing for the route — the caller then has no embedding
-        capability to advertise, which is truthful.
+        Resolution order (#2366 — continuity beats catalog order):
+
+        1. An explicit config pin (operator intent) always wins.
+        2. A discovered model matching the DB's DOMINANT existing embedding
+           profile — same model identity (:func:`normalize_embedding_model_id`),
+           or the same shared space via a verified #2290 pin. A non-empty corpus
+           should keep landing new memories in the space old memories already
+           live in, rather than silently splitting recall across two spaces.
+        3. A discovered model whose dimension matches ``deployment_dim``
+           (``kestrel_embedding_dim``) — no column migration needed.
+        4. Only then the route's ``selection_hints`` (substring patterns from
+           config, no hardcoded ids), then the first discovered model.
+
+        ``corpus_profile`` is the dominant existing profile as a dict
+        (``{"provider", "model", "dim", "space_id", ...}``) or ``None`` when the
+        corpus is empty / unreadable. ``deployment_dim`` is the deployment's
+        effective embedding dimension. Returns ``None`` when discovery found
+        nothing for the route — the caller then has no embedding capability to
+        advertise, which is truthful.
         """
         route_name = provider.get("name")
         vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
@@ -547,10 +597,26 @@ class ModelDiscoveryMixin:
         if not candidates:
             return None
 
-        # A config pin is operator intent — honour it before hint matching.
+        # A config pin is operator intent — honour it before everything else.
         pinned = next((m for m in candidates if m.is_pinned), None)
         if pinned is not None:
             return pinned
+
+        # #2366 (1) — prefer continuity with the existing corpus space.
+        if corpus_profile:
+            corpus_match = self._match_corpus_profile(candidates, corpus_profile)
+            if corpus_match is not None:
+                return corpus_match
+
+        # #2366 (2) — otherwise prefer a model that fits the deployment's vector
+        # column dimension, so recall stays available without a re-embed.
+        if deployment_dim:
+            dim_match = next(
+                (m for m in candidates if _model_offers_dim(m, deployment_dim)),
+                None,
+            )
+            if dim_match is not None:
+                return dim_match
 
         for hint in provider.get("selection_hints") or []:
             hint_lower = str(hint).lower()
@@ -566,6 +632,45 @@ class ModelDiscoveryMixin:
                 return match
 
         return candidates[0]
+
+    def _match_corpus_profile(
+        self, candidates: List["EmbeddingModelInfo"], corpus_profile: Dict[str, Any]
+    ) -> Optional["EmbeddingModelInfo"]:
+        """Return the discovered model that preserves the corpus space (#2366).
+
+        Matches on the dominant profile's model identity first (same weights,
+        cross-route via :func:`normalize_embedding_model_id`), then on a verified
+        #2290 shared-space pin whose ``space_id`` equals the corpus space — a
+        member route of that pin lands new rows in the same coordinate space.
+        """
+        from .embedding_discovery import normalize_embedding_model_id
+
+        dom_model = normalize_embedding_model_id(corpus_profile.get("model") or "")
+        if dom_model:
+            match = next(
+                (
+                    m for m in candidates
+                    if normalize_embedding_model_id(m.id) == dom_model
+                ),
+                None,
+            )
+            if match is not None:
+                return match
+
+        dom_space = corpus_profile.get("space_id")
+        pins = getattr(self, "_embedding_space_pins", None)
+        verified = getattr(self, "_verified_space_pins", None)
+        if dom_space and pins:
+            for m in candidates:
+                for pin in pins:
+                    if getattr(pin, "space_id", None) != dom_space:
+                        continue
+                    if not pin.covers(m.route, m.route.split(":", 1)[0]):
+                        continue
+                    parity = verified.get(pin.name) if verified else None
+                    if parity is not None and getattr(parity, "passed", False):
+                        return m
+        return None
 
     async def reconcile_embedding_capabilities(self, *, use_cache: bool = True) -> None:
         """Fold live embedding discovery into each route's static capabilities (#2338).
@@ -602,6 +707,13 @@ class ModelDiscoveryMixin:
             if m.route:
                 by_route.setdefault(m.route, []).append(m)
 
+        # #2366 — bias auto-resolution toward the corpus the DB already holds so
+        # a fresh default doesn't silently move the agent into a new embedding
+        # space. Both signals are best-effort: a missing/unreadable corpus or
+        # dim just falls through to the prior hint/catalog behaviour.
+        corpus_profile = await self._get_corpus_embedding_profile()
+        deployment_dim = _resolve_deployment_embedding_dim()
+
         for provider in providers:
             route_name = provider.get("name")
             # Only advertise where THIS route actually discovered embeddings —
@@ -614,7 +726,11 @@ class ModelDiscoveryMixin:
                 caps = {}
                 provider["capabilities"] = caps
             caps["supports_embeddings"] = True
-            default = await self.resolve_default_embedding_model(provider)
+            default = await self.resolve_default_embedding_model(
+                provider,
+                corpus_profile=corpus_profile,
+                deployment_dim=deployment_dim,
+            )
             if default is not None:
                 if not caps.get("embedding_model"):
                     caps["embedding_model"] = default.id
@@ -623,8 +739,85 @@ class ModelDiscoveryMixin:
                         route_name,
                         default.id,
                     )
+                    self._note_embedding_space_change(
+                        route_name, default, corpus_profile
+                    )
                 if not caps.get("embedding_dim") and default.native_dim:
                     caps["embedding_dim"] = default.native_dim
+
+    def _note_embedding_space_change(
+        self,
+        route_name: str,
+        chosen: "EmbeddingModelInfo",
+        corpus_profile: Optional[Dict[str, Any]],
+    ) -> None:
+        """Record + loudly log an auto-default that changes the corpus space (#2366).
+
+        When a non-empty corpus exists and the freshly auto-resolved model does
+        NOT match its dominant profile, new memories will land in a different
+        embedding space than the existing ones. That is a real (if contained)
+        recall split, so we log a warning and stash a structured record that the
+        settings GET surfaces (the UI's mismatch banner renders it).
+        """
+        if not corpus_profile:
+            return
+        from .embedding_discovery import normalize_embedding_model_id
+
+        dominant_model = corpus_profile.get("model")
+        if not dominant_model:
+            return
+        if normalize_embedding_model_id(chosen.id) == normalize_embedding_model_id(
+            dominant_model
+        ):
+            return
+        warning = {
+            "route": route_name,
+            "chosen_model": chosen.id,
+            "corpus_model": dominant_model,
+            "corpus_dim": corpus_profile.get("dim"),
+            "corpus_space_id": corpus_profile.get("space_id"),
+            "corpus_row_count": corpus_profile.get("row_count"),
+        }
+        logger.warning(
+            "Auto-resolved embedding model for %s (%s) changes the embedding "
+            "space away from the corpus's dominant profile (%s @%s, %s rows). "
+            "New memories will not be comparable to existing ones until a "
+            "re-embed — set an explicit embedding model or re-embed to keep one "
+            "space.",
+            route_name,
+            chosen.id,
+            dominant_model,
+            corpus_profile.get("dim"),
+            corpus_profile.get("row_count"),
+        )
+        warnings = getattr(self, "_embedding_space_change_warnings", None)
+        if not isinstance(warnings, dict):
+            warnings = {}
+            self._embedding_space_change_warnings = warnings
+        warnings[route_name] = warning
+
+    async def _get_corpus_embedding_profile(self) -> Optional[Dict[str, Any]]:
+        """Return the DB's dominant existing embedding profile, or ``None`` (#2366).
+
+        Delegates to a provider callback wired by the agent
+        (:meth:`LLMService.set_corpus_embedding_profile_provider`) so the LLM
+        service stays storage-agnostic. Best-effort: any failure (no callback,
+        empty corpus, unreadable table) yields ``None`` and the caller falls
+        back to hint/catalog order.
+        """
+        callback = getattr(self, "_corpus_embedding_profile_provider", None)
+        if callback is None:
+            return None
+        try:
+            import inspect
+
+            result = callback()
+            if inspect.isawaitable(result):
+                result = await result
+            return result or None
+        except Exception as exc:  # pragma: no cover - never break reconcile
+            logger.debug("corpus embedding profile lookup failed: %s", exc)
+            return None
 
     def clear_embedding_discovery_cache(self) -> None:
         """Drop the per-instance embedding-discovery cache to force rediscovery."""
