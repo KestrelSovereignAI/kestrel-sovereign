@@ -403,6 +403,118 @@ async def test_null_vector_on_target_profile_is_still_stale(db):
     assert await reindexer.count_stale("document_chunks") == 0
 
 
+def test_reindex_refuses_when_resolved_db_missing(tmp_path, capsys):
+    # reindex/audit are maintenance verbs over an existing corpus. A
+    # --data-dir with no kestrel_prime.db must refuse with a non-zero exit
+    # rather than let the driver create an empty DB and count zero rows
+    # (the confident false success #2327 is about).
+    import argparse
+
+    from kestrel_sovereign import cli_embeddings
+
+    args = argparse.Namespace(
+        embeddings_command="reindex",
+        table=None,
+        agent_id=None,
+        agent_name=None,
+        data_dir=str(tmp_path),  # empty dir — no kestrel_prime.db
+        batch=10,
+        rate_limit=0.0,
+        dry_run=True,
+        yes=False,
+    )
+    rc = cli_embeddings.run(args)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no database found" in err
+    assert "will not create a new" in err
+
+
+def test_resolve_db_target_refuses_db_path_with_multi_agent_roster(monkeypatch):
+    # KESTREL_DB_PATH set + a multi_agent.toml roster + no explicit selector
+    # must refuse rather than let KESTREL_DB_PATH silently pick the DB (#2327).
+    import argparse
+
+    from kestrel_sovereign import cli_embeddings
+
+    monkeypatch.setenv("KESTREL_DB_PATH", "/tmp/agent_data/claw")
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.setattr(
+        cli_embeddings,
+        "_discover_local_agents",
+        lambda: {"wren": "/tmp/agent_data/wren"},
+    )
+
+    args = argparse.Namespace(agent_name=None, data_dir=None)
+    err, pg_url, sqlite_path = cli_embeddings._resolve_db_target(args)
+    assert pg_url is None and sqlite_path is None
+    assert err is not None
+    assert "KESTREL_DB_PATH is set" in err
+    assert "wren" in err
+    assert "--agent-name" in err
+
+
+def test_resolve_db_target_honors_db_path_without_roster(monkeypatch):
+    # No roster → KESTREL_DB_PATH still resolves as the server default.
+    import argparse
+
+    from kestrel_sovereign import cli_embeddings
+
+    monkeypatch.setenv("KESTREL_DB_PATH", "/tmp/solo")
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+    monkeypatch.setattr(cli_embeddings, "_discover_local_agents", lambda: {})
+
+    args = argparse.Namespace(agent_name=None, data_dir=None)
+    err, pg_url, sqlite_path = cli_embeddings._resolve_db_target(args)
+    assert err is None and pg_url is None
+    assert sqlite_path == "/tmp/solo/kestrel_prime.db"
+
+
+def test_resolve_db_target_refuses_db_path_from_kestrel_home(monkeypatch, tmp_path):
+    # The multi-agent guard must hold even when the command runs OUTSIDE the
+    # project root: discovery is anchored on paths.project_dir() (KESTREL_HOME
+    # aware), not os.getcwd(). Without mocking _discover_local_agents, set up a
+    # real KESTREL_HOME whose multi_agent.toml defines an agent, chdir
+    # elsewhere, set KESTREL_DB_PATH, and confirm the refusal still fires
+    # rather than KESTREL_DB_PATH silently winning (#2327).
+    import argparse
+    import os
+
+    from kestrel_sovereign import cli_embeddings
+
+    home = tmp_path / "home"
+    (home / "agent_data" / "wren").mkdir(parents=True)
+    # A real (empty-but-present) DB file so the roster's relative data_dir
+    # resolves against the home, not cwd.
+    (home / "agent_data" / "wren" / "kestrel_prime.db").write_text("")
+    (home / "multi_agent.toml").write_text(
+        "[agents.wren]\n"
+        'data_dir = "agent_data/wren"\n'
+        "port = 8801\n"
+    )
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path / "wrong" / "claw"))
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_DB_BACKEND", raising=False)
+
+    args = argparse.Namespace(agent_name=None, data_dir=None)
+    err, pg_url, sqlite_path = cli_embeddings._resolve_db_target(args)
+    assert pg_url is None and sqlite_path is None
+    assert err is not None
+    assert "KESTREL_DB_PATH is set" in err
+    assert "wren" in err
+
+
 @pytest.mark.asyncio
 async def test_load_persisted_embedding_route(db):
     from kestrel_sovereign import cli_embeddings
