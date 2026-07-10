@@ -94,8 +94,9 @@ async def test_port_allocator_seeds_past_configured_ports(tmp_path):
             data_dir=Path("agent_data/Kestrel"), port=8801, autostart=False,
         ),
     })
-    await manager.load_from_config(config)   # loads nothing (autostart=False) but must seed
-    assert manager._port_seq >= 8801, "allocator seeded past every configured port"
+    await manager.load_from_config(config)   # loads nothing (autostart=False) but must reserve
+    assert 8801 in manager._reserved_ports, "configured port reserved"
+    assert manager._allocate_port() != 8801, "allocation skips the configured port"
 
 
 @pytest.mark.asyncio
@@ -115,7 +116,11 @@ async def test_port_allocator_accounts_for_the_host_port(tmp_path):
         },
     )
     await manager.load_from_config(config)
-    assert manager._port_seq >= 9001, "allocator seeded past the host port"
+    assert 9001 in manager._reserved_ports, "host port reserved"
+    assert 8801 in manager._reserved_ports, "agent port reserved"
+    allocated = manager._allocate_port()
+    assert allocated not in (8801, 9001), "allocation avoids host + agent ports"
+    assert allocated < 9001, "a high host port must NOT starve the lower free range (codex round 6)"
 
 
 def test_save_is_atomic_on_write_failure(tmp_path, monkeypatch):
