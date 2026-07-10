@@ -369,6 +369,15 @@ class MultiAgentConfig(BaseModel):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 toml.dump(data, f)
+            # mkstemp minted 0600 — carrying that onto the target would strip
+            # group/other readability an operator granted (a config another
+            # service account reads). Preserve the existing mode; default new
+            # files to the conventional 0644 (codex P2 round 7).
+            try:
+                mode = path.stat().st_mode & 0o7777 if path.exists() else 0o644
+                os.chmod(tmp_path, mode)
+            except OSError:
+                pass  # never fail the save over metadata
             os.replace(tmp_path, path)
         except BaseException:
             try:

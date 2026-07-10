@@ -145,3 +145,42 @@ def test_save_is_atomic_on_write_failure(tmp_path, monkeypatch):
     assert config_path.read_text() == original, "original registry untouched by the failed write"
     leftovers = list(tmp_path.glob(".multi_agent.toml.*"))
     assert leftovers == [], "no temp-file litter after failure"
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_registered_but_unloaded_names(tmp_path):
+    """codex P2 round 7: remote / autostart=false agents aren't in the
+    manager's loaded set — creating their name silently replaced the
+    registration in the toml."""
+    from kestrel_sovereign.multi_agent.config import RemoteAgentConfig
+
+    config = MultiAgentConfig(agents={
+        "Remotey": RemoteAgentConfig(url="http://elsewhere:9000"),
+    })
+    manager = MagicMock()
+    manager.create_agent = AsyncMock()
+    req = _request_with_state(
+        agent_manager=manager,
+        multi_agent_config=config,
+        multi_agent_config_path=tmp_path / "multi_agent.toml",
+    )
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        await create_agent.__wrapped__(req, CreateAgentRequest(name="remotey"))
+    assert exc.value.status_code == 409
+    manager.create_agent.assert_not_awaited()
+
+
+def test_atomic_save_preserves_file_mode(tmp_path):
+    """codex P2 round 7: mkstemp's 0600 must not strip operator-granted
+    permissions from an existing config on rewrite."""
+    import os
+    config_path = tmp_path / "multi_agent.toml"
+    config = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+    })
+    config.save(config_path)
+    os.chmod(config_path, 0o664)
+    config.agents["Two"] = LocalAgentConfig(data_dir=Path("agent_data/Two"), port=8802)
+    config.save(config_path)
+    assert (config_path.stat().st_mode & 0o777) == 0o664, "existing mode preserved across atomic replace"

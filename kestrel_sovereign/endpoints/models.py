@@ -150,6 +150,20 @@ async def create_agent(request: Request, body: CreateAgentRequest):
             detail="Agent name must start with a letter and contain only letters, numbers, hyphens, or underscores.",
         )
 
+    # A name can be REGISTERED without being LOADED (remote agents,
+    # autostart=false locals) — the manager's duplicate check only sees loaded
+    # agents, so creation would silently REPLACE that registration in
+    # multi_agent.toml (codex P2 round 7). Case-insensitive: the toml is the
+    # routing namespace and case-folded collisions are operator error.
+    ma_config_pre = getattr(request.app.state, 'multi_agent_config', None)
+    if ma_config_pre is not None:
+        taken = {existing.lower() for existing in getattr(ma_config_pre, 'agents', {})}
+        if name.lower() in taken:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An agent named '{name}' is already registered in the multi-agent config.",
+            )
+
     try:
         agent = await agent_manager.create_agent(name)
         # Persist the registration when the deployment is config-file-driven
