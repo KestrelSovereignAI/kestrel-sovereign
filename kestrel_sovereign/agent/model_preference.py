@@ -140,9 +140,24 @@ class ModelPreferenceMixin:
                 return
             route = json.loads(result[0][0])
             # ``route`` may be a string (explicit selector) or None (auto).
+            # Boot applies the persisted value WITHOUT the live upstream probe
+            # that explicit sets run (#2326): probing at boot could fail startup
+            # on a transient upstream outage. Instead we log loudly so a
+            # persisted route that is dead upstream is visible in the boot logs
+            # (the write path still degrades gracefully to keyword search).
             self.llm_service.set_embedding_route(route, persist=False)
-            if route:
-                logging.info("Loaded persisted embedding_route: %s", route)
+            if route and route != "none":
+                logging.warning(
+                    "Loaded persisted embedding_route %r without a live upstream "
+                    "probe (#2326): if the route's model is not currently served, "
+                    "storage writes will degrade to keyword search. Re-set it via "
+                    "the settings API/UI to live-validate.",
+                    route,
+                )
+            elif route == "none":
+                logging.info(
+                    "Loaded persisted embedding_route: none (embeddings disabled)"
+                )
             else:
                 logging.info("Loaded persisted embedding_route: auto (follow chat)")
         except Exception as e:

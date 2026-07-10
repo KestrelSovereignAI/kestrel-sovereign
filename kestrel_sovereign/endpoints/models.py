@@ -1490,7 +1490,11 @@ async def set_embedding_settings(request: Request):
             raise HTTPException(status_code=503, detail="LLM service not available.")
 
         try:
-            agent.llm_service.set_embedding_route(route)
+            # Async set (#2326): after static validation, a cloud route is
+            # live-probed with a canary embed so a listed-but-dead upstream
+            # model (e.g. OpenRouter empty provider pool) is refused here rather
+            # than silently 404'ing to keyword fallback on the next write.
+            await agent.llm_service.aset_embedding_route(route)
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 

@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -706,6 +707,163 @@ def test_set_embedding_route_validation_rejects_unknown_and_non_embedding():
     # The good route still sets.
     service.set_embedding_route("openai:api")
     assert service.get_embedding_route() == "openai:api"
+
+
+# --- #2326 live upstream probe on explicit set -------------------------------
+
+
+class _ProbeAdapter:
+    """Adapter whose embed either raises or returns a fixed vector, so the
+    #2326 live-probe path can be exercised without a real provider."""
+
+    def __init__(self, *, raise_exc: Optional[Exception] = None, vector=None):
+        self._raise_exc = raise_exc
+        self._vector = vector if vector is not None else [0.1, 0.2, 0.3]
+
+    def provider_capabilities(self):
+        return OpenAIAdapter().provider_capabilities()
+
+    async def aembed(self, client, text, model=None):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return self._vector
+
+    async def aembed_batch(self, client, texts, model=None):
+        return [self._vector for _ in texts]
+
+
+def _probe_service(providers):
+    service = LLMService.__new__(LLMService)
+    service.providers = list(providers)
+    service._disabled_routes = {}
+    service._embedding_route = None
+    service._embedding_route_persistence_callback = None
+    return service
+
+
+async def test_aset_embedding_route_refuses_dead_upstream_cloud_route():
+    """#2326 — a cloud route that passes static validation but whose upstream
+    model is dead (aembed 404s) is refused with the upstream error surfaced."""
+    import pytest
+
+    dead = _route(
+        "openrouter:api", "openrouter",
+        _ProbeAdapter(raise_exc=Exception(
+            "Error code: 404 - No endpoints found for qwen/qwen3-embedding-0.6b."
+        )),
+    )
+    service = _probe_service([dead])
+
+    with pytest.raises(ValueError, match="live embedding probe failed"):
+        await service.aset_embedding_route("openrouter:api")
+    # The knob must NOT have been set — refusing means the prior state stands.
+    assert service.get_embedding_route() is None
+
+
+async def test_aset_embedding_route_refuses_when_probe_returns_no_vector():
+    """#2326 — an upstream that returns no embedding (None/empty) is refused."""
+    import pytest
+
+    empty = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[]))
+    service = _probe_service([empty])
+
+    with pytest.raises(ValueError, match="returned no embedding"):
+        await service.aset_embedding_route("openrouter:api")
+    assert service.get_embedding_route() is None
+
+
+async def test_aset_embedding_route_accepts_live_cloud_route():
+    """#2326 — a cloud route whose canary probe succeeds is accepted and set."""
+    live = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[0.4, 0.5]))
+    service = _probe_service([live])
+
+    await service.aset_embedding_route("openrouter:api")
+    assert service.get_embedding_route() == "openrouter:api"
+
+
+async def test_aset_embedding_route_skips_probe_for_local_route():
+    """#2326 — local routes are not live-probed (the empty-pool failure mode is
+    a cloud-meta-provider property); a would-be-failing local adapter still
+    sets."""
+    local = _route(
+        "ollama:local", "ollama",
+        _ProbeAdapter(raise_exc=Exception("would fail if probed")),
+        is_local=True,
+    )
+    service = _probe_service([local])
+
+    await service.aset_embedding_route("ollama:local")
+    assert service.get_embedding_route() == "ollama:local"
+
+
+async def test_aset_embedding_route_refuses_disabled_route():
+    """#2326 — a route that statically matches an embedding-capable provider but
+    is currently disabled (``_disabled_routes``) resolves to no *available*
+    probe target. Committing it would degrade every write to keyword fallback
+    with no probe, so the set is refused rather than silently accepted."""
+    import pytest
+
+    disabled = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[0.1]))
+    service = _probe_service([disabled])
+    service._disabled_routes = {"openrouter:api": "auth_failed"}
+
+    with pytest.raises(ValueError, match="not currently available"):
+        await service.aset_embedding_route("openrouter:api")
+    assert service.get_embedding_route() is None
+
+
+async def test_aset_embedding_route_still_enforces_static_validation():
+    """#2326 — the async setter runs static validation first: an unknown route
+    is refused before any probe."""
+    import pytest
+
+    openai = _route("openai:api", "openai", _ProbeAdapter(vector=[0.1]))
+    service = _probe_service([openai])
+
+    with pytest.raises(ValueError, match="no configured route matches"):
+        await service.aset_embedding_route("gemini:api")
+
+
+async def test_aset_embedding_route_none_and_auto_skip_probe():
+    """#2326 — the ``none`` off-switch and ``auto`` clear are never probed."""
+    live = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[0.1]))
+    service = _probe_service([live])
+
+    await service.aset_embedding_route("none")
+    assert service.get_embedding_route() == "none"
+    await service.aset_embedding_route("auto")
+    assert service.get_embedding_route() is None
+
+
+async def test_load_persisted_embedding_route_dead_route_logs_loud_no_crash(caplog):
+    """#2326 — boot-time load of a persisted (possibly dead-upstream) route does
+    NOT probe: it applies via the sync setter and logs loudly, never crashing."""
+    import logging as _logging
+
+    from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
+
+    mixin = ModelPreferenceMixin.__new__(ModelPreferenceMixin)
+    mixin.agent_id = "a1"
+
+    dead = _route("openrouter:api", "openrouter", _ProbeAdapter(
+        raise_exc=Exception("404 - No endpoints found")))
+    llm = _probe_service([dead])
+    mixin.llm_service = llm
+
+    class _DB:
+        async def fetchall(self, *_a, **_k):
+            return [(json.dumps("openrouter:api"),)]
+
+    mixin._raw_storage = SimpleNamespace(db=_DB())
+
+    with caplog.at_level(_logging.WARNING):
+        await mixin._load_embedding_route()
+
+    # No crash, route applied without a live probe, and a loud warning emitted.
+    assert llm.get_embedding_route() == "openrouter:api"
+    assert any(
+        "without a live upstream probe" in r.getMessage() for r in caplog.records
+    )
 
 
 # --- #2287 first-class "none" (embeddings deliberately off) ------------------
