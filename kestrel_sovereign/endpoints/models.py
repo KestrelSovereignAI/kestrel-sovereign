@@ -153,9 +153,25 @@ async def create_agent(request: Request, body: CreateAgentRequest):
     # A name can be REGISTERED without being LOADED (remote agents,
     # autostart=false locals) — the manager's duplicate check only sees loaded
     # agents, so creation would silently REPLACE that registration in
-    # multi_agent.toml (codex P2 round 7). Case-insensitive: the toml is the
-    # routing namespace and case-folded collisions are operator error.
-    ma_config_pre = getattr(request.app.state, 'multi_agent_config', None)
+    # multi_agent.toml (codex P2 round 7). Check against the CURRENT ON-DISK
+    # config, not the startup-time snapshot: an operator can edit the file
+    # while the server runs, and saving the stale snapshot back would discard
+    # every external change (codex P1 round 10). Case-insensitive: the toml is
+    # the routing namespace and case-folded collisions are operator error.
+    def _current_config():
+        cfg_path = getattr(request.app.state, 'multi_agent_config_path', None)
+        if cfg_path:
+            from kestrel_sovereign.multi_agent.config import MultiAgentConfig as _MAC
+            try:
+                return _MAC.from_file(cfg_path), cfg_path
+            except Exception as reload_err:
+                logger.warning(
+                    f"Could not reload {cfg_path} ({reload_err}); "
+                    "using the startup-time config for this operation."
+                )
+        return getattr(request.app.state, 'multi_agent_config', None), cfg_path
+
+    ma_config_pre, _ = _current_config()
     if ma_config_pre is not None:
         taken = {existing.lower() for existing in getattr(ma_config_pre, 'agents', {})}
         if name.lower() in taken:
@@ -173,14 +189,18 @@ async def create_agent(request: Request, body: CreateAgentRequest):
         # agent_data/ and need no write. Best-effort: a persistence failure is
         # SURFACED in the response, never a rollback of the live agent.
         persisted = None
-        config_path = getattr(request.app.state, 'multi_agent_config_path', None)
-        ma_config = getattr(request.app.state, 'multi_agent_config', None)
+        # RE-read the on-disk config for the merge (codex P1 round 10): the
+        # inception above awaited, so even our own pre-check snapshot may be
+        # stale. The fresh object carries every external edit forward.
+        ma_config, config_path = _current_config()
         if config_path and ma_config is not None:
             try:
                 created_cfg = agent_manager._created_configs.get(name)
                 if created_cfg is not None:
                     ma_config.agents[name] = created_cfg
                     ma_config.save(config_path)
+                    # Keep the app-state snapshot current for the next reader.
+                    request.app.state.multi_agent_config = ma_config
                     persisted = True
             except Exception as persist_err:
                 logger.error(

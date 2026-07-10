@@ -369,9 +369,20 @@ class MultiAgentConfig(BaseModel):
         # followed the link. Resolve to the real target and replace that.
         if path.exists():
             path = path.resolve()
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
-        )
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+            )
+        except OSError:
+            # The parent directory isn't writable but the FILE may be (a
+            # group-writable config under an operator-owned directory) — the
+            # in-place write this strategy replaced handled that fine. Fall
+            # back to it: non-atomic, but strictly better than refusing to
+            # persist at all (codex P2 round 10).
+            with open(path, "w", encoding="utf-8") as f:
+                toml.dump(data, f)
+            logger.info(f"Saved multi_agent config to {path} (in-place: parent dir not writable)")
+            return
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 toml.dump(data, f)
@@ -390,9 +401,14 @@ class MultiAgentConfig(BaseModel):
                     st = path.stat()
                     os.chmod(tmp_path, st.st_mode & 0o7777)
                     try:
-                        os.chown(tmp_path, -1, st.st_gid)
+                        # uid preservation only works as root; gid works with
+                        # membership — try both, degrade per-field (round 10).
+                        os.chown(tmp_path, st.st_uid, st.st_gid)
                     except (OSError, AttributeError):
-                        pass  # non-POSIX or not a member of the group
+                        try:
+                            os.chown(tmp_path, -1, st.st_gid)
+                        except (OSError, AttributeError):
+                            pass  # non-POSIX or not a member of the group
                 else:
                     current_umask = os.umask(0)
                     os.umask(current_umask)

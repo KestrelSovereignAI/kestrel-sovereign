@@ -220,3 +220,55 @@ def test_atomic_save_writes_through_symlinks(tmp_path):
     assert link.is_symlink(), "the symlink survives the save"
     reloaded = MultiAgentConfig.from_file(real)
     assert "Two" in reloaded.agents, "the TARGET received the update"
+
+
+@pytest.mark.asyncio
+async def test_create_merges_with_the_current_on_disk_config(tmp_path):
+    """codex P1 round 10: saving the startup-time snapshot discarded every
+    external edit made to the toml after boot — the merge must start from the
+    CURRENT file."""
+    config_path = tmp_path / "multi_agent.toml"
+    startup = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+    })
+    startup.save(config_path)
+    # An operator adds an agent AFTER startup, directly in the file.
+    edited = MultiAgentConfig.from_file(config_path)
+    edited.agents["HandEdited"] = LocalAgentConfig(data_dir=Path("agent_data/HandEdited"), port=8805)
+    edited.save(config_path)
+
+    manager = MagicMock()
+    manager.create_agent = AsyncMock(return_value=SimpleNamespace(agent_id="did:x:n"))
+    manager._created_configs = {"Newbie": LocalAgentConfig(data_dir=Path("agent_data/Newbie"), port=8806)}
+    req = _request_with_state(
+        agent_manager=manager,
+        multi_agent_config=startup,          # STALE snapshot
+        multi_agent_config_path=config_path,
+    )
+    result = await create_agent.__wrapped__(req, CreateAgentRequest(name="Newbie"))
+    assert result["persisted"] is True
+    reloaded = MultiAgentConfig.from_file(config_path)
+    assert "HandEdited" in reloaded.agents, "external edit survives the create"
+    assert "Newbie" in reloaded.agents
+    assert "Kestrel" in reloaded.agents
+
+
+def test_save_falls_back_to_in_place_when_parent_dir_unwritable(tmp_path):
+    """codex P2 round 10: group-writable file under an unwritable directory —
+    the pre-atomic behavior persisted fine; refuse to regress it."""
+    import os
+    subdir = tmp_path / "etcish"
+    subdir.mkdir()
+    config_path = subdir / "multi_agent.toml"
+    config = MultiAgentConfig(agents={
+        "Kestrel": LocalAgentConfig(data_dir=Path("agent_data/Kestrel"), port=8801),
+    })
+    config.save(config_path)
+    os.chmod(subdir, 0o555)   # dir read/exec only; the FILE stays writable
+    try:
+        config.agents["Two"] = LocalAgentConfig(data_dir=Path("agent_data/Two"), port=8802)
+        config.save(config_path)   # must not raise
+        reloaded = MultiAgentConfig.from_file(config_path)
+        assert "Two" in reloaded.agents, "in-place fallback persisted the update"
+    finally:
+        os.chmod(subdir, 0o755)
