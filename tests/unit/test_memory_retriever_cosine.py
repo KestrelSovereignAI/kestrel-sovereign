@@ -146,6 +146,20 @@ def test_score_semantic_uses_cosine_when_embeddings_present():
     assert score == pytest.approx(0.7)
 
 
+def test_score_semantic_projects_model_specific_cosine_floor():
+    retriever = MemoryRetriever(MagicMock())
+    score = retriever._score_semantic(
+        content="no literal overlap",
+        query="aquatic companion",
+        expanded_concepts=[],
+        semantic_similarity=0.4,
+        vector_cosine_floor=0.2,
+    )
+
+    # (0.4 - 0.2) / (1 - 0.2) = 0.25, then 70% semantic core weight.
+    assert score == pytest.approx(0.175)
+
+
 def test_score_semantic_falls_back_to_keyword_without_embeddings():
     """No embeddings → keyword overlap. Verifies the original
     behaviour is unchanged on rows without embeddings."""

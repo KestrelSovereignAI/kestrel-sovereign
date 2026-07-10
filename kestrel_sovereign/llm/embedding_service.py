@@ -15,6 +15,59 @@ from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
 logger = logging.getLogger(__name__)
 
 
+MEMORY_RETRIEVAL_INSTRUCTION = (
+    "Retrieve conversation memories that are relevant to the query"
+)
+EPISODE_RETRIEVAL_INSTRUCTION = (
+    "Retrieve memory episodes that are relevant to the query"
+)
+
+
+def _is_qwen3_embedding_model(model: Optional[str]) -> bool:
+    """Return whether ``model`` uses Qwen3's asymmetric query contract."""
+    normalized = (model or "").lower().replace("_", "-")
+    return "qwen3-embedding" in normalized
+
+
+def _prepare_retrieval_query(
+    text: str,
+    model: Optional[str],
+    instruction: str,
+    query_format: Optional[str] = None,
+) -> str:
+    """Apply a model's documented retrieval-query representation.
+
+    Qwen3-Embedding expects instructions on queries, while stored documents
+    remain unchanged. Providers that manage this server-side can declare the
+    ``raw`` format; ``qwen3`` forces client-side formatting. With no explicit
+    capability, the model name selects the documented Qwen3 contract.
+    """
+    normalized_format = (query_format or "").strip().lower()
+    if normalized_format == "raw":
+        return text
+    if normalized_format == "qwen3" or (
+        not normalized_format and _is_qwen3_embedding_model(model)
+    ):
+        return f"<Instruct>: {instruction}\n<Query>: {text}"
+    return text
+
+
+def _retrieval_similarity_floor(
+    model: Optional[str], override: Optional[float] = None
+) -> float:
+    """Return the calibrated raw-cosine no-match floor for ``model``.
+
+    Qwen3-Embedding's instructed queries showed an unrelated-corpus band near
+    0.30 and useful paraphrases beginning near 0.35 in the live Kestrel
+    dogfood corpus. A 0.20 projection floor preserves that mid-band while the
+    public semantic eligibility threshold rejects the measured noise. Models
+    without live calibration retain the historical zero floor.
+    """
+    if override is not None:
+        return max(0.0, min(0.99, float(override)))
+    return 0.20 if _is_qwen3_embedding_model(model) else 0.0
+
+
 @dataclass(frozen=True)
 class EmbeddingProfile:
     """Identity of an embedding configuration (#1477).
@@ -238,6 +291,21 @@ class EmbeddingService:
             self._handle_embed_error(e, "Async embedding failed")
             return None
 
+    async def aembed_query(
+        self,
+        text: str,
+        *,
+        instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
+    ) -> Optional[List[float]]:
+        """Embed a retrieval query using the model's query-side contract."""
+        return await self.aembed(
+            _prepare_retrieval_query(text, self.model, instruction)
+        )
+
+    def retrieval_similarity_floor(self) -> float:
+        """Raw-cosine floor used to project retrieval relevance."""
+        return _retrieval_similarity_floor(self.model)
+
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         """
         Generate embeddings for multiple texts (async).
@@ -280,6 +348,7 @@ class EmbeddingService:
         known_dims = {
             "nomic-embed-text": 768,
             "mxbai-embed-large": 1024,
+            "qwen3-embedding:0.6b": 1024,
         }
         dim = known_dims.get(self.model)
         if not dim:
@@ -324,6 +393,8 @@ class ProviderEmbeddingService:
         capabilities = provider.get("capabilities") or {}
         self.model = capabilities.get("embedding_model")
         self.embedding_dim = capabilities.get("embedding_dim")
+        self._query_format = capabilities.get("embedding_query_format")
+        self._similarity_floor = capabilities.get("embedding_similarity_floor")
         # #1477 normalization flag — capability-declared; defaults to
         # False because most providers (OpenAI, Vertex, Ollama
         # nomic-embed-text) return raw vectors and let the caller
@@ -373,6 +444,23 @@ class ProviderEmbeddingService:
             text,
             model=self.model,
         )
+
+    async def aembed_query(
+        self,
+        text: str,
+        *,
+        instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
+    ) -> Optional[List[float]]:
+        """Embed a retrieval query using the model's query-side contract."""
+        return await self.aembed(
+            _prepare_retrieval_query(
+                text, self.model, instruction, self._query_format
+            )
+        )
+
+    def retrieval_similarity_floor(self) -> float:
+        """Raw-cosine floor used to project retrieval relevance."""
+        return _retrieval_similarity_floor(self.model, self._similarity_floor)
 
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         return await self.adapter.aembed_batch(

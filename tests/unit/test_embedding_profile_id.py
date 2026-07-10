@@ -204,6 +204,62 @@ def test_provider_embedding_service_falls_back_to_name_when_no_vendor():
     assert profile.provider == "openai:api"  # falls back to ``name``
 
 
+@pytest.mark.asyncio
+async def test_qwen3_query_uses_documented_instruction_format():
+    provider = _stub_provider(vendor="ollama", model="qwen3-embedding:0.6b", dim=1024)
+    provider["adapter"].aembed = AsyncMock(return_value=[0.1, 0.2])
+    service = ProviderEmbeddingService(provider)
+
+    result = await service.aembed_query("unusual aquatic pet")
+
+    assert result == [0.1, 0.2]
+    provider["adapter"].aembed.assert_awaited_once_with(
+        provider["client"],
+        "<Instruct>: Retrieve conversation memories that are relevant to the query\n"
+        "<Query>: unusual aquatic pet",
+        model="qwen3-embedding:0.6b",
+    )
+    assert service.retrieval_similarity_floor() == pytest.approx(0.2)
+
+
+@pytest.mark.asyncio
+async def test_symmetric_model_keeps_retrieval_query_unchanged():
+    provider = _stub_provider()
+    provider["adapter"].aembed = AsyncMock(return_value=[0.1])
+    service = ProviderEmbeddingService(provider)
+
+    await service.aembed_query("literal query")
+
+    provider["adapter"].aembed.assert_awaited_once_with(
+        provider["client"],
+        "literal query",
+        model="text-embedding-3-small",
+    )
+    assert service.retrieval_similarity_floor() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_provider_can_disable_qwen_client_side_query_formatting():
+    provider = _stub_provider(
+        vendor="managed-api",
+        model="qwen3-embedding-8b",
+        dim=4096,
+        embedding_query_format="raw",
+        embedding_similarity_floor=0.31,
+    )
+    provider["adapter"].aembed = AsyncMock(return_value=[0.1])
+    service = ProviderEmbeddingService(provider)
+
+    await service.aembed_query("server formats this")
+
+    provider["adapter"].aembed.assert_awaited_once_with(
+        provider["client"],
+        "server formats this",
+        model="qwen3-embedding-8b",
+    )
+    assert service.retrieval_similarity_floor() == pytest.approx(0.31)
+
+
 # --- EmbeddingService (legacy Ollama) describe --------------------------------
 
 

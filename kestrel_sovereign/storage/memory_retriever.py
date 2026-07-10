@@ -41,7 +41,12 @@ from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
 from .memory_models import MemoryMetadata
-from .async_conversation_store import AsyncConversationStore
+from .async_conversation_store import (
+    AsyncConversationStore,
+    _strip_search_wrappers,
+    _token_match_score,
+    _tokenize_for_search,
+)
 from .associative_linker import AssociativeLinker
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
@@ -159,6 +164,7 @@ class MemoryRetriever:
         self.linker = linker
         self._access_update_tasks: set[asyncio.Task[None]] = set()
         self._sqla_factory_unavailable = False
+        self._unprofiled_lexical_scan_warned = False
 
     async def retrieve(
         self,
@@ -194,6 +200,35 @@ class MemoryRetriever:
         # because it's already scoped via self.agent_id in the store
         history = await self.conversations.get_conversation_history(limit=1000)
         query_embedding = await self._embed_query(query)
+        vector_cosine_floor = self._query_similarity_floor()
+
+        current_profile_id: Optional[str] = None
+        embedding_service_for_profile = getattr(
+            self.conversations, "embedding_service", None
+        )
+        if embedding_service_for_profile is not None and hasattr(
+            embedding_service_for_profile, "current_profile_id"
+        ):
+            try:
+                current_profile_id = (
+                    embedding_service_for_profile.current_profile_id()
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "current_profile_id() failed during retriever load: %s",
+                    exc,
+                )
+        if (
+            query_embedding is not None
+            and current_profile_id is None
+            and not self._unprofiled_lexical_scan_warned
+        ):
+            logger.warning(
+                "Embedding service has no profile id; memory retrieval must "
+                "lexically scan the full live corpus until the model is "
+                "profiled or backfilled."
+            )
+            self._unprofiled_lexical_scan_warned = True
 
         # Recent history is only one candidate source. Pinned and important
         # rows must remain recallable after they age beyond that window.
@@ -207,19 +242,24 @@ class MemoryRetriever:
             logger.debug("Salient memory candidate generation unavailable: %s", exc)
             salient = []
         lexical: List[Dict[str, Any]] = []
-        if query_embedding is None:
-            try:
-                # Encrypted content cannot use plaintext SQL FTS. The lexical
-                # fallback deliberately scans the corpus in bounded pages;
-                # vector-capable routes avoid that O(N) fallback entirely.
-                lexical = await self.conversations.get_lexical_memory_candidates(
-                    query, limit=max(100, limit * 10)
-                )
-                if not isinstance(lexical, list):
-                    lexical = []
-            except Exception as exc:  # noqa: BLE001 - lexical fallback is optional
-                logger.debug("Lexical memory candidate generation unavailable: %s", exc)
+        try:
+            # Always cover rows outside the active vector space. A deployment
+            # is commonly mixed during backfill/model migration; treating one
+            # non-empty kNN result as proof that every row is embedded makes
+            # exact legacy facts permanently invisible. When no query vector
+            # exists, scan every live row as the complete fallback.
+            lexical = await self.conversations.get_lexical_memory_candidates(
+                query,
+                limit=max(100, limit * 10),
+                excluded_embedding_profile_id=(
+                    current_profile_id if query_embedding is not None else None
+                ),
+            )
+            if not isinstance(lexical, list):
                 lexical = []
+        except Exception as exc:  # noqa: BLE001 - candidate source is degradable
+            logger.warning("Lexical memory candidate generation unavailable: %s", exc)
+            lexical = []
         by_id = {
             str(row.get("id")): row
             for row in [*history, *salient, *lexical]
@@ -245,23 +285,6 @@ class MemoryRetriever:
         # #1477 — only compare rows stamped with the current embedding
         # profile id. Cross-profile rows return as absent from the vector
         # signal and naturally fall through to keyword overlap.
-        current_profile_id: Optional[str] = None
-        embedding_service_for_profile = getattr(
-            self.conversations, "embedding_service", None
-        )
-        if embedding_service_for_profile is not None and hasattr(
-            embedding_service_for_profile, "current_profile_id"
-        ):
-            try:
-                current_profile_id = (
-                    embedding_service_for_profile.current_profile_id()
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug(
-                    "current_profile_id() failed during retriever load: %s",
-                    exc,
-                )
-
         # If we have a query embedding, ask the sovereign vector backend for
         # per-row semantic similarities. We still score the full recent-history
         # slice below so emotional/importance/recency/access/certainty ranking
@@ -274,6 +297,13 @@ class MemoryRetriever:
                 current_profile_id=current_profile_id,
                 k=max(200, limit * 20),
             )
+
+            # Active-profile rows are represented by this bounded kNN source;
+            # lexical scanning below deliberately covers rows *outside* that
+            # space. Searching every active embedded row lexically would turn
+            # every healthy encrypted-vector query into an O(total corpus)
+            # decrypt pass. Keep k comfortably above the rendered result count
+            # and rely on embedding backfill/profile audits for coverage.
 
             # Vector kNN searches the whole live corpus. Hydrate older hits so
             # reranking is not constrained to recent/salient seed rows.
@@ -341,6 +371,20 @@ class MemoryRetriever:
 
         for msg in history:
             content = msg.get("content", "")
+            metadata = msg.get("metadata", {}) or {}
+
+            # Operator/signal transport and explicit commands are control
+            # plane records, not autobiographical memories. They can contain
+            # vocabulary that spuriously dominates kNN (especially the query
+            # embedded in a prior !memory command), so fail closed here.
+            if metadata.get("operator_signal") or metadata.get("signal_wake"):
+                continue
+            raw_user_content = (
+                extract_raw_user_content(content)
+                if msg.get("role") == "user" else content
+            )
+            if msg.get("role") == "user" and raw_user_content.lstrip().startswith("!"):
+                continue
 
             # Skip messages that are near-duplicates of the current query.
             # This is the ONLY echo guard now — the prior blanket
@@ -359,20 +403,21 @@ class MemoryRetriever:
             # rows, not just on synthetic test data. (Codex P2 on PR-1481.)
             comparison_content = content
             if msg.get("role") == "user":
-                comparison_content = extract_raw_user_content(content)
+                comparison_content = raw_user_content
             if _normalize_for_echo_check(comparison_content) == query_normalized:
                 continue
 
             components = self._calculate_score_components(
                 content=content,
                 query=query,
-                metadata=msg.get("metadata", {}),
+                metadata=metadata,
                 emotional_context=emotional_context,
                 created_at=msg.get("created_at"),
                 expanded_concepts=expanded_concepts,
                 query_embedding=query_embedding,
                 content_embedding=row_embeddings.get(msg.get("id")),
                 semantic_similarity=semantic_similarities.get(str(msg.get("id"))),
+                vector_cosine_floor=vector_cosine_floor,
             )
 
             relevance = components["semantic"]
@@ -451,6 +496,7 @@ class MemoryRetriever:
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
         semantic_similarity: Optional[float] = None,
+        vector_cosine_floor: float = 0.0,
     ) -> float:
         """
         Calculate weighted retrieval score.
@@ -474,6 +520,7 @@ class MemoryRetriever:
             query_embedding=query_embedding,
             content_embedding=content_embedding,
             semantic_similarity=semantic_similarity,
+            vector_cosine_floor=vector_cosine_floor,
         )["total"]
 
     def _calculate_score_components(
@@ -487,6 +534,7 @@ class MemoryRetriever:
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
         semantic_similarity: Optional[float] = None,
+        vector_cosine_floor: float = 0.0,
     ) -> Dict[str, float]:
         """Return calibrated component scores and their weighted total."""
         # Parse metadata if string
@@ -507,6 +555,7 @@ class MemoryRetriever:
             query_embedding=query_embedding,
             content_embedding=content_embedding,
             semantic_similarity=semantic_similarity,
+            vector_cosine_floor=vector_cosine_floor,
         )
 
         # 2. Emotional score (mood congruence)
@@ -556,6 +605,7 @@ class MemoryRetriever:
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
         semantic_similarity: Optional[float] = None,
+        vector_cosine_floor: float = 0.0,
     ) -> float:
         """
         Score semantic relevance.
@@ -569,11 +619,10 @@ class MemoryRetriever:
            concept-expansion path from :class:`AssociativeLinker` still
            rewards related-concept matches the embedding might miss
            on short utterances.
-        2. **Keyword overlap** fallback when embeddings aren't
-           available — same shape as the original
-           ``TODO: can be upgraded to embeddings`` implementation,
-           preserved verbatim so a deployment without Ollama keeps
-           the prior behaviour.
+        2. **Tokenized lexical overlap** fallback when embeddings aren't
+           available. It reuses conversation search's canonical wrapper,
+           punctuation, stopword, and negation semantics rather than a second
+           whitespace tokenizer.
 
         Mixing both paths within a single ``retrieve()`` call is
         intentional: rows written before the Phase-2 migration / while
@@ -581,20 +630,38 @@ class MemoryRetriever:
         scores use the same no-match=0 and exact-match=1 calibration so this doesn't
         produce a discontinuity in the final ranking.
         """
+        projected_content = _strip_search_wrappers(content)
+        query_tokens = list(dict.fromkeys(
+            _tokenize_for_search(_strip_search_wrappers(query))
+        ))
+        lexical = _token_match_score(query_tokens, projected_content.lower())
+
         if semantic_similarity is not None:
-            content_lower = content.lower()
+            calibrated_vector = max(
+                0.0,
+                (semantic_similarity - vector_cosine_floor)
+                / (1.0 - vector_cosine_floor),
+            )
+            core_relevance = max(lexical, min(1.0, calibrated_vector))
+            content_lower = projected_content.lower()
             concept_score = 0.0
             if expanded_concepts:
                 concept_matches = sum(
                     1 for c in expanded_concepts if c in content_lower
                 )
                 concept_score = min(1.0, concept_matches / len(expanded_concepts))
-            return semantic_similarity * 0.7 + concept_score * 0.3
+            return core_relevance * 0.7 + concept_score * 0.3
 
         if query_embedding is not None and content_embedding is not None:
             cosine = _cosine_unit(query_embedding, content_embedding)
             if cosine is not None:
-                content_lower = content.lower()
+                calibrated_vector = max(
+                    0.0,
+                    (cosine - vector_cosine_floor)
+                    / (1.0 - vector_cosine_floor),
+                )
+                core_relevance = max(lexical, min(1.0, calibrated_vector))
+                content_lower = projected_content.lower()
                 concept_score = 0.0
                 if expanded_concepts:
                     concept_matches = sum(
@@ -606,27 +673,9 @@ class MemoryRetriever:
                 # Same 70/30 split the keyword path uses — keeps the
                 # weighting between "core signal" and "concept-expansion
                 # bonus" consistent across paths.
-                return cosine * 0.7 + concept_score * 0.3
+                return core_relevance * 0.7 + concept_score * 0.3
 
-        content_lower = content.lower()
-        query_lower = query.lower()
-
-        # Split into words
-        query_words = set(query_lower.split())
-        content_words = set(content_lower.split())
-
-        # Remove very common words
-        stop_words = {"the", "a", "an", "is", "are", "was", "were", "i", "you",
-                      "to", "and", "of", "in", "it", "that", "this", "for"}
-        query_words -= stop_words
-        content_words -= stop_words
-
-        if not query_words:
-            return 0.0
-
-        # Keyword overlap
-        overlap = len(query_words & content_words)
-        keyword_score = min(1.0, overlap / len(query_words))
+        content_lower = projected_content.lower()
 
         # Concept match bonus
         concept_score = 0.0
@@ -637,7 +686,7 @@ class MemoryRetriever:
             concept_score = min(1.0, concept_matches / len(expanded_concepts))
 
         # Combine: 70% keyword, 30% concept
-        return keyword_score * 0.7 + concept_score * 0.3
+        return lexical * 0.7 + concept_score * 0.3
 
     def _get_vector_session_factory(self):
         """Build/reuse the SQLAlchemy factory backing vector search."""
@@ -736,7 +785,11 @@ class MemoryRetriever:
         if not query or not query.strip():
             return None
         try:
-            embedding = await service.aembed(query)
+            embed_query = getattr(type(service), "aembed_query", None)
+            if callable(embed_query):
+                embedding = await embed_query(service, query)
+            else:
+                embedding = await service.aembed(query)
         except Exception as e:
             logger.warning(
                 "Query embedding failed (falling back to keyword "
@@ -746,6 +799,18 @@ class MemoryRetriever:
         if not embedding:
             return None
         return list(embedding)
+
+    def _query_similarity_floor(self) -> float:
+        """Read model-specific cosine calibration from the embedding service."""
+        service = getattr(self.conversations, "embedding_service", None)
+        floor_getter = getattr(service, "retrieval_similarity_floor", None)
+        if not callable(floor_getter):
+            return 0.0
+        try:
+            floor = float(floor_getter())
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(0.99, floor))
 
     def _score_emotional(
         self,

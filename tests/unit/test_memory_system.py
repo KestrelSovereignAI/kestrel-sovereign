@@ -678,6 +678,116 @@ class TestMemoryRetriever:
         # freshness/salience turn it into context noise.
         assert 2 not in ids
 
+    @pytest.mark.asyncio
+    async def test_lexical_relevance_uses_candidate_tokenizer_for_punctuation(self):
+        """#2335: candidate generation and final gating share token rules."""
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [{
+            "role": "user",
+            "id": 1,
+            "content": "My cobalt axolotl is named Quasar-17.",
+            "metadata": {},
+            "created_at": "2025-01-15T10:00:00+00:00",
+        }]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="axolotl?", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert [row["id"] for row in results] == [1]
+        assert results[0]["relevance_score"] == pytest.approx(0.7)
+
+    @pytest.mark.asyncio
+    async def test_mixed_vector_corpus_merges_old_lexical_exact_match(self):
+        """#2334: non-empty kNN must not hide rows outside its profile."""
+        store = AsyncMock()
+        store.embedding_service = MagicMock()
+        store.embedding_service.aembed = AsyncMock(return_value=[1.0, 0.0])
+        store.embedding_service.current_profile_id.return_value = "active-profile"
+        store.get_conversation_history.return_value = [{
+            "role": "assistant", "id": 10, "content": "routine gardening",
+            "metadata": {}, "created_at": "2026-01-01T00:00:00+00:00",
+        }]
+        old_exact = {
+            "role": "user", "id": 1,
+            "content": "The ancient zirconium compass belongs north.",
+            "metadata": {"importance": 0.0},
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }
+        store.get_lexical_memory_candidates.return_value = [old_exact]
+        retriever = MemoryRetriever(store)
+        retriever._semantic_similarities_via_vector_backend = AsyncMock(
+            return_value={"10": 0.50}
+        )
+
+        results = await retriever.retrieve(
+            query="zirconium", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert [row["id"] for row in results] == [1]
+        store.get_lexical_memory_candidates.assert_awaited_once_with(
+            "zirconium", limit=100,
+            excluded_embedding_profile_id="active-profile",
+        )
+
+    @pytest.mark.asyncio
+    async def test_vector_positive_floor_does_not_admit_unrelated_salience(self):
+        """#2334: dense-model positive cosine is not lexical relevance."""
+        store = AsyncMock()
+        store.embedding_service = MagicMock()
+        store.embedding_service.aembed = AsyncMock(return_value=[1.0, 0.0])
+        store.embedding_service.current_profile_id.return_value = "active-profile"
+        store.get_conversation_history.return_value = [{
+            "role": "assistant", "id": 10, "content": "routine gardening",
+            "metadata": {"importance": 1.0, "access_count": 100},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }]
+        store.get_lexical_memory_candidates.return_value = []
+        retriever = MemoryRetriever(store)
+        retriever._semantic_similarities_via_vector_backend = AsyncMock(
+            return_value={"10": 0.50}
+        )
+
+        results = await retriever.retrieve(
+            query="absentneedle", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_control_plane_rows_are_not_recalled_as_memory(self):
+        """Control transport and commands cannot become autobiographical facts."""
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [
+            {
+                "role": "user", "id": 1, "content": "operator zirconium",
+                "metadata": {"operator_signal": True},
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "role": "user", "id": 2, "content": "!memory recall zirconium",
+                "metadata": {}, "created_at": "2026-01-01T00:00:01+00:00",
+            },
+            {
+                "role": "user", "id": 3,
+                "content": "My zirconium compass points north.",
+                "metadata": {}, "created_at": "2026-01-01T00:00:02+00:00",
+            },
+            {
+                "role": "user", "id": 4,
+                "content": "/r/zirconium is my favorite materials forum.",
+                "metadata": {}, "created_at": "2026-01-01T00:00:03+00:00",
+            },
+        ]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="zirconium", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert {row["id"] for row in results} == {3, 4}
+
 
 class TestDecayCalculation:
     """Tests for standalone decay calculation."""

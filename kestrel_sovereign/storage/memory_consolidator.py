@@ -30,6 +30,11 @@ _SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
 from .memory_models import MemoryEpisode, TemporalPattern
 from .async_database import AsyncDatabase
 from .memory_retriever import calculate_decay
+from .async_conversation_store import (
+    _strip_search_wrappers,
+    _token_match_score,
+    _tokenize_for_search,
+)
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
@@ -884,7 +889,19 @@ class MemoryConsolidator:
         if service is None:
             return None
         try:
-            query_embedding = await service.aembed(query)
+            embed_query = getattr(type(service), "aembed_query", None)
+            if callable(embed_query):
+                from kestrel_sovereign.llm.embedding_service import (
+                    EPISODE_RETRIEVAL_INSTRUCTION,
+                )
+
+                query_embedding = await embed_query(
+                    service,
+                    query,
+                    instruction=EPISODE_RETRIEVAL_INSTRUCTION,
+                )
+            else:
+                query_embedding = await service.aembed(query)
         except Exception as e:  # noqa: BLE001
             logger.debug("episode query embed failed: %s", e)
             return None
@@ -923,41 +940,67 @@ class MemoryConsolidator:
     async def _keyword_episode_ids(
         self, query: str, limit: int, exclude_ids: Optional[List[str]] = None
     ) -> List[str]:
-        """Keyword LIKE recall over title+summary, ranked by recency.
+        """Token-aware keyword recall over title+summary.
 
         ``exclude_ids`` (the vector hits) are filtered out IN SQL so the LIMIT
         returns up to ``limit`` genuinely-NEW matches — otherwise a query that
         the vector path already satisfied would consume the whole LIMIT with
         rows already surfaced, starving keyword-only legacy episodes."""
-        # Case-insensitive via LOWER() on both sides — portable across SQLite
-        # (LIKE is ASCII-case-insensitive) AND Postgres (LIKE is case-SENSITIVE).
-        # On PG the kNN path is gated off, so this keyword fallback is the only
-        # recall; a case-sensitive match there would miss "sailing" vs
-        # "Sailing trip" and record no access heat.
-        like = f"%{query.lower()}%"
+        query_projection = _strip_search_wrappers(query)
+        query_tokens = list(dict.fromkeys(_tokenize_for_search(query_projection)))
+        if not query_tokens:
+            return []
         exclude_ids = exclude_ids or []
         exclude_clause = ""
-        params: list = [self.agent_id, like, like]
+        token_clause = " OR ".join(
+            "(LOWER(title) LIKE ? OR LOWER(COALESCE(summary, '')) LIKE ?)"
+            for _ in query_tokens
+        )
+        score_clause = " + ".join(
+            "CASE WHEN LOWER(title) LIKE ? "
+            "OR LOWER(COALESCE(summary, '')) LIKE ? THEN 1 ELSE 0 END"
+            for _ in query_tokens
+        )
+        score_params: list = []
+        match_params: list = []
+        for token in query_tokens:
+            like = f"%{token}%"
+            score_params.extend((like, like))
+            match_params.extend((like, like))
+        params: list = [*score_params, self.agent_id, *match_params]
         if exclude_ids:
             exclude_clause = (
                 " AND id NOT IN (" + ",".join("?" for _ in exclude_ids) + ")"
             )
             params.extend(exclude_ids)
-        params.append(limit)
+        # Fetch a bounded superset so overlap ranking, not raw recency, chooses
+        # the final rows. Exact phrases receive a deterministic preference.
+        params.append(max(limit * 5, limit))
         try:
             rows = await self._db.fetchall(
-                f"""SELECT id FROM memory_episodes
+                f"""SELECT id, title, summary, created_at,
+                           ({score_clause}) AS token_match_count
+                    FROM memory_episodes
                     WHERE agent_id = ?
-                      AND (LOWER(title) LIKE ? OR LOWER(summary) LIKE ?)
+                      AND ({token_clause})
                     {exclude_clause}
-                    ORDER BY created_at DESC
+                    ORDER BY token_match_count DESC, created_at DESC
                     LIMIT ?""",
                 tuple(params),
             )
         except Exception as e:  # noqa: BLE001
             logger.debug("episode keyword recall failed: %s", e)
             return []
-        return [r[0] for r in rows or []]
+        query_lower = " ".join(query_projection.lower().split())
+        ranked: List[Tuple[float, int, str]] = []
+        for position, row in enumerate(rows or []):
+            episode_id, title, summary, _created_at, _match_count = row
+            combined = f"{title or ''} {summary or ''}".lower()
+            overlap = _token_match_score(query_tokens, combined)
+            phrase_bonus = 1.0 if query_lower and query_lower in combined else 0.0
+            ranked.append((overlap + phrase_bonus, -position, episode_id))
+        ranked.sort(reverse=True)
+        return [episode_id for _score, _position, episode_id in ranked[:limit]]
 
     async def _episodes_by_ids(self, ids: List[str]) -> List[MemoryEpisode]:
         """Materialize MemoryEpisode rows by id, preserving the given order."""
