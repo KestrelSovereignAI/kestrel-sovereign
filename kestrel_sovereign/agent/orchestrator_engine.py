@@ -2003,6 +2003,7 @@ class OrchestratorEngineMixin:
                     iteration, user_message,
                     tool_events=tool_events, tool_results=tool_results,
                     streaming=streaming, session_id=session_id,
+                    effective_model=effective_model,
                 )
                 _collect_parts()
             return
@@ -2018,6 +2019,7 @@ class OrchestratorEngineMixin:
                         iteration, user_message,
                         tool_events=tool_events, tool_results=tool_results,
                         streaming=streaming, session_id=session_id,
+                        effective_model=effective_model,
                     )
                     _collect_parts()
             else:
@@ -2040,13 +2042,14 @@ class OrchestratorEngineMixin:
                     [[] for _ in batch_tcs] if tool_results is not None else None
                 )
 
-                async def _run_one(tc, msg_list, res_list):
+                async def _run_one(tc, msg_list, res_list, em=effective_model):
                     async with semaphore:
                         await self._dispatch_tool_call(
                             tc, features_by_tool_name, known_tools, msg_list,
                             iteration, user_message,
                             tool_events=tool_events, tool_results=res_list,
                             streaming=streaming, session_id=session_id,
+                            effective_model=em,
                         )
 
                 await asyncio.gather(
@@ -2168,6 +2171,7 @@ class OrchestratorEngineMixin:
                 messages, iteration, user_message,
                 tool_results=tool_results,
                 session_id=session_id,
+                effective_model=effective_model,
             )
 
             # Continue conversation with tool results
@@ -2411,6 +2415,7 @@ class OrchestratorEngineMixin:
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
                 session_id=session_id, part_emit_buffer=part_emit_buffer,
+                effective_model=effective_model,
             )
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:

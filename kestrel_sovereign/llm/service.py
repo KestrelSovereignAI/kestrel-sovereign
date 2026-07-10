@@ -64,6 +64,12 @@ _LAST_RESPONSE_IDENTITY: ContextVar[Optional[Dict[str, Optional[str]]]] = (
     ContextVar("kestrel_last_response_identity", default=None)
 )
 
+# Vendors whose server ignores the requested model ID and serves whatever
+# weights are loaded. Explicit-route callers must still catalog-validate on
+# these, otherwise the response is silently metered as the requested model
+# even though a different one produced it (codex round-2 P2 on #2352).
+_MODEL_IGNORING_VENDORS = frozenset({"llama_cpp", "ollama"})
+
 
 class AuditResult(BaseModel):
     """Structured result of a response-integrity audit.
@@ -2685,10 +2691,18 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         that streamed fine on the chat path was rejected here. There is no
         cross-vendor cascade risk when the route is explicitly pinned, so honour
         it exactly as streaming does.
+
+        EXCEPTION: local vendors whose server ignores the requested model ID and
+        serves whatever weights are loaded (e.g. ``llama_cpp``, ``ollama:local``
+        with a preloaded model) — trusting an explicit selection there would
+        silently mislabel the response (codex round-2 P2). Keep catalog
+        validation on those so a mismatched pin fails loud instead of being
+        metered as the wrong model.
         """
         messages = messages_for(provider["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
-        if target_model and target_model != "auto" and not explicit_selection:
+        skip_catalog = explicit_selection and provider.get("vendor") not in _MODEL_IGNORING_VENDORS
+        if target_model and target_model != "auto" and not skip_catalog:
             if not self._model_available_for_route(provider, target_model):
                 raise ModelNotAvailableForRoute(
                     vendor=provider.get("vendor"),
