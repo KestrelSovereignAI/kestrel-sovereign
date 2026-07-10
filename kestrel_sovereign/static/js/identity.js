@@ -837,6 +837,15 @@ function openNewAgentFlow() {
         if (!goToSpawnTab()) Toast.info('Creating a new agent requires the Spawn feature.');
         return;
     }
+    // Demo rail (#868, codex P1): AgentManager.create_agent mints a LIVE
+    // (non-demo-scoped) agent, and on a demo-classified server the dialog's
+    // post-create select() would install a host-agent prefix targeting it —
+    // the exact routing precondition the misconfig gate exists to refuse.
+    // Creation is an operator action for real servers; refuse it here.
+    if (agentListDefaultAdapter && agentListDefaultAdapter.serverDemoMode) {
+        Toast.warning('This server is in demo mode — creating live agents is disabled.');
+        return;
+    }
     openCreateAgentDialog({
         modal: Modal,
         api: API,
@@ -849,6 +858,11 @@ function openNewAgentFlow() {
                 if (agentListHandle) await agentListHandle.refresh();
             } catch (_) { /* best-effort refresh */ }
             try {
+                // Defense in depth for the demo rail: if the refresh above
+                // reclassified the server into misconfig (demo server + live
+                // agent — which a freshly-minted agent IS), selection must
+                // honor the same refusal handleAgentsLoaded applies.
+                if (agentListDefaultAdapter && agentListDefaultAdapter.serverDemoMode) return;
                 if (agentListHandle) agentListHandle.select(name);
                 else if (window.selectAgent) await window.selectAgent(name);
             } catch (_) { /* selection is best-effort */ }

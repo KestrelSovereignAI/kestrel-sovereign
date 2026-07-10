@@ -177,3 +177,20 @@ test('names beyond the server 64-char bound are rejected client-side (codex P3)'
     assert.ok(err && err.textContent.length > 0, 'inline validation error shown');
     Modal.hide();
 });
+
+test('demo-classified servers refuse the Create flow entirely — the #868 rail (codex P1)', async () => {
+    // Source contract: openNewAgentFlow must gate on serverDemoMode BEFORE
+    // opening the dialog, and the post-create selection re-checks it. A
+    // created agent is live (non-demo-scoped); selecting it on a demo server
+    // installs exactly the routing the misconfig gate refuses.
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
+    const start = src.indexOf('function openNewAgentFlow()');
+    const block = src.slice(start, start + 2600);
+    assert.match(block, /serverDemoMode[\s\S]{0,200}?return;/,
+        'creation refused on demo-mode servers before the dialog opens');
+    const created = block.indexOf('onCreated');
+    assert.ok(created > -1, 'onCreated wiring present');
+    assert.match(block.slice(created), /serverDemoMode/,
+        'post-create selection re-checks the demo rail');
+});
