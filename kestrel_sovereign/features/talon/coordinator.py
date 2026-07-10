@@ -407,6 +407,29 @@ class TalonCoordinatorFeature(Feature):
                     "talon_pipeline_dispatch signal source",
                 )
 
+            # Register the support sources the built-in ``fleet_coding_pipeline``
+            # workflow names (#2303) and inject the workflow itself into the
+            # workflows package's built-in registry so workflow_load_builtin /
+            # workflow_run can load and start it. Fleet-coordination domain, so
+            # the coordinator owns these registrations (same posture as the
+            # workflow-rescue sources above). Both calls are idempotent and the
+            # built-in injection no-ops when kestrel-feature-workflows is absent.
+            from kestrel_sovereign.signals.sources.fleet_coding_pipeline import (
+                register_fleet_coding_pipeline_builtin,
+                register_fleet_coding_pipeline_sources,
+            )
+            fleet_registered = register_fleet_coding_pipeline_sources(registry)
+            if fleet_registered:
+                logger.info(
+                    "TalonCoordinatorFeature registered fleet-coding-pipeline "
+                    "signal sources: %s", ", ".join(fleet_registered),
+                )
+            if register_fleet_coding_pipeline_builtin():
+                logger.info(
+                    "TalonCoordinatorFeature registered the fleet_coding_pipeline "
+                    "built-in workflow",
+                )
+
     async def post_all_features_loaded(self, agent):
         """Register the ``talon:`` Waitable provider with the wait engine.
 
