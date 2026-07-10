@@ -13,6 +13,7 @@ from kestrel_sovereign.fleet.orchestrator import (
     FEATURE_ALLOWLIST,
     TOOL_ALLOWLIST,
     RESTRICTED_TOOLS,
+    RESTRICTED_TOOL_ARGS,
     REFLECTION_SCHEDULE,
     additional_constraints,
     build_local_agent_config,
@@ -21,6 +22,7 @@ from kestrel_sovereign.fleet.orchestrator import (
     build_spawn_mandate,
     constitution_text,
     is_tool_allowed,
+    is_tool_call_allowed,
     is_tool_denied,
 )
 
@@ -30,6 +32,7 @@ __all__ = [
     "FEATURE_ALLOWLIST",
     "TOOL_ALLOWLIST",
     "RESTRICTED_TOOLS",
+    "RESTRICTED_TOOL_ARGS",
     "REFLECTION_SCHEDULE",
     "additional_constraints",
     "build_local_agent_config",
@@ -38,5 +41,6 @@ __all__ = [
     "build_spawn_mandate",
     "constitution_text",
     "is_tool_allowed",
+    "is_tool_call_allowed",
     "is_tool_denied",
 ]

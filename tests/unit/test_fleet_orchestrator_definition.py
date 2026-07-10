@@ -80,9 +80,29 @@ def test_allowlist_denies_write_edit_and_talon_dispatch_tools():
     ):
         assert fo.is_tool_denied(tool), f"{tool} must be denied"
 
-    # GitHub write tools are denied.
-    for tool in ("create_issue", "create_pr"):
+    # GitHub write tools are denied (real kestrel_feature_github @tool names).
+    for tool in (
+        "create_github_issue",
+        "create_github_pull_request",
+        "merge_github_pull_request",
+        "add_github_issue_comment",
+        "add_github_label",
+        "remove_github_label",
+        "close_github_issue",
+        "reopen_github_issue",
+    ):
         assert fo.is_tool_denied(tool)
+
+    # Scheduler mutation tools are denied (P1 #2321).
+    for tool in (
+        "schedule_add",
+        "schedule_remove",
+        "schedule_pause",
+        "schedule_resume",
+        "schedule_update",
+        "schedule_record_outcome",
+    ):
+        assert fo.is_tool_denied(tool), f"{tool} must be denied"
 
     # Workflow-mutation tools are denied (only run/load/read are scoped in).
     for tool in ("workflow_cancel", "workflow_force_abort", "workflow_define"):
@@ -93,9 +113,22 @@ def test_allowed_dispatch_and_read_tools_are_not_denied():
     # workflow_run is the ONLY dispatch surface — it must be allowed.
     assert fo.is_tool_allowed("workflow_run")
     assert not fo.is_tool_denied("workflow_run")
-    # Read tools across the three surfaces are allowed.
-    for tool in ("workflow_status", "talon_status", "talon_health", "list_issues", "get_repo_info"):
+    # Read tools across the surfaces are allowed (real feature @tool names).
+    for tool in (
+        "workflow_status",
+        "talon_status",
+        "talon_health",
+        "list_github_issues",
+        "get_github_repo_info",
+    ):
         assert fo.is_tool_allowed(tool)
+        assert not fo.is_tool_denied(tool)
+
+
+def test_scheduler_read_status_tools_remain_available():
+    """The Signals-view read/status scheduler tools are NOT denied — only the
+    cron-mutating tools are (P1 #2321)."""
+    for tool in ("schedule_list", "schedule_history", "schedule_engagement"):
         assert not fo.is_tool_denied(tool)
 
 
@@ -118,7 +151,14 @@ async def test_restriction_hook_hard_denies_dispatch_and_write_tools():
     assert isinstance(hook, MandateRestrictionHook)
     assert HookEvent.PRE_TOOL_USE in hook.events
 
-    for tool in ("talon_claim", "fs_write", "shell", "create_pr", "workflow_cancel"):
+    for tool in (
+        "talon_claim",
+        "fs_write",
+        "shell",
+        "create_github_pull_request",
+        "workflow_cancel",
+        "schedule_add",
+    ):
         out = await hook.execute(
             HookInput(
                 session_id="t",
@@ -129,28 +169,69 @@ async def test_restriction_hook_hard_denies_dispatch_and_write_tools():
         )
         assert out.permission_decision == PermissionDecision.DENY, f"{tool} not denied"
 
-    for tool in ("workflow_run", "talon_status", "list_issues"):
+    for tool, tool_input in (
+        ("workflow_run", {"name": "fleet_coding_pipeline"}),
+        ("talon_status", {}),
+        ("list_github_issues", {}),
+    ):
         out = await hook.execute(
             HookInput(
                 session_id="t",
                 hook_event_name=HookEvent.PRE_TOOL_USE.value,
                 tool_name=tool,
-                tool_input={},
+                tool_input=tool_input,
             )
         )
         assert out.permission_decision != PermissionDecision.DENY, f"{tool} wrongly denied"
 
 
 @pytest.mark.asyncio
+async def test_restriction_hook_scopes_workflow_run_to_fleet_coding_pipeline():
+    """P1 (#2321): workflow_run is allowed ONLY for fleet_coding_pipeline. Any
+    other workflow name (stalled_work_rescue, an arbitrary loaded definition, or
+    a missing name) is hard-denied at the argument level — the tool-name
+    allowlist alone can't express this."""
+    hook = fo.build_restriction_hook()
+
+    async def run(name):
+        tool_input = {} if name is None else {"name": name}
+        return await hook.execute(
+            HookInput(
+                session_id="t",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name="workflow_run",
+                tool_input=tool_input,
+            )
+        )
+
+    # The single permitted workflow passes.
+    ok = await run("fleet_coding_pipeline")
+    assert ok.permission_decision != PermissionDecision.DENY
+
+    # Every other name — including a builtin — is denied.
+    for name in ("stalled_work_rescue", "some_other_workflow", "", None):
+        out = await run(name)
+        assert out.permission_decision == PermissionDecision.DENY, (
+            f"workflow_run({name!r}) must be denied"
+        )
+
+    # The pure-Python mirror agrees with the hook.
+    assert fo.is_tool_call_allowed("workflow_run", {"name": "fleet_coding_pipeline"})
+    assert not fo.is_tool_call_allowed("workflow_run", {"name": "stalled_work_rescue"})
+    assert not fo.is_tool_call_allowed("workflow_run", {})
+
+
+@pytest.mark.asyncio
 async def test_reload_path_registers_the_deny_hook_from_constraints():
-    """The mandate the definition builds carries restricted_tools, so the real
-    reload seam (register_restriction_hook) installs a hook that blocks talon
-    dispatch via the HooksManager — the same path KestrelAgent.initialize uses."""
+    """The mandate the definition builds carries restricted_tools +
+    restricted_tool_args, so the real reload seam (register_restriction_hook)
+    installs a hook that blocks talon dispatch AND arg-scopes workflow_run via
+    the HooksManager — the same path KestrelAgent.initialize uses."""
     manager = HooksManager()
     count = register_restriction_hook(
         manager, type("M", (), {"additional_constraints": fo.additional_constraints()})()
     )
-    assert count == len(fo.RESTRICTED_TOOLS)
+    assert count == len(fo.RESTRICTED_TOOLS) + len(fo.RESTRICTED_TOOL_ARGS)
 
     out = await manager.execute_hooks(
         HookEvent.PRE_TOOL_USE,
@@ -159,6 +240,20 @@ async def test_reload_path_registers_the_deny_hook_from_constraints():
             hook_event_name=HookEvent.PRE_TOOL_USE.value,
             tool_name="talon_claim",
             tool_input={},
+        ),
+    )
+    blocked = evaluate_blocking_decision(out)
+    assert blocked is not None and blocked.decision == PermissionDecision.DENY
+
+    # The arg-scope survives the reload reconstruction too: a foreign workflow
+    # name is denied through the same HooksManager path.
+    out = await manager.execute_hooks(
+        HookEvent.PRE_TOOL_USE,
+        HookInput(
+            session_id="t",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="workflow_run",
+            tool_input={"name": "stalled_work_rescue"},
         ),
     )
     blocked = evaluate_blocking_decision(out)
@@ -182,6 +277,9 @@ def test_constitution_encodes_required_rules():
     assert "scalat" in text or "escalate" in text.lower()
     # The restricted tools are surfaced as not-available.
     assert "talon_claim" in text
+    # The workflow_run argument scope is surfaced too.
+    assert "workflow_run" in text
+    assert "fleet_coding_pipeline" in text
 
 
 def test_additional_constraints_only_narrow_and_validate():
@@ -197,6 +295,11 @@ def test_additional_constraints_only_narrow_and_validate():
     constraints = fo.additional_constraints()
     assert isinstance(constraints["behavioral_rules"], list)
     assert isinstance(constraints["restricted_tools"], list)
+    # The argument-level narrowing is carried and scopes workflow_run.
+    assert isinstance(constraints["restricted_tool_args"], dict)
+    assert constraints["restricted_tool_args"]["workflow_run"]["name"] == [
+        "fleet_coding_pipeline"
+    ]
     # No capability-granting keys.
     for forbidden in ("grant_features", "override_constitution", "remove_restrictions"):
         assert forbidden not in constraints
@@ -224,6 +327,10 @@ def test_spawn_mandate_carries_ceiling_and_constraints():
     assert sorted(mandate.features_allowed) == sorted(fo.FEATURE_ALLOWLIST)
     assert mandate.additional_constraints["restricted_tools"] == sorted(fo.RESTRICTED_TOOLS)
     assert mandate.additional_constraints["behavioral_rules"]
+    assert (
+        mandate.additional_constraints["restricted_tool_args"]["workflow_run"]["name"]
+        == ["fleet_coding_pipeline"]
+    )
     # Long-lived (persistent orchestrator), not an ephemeral task child.
     assert mandate.ttl_seconds >= 24 * 3600
 

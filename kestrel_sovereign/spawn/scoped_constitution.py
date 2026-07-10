@@ -34,7 +34,7 @@ RESTRICTION_CONSTRAINTS = frozenset({
 # the prompt, so an unknown/free-text key can't reach the model as governing
 # text (see render_mandate_constitution_block).
 KNOWN_RESTRICTION_KEYS = frozenset(
-    {"behavioral_rules", "restricted_tools", "max_tokens"}
+    {"behavioral_rules", "restricted_tools", "restricted_tool_args", "max_tokens"}
 ) | RESTRICTION_CONSTRAINTS
 
 # The spawn tool turns a bare flag ("no_web") into ``{key: "true"}`` and accepts
@@ -83,6 +83,38 @@ def _nonneg_number(value):
     return None
 
 
+def _sanitize_tool_args(value) -> dict:
+    """Coerce ``restricted_tool_args`` to its safe rendered/enforced shape.
+
+    Shape ``{tool_name: {arg_name: [allowed_value, ...]}}``. Keys are safe
+    identifiers and every value is a safe token; anything else is dropped so a
+    free-text/injection payload can't reach the prompt or the deny hook. Returns
+    ``{}`` when nothing survives (the caller then drops the key entirely)."""
+    if not isinstance(value, dict):
+        return {}
+    clean: dict = {}
+    for tool_name, arg_spec in value.items():
+        if not isinstance(tool_name, str) or not _SAFE_FLAG_KEY_RE.match(tool_name):
+            continue
+        if not isinstance(arg_spec, dict):
+            continue
+        clean_args: dict = {}
+        for arg_name, allowed in arg_spec.items():
+            if not isinstance(arg_name, str) or not _SAFE_FLAG_KEY_RE.match(arg_name):
+                continue
+            items = allowed if isinstance(allowed, (list, tuple, set)) else [allowed]
+            values = [
+                str(v).strip()
+                for v in items
+                if _SAFE_TOKEN_RE.match(str(v).strip())
+            ]
+            if values:
+                clean_args[arg_name] = sorted(set(values))
+        if clean_args:
+            clean[tool_name] = clean_args
+    return clean
+
+
 def _sanitize_render_constraints(raw: dict) -> dict:
     """Per-field sanitize additional_constraints for prompt surfacing.
 
@@ -109,6 +141,10 @@ def _sanitize_render_constraints(raw: dict) -> dict:
             ]
             if tools:
                 clean[key] = tools
+        elif key == "restricted_tool_args":
+            tool_args = _sanitize_tool_args(value)
+            if tool_args:
+                clean[key] = tool_args
         elif key == "max_tokens":
             num = _nonneg_number(value)
             if num is not None:
@@ -202,6 +238,21 @@ class ScopedConstitution:
                         f"Constraint 'restricted_tools' must be a list, "
                         f"got {type(value).__name__}"
                     )
+            elif key == "restricted_tool_args":
+                # Narrowing a tool to an argument allowlist is a restriction.
+                if not isinstance(value, dict):
+                    errors.append(
+                        f"Constraint 'restricted_tool_args' must be a dict, "
+                        f"got {type(value).__name__}"
+                    )
+                else:
+                    for tool_name, arg_spec in value.items():
+                        if not isinstance(arg_spec, dict):
+                            errors.append(
+                                f"Constraint 'restricted_tool_args[{tool_name}]' "
+                                f"must be a dict of arg -> allowed values, got "
+                                f"{type(arg_spec).__name__}"
+                            )
             elif key == "max_tokens":
                 # Token limits are restrictions
                 if not isinstance(value, (int, float)) or value < 0:
@@ -289,6 +340,26 @@ class ScopedConstitution:
                     f"\nRestricted tools (not available): "
                     f"{', '.join(sorted(str(t) for t in tools))}"
                 )
+            elif key == "restricted_tool_args":
+                if isinstance(value, dict):
+                    for tool_name, arg_spec in sorted(
+                        value.items(), key=lambda kv: str(kv[0])
+                    ):
+                        if not isinstance(arg_spec, dict):
+                            continue
+                        for arg_name, allowed in sorted(
+                            arg_spec.items(), key=lambda kv: str(kv[0])
+                        ):
+                            allowed_list = (
+                                allowed
+                                if isinstance(allowed, (list, tuple, set))
+                                else [allowed]
+                            )
+                            parts.append(
+                                f"\nRestricted tool arguments: '{tool_name}' may "
+                                f"only be used with '{arg_name}' in "
+                                f"{', '.join(sorted(str(v) for v in allowed_list))}"
+                            )
             elif key in RESTRICTION_CONSTRAINTS:
                 parts.append(f"\nRestriction active: {key}")
             elif key == "max_tokens":

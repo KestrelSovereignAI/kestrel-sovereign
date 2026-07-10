@@ -16,20 +16,31 @@ The Fleet Orchestrator needs three narrowings that the coarse ``multi_agent.toml
    reflection features, never a file/shell/computer-use feature. This is the
    ``features`` allowlist (feature-class granularity) — see
    :data:`FEATURE_ALLOWLIST`.
-2. **An intra-feature tool deny-list** — ``TalonCoordinatorFeature`` bundles
-   *both* read tools (``talon_status`` …) and dispatch tools (``talon_claim`` …)
-   in one class, and ``WorkflowsFeature`` bundles ``workflow_run`` alongside
-   mutating tools (``workflow_cancel`` …). A feature-class allowlist cannot keep
-   the reads while denying the dispatch tools, so the split is expressed as a
-   tool-level deny-list — see :data:`RESTRICTED_TOOLS`.
+2. **An intra-feature tool deny-list** — the ceiling features bundle read tools
+   *and* mutating tools in one class each: ``TalonCoordinatorFeature`` mixes
+   reads (``talon_status`` …) with dispatch tools (``talon_claim`` …);
+   ``WorkflowsFeature`` mixes ``workflow_run`` with mutating tools
+   (``workflow_cancel`` …); ``GitHubFeature`` mixes reads with issue/PR writes;
+   ``SchedulerFeature`` mixes status reads with cron-mutating tools
+   (``schedule_add`` …). A feature-class allowlist cannot keep the reads while
+   denying the mutations, so the split is expressed as a tool-level deny-list
+   derived from the tool names those features actually load — see
+   :data:`RESTRICTED_TOOLS`.
+2b. **An intra-tool argument deny-list** — ``workflow_run`` must be *kept* (it is
+   the dispatch surface) but scoped to a single workflow. A tool-name allowlist
+   cannot express "``workflow_run`` but only for ``fleet_coding_pipeline``", so
+   that narrowing is expressed as an argument allowlist — see
+   :data:`RESTRICTED_TOOL_ARGS` — and enforced at PRE_TOOL_USE by the same hook
+   (#2321).
 3. **Governing behavioral rules** — the constitution encoded below.
 
-All three are exactly what a signed :class:`~kestrel_sovereign.spawn.mandate.SpawnMandate`
+All are exactly what a signed :class:`~kestrel_sovereign.spawn.mandate.SpawnMandate`
 carries: ``features_allowed`` (the ceiling, enforced at feature discovery —
-#2226), ``additional_constraints.restricted_tools`` (hard-denied at
+#2226), ``additional_constraints.restricted_tools`` /
+``additional_constraints.restricted_tool_args`` (hard-denied at
 ``PRE_TOOL_USE`` by :class:`~kestrel_sovereign.spawn.mandate_hook.MandateRestrictionHook`
-— #2137), and ``additional_constraints.behavioral_rules`` (surfaced into the
-governing constitution — #2225). Inceptioning the agent as a child of the
+— #2137, #2321), and ``additional_constraints.behavioral_rules`` (surfaced into
+the governing constitution — #2225). Inceptioning the agent as a child of the
 Sovereign records these on its ``spawned_by`` edge, and **every** boot path
 (host restart, single-agent server, CLI) re-applies them via
 ``read_spawn_mandate`` / ``read_spawn_features_allowed`` in
@@ -146,12 +157,24 @@ TALON_READ_TOOLS = frozenset(
     }
 )
 
-# GitHub read tools (data_access skills; create_issue / create_pr are denied below).
+# GitHub READ tools (verified against kestrel_feature_github/feature.py @tool
+# names — the GitHubFeature class the ceiling loads). The write tools
+# (create_github_issue / merge_github_pull_request / …) are denied below.
 GITHUB_READ_TOOLS = frozenset(
     {
-        "list_issues",
-        "list_prs",
-        "get_repo_info",
+        "read_github_file",
+        "list_github_files",
+        "search_github_code",
+        "get_code_definition",
+        "list_code_definitions",
+        "get_self_repo_info",
+        "get_github_repo_info",
+        "list_source_components",
+        "get_component_source",
+        "list_github_issues",
+        "get_github_issue",
+        "get_github_issue_comments",
+        "scan_stale_work",
     }
 )
 
@@ -191,11 +214,43 @@ WORKFLOW_MUTATION_TOOLS = frozenset(
     }
 )
 
-# GitHub write tools.
+# GitHub write tools — the complete set the GitHubFeature actually loads
+# (verified against kestrel_feature_github/feature.py @tool names). The
+# deny-list is derived from what the feature loads, not hand-maintained against
+# intent: every issue/PR/label-mutating tool is denied so the orchestrator can
+# read fleet repos but never mutate them directly (all writes flow through
+# fleet_coding_pipeline). ``invalidate_github_cache`` is included because it
+# mutates shared feature state.
 GITHUB_WRITE_TOOLS = frozenset(
     {
-        "create_issue",
-        "create_pr",
+        "create_github_issue",
+        "add_github_issue_comment",
+        "add_github_label",
+        "remove_github_label",
+        "close_github_issue",
+        "reopen_github_issue",
+        "create_github_pull_request",
+        "merge_github_pull_request",
+        "invalidate_github_cache",
+    }
+)
+
+# Scheduler mutation tools (verified against features/scheduler/feature.py @tool
+# names). SchedulerFeature is in the ceiling for the read/status surface
+# (schedule_list / schedule_history / schedule_engagement, which feed the
+# kestrel-claws Signals tab), but its cron-mutating tools would let the agent
+# create/alter scheduled tasks — including built-in signal sources — so they are
+# hard-denied. The `reflect` triage sweep (REFLECTION_SCHEDULE) is seeded by the
+# operator at materialization time, not by the agent, so denying schedule_add
+# here does not block it.
+SCHEDULER_MUTATION_TOOLS = frozenset(
+    {
+        "schedule_add",
+        "schedule_remove",
+        "schedule_pause",
+        "schedule_resume",
+        "schedule_update",
+        "schedule_record_outcome",
     }
 )
 
@@ -218,8 +273,25 @@ RESTRICTED_TOOLS = (
     TALON_DISPATCH_TOOLS
     | WORKFLOW_MUTATION_TOOLS
     | GITHUB_WRITE_TOOLS
+    | SCHEDULER_MUTATION_TOOLS
     | WRITE_EDIT_FILE_TOOLS
 )
+
+
+# ---------------------------------------------------------------------------
+# Argument-level tool restriction (positive allowlist, enforced at PRE_TOOL_USE).
+# ---------------------------------------------------------------------------
+# ``workflow_run`` is the orchestrator's ONLY dispatch surface, but a plain
+# tool-name allowlist cannot stop it from starting *other* workflows
+# (``stalled_work_rescue`` or any builtin/loaded definition), which would bypass
+# the fleet_coding_pipeline-specific consent scope. MandateRestrictionHook
+# enforces this at the argument level: ``workflow_run`` is denied unless its
+# ``name`` argument (the workflow definition name) is fleet_coding_pipeline.
+WORKFLOW_RUN_ALLOWED_NAMES = frozenset({"fleet_coding_pipeline"})
+
+RESTRICTED_TOOL_ARGS: Dict[str, Dict[str, List[str]]] = {
+    "workflow_run": {"name": sorted(WORKFLOW_RUN_ALLOWED_NAMES)},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -237,10 +309,14 @@ BEHAVIORAL_RULES: List[str] = [
     ),
     (
         "Never invoke talon claim/dispatch tools (`talon_claim`, "
-        "`talon_file_and_claim`, `talon_batch`, …) or any code-editing, "
-        "filesystem, or shell tool directly. Commission every code change "
-        "through the `fleet_coding_pipeline` workflow, which routes the actual "
-        "run through the coordinator's audited dispatch seam."
+        "`talon_file_and_claim`, `talon_batch`, …), GitHub write tools "
+        "(`create_github_issue`, `merge_github_pull_request`, …), scheduler "
+        "mutation tools (`schedule_add`, `schedule_remove`, …), or any "
+        "code-editing, filesystem, or shell tool directly. Commission every "
+        "code change through the `fleet_coding_pipeline` workflow, which routes "
+        "the actual run through the coordinator's audited dispatch seam. "
+        "`workflow_run` may only start `fleet_coding_pipeline`, never any other "
+        "workflow."
     ),
     (
         "Never approve your own `consent_collect` gates. Approvals belong to the "
@@ -293,6 +369,10 @@ def additional_constraints() -> Dict[str, Any]:
     return {
         "behavioral_rules": list(BEHAVIORAL_RULES),
         "restricted_tools": sorted(RESTRICTED_TOOLS),
+        "restricted_tool_args": {
+            tool: {arg: list(values) for arg, values in spec.items()}
+            for tool, spec in RESTRICTED_TOOL_ARGS.items()
+        },
     }
 
 
@@ -304,6 +384,25 @@ def is_tool_allowed(tool_name: str) -> bool:
 def is_tool_denied(tool_name: str) -> bool:
     """True when ``tool_name`` is hard-denied by the restriction deny-list."""
     return tool_name in RESTRICTED_TOOLS
+
+
+def is_tool_call_allowed(tool_name: str, tool_input: Optional[Dict[str, Any]] = None) -> bool:
+    """True when a concrete ``tool_name`` + ``tool_input`` call is permitted.
+
+    Layers the argument-level restriction (:data:`RESTRICTED_TOOL_ARGS`) on top
+    of :func:`is_tool_allowed`: an arg-restricted tool (``workflow_run``) is only
+    allowed when every restricted argument holds a permitted value. This mirrors
+    exactly what :class:`MandateRestrictionHook` enforces at PRE_TOOL_USE.
+    """
+    if is_tool_denied(tool_name):
+        return False
+    args = tool_input or {}
+    spec = RESTRICTED_TOOL_ARGS.get(tool_name)
+    if spec:
+        for arg_name, allowed in spec.items():
+            if str(args.get(arg_name)) not in {str(v) for v in allowed}:
+                return False
+    return tool_name in TOOL_ALLOWLIST
 
 
 def build_spawn_mandate(
@@ -374,7 +473,13 @@ def build_restriction_hook():
     """
     from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
 
-    return MandateRestrictionHook(sorted(RESTRICTED_TOOLS))
+    return MandateRestrictionHook(
+        sorted(RESTRICTED_TOOLS),
+        restricted_tool_args={
+            tool: {arg: list(values) for arg, values in spec.items()}
+            for tool, spec in RESTRICTED_TOOL_ARGS.items()
+        },
+    )
 
 
 def build_local_agent_config(
