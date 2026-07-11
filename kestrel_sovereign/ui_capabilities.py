@@ -25,7 +25,7 @@ from typing import Any, Dict
 from kestrel_sovereign.feature_registry import FeatureStatus, get_registry
 
 
-def _active_class_names(agent) -> set:
+def active_feature_class_names(agent) -> set:
     """Feature class names that are loaded AND not runtime-disabled.
 
     The Feature Store enable/disable endpoints toggle a per-feature ``enabled``
@@ -59,7 +59,7 @@ def compute_feature_capabilities(agent) -> Dict[str, bool]:
     a force-*true* on a disabled feature is ignored — a disabled feature has no UI
     assets to gate into.
     """
-    active = _active_class_names(agent)
+    active = active_feature_class_names(agent)
     registry = get_registry(enabled_class_names=active)
     caps: Dict[str, bool] = {}
     for info in registry.values():

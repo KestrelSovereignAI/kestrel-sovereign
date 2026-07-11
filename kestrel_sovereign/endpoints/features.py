@@ -19,7 +19,10 @@ from kestrel_sovereign.feature_registry import (
     get_registry,
     get_skills_for_package,
 )
-from kestrel_sovereign.ui_capabilities import compute_feature_capabilities
+from kestrel_sovereign.ui_capabilities import (
+    active_feature_class_names,
+    compute_feature_capabilities,
+)
 from kestrel_sovereign.ui_contributions import compute_ui_manifest
 
 logger = logging.getLogger(__name__)
@@ -53,7 +56,40 @@ def _feature_package_to_dict(info: FeaturePackageInfo) -> Dict[str, Any]:
 
 def _get_enabled_class_names(agent) -> set:
     """Return the set of Feature class names currently enabled on *agent*."""
-    return set(agent.features.keys()) if hasattr(agent, "features") else set()
+    return active_feature_class_names(agent)
+
+
+def _registry_info(agent, name: str) -> Optional[FeaturePackageInfo]:
+    """Resolve a catalog stable ID or Feature class name to package metadata."""
+    registry = get_registry(enabled_class_names=_get_enabled_class_names(agent))
+    for stable_id, info in registry.items():
+        if name in {stable_id, info.name} or name in info.features:
+            return info
+    return None
+
+
+def _get_loaded_features_or_404(agent, name: str) -> List[tuple[str, Any]]:
+    """Resolve a class name or package stable ID to loaded feature instances."""
+    features = getattr(agent, "features", {}) or {}
+    if name in features:
+        return [(name, features[name])]
+
+    info = _registry_info(agent, name)
+    if info is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Feature '{name}' not found in registry",
+        )
+    loaded = [
+        (class_name, features[class_name])
+        for class_name in info.features if class_name in features
+    ]
+    if not loaded:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Feature '{name}' not loaded on this agent",
+        )
+    return loaded
 
 
 def _get_feature_or_404(agent, name: str):
@@ -201,7 +237,9 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
             "name": name,
             "tool_name": feature.tool_name,
             "description": feature.tool_description,
-            "status": "enabled",
+            "status": (
+                "enabled" if getattr(feature, "enabled", True) else "disabled"
+            ),
             "tools": [_tool_to_dict(t) for t in tools],
             "hooks": [{"name": h.name, "events": [e.value for e in h.events]} for h in hooks] if hooks else [],
             "config_schema": feature.config_schema,
@@ -217,14 +255,11 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
         return detail
 
     # Not loaded — look up in registry
-    enabled = _get_enabled_class_names(agent)
-    registry = get_registry(enabled_class_names=enabled)
-
-    for info in registry.values():
-        if name in info.features or info.name == name:
-            d = _feature_package_to_dict(info)
-            d["install_instructions"] = f"pip install {info.package}" if not info.core else None
-            return d
+    info = _registry_info(agent, name)
+    if info is not None:
+        d = _feature_package_to_dict(info)
+        d["install_instructions"] = f"pip install {info.package}" if not info.core else None
+        return d
 
     raise HTTPException(status_code=404, detail=f"Feature '{name}' not found in registry or loaded features")
 
@@ -239,14 +274,7 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     agent = get_agent(request)
 
     # Look up package info from registry
-    enabled = _get_enabled_class_names(agent)
-    registry = get_registry(enabled_class_names=enabled)
-
-    pkg_info = None
-    for info in registry.values():
-        if name in info.features or info.name == name:
-            pkg_info = info
-            break
+    pkg_info = _registry_info(agent, name)
 
     if pkg_info is None:
         raise HTTPException(status_code=404, detail=f"Feature '{name}' not found in registry")
@@ -254,8 +282,8 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     if pkg_info.core:
         raise HTTPException(status_code=400, detail=f"Feature '{name}' is a core feature and is already installed")
 
-    if pkg_info.status == FeatureStatus.ENABLED:
-        raise HTTPException(status_code=400, detail=f"Feature '{name}' is already enabled")
+    if pkg_info.status != FeatureStatus.AVAILABLE:
+        raise HTTPException(status_code=400, detail=f"Feature '{name}' is already installed")
 
     # Install via pip in a subprocess
     package_spec = pkg_info.package
@@ -288,7 +316,7 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     Re-registers hooks with the HooksManager and calls on_enable().
     """
     agent = get_agent(request)
-    feature = _get_feature_or_404(agent, name)
+    loaded = _get_loaded_features_or_404(agent, name)
 
     # Re-register hooks with the agent's HooksManager. Track what we registered
     # so a failing on_enable() can be fully rolled back — otherwise the feature
@@ -296,30 +324,72 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     # endpoint reports an error, and the next capability computation would see it
     # as enabled.
     hooks_manager = getattr(agent, "hooks_manager", None)
-    registered_hooks = []
-    if hooks_manager:
-        for hook in feature.get_hooks():
-            hooks_manager.register(hook)
-            registered_hooks.append(hook)
-            logger.info(f"Re-registered hook '{hook.name}' for feature '{name}'")
-
-    # Flip the flag only after on_enable() succeeds. If the lifecycle hook
-    # raises, unwind the hook registrations and leave `enabled` untouched so the
-    # feature stays authoritatively off.
+    activated: List[tuple[str, Any, List[Any], bool]] = []
     try:
-        await feature.on_enable()
+        for class_name, feature in loaded:
+            original = bool(getattr(feature, "enabled", True))
+            if original:
+                continue
+            registered_hooks = []
+            if hooks_manager:
+                for hook in feature.get_hooks():
+                    hooks_manager.register(hook)
+                    registered_hooks.append(hook)
+                    logger.info(
+                        "Re-registered hook '%s' for feature '%s'",
+                        hook.name,
+                        class_name,
+                    )
+            try:
+                await feature.on_enable()
+            except Exception:
+                try:
+                    await feature.on_disable()
+                except Exception:
+                    logger.exception(
+                        "Cleanup after failed enable of feature '%s' failed",
+                        class_name,
+                    )
+                finally:
+                    if hooks_manager:
+                        for hook in registered_hooks:
+                            try:
+                                hooks_manager.unregister(hook)
+                            except Exception:
+                                logger.exception(
+                                    "Hook rollback failed for feature '%s'",
+                                    class_name,
+                                )
+                    feature.enabled = original
+                raise
+            feature.enabled = True
+            activated.append((class_name, feature, registered_hooks, original))
     except Exception:
-        if hooks_manager:
-            for hook in registered_hooks:
-                hooks_manager.unregister(hook)
-                logger.info(
-                    f"Rolled back hook '{hook.name}' for feature '{name}' after on_enable() failed"
+        for class_name, feature, registered_hooks, original in reversed(activated):
+            try:
+                await feature.on_disable()
+            except Exception:
+                logger.exception(
+                    "Lifecycle rollback failed for feature '%s'",
+                    class_name,
                 )
+            finally:
+                if hooks_manager:
+                    for hook in registered_hooks:
+                        try:
+                            hooks_manager.unregister(hook)
+                        except Exception:
+                            logger.exception(
+                                "Hook rollback failed for feature '%s'",
+                                class_name,
+                            )
+                feature.enabled = original
+                logger.info("Rolled back enable of feature '%s'", class_name)
         raise
 
-    feature.enabled = True
     return {
         "name": name,
+        "features": [class_name for class_name, _ in loaded],
         "status": "enabled",
         "capabilities": compute_feature_capabilities(agent),
     }
@@ -333,21 +403,55 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     Calls on_disable() and unregisters hooks from the HooksManager.
     """
     agent = get_agent(request)
-    feature = _get_feature_or_404(agent, name)
-
-    # Call on_disable lifecycle hook first
-    await feature.on_disable()
+    loaded = _get_loaded_features_or_404(agent, name)
 
     # Unregister hooks from the agent's HooksManager
     hooks_manager = getattr(agent, "hooks_manager", None)
-    if hooks_manager:
-        for hook in feature.get_hooks():
-            hooks_manager.unregister(hook)
-            logger.info(f"Unregistered hook '{hook.name}' for feature '{name}'")
+    deactivated: List[tuple[str, Any, List[Any], bool]] = []
+    try:
+        for class_name, feature in loaded:
+            original = bool(getattr(feature, "enabled", True))
+            if not original:
+                continue
+            await feature.on_disable()
+            hooks = list(feature.get_hooks())
+            if hooks_manager:
+                for hook in hooks:
+                    hooks_manager.unregister(hook)
+                    logger.info(
+                        "Unregistered hook '%s' for feature '%s'",
+                        hook.name,
+                        class_name,
+                    )
+            feature.enabled = False
+            deactivated.append((class_name, feature, hooks, original))
+    except Exception:
+        for class_name, feature, hooks, original in reversed(deactivated):
+            try:
+                if hooks_manager:
+                    for hook in hooks:
+                        try:
+                            hooks_manager.register(hook)
+                        except Exception:
+                            logger.exception(
+                                "Hook rollback failed for feature '%s'",
+                                class_name,
+                            )
+                try:
+                    await feature.on_enable()
+                except Exception:
+                    logger.exception(
+                        "Lifecycle rollback failed for feature '%s'",
+                        class_name,
+                    )
+            finally:
+                feature.enabled = original
+                logger.info("Rolled back disable of feature '%s'", class_name)
+        raise
 
-    feature.enabled = False
     return {
         "name": name,
+        "features": [class_name for class_name, _ in loaded],
         "status": "disabled",
         "capabilities": compute_feature_capabilities(agent),
     }
@@ -363,26 +467,34 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     agent = get_agent(request)
 
-    # Check if feature is loaded — unregister hooks and call on_remove if so
-    features = getattr(agent, "features", {})
-    feature = features.get(name)
-    if feature is not None:
-        # Unregister hooks before removal
-        hooks_manager = getattr(agent, "hooks_manager", None)
-        if hooks_manager:
-            for hook in feature.get_hooks():
-                hooks_manager.unregister(hook)
-                logger.info(f"Unregistered hook '{hook.name}' during removal of feature '{name}'")
-
-        await feature.on_remove()
-
-    # Look up package info
-    pkg_info = get_package_for_feature(name)
+    pkg_info = get_package_for_feature(name) or _registry_info(agent, name)
     if pkg_info is None:
         raise HTTPException(status_code=404, detail=f"Feature '{name}' not found in registry")
 
     if pkg_info.core:
         raise HTTPException(status_code=400, detail="Cannot remove a core feature")
+
+    # Check if feature is loaded — unregister hooks and call on_remove if so
+    features = getattr(agent, "features", {}) or {}
+    loaded = [
+        (class_name, features[class_name])
+        for class_name in pkg_info.features
+        if class_name in features
+    ]
+    for class_name, feature in loaded:
+        # Unregister hooks before removal
+        hooks_manager = getattr(agent, "hooks_manager", None)
+        if hooks_manager:
+            for hook in feature.get_hooks():
+                hooks_manager.unregister(hook)
+                logger.info(
+                    "Unregistered hook '%s' during removal of feature '%s'",
+                    hook.name,
+                    class_name,
+                )
+
+        await feature.on_remove()
+        feature.enabled = False
 
     package_spec = pkg_info.package
     try:
@@ -402,6 +514,7 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     return {
         "status": "removed",
         "package": package_spec,
+        "features": [class_name for class_name, _ in loaded],
         "message": f"Package '{package_spec}' uninstalled. Restart the agent to fully unload.",
     }
 
@@ -645,6 +758,8 @@ async def list_all_skills(
 
     # Live skills from loaded features
     for feature_name, feature in features.items():
+        if not getattr(feature, "enabled", True):
+            continue
         for tool in feature.get_tools():
             skill = _tool_to_dict(tool)
             skill["feature"] = feature_name
