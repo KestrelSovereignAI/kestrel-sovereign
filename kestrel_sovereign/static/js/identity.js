@@ -1645,6 +1645,11 @@ window.loadConversation = async function(sessionId, options = {}) {
     const paneAtClick = state.chatPanes.get(host);
     const busyAtClick = state.waitingAgents.has(host)
         || !!(paneAtClick && paneAtClick.streamingMsgDiv);
+    // Monotonic activity marker (#2380 codex round 9): a turn that starts AND
+    // completes entirely inside this load's awaits leaves both busy flags
+    // false at the commit check — but its bubbles grew the pane. Snapshot the
+    // child count so that case is detectable too.
+    const paneChildrenAtClick = paneAtClick ? paneAtClick.element.childElementCount : 0;
 
     // Roll the selection back to the session the CAPTURED host's pane actually
     // renders (not the previously *pending* selection — that one may itself
@@ -1761,7 +1766,11 @@ window.loadConversation = async function(sessionId, options = {}) {
         const paneNow = state.chatPanes.get(host);
         const busyNow = state.waitingAgents.has(host)
             || !!(paneNow && paneNow.streamingMsgDiv);
-        if (!busyAtClick && busyNow) {
+        // Child-count growth catches a turn that ran to completion entirely
+        // within the awaits (both busy flags false again) — and a replacement
+        // turn masked by busyAtClick (#2380 codex round 9 P1).
+        const paneChildrenNow = paneNow ? paneNow.element.childElementCount : 0;
+        if ((!busyAtClick && busyNow) || paneChildrenNow > paneChildrenAtClick) {
             return;
         }
 
