@@ -42,6 +42,7 @@ def _make_feature(
     hooks=None,
     config_schema=None,
     config=None,
+    enabled=True,
 ):
     """Create a mock Feature instance."""
     feature = MagicMock()
@@ -56,6 +57,7 @@ def _make_feature(
     feature.on_enable = AsyncMock()
     feature.on_disable = AsyncMock()
     feature.on_remove = AsyncMock()
+    feature.enabled = enabled
     return feature
 
 
@@ -143,6 +145,18 @@ class TestListFeatures:
         assert data["count"] == 1
         assert data["features"][0]["name"] == "core-pkg"
 
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_disabled_loaded_feature_is_not_reported_enabled(self, mock_registry):
+        mock_registry.return_value = {}
+        feature = _make_feature(enabled=False)
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            client.get("/api/features")
+
+        assert mock_registry.call_args.kwargs["enabled_class_names"] == set()
+
 
 # ---------------------------------------------------------------------------
 # GET /api/features/installed
@@ -194,6 +208,17 @@ class TestGetFeatureDetail:
         assert len(data["tools"]) == 1
         assert data["config_schema"] is not None
 
+    def test_loaded_disabled_feature_reports_disabled(self):
+        feature = _make_feature(enabled=False)
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.get("/api/features/TestFeature")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "disabled"
+
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_unloaded_feature_from_registry(self, mock_registry):
         mock_registry.return_value = dict(FAKE_REGISTRY)
@@ -226,7 +251,7 @@ class TestGetFeatureDetail:
 
 class TestEnableFeature:
     def test_enable_calls_on_enable(self):
-        feature = _make_feature()
+        feature = _make_feature(enabled=False)
         agent = _make_agent(features={"TestFeature": feature})
         app = _make_app(agent)
 
@@ -246,6 +271,69 @@ class TestEnableFeature:
 
         assert resp.status_code == 404
 
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_enable_accepts_package_stable_id(self, mock_registry):
+        first = _make_feature(name="FirstFeature", enabled=False)
+        second = _make_feature(name="SecondFeature", enabled=False)
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_registry.return_value = {"multi-pkg": info}
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.post("/api/features/multi-pkg/enable")
+
+        assert resp.status_code == 200
+        assert resp.json()["features"] == ["FirstFeature", "SecondFeature"]
+        first.on_enable.assert_awaited_once()
+        second.on_enable.assert_awaited_once()
+        assert first.enabled is True and second.enabled is True
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_package_enable_rolls_back_when_a_member_fails(self, mock_registry):
+        first = _make_feature(name="FirstFeature", enabled=False)
+        second = _make_feature(name="SecondFeature", enabled=False)
+        second.on_enable.side_effect = RuntimeError("boom")
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_registry.return_value = {"multi-pkg": info}
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/multi-pkg/enable")
+
+        assert resp.status_code == 500
+        first.on_disable.assert_awaited_once()
+        second.on_disable.assert_awaited_once()
+        assert first.enabled is False and second.enabled is False
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_enable_rollback_continues_when_cleanup_fails(self, mock_registry):
+        first = _make_feature(name="FirstFeature", enabled=False)
+        first.on_disable.side_effect = RuntimeError("cleanup failed")
+        second = _make_feature(name="SecondFeature", enabled=False)
+        second.on_enable.side_effect = RuntimeError("enable failed")
+        second.on_disable.side_effect = RuntimeError("second cleanup failed")
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_registry.return_value = {"multi-pkg": info}
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/multi-pkg/enable")
+
+        assert resp.status_code == 500
+        assert first.enabled is False and second.enabled is False
+
 
 # ---------------------------------------------------------------------------
 # POST /api/features/{name}/disable
@@ -264,6 +352,67 @@ class TestDisableFeature:
         assert resp.status_code == 200
         assert resp.json()["status"] == "disabled"
         feature.on_disable.assert_awaited_once()
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_disable_accepts_package_stable_id(self, mock_registry):
+        first = _make_feature(name="FirstFeature")
+        second = _make_feature(name="SecondFeature")
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_registry.return_value = {"multi-pkg": info}
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.post("/api/features/multi-pkg/disable")
+
+        assert resp.status_code == 200
+        assert resp.json()["features"] == ["FirstFeature", "SecondFeature"]
+        first.on_disable.assert_awaited_once()
+        second.on_disable.assert_awaited_once()
+        assert first.enabled is False and second.enabled is False
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_package_disable_rolls_back_when_a_member_fails(self, mock_registry):
+        first = _make_feature(name="FirstFeature")
+        second = _make_feature(name="SecondFeature")
+        second.on_disable.side_effect = RuntimeError("boom")
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_registry.return_value = {"multi-pkg": info}
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/multi-pkg/disable")
+
+        assert resp.status_code == 500
+        first.on_enable.assert_awaited_once()
+        assert first.enabled is True and second.enabled is True
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_disable_rollback_restores_flag_when_reenable_fails(self, mock_registry):
+        first = _make_feature(name="FirstFeature")
+        first.on_enable.side_effect = RuntimeError("rollback failed")
+        second = _make_feature(name="SecondFeature")
+        second.on_disable.side_effect = RuntimeError("disable failed")
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_registry.return_value = {"multi-pkg": info}
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/api/features/multi-pkg/disable")
+
+        assert resp.status_code == 500
+        assert first.enabled is True and second.enabled is True
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +480,54 @@ class TestRemoveFeature:
             resp = client.post("/api/features/Unknown/remove")
 
         assert resp.status_code == 404
+
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    def test_remove_accepts_package_stable_id(self, mock_pkg, mock_registry, mock_run):
+        mock_pkg.return_value = None
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_registry.return_value = {"multi-pkg": info}
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        first = _make_feature(name="FirstFeature")
+        second = _make_feature(name="SecondFeature")
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.post("/api/features/multi-pkg/remove")
+
+        assert resp.status_code == 200
+        assert resp.json()["features"] == ["FirstFeature", "SecondFeature"]
+        first.on_remove.assert_awaited_once()
+        second.on_remove.assert_awaited_once()
+        command = mock_run.call_args.args[0]
+        assert command[-2:] == ["-y", "kestrel-feature-multi"]
+
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    def test_remove_by_class_cleans_every_loaded_package_member(self, mock_pkg, mock_run):
+        info = FeaturePackageInfo(
+            name="multi-pkg", package="kestrel-feature-multi", git="",
+            features=["FirstFeature", "SecondFeature"], description="multi",
+        )
+        mock_pkg.return_value = info
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        first = _make_feature(name="FirstFeature")
+        second = _make_feature(name="SecondFeature")
+        agent = _make_agent(features={"FirstFeature": first, "SecondFeature": second})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.post("/api/features/FirstFeature/remove")
+
+        assert resp.status_code == 200
+        first.on_remove.assert_awaited_once()
+        second.on_remove.assert_awaited_once()
+        assert first.enabled is False and second.enabled is False
 
 
 # ---------------------------------------------------------------------------
