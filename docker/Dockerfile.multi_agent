@@ -1,6 +1,8 @@
 # Dockerfile for Kestrel MultiAgent Host — Cloud Run / Azure Container Apps
-# Runs the multi-agent host (host.py) which spawns agent subprocesses.
-# Same base as Dockerfile.cloudrun but entrypoint is host:app, not kestrel_sovereign.server:app.
+# Runs the consolidated server:app in multi-agent mode, which co-hosts all
+# agents in one process (the legacy proxy host.py was retired in #2382).
+# Same base as Dockerfile.cloudrun; the multi_agent entrypoint sets
+# KESTREL_MULTI_AGENT=1 and launches kestrel_sovereign.server:app.
 ARG TARGETARCH
 FROM ghcr.io/astral-sh/uv:latest AS uv
 FROM --platform=linux/${TARGETARCH} python:3.11-slim

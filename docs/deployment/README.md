@@ -128,18 +128,18 @@ The agent uses `min-instances=1` to stay warm (LLM calls exceed GitHub's 10s web
 
 ## MultiAgent vs single-agent
 
-The dev deployment runs **multi_agent mode** — a host process routes traffic to per-agent subprocesses. See [`host.py`](../../host.py) for the host, [`server.py`](../../server.py) for individual agents.
+The dev deployment runs **multi_agent mode** — a single `kestrel_sovereign.server:app` process co-hosts every agent in-process via `AgentManager`. See [`server.py`](../../kestrel_sovereign/server.py) for the consolidated host+agent application. (The legacy proxy host `host.py` and the `kestrel start --subprocess` launch mode were retired in #2382.)
 
 Two agents ship in the default multi_agent image:
 - `Kestrel` (port 8801) — main agent and GitHub bot webhook target
 - `kestrel-demo` (port 8802) — demo agent for UI examples
 
-The `/webhooks/github-app` endpoint is a proxy on the host that forwards to the first agent (Kestrel).
+The `/webhooks/github-app` endpoint is served by `server:app` and dispatched to the target agent in-process.
 
 ## Troubleshooting
 
 ### Webhook returns 401 with `{"detail": "Invalid or missing API Key"}`
-The host's auth middleware is rejecting the request. Check [`host.py`](../../host.py) — `/webhooks/` paths must bypass API key auth.
+The server's auth middleware is rejecting the request. Check [`server.py`](../../kestrel_sovereign/server.py) — `/webhooks/` paths must bypass API key auth.
 
 ### Webhook returns 200 but agent doesn't respond
 Check the webhook delivery page on GitHub. Response body includes diagnostic info in dev mode. Common issues:

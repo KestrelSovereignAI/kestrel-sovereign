@@ -912,7 +912,6 @@
     },
     {
       "existing_code_refs": [
-        "host.py",
         "kestrel_sovereign/server.py",
         "kestrel_sovereign/static/index.html",
         "kestrel_sovereign/static/js/ui-ext/panels.js",
@@ -921,11 +920,14 @@
         "tests/frontend/feature_ui_contributions_loader.test.mjs",
         "tests/frontend/ui_ext_panels_teardown.test.mjs",
         "tests/integration/test_feature_ui_runtime_enable.py",
-        "tests/integration/test_host_proxy_integration.py",
         "tests/unit/test_ui_contributions_runtime_enable.py"
       ],
-      "findings": [],
-      "missing_code_refs": [],
+      "findings": [
+        "missing_code_refs"
+      ],
+      "missing_code_refs": [
+        "tests/integration/test_host_proxy_integration.py"
+      ],
       "missing_links": [],
       "path": "docs/architecture/features/PANEL_EXTRACTION_PLAYBOOK.md",
       "privacy": "public",
@@ -1806,7 +1808,6 @@
         "tests/unit/test_extracted_feature_boundary_contracts.py",
         "tests/unit/test_feature_doc_canonicality.py",
         "tests/unit/test_generate_feature_docs.py",
-        "tests/unit/test_host_query_param_auth.py",
         "tests/unit/test_model_selection_contracts.py",
         "tests/unit/test_permission_seam_contracts.py",
         "tests/unit/test_privacy_active_session_contracts.py",
@@ -1821,6 +1822,7 @@
       ],
       "missing_code_refs": [
         "tests/unit/test_cloud_launcher_contracts.py",
+        "tests/unit/test_host_query_param_auth.py",
         "tests/unit/test_runpod_model_contracts.py"
       ],
       "missing_links": [],
@@ -3484,7 +3486,7 @@
         ".github/workflows/deploy.yml",
         ".github/workflows/weekly-analysis.yml",
         "deploy_config.toml",
-        "host.py",
+        "kestrel_sovereign/server.py",
         "server.py"
       ],
       "findings": [],

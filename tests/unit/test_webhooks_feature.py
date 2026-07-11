@@ -1361,43 +1361,11 @@ class TestWebhookMultiAgentDispatch:
         assert rows[0][1] == 404
 
 
-# ============================================================================
-# Host generic webhook proxy (F332 follow-up: host serves /webhooks/{name})
-# ============================================================================
-
-
-class TestHostGenericWebhookProxy:
-    """The multi-agent host must forward ``/webhooks/{name}`` to a backing
-    agent; otherwise the public URL webhooks_register() advertises 404s in
-    host/subprocess deployments even though the feature router is fixed."""
-
-    @pytest.mark.asyncio
-    async def test_generic_webhook_proxies_to_first_agent(self, monkeypatch):
-        import kestrel_sovereign.host as host_mod
-
-        captured = {}
-
-        async def _fake_proxy(*, request, agent_id, path, config, client):
-            from fastapi.responses import JSONResponse
-            captured["agent_id"] = agent_id
-            captured["path"] = path
-            return JSONResponse({"ok": True})
-
-        monkeypatch.setattr(host_mod, "proxy_request_streaming", _fake_proxy)
-
-        # Minimal request stub with the app.state the handler reads.
-        config = MagicMock()
-        config.agents = {"emma": object(), "nellie": object()}
-        request = MagicMock()
-        request.app.state.multi_agent_config = config
-        request.app.state.http_client = MagicMock()
-
-        resp = await host_mod.generic_webhook_proxy(request, "stripe")
-
-        assert resp.status_code == 200
-        # Deterministic first-agent selection; path forwarded verbatim.
-        assert captured["agent_id"] == "emma"
-        assert captured["path"] == "webhooks/stripe"
+# The legacy multi-agent host's ``/webhooks/{name}`` PROXY (which forwarded to a
+# backing agent subprocess) was retired with ``kestrel_sovereign.host`` in
+# #2382. The deployed ``server:app`` now co-hosts every agent in-process and
+# serves ``/webhooks/{name}`` directly via the shared dispatch router exercised
+# by ``TestWebhookMultiAgentDispatch`` above — there is no proxy hop left to test.
 
 
 # ============================================================================

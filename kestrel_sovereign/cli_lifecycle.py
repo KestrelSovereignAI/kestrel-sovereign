@@ -96,8 +96,6 @@ def cmd_start(args) -> int:
             return 1
         return 0
 
-    if getattr(args, "subprocess", False):
-        return _start_subprocess_mode(project_dir, multi_agent, pm)
     return _start_inprocess_mode(project_dir, multi_agent, pm)
 
 
@@ -165,86 +163,6 @@ def _start_inprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) ->
         print("          \u274c")
         print(f"   Check log: {log_file}")
         return 1
-
-    print(f"\n\U0001F985 MultiAgent ready: http://localhost:{multi_agent.host.port}")
-    return 0
-
-
-def _start_subprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) -> int:
-    """Start host + separate agent processes (legacy --subprocess mode)."""
-    # Start the full multi_agent (host + autostart agents)
-    print("\U0001F985 Kestrel MultiAgent starting (subprocess)...")
-    print(f"   Host:     http://localhost:{multi_agent.host.port}")
-
-    autostart = multi_agent.get_autostart_agents()
-    manual = {
-        name: cfg for name, cfg in multi_agent.get_local_agents().items()
-        if not cfg.autostart
-    }
-
-    if autostart or manual:
-        print("   Agents:")
-        for name, cfg in autostart.items():
-            resolved = (project_dir / cfg.data_dir).resolve()
-            print(f"     {name:12} port {cfg.port}  {resolved}/       autostart")
-        for name, cfg in manual.items():
-            resolved = (project_dir / cfg.data_dir).resolve()
-            print(f"     {name:12} port {cfg.port}  {resolved}/       manual (skipped)")
-    print()
-
-    # Start host
-    host_pid_file = _host_pid_file(project_dir)
-    existing_host = pm.read_pid(host_pid_file)
-    if existing_host and pm.is_process_running(existing_host):
-        print(f"   Host already running (PID: {existing_host})")
-    else:
-        if existing_host:
-            pm.clear_pid(host_pid_file)
-
-        if pm.is_port_in_use(multi_agent.host.port):
-            orphans = pm.find_pids_on_port(multi_agent.host.port)
-            print(f"   Host port {multi_agent.host.port} already in use"
-                  + (f" by PID(s) {orphans}" if orphans else ""))
-            print(f"   Run: kestrel stop   (add --force if it doesn't die)")
-            return 1
-
-        env = pm._load_env()
-        env["PORT"] = str(multi_agent.host.port)
-        # Host is NOT an agent — no DB path, no KESTREL_SERVE_UI
-
-        log_file = _host_log_file(project_dir)
-        # Use the fully-qualified package path. Pre-move this said
-        # ``host:app``, which only resolved when CWD happened to contain
-        # ``host.py`` — i.e. only on source clones. Pip-installed users
-        # got ``ModuleNotFoundError: No module named 'host'`` on the
-        # legacy ``--subprocess`` path. Same fix shape as #1097.
-        cmd = [sys.executable, "-m", "uvicorn", "kestrel_sovereign.host:app",
-               "--host", multi_agent.host.bind, "--port", str(multi_agent.host.port)]
-
-        print(f"   Starting host on :{multi_agent.host.port}...", end="", flush=True)
-        pm._spawn(cmd, env, log_file, host_pid_file)
-
-        if pm.wait_for_health(multi_agent.host.port, timeout=30):
-            print("          \u2705")
-        else:
-            print("          \u274c")
-            print(f"   Check log: {log_file}")
-            return 1
-
-    # Start autostart agents
-    for name, cfg in autostart.items():
-        print(f"   Starting {name} on :{cfg.port}...", end="", flush=True)
-        try:
-            pm.start_agent(name, cfg, multi_agent.host.bind)
-        except RuntimeError as e:
-            print(f"          \u274c")
-            print(f"   {e}")
-            continue
-
-        if pm.wait_for_health(cfg.port, timeout=30):
-            print("          \u2705")
-        else:
-            print("          \u274c")
 
     print(f"\n\U0001F985 MultiAgent ready: http://localhost:{multi_agent.host.port}")
     return 0
@@ -1184,7 +1102,6 @@ def cmd_update(args) -> int:
             print(f"• restart: kestrel restart {target or ''}".rstrip())
             restart_args = argparse.Namespace(
                 name=target,
-                subprocess=bool(getattr(args, "subprocess", False)),
                 force=bool(getattr(args, "force", False)),
             )
             rc = cli.cmd_restart(restart_args)
@@ -1314,13 +1231,9 @@ def cmd_logs(args) -> int:
 
 def add_lifecycle_subparsers(subparsers) -> None:
     """Register start/stop/restart/update/status/logs on ``subparsers``."""
-    # kestrel start [name] [--subprocess]
+    # kestrel start [name]
     start_p = subparsers.add_parser("start", help="Start host and/or agents")
     start_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
-    start_p.add_argument(
-        "--subprocess", action="store_true",
-        help="Run each agent as a separate process (legacy mode)",
-    )
 
     # kestrel stop [name] [--force]
     stop_p = subparsers.add_parser("stop", help="Stop host and/or agents")
@@ -1330,13 +1243,9 @@ def add_lifecycle_subparsers(subparsers) -> None:
         help="Send SIGKILL instead of SIGTERM (also used when reaping orphans)",
     )
 
-    # kestrel restart [name] [--subprocess] [--force]
+    # kestrel restart [name] [--force]
     restart_p = subparsers.add_parser("restart", help="Restart host and/or agents")
     restart_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
-    restart_p.add_argument(
-        "--subprocess", action="store_true",
-        help="Run each agent as a separate process (legacy mode)",
-    )
     restart_p.add_argument(
         "--force", action="store_true",
         help="Force-kill existing processes during the stop phase",
@@ -1432,10 +1341,6 @@ def add_lifecycle_subparsers(subparsers) -> None:
             "Path to a non-default host-features manifest "
             "(forwarded to `kestrel feature sync`)"
         ),
-    )
-    update_p.add_argument(
-        "--subprocess", action="store_true",
-        help="Forwarded to `kestrel restart` (run agents as subprocesses)",
     )
     update_p.add_argument(
         "--force", action="store_true",

@@ -275,14 +275,16 @@ def test_csrf_accepts_matching_token():
 
 
 # ---------------------------------------------------------------------------
-# Host-route integration through host.app auth middleware (AC #1 + #4)
+# Host-route integration through server.app auth middleware (AC #1 + #4)
+# The host-feature runtime + /api/host/* routes were consolidated onto the
+# deployed server:app (issue #2382); the legacy proxy host was retired.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def host_app_with_feature(monkeypatch):
-    """host.app with a demo host feature mounted, bypassing the full lifespan."""
-    from kestrel_sovereign import host as host_module
+    """server.app with a demo host feature mounted, bypassing the full lifespan."""
+    from kestrel_sovereign import server as host_module
 
     monkeypatch.setenv("KESTREL_API_KEY", "test-host-key")
     monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "")
