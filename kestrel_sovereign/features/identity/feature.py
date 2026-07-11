@@ -75,23 +75,16 @@ class IdentityFeature(Feature):
         logger.info("Initializing IdentityFeature")
 
     def _load_import_package(self, package_json: str):
-        """Parse a loaded export into an AgentIdentityPackage, unsealing
-        it first when it is a hybrid-KEM sealed capsule (#2398).
+        """Parse a loaded export into an AgentIdentityPackage.
 
-        A sealed capsule is opened with THIS agent's local KEM keypair
-        (recipient custody). A non-sealed export is parsed unchanged.
-        Sealed input the agent can't open, or a tampered capsule, fails
-        loud via SealedExportError rather than degrading to an empty
-        plaintext package.
+        ALWAYS routes through ``open_identity_export`` — it parses a
+        plaintext package, unseals a hybrid-KEM capsule with THIS
+        agent's local KEM keypair (recipient custody), AND fails closed
+        on a tampered/format-stripped capsule. Calling ``from_json``
+        directly for the "not exactly a capsule" case would skip that
+        tamper check (codex #2398 round 10).
         """
-        from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
-        from kestrel_sovereign.identity.sealed_export import (
-            is_sealed_identity_export,
-            open_identity_export,
-        )
-
-        if not is_sealed_identity_export(package_json):
-            return AgentIdentityPackage.from_json(package_json)
+        from kestrel_sovereign.identity.sealed_export import open_identity_export
 
         signing_did = getattr(self.agent, "signing_did", None) or ""
         slug = signing_did.rsplit(":", 1)[-1] if signing_did.startswith("did:web:") else None
