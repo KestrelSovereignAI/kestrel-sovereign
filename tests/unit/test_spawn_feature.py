@@ -21,6 +21,7 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xPARENT"):
     agent.shutdown = AsyncMock()
     agent.process_input = AsyncMock(return_value="task completed")
     agent._private_key = None  # No signing in unit tests
+    agent.identity = None
     return agent
 
 
