@@ -305,7 +305,13 @@ def detect_agent_kem_slug(storage_dir: Optional[Path] = None) -> Optional[str]:
     for multi-segment DIDs (``did:web:host:agent:v1`` → files use
     ``agent_*``, not ``v1_*``) and for legacy did:pkh recipients.
     """
-    directory = Path(storage_dir) if storage_dir is not None else Path.cwd()
+    if storage_dir is not None:
+        directory = Path(storage_dir)
+    else:
+        # Match SecureKeyStorage's default so discovery and loading look
+        # in the same place (not cwd).
+        from kestrel_sovereign.storage import get_default_agent_data_dir
+        directory = Path(get_default_agent_data_dir())
     candidates = sorted(directory.glob("*_x25519.key.enc"))
     if not candidates:
         return None
@@ -618,7 +624,9 @@ def open_identity_export(
         if kem_keypair is None:
             # Prefer an explicit slug; otherwise discover it from the
             # local key files (robust to multi-segment / did:pkh DIDs).
-            if slug is None and storage_dir is not None:
+            # Detection uses the default agent data dir when storage_dir
+            # is None, mirroring SecureKeyStorage.
+            if slug is None:
                 slug = detect_agent_kem_slug(storage_dir)
             if slug is None:
                 raise SealedExportError(
