@@ -29,6 +29,27 @@ def _is_qwen3_embedding_model(model: Optional[str]) -> bool:
     return "qwen3-embedding" in normalized
 
 
+def _is_nomic_embedding_model(model: Optional[str]) -> bool:
+    """Return whether ``model`` requires Nomic retrieval task prefixes."""
+    return "nomic-embed-text" in (model or "").lower().replace("_", "-")
+
+
+def _prepare_retrieval_document(
+    text: str,
+    model: Optional[str],
+    document_format: Optional[str] = None,
+) -> str:
+    """Apply the model's document-side retrieval representation."""
+    normalized_format = (document_format or "").strip().lower()
+    if normalized_format == "raw":
+        return text
+    if normalized_format == "nomic" or (
+        not normalized_format and _is_nomic_embedding_model(model)
+    ):
+        return f"search_document: {text}"
+    return text
+
+
 def _prepare_retrieval_query(
     text: str,
     model: Optional[str],
@@ -45,6 +66,8 @@ def _prepare_retrieval_query(
     normalized_format = (query_format or "").strip().lower()
     if normalized_format == "raw":
         return text
+    if _is_nomic_embedding_model(model):
+        return f"search_query: {text}"
     if normalized_format == "qwen3" or (
         not normalized_format and _is_qwen3_embedding_model(model)
     ):
@@ -57,15 +80,65 @@ def _retrieval_similarity_floor(
 ) -> float:
     """Return the calibrated raw-cosine no-match floor for ``model``.
 
-    Qwen3-Embedding's instructed queries showed an unrelated-corpus band near
-    0.30 and useful paraphrases beginning near 0.35 in the live Kestrel
-    dogfood corpus. A 0.20 projection floor preserves that mid-band while the
-    public semantic eligibility threshold rejects the measured noise. Models
-    without live calibration retain the historical zero floor.
+    The versioned Kestrel quality suite measures each model's positive
+    no-match band alongside valid paraphrases. Qwen3 projects from 0.27;
+    Nomic's correctly-prefixed retrieval space projects from 0.35. The public
+    semantic eligibility threshold and relative gate reject the remaining
+    measured noise. Models without live calibration retain the historical
+    zero floor.
     """
     if override is not None:
         return max(0.0, min(0.99, float(override)))
-    return 0.20 if _is_qwen3_embedding_model(model) else 0.0
+    if _is_qwen3_embedding_model(model):
+        return 0.27
+    if _is_nomic_embedding_model(model):
+        return 0.35
+    return 0.0
+
+
+def _document_space_id(
+    provider: str,
+    model: str,
+    declared_space_id: Optional[str] = None,
+    document_format: Optional[str] = None,
+) -> Optional[str]:
+    """Version stored-vector preprocessing in the embedding profile.
+
+    Adding Nomic's required document prefix changes every stored vector.  The
+    profile must therefore change too, forcing a safe reindex instead of
+    comparing new instructed queries with legacy raw-document vectors.
+    """
+    normalized_format = (document_format or "").strip().lower()
+    instructed = normalized_format == "nomic" or (
+        not normalized_format and _is_nomic_embedding_model(model)
+    )
+    if not instructed:
+        return declared_space_id
+    base = declared_space_id or f"{provider}:{model}"
+    return f"{base}|document=search_document:v1"
+
+
+async def aembed_retrieval_query(
+    service: Any,
+    text: str,
+    *,
+    instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
+) -> Optional[List[float]]:
+    """Use the asymmetric query API with compatibility for legacy services."""
+    embed_query = getattr(type(service), "aembed_query", None)
+    if callable(embed_query):
+        return await embed_query(service, text, instruction=instruction)
+    model = getattr(service, "model", None)
+    if isinstance(model, str) and _is_nomic_embedding_model(model):
+        # Calling a legacy service's document API here would silently apply
+        # ``search_document:`` to a query. Fail closed instead of comparing
+        # incompatible representations; Nomic services must expose the
+        # asymmetric query method.
+        logger.warning(
+            "Nomic embedding service lacks aembed_query; query embedding disabled"
+        )
+        return None
+    return await service.aembed(text)
 
 
 @dataclass(frozen=True)
@@ -236,7 +309,10 @@ class EmbeddingService:
             return None
 
         try:
-            response = self.client.embed(model=self.model, input=text)
+            response = self.client.embed(
+                model=self.model,
+                input=_prepare_retrieval_document(text, self.model),
+            )
             # Ollama returns embeddings in response['embeddings']
             embeddings = response.get('embeddings', [])
             if embeddings:
@@ -261,7 +337,10 @@ class EmbeddingService:
             return [None] * len(texts)
 
         try:
-            response = self.client.embed(model=self.model, input=texts)
+            response = self.client.embed(
+                model=self.model,
+                input=[_prepare_retrieval_document(text, self.model) for text in texts],
+            )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
             self._handle_embed_error(e, "Batch embedding failed")
@@ -282,7 +361,10 @@ class EmbeddingService:
             return None
 
         try:
-            response = await self.async_client.embed(model=self.model, input=text)
+            response = await self.async_client.embed(
+                model=self.model,
+                input=_prepare_retrieval_document(text, self.model),
+            )
             embeddings = response.get('embeddings', [])
             if embeddings:
                 return embeddings[0]
@@ -298,9 +380,18 @@ class EmbeddingService:
         instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
     ) -> Optional[List[float]]:
         """Embed a retrieval query using the model's query-side contract."""
-        return await self.aembed(
-            _prepare_retrieval_query(text, self.model, instruction)
-        )
+        if not OLLAMA_AVAILABLE:
+            return None
+        try:
+            response = await self.async_client.embed(
+                model=self.model,
+                input=_prepare_retrieval_query(text, self.model, instruction),
+            )
+            embeddings = response.get("embeddings", [])
+            return embeddings[0] if embeddings else None
+        except Exception as exc:
+            self._handle_embed_error(exc, "Async query embedding failed")
+            return None
 
     def retrieval_similarity_floor(self) -> float:
         """Raw-cosine floor used to project retrieval relevance."""
@@ -321,7 +412,10 @@ class EmbeddingService:
             return [None] * len(texts)
 
         try:
-            response = await self.async_client.embed(model=self.model, input=texts)
+            response = await self.async_client.embed(
+                model=self.model,
+                input=[_prepare_retrieval_document(text, self.model) for text in texts],
+            )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
             self._handle_embed_error(e, "Async batch embedding failed")
@@ -359,6 +453,7 @@ class EmbeddingService:
                 model=self.model,
                 dim=dim,
                 normalized=False,
+                space_id=_document_space_id("ollama", self.model),
             )
         except ValueError:
             return None
@@ -394,6 +489,7 @@ class ProviderEmbeddingService:
         self.model = capabilities.get("embedding_model")
         self.embedding_dim = capabilities.get("embedding_dim")
         self._query_format = capabilities.get("embedding_query_format")
+        self._document_format = capabilities.get("embedding_document_format")
         self._similarity_floor = capabilities.get("embedding_similarity_floor")
         # #1477 normalization flag — capability-declared; defaults to
         # False because most providers (OpenAI, Vertex, Ollama
@@ -458,7 +554,9 @@ class ProviderEmbeddingService:
     async def aembed(self, text: str) -> Optional[List[float]]:
         return await self.adapter.aembed(
             self.client,
-            text,
+            _prepare_retrieval_document(
+                text, self.model, self._document_format
+            ),
             model=self.model,
             **self._embed_kwargs(),
         )
@@ -470,10 +568,13 @@ class ProviderEmbeddingService:
         instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
     ) -> Optional[List[float]]:
         """Embed a retrieval query using the model's query-side contract."""
-        return await self.aembed(
+        return await self.adapter.aembed(
+            self.client,
             _prepare_retrieval_query(
                 text, self.model, instruction, self._query_format
-            )
+            ),
+            model=self.model,
+            **self._embed_kwargs(),
         )
 
     def retrieval_similarity_floor(self) -> float:
@@ -483,7 +584,12 @@ class ProviderEmbeddingService:
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         return await self.adapter.aembed_batch(
             self.client,
-            texts,
+            [
+                _prepare_retrieval_document(
+                    text, self.model, self._document_format
+                )
+                for text in texts
+            ],
             model=self.model,
             **self._embed_kwargs(),
         )
@@ -518,7 +624,12 @@ class ProviderEmbeddingService:
                 model=self.model,
                 dim=self.embedding_dim,
                 normalized=self._normalized,
-                space_id=self._space_id,
+                space_id=_document_space_id(
+                    provider_label,
+                    self.model,
+                    self._space_id,
+                    self._document_format,
+                ),
             )
         except ValueError as exc:
             logger.warning(
@@ -595,7 +706,7 @@ async def semantic_search(
         return []
 
     # Get query embedding
-    query_embedding = await embedding_service.aembed(query)
+    query_embedding = await aembed_retrieval_query(embedding_service, query)
     if query_embedding is None:
         logger.warning("Failed to embed query, falling back to empty results")
         return []

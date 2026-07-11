@@ -37,13 +37,14 @@ import asyncio
 import logging
 import math
 import struct
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
 from .memory_models import MemoryMetadata
 from .async_conversation_store import (
     AsyncConversationStore,
+    _TOKEN_MATCH_THRESHOLD,
     _strip_search_wrappers,
     _token_match_score,
     _tokenize_for_search,
@@ -83,6 +84,47 @@ def _normalize_for_echo_check(text: str) -> str:
         if tok:
             tokens.append(tok.lower())
     return " ".join(tokens)
+
+
+_INTERROGATIVE_OPENERS = frozenset({
+    "what", "which", "who", "whom", "whose", "how", "when", "where", "why",
+    "do", "does", "did", "can", "could", "would", "should", "is", "are",
+    "was", "were", "have", "has", "will",
+})
+
+
+def _is_user_query_echo(content: str, query: str) -> bool:
+    """Drop a prior user *question* that contains this retrieval query.
+
+    Exact normalization remains the first guard.  The containment rule applies
+    only to interrogative/request-shaped turns, so factual user memories remain
+    eligible (``"my favorite color is blue"`` queried with ``"blue"``), while
+    dogfood probes such as ``"Which memory mentions absentneedle?"`` cannot
+    manufacture evidence for the later query ``"absentneedle"``.
+    """
+    if _normalize_for_echo_check(content) == _normalize_for_echo_check(query):
+        return True
+    stripped = content.strip()
+    first = (
+        stripped.split(maxsplit=1)[0].strip(_ECHO_EDGE_PUNCT).lower()
+        if stripped else ""
+    )
+    if "?" not in stripped and first not in _INTERROGATIVE_OPENERS:
+        return False
+    query_tokens = set(_tokenize_for_search(_strip_search_wrappers(query)))
+    content_tokens = set(_tokenize_for_search(_strip_search_wrappers(stripped)))
+    if bool(query_tokens) and query_tokens <= content_tokens:
+        return True
+    # Adversarial/dogfood probes often suffix a nonce to prove that no stored
+    # fact exists (``absentneedle-7f3c91``). The canonical tokenizer splits
+    # that into a distinctive stem plus nonce. A prior question containing the
+    # stem must not become its own evidence merely because the full query has
+    # an extra token. Keep this deliberately narrow: a shared token must be
+    # long enough to carry real identity, and this runs only on questions.
+    return any(
+        len(token) >= 8 and token in content_tokens
+        for token in query_tokens
+    )
 
 
 def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
@@ -148,6 +190,7 @@ class MemoryRetriever:
 
     # Decay parameters (Ebbinghaus-inspired)
     DECAY_HALF_LIFE_DAYS = 30  # Memory strength halves every 30 days
+    RELATIVE_RELEVANCE_RATIO = 0.75
 
     def __init__(
         self,
@@ -174,7 +217,7 @@ class MemoryRetriever:
         emotional_context: Optional[MemoryMetadata] = None,
         limit: int = 10,
         min_score: float = 0.1,
-        min_relevance: float = 0.1,
+        min_relevance: float = 0.2,
         read_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
@@ -380,6 +423,12 @@ class MemoryRetriever:
             # embedded in a prior !memory command), so fail closed here.
             if metadata.get("operator_signal") or metadata.get("signal_wake"):
                 continue
+            # Structured claim tools already hide superseded decisions/action
+            # items by default. General recall must honor the same explicit
+            # stale marker or it can inject an obsolete fact beside its
+            # replacement and ask the LLM to guess which one is current.
+            if metadata.get("superseded_by"):
+                continue
             raw_user_content = (
                 extract_raw_user_content(content)
                 if msg.get("role") == "user" else content
@@ -405,7 +454,13 @@ class MemoryRetriever:
             comparison_content = content
             if msg.get("role") == "user":
                 comparison_content = raw_user_content
-            if _normalize_for_echo_check(comparison_content) == query_normalized:
+            if (
+                _normalize_for_echo_check(comparison_content) == query_normalized
+                or (
+                    msg.get("role") == "user"
+                    and _is_user_query_echo(comparison_content, query)
+                )
+            ):
                 continue
 
             components = self._calculate_score_components(
@@ -432,7 +487,24 @@ class MemoryRetriever:
             if relevance >= min_relevance and score >= min_score:
                 scored.append((msg, score, components))
 
-        # Sort by score descending
+        # Salience reranks genuinely competitive memories; it must not let a
+        # merely-above-threshold fresh/important row outrank the query's much
+        # stronger semantic match. The relative gate adapts to each query and
+        # embedding model while the absolute ``min_relevance`` gate still
+        # provides abstention. Empirical suite v1 selected 0.75: all 15
+        # answerable Qwen-8B and Nomic cases remained recallable/top-1 while
+        # high-salience distractors stopped winning.
+        if scored:
+            strongest_relevance = max(item[2]["semantic"] for item in scored)
+            competitive_floor = (
+                strongest_relevance * self.RELATIVE_RELEVANCE_RATIO
+            )
+            scored = [
+                item for item in scored
+                if item[2]["semantic"] >= competitive_floor
+            ]
+
+        # Sort competitive candidates by human-like salience score.
         scored.sort(key=lambda x: x[1], reverse=True)
 
         # Return top results with scores
@@ -636,6 +708,13 @@ class MemoryRetriever:
             _tokenize_for_search(_strip_search_wrappers(query))
         ))
         lexical = _token_match_score(query_tokens, projected_content.lower())
+        # Candidate generation deliberately accepts any overlap so it cannot
+        # hide an old exact fact before final scoring. Eligibility uses the
+        # canonical match threshold: a single shared word in a two-token
+        # unknown query ("favorite planet" → "favorite breakfast") is noise,
+        # not 50%-relevant memory evidence.
+        if lexical < _TOKEN_MATCH_THRESHOLD:
+            lexical = 0.0
 
         if semantic_similarity is not None:
             calibrated_vector = max(
@@ -786,11 +865,11 @@ class MemoryRetriever:
         if not query or not query.strip():
             return None
         try:
-            embed_query = getattr(type(service), "aembed_query", None)
-            if callable(embed_query):
-                embedding = await embed_query(service, query)
-            else:
-                embedding = await service.aembed(query)
+            from kestrel_sovereign.llm.embedding_service import (
+                aembed_retrieval_query,
+            )
+
+            embedding = await aembed_retrieval_query(service, query)
         except Exception as e:
             logger.warning(
                 "Query embedding failed (falling back to keyword "

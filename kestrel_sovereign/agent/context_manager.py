@@ -37,6 +37,8 @@ from .memory_manager import MemoryManager
 from .tool_context_manager import ToolContextManager
 
 if TYPE_CHECKING:
+    from collections import OrderedDict
+
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
     from kestrel_sovereign.storage.memory_retriever import MemoryRetriever
@@ -85,7 +87,7 @@ def reset_injection_tracking() -> None:
 # content still surfaces. Override via ``[retrieval]`` in kestrel.toml.
 _RETRIEVAL_DEFAULTS = {
     "memory_min_score": 0.3,
-    "memory_min_relevance": 0.1,
+    "memory_min_relevance": 0.2,
     "rag_min_score": 0.5,
 }
 _RETRIEVAL_CONFIG_CACHE: Optional[Dict[str, float]] = None

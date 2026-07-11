@@ -24,7 +24,6 @@ Usage:
     report = await memory.consolidate()
 """
 import logging
-from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 from .memory_models import MemoryMetadata, TemporalPattern, MemoryEpisode
@@ -280,7 +279,7 @@ class MemorySystem:
         query: str,
         limit: int = 10,
         emotional_context: Optional[MemoryMetadata] = None,
-        min_relevance: float = 0.1,
+        min_relevance: float = 0.2,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve memories relevant to query with human-like weighting.

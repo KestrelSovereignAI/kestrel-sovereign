@@ -261,7 +261,7 @@ banned = []
 #
 # [retrieval]
 # memory_min_score = 0.3  # weighted retrieval score on emotionally-weighted memories
-# memory_min_relevance = 0.1  # semantic/lexical eligibility before salience reranking
+# memory_min_relevance = 0.2  # calibrated eligibility before salience reranking
 # rag_min_score    = 0.5  # cosine similarity floor on RAG embedding candidates
 
 # =============================================================================

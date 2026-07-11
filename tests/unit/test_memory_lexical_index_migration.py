@@ -44,6 +44,7 @@ async def test_sqlite_legacy_schema_migration_is_idempotent(tmp_path):
         assert "conversation_lexical_tokens" in tables
         assert "idx_conversation_lexical_token_lookup" in indexes
         assert "idx_conversation_lexical_coverage" in indexes
+        assert "idx_conversation_lexical_message" in indexes
     finally:
         await db.close()
 
@@ -70,4 +71,5 @@ async def test_postgres_migration_uses_additive_transactional_ddl():
     assert any("ADD COLUMN IF NOT EXISTS lexical_index_version" in sql for sql in statements)
     assert any("CREATE TABLE IF NOT EXISTS conversation_lexical_tokens" in sql for sql in statements)
     assert any("idx_conversation_lexical_coverage" in sql for sql in statements)
+    assert any("idx_conversation_lexical_message" in sql for sql in statements)
     db.transaction.assert_called_once_with()

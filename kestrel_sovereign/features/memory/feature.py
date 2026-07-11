@@ -644,7 +644,7 @@ class MemoryFeature(Feature):
         query: str,
         mood: str = "neutral",
         limit: int = 10,
-        min_relevance: float = 0.1,
+        min_relevance: float = 0.2,
     ) -> ToolResult:
         """
         Retrieve memories with human-like weighting.

@@ -18,16 +18,14 @@ These tests are pure-Python / SQLite — no real DB needed.
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from kestrel_sovereign.llm.embedding_service import (
-    EmbeddingProfile,
     EmbeddingService,
     ProviderEmbeddingService,
+    aembed_retrieval_query,
     cosine_similarity,
     derive_embedding_profile,
 )
@@ -220,7 +218,56 @@ async def test_qwen3_query_uses_documented_instruction_format():
         model="qwen3-embedding:0.6b",
         dimensions=1024,
     )
-    assert service.retrieval_similarity_floor() == pytest.approx(0.2)
+    assert service.retrieval_similarity_floor() == pytest.approx(0.27)
+
+
+@pytest.mark.asyncio
+async def test_nomic_uses_asymmetric_retrieval_prefixes_and_new_profile():
+    provider = _stub_provider(
+        vendor="ollama", model="nomic-embed-text", dim=768
+    )
+    provider["adapter"].aembed = AsyncMock(return_value=[0.1])
+    provider["adapter"].aembed_batch = AsyncMock(return_value=[[0.1]])
+    service = ProviderEmbeddingService(provider)
+
+    await service.aembed("stored memory")
+    await service.aembed_batch(["first", "second"])
+    await service.aembed_query("what do I remember?")
+
+    calls = provider["adapter"].aembed.await_args_list
+    assert calls[0].args[1] == "search_document: stored memory"
+    assert calls[1].args[1] == "search_query: what do I remember?"
+    assert provider["adapter"].aembed_batch.await_args.args[1] == [
+        "search_document: first",
+        "search_document: second",
+    ]
+    profile = service.describe()
+    legacy = derive_embedding_profile(
+        provider="ollama", model="nomic-embed-text", dim=768
+    )
+    assert profile is not None
+    assert profile.space_id.endswith("|document=search_document:v1")
+    assert profile.profile_id != legacy.profile_id
+
+
+@pytest.mark.asyncio
+async def test_provider_can_declare_server_side_nomic_document_formatting():
+    provider = _stub_provider(
+        vendor="managed-api", model="nomic-embed-text", dim=768
+    )
+    provider["capabilities"]["embedding_document_format"] = "raw"
+    provider["adapter"].aembed = AsyncMock(return_value=[0.1])
+    service = ProviderEmbeddingService(provider)
+
+    await service.aembed("server formats this")
+
+    provider["adapter"].aembed.assert_awaited_once_with(
+        provider["client"],
+        "server formats this",
+        model="nomic-embed-text",
+        dimensions=768,
+    )
+    assert service.describe().space_id == "managed-api:nomic-embed-text"
 
 
 @pytest.mark.asyncio
@@ -333,6 +380,18 @@ def test_embedding_service_describe_unknown_model_returns_none():
 
 
 # --- cosine_similarity length guard ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_legacy_nomic_service_without_query_api_fails_closed():
+    class LegacyNomicService:
+        model = "nomic-embed-text"
+        aembed = AsyncMock(return_value=[1.0])
+
+    service = LegacyNomicService()
+
+    assert await aembed_retrieval_query(service, "where is the fact?") is None
+    service.aembed.assert_not_awaited()
 
 
 def test_cosine_similarity_mismatched_lengths_returns_zero():

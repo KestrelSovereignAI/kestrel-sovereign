@@ -549,6 +549,15 @@ async def migrate_conversation_lexical_index(db: "AsyncDatabase") -> None:
             "ON conversation_history(agent_id, lexical_index_version, "
             "lexical_index_id)"
         )
+        # Orphan-token cleanup probes by agent + stable blind-index key.  The
+        # coverage index above cannot serve that lookup efficiently because
+        # lexical_index_version sits between those columns.  Without this
+        # index a cleanup after a large backfill degenerates into one full
+        # per-agent history scan for every token row.
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_lexical_message "
+            "ON conversation_history(agent_id, lexical_index_id)"
+        )
 
 
 async def migrate_add_embedding_profile_id(
