@@ -219,6 +219,7 @@ async def test_qwen3_query_uses_documented_instruction_format():
         dimensions=1024,
     )
     assert service.retrieval_similarity_floor() == pytest.approx(0.27)
+    assert service.requires_answerability_gate() is True
 
 
 @pytest.mark.asyncio
@@ -248,6 +249,7 @@ async def test_nomic_uses_asymmetric_retrieval_prefixes_and_new_profile():
     assert profile is not None
     assert profile.space_id.endswith("|document=search_document:v1")
     assert profile.profile_id != legacy.profile_id
+    assert service.requires_answerability_gate() is True
 
 
 @pytest.mark.asyncio
@@ -268,6 +270,15 @@ async def test_provider_can_declare_server_side_nomic_document_formatting():
         dimensions=768,
     )
     assert service.describe().space_id == "managed-api:nomic-embed-text"
+
+
+def test_provider_can_override_answerability_gate_model_default():
+    provider = _stub_provider(
+        vendor="managed-api", model="nomic-embed-text", dim=768
+    )
+    provider["capabilities"]["embedding_answerability_gate"] = False
+
+    assert ProviderEmbeddingService(provider).requires_answerability_gate() is False
 
 
 @pytest.mark.asyncio

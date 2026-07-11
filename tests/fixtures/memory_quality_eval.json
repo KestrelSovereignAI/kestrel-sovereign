@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "description": "Curated conversation-memory retrieval evaluation: paraphrase, abstention, contradiction, emotion, importance, and long-horizon recall.",
   "memories": [
     {"id": "pet-current", "text": "My cobalt axolotl is named Quasar-17.", "days_old": 30, "importance": 0.8},
@@ -45,6 +45,15 @@
     {"id": "uncertain-trip", "query": "Do I have confirmed plans to visit Iceland?", "relevant": ["uncertain"]},
     {"id": "abstain-planet", "query": "What is my favorite planet?", "relevant": [], "expect_empty": true},
     {"id": "abstain-language", "query": "Which language am I fluent in?", "relevant": [], "expect_empty": true},
-    {"id": "abstain-birthday", "query": "When is my birthday?", "relevant": [], "expect_empty": true}
+    {"id": "abstain-birthday", "query": "When is my birthday?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-color", "query": "What is my favorite color?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-employer", "query": "Which company do I work for?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-shoe-size", "query": "What is my shoe size?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-mother", "query": "What is my mother's name?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-address", "query": "What is my home address?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-anniversary", "query": "When is my wedding anniversary?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-blood-type", "query": "What is my blood type?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-college", "query": "Which college did I attend?", "relevant": [], "expect_empty": true},
+    {"id": "abstain-phone", "query": "What is my phone number?", "relevant": [], "expect_empty": true}
   ]
 }

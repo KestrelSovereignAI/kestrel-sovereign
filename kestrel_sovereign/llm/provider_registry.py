@@ -38,9 +38,6 @@ import asyncio
 import logging
 import os
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
-from pathlib import Path
-import json as _json
 
 import openai
 
@@ -54,7 +51,6 @@ except ImportError:
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter, ProviderInfo
 from kestrel_sdk.llm import ProviderCapabilities
 
-from .adapter import LLMAdapter
 from .ollama_adapter import OllamaAdapter
 from .openai_adapter import OpenAIAdapter
 from .anthropic_adapter import AnthropicAdapter
@@ -406,6 +402,15 @@ class ProviderRegistry:
         # above; surfaced as ``reasoning_effort`` on the dict shape by
         # ``LLMService`` and gated to llama.cpp in ``provider_cache_body``.
         info._kestrel_reasoning_effort = route_cfg.get("reasoning_effort")  # type: ignore[attr-defined]
+        answerability_gate = route_cfg.get("embedding_answerability_gate")
+        if answerability_gate is not None and not isinstance(
+            answerability_gate, bool
+        ):
+            raise ValueError(
+                f"Route {vendor}:{route}: embedding_answerability_gate must "
+                "be boolean"
+            )
+        info._kestrel_embedding_answerability_gate = answerability_gate  # type: ignore[attr-defined]
         return info
 
     def _build_client_and_adapter(

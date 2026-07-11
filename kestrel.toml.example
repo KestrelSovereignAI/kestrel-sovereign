@@ -263,6 +263,9 @@ banned = []
 # memory_min_score = 0.3  # weighted retrieval score on emotionally-weighted memories
 # memory_min_relevance = 0.2  # calibrated eligibility before salience reranking
 # rag_min_score    = 0.5  # cosine similarity floor on RAG embedding candidates
+# memory_answerability_gate = true  # global kill switch for the LLM evidence stage
+# memory_answerability_timeout_seconds = 12.0  # hard per-recall latency bound
+# memory_answerability_model = "gemma4:31b"  # optional qualified judge; defaults to active chat model
 
 # =============================================================================
 # Backup Retention

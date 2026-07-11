@@ -10,13 +10,11 @@ This is the single entry point for all LLM operations. It handles:
 import logging
 import re
 import json
-import os
 import time
 import asyncio
 import inspect
 from contextvars import ContextVar
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
-from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
 import openai
@@ -25,6 +23,7 @@ from kestrel_sdk.llm import ProviderCapabilities
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from .embedding_space import EmbeddingSpacePin, ParityResult
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
@@ -38,7 +37,6 @@ from .cancellation import CancelToken
 from .error_handling import (
     handle_llm_errors,
     handle_observability_errors,
-    handle_storage_errors,
     LLMError,
     LLMProviderError,
     LLMProviderUnavailableError,
@@ -53,7 +51,6 @@ from .streaming import StreamingMixin, RoutingResolution
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
 from kestrel_sovereign.kestrel_config.constants import (
-    HTTP_TIMEOUT_MEDIUM,
     CLIENT_CLOSE_TIMEOUT,
 )
 from kestrel_sovereign.config import load_config, load_section
@@ -2386,6 +2383,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             if not isinstance(raw_capabilities, ProviderCapabilities):
                 raw_capabilities = ProviderCapabilities()
             capabilities = raw_capabilities.to_dict()
+            answerability_gate = getattr(
+                provider, "_kestrel_embedding_answerability_gate", None
+            )
+            if answerability_gate is not None:
+                capabilities["embedding_answerability_gate"] = answerability_gate
             out.append({
                 "name": provider.name,
                 "vendor": getattr(provider, "vendor", None),
@@ -3493,7 +3495,6 @@ No other text or formatting.
                         f"Underlying error: {e}"
                     ) from e
 
-        provider_type = "local" if force_local_only else "all"
         raise LLMAllProvidersFailedError(errors)
 
     async def get_response_with_model(

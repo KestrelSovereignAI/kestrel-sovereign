@@ -172,6 +172,36 @@ async def test_search_memory_returns_raw_user_text_to_llm():
 
 
 @pytest.mark.asyncio
+async def test_search_memory_drops_only_the_active_question_echo():
+    feature = MemoryFeature.__new__(MemoryFeature)
+    current = {
+        "id": 12,
+        "role": "user",
+        "content": "<user_input>What is my favorite planet?</user_input>",
+        "metadata": {"sent_form": True},
+    }
+    historical = {
+        "id": 4,
+        "role": "user",
+        "content": "What is my favorite planet?",
+        "metadata": {"sent_form": True},
+    }
+    fake_store = MagicMock()
+    fake_store.search_history = AsyncMock(return_value=[current, historical])
+    fake_store.get_conversation_history = AsyncMock(return_value=[current])
+    feature._get_conversation_store = lambda: fake_store
+
+    out = await feature.search_memory(query="favorite planet", limit=10)
+
+    assert out.status is ToolResultStatus.OK
+    assert [row["id"] for row in out.data["results"]] == [4]
+    assert out.data["count"] == 1
+    fake_store.get_conversation_history.assert_awaited_once_with(
+        limit=20, session_id=None
+    )
+
+
+@pytest.mark.asyncio
 async def test_recall_recent_returns_raw_user_text_to_llm():
     feature = MemoryFeature.__new__(MemoryFeature)
 

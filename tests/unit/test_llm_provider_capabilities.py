@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import pytest
+
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -505,6 +507,42 @@ def test_provider_registry_parses_route_level_sibling():
     service = LLMService.__new__(LLMService)
     [route_dict] = service._convert_providers_format([info])
     assert route_dict["embedding_sibling"] == "openai:api"
+
+
+def test_provider_registry_carries_answerability_override_across_sdk_boundary():
+    registry = ProviderRegistry({})
+    route_cfg = {
+        "adapter": "AnthropicAdapter",
+        "api_key_env": "X_UNSET_KEY",
+        "model": "claude-3-opus-20240229",
+        "embedding_answerability_gate": False,
+    }
+    registry._resolve_secret = lambda rc, env_key, plain_key: "fake-key"
+
+    info = registry._build_route(
+        "anthropic", "api", {"is_cloud": True}, route_cfg
+    )
+
+    assert info is not None
+    service = LLMService.__new__(LLMService)
+    [route_dict] = service._convert_providers_format([info])
+    assert route_dict["capabilities"]["embedding_answerability_gate"] is False
+
+
+def test_provider_registry_rejects_non_boolean_answerability_override():
+    registry = ProviderRegistry({})
+    route_cfg = {
+        "adapter": "AnthropicAdapter",
+        "api_key_env": "X_UNSET_KEY",
+        "model": "claude-3-opus-20240229",
+        "embedding_answerability_gate": "false",
+    }
+    registry._resolve_secret = lambda rc, env_key, plain_key: "fake-key"
+
+    with pytest.raises(ValueError, match="answerability_gate must be boolean"):
+        registry._build_route(
+            "anthropic", "api", {"is_cloud": True}, route_cfg
+        )
 
 
 def test_provider_registry_route_level_sibling_overrides_vendor_level():
