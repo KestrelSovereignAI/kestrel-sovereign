@@ -1639,6 +1639,13 @@ window.loadConversation = async function(sessionId, options = {}) {
     const host = API.getHostAgent();
     const loadToken = ++conversationLoadSeq;
 
+    // Pane-activity snapshot at click time (#2380 codex round 6): an explicit
+    // click overrides a stream that was ALREADY running, but never a turn the
+    // user starts DURING this load's awaits — that turn owns the pane.
+    const paneAtClick = state.chatPanes.get(host);
+    const busyAtClick = state.waitingAgents.has(host)
+        || !!(paneAtClick && paneAtClick.streamingMsgDiv);
+
     // Roll the selection back to the session the CAPTURED host's pane actually
     // renders (not the previously *pending* selection — that one may itself
     // have never rendered, and not the global currentSessionId — the operator
@@ -1735,6 +1742,22 @@ window.loadConversation = async function(sessionId, options = {}) {
         // the NEWLY-visible agent's pane. (Covers the no-expectedAgent callers
         // too; the expectedAgent guards above only ran for pinned loads.)
         if (API.getHostAgent() !== host) {
+            return;
+        }
+
+        // A turn STARTED during this load's awaits owns the pane (#2380 codex
+        // round 6 P1): the composer stayed usable against the previous session
+        // while getConversation/getRestartStatusEvents were in flight, so
+        // wiping now would generation-gate the user's in-flight response and
+        // visually discard their turn. Drop the load and roll the selection
+        // back to the session the pane actually holds. (A stream already
+        // running at click time doesn't trip this — explicit clicks override
+        // pre-existing streams, as before.)
+        const paneNow = state.chatPanes.get(host);
+        const busyNow = state.waitingAgents.has(host)
+            || !!(paneNow && paneNow.streamingMsgDiv);
+        if (!busyAtClick && busyNow) {
+            rollbackToRendered();
             return;
         }
 
