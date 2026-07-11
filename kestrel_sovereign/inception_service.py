@@ -402,6 +402,12 @@ def backup_or_refuse_existing_identity(output_dir: Path, slug: str, force: bool)
         "*_mldsa65.bytes.enc",
         "*_archival_slhdsa.bytes.enc",
         "*_archival_slhdsa_pub.bytes.enc",
+        # Classical identity material too: force re-minting a legacy
+        # did:pkh agent's dir must not leave its secp256k1 private key
+        # live and un-backed-up beside the new identity.
+        "kestrel_0x*.json",
+        "kestrel_0x*.key.enc",
+        "kestrel_0x*.pem",
     ):
         existing.update(output_dir.glob(pattern))
     existing.update(
@@ -478,10 +484,16 @@ def save_born_hybrid_identity(
         cleanup_artifacts(created)
         raise
 
-    did_path = output_dir / f"{slug}_did.json"
-    with open(did_path, "w", encoding="utf-8") as f:
-        json.dump(did_document, f, indent=2)
-    created.append(did_path)
+    try:
+        did_path = output_dir / f"{slug}_did.json"
+        with open(did_path, "w", encoding="utf-8") as f:
+            json.dump(did_document, f, indent=2)
+        created.append(did_path)
+    except Exception:
+        # A key set without its DID document is unloadable AND blocks the
+        # next inception attempt — don't orphan it on a failed doc write.
+        cleanup_artifacts(created)
+        raise
     logging.info(f"Saved born-hybrid identity for {did_document['id']} in {output_dir}")
     return created
 
