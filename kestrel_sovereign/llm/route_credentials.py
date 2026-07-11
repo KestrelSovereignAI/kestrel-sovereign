@@ -14,14 +14,15 @@ needs no credential (e.g. a local Ollama route).
 
 from __future__ import annotations
 
-# Per-vendor alternate credential env vars. Some vendors accept more than
-# one kind of key. OpenRouter accepts either the standard inference key
-# (``OPENROUTER_API_KEY``) or a management key
-# (``OPENROUTER_MANAGEMENT_API_KEY``) from which the runtime mints a
-# scoped bootstrap inference key. This fallback applies even when the
-# route TOML omits ``management_api_key_env``, keeping setup/check/doctor
-# in agreement for a management-key-only setup.
-_VENDOR_ALT_API_KEY_ENV = {
+# Per-vendor default management-key env vars. Some vendors accept more
+# than one kind of key. OpenRouter accepts either the standard inference
+# key (``OPENROUTER_API_KEY``) or a management key from which the runtime
+# mints a scoped bootstrap inference key. The runtime resolves that key as
+# ``route["management_api_key_env"] or <this default>`` (see
+# ``provider_registry._openrouter_management_key``), so the default only
+# applies when the route TOML omits ``management_api_key_env`` — a route
+# that declares a custom name is served *only* from that name.
+_VENDOR_DEFAULT_MANAGEMENT_ENV = {
     "openrouter": "OPENROUTER_MANAGEMENT_API_KEY",
 }
 
@@ -32,12 +33,14 @@ def accepted_credential_envs(route_id: str, route: dict) -> list[str]:
     The route is authenticated if any returned name is set (non-empty) in
     ``.env``. An empty list means the route needs no credential.
 
-    Resolution order:
+    Resolution order (mirrors the runtime, which reads
+    ``route["management_api_key_env"] or <vendor default>``):
       1. ``route["api_key_env"]`` (the primary inference key), if declared.
       2. ``route["management_api_key_env"]`` (an explicitly declared
-         management key), if declared.
-      3. The static per-vendor alternate for ``route_id``'s vendor, if any
-         — applied even when the route TOML omits it.
+         management key), if declared — the vendor default does NOT
+         apply in this case, because the runtime won't read it either.
+      3. Otherwise the per-vendor default management env for
+         ``route_id``'s vendor, if any.
     """
     envs: list[str] = []
 
@@ -45,13 +48,11 @@ def accepted_credential_envs(route_id: str, route: dict) -> list[str]:
     if primary:
         envs.append(primary)
 
-    management = route.get("management_api_key_env")
+    vendor_key = route_id.partition(":")[0]
+    management = route.get("management_api_key_env") or _VENDOR_DEFAULT_MANAGEMENT_ENV.get(
+        vendor_key
+    )
     if management and management not in envs:
         envs.append(management)
-
-    vendor_key = route_id.partition(":")[0]
-    alt = _VENDOR_ALT_API_KEY_ENV.get(vendor_key)
-    if alt and alt not in envs:
-        envs.append(alt)
 
     return envs

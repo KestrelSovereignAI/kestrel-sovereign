@@ -97,11 +97,11 @@ def test_doctor_blocks_on_missing_api_key_env(tmp_path):
     assert any("OPENAI_API_KEY" in m for m in report.fail)
 
 
-def test_doctor_accepts_openrouter_management_key_only(tmp_path):
+def test_doctor_accepts_openrouter_management_key_only_undeclared_env(tmp_path):
     """Management-key-only OpenRouter passes doctor even when the route
     TOML omits ``management_api_key_env`` (#2245).
 
-    setup --check accepts this shape via the vendor alt-key fallback;
+    setup --check accepts this shape via the vendor default fallback;
     doctor must agree or a valid setup fails ``kestrel doctor``.
     """
     _seed_ready(tmp_path)

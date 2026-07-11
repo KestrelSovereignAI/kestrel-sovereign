@@ -45,3 +45,17 @@ def test_management_key_only_route():
         {"management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY"},
     )
     assert envs == ["OPENROUTER_MANAGEMENT_API_KEY"]
+
+
+def test_custom_management_env_suppresses_vendor_default():
+    # The runtime reads ``management_api_key_env or <default>`` — a route
+    # that declares a custom name is served only from that name, so the
+    # default must NOT satisfy setup/check/doctor for it.
+    envs = accepted_credential_envs(
+        "openrouter:api",
+        {
+            "api_key_env": "OPENROUTER_API_KEY",
+            "management_api_key_env": "MY_CUSTOM_MGMT_KEY",
+        },
+    )
+    assert envs == ["OPENROUTER_API_KEY", "MY_CUSTOM_MGMT_KEY"]
