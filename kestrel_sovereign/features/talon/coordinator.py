@@ -540,26 +540,152 @@ class TalonCoordinatorFeature(Feature):
         self,
         stale_days: int = 3,
         repo: Optional[str] = None,
+        repos: Optional[Any] = None,
+        org: Optional[Any] = None,
+        repo_prefix: Optional[Any] = None,
+        exclude_repos: Optional[Any] = None,
     ) -> ToolResult:
-        """Scan for stale work without taking action (#2281).
+        """Scan for stale work without taking action (#2281, #2269).
 
         This is the scheduler-facing wrapper around Talon's existing live
         stalled-job survey. It keeps ``ecosystem_discovery_watch`` wired to a
         real in-tree tool while preserving the evidence boundary: discovery
         returns findings only, and any repair/closure still needs a later gate.
 
+        Two modes:
+
+        * **Single-repo / no filter (legacy).** With no roster args, it surveys
+          all live stalled Talon jobs, optionally filtered to one ``repo`` slug.
+        * **Roster mode (#2269).** When any of ``repos`` / ``org`` /
+          ``repo_prefix`` is given — or ``repo`` carries a wildcard — the args
+          are parsed into a durable ecosystem roster and expanded against the
+          repos accessible to the agent's GitHub token. Wildcards like
+          ``KestrelSovereignAI/kestrel-feature-*`` are treated as prefixes, not
+          literal repo names; tekspear repos are always excluded; and repos that
+          could not be resolved are reported as explicit ``scan_failures``.
+
         Args:
             stale_days: How many idle days mark Talon work as stalled.
-            repo: Optional ``owner/name`` filter.
+            repo: Optional ``owner/name`` filter (or a wildcard → roster mode).
+            repos: Explicit allowlist of ``owner/name`` slugs (or wildcards).
+            org: Org(s) whose accessible repos form the roster.
+            repo_prefix: Prefix(es) matched against accessible repos.
+            exclude_repos: Explicit ``owner/name`` slugs to drop from the roster.
         """
-        stalled = await self._survey_stalled_talon_jobs(stale_days)
-        if repo:
-            stalled = [item for item in stalled if item.get("repo") == repo]
+        from kestrel_sovereign.signals.sources.ecosystem_roster import (
+            is_wildcard,
+            parse_roster_spec,
+            expand_roster,
+        )
 
+        roster_requested = bool(repos or org or repo_prefix) or bool(
+            repo and is_wildcard(str(repo))
+        )
+
+        stalled = await self._survey_stalled_talon_jobs(stale_days)
+
+        if not roster_requested:
+            if repo:
+                stalled = [item for item in stalled if item.get("repo") == repo]
+            findings = self._stale_findings(stalled, default_repo=repo or "")
+            return ToolResult.ok(
+                confirmation=(
+                    f"Found {len(findings)} stale work item(s) "
+                    f"older than {stale_days} day(s)."
+                ),
+                data={
+                    "summary": (
+                        f"{len(findings)} stale work item(s)"
+                        if findings
+                        else "No actionable stale work findings."
+                    ),
+                    "findings": findings,
+                    "stale_days": stale_days,
+                    "repo": repo or "",
+                },
+            )
+
+        spec = parse_roster_spec(
+            org=org,
+            repos=repos,
+            repo=repo,
+            repo_prefix=repo_prefix,
+            exclude_repos=exclude_repos,
+        )
+        accessible, discovery_error = await self._discover_roster_universe(spec.orgs)
+        expansion = expand_roster(
+            spec,
+            accessible_repos=accessible,
+            discovery_error=discovery_error,
+        )
+
+        roster = set(expansion.repos)
+        findings = self._stale_findings(
+            [item for item in stalled if item.get("repo") in roster],
+        )
+
+        scan_failures: List[Dict[str, Any]] = []
+        for failure in expansion.failures:
+            target = (
+                failure.get("repo")
+                or failure.get("pattern")
+                or failure.get("scope")
+                or "?"
+            )
+            entry = {
+                "repo": failure.get("repo", ""),
+                "kind": "scan_failure",
+                "status": "inaccessible",
+                "severity": "high",
+                "title": f"Roster scan failure: {target} ({failure.get('reason', '')})",
+                "reason": failure.get("reason", ""),
+                "target": target,
+                "suggested_gate": "triage_lane",
+                "actionable": True,
+            }
+            scan_failures.append(entry)
+            # Surface failures as findings too so the discovery watch never
+            # silently drops an inaccessible repo (#2269 AC3).
+            findings.append(entry)
+
+        summary_bits = []
+        if findings:
+            summary_bits.append(f"{len(findings)} finding(s)")
+        summary_bits.append(f"{len(expansion.repos)} repo(s) scanned")
+        if scan_failures:
+            summary_bits.append(f"{len(scan_failures)} scan failure(s)")
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Scanned {len(expansion.repos)} roster repo(s) for stale work "
+                f"older than {stale_days} day(s); "
+                f"{len(scan_failures)} inaccessible."
+            ),
+            data={
+                "summary": (
+                    ", ".join(summary_bits)
+                    if findings or scan_failures
+                    else "No actionable stale work findings."
+                ),
+                "findings": findings,
+                "scan_failures": scan_failures,
+                "scanned_repos": list(expansion.repos),
+                "excluded_repos": list(expansion.excluded),
+                "stale_days": stale_days,
+                "repo": repo or "",
+            },
+        )
+
+    def _stale_findings(
+        self,
+        stalled: List[Dict[str, Any]],
+        default_repo: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Shape surveyed stalled Talon jobs into actionable discovery findings."""
         findings: List[Dict[str, Any]] = []
         for item in stalled:
             issue = item.get("issue")
-            repo_name = item.get("repo") or repo or ""
+            repo_name = item.get("repo") or default_repo or ""
             title_parts = ["Stalled Talon job", str(item.get("id") or "?")]
             if repo_name and issue:
                 title_parts.append(f"for {repo_name}#{issue}")
@@ -576,23 +702,36 @@ class TalonCoordinatorFeature(Feature):
                 "suggested_gate": "govern_stalled_work_rescue",
                 "actionable": True,
             })
+        return findings
 
-        return ToolResult.ok(
-            confirmation=(
-                f"Found {len(findings)} stale work item(s) "
-                f"older than {stale_days} day(s)."
-            ),
-            data={
-                "summary": (
-                    f"{len(findings)} stale work item(s)"
-                    if findings
-                    else "No actionable stale work findings."
-                ),
-                "findings": findings,
-                "stale_days": stale_days,
-                "repo": repo or "",
-            },
-        )
+    async def _discover_roster_universe(
+        self, orgs: tuple[str, ...]
+    ) -> tuple[set[str], Optional[str]]:
+        """Fetch the set of repos accessible to the agent's GitHub token.
+
+        Returns ``(accessible_repos, error)``. ``error`` is set when a listing
+        could not be fetched at all; a partial set with an error means some orgs
+        listed and others did not — :func:`expand_roster` turns the missing ones
+        into explicit failures. ``orgs`` empty falls back to the configured
+        default orgs (``[github].orgs`` or ``KestrelSovereignAI``).
+        """
+        from kestrel_sovereign.endpoints.github import discover_accessible_repos
+
+        accessible: set[str] = set()
+        error: Optional[str] = None
+        targets: List[Optional[str]] = list(orgs) if orgs else [None]
+        for target in targets:
+            try:
+                found = await discover_accessible_repos(org=target)
+                accessible.update(found)
+            except Exception as exc:  # noqa: BLE001 - inaccessible → explicit failure
+                error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "scan_stale_work: could not list repos for org %s: %s",
+                    target or "<default>",
+                    exc,
+                )
+        return accessible, error
 
     @tool(
         name="talon_claim",
