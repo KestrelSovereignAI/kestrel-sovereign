@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-10
-**Scope:** 1983 tracked files (1293 `.py`, 326 `.md`, 364 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-11
+**Scope:** 1998 tracked files (1303 `.py`, 327 `.md`, 368 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -708,6 +708,8 @@ Repo entry points and standard project files.
   - `class PromptAdaptation`; `class ConstitutionalProfile`; `class StateOfMind`; `class ConstitutionalProfileService`; `def get_profile_service()`
 - **kestrel_sovereign/llm/continuation_store.py** — Per-conversation continuation cursor store for stateful provider protocols.
   - `class ContinuationCursor`; `class ContinuationStore`; `class InMemoryContinuationStore`
+- **kestrel_sovereign/llm/embedding_discovery.py** — Embedding-model discovery (#2338).
+  - `class EmbeddingModelInfo`; `def normalize_embedding_model_id(model_id)`
 - **kestrel_sovereign/llm/embedding_service.py** — Embedding Service for Kestrel.
   - `class EmbeddingProfile`; `def derive_embedding_profile()`; `class EmbeddingService`; `class ProviderEmbeddingService`; `def cosine_similarity(a, b)`; `async def semantic_search(query, documents, embedding_service, top_k)`; `def get_embedding_service(model, base_url)`; `def get_provider_embedding_service(llm_service)`; `…`
 - **kestrel_sovereign/llm/embedding_space.py** — Shared local/cloud embedding-space pins + parity gate (#2290).
@@ -983,6 +985,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/kebab_menu.js** — (js asset)
 - **kestrel_sovereign/static/js/memories.js** — (js asset)
 - **kestrel_sovereign/static/js/metrics.js** — (js asset)
+- **kestrel_sovereign/static/js/new_agent_dialog.js** — (js asset)
 - **kestrel_sovereign/static/js/panels.js** — (js asset)
 - **kestrel_sovereign/static/js/resources.js** — (js asset)
 - **kestrel_sovereign/static/js/security.js** — (js asset)
@@ -1068,11 +1071,13 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/destructive_audit.py** — Append-only audit trail for destructive storage operations (#750).
   - `def destructive_audit_caller(identity)`; `def audit_db_path_for(main_db_path)`; `def default_caller_identity()`; `def hash_rows(rows)`; `class DestructiveAuditEvent`; `class DestructiveAuditLog`
 - **kestrel_sovereign/storage/embedding_reindex.py** — Operator-triggered re-embedding of stored vectors (#2289).
-  - `class ReindexStats`; `class EmbeddingReindexer`
+  - `class ReindexStats`; `async def dominant_embedding_profile(db, agent_id)`; `class EmbeddingReindexer`
 - **kestrel_sovereign/storage/emotional_tagger.py** — Emotional analysis for conversation messages.
   - `class EmotionalTagger`; `async def analyze_message(content, role)`
 - **kestrel_sovereign/storage/encryption.py** — Backward-compatible encryption re-exports — DEPRECATED SHIM.
   - `def encrypt_string(content, fernet, agent_did, purpose)`; `def decrypt_string(content, metadata, fernet, agent_did, …)`
+- **kestrel_sovereign/storage/lexical_memory_index.py** — Privacy-preserving exact-token candidate index for conversation memory.
+  - `class LexicalIndexHealth`; `class ConversationLexicalIndex`
 - **kestrel_sovereign/storage/memory_consolidator.py** — Memory consolidation and forgetting curve.
   - `class MemoryConsolidator`
 - **kestrel_sovereign/storage/memory_models.py** — Memory Models for Human-Like Memory System.
@@ -1117,7 +1122,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/sqla/episode.py** — SQLAlchemy mapping of the ``memory_episodes`` table.
   - `class MemoryEpisodeRow`; `def build_episode_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/migrations.py** — One-time data migrations for sovereign-core SQLAlchemy entities.
-  - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`; `async def migrate_conversation_history_add_embedding_vec(db)`; `async def migrate_add_embedding_profile_id(db)`; `async def migrate_create_embedding_profiles(db)`; `async def migrate_embedding_profiles_add_parity(db)`; `async def migrate_compaction_terminology(db)`; `async def migrate_canonical_session_ids(db)`
+  - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`; `async def migrate_conversation_history_add_embedding_vec(db)`; `async def migrate_conversation_lexical_index(db)`; `async def migrate_add_embedding_profile_id(db)`; `async def migrate_create_embedding_profiles(db)`; `async def migrate_embedding_profiles_add_parity(db)`; `async def migrate_compaction_terminology(db)`; `…`
 - **kestrel_sovereign/storage/sqla/saved_item.py** — SQLAlchemy mapping of the ``saved_items`` table.
   - `class SavedItem`; `def build_saved_item_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/session.py** — Construct async SQLAlchemy session factories that connect to the same database as a given :class:`AsyncDatabase`.
@@ -1469,6 +1474,7 @@ Repo entry points and standard project files.
 - **docs/audit/FEATURE_INVENTORY_RECONCILIATION.md** — Feature Inventory Reconciliation — The legacy catalog used fixed plugin counts that no longer matched the implementation.
 - **docs/audit/FEATURE_MODULE_MATRIX.md** — Feature Module Matrix — Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py) scans single-file modules, package `__init__.py`, and package `feature.py`.
 - **docs/audit/FEATURE_PROOF_MATRIX.md** — Feature Proof Matrix — This is the first pass at mapping each discoverable feature module to direct proof.
+- **docs/audit/MEMORY_SYSTEM_ROUND_2_2026-07-10.md** — Memory System Deep Dive — Round 2 — ## Scope and method
 - **docs/audit/OKF_MIGRATION_PLAN.md** — Kestrel Documentation OKF Migration Plan — ## Purpose
 - **docs/audit/README.md** — Kestrel Whole-of-Vision Audit — This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and red-team program derived from `KESTREL_FEATURES.md`.
 - **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
@@ -1741,6 +1747,7 @@ Repo entry points and standard project files.
 - **tests/frontend/api_client_dispatch_pinning.test.mjs** — (mjs asset)
 - **tests/frontend/api_client_stop.test.mjs** — (mjs asset)
 - **tests/frontend/app_init_order.test.mjs** — (mjs asset)
+- **tests/frontend/approval_modal_layout.test.mjs** — (mjs asset)
 - **tests/frontend/attachment_composer.test.mjs** — (mjs asset)
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
 - **tests/frontend/autoload_race.test.mjs** — (mjs asset)
@@ -1763,6 +1770,7 @@ Repo entry points and standard project files.
 - **tests/frontend/conversations_fulltext_search.test.mjs** — (mjs asset)
 - **tests/frontend/conversations_new_conversation.test.mjs** — (mjs asset)
 - **tests/frontend/conversations_pane.test.mjs** — (mjs asset)
+- **tests/frontend/conversations_stale_embed.test.mjs** — (mjs asset)
 - **tests/frontend/conversations_turn_refresh.test.mjs** — (mjs asset)
 - **tests/frontend/core_panels_regressions.test.mjs** — (mjs asset)
 - **tests/frontend/demo_reset_guard.test.mjs** — (mjs asset)
@@ -1785,6 +1793,7 @@ Repo entry points and standard project files.
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
 - **tests/frontend/model_settings.test.mjs** — (mjs asset)
 - **tests/frontend/mount_panels.test.mjs** — (mjs asset)
+- **tests/frontend/new_agent_dialog.test.mjs** — (mjs asset)
 - **tests/frontend/overlay_root.test.mjs** — (mjs asset)
 - **tests/frontend/parallel_chat.test.mjs** — (mjs asset)
 - **tests/frontend/queue_mode.test.mjs** — (mjs asset)
@@ -1843,7 +1852,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_asset_restorer_external_ref.py** — Integration tests for #1438 — external-ref asset restoration via the filecoin adapter (Phase-2 follow-up to #1391).
   - `def temp_db()`; `async def test_external_ref_asset_fetched_and_routed(temp_db)`; `async def test_inline_and_external_ref_in_one_car(temp_db)`; `async def test_external_ref_fetch_failure_lands_on_skipped(temp_db)`; `async def test_malformed_external_ref_lands_on_skipped(temp_db)`; `async def test_pre_1438_inline_only_path_unchanged(temp_db)`
 - **tests/integration/test_atomic_increment_metadata.py** — Integration tests for ``AsyncConversationStore.atomic_increment_metadata_counter``.
-  - `async def test_increment_creates_counter_when_absent(tmp_path)`; `async def test_increment_is_monotonic_across_serial_calls(tmp_path)`; `async def test_increment_does_not_collide_concurrent_calls(tmp_path)`; `async def test_increment_preserves_other_metadata_fields(tmp_path)`; `async def test_postgres_sql_shape_uses_jsonb_cast(tmp_path)`; `async def test_increment_returns_false_for_unknown_message(tmp_path)`; `async def test_increment_returns_true_for_real_message(tmp_path)`; `async def test_increment_without_timestamp_field(tmp_path)`
+  - `async def test_increment_creates_counter_when_absent(tmp_path)`; `async def test_increment_is_monotonic_across_serial_calls(tmp_path)`; `async def test_increment_does_not_collide_concurrent_calls(tmp_path)`; `async def test_increment_preserves_other_metadata_fields(tmp_path)`; `async def test_atomic_metadata_merge_preserves_counter_and_json_null(tmp_path)`; `async def test_bounded_history_returns_newest_rows_oldest_first(tmp_path)`; `async def test_bounded_history_filters_hidden_rows_before_limit(tmp_path)`; `async def test_postgres_sql_shape_uses_jsonb_cast(tmp_path)`; `…`
 - **tests/integration/test_avatar_api_e2e.py** — Integration tests for avatar API endpoints
   - `def client(monkeypatch)`; `class TestFileEndpoint`; `class TestIdentityEndpoint`; `class TestAvatarStorageIntegration`; `class TestVisualIdentityFeatureIntegration`; `class TestFileServing`
 - **tests/integration/test_backup_e2e.py** — —
@@ -1897,7 +1906,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_ephemeral_purge_scoped.py** — Integration tests for the scoped EPHEMERAL leak-purge (#867).
   - `async def test_no_writes_during_ephemeral_destroys_nothing(tmp_path)`; `async def test_only_in_window_rows_are_purged(tmp_path)`; `async def test_purge_without_watermark_refuses(tmp_path)`; `async def test_watermark_refreshes_on_re_entry(tmp_path)`; `async def test_graph_nodes_with_iso_timestamps_are_scoped_correctly(tmp_path)`; `async def test_graph_nodes_without_created_at_are_skipped_with_warning(tmp_path, caplog)`; `async def test_other_agents_data_untouched(tmp_path)`
 - **tests/integration/test_episode_recall.py** — Relevance-based episode recall + access tracking (#1674 P2).
-  - `async def db()`; `async def test_keyword_recall_when_no_embedding_provider(db)`; `async def test_recall_increments_access_count(db)`; `async def test_from_row_tolerates_native_datetimes()`; `async def test_recall_empty_query_returns_nothing(db)`; `async def test_recall_merges_vector_and_keyword(db)`; `async def test_recall_keyword_not_starved_when_vector_fills_limit(db)`; `async def test_recall_scoped_to_agent(db)`; `…`
+  - `async def db()`; `async def test_keyword_recall_when_no_embedding_provider(db)`; `async def test_keyword_recall_accepts_natural_language_topic_query(db)`; `async def test_keyword_recall_ranks_full_overlap_before_recent_partial_hits(db)`; `async def test_recall_increments_access_count(db)`; `async def test_from_row_tolerates_native_datetimes()`; `async def test_recall_empty_query_returns_nothing(db)`; `async def test_recall_merges_vector_and_keyword(db)`; `…`
 - **tests/integration/test_feature_install_discover_e2e.py** — E2E tests for the feature install/discover lifecycle (Issue #495).
   - `class ExternalGPUFeature`; `class ExternalStorageFeature`; `class ExternalMonitorFeature`; `async def core_only_agent(temp_db, monkeypatch)`; `async def agent_with_ext_features(temp_db, monkeypatch)`; `class TestCoreOnlyAgent`; `class TestEntryPointDiscovery`; `class TestFeaturesAppearInAgent`; `…`
 - **tests/integration/test_feature_lifecycle_e2e.py** — E2E tests for feature lifecycle: enable/disable/remove cycle with hook management.
@@ -2330,9 +2339,11 @@ Repo entry points and standard project files.
 - **tests/unit/test_conversation_sent_form.py** — Sent-form metadata round-trip for user-turn storage.
   - `async def store()`; `class TestSentFormMetadataRoundTrip`
 - **tests/unit/test_conversation_store_embedding_write.py** — Tests for the optional embedding-write path on :meth:`AsyncConversationStore.add_conversation`.
-  - `def test_serialize_embedding_round_trips_float32()`; `def test_format_pgvector_text_round_trips()`; `async def test_add_conversation_without_service_uses_legacy_insert()`; `async def test_add_conversation_writes_model_provider_columns()`; `def small_embedding_dim(monkeypatch)`; `async def test_add_conversation_with_service_writes_embedding_vec_sqlite(small_embedding_dim)`; `async def test_add_conversation_with_service_writes_embedding_vec_postgres(small_embedding_dim)`; `async def test_add_conversation_skips_embedding_when_route_is_none(monkeypatch)`; `…`
+  - `def test_serialize_embedding_round_trips_float32()`; `def test_format_pgvector_text_round_trips()`; `async def test_add_conversation_without_service_uses_legacy_insert()`; `async def test_non_schema_insert_failure_is_not_masked_by_legacy_retry()`; `async def test_missing_lexical_columns_preserve_vector_profile_stamp(small_embedding_dim)`; `async def test_add_conversation_writes_model_provider_columns()`; `def small_embedding_dim(monkeypatch)`; `async def test_add_conversation_with_service_writes_embedding_vec_sqlite(small_embedding_dim)`; `…`
 - **tests/unit/test_cors_middleware.py** — Tests for CORS origin resolution and the wildcard-credentials guard.
   - `class TestCORSDefaults`; `class TestCORSEnvironmentOverride`; `class TestCORSWildcardGuard`
+- **tests/unit/test_create_agent_persistence.py** — POST /api/agents must persist toml-driven registrations (#2358 codex P1).
+  - `async def test_create_agent_persists_into_toml_driven_config(tmp_path)`; `async def test_create_agent_skips_persistence_for_auto_discovered_deployments()`; `def test_save_round_trips_feature_allowlists(tmp_path)`; `async def test_port_allocator_seeds_past_configured_ports(tmp_path)`; `async def test_port_allocator_accounts_for_the_host_port(tmp_path)`; `def test_save_is_atomic_on_write_failure(tmp_path, monkeypatch)`; `async def test_create_rejects_registered_but_unloaded_names(tmp_path)`; `def test_atomic_save_preserves_file_mode(tmp_path)`; `…`
 - **tests/unit/test_cron_parser.py** — Unit tests for the lightweight cron expression parser.
   - `class TestParseField`; `class TestParse`; `class TestAliases`; `class TestMatches`; `class TestNextRun`; `class TestEdgeCases`
 - **tests/unit/test_crypto_suite.py** — CryptoSuite + Secp256k1Suite KAT tests — Wave 1 (#916).
@@ -2415,12 +2426,18 @@ Repo entry points and standard project files.
   - `def test_parse_returns_none_when_block_absent()`; `def test_parse_dormant_when_disabled_explicitly()`; `def test_parse_active_minimal()`; `def test_parse_active_full()`; `def test_parse_active_requires_terms()`; `def test_parse_active_rejects_empty_terms()`; `def test_parse_rejects_non_string_terms()`; `def test_parse_rejects_non_list_proofs()`; `…`
 - **tests/unit/test_embedding_blob_endianness.py** — #1653: vector BLOBs must be explicit little-endian with an alignment guard.
   - `def test_roundtrip_is_explicit_little_endian(serialize, deserialize)`; `def test_deserialize_skips_misaligned_blob_instead_of_truncating(serialize, deserialize)`; `def test_empty_embedding_roundtrips(serialize, deserialize)`
+- **tests/unit/test_embedding_discovery.py** — Dynamic embedding-model discovery (#2338).
+  - `def test_normalize_strips_vendor_prefix_and_tag()`; `def test_native_dim_folds_into_options()`; `async def test_openrouter_embedding_discovery_uses_dedicated_endpoint(monkeypatch)`; `async def test_openrouter_embedding_discovery_no_key_returns_empty(monkeypatch)`; `async def test_ollama_embedding_discovery_filters_by_capability()`; `async def test_ollama_embedding_discovery_uses_provided_client()`; `async def test_openai_embedding_discovery_filters_by_id_prefix()`; `async def test_capability_flips_on_when_discovery_returns_models()`; `…`
 - **tests/unit/test_embedding_profile_id.py** — End-to-end tests for #1477 embedding_profile_id stamping + kNN filter.
   - `def test_profile_id_is_deterministic()`; `def test_profile_id_changes_on_provider_change()`; `def test_profile_id_changes_on_model_change()`; `def test_profile_id_changes_on_dim_change()`; `def test_profile_id_changes_on_normalized_flag()`; `def test_profile_id_changes_on_space_id_override()`; `def test_profile_id_is_12_hex_chars()`; `def test_derive_rejects_blank_fields()`; `…`
 - **tests/unit/test_embedding_profile_id_e2e.py** — End-to-end #1477 verification on a real SQLite DB.
   - `async def test_e2e_migrations_create_columns_and_registry()`; `async def test_e2e_audit_counts_mixed_profile_rows()`; `async def test_e2e_profile_filter_excludes_other_profiles()`; `async def test_e2e_registry_upsert_round_trip()`
 - **tests/unit/test_embedding_reindex.py** — Unit tests for ``kestrel embeddings reindex`` (#2289).
-  - `class FakeEmbeddingService`; `async def db()`; `async def test_reindex_stamps_all_rows_to_target(db)`; `async def test_reindex_is_idempotent(db)`; `async def test_dry_run_counts_match_and_touch_nothing(db)`; `async def test_resume_after_interrupt_loses_nothing(db)`; `async def test_empty_source_text_is_skipped_not_stamped(db)`; `async def test_reindex_refuses_when_no_provider_resolves(db, capsys)`; `…`
+  - `class FakeEmbeddingService`; `async def db()`; `async def test_dominant_embedding_profile_picks_majority(db)`; `async def test_dominant_embedding_profile_agent_scoped(db)`; `async def test_dominant_embedding_profile_none_when_empty(db)`; `async def test_dominant_embedding_profile_none_without_registry_row(db)`; `async def test_reindex_stamps_all_rows_to_target(db)`; `async def test_reindex_is_idempotent(db)`; `…`
+- **tests/unit/test_embedding_reindex_endpoint.py** — Unit tests for the UI reindex endpoint ``POST /api/embedding/reindex`` (#2336).
+  - `class DeadEmbeddingService`; `async def seeded_db()`; `async def test_reindex_dry_run_reports_counts_and_touches_nothing(seeded_db)`; `async def test_reindex_execute_round_trip_reembeds_all(seeded_db)`; `async def test_reindex_dead_service_is_error_not_false_success(seeded_db)`; `async def test_reindex_execute_empty_corpus_reports_done_inline(seeded_db)`; `async def test_reindex_pinned_dim_forwarded_rows_flip_profile(seeded_db)`; `async def test_reindex_without_dim_forwarding_would_dim_mismatch(seeded_db)`; `…`
+- **tests/unit/test_embedding_route_model.py** — Per-route embedding_model set/clear at runtime (#2337).
+  - `def test_set_then_clear_round_trip()`; `def test_set_invalidates_discovery_cache()`; `def test_set_re_advertises_embedding_capability()`; `def test_clear_restores_pre_override_capabilities()`; `def test_clear_removes_capability_added_by_override()`; `def test_unknown_route_is_rejected()`; `async def test_probe_on_save_rejects_dead_cloud_slug(monkeypatch)`; `async def test_probe_on_save_rejects_empty_vector(monkeypatch)`; `…`
 - **tests/unit/test_embedding_service_missing_model.py** — Soften the first-run UX when Ollama hasn't pulled the embedding model yet — #657.
   - `class TestModelNotFoundIsWarningNotError`; `def test_cosine_similarity_returns_zero_for_dimension_mismatch()`
 - **tests/unit/test_embedding_space.py** — Shared local/cloud embedding space (#2290).
@@ -2446,7 +2463,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_escalation_classifier.py** — Tests for the escalation classifier (#1540 / #1563).
   - `def test_audit_row_with_user_denied_decision_yields_user_denied()`; `def test_audit_row_with_web_ui_per_scope_user_choice_yields_user_denied(choice)`; `def test_audit_row_for_different_tool_does_not_attribute_denial()`; `def test_audit_row_for_different_feature_does_not_attribute_denial()`; `def test_codex_rejected_by_user_without_audit_is_sandbox_blocked()`; `def test_sandbox_seccomp_refusal_is_sandbox_blocked()`; `def test_approval_timeout_is_policy_blocked()`; `def test_auto_denied_is_policy_blocked()`; `…`
 - **tests/unit/test_example_model_config_contracts.py** — Contracts for example model config files and catalog source-of-truth shape.
-  - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`
+  - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`; `def test_example_documents_both_memory_retrieval_floors()`
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
   - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`; `class TestExecuteNamedToolSubagentDispatch`
 - **tests/unit/test_external_feature_subagent_dispatch.py** — External (SDK-base) features must be dispatchable like in-tree features.
@@ -2614,13 +2631,19 @@ Repo entry points and standard project files.
 - **tests/unit/test_memory_agency_feature.py** — Tests for the MemoryAgencyFeature.
   - `class FakeDB`; `class FakeGraphStore`; `class PrivacyWrappedStorage`; `async def test_initialize_uses_raw_storage_without_touching_wrapper_db()`; `async def test_memory_pin_refuses_privacy_hidden_mode_without_db_access()`; `async def test_sovereign_override_still_clears_pins_in_privacy_hidden_mode()`; `async def test_sovereign_override_ensures_pin_table_after_privacy_first_init()`; `async def test_pin_memory_sets_decay_protected()`; `…`
 - **tests/unit/test_memory_candidate_generation.py** — —
-  - `async def test_salient_candidate_query_uses_backend_json_dialect(backend_type, expected_sql)`
+  - `async def test_salient_candidate_query_uses_backend_json_dialect(backend_type, expected_sql)`; `async def test_lexical_candidates_can_scope_to_rows_outside_active_profile()`; `async def test_blind_index_shortlists_encrypted_exact_match_without_full_scan(tmp_path, monkeypatch)`; `async def test_partial_blind_index_keeps_unindexed_legacy_fact_recallable(tmp_path, monkeypatch)`; `async def test_encrypted_backfill_is_resumable_and_eliminates_bridge_scan(tmp_path, monkeypatch)`; `async def test_index_write_failure_persists_uncovered_recallable_message(tmp_path, monkeypatch)`; `async def test_oversize_query_uses_complete_fallback_instead_of_partial_ranking(tmp_path, monkeypatch)`; `async def test_large_corpus_backfill_removes_recall_time_full_scan(tmp_path, monkeypatch)`; `…`
 - **tests/unit/test_memory_consolidate_lock.py** — #round3: the manual `!memory consolidate` tool must serialize against the scheduled cron run by holding ResourceLock.MEMORY (the same lock the dispatcher holds for the cron tick).
   - `async def test_manual_consolidate_holds_memory_lock()`; `async def test_manual_consolidate_runs_without_dispatcher_lock()`; `async def test_tool_surfaces_episodes_deleted_from_consolidate()`; `async def test_tool_no_forgotten_clause_when_none_deleted()`
 - **tests/unit/test_memory_feature_episode_recall.py** — get_episodes tool: relevance (query) vs recency (#1674 P2).
   - `async def test_get_episodes_query_uses_semantic_recall(monkeypatch)`; `async def test_get_episodes_no_query_uses_recency(monkeypatch)`; `async def test_get_episodes_blank_query_is_recency(monkeypatch)`
 - **tests/unit/test_memory_feature_strips_sent_form.py** — Regression: memory recall must strip sent-form wrappers from user rows.
   - `def test_strip_helper_pulls_raw_text_from_user_rows_only()`; `def test_strip_helper_leaves_metadata_untouched()`; `async def test_recall_emotional_unknown_mood_is_partial()`; `async def test_recall_emotional_known_mood_is_ok()`; `async def test_recall_emotional_non_string_mood_fails_cleanly()`; `def test_strip_helper_does_not_mutate_input()`; `async def test_search_memory_returns_raw_user_text_to_llm()`; `async def test_recall_recent_returns_raw_user_text_to_llm()`; `…`
+- **tests/unit/test_memory_lexical_index_feature.py** — —
+  - `async def test_memory_index_backfill_starts_background_and_records_result(monkeypatch)`; `async def test_memory_index_backfill_rejects_duplicate_running_job(monkeypatch)`; `async def test_memory_index_backfill_validates_batch_size(monkeypatch)`; `async def test_shutdown_cancels_owned_backfill(monkeypatch)`; `async def test_memory_status_survives_unavailable_index_health(monkeypatch)`
+- **tests/unit/test_memory_lexical_index_migration.py** — —
+  - `async def test_sqlite_legacy_schema_migration_is_idempotent(tmp_path)`; `async def test_postgres_migration_uses_additive_transactional_ddl()`
+- **tests/unit/test_memory_logging_privacy.py** — Privacy contracts for routine memory/request diagnostics (#2332).
+  - `def test_request_logs_do_not_embed_history_or_response_snippets()`
 - **tests/unit/test_memory_manager.py** — Unit tests for MemoryManager.
   - `class TestMemoryManagerInit`; `class TestStashMessages`; `class TestStashPop`; `class TestStashApply`; `class TestStashList`; `class TestStashDrop`; `class TestStashSave`; `class TestStashPeek`; `…`
 - **tests/unit/test_memory_retriever_cosine.py** — Tests for the vector-cosine semantic-score path on :class:`MemoryRetriever`.
@@ -2963,6 +2986,8 @@ Repo entry points and standard project files.
   - `class TestTierValidation`; `class TestCIDValidation`; `class TestMaxSizeBounded`
 - **tests/unit/test_sovereignty_v3.py** — Unit tests for V3 Sovereignty: AssetCollector, manifest v3, and CAR packaging.
   - `class StubAssetCollector`; `class TestAssetDescriptor`; `class TestAssetMetadata`; `class TestManifestV3`; `class TestAssetCollectorProtocol`; `class TestCARExternalRef`; `class TestCAREncryptedRoundtrip`; `class TestCARWithAssets`
+- **tests/unit/test_spawn_budget_enforcement.py** — Per-child spawn budget enforcement via DelegatedWallet spend routing (#2113).
+  - `class FakeWallet`; `async def test_transfer_enforces_ceiling()`; `async def test_get_balance_capped_at_remaining()`; `async def test_delegates_unoverridden_attrs()`; `async def test_nested_budgeted_spawn_unwraps_delegated_parent()`; `async def test_create_refunds_parent_on_setup_failure()`; `async def test_failed_nested_setup_restores_parent_headroom()`; `async def test_release_restores_parent_headroom()`; `…`
 - **tests/unit/test_spawn_endpoint.py** — Tests for the inlined spawn panel endpoint.
   - `async def test_get_spawn_children_returns_empty_when_no_manager(monkeypatch)`; `async def test_get_spawn_children_uses_agent_attached_manager(monkeypatch)`; `async def test_get_spawn_children_falls_back_to_app_state_manager(monkeypatch)`; `async def test_spawn_history_filtered_by_parent_did(monkeypatch)`; `async def test_spawn_history_excludes_legacy_records_without_parent_did(monkeypatch)`; `def test_get_agent_manager_helper_prefers_agent_then_app_state()`
 - **tests/unit/test_spawn_feature.py** — Unit tests for SpawnFeature and AgentManager spawn extensions.
