@@ -272,6 +272,10 @@ async def retire_agent(
                 db_dir / f"{slug}_mldsa65.bytes.enc",
                 db_dir / f"{slug}_archival_slhdsa.bytes.enc",
                 db_dir / f"{slug}_archival_slhdsa_pub.bytes.enc",
+                # Hybrid-KEM receive keys (#2398), if the agent generated them
+                db_dir / f"{slug}_x25519.key.enc",
+                db_dir / f"{slug}_mlkem768.bytes.enc",
+                db_dir / f"{slug}_mlkem768_pub.bytes.enc",
             ):
                 if sibling.exists():
                     shutil.move(str(sibling), str(agent_archive_path / sibling.name))

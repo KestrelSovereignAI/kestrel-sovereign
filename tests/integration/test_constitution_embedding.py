@@ -167,7 +167,7 @@ async def test_constitution_stored_first(tmp_path):
 
 @pytest.mark.anyio
 @pytest.mark.asyncio
-async def test_did_format_validation(tmp_path):
+async def test_did_format_validation(tmp_path, monkeypatch):
     """
     Verify that the CLASSICAL DID follows W3C spec with proper Ethereum
     address formatting. Since #2399 the default inception method is
@@ -179,6 +179,7 @@ async def test_did_format_validation(tmp_path):
     - Address is 42 chars (0x + 40 hex)
     - Address has EIP-55 checksum applied
     """
+    monkeypatch.delenv("KESTREL_IDENTITY_METHOD", raising=False)
     output_dir = tmp_path / "test_agent"
 
     credentials = await create_kestrel_identity_async(
@@ -493,6 +494,7 @@ async def test_default_did_is_born_hybrid_did_web(tmp_path, monkeypatch):
     """The DEFAULT inception method (#2399) mints a did:web hybrid DID."""
     monkeypatch.setenv("KESTREL_DID_WEB_DOMAIN", "agents.kestrel-sovereign.test")
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.delenv("KESTREL_IDENTITY_METHOD", raising=False)
     output_dir = tmp_path / "test_agent"
 
     credentials = await create_kestrel_identity_async(str(output_dir))

@@ -881,3 +881,33 @@ async def test_kem_vm_reusing_signing_id_does_not_poison_signing_vms(tmp_path, m
     signed = sign_package(package, storage_dir=tmp_path)
     ok, msg = verify_package_signature(signed, storage_dir=tmp_path)
     assert ok, msg
+
+
+@pytest.mark.asyncio
+async def test_force_reinception_backs_up_kem_keys(tmp_path, monkeypatch):
+    """KEM receive keys join the re-inception backup sweep so force
+    re-mint never leaves stale recipient private material live and
+    detect_agent_kem_slug can't pick up a prior agent's keys (codex r13)."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_DID_WEB_DOMAIN", "agents.kestrel-sovereign.test")
+    monkeypatch.delenv("KESTREL_IDENTITY_METHOD", raising=False)
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.identity.sealed_export import (
+        generate_agent_kem_keypair, detect_agent_kem_slug,
+    )
+
+    old = await create_kestrel_identity_async(
+        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md", agent_name="Kembird",
+    )
+    old_slug = old.agent_did.rsplit(":", 1)[-1]
+    generate_agent_kem_keypair(old_slug, tmp_path)
+
+    await create_kestrel_identity_async(
+        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md",
+        agent_name="Kembird", force=True,
+    )
+    # Old KEM private keys backed up, not left live; slug detection sees
+    # exactly the new agent's key (not two)
+    assert list(tmp_path.glob(f"{old_slug}_x25519.key.enc.backup-*"))
+    assert not (tmp_path / f"{old_slug}_x25519.key.enc").exists()
+    assert detect_agent_kem_slug(tmp_path) is None  # new agent hasn't generated KEM yet
