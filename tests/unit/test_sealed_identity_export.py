@@ -421,3 +421,47 @@ def test_unseal_rejects_json_non_object_payload():
     )
     with pytest.raises(SealedExportError, match="not a valid identity"):
         unseal_identity_package(capsule, kp)
+
+
+def test_recipient_resolution_handles_relative_key_agreement_refs():
+    """DID Core allows keyAgreement to reference VMs by relative
+    fragment ("#kem-1") against absolute VM ids (codex round 2)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.identity.sealed_export import (
+        agent_kem_public_multibases, recipient_keys_from_did_document,
+    )
+
+    kp = generate_hybrid_kem_keypair()
+    classical_mb, pq_mb = agent_kem_public_multibases(kp)
+    did = "did:web:example.com:recip"
+    doc = {
+        "id": did,
+        "verificationMethod": [
+            {"id": f"{did}#kem-1", "type": "Multikey",
+             "publicKeyMultibase": classical_mb},
+            {"id": f"{did}#kem-2", "type": "Multikey",
+             "publicKeyMultibase": pq_mb},
+        ],
+        "keyAgreement": ["#kem-1", "#kem-2"],
+    }
+    keys = recipient_keys_from_did_document(doc)
+    assert keys.classical_alg == "x25519"
+    assert keys.pq_alg == "ml-kem-768"
+
+
+def test_generate_kem_keypair_refuses_partial_existing_set(tmp_path, monkeypatch):
+    """Any surviving KEM key component blocks regeneration — a partial
+    set still holds recoverable private material (codex round 2)."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, generate_agent_kem_keypair,
+    )
+
+    generate_agent_kem_keypair("partialbird", tmp_path)
+    # Simulate an interrupted state: only the public sidecar removed
+    (tmp_path / "partialbird_mlkem768_pub.bytes.enc").unlink()
+    with pytest.raises(SealedExportError, match="already exists"):
+        generate_agent_kem_keypair("partialbird", tmp_path)
+    # The surviving private material was NOT clobbered
+    assert (tmp_path / "partialbird_x25519.key.enc").exists()
+    assert (tmp_path / "partialbird_mlkem768.bytes.enc").exists()

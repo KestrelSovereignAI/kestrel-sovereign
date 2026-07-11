@@ -188,10 +188,17 @@ def recipient_keys_from_did_document(did_document: Dict[str, Any]) -> RecipientK
             f"DID document must be a dict; got {type(did_document).__name__}"
         )
 
+    # Index VMs by absolute id AND by "#fragment": DID Core allows
+    # relative DID-URL references (keyAgreement: ["#kem-1"]) against
+    # absolute VM ids (did:web:...#kem-1) and vice versa.
+    doc_id = did_document.get("id") or ""
     vm_by_id: Dict[str, Dict[str, Any]] = {}
     for vm in did_document.get("verificationMethod") or []:
         if isinstance(vm, dict) and vm.get("id"):
-            vm_by_id[vm["id"]] = vm
+            vm_id = vm["id"]
+            vm_by_id[vm_id] = vm
+            if "#" in vm_id:
+                vm_by_id["#" + vm_id.rsplit("#", 1)[-1]] = vm
 
     key_agreement = did_document.get("keyAgreement") or []
     if not isinstance(key_agreement, list) or not key_agreement:
@@ -207,7 +214,13 @@ def recipient_keys_from_did_document(did_document: Dict[str, Any]) -> RecipientK
     pq: List[tuple] = []
     for entry in key_agreement:
         if isinstance(entry, str):
+            # Normalize: absolute reference, relative "#fragment", or an
+            # absolute reference whose VM is indexed by fragment.
             vm = vm_by_id.get(entry)
+            if vm is None and entry.startswith("#") and doc_id:
+                vm = vm_by_id.get(doc_id + entry)
+            if vm is None and "#" in entry:
+                vm = vm_by_id.get("#" + entry.rsplit("#", 1)[-1])
             if vm is None:
                 # A dangling reference is a malformed document; note it
                 # but keep scanning — the required-key check below is
@@ -295,20 +308,32 @@ def generate_agent_kem_keypair(
     """
     if not slug:
         raise SealedExportError("slug must be non-empty")
-    if has_agent_kem_keypair(slug, storage_dir):
+    # Refuse if ANY component exists — not just a complete set. A
+    # partial set (interrupted write, deleted sidecar) still holds
+    # recoverable private-key material; overwriting it would make
+    # capsules sealed to the old public keys permanently unopenable.
+    storage_probe = SecureKeyStorage(storage_dir)
+    x_id, pq_id, pq_pub_id = _kem_key_ids(slug)
+    present = [
+        name for name, exists in (
+            (f"{x_id}.key.enc", storage_probe.has_key(x_id)),
+            (f"{pq_id}.bytes.enc", storage_probe.has_secret_bytes(pq_id)),
+            (f"{pq_pub_id}.bytes.enc", storage_probe.has_secret_bytes(pq_pub_id)),
+        ) if exists
+    ]
+    if present:
         raise SealedExportError(
-            f"hybrid KEM keypair for slug {slug!r} already exists; "
-            f"refusing to overwrite. Rotation requires explicitly "
-            f"removing the old key files first (capsules sealed to the "
-            f"old keys become unopenable)."
+            f"KEM key material for slug {slug!r} already exists "
+            f"({present}); refusing to overwrite. Rotation or repair of "
+            f"a partial set requires explicitly removing the old key "
+            f"files first (capsules sealed to the old keys become "
+            f"unopenable)."
         )
 
     hybrid = generate_hybrid_kem_keypair()
-    storage = SecureKeyStorage(storage_dir)
-    x_id, pq_id, pq_pub_id = _kem_key_ids(slug)
-    storage.save_private_key(hybrid.classical.private_key, x_id)
-    storage.save_secret_bytes(hybrid.pq.private_key, pq_id)
-    storage.save_secret_bytes(hybrid.pq.public_key, pq_pub_id)
+    storage_probe.save_private_key(hybrid.classical.private_key, x_id)
+    storage_probe.save_secret_bytes(hybrid.pq.private_key, pq_id)
+    storage_probe.save_secret_bytes(hybrid.pq.public_key, pq_pub_id)
     logger.info(f"Generated hybrid KEM keypair for slug {slug!r}")
     return hybrid
 
