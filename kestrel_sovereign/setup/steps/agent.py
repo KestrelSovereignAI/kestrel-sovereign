@@ -248,6 +248,26 @@ def _ensure_did_web_domain(ctx: SetupContext) -> bool:
     if method != IDENTITY_METHOD_DID_WEB or os.environ.get(DID_WEB_DOMAIN_ENV):
         return True
 
+    if ctx.flow is Flow.QUICKSTART:
+        # Quickstart's contract is a zero-config LOCAL bootstrap. A
+        # fresh user has no domain yet, and a classical fallback would
+        # mint the quantum-vulnerable identity this epic eliminates —
+        # so default the did:web domain to "localhost" (spec-legal,
+        # unmistakably local, unique per agent via the slug's entropy
+        # suffix). Verification is local-custody anchored either way;
+        # when a real domain arrives, the rotation ceremony migrates
+        # the agent to it with full succession continuity.
+        from kestrel_sovereign.setup.env_file import write_env
+
+        os.environ[DID_WEB_DOMAIN_ENV] = "localhost"
+        write_env(ctx.env_path, {DID_WEB_DOMAIN_ENV: "localhost"})
+        ctx.record(
+            f"Quickstart: {DID_WEB_DOMAIN_ENV} defaulted to 'localhost' — "
+            f"the agent's did:web identity is local-only. Set a real "
+            f"domain in .env and run a rotation ceremony to publish it."
+        )
+        return True
+
     if ctx.flow is Flow.INTERACTIVE:
         domain = ctx.prompter.text(
             "did:web domain for new agents' DID documents "

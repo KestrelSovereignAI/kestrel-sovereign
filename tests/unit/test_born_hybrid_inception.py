@@ -12,6 +12,7 @@ Covers the full birth-to-boot loop:
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -426,3 +427,30 @@ def test_sign_mandate_refuses_keyless_parent():
     )
     with pytest.raises(ValueError, match="neither a hybrid identity nor a legacy"):
         sign_mandate(mandate, None, parent_identity=None)
+
+
+# ---------------------------------------------------------------------------
+# Quickstart zero-config contract (CI clean-install regression)
+# ---------------------------------------------------------------------------
+
+def test_quickstart_defaults_domain_to_localhost(tmp_path, monkeypatch):
+    """kestrel setup --quickstart on a clean box must not block on the
+    did:web domain: it defaults to 'localhost' (recorded, persisted)
+    rather than falling back to a classical identity."""
+    from kestrel_sovereign.setup.steps.agent import _ensure_did_web_domain
+    from kestrel_sovereign.setup.context import Flow, SetupContext
+
+    monkeypatch.delenv(DID_WEB_DOMAIN_ENV, raising=False)
+    monkeypatch.delenv(IDENTITY_METHOD_ENV, raising=False)
+
+    ctx = SetupContext(
+        project_dir=tmp_path,
+        agent_data_root=tmp_path / "agent_data",
+        flow=Flow.QUICKSTART,
+        prompter=None,  # quickstart branch never prompts
+    )
+    assert _ensure_did_web_domain(ctx) is True
+    assert os.environ.get(DID_WEB_DOMAIN_ENV) == "localhost"
+    assert not ctx.blockers
+    assert any("localhost" in r for r in ctx.changes)
+    assert f"{DID_WEB_DOMAIN_ENV}=localhost" in (tmp_path / ".env").read_text()
