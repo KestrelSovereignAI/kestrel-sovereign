@@ -180,23 +180,23 @@ def validate_structured_content(content: Dict[str, Any], schema_id: str) -> Dict
     errors = []
 
     # Check required fields
-    for field in schema["required_fields"]:
-        if field not in content or content[field] is None:
-            errors.append(f"Missing required field: {field}")
-        elif content[field] == "" or content[field] == []:
-            errors.append(f"Required field is empty: {field}")
+    for required_field in schema["required_fields"]:
+        if required_field not in content or content[required_field] is None:
+            errors.append(f"Missing required field: {required_field}")
+        elif content[required_field] == "" or content[required_field] == []:
+            errors.append(f"Required field is empty: {required_field}")
 
     # Check field types
     field_types = schema.get("field_types", {})
-    for field, value in content.items():
-        if field in field_types and value is not None:
-            expected_type = field_types[field]
+    for field_name, value in content.items():
+        if field_name in field_types and value is not None:
+            expected_type = field_types[field_name]
             if expected_type == "string" and not isinstance(value, str):
-                errors.append(f"Field '{field}' should be a string")
+                errors.append(f"Field '{field_name}' should be a string")
             elif expected_type == "integer" and not isinstance(value, int):
-                errors.append(f"Field '{field}' should be an integer")
+                errors.append(f"Field '{field_name}' should be an integer")
             elif expected_type == "list" and not isinstance(value, list):
-                errors.append(f"Field '{field}' should be a list")
+                errors.append(f"Field '{field_name}' should be a list")
 
     return {
         "valid": len(errors) == 0,
@@ -957,7 +957,13 @@ class SavedItemsStore:
         query_embedding = None
         if embedding_service:
             try:
-                query_embedding = await embedding_service.aembed(query)
+                from kestrel_sovereign.llm.embedding_service import (
+                    aembed_retrieval_query,
+                )
+
+                query_embedding = await aembed_retrieval_query(
+                    embedding_service, query
+                )
             except Exception as e:
                 logger.warning(f"Failed to embed query: {e}")
 
@@ -1275,7 +1281,7 @@ class SavedItemsStore:
 
     async def delete_item(self, item_id: str) -> bool:
         """Delete a saved item."""
-        result = await self.db.execute(
+        await self.db.execute(
             "DELETE FROM saved_items WHERE id = ? AND agent_id = ?",
             (item_id, self.agent_id)
         )

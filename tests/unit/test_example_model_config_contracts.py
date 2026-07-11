@@ -84,4 +84,4 @@ def test_package_local_model_catalog_duplicate_is_removed():
 def test_example_documents_both_memory_retrieval_floors():
     text = (PROJECT_ROOT / "kestrel.toml.example").read_text(encoding="utf-8")
     assert "# memory_min_score = 0.3" in text
-    assert "# memory_min_relevance = 0.1" in text
+    assert "# memory_min_relevance = 0.2" in text

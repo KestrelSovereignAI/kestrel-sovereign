@@ -391,7 +391,9 @@
         "kestrel_sovereign/storage/memory_system.py",
         "kestrel_sovereign/storage/privacy_wrapper.py",
         "kestrel_sovereign/storage/schema_router.py",
-        "kestrel_sovereign/storage/temporal_analyzer.py"
+        "kestrel_sovereign/storage/temporal_analyzer.py",
+        "scripts/benchmark_memory_quality.py",
+        "tests/fixtures/memory_quality_eval.json"
       ],
       "findings": [
         "missing_local_links"
@@ -1703,6 +1705,20 @@
       "status": "needs-revalidation",
       "title": "Feature Proof Matrix",
       "type": "Audit Ledger"
+    },
+    {
+      "existing_code_refs": [
+        "scripts/benchmark_memory_quality.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/audit/MEMORY_RETRIEVAL_QUALITY_2026-07-11.md",
+      "privacy": "public",
+      "render": "internal",
+      "status": "active",
+      "title": "Memory Retrieval Quality Benchmark \u2014 July 2026",
+      "type": "Audit Report"
     },
     {
       "existing_code_refs": [],

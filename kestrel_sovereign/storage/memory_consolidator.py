@@ -19,14 +19,6 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
-# ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
-# importing it here would create a circular import via
-# ``agent/__init__.py`` → ``context_builder`` → ``features.bootstrap``
-# → ``features.base``. Inline the canonical state strings instead.
-_SALVAGE_STATE_POINTER_ONLY = "pointer-only"
-_SALVAGE_STATE_PENDING_SUMMARY = "pending-summary"
-_SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
-
 from .memory_models import MemoryEpisode, TemporalPattern
 from .async_database import AsyncDatabase
 from .memory_retriever import calculate_decay
@@ -36,6 +28,14 @@ from .async_conversation_store import (
     _tokenize_for_search,
 )
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
+
+# ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
+# importing it here would create a circular import via
+# ``agent/__init__.py`` → ``context_builder`` → ``features.bootstrap``
+# → ``features.base``. Inline the canonical state strings instead.
+_SALVAGE_STATE_POINTER_ONLY = "pointer-only"
+_SALVAGE_STATE_PENDING_SUMMARY = "pending-summary"
+_SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
 
 logger = logging.getLogger(__name__)
 
@@ -889,19 +889,16 @@ class MemoryConsolidator:
         if service is None:
             return None
         try:
-            embed_query = getattr(type(service), "aembed_query", None)
-            if callable(embed_query):
-                from kestrel_sovereign.llm.embedding_service import (
-                    EPISODE_RETRIEVAL_INSTRUCTION,
-                )
+            from kestrel_sovereign.llm.embedding_service import (
+                EPISODE_RETRIEVAL_INSTRUCTION,
+                aembed_retrieval_query,
+            )
 
-                query_embedding = await embed_query(
-                    service,
-                    query,
-                    instruction=EPISODE_RETRIEVAL_INSTRUCTION,
-                )
-            else:
-                query_embedding = await service.aembed(query)
+            query_embedding = await aembed_retrieval_query(
+                service,
+                query,
+                instruction=EPISODE_RETRIEVAL_INSTRUCTION,
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("episode query embed failed: %s", e)
             return None

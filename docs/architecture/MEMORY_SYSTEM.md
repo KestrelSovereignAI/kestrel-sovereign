@@ -450,9 +450,23 @@ semantic = keyword_score * 0.7 + concept_score * 0.3
   expanded with associated concepts from the knowledge graph. Matching
   concepts in the message content boost this score.
 
-Orthogonal and negative cosine values map to zero relevance. An independent
-semantic floor rejects unrelated candidates before emotion, importance,
-recency, access, and certainty rerank the eligible set.
+Orthogonal and negative cosine values map to zero relevance. Model-specific
+raw-cosine floors project each embedding model's positive no-match band back to
+zero. The independent semantic floor defaults to `0.2`; a lexical candidate
+must also meet the canonical 60% token-overlap threshold. After that absolute
+gate, candidates below 75% of the strongest relevance signal for the current
+query are removed. Emotion, importance, recency, access, and certainty rerank
+only this competitive set, so a fresh high-importance distractor cannot outrank
+a substantially stronger semantic match.
+
+Nomic Embed requires asymmetric task prefixes: stored memories/documents use
+`search_document:` and queries use `search_query:`. This preprocessing is part
+of the embedding profile identity; upgrading from legacy raw Nomic vectors
+therefore exposes the old rows as stale until the normal embedding reindex runs,
+rather than mixing incompatible representations. Operators upgrading an
+existing Nomic corpus should run `kestrel embeddings reindex` for each agent;
+recall safely falls back to lexical candidates until reindexing completes.
+Qwen3 uses its instructed query format and raw stored documents.
 
 ### Emotional Score (20%)
 
@@ -512,7 +526,24 @@ massed repetition.
 
 ### Minimum Score Threshold
 
-Results below `min_score` (default 0.1) are filtered out before sorting.
+Results below `min_score` (context default `0.3`) or semantic relevance `0.2`
+are filtered out before relative relevance gating and salience sorting.
+
+### Retrieval Quality Benchmark
+
+Run the curated paraphrase, abstention, contradiction, mood, importance, and
+long-horizon suite against a locally installed embedding model:
+
+```bash
+uv run python scripts/benchmark_memory_quality.py \
+  --model qwen3-embedding:8b
+```
+
+The suite and labels live in
+`tests/fixtures/memory_quality_eval.json`. It reports precision/recall, MRR,
+top-1 accuracy, abstention accuracy, forbidden stale hits, and result volume.
+Model or threshold changes should publish before/after results rather than rely
+on isolated cosine examples.
 
 ### Certainty Score (10%)
 
