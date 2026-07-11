@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -29,6 +28,7 @@ from kestrel_sdk.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPar
 # subclass kestrel_sdk.features.base.Feature are also recognized as
 # kestrel_sovereign.features.base.Feature at runtime (issubclass passes).
 from kestrel_sdk.features.base import Feature as _SdkFeature
+from kestrel_sdk.features.ui import UIContributions
 # One source of truth for tool-schema generation: the @tool decorator and its
 # docstring parser live in the SDK. Sovereign re-exports them (not a second
 # copy) so both in-tree and external features share the SDK's annotation
@@ -109,43 +109,6 @@ class TaskHandler(Protocol):
     async def handle_task(self, task: Task) -> Task:
         """Handle an A2A task and return the updated task."""
         ...
-
-
-@dataclass
-class UIContributions:
-    """Static frontend assets + entry modules a feature contributes to the web UI.
-
-    Returned by ``Feature.get_ui_contributions()`` and merged into the manifest
-    served at ``GET /api/ui/contributions``. Mirrors ``get_router()``: the server
-    discovers it after all features load and serves the assets it describes.
-
-    Fields:
-        modules: Ordered list of ES module paths to ``import()`` at boot. Each
-            module is expected to call ``UI.register(...)`` when imported.
-        css: Optional list of stylesheet paths to inject (``<link rel=stylesheet>``).
-        static_dir: Absolute filesystem path of the directory holding this
-            feature's assets. When set, the server mounts it at
-            ``/features/{name}/static/`` and ``modules``/``css`` are interpreted
-            as paths RELATIVE to that mount (e.g. ``"ui.js"`` →
-            ``/features/{name}/static/ui.js``). This is how a pip-installed,
-            out-of-tree feature ships assets that don't live in core ``static/``.
-            When ``None`` the feature serves no directory of its own and
-            ``modules``/``css`` MUST be root-relative same-origin paths the host
-            already serves (e.g. core-bundled ``/js/...`` assets).
-        capability: UI capability key this contribution gates on. Defaults to the
-            feature's registry name (keeps it in sync with the capability set);
-            ``None`` lets the server resolve the default.
-
-    Security: paths must be same-origin (root-relative or relative); remote /
-    absolute (scheme-bearing or protocol-relative ``//host``) URLs are rejected
-    server-side. ``installed = trusted`` — a feature's UI JS is no greater
-    privilege than its Python (pip already grants arbitrary code execution).
-    """
-
-    modules: List[str] = field(default_factory=list)
-    css: List[str] = field(default_factory=list)
-    static_dir: Optional[str] = None
-    capability: Optional[str] = None
 
 
 class Feature(_SdkFeature):

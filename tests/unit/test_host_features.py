@@ -68,7 +68,11 @@ class _DemoHostFeature(HostFeature):
 # get_ui_contributions on the SDK ABC takes no args; override cleanly.
 class _UIHostFeature(_DemoHostFeature):
     def get_ui_contributions(self):
-        return UIContributions(static_dir=None, modules=["/host/features/demo-host/panel.js"])
+        return UIContributions(
+            static_dir=None,
+            modules=["/host/features/demo-host/panel.js"],
+            css=["/host/features/demo-host/panel.css"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +364,7 @@ def test_host_ui_manifest_and_mount():
     assert len(manifest) == 1
     assert manifest[0]["feature"] == "demo-host"
     assert manifest[0]["modules"] == ["/host/features/demo-host/panel.js"]
+    assert manifest[0]["css"] == ["/host/features/demo-host/panel.css"]
 
 
 def test_host_ui_manifest_rejects_remote_modules():

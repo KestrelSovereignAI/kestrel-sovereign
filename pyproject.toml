@@ -54,9 +54,9 @@ dependencies = [
     # read-loop recovery, stdout framing, restart event re-registration) and
     # @tool annotation resolution (Optional/PEP 604/PEP 563 no longer degrade to
     # "string"). The in-tree @tool decorator now re-exports the SDK's fixed copy.
-    # 0.29.2 floor: adds the HostFeature / HostContext / UIContributions
-    # host-scope contract consumed by the multi-agent host feature runtime (#2293).
-    "kestrel-sovereign-sdk>=0.29.2,<0.30",
+    # 0.29.3 floor: SDK-owned agent/host UIContributions (including css) and
+    # AppExtension; host scope remains consumed by the multi-agent runtime.
+    "kestrel-sovereign-sdk>=0.29.3,<0.30",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -195,7 +195,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics]>=0.29.2,<0.30",
+    "kestrel-sovereign-sdk[metrics]>=0.29.3,<0.30",
 ]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the
