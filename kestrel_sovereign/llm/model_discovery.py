@@ -576,8 +576,8 @@ class ModelDiscoveryMixin:
         *,
         corpus_profile: Optional[Dict[str, Any]] = None,
         deployment_dim: Optional[int] = None,
-    ) -> Optional["EmbeddingModelInfo"]:
-        """Pick a route's default embedding model, mirroring chat ``auto`` (#2338).
+    ) -> Tuple[Optional["EmbeddingModelInfo"], Optional[int]]:
+        """Pick a route's default embedding ``(model, dim)``, mirroring chat ``auto`` (#2338).
 
         Resolution order (#2366 — continuity beats catalog order):
 
@@ -592,12 +592,22 @@ class ModelDiscoveryMixin:
         4. Only then the route's ``selection_hints`` (substring patterns from
            config, no hardcoded ids), then the first discovered model.
 
+        Every non-``None`` model is returned WITH the dim the branch resolved it
+        on — never a bare model (#2376). A corpus-matched auto-resolution means
+        "keep this space", and a space is ``<model>@<dim>``, so the dominant
+        profile's dim IS the answer even when discovery never exposed the model's
+        Matryoshka range (``dim_options`` empty). The dim-compatibility branch
+        returns the matched ``deployment_dim``; the hint/catalog fallback returns
+        the model's native/advertised dim. A resolved embedding-capable state
+        with ``embedding_dim: None`` is invalid by construction — it embeds at
+        the provider's native width and the column guard then refuses the write.
+
         ``corpus_profile`` is the dominant existing profile as a dict
         (``{"provider", "model", "dim", "space_id", ...}``) or ``None`` when the
         corpus is empty / unreadable. ``deployment_dim`` is the deployment's
-        effective embedding dimension. Returns ``None`` when discovery found
-        nothing for the route — the caller then has no embedding capability to
-        advertise, which is truthful.
+        effective embedding dimension. Returns ``(None, None)`` when discovery
+        found nothing for the route — the caller then has no embedding capability
+        to advertise, which is truthful.
         """
         route_name = provider.get("name")
         vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
@@ -606,28 +616,36 @@ class ModelDiscoveryMixin:
         else:
             candidates = await self.discover_embedding_models(vendor=vendor)
         if not candidates:
-            return None
+            return None, None
 
         # A config pin is operator intent — honour it before everything else.
+        # Its own dim lives in ``capabilities`` and the route caller keeps it;
+        # native_dim is a truthful default the caller only falls back to.
         pinned = next((m for m in candidates if m.is_pinned), None)
         if pinned is not None:
-            return pinned
+            return pinned, pinned.native_dim
 
-        # #2366 (1) — prefer continuity with the existing corpus space.
+        # #2366 (1) — prefer continuity with the existing corpus space. The
+        # corpus's dominant dim IS the resolved dim: a corpus match keeps the
+        # existing space (``<model>@<dim>``), so 768 old rows pin 768 new ones —
+        # even when discovery couldn't advertise 768 as a dim option (#2376).
         if corpus_profile:
             corpus_match = self._match_corpus_profile(candidates, corpus_profile)
             if corpus_match is not None:
-                return corpus_match
+                corpus_dim = corpus_profile.get("dim")
+                dim = int(corpus_dim) if corpus_dim else corpus_match.native_dim
+                return corpus_match, dim
 
         # #2366 (2) — otherwise prefer a model that fits the deployment's vector
-        # column dimension, so recall stays available without a re-embed.
+        # column dimension, so recall stays available without a re-embed. The
+        # dim it matched on is the resolved dim (#2376).
         if deployment_dim:
             dim_match = next(
                 (m for m in candidates if _model_offers_dim(m, deployment_dim)),
                 None,
             )
             if dim_match is not None:
-                return dim_match
+                return dim_match, int(deployment_dim)
 
         for hint in provider.get("selection_hints") or []:
             hint_lower = str(hint).lower()
@@ -640,9 +658,9 @@ class ModelDiscoveryMixin:
                 None,
             )
             if match is not None:
-                return match
+                return match, match.native_dim
 
-        return candidates[0]
+        return candidates[0], candidates[0].native_dim
 
     def _match_corpus_profile(
         self, candidates: List["EmbeddingModelInfo"], corpus_profile: Dict[str, Any]
@@ -871,12 +889,16 @@ class ModelDiscoveryMixin:
           capability left behind by a prior route/pin state is corrected rather
           than served.
 
-        Returns ``(None, None)`` only when discovery finds NO embedding model
-        for the route (a truthful "off") — never a silent ``None`` while capable
-        models are discovered. Writes ``supports_embeddings`` /
-        ``embedding_model`` / ``embedding_dim`` into the route's capabilities as
-        a side effect so the sync readers (``get_embedding_settings``,
-        ``ProviderEmbeddingService.describe``) observe the same answer.
+        Returns ``(None, None)`` when discovery finds NO embedding model for the
+        route (a truthful "off"), OR when the resolved model has no concrete dim
+        from any branch (#2376) — an embedding-capable state without a dim is
+        invalid by construction, so we fail closed rather than persist
+        ``embedding_model`` without ``embedding_dim``. Otherwise writes
+        ``supports_embeddings`` / ``embedding_model`` / ``embedding_dim`` into the
+        route's capabilities together, as a side effect, so the sync readers
+        (``get_embedding_settings``, ``ProviderEmbeddingService.describe``)
+        observe the same answer and ``embedding_model`` NEVER stands without a
+        ``embedding_dim``.
         """
         if not isinstance(provider, dict):
             return None, None
@@ -894,7 +916,7 @@ class ModelDiscoveryMixin:
             corpus_profile = await self._get_corpus_embedding_profile()
         if deployment_dim is None:
             deployment_dim = _resolve_deployment_embedding_dim()
-        chosen = await self.resolve_default_embedding_model(
+        chosen, resolved_dim = await self.resolve_default_embedding_model(
             provider,
             corpus_profile=corpus_profile,
             deployment_dim=deployment_dim,
@@ -904,13 +926,29 @@ class ModelDiscoveryMixin:
             # whatever a static config pin already established (may be None).
             return caps.get("embedding_model"), caps.get("embedding_dim")
 
-        dim = self._resolve_route_embedding_dim(
-            caps, chosen, corpus_profile, deployment_dim
-        )
+        dim = self._resolve_route_embedding_dim(caps, chosen, resolved_dim)
+        if dim is None:
+            # #2376 — an embedding-capable state with no concrete dim is invalid
+            # BY CONSTRUCTION: the adapter would embed at the provider's native
+            # width, the column guard would then refuse the write, and the read
+            # path would build a kNN spec at the wrong width. Discovery supplied
+            # no dim for this model (``native_dim`` unknown, ``dim_options``
+            # empty — the ollama/OpenRouter case in the issue), and neither the
+            # corpus nor the deployment pinned one. We CANNOT truthfully
+            # advertise embeddings for this route, so fail closed: leave the
+            # capabilities untouched (never persist ``embedding_model`` without
+            # ``embedding_dim``) and report whatever prior state stood.
+            logger.debug(
+                "embedding resolve for %s skipped: model %s has no known dim "
+                "(corpus/deployment/native all unset) — not advertising "
+                "embeddings without a dim (#2376)",
+                provider.get("name"),
+                chosen.id,
+            )
+            return caps.get("embedding_model"), caps.get("embedding_dim")
         caps["supports_embeddings"] = True
         caps["embedding_model"] = chosen.id
-        if dim is not None:
-            caps["embedding_dim"] = int(dim)
+        caps["embedding_dim"] = int(dim)
         if chosen.is_pinned:
             # Operator intent — not an auto default. Drop any stale auto marker so
             # the pin is honoured verbatim on subsequent discovery, and clear any
@@ -936,25 +974,23 @@ class ModelDiscoveryMixin:
     def _resolve_route_embedding_dim(
         caps: Dict[str, Any],
         chosen: "EmbeddingModelInfo",
-        corpus_profile: Optional[Dict[str, Any]],
-        deployment_dim: Optional[int],
+        resolved_dim: Optional[int],
     ) -> Optional[int]:
-        """Pick the embedding dim to persist for a resolved model (#2372).
+        """Pick the embedding dim to persist for a resolved model (#2372/#2376).
 
         An explicit pin's own dim is authoritative — it was written into
-        ``capabilities`` at pin time, so keep it. Otherwise prefer a dim that
-        keeps the vector columns aligned and preserves the corpus space — the
-        deployment dim, then the corpus's dominant dim — when the model can
-        actually serve it (native size or a Matryoshka truncation option),
-        falling back to the model's native dim.
+        ``capabilities`` at pin time, so keep it. Otherwise the resolver already
+        chose the dim the model was matched on (the corpus's dominant dim for a
+        corpus match, the deployment dim for a dim-compat match, or the model's
+        native dim for the hint/catalog fallback), so honour it — falling back to
+        the model's native dim only if the branch left it unset. Attaching that
+        dim is what stops an auto-resolved corpus-matched model from embedding at
+        the provider's native width and tripping the column guard (#2376).
         """
-        if chosen.is_pinned:
-            if caps.get("embedding_dim") is not None:
-                return caps.get("embedding_dim")
-            return chosen.native_dim
-        for candidate in (deployment_dim, (corpus_profile or {}).get("dim")):
-            if candidate and _model_offers_dim(chosen, int(candidate)):
-                return int(candidate)
+        if chosen.is_pinned and caps.get("embedding_dim") is not None:
+            return caps.get("embedding_dim")
+        if resolved_dim is not None:
+            return int(resolved_dim)
         return chosen.native_dim
 
     def clear_embedding_discovery_cache(self) -> None:

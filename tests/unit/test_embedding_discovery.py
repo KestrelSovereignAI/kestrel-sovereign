@@ -289,7 +289,7 @@ async def test_resolve_default_respects_selection_hints():
         "capabilities": {},
     }
     svc = _FakeService([provider])
-    chosen = await svc.resolve_default_embedding_model(provider)
+    chosen, _ = await svc.resolve_default_embedding_model(provider)
     assert chosen.id == "qwen/qwen3-embedding-8b"
 
 
@@ -304,7 +304,7 @@ async def test_resolve_default_falls_back_to_first_discovered():
         "capabilities": {},  # no hints, no pin
     }
     svc = _FakeService([provider])
-    chosen = await svc.resolve_default_embedding_model(provider)
+    chosen, _ = await svc.resolve_default_embedding_model(provider)
     assert chosen.id == "google/gemini-embedding-2"
 
 
@@ -322,7 +322,7 @@ async def test_resolve_default_pin_wins_over_hint():
         "capabilities": {},
     }
     svc = _FakeService([provider])
-    chosen = await svc.resolve_default_embedding_model(provider)
+    chosen, _ = await svc.resolve_default_embedding_model(provider)
     assert chosen.id == "google/gemini-embedding-2"
     assert chosen.is_pinned is True
 
@@ -336,7 +336,7 @@ async def test_resolve_default_none_when_no_discovery():
         "capabilities": {},
     }
     svc = _FakeService([provider])
-    assert await svc.resolve_default_embedding_model(provider) is None
+    assert await svc.resolve_default_embedding_model(provider) == (None, None)
 
 
 # --- #2366 corpus-first auto resolution --------------------------------------
@@ -357,8 +357,11 @@ async def test_resolve_default_prefers_corpus_dominant_profile():
     svc = _FakeService([provider])
     corpus = {"provider": "openrouter", "model": "qwen3-embedding-8b",
               "dim": 768, "space_id": "s", "row_count": 63}
-    chosen = await svc.resolve_default_embedding_model(provider, corpus_profile=corpus)
+    chosen, dim = await svc.resolve_default_embedding_model(provider, corpus_profile=corpus)
     assert chosen.id == "qwen/qwen3-embedding-8b"
+    # #2376 — a corpus match carries the corpus's dominant dim, so the resolved
+    # state is a full ``<model>@<dim>`` space, never a bare model.
+    assert dim == 768
 
 
 async def test_resolve_default_corpus_matches_cross_route_identity():
@@ -377,8 +380,9 @@ async def test_resolve_default_corpus_matches_cross_route_identity():
     svc = _FakeService([provider])
     corpus = {"provider": "ollama", "model": "qwen3-embedding:0.6b",
               "dim": 768, "space_id": "s", "row_count": 10}
-    chosen = await svc.resolve_default_embedding_model(provider, corpus_profile=corpus)
+    chosen, dim = await svc.resolve_default_embedding_model(provider, corpus_profile=corpus)
     assert chosen.id == "qwen/qwen3-embedding-0.6b"
+    assert dim == 768
 
 
 async def test_resolve_default_prefers_deployment_dim_when_no_corpus_match():
@@ -397,8 +401,40 @@ async def test_resolve_default_prefers_deployment_dim_when_no_corpus_match():
         "capabilities": {},
     }
     svc = _FakeService([provider])
-    chosen = await svc.resolve_default_embedding_model(provider, deployment_dim=768)
+    chosen, dim = await svc.resolve_default_embedding_model(provider, deployment_dim=768)
     assert chosen.id == "qwen/qwen3-embedding-8b"
+    # #2376 — the dim-compat branch carries the matched deployment dim.
+    assert dim == 768
+
+
+async def test_resolve_route_refuses_model_without_a_dim():
+    # #2376 — hint/catalog fallback picks a model discovery could give no dim for
+    # (native_dim=None, empty dim_options — the ollama/OpenRouter case), and no
+    # corpus/deployment continuity pins one. An embedding-capable state without a
+    # concrete dim is invalid by construction (native-dim embeds → column-guard
+    # write refusals → read-spec confusion), so the route must NOT be advertised
+    # as embedding-capable: never persist embedding_model without embedding_dim.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="google/gemini-embedding-2", provider="openrouter",
+                               native_dim=None, dim_options=[]),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    model, dim = await svc.resolve_route_embedding_model(provider)
+    assert model is None
+    assert dim is None
+    caps = provider["capabilities"]
+    assert caps.get("embedding_model") is None
+    assert caps.get("embedding_dim") is None
+    assert not caps.get("supports_embeddings")
+    # The invariant: a persisted embedding_model always carries a dim.
+    if caps.get("embedding_model") is not None:
+        assert caps.get("embedding_dim") is not None
 
 
 async def test_resolve_default_empty_corpus_falls_through_to_hints():
@@ -415,7 +451,7 @@ async def test_resolve_default_empty_corpus_falls_through_to_hints():
         "capabilities": {},
     }
     svc = _FakeService([provider])
-    chosen = await svc.resolve_default_embedding_model(provider, corpus_profile=None)
+    chosen, _ = await svc.resolve_default_embedding_model(provider, corpus_profile=None)
     assert chosen.id == "qwen/qwen3-embedding-8b"
 
 
@@ -916,6 +952,116 @@ async def test_explicit_config_pin_survives_cache_clear(monkeypatch):
     model2, dim2 = await svc.resolve_route_embedding_model(provider)
     assert model2 == "google/gemini-embedding-2"
     assert "embedding_model_auto_resolved" not in provider["capabilities"]
+
+
+# --- #2376 auto-resolved model must carry the resolved dim -------------------
+
+
+async def test_cleared_pin_corpus_match_attaches_corpus_dim_without_dim_options(monkeypatch):
+    # Round-5 (#2376): the corpus-matched model's ``dim_options`` is EMPTY —
+    # discovery (ollama /api/show, the OpenRouter catalog) does not expose its
+    # Matryoshka range — so ``_model_offers_dim`` can't confirm 768. The corpus
+    # it matched against IS the proof: a corpus match keeps the existing space
+    # (``<model>@768``), so 768 must still be attached, NEVER native 4096.
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=4096),  # dim_options empty
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    corpus = {"provider": "openrouter", "model": "qwen3-embedding-8b",
+              "dim": 768, "space_id": "s", "row_count": 63}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus)
+
+    model, dim = await svc.resolve_route_embedding_model(provider)
+    assert (model, dim) == ("qwen/qwen3-embedding-8b", 768)
+    # The dim is persisted so the sync readers agree and never embed at native.
+    assert provider["capabilities"]["embedding_dim"] == 768
+
+
+async def test_auto_resolved_state_embeds_at_resolved_dim_not_native(monkeypatch):
+    # The live-write shape: once the resolver attaches the corpus dim, a
+    # ProviderEmbeddingService built from those capabilities forwards
+    # ``dimensions=768`` on every embed (a fake MRL adapter truncates to it),
+    # so the write lands 768-wide vectors that the column guard accepts —
+    # instead of native 4096 that it refuses (#2376).
+    from kestrel_sovereign.llm.embedding_service import ProviderEmbeddingService
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+
+    class _MRLAdapter:
+        """A Matryoshka adapter: truncates to the requested ``dimensions``."""
+        async def aembed(self, client, text, *, model=None, dimensions=None):
+            width = dimensions or 4096  # native when nothing requested
+            return [0.1] * width
+
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": _adapter_returning([
+            EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                               native_dim=4096),
+        ]),
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    corpus = {"provider": "openrouter", "model": "qwen3-embedding-8b",
+              "dim": 768, "space_id": "s", "row_count": 63}
+    svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus)
+    await svc.resolve_route_embedding_model(provider)
+
+    # Build the runtime embedding service from the resolved capabilities and a
+    # real MRL adapter; the embed must arrive at 768, not the native 4096.
+    provider["adapter"] = _MRLAdapter()
+    embed_svc = ProviderEmbeddingService(provider)
+    vec = await embed_svc.aembed("hello")
+    assert len(vec) == 768
+
+
+async def test_resolved_embedding_state_invariant_model_implies_dim(monkeypatch):
+    # Invariant (#2376): a resolved embedding-capable route can NEVER carry a
+    # model with a null dim — that state embeds at native width and breaks the
+    # write/read paths. Every non-``None`` resolution attaches a dim.
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_discovery._resolve_deployment_embedding_dim",
+        lambda: None,
+    )
+    scenarios = [
+        # (corpus_profile, native_dim, dim_options)
+        ({"provider": "openrouter", "model": "qwen3-embedding-8b",
+          "dim": 768, "space_id": "s", "row_count": 5}, 4096, []),   # corpus match
+        (None, 3072, []),                                            # catalog fallback
+    ]
+    for corpus, native_dim, dim_options in scenarios:
+        provider = {
+            "vendor": "openrouter",
+            "name": "openrouter:api",
+            "adapter": _adapter_returning([
+                EmbeddingModelInfo(id="qwen/qwen3-embedding-8b", provider="openrouter",
+                                   native_dim=native_dim, dim_options=list(dim_options)),
+            ]),
+            "client": None,
+            "capabilities": {},
+        }
+        svc = _FakeService([provider])
+        svc._corpus_embedding_profile_provider = AsyncMock(return_value=corpus)
+        model, dim = await svc.resolve_route_embedding_model(provider)
+        assert model is not None
+        assert dim is not None, "embedding_model set ⇒ embedding_dim set"
+        assert provider["capabilities"].get("embedding_dim") is not None
 
 
 async def test_discovery_cache_reused_until_cleared():
