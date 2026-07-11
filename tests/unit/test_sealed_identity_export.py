@@ -836,3 +836,48 @@ def test_open_export_detects_kem_slug_from_files_multisegment(tmp_path, monkeypa
     # No slug passed — must be discovered from the *_x25519.key.enc file
     loaded = open_identity_export(capsule, storage_dir=tmp_path)
     assert loaded.did == did
+
+
+@pytest.mark.asyncio
+async def test_kem_vm_reusing_signing_id_does_not_poison_signing_vms(tmp_path, monkeypatch):
+    """A KEM VM that reuses a signing method id (#key-1) must not end up
+    in new_verification_methods and break package verification — signing
+    VMs are reconstructed from decoded signing entries (codex r12)."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_DID_WEB_DOMAIN", "agents.kestrel-sovereign.test")
+    monkeypatch.delenv("KESTREL_IDENTITY_METHOD", raising=False)
+    import json as _json
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.signing import sign_package, verify_package_signature
+    from kestrel_sovereign.identity.sealed_export import (
+        generate_agent_kem_keypair, agent_kem_public_multibases,
+    )
+
+    creds = await create_kestrel_identity_async(
+        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md", agent_name="Reuser",
+    )
+    kem = generate_agent_kem_keypair(creds.agent_did.rsplit(":", 1)[-1], tmp_path)
+    c_mb, _ = agent_kem_public_multibases(kem)
+    did_path = next(tmp_path.glob("*_did.json"))
+    doc = _json.loads(did_path.read_text())
+    # Malicious/merged: a KEM VM reusing the signing id "#key-1"
+    doc["verificationMethod"].append(
+        {"id": f"{creds.agent_did}#key-1", "type": "Multikey", "publicKeyMultibase": c_mb})
+    did_path.write_text(_json.dumps(doc))
+
+    ident = load_agent_identity(None, storage_dir=tmp_path)
+    # Only genuine signing algs survive
+    from kestrel_sovereign.security.multikey import multibase_to_public_key
+    algs = {multibase_to_public_key(vm["publicKeyMultibase"])[0].alg_id
+            for vm in ident.new_verification_methods}
+    assert algs == {"ed25519", "ml-dsa-65"}
+
+    package = AgentIdentityPackage(
+        did=creds.agent_did, agent_name="Reuser", created_at="t",
+        constitution_hash="h", constitution_text="c",
+    )
+    signed = sign_package(package, storage_dir=tmp_path)
+    ok, msg = verify_package_signature(signed, storage_dir=tmp_path)
+    assert ok, msg

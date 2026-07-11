@@ -522,12 +522,19 @@ def _load_born_hybrid(
     # also publish KEM keyAgreement methods (#2398 sealed-capsule
     # recipients); including those would make hybrid package signatures
     # unverifiable (the verifier rejects VMs whose multicodec isn't a
-    # signing suite). parse_did_document already dropped KEM methods, so
-    # filter the raw array down to the signing kids it returned.
-    signing_kids = {kid for kid, _suite, _pub in parsed_vms}
+    # signing suite). Reconstruct the signing VMs canonically from the
+    # decoded signing entries — an id-based filter over the raw array
+    # would pull a KEM VM back in if it reused a signing method's id
+    # (e.g. a malformed doc publishing #key-1 for a KEM key).
+    from kestrel_sovereign.security.multikey import public_key_to_multibase
     signing_vms = [
-        vm for vm in (did_document.get("verificationMethod") or [])
-        if isinstance(vm, dict) and vm.get("id") in signing_kids
+        {
+            "id": kid,
+            "type": "Multikey",
+            "controller": new_did,
+            "publicKeyMultibase": public_key_to_multibase(suite, pub),
+        }
+        for kid, suite, pub in parsed_vms
     ]
 
     logger.info(f"Loaded born-hybrid agent identity: {new_did}")
