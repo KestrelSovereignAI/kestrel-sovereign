@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -139,6 +140,28 @@ def test_mount_records_host_feature_prefix():
     assert not hf.is_host_feature_path(app, "/api/agents/claw/api/conversations")
 
 
+def test_agent_prefixed_host_path_still_requires_csrf():
+    """The public per-agent alias must not bypass the host CSRF boundary."""
+    from kestrel_sovereign import server
+
+    app = FastAPI()
+    hf.mount_host_feature_routers(app, [_UIHostFeature()])
+    path = "/api/agents/Kite/api/demo-host/do"
+    request = SimpleNamespace(
+        method="POST",
+        app=app,
+        url=SimpleNamespace(path=path),
+        scope={"path": path},
+        cookies={},
+        headers={},
+    )
+
+    response = server._enforce_host_csrf(request)
+
+    assert response is not None
+    assert response.status_code == 403
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle (AC #3)
 # ---------------------------------------------------------------------------
@@ -167,6 +190,130 @@ async def test_one_feature_start_failure_does_not_abort_others():
     # Boom first — must not prevent ok from starting.
     await hf.start_host_features([_Boom(), ok], SovereignHostContext())
     assert ok.started is True
+
+
+@pytest.mark.asyncio
+async def test_server_lifespan_wires_and_closes_host_features(
+    monkeypatch, tmp_path: Path,
+):
+    """Exercise the deployed ``server:app`` call site, not runtime helpers.
+
+    The host-feature block is the behavior moved by #2382.  This pins startup
+    order, the platform ``PORT`` override exposed through ``HostContext``, and
+    the shutdown mirror without booting a real agent or database.
+    """
+    from kestrel_sovereign import server
+    from kestrel_sovereign.a2a import did_registry
+    from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
+    from kestrel_sovereign.security import demo_isolation
+
+    events: list[str] = []
+    config_path = tmp_path / "multi_agent.toml"
+    config_path.write_text("[host]\nport = 8888\n")
+    fake_config = SimpleNamespace(
+        host=SimpleNamespace(bind="127.0.0.1", port=8888),
+        agents={"Kite": object()},
+    )
+    fake_agent = SimpleNamespace(is_test_instance=True)
+
+    class FakeManager:
+        init_failures = []
+
+        async def load_from_config(self, config):
+            assert config is fake_config
+            events.append("agents-load")
+            return 1
+
+        def list_agents(self):
+            return ["Kite"]
+
+        def get_agent(self, name):
+            assert name == "Kite"
+            return fake_agent
+
+        async def shutdown_all(self):
+            events.append("agents-stop")
+
+    fake_manager = FakeManager()
+    feature = _UIHostFeature()
+
+    class Closeable:
+        def __init__(self, event: str):
+            self.event = event
+
+        async def close(self):
+            events.append(self.event)
+
+    ctx = SovereignHostContext(
+        db=Closeable("db-close"),
+        config={},
+        session_factory=Closeable("session-close"),
+    )
+
+    async def build_context(*, config):
+        assert config["host_port"] == 9090
+        events.append("context-build")
+        return ctx
+
+    async def start_features(features, supplied_ctx):
+        assert features == [feature]
+        assert supplied_ctx is ctx
+        events.append("host-start")
+
+    async def stop_features(features, supplied_ctx):
+        assert features == [feature]
+        assert supplied_ctx is ctx
+        events.append("host-stop")
+
+    monkeypatch.setenv("PORT", "9090")
+    monkeypatch.setattr(server, "resolve_multi_agent_path", lambda env: config_path)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *a, **k: fake_config)
+    monkeypatch.setattr(agent_manager, "AgentManager", lambda **k: fake_manager)
+    monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *a, **k: None)
+    monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda agents: True)
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda app: None)
+    monkeypatch.setattr(server, "_unmount_feature_ui_assets", lambda app: None)
+    monkeypatch.setattr(server, "_unmount_feature_routers", lambda app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda app: None)
+    monkeypatch.setattr(hf, "instantiate_host_features", lambda **k: [feature])
+    monkeypatch.setattr(hf, "build_host_context", build_context)
+    monkeypatch.setattr(
+        hf,
+        "mount_host_feature_routers",
+        lambda app, features: events.append("host-router-mount"),
+    )
+    monkeypatch.setattr(
+        hf,
+        "mount_host_feature_ui",
+        lambda app, features: events.append("host-ui-mount"),
+    )
+    monkeypatch.setattr(hf, "start_host_features", start_features)
+    monkeypatch.setattr(hf, "stop_host_features", stop_features)
+    monkeypatch.setattr(
+        hf, "unmount_host_features", lambda app: events.append("host-unmount")
+    )
+
+    test_app = FastAPI()
+    async with server.lifespan(test_app):
+        assert fake_config.host.port == 9090
+        assert test_app.state.host_features == [feature]
+        assert test_app.state.host_context is ctx
+        assert events == [
+            "agents-load",
+            "context-build",
+            "host-router-mount",
+            "host-ui-mount",
+            "host-start",
+        ]
+
+    assert events[-5:] == [
+        "host-stop",
+        "host-unmount",
+        "session-close",
+        "db-close",
+        "agents-stop",
+    ]
 
 
 # ---------------------------------------------------------------------------

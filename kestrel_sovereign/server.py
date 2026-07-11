@@ -432,6 +432,18 @@ def _host_config_mapping(config) -> dict:
         return {}
 
 
+def _apply_platform_host_port(config, env) -> None:
+    """Keep the host config aligned with the platform-selected listen port.
+
+    Cloud Run and Azure Container Apps inject ``PORT`` and uvicorn binds that
+    value.  Host features receive the same effective port through
+    ``HostContext`` rather than the stale value from ``multi_agent.toml``.
+    """
+    platform_port = env.get("PORT")
+    if platform_port is not None:
+        config.host.port = int(platform_port)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the application's lifespan."""
@@ -453,6 +465,7 @@ async def lifespan(app: FastAPI):
                 str(multi_agent_path) if multi_agent_path.exists() else None,
                 auto_discover_fallback=True,
             )
+            _apply_platform_host_port(config, os.environ)
             manager = AgentManager(base_data_dir=Path.cwd())
             loaded = await manager.load_from_config(config)
             app.state.agent_manager = manager
@@ -1272,7 +1285,15 @@ def _enforce_host_csrf(request: Request):
 
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return None
-    if not is_host_feature_path(request.app, request.url.path):
+    # Auth runs before the multi-agent routing middleware strips
+    # ``/api/agents/{name}``.  Normalize that public alias here so a
+    # cookie-authenticated request cannot bypass host-feature CSRF simply by
+    # spelling the same route through an agent prefix (#2382 review).
+    path = request.scope.get("path", request.url.path)
+    match = _AGENT_PATH_RE.match(path)
+    if match:
+        path = "/" + match.group(2)
+    if not is_host_feature_path(request.app, path):
         return None
     try:
         enforce_csrf(request, authed_via_cookie=True)
