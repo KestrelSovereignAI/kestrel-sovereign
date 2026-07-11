@@ -47,6 +47,23 @@ def test_management_key_only_route():
     assert envs == ["OPENROUTER_MANAGEMENT_API_KEY"]
 
 
+def test_inline_api_key_needs_no_env():
+    # The runtime falls back to an inline ``api_key`` when the env var is
+    # unset (``_resolve_secret``), so check/doctor must not demand .env.
+    envs = accepted_credential_envs(
+        "openrouter:api",
+        {"api_key_env": "OPENROUTER_API_KEY", "api_key": "sk-or-inline"},
+    )
+    assert envs == []
+
+
+def test_inline_management_key_needs_no_env():
+    envs = accepted_credential_envs(
+        "openrouter:api", {"management_api_key": "sk-or-mgmt-inline"}
+    )
+    assert envs == []
+
+
 def test_custom_management_env_suppresses_vendor_default():
     # The runtime reads ``management_api_key_env or <default>`` — a route
     # that declares a custom name is served only from that name, so the

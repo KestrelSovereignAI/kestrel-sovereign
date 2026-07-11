@@ -42,6 +42,14 @@ def accepted_credential_envs(route_id: str, route: dict) -> list[str]:
       3. Otherwise the per-vendor default management env for
          ``route_id``'s vendor, if any.
     """
+    # Inline credentials satisfy the route outright: the runtime resolves
+    # secrets as ``env var or route["api_key"]`` (``_resolve_secret``) and
+    # ``env var or route["management_api_key"]``
+    # (``_openrouter_management_key``), so a route carrying an inline key
+    # needs nothing from ``.env``.
+    if route.get("api_key") or route.get("management_api_key"):
+        return []
+
     envs: list[str] = []
 
     primary = route.get("api_key_env")
