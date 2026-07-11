@@ -23,8 +23,8 @@ not CSRF-susceptible — a browser never auto-attaches those headers, so a
 cross-site page cannot forge such a request. Requiring a CSRF token from them
 would only break legitimate scripted clients.
 
-This helper is deliberately transport-agnostic and reusable: the host wires it
-today (:mod:`kestrel_sovereign.host`), and per-agent routes can adopt the same
+This helper is deliberately transport-agnostic and reusable: the deployed host
+wires it in :mod:`kestrel_sovereign.server`, and per-agent routes can adopt the same
 :func:`enforce_csrf` / :func:`issue_csrf_cookie` primitives later without
 re-implementing the check.
 """

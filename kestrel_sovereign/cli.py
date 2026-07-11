@@ -6,8 +6,7 @@ It subsumes main.py's interactive chat into `kestrel shell <name>`.
 
 Commands:
     kestrel start                  # start all agents in-process (default)
-    kestrel start --subprocess     # start host + agents as separate processes
-    kestrel start <name>           # start just one agent (subprocess)
+    kestrel start <name>           # start just one agent (standalone process)
     kestrel stop                   # stop everything (agents first, then host)
     kestrel stop <name>            # stop just one agent
     kestrel status                 # table: host + all agents with ports, PIDs, status
@@ -1387,7 +1386,6 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _query_agents_api,
     _reap_orphans_on_port,
     _start_inprocess_mode,
-    _start_subprocess_mode,
     _resolve_source_checkout,
     _project_dir_is_git,
     _git_working_tree_dirty,

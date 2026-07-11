@@ -100,10 +100,9 @@ async def get_agents(request: Request):
             "agents": agents_list,
             "mode": "multi_agent",
             "server_demo_mode": server_demo_mode,
-            # POST /api/agents works on THIS host (in-process manager). The
-            # subprocess host serves its own /api/agents without this flag —
-            # clients must treat absence as false (codex P2 on #2358: its
-            # POST route doesn't exist and every create 405'd).
+            # POST /api/agents works on this in-process manager. Keep the
+            # capability explicit so older clients can safely treat absence as
+            # false instead of attempting a route the host may not expose.
             "can_create_agents": True,
         }
 

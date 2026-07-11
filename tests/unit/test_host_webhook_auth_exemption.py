@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
-from kestrel_sovereign.host import WEBHOOK_PATH_RE, auth_middleware
+from kestrel_sovereign.server import WEBHOOK_PATH_RE, auth_middleware
 
 
 def test_webhook_path_re_matches_bare_and_agent_prefixed():

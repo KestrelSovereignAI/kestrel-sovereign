@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
+from kestrel_sovereign.server import auth_middleware
+
 API_KEY = "test-api-key-for-sse-restriction"
 
 
@@ -119,6 +121,29 @@ class TestQueryParamAuthOnSSEPaths:
         resp = client.post(f"/api/agent/stream?api_key={API_KEY}")
         assert resp.status_code == 200
         assert resp.json() == {"type": "stream"}
+
+
+def test_real_auth_accepts_agent_prefixed_sse_query_key(monkeypatch):
+    """Pin the deployed multi-agent URL shape against the real middleware."""
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    test_app = FastAPI()
+    test_app.middleware("http")(auth_middleware)
+    test_app.add_middleware(
+        SessionMiddleware,
+        secret_key="test-session-secret",
+        session_cookie="kestrel_session",
+    )
+
+    @test_app.get("/api/agents/{agent}/api/agent/notifications/sse")
+    def prefixed_sse(agent: str):
+        return {"agent": agent}
+
+    client = TestClient(test_app)
+    response = client.get(
+        f"/api/agents/Kite/api/agent/notifications/sse?api_key={API_KEY}"
+    )
+    assert response.status_code == 200
+    assert response.json() == {"agent": "Kite"}
 
 
 class TestQueryParamAuthRejectedOnOtherPaths:

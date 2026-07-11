@@ -1,15 +1,14 @@
 """GET / seeds ``window.KESTREL_UI_CONFIG`` per serving topology (#2048).
 
-Three topologies serve the console page:
+Two topologies serve the console page (the legacy subprocess ``host.py`` was
+retired in #2382):
 
 * standalone ``server:app`` — a single agent is resolvable at render, so the
   page is seeded with its ``featureCapabilities`` map (#2041);
 * multi-agent ``server:app`` — no agent is resolvable, so the page is seeded
   with ``multiAgentHost: true`` and app.js skips the un-prefixed boot fetches
   of /api/ui/capabilities and /api/ui/contributions that are known to 503
-  ("Agent not initialized") until selectAgent() pins routing;
-* subprocess ``host.py`` — unconditionally multi-agent, same
-  ``multiAgentHost`` seed.
+  ("Agent not initialized") until selectAgent() pins routing.
 """
 
 from contextlib import asynccontextmanager
@@ -90,14 +89,3 @@ class TestServerReadRoot:
         assert response.status_code == 200
         assert "multiAgentHost" not in response.text
         assert "featureCapabilities" not in response.text
-
-
-class TestHostServeIndex:
-    def test_host_page_always_seeds_multi_agent_host_flag(self):
-        from kestrel_sovereign import host
-
-        with TestClient(host.app) as client:
-            response = client.get("/")
-
-        assert response.status_code == 200
-        assert '"multiAgentHost": true' in response.text

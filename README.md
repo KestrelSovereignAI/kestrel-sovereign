@@ -367,8 +367,7 @@ kestrel-sovereign/
 │   ├── storage/               # SQL-backed storage facade and stores
 │   ├── static/                # Sovereign Console frontend
 │   └── ...
-├── server.py                  # Re-export shim → kestrel_sovereign/server.py
-├── host.py                    # Multi-agent multi_agent host
+├── server.py                  # Re-export shim → kestrel_sovereign/server.py (consolidated host + agent app)
 ├── main.py                    # Re-export shim → kestrel_sovereign/main.py
 ├── docs/                      # Architecture & guides
 └── tests/                     # Test suite
@@ -691,8 +690,7 @@ Apache 2.0 — see [LICENSE](https://github.com/KestrelSovereignAI/kestrel-sover
 | File | Purpose |
 |------|---------|
 | `kestrel_sovereign/cli.py` | Canonical `kestrel` CLI entry point |
-| `kestrel_sovereign/server.py` | FastAPI agent server (root `server.py` is a re-export shim for source clones) |
-| `host.py` | Multi-agent multi_agent host (Cloud Run) |
+| `kestrel_sovereign/server.py` | FastAPI agent server + consolidated multi-agent host (root `server.py` is a re-export shim for source clones) |
 | `kestrel_sovereign/main.py` | Direct interactive REPL (root `main.py` is a re-export shim for source clones) |
 | `kestrel.toml` | Unified config (LLM, agents, features). `[llm]` holds provider config. |
 | `KESTREL_FEATURES.md` | Canonical feature inventory |

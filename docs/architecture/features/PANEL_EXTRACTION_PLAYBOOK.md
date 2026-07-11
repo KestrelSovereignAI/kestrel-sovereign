@@ -178,14 +178,14 @@ activation MUST stop it on `panel:hidden`.
 ### 8. Handle multi-agent host mode: pin assets to the selected agent
 
 The wrong-agent trap (#2048): in multi-agent host mode the UI is served by the
-host (`host.py`), a thin proxy that owns no feature static mounts. The host runs
-agents as separate processes that may have **heterogeneous** feature sets — the
-selected agent can have a feature enabled (and its `static_dir` mounted) while
-the first-configured agent does not. The per-agent manifest is fetched
+consolidated host (`kestrel_sovereign/server.py`), which co-hosts every agent
+in-process via `AgentManager`. Agents may have **heterogeneous** feature sets —
+the selected agent can have a feature enabled (and its `static_dir` mounted)
+while the first-configured agent does not. The per-agent manifest is fetched
 host-agent-prefixed, but the module/css URLs it carries are root-relative
-(`/features/{slug}/static/…`). A host route that proxied those to a *fixed* first
-agent would 404 whenever that agent lacks the feature — and serves the wrong code
-in the general case.
+(`/features/{slug}/static/…`). Resolving those against a *fixed* first agent
+would 404 whenever that agent lacks the feature — and serves the wrong code in
+the general case.
 
 Fix (the simpler robust option of the two in #2048): **pin feature-static URLs to
 the selected agent on the frontend**, not on the host. `pinFeatureAssetUrl`
@@ -211,9 +211,10 @@ Mirror the Spawn coverage:
 - **Runtime-enable serving** — assert a disabled feature's `static_dir` is still
   mounted/served (`tests/integration/test_feature_ui_runtime_enable.py`,
   `tests/unit/test_ui_contributions_runtime_enable.py`).
-- **Multi-agent host delivery** — assert the host serves an agent-pinned
-  feature-static asset header-less, and keeps feature *API* routes protected
-  (`tests/integration/test_host_proxy_integration.py`); assert the loader pins
+- **Multi-agent host delivery** — assert the deployed server mounts host feature
+  routers/UI and runs their lifecycle (`tests/unit/test_host_features.py`), and
+  keeps feature-static assets protected
+  (`tests/integration/test_feature_ui_assets_auth.py`); assert the loader pins
   `/features/…` URLs but not `/js/…`
   (`tests/frontend/feature_ui_contributions_loader.test.mjs`).
 - **Teardown on disable** — assert the panel stops its work (interval cleared /

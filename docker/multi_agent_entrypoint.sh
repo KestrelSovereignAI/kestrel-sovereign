@@ -3,7 +3,7 @@
 # 1. Provisions agent directories from KESTREL_AGENTS env var (if set)
 # 2. Generates multi_agent.toml via auto-discovery if not mounted
 # 3. Bootstraps agent identities for any new agent data dirs
-# 4. Starts the multi_agent host (host.py)
+# 4. Starts the multi_agent host (server:app in multi-agent mode, #2382)
 
 set -e
 
@@ -91,4 +91,9 @@ print('  Database initialized.')
 done
 
 echo "Starting Kestrel MultiAgent Host on port $PORT..."
-exec /app/.venv/bin/uvicorn host:app --host 0.0.0.0 --port "$PORT"
+# Consolidated onto server:app in multi-agent mode (#2382). The legacy
+# proxy host (host:app) was retired; server:app co-hosts all agents in one
+# process and mounts the host-feature runtime unconditionally.
+export KESTREL_MULTI_AGENT=1
+export KESTREL_MULTI_AGENT_CONFIG="$MULTI_AGENT_CONFIG"
+exec /app/.venv/bin/uvicorn kestrel_sovereign.server:app --host 0.0.0.0 --port "$PORT"
