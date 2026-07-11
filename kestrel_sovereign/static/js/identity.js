@@ -1678,15 +1678,18 @@ window.loadConversation = async function(sessionId, options = {}) {
         });
     };
 
-    activeConversationId = sessionId;
-    activeConversationIdsByAgent.set(host, sessionId);
-    applyHighlight(sessionId);
+    // NB: the selection/highlight is deliberately NOT committed here (#2380
+    // codex round 8 P1): between the click and the pane commit below, the
+    // composer stays usable against the PREVIOUS session — highlighting the
+    // clicked row during that window would show B selected while a quick send
+    // persists to A. The commit happens atomically with the pane switch, after
+    // every guard has passed.
 
     // Same-session no-op (#2380 codex round 2, carried from the legacy
     // loader): re-clicking the already-active conversation must not wipe the
     // pane — an in-flight stream would be generation-gated out and its chunks
-    // dropped. The highlight commit above is idempotent for this case. Callers
-    // that NEED a same-session re-render (the encryption-view toggle) pass
+    // dropped. The highlight is already correct for this case. Callers that
+    // NEED a same-session re-render (the encryption-view toggle) pass
     // ``{ force: true }``.
     if (!options.force && sessionId === state.currentSessionId) {
         return;
@@ -1706,11 +1709,10 @@ window.loadConversation = async function(sessionId, options = {}) {
         // wipe + render A's history into B's pane after the user
         // switched.  The pre-await guard above catches the case where
         // the switch happened BEFORE the fetch; this one catches a
-        // switch DURING.  Codex round-3 catch on #1358. Roll the pending
-        // selection back so the captured agent's map entry doesn't point at a
-        // session that never rendered (#2380 codex round 7).
+        // switch DURING.  Codex round-3 catch on #1358. Nothing to roll back:
+        // the selection commit is deferred to the pane commit below (#2380
+        // codex round 8).
         if (hasExpectedAgent(options) && !currentAgentMatches(options.expectedAgent)) {
-            rollbackToRendered();
             return;
         }
 
@@ -1744,10 +1746,7 @@ window.loadConversation = async function(sessionId, options = {}) {
         // captured host's pane while assigning state.currentSessionId through
         // the NEWLY-visible agent's pane. (Covers the no-expectedAgent callers
         // too; the expectedAgent guards above only ran for pinned loads.)
-        // Roll the pending selection back so the captured agent's map entry
-        // doesn't point at a session that never rendered (#2380 codex round 7).
         if (API.getHostAgent() !== host) {
-            rollbackToRendered();
             return;
         }
 
@@ -1755,15 +1754,14 @@ window.loadConversation = async function(sessionId, options = {}) {
         // round 6 P1): the composer stayed usable against the previous session
         // while getConversation/getRestartStatusEvents were in flight, so
         // wiping now would generation-gate the user's in-flight response and
-        // visually discard their turn. Drop the load and roll the selection
-        // back to the session the pane actually holds. (A stream already
-        // running at click time doesn't trip this — explicit clicks override
-        // pre-existing streams, as before.)
+        // visually discard their turn. Drop the load — the selection was never
+        // committed, so the highlight still points at the session the turn
+        // went to. (A stream already running at click time doesn't trip this —
+        // explicit clicks override pre-existing streams, as before.)
         const paneNow = state.chatPanes.get(host);
         const busyNow = state.waitingAgents.has(host)
             || !!(paneNow && paneNow.streamingMsgDiv);
         if (!busyAtClick && busyNow) {
-            rollbackToRendered();
             return;
         }
 
@@ -1785,14 +1783,19 @@ window.loadConversation = async function(sessionId, options = {}) {
             if (!paneIsCold || userBusy || sessionAlreadySet) {
                 // User started a turn while auto-load was in flight. Drop the
                 // auto-load — the in-flight stream is what the user actually
-                // wants to see — and roll the pre-committed selection back to
-                // the session the pane actually holds, so the sidebar doesn't
-                // stay pinned to a conversation that never rendered (#2380
-                // codex round 3 P2).
-                rollbackToRendered();
+                // wants to see. Nothing to roll back: the selection commit is
+                // deferred to the pane commit below (#2380 codex round 8).
                 return;
             }
         }
+
+        // COMMIT POINT: every guard has passed and the render below is fully
+        // synchronous, so the selection, the highlight (#2222), and the pane
+        // switch land atomically — the sidebar can never show a session the
+        // composer isn't anchored to (#2380 codex round 8 P1).
+        activeConversationId = sessionId;
+        activeConversationIdsByAgent.set(host, sessionId);
+        applyHighlight(sessionId);
 
         // Wipe ONLY the visible agent's pane and bump that agent's
         // pane-local generation. A stream still running against the
@@ -2146,11 +2149,20 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
         // below stays correct in both modes.
         if (detail && detail.sessionId) {
             const agentKey = detail.agent !== undefined ? detail.agent : null;
-            activeConversationIdsByAgent.set(agentKey, detail.sessionId);
-            if (currentAgentMatches(agentKey)) {
-                activeConversationId = detail.sessionId;
-                if (conversationsHandle) {
-                    conversationsHandle.setActiveSessionId(activeConversationId);
+            // Only adopt the event's session while the agent's pane still
+            // holds it (or holds nothing yet — the first-turn session-derive
+            // case). A turn that completes AFTER the user switched to another
+            // conversation must not yank the highlight back to the old
+            // session (#2380 codex round 8 P2); the list refresh below still
+            // updates its tile counts.
+            const paneSession = state.chatPanes.get(agentKey)?.sessionId || null;
+            if (paneSession === null || paneSession === detail.sessionId) {
+                activeConversationIdsByAgent.set(agentKey, detail.sessionId);
+                if (currentAgentMatches(agentKey)) {
+                    activeConversationId = detail.sessionId;
+                    if (conversationsHandle) {
+                        conversationsHandle.setActiveSessionId(activeConversationId);
+                    }
                 }
             }
         }
