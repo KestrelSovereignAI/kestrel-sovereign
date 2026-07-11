@@ -919,15 +919,13 @@
         "server.py",
         "tests/frontend/feature_ui_contributions_loader.test.mjs",
         "tests/frontend/ui_ext_panels_teardown.test.mjs",
+        "tests/integration/test_feature_ui_assets_auth.py",
         "tests/integration/test_feature_ui_runtime_enable.py",
+        "tests/unit/test_host_features.py",
         "tests/unit/test_ui_contributions_runtime_enable.py"
       ],
-      "findings": [
-        "missing_code_refs"
-      ],
-      "missing_code_refs": [
-        "tests/integration/test_host_proxy_integration.py"
-      ],
+      "findings": [],
+      "missing_code_refs": [],
       "missing_links": [],
       "path": "docs/architecture/features/PANEL_EXTRACTION_PLAYBOOK.md",
       "privacy": "public",
@@ -1822,7 +1820,6 @@
       ],
       "missing_code_refs": [
         "tests/unit/test_cloud_launcher_contracts.py",
-        "tests/unit/test_host_query_param_auth.py",
         "tests/unit/test_runpod_model_contracts.py"
       ],
       "missing_links": [],
