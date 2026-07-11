@@ -1795,7 +1795,6 @@
         "tests/integration/test_storage_backend_parity.py",
         "tests/unit/test_agent_backend_routing_contracts.py",
         "tests/unit/test_agent_runtime_endpoint_contracts.py",
-        "tests/unit/test_api_key_query_param.py",
         "tests/unit/test_auth_decision_table.py",
         "tests/unit/test_command_handler_async_boundary_contracts.py",
         "tests/unit/test_command_handler_privacy_contracts.py",
