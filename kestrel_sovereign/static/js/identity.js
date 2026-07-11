@@ -1682,6 +1682,28 @@ window.loadConversation = async function(sessionId, options = {}) {
 
         const currentAgent = API.getHostAgent();
 
+        // Fetch the restart status-bubble trail (#1816) BEFORE committing the
+        // pane switch, so there are NO awaits between the wipe and the
+        // synchronous render below — a load superseded mid-await could
+        // otherwise append its historical timeline into whatever conversation
+        // now owns the pane (#2380 codex round 3 P1). Tolerate the endpoint
+        // being absent (restart feature not loaded) — there's just no trail.
+        let restartEvents = [];
+        try {
+            const res = await API.getRestartStatusEvents(sessionId);
+            restartEvents = Array.isArray(res?.events) ? res.events : [];
+        } catch (e) {
+            restartEvents = [];
+        }
+
+        // Superseded-load check: if the operator clicked ANOTHER conversation
+        // while this one's fetches were in flight, the later click owns the
+        // selection — drop this load entirely (its render would clobber the
+        // newer conversation's pane).
+        if (activeConversationId !== sessionId) {
+            return;
+        }
+
         // Auto-load defense-in-depth: the maybeAutoLoadMostRecent() caller
         // already checked the pane was cold synchronously, but the
         // /api/conversations fetch + this getConversation() fetch above
@@ -1698,9 +1720,15 @@ window.loadConversation = async function(sessionId, options = {}) {
             const userBusy = state.waitingAgents.has(currentAgent);
             const sessionAlreadySet = !!state.currentSessionId;
             if (!paneIsCold || userBusy || sessionAlreadySet) {
-                // User started a turn while auto-load was in flight.
-                // Drop the auto-load silently — the in-flight stream is
-                // what the user actually wants to see.
+                // User started a turn while auto-load was in flight. Drop the
+                // auto-load — the in-flight stream is what the user actually
+                // wants to see — and roll the pre-committed selection back so
+                // the sidebar doesn't stay pinned to a conversation that never
+                // rendered (#2380 codex round 3 P2).
+                activeConversationId = prevActiveId;
+                if (prevMappedId === undefined) activeConversationIdsByAgent.delete(host);
+                else activeConversationIdsByAgent.set(host, prevMappedId);
+                applyHighlight(prevActiveId);
                 return;
             }
         }
@@ -1749,23 +1777,8 @@ window.loadConversation = async function(sessionId, options = {}) {
             chatContainer.appendChild(banner);
         }
 
-        // Repaint the restart status-bubble trail (requesting → executing →
-        // completed) on reload (#1816). These bubbles render live via the
-        // ``restart_status`` SSE side-channel but vanish on reload because they
-        // are never persisted as conversation rows — their durable home is the
-        // ``restart_status_events`` audit table (#1562), scoped server-side to
-        // requests filed from THIS session (#1812). Tolerate the endpoint being
-        // absent (restart feature not loaded) — there's just no trail then.
-        // Ported from the legacy history.js loader (#2380).
-        let restartEvents = [];
-        try {
-            const res = await API.getRestartStatusEvents(sessionId);
-            restartEvents = Array.isArray(res?.events) ? res.events : [];
-        } catch (e) {
-            restartEvents = [];
-        }
-
-        // Interleave messages and restart status bubbles in timestamp order so
+        // Interleave messages and restart status bubbles (#1816, fetched
+        // above, pre-commit) in timestamp order so
         // the trail lands chronologically among the conversation turns, matching
         // the live render order. DB timestamps are UTC; conversation rows
         // serialize naive (no tz) while restart events carry +00:00, so pin naive
