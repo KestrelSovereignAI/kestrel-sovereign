@@ -61,11 +61,11 @@ for dir in "$AGENT_DATA_DIR"/*/; do
     agent_name=$(basename "$dir")
 
     # Bootstrap identity if missing
-    if ! ls "$dir"/kestrel_*.json &>/dev/null; then
+    if ! ls "$dir"/kestrel_*.json &>/dev/null && ! ls "$dir"/*_did.json &>/dev/null; then
         echo "Bootstrapping identity for agent '$agent_name'..."
         /app/.venv/bin/python -c "
 from kestrel_sovereign.inception_service import create_kestrel_identity
-creds = create_kestrel_identity('$dir', 'docs/principles/KESTREL_CONSTITUTION.md')
+creds = create_kestrel_identity('$dir', 'docs/principles/KESTREL_CONSTITUTION.md', agent_name='$agent_name')
 print(f'  Created: {creds.agent_did}')
 "
     else

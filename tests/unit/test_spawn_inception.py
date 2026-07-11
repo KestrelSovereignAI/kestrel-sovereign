@@ -46,8 +46,8 @@ async def test_inception_with_parent_did_adds_controller(tmp_dir, constitution_p
         parent_did=parent_did,
     )
 
-    # Find the DID document file
-    did_files = list(Path(tmp_dir).glob("kestrel_*.json"))
+    # Find the DID document file (born-hybrid default writes <slug>_did.json)
+    did_files = list(Path(tmp_dir).glob("*_did.json"))
     assert len(did_files) == 1, f"Expected 1 DID JSON file, found {len(did_files)}"
 
     with open(did_files[0]) as f:
@@ -96,14 +96,14 @@ async def test_inception_without_parent_did_has_no_controller(tmp_dir, constitut
         agent_name="StandaloneAgent",
     )
 
-    did_files = list(Path(tmp_dir).glob("kestrel_*.json"))
+    did_files = list(Path(tmp_dir).glob("*_did.json"))
     assert len(did_files) == 1
 
     with open(did_files[0]) as f:
         did_doc = json.load(f)
 
     # controller should not be present at the top level
-    # (note: publicKey[0].controller is the self-reference, which is normal)
+    # (note: verificationMethod[*].controller is the self-reference, which is normal)
     assert "controller" not in did_doc or did_doc.get("controller") == did_doc["id"]
 
 

@@ -635,7 +635,12 @@ class AgentManager:
 
         parent_private_key = getattr(parent_agent, '_private_key', None)
         parent_identity = getattr(parent_agent, 'identity', None)
-        if parent_private_key is not None:
+        # A hybrid parent (rotated or born-hybrid #2397) signs via its
+        # hybrid keypair and needs no legacy private key; a legacy
+        # parent signs with its ECDSA key. Only a parent with neither
+        # (pre-inception construction) leaves the mandate unsigned.
+        parent_is_hybrid = bool(parent_identity is not None and parent_identity.is_hybrid)
+        if parent_private_key is not None or parent_is_hybrid:
             sign_mandate(
                 mandate, parent_private_key,
                 parent_identity=parent_identity,

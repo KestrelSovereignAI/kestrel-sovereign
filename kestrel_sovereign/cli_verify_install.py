@@ -350,8 +350,13 @@ def _test_2_core_sovereign(work_dir: Path) -> List[VerifyResult]:
         (
             "from kestrel_sovereign.inception_service "
             "import create_kestrel_identity\n"
+            # The /health probe agent is an ephemeral local test
+            # fixture — nothing publishes its DID document, so the
+            # classical did:pkh method keeps verify-install free of
+            # the born-hybrid KESTREL_DID_WEB_DOMAIN/KESTREL_DATA_KEY
+            # requirements (#2397).
             f"create_kestrel_identity({str(agent_dir)!r}, "
-            f"{str(constitution_path)!r})\n"
+            f"{str(constitution_path)!r}, identity_method='did:pkh')\n"
             "print('identity bootstrapped')\n"
         ),
         env_extra={"KESTREL_DB_PATH": str(agent_dir)},

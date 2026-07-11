@@ -90,7 +90,7 @@ _HYBRID_PREFIX = "hybrid:"
 
 def sign_mandate(
     mandate: SpawnMandate,
-    parent_private_key: ec.EllipticCurvePrivateKey,
+    parent_private_key: Optional[ec.EllipticCurvePrivateKey],
     *,
     parent_identity=None,
 ) -> SpawnMandate:
@@ -98,18 +98,20 @@ def sign_mandate(
 
     Two paths:
 
-    - **Hybrid parent**: pass ``parent_identity`` (an
-      :class:`AgentIdentity` from ``runtime_identity.load_agent_identity``).
-      When ``parent_identity.is_hybrid`` is True, the mandate is signed
+    - **Hybrid parent** (rotated or born-hybrid #2397): pass
+      ``parent_identity`` (an :class:`AgentIdentity` from
+      ``runtime_identity.load_agent_identity``). When
+      ``parent_identity.is_hybrid`` is True, the mandate is signed
       with both the Ed25519 and ML-DSA-65 halves via ``sign_hybrid``;
       ``parent_signature`` is set to ``"hybrid:" + base64(json.dumps(sigs))``.
-      ``parent_private_key`` is still required (and must be the legacy
-      ECDSA key) so the function has a uniform fall-through if hybrid
-      signing fails.
-    - **Legacy parent**: omit ``parent_identity``. The mandate is signed
-      with secp256k1 ECDSA (Wave 1 sub-PR 5 path), and
-      ``parent_signature`` is the hex-encoded DER signature. Same
-      shape and bytes as before this PR.
+      ``parent_private_key`` may be None — born-hybrid parents have no
+      legacy ECDSA key at all.
+    - **Legacy parent**: omit ``parent_identity`` (or pass a
+      legacy-only identity). The mandate is signed with secp256k1
+      ECDSA (Wave 1 sub-PR 5 path), and ``parent_signature`` is the
+      hex-encoded DER signature. ``parent_private_key`` is required
+      here; a parent with neither key raises ``ValueError`` rather
+      than emitting an unsigned mandate.
 
     The verify side accepts both formats by prefix-sniffing
     ``parent_signature``.
@@ -139,6 +141,11 @@ def sign_mandate(
         )
         return mandate
 
+    if parent_private_key is None:
+        raise ValueError(
+            "sign_mandate: parent has neither a hybrid identity nor a "
+            "legacy private key; refusing to emit an unsigned mandate."
+        )
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
     signature = suite.sign(payload, parent_private_key)
     mandate.parent_signature = signature.hex()
@@ -190,12 +197,19 @@ def verify_mandate(
         # Binding check: the caller's loaded identity must be for
         # mandate.parent_did. If they don't match the receiver loaded
         # the wrong agent (or an attacker is feeding us VMs from a
-        # different agent's identity).
-        if parent_identity.legacy_did != mandate.parent_did:
+        # different agent's identity). A rotated parent legitimately
+        # holds two DIDs (legacy did:pkh + new did:web); a born-hybrid
+        # parent (#2397) holds only the did:web — accept a mandate
+        # naming either, never one naming neither.
+        bound_dids = {
+            d for d in (parent_identity.legacy_did, parent_identity.new_did) if d
+        }
+        if mandate.parent_did not in bound_dids:
             logger.warning(
                 f"Mandate parent_did={mandate.parent_did!r} doesn't match "
-                f"parent_identity.legacy_did={parent_identity.legacy_did!r} "
-                f"— refusing to verify against unrelated identity"
+                f"any DID of the loaded parent identity "
+                f"({sorted(bound_dids)}) — refusing to verify against "
+                f"unrelated identity"
             )
             return False
         return _verify_mandate_hybrid(
