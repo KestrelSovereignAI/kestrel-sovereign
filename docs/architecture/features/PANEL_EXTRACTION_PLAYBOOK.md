@@ -211,9 +211,10 @@ Mirror the Spawn coverage:
 - **Runtime-enable serving** — assert a disabled feature's `static_dir` is still
   mounted/served (`tests/integration/test_feature_ui_runtime_enable.py`,
   `tests/unit/test_ui_contributions_runtime_enable.py`).
-- **Multi-agent host delivery** — assert the host serves an agent-pinned
-  feature-static asset header-less, and keeps feature *API* routes protected
-  (`tests/integration/test_host_proxy_integration.py`); assert the loader pins
+- **Multi-agent host delivery** — assert the deployed server mounts host feature
+  routers/UI and runs their lifecycle (`tests/unit/test_host_features.py`), and
+  keeps feature-static assets protected
+  (`tests/integration/test_feature_ui_assets_auth.py`); assert the loader pins
   `/features/…` URLs but not `/js/…`
   (`tests/frontend/feature_ui_contributions_loader.test.mjs`).
 - **Teardown on disable** — assert the panel stops its work (interval cleared /
