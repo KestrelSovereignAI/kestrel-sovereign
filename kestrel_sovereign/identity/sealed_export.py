@@ -461,7 +461,18 @@ def unseal_identity_package(
         ) from e
     try:
         return AgentIdentityPackage.from_json(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as e:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        # e.g. a sealed payload of valid JSON that isn't an object —
+        # from_json calls .get on it (codex P2: the error contract is
+        # SealedExportError for ALL malformed sealed input, not a
+        # leaked AttributeError).
+        AttributeError,
+    ) as e:
         raise SealedExportError(
             f"capsule unsealed but the payload is not a valid identity "
             f"package: {e}"

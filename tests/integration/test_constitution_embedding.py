@@ -169,7 +169,10 @@ async def test_constitution_stored_first(tmp_path):
 @pytest.mark.asyncio
 async def test_did_format_validation(tmp_path):
     """
-    Verify that the DID follows W3C spec with proper Ethereum address formatting.
+    Verify that the CLASSICAL DID follows W3C spec with proper Ethereum
+    address formatting. Since #2399 the default inception method is
+    born-hybrid did:web, so this test opts into the classical path
+    explicitly — it validates the did:pkh spec, not the default.
 
     Tests:
     - DID format: did:pkh:eip155:1:0x{address}
@@ -178,7 +181,9 @@ async def test_did_format_validation(tmp_path):
     """
     output_dir = tmp_path / "test_agent"
 
-    credentials = await create_kestrel_identity_async(str(output_dir))
+    credentials = await create_kestrel_identity_async(
+        str(output_dir), identity_method="did:pkh",
+    )
 
     # Verify DID format
     did = credentials.agent_did
@@ -480,3 +485,15 @@ async def test_constitution_node_timestamp(tmp_path):
         from datetime import datetime
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         assert parsed is not None, "Timestamp must be valid ISO format"
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_default_did_is_born_hybrid_did_web(tmp_path, monkeypatch):
+    """The DEFAULT inception method (#2399) mints a did:web hybrid DID."""
+    monkeypatch.setenv("KESTREL_DID_WEB_DOMAIN", "agents.kestrel-sovereign.test")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    output_dir = tmp_path / "test_agent"
+
+    credentials = await create_kestrel_identity_async(str(output_dir))
+    assert credentials.agent_did.startswith("did:web:agents.kestrel-sovereign.test:")

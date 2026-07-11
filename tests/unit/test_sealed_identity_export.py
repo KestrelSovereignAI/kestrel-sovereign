@@ -401,3 +401,23 @@ async def test_import_serialized_sealed_without_keys_fails_loud(sqlite_db, recip
         await importer.import_serialized(
             capsule, verify_signature=False, allow_unsigned=True
         )
+
+
+def test_unseal_rejects_json_non_object_payload():
+    """A capsule whose decrypted payload is valid JSON but not an
+    identity-package object must fail closed as SealedExportError,
+    not leak an AttributeError (codex P2)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.security.sealed_capsule import seal_capsule
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, unseal_identity_package,
+    )
+
+    kp = generate_hybrid_kem_keypair()
+    capsule = seal_capsule(
+        b"[]",
+        recipient_classical_public_key=kp.classical.public_key,
+        recipient_pq_public_key=kp.pq.public_key,
+    )
+    with pytest.raises(SealedExportError, match="not a valid identity"):
+        unseal_identity_package(capsule, kp)

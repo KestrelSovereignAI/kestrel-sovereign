@@ -22,14 +22,16 @@ async def test_successful_inception(tmp_path):
 
     credentials = await create_kestrel_identity_async(str(output_dir))
 
-    assert credentials.agent_did.startswith("did:pkh:eip155:1:0x")
+    # Default inception (#2399) mints a born-hybrid did:web identity.
+    assert credentials.agent_did.startswith("did:web:")
     assert Path(credentials.db_path).exists()
     assert "CRITICAL: Agent" in credentials.backup_prompt
 
-    # Check that the files were created
+    # Check that the files were created: DID document, DB, and the
+    # encrypted hybrid key material (born-hybrid never writes plaintext).
     files = list(output_dir.iterdir())
-    assert any(f.name.endswith('.json') for f in files)
+    assert any(f.name.endswith('_did.json') for f in files)
     assert any(f.name.endswith('.db') for f in files)
-    # Key file: .pem (plaintext fallback) or .key.enc (encrypted when KESTREL_DATA_KEY is set)
-    assert any(f.name.endswith('.pem') or f.name.endswith('.key.enc') for f in files), \
-        f"Expected key file (.pem or .key.enc) in {[f.name for f in files]}" 
+    assert any(f.name.endswith('_ed25519.key.enc') for f in files)
+    assert any(f.name.endswith('_mldsa65.bytes.enc') for f in files)
+    assert not any(f.name.endswith('.pem') for f in files) 
