@@ -468,6 +468,48 @@ existing Nomic corpus should run `kestrel embeddings reindex` for each agent;
 recall safely falls back to lexical candidates until reindexing completes.
 Qwen3 uses its instructed query format and raw stored documents.
 
+#### Second-stage answerability
+
+Cosine similarity establishes topical relevance, not whether a memory contains
+the particular attribute requested. Configured bi-encoder services therefore
+pass the competitive candidate set through one batched evidence check before
+salience sorting; the provider capability `embedding_answerability_gate` can
+explicitly override that default.
+
+The expanded suite also found an unsupported phone-number hit with Qwen3 8B,
+so this is a bi-encoder contract rather than a Nomic special case. The gate is
+enabled for every configured vector model unless a provider explicitly opts
+out after supplying its own validated evidence layer.
+
+The gate uses the agent's existing LLM service and its live privacy routing. A
+local-only privacy mode forces the judge onto a local route; cloud processing is
+used only when the active privacy policy already permits cloud LLM calls. The
+gate creates no new persisted copy of the query or candidates. Candidate text
+is framed as untrusted quoted data, outputs may reference only opaque candidate
+labels, and malformed/unknown labels fail closed.
+
+This is an inline, turn-critical call: measured qualified local judges add
+roughly 4–9 seconds on this host, and cloud models may add cost on every
+recall-bearing turn. Operators can pin a benchmarked judge with
+`retrieval.memory_answerability_model`, change the hard bound with
+`retrieval.memory_answerability_timeout_seconds`, or restore ordinary semantic
+recall immediately with the global kill switch
+`retrieval.memory_answerability_gate = false`. Memory status reports judge
+calls, failures, and cumulative latency; failures are warning-level events.
+
+The call is bounded to eight candidates, 1,200 characters per candidate, and a
+12-second timeout. If no policy-compliant judge is available or the call fails,
+only candidates containing every canonical query token survive. Pure
+lexical/offline retrieval never invokes the judge, so exact recall remains
+available without an LLM. Providers with a separately validated answerability
+layer can advertise `embedding_answerability_gate = false`.
+
+Only silent weighted retrieval/context injection is gated. The explicit
+`search_memory` history tool remains a literal operator/agent search surface;
+it suppresses the active question echo but does not ask the evidence judge.
+Candidates beyond the eight-item semantic shortlist are deliberately omitted
+from a gated result, even when a caller requests a larger limit.
+
 ### Emotional Score (20%)
 
 Implements **mood-congruent recall** -- the psychological finding that

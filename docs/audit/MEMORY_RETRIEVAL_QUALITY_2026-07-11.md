@@ -104,12 +104,61 @@ because their legacy raw-document vectors no longer match the versioned
 profile. Operators must run `kestrel embeddings reindex` for each agent after
 upgrading; incompatible old and new representations are never mixed.
 
-## Residual risk
+## Round-one residual risk
 
 Nomic still cannot reliably distinguish an unsupported personal question from
 a semantically adjacent fact: “favorite planet” resembles “favorite breakfast,”
 and “birthday” resembles dated obligations. Its answerable ranking is now
 correct, but fixed cosine thresholds cannot separate those score bands without
 dropping valid grief/book paraphrases. A second-stage entailment/answerability
-gate needs its own latency and privacy design; do not hide that limitation by
-overfitting this small suite.
+gate therefore needed an explicit latency and privacy design; a threshold-only
+patch would merely overfit this small suite.
+
+## Follow-up: second-stage answerability (#2378)
+
+Suite v2 expands the abstention set from 3 to 12 unsupported personal
+attributes. Correctly instructed Nomic without a judge scored 1.000 recall and
+0.500 abstention. A 3B Llama judge was empirically inadequate: it preserved
+recall but did not improve the expanded abstention score. This is evidence that
+"an LLM call" alone is not a quality guarantee.
+
+A local Gemma 31B evidence judge produced 1.000 recall, precision, MRR, top-1,
+and abstention across all 27 queries. On the measured host its 21 non-empty
+candidate calls averaged 4.46 seconds warm and peaked at 7.20 seconds. The
+production gate makes one batched call per recall and enforces a 12-second
+timeout. Failures retain exact lexical evidence only; lexical-only retrieval
+bypasses the judge entirely.
+
+Suite v2 also exposed one Qwen3 8B miss that v1 did not: the unsupported phone
+number query retrieved the generic welcome message, yielding 0.917 abstention
+without a judge. The answerability stage therefore applies to all configured
+bi-encoder models by default, not only Nomic; a provider may opt out only by
+declaring `embedding_answerability_gate = false` for a separately validated
+evidence layer.
+
+Run the measured configuration with:
+
+```bash
+uv run python scripts/benchmark_memory_quality.py \
+  --model nomic-embed-text:latest --judge-model gemma4:31b
+```
+
+Candidate content follows the same privacy boundary as the agent's normal LLM
+turn: local-only modes force a local judge, while cloud routing is possible only
+when the active privacy policy permits it. No answerability payload is stored by
+the memory layer.
+
+The benchmark adapter requests Ollama JSON mode with temperature zero. The
+production LLM service relies on the strict JSON instruction and may use the
+active model's normal sampling defaults, so these quality and parse-success
+figures are a model-qualification result, not a guarantee for every production
+route. Set `retrieval.memory_answerability_model` to the qualified model, then
+repeat live-path verification. The global
+`retrieval.memory_answerability_gate = false` kill switch removes the added
+call and preserves normal semantic recall if judge latency, cost, or failure
+rate is unacceptable.
+
+The remaining risk is judge capability: the 3B result proves that small models
+can return syntactically valid but incorrect evidence decisions. Deployments
+using Nomic should qualify their chosen chat model with this suite; unavailable,
+timed-out, or malformed judges fail closed rather than leaking a topical guess.

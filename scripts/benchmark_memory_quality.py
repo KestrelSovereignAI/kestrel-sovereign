@@ -30,6 +30,11 @@ from typing import Any, Mapping, Sequence
 
 from kestrel_sovereign.llm.embedding_service import EmbeddingService
 from kestrel_sovereign.storage.memory_models import MemoryMetadata
+from kestrel_sovereign.storage.memory_answerability import (
+    AnswerabilityCandidate,
+    LLMAnswerabilityGate,
+    has_exact_lexical_evidence,
+)
 from kestrel_sovereign.storage.memory_retriever import MemoryRetriever
 
 
@@ -39,6 +44,33 @@ DEFAULT_SUITE = (
     / "fixtures"
     / "memory_quality_eval.json"
 )
+
+
+class _OllamaJudgeService:
+    """Benchmark adapter matching the production gate's LLM service contract."""
+
+    def __init__(self, client: Any, model: str) -> None:
+        self.client = client
+        self.model = model
+
+    async def generate(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        **_kwargs: Any,
+    ) -> str:
+        response = await self.client.chat(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            format="json",
+            options={"temperature": 0},
+        )
+        message = response.get("message", {})
+        return str(message.get("content", ""))
 
 
 @dataclass(frozen=True)
@@ -194,6 +226,17 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     )
     results = []
     details = []
+    judge_latencies: list[float] = []
+    judge_required = service.requires_answerability_gate()
+    judge = (
+        LLMAnswerabilityGate(
+            _OllamaJudgeService(service.async_client, args.judge_model),
+            timeout_seconds=args.judge_timeout,
+            force_local_only_provider=lambda: True,
+        )
+        if args.judge_model and judge_required else None
+    )
+    memory_by_id = {str(memory["id"]): memory for memory in memories}
     for query in queries:
         query_vector = await service.aembed_query(str(query["query"]))
         if query_vector is None:
@@ -212,6 +255,35 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             min_relevance=args.min_relevance,
             limit=args.limit,
         )
+        judge_completed = None
+        judge_reason = ""
+        if judge is not None and ranked:
+            decision = await judge.filter(
+                str(query["query"]),
+                [
+                    AnswerabilityCandidate(
+                        memory_id=str(row["id"]),
+                        content=str(memory_by_id[str(row["id"])]["text"]),
+                    )
+                    for row in ranked
+                ],
+            )
+            judge_latencies.append(decision.latency_ms)
+            judge_completed = decision.completed
+            judge_reason = decision.reason
+            if decision.completed:
+                ranked = [
+                    row for row in ranked
+                    if str(row["id"]) in decision.answerable_ids
+                ]
+            else:
+                ranked = [
+                    row for row in ranked
+                    if has_exact_lexical_evidence(
+                        str(query["query"]),
+                        str(memory_by_id[str(row["id"])]["text"]),
+                    )
+                ]
         results.append((query, ranked))
         details.append(
             {
@@ -220,6 +292,8 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "relevant": query.get("relevant", []),
                 "forbidden": query.get("forbidden", []),
                 "returned": ranked,
+                "judge_completed": judge_completed,
+                "judge_reason": judge_reason,
             }
         )
     metrics = summarize(results, limit=args.limit)
@@ -230,6 +304,19 @@ async def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "min_score": args.min_score,
         "min_relevance": args.min_relevance,
         "limit": args.limit,
+        "judge_model": args.judge_model,
+        "judge_required": judge_required,
+        "judge_enabled": judge is not None,
+        "answerability": {
+            "calls": len(judge_latencies),
+            "mean_latency_ms": mean(judge_latencies) if judge_latencies else 0.0,
+            "max_latency_ms": max(judge_latencies, default=0.0),
+            "generation_contract": {
+                "format": "json",
+                "temperature": 0,
+                "production_equivalent": False,
+            },
+        },
         "metrics": metrics.as_dict(),
         "queries": details,
     }
@@ -244,6 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-score", type=float, default=0.3)
     parser.add_argument("--min-relevance", type=float, default=0.2)
     parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument("--judge-model")
+    parser.add_argument("--judge-timeout", type=float, default=12.0)
     parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
@@ -260,6 +349,13 @@ def main() -> int:
         )
         for name, value in report["metrics"].items():
             print(f"{name}: {value:.4f}" if isinstance(value, float) else f"{name}: {value}")
+        if report["judge_model"]:
+            timing = report["answerability"]
+            print(
+                f"answerability_judge={report['judge_model']} calls={timing['calls']} "
+                f"mean_latency_ms={timing['mean_latency_ms']:.1f} "
+                f"max_latency_ms={timing['max_latency_ms']:.1f}"
+            )
         print("\nPer-query top results:")
         for query in report["queries"]:
             top = ", ".join(

@@ -50,6 +50,11 @@ from .async_conversation_store import (
     _tokenize_for_search,
 )
 from .associative_linker import AssociativeLinker
+from .memory_answerability import (
+    AnswerabilityCandidate,
+    LLMAnswerabilityGate,
+    has_exact_lexical_evidence,
+)
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
@@ -195,7 +200,9 @@ class MemoryRetriever:
     def __init__(
         self,
         conversation_store: AsyncConversationStore,
-        linker: Optional[AssociativeLinker] = None
+        linker: Optional[AssociativeLinker] = None,
+        answerability_gate: Optional[LLMAnswerabilityGate] = None,
+        answerability_enabled: bool = True,
     ):
         """
         Initialize retriever.
@@ -206,6 +213,13 @@ class MemoryRetriever:
         """
         self.conversations = conversation_store
         self.linker = linker
+        self.answerability_gate = answerability_gate
+        self.answerability_enabled = bool(answerability_enabled)
+        self.answerability_stats = {
+            "calls": 0,
+            "failures": 0,
+            "total_latency_ms": 0.0,
+        }
         self._access_update_tasks: set[asyncio.Task[None]] = set()
         self._sqla_factory_unavailable = False
         self._unprofiled_lexical_scan_warned = False
@@ -504,6 +518,20 @@ class MemoryRetriever:
                 if item[2]["semantic"] >= competitive_floor
             ]
 
+        # Some embedding models form useful topical neighborhoods but cannot
+        # reliably tell whether a candidate contains the requested attribute.
+        # Batch the competitive vector candidates through one evidence check.
+        # Lexical-only operation deliberately bypasses this gate; if the judge
+        # fails, retain only canonical lexical evidence rather than inventing
+        # an answer or making exact offline recall unavailable.
+        if (
+            scored
+            and query_embedding is not None
+            and self.answerability_enabled
+            and self._answerability_required()
+        ):
+            scored = await self._filter_answerable(query, scored)
+
         # Sort competitive candidates by human-like salience score.
         scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -525,6 +553,70 @@ class MemoryRetriever:
                     self._schedule_access_update(msg_id, agent_id)
 
         return results
+
+    def _answerability_required(self) -> bool:
+        service = getattr(self.conversations, "embedding_service", None)
+        required = getattr(type(service), "requires_answerability_gate", None)
+        return bool(required(service)) if callable(required) else False
+
+    async def _filter_answerable(
+        self,
+        query: str,
+        scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]],
+    ) -> List[Tuple[Dict[str, Any], float, Dict[str, float]]]:
+        semantic_order = sorted(
+            scored, key=lambda item: item[2]["semantic"], reverse=True
+        )
+        if self.answerability_gate is None:
+            self.answerability_stats["failures"] += 1
+            logger.warning(
+                "Embedding model requires answerability filtering but no judge "
+                "is configured; retaining lexical evidence only"
+            )
+            return self._lexically_supported(query, semantic_order)
+        decision = await self.answerability_gate.filter(
+            query,
+            [
+                AnswerabilityCandidate(
+                    memory_id=str(item[0].get("id")),
+                    content=str(item[0].get("content", "")),
+                )
+                for item in semantic_order
+            ],
+        )
+        self.answerability_stats["calls"] += 1
+        self.answerability_stats["total_latency_ms"] += decision.latency_ms
+        logger.info(
+            "Memory answerability gate completed=%s kept=%d/%d latency_ms=%.3f reason=%s",
+            decision.completed,
+            len(decision.answerable_ids),
+            len(semantic_order),
+            decision.latency_ms,
+            decision.reason,
+        )
+        if not decision.completed:
+            self.answerability_stats["failures"] += 1
+            logger.warning(
+                "Memory answerability degraded to exact lexical evidence: %s",
+                decision.reason,
+            )
+            return self._lexically_supported(query, semantic_order)
+        return [
+            item for item in semantic_order
+            if str(item[0].get("id")) in decision.answerable_ids
+        ]
+
+    @staticmethod
+    def _lexically_supported(
+        query: str,
+        scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]],
+    ) -> List[Tuple[Dict[str, Any], float, Dict[str, float]]]:
+        return [
+            item for item in scored
+            if has_exact_lexical_evidence(
+                query, str(item[0].get("content", ""))
+            )
+        ]
 
     def _schedule_access_update(self, message_id: int, agent_id: str) -> asyncio.Task[None]:
         """Own rehearsal-effect bookkeeping tasks so shutdown can await them."""

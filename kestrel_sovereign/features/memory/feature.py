@@ -16,6 +16,7 @@ kestrel-sovereign #1042 narration-honesty contract (see #1061).
 """
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +31,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+from kestrel_sovereign.storage.memory_retriever import _is_user_query_echo
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -176,10 +178,42 @@ class MemoryFeature(Feature):
                 limit=limit,
                 session_id=session_id,
             )
+            # The current user turn is persisted before an agent may call this
+            # tool. Identify the newest ordinary user row so we suppress only
+            # the active question, not a genuinely historical question that a
+            # later search is expected to find. Operator/signal user rows can
+            # be appended after the active turn, so ignore them here.
+            get_recent = getattr(conv_store, "get_conversation_history", None)
+            recent = (
+                await get_recent(limit=20, session_id=session_id)
+                if inspect.iscoroutinefunction(get_recent)
+                else []
+            )
+            ordinary_user_ids = [
+                row.get("id") for row in recent
+                if row.get("id") is not None
+                and row.get("role") == "user"
+                and not (row.get("metadata") or {}).get("operator_signal")
+                and not (row.get("metadata") or {}).get("signal_wake")
+            ]
+            newest_user_id = max(ordinary_user_ids, default=None)
+            results = [
+                row for row in results
+                if not (
+                    newest_user_id is not None
+                    and row.get("id") == newest_user_id
+                    and row.get("role") == "user"
+                    and _is_user_query_echo(
+                        extract_raw_user_content(str(row.get("content", ""))),
+                        query,
+                    )
+                )
+            ]
+            cleaned = _strip_sent_form_for_recall(results)
             return {
                 "ok": True,
-                "results": _strip_sent_form_for_recall(results),
-                "count": len(results),
+                "results": cleaned,
+                "count": len(cleaned),
                 "query": query,
                 "session_id": session_id,
             }

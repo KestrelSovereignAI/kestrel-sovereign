@@ -31,11 +31,34 @@ from .emotional_tagger import EmotionalTagger
 from .temporal_analyzer import TemporalAnalyzer
 from .associative_linker import AssociativeLinker
 from .memory_retriever import MemoryRetriever
+from .memory_answerability import LLMAnswerabilityGate
 from .memory_consolidator import MemoryConsolidator
 from .schema_router import SchemaRouter
 from .async_storage import AsyncStorage
+from kestrel_sovereign.config import load_section
 
 logger = logging.getLogger(__name__)
+
+
+def _answerability_settings() -> tuple[bool, float, Optional[str]]:
+    """Load and validate the global retrieval answerability controls."""
+    config = load_section("retrieval") or {}
+    enabled = config.get("memory_answerability_gate", True)
+    timeout = config.get("memory_answerability_timeout_seconds", 12.0)
+    model = config.get("memory_answerability_model")
+    if not isinstance(enabled, bool):
+        raise ValueError("retrieval.memory_answerability_gate must be boolean")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or float(timeout) <= 0
+    ):
+        raise ValueError(
+            "retrieval.memory_answerability_timeout_seconds must be positive"
+        )
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError("retrieval.memory_answerability_model must be a model string")
+    return enabled, float(timeout), model.strip() if model else None
 
 
 def _routing_suppressed(metadata: Optional[Dict[str, Any]]) -> bool:
@@ -96,9 +119,23 @@ class MemorySystem:
         # AsyncStorage uses 'db' not 'database'
         self.analyzer = TemporalAnalyzer(self.storage.db)
         self.linker = AssociativeLinker(self.storage.graph)
+        llm_service = getattr(self.storage, "llm_service", None)
+        answerability_enabled, answerability_timeout, answerability_model = (
+            _answerability_settings()
+        )
         self.retriever = MemoryRetriever(
             self.storage.conversation,
-            self.linker
+            self.linker,
+            answerability_gate=(
+                LLMAnswerabilityGate(
+                    llm_service,
+                    timeout_seconds=answerability_timeout,
+                    model_override=answerability_model,
+                )
+                if llm_service is not None and answerability_enabled
+                else None
+            ),
+            answerability_enabled=answerability_enabled,
         )
         self.consolidator = MemoryConsolidator(
             self.storage.db,
@@ -107,7 +144,7 @@ class MemorySystem:
             # Reuse the agent-scoped LLM service for episode embeddings +
             # semantic recall (#1674 P2). None-safe: recall degrades to
             # keyword search when no embedding provider is configured.
-            llm_service=getattr(self.storage, "llm_service", None),
+            llm_service=llm_service,
         )
 
         # Schema-aware routing: promote extracted structure (action items,
@@ -574,6 +611,9 @@ class MemorySystem:
                 "temporal_analyzer": self.analyzer is not None,
                 "associative_linker": self.linker is not None,
                 "memory_retriever": self.retriever is not None,
+                "answerability_gate": bool(
+                    self.retriever and self.retriever.answerability_enabled
+                ),
                 "memory_consolidator": self.consolidator is not None,
             },
             "scoring_weights": {
@@ -585,4 +625,7 @@ class MemorySystem:
                 "access": MemoryRetriever.WEIGHT_ACCESS,
             },
             "decay_half_life_days": MemoryRetriever.DECAY_HALF_LIFE_DAYS,
+            "answerability": (
+                dict(self.retriever.answerability_stats) if self.retriever else {}
+            ),
         }

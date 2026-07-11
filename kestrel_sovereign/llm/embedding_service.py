@@ -96,6 +96,21 @@ def _retrieval_similarity_floor(
     return 0.0
 
 
+def _requires_answerability_gate(
+    model: Optional[str], override: Optional[bool] = None
+) -> bool:
+    """Return whether vector-only matches need second-stage evidence checking."""
+    if override is not None:
+        if not isinstance(override, bool):
+            raise TypeError("embedding_answerability_gate must be boolean")
+        return override
+    # Every bi-encoder answers topical similarity rather than entailment. The
+    # expanded quality suite found a Qwen3-8B false answer even though its
+    # original calibration set was perfect. Providers that already apply a
+    # validated cross-encoder/evidence layer may explicitly opt out.
+    return bool(model)
+
+
 def _document_space_id(
     provider: str,
     model: str,
@@ -397,6 +412,10 @@ class EmbeddingService:
         """Raw-cosine floor used to project retrieval relevance."""
         return _retrieval_similarity_floor(self.model)
 
+    def requires_answerability_gate(self) -> bool:
+        """Bi-encoder recall needs an evidence check beyond cosine similarity."""
+        return _requires_answerability_gate(self.model)
+
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         """
         Generate embeddings for multiple texts (async).
@@ -491,6 +510,7 @@ class ProviderEmbeddingService:
         self._query_format = capabilities.get("embedding_query_format")
         self._document_format = capabilities.get("embedding_document_format")
         self._similarity_floor = capabilities.get("embedding_similarity_floor")
+        self._answerability_gate = capabilities.get("embedding_answerability_gate")
         # #1477 normalization flag — capability-declared; defaults to
         # False because most providers (OpenAI, Vertex, Ollama
         # nomic-embed-text) return raw vectors and let the caller
@@ -580,6 +600,10 @@ class ProviderEmbeddingService:
     def retrieval_similarity_floor(self) -> float:
         """Raw-cosine floor used to project retrieval relevance."""
         return _retrieval_similarity_floor(self.model, self._similarity_floor)
+
+    def requires_answerability_gate(self) -> bool:
+        """Return the route capability or calibrated model default."""
+        return _requires_answerability_gate(self.model, self._answerability_gate)
 
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         return await self.adapter.aembed_batch(
