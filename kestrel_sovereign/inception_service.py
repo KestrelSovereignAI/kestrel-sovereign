@@ -315,7 +315,7 @@ def slugify_agent_name(name: str) -> str:
     segment and the key-file prefix, so ``:`` and path separators are
     structurally excluded.
     """
-    slug = "".join(c if c.isalnum() else "-" for c in name.lower())
+    slug = "".join(c if (c.isalnum() and c.isascii()) else "-" for c in name.lower())
     while "--" in slug:
         slug = slug.replace("--", "-")
     slug = slug.strip("-")
@@ -323,6 +323,24 @@ def slugify_agent_name(name: str) -> str:
         raise ValueError(
             f"Agent name {name!r} produces an empty did:web slug; "
             f"pass did_web_slug explicitly."
+        )
+    return slug
+
+
+def validate_did_web_slug(slug: str) -> str:
+    """Validate an explicit did:web slug.
+
+    The slug is a DID path segment, a raw filename prefix, AND a
+    ``SecureKeyStorage`` key id — three consumers with different
+    sanitization rules. Restrict to the intersection ([a-z0-9-]) so a
+    slug can never mean different things to different layers (e.g. a
+    ``/`` nesting the DID doc path while key storage strips it).
+    """
+    import re
+    if not re.fullmatch(r"[a-z0-9-]+", slug or ""):
+        raise ValueError(
+            f"did_web_slug {slug!r} must be non-empty lowercase ASCII "
+            f"alphanumerics and dashes ([a-z0-9-])."
         )
     return slug
 
@@ -566,6 +584,27 @@ async def create_kestrel_identity_async(
             agent_name = f"Kestrel-Test-{test_cycle_id[-4:]}" if test_cycle_id else "Kestrel-Test"
         else:
             agent_name = "Kestrel Agent"
+    # Resolve + validate the identity method BEFORE any database work so
+    # a bad method, missing domain, or malformed slug fails cleanly with
+    # nothing on disk (codex round 3: a post-DB raise stranded
+    # kestrel_prime.db and forced --force on retry).
+    method = resolve_identity_method(identity_method)
+    domain = None
+    slug = None
+    if method == IDENTITY_METHOD_DID_WEB:
+        domain = did_web_domain or os.environ.get(DID_WEB_DOMAIN_ENV)
+        if not domain:
+            raise ValueError(
+                "Born-hybrid inception (identity_method='did:web') requires "
+                "a domain for the agent's DID document. Pass did_web_domain= "
+                f"or set {DID_WEB_DOMAIN_ENV} (e.g. agents.example.com). To "
+                "mint a classical wallet-bound identity instead, pass "
+                "identity_method='did:pkh'."
+            )
+        slug = validate_did_web_slug(
+            did_web_slug if did_web_slug is not None else slugify_agent_name(agent_name)
+        )
+
     # Determine if we're using external database or creating SQLite
     using_external_db = database is not None
     db_path = None
@@ -619,24 +658,11 @@ async def create_kestrel_identity_async(
     # 1+2. Generate cryptographic identity and persist it.
     # Default (#2397): born-hybrid did:web (Ed25519 + ML-DSA-65).
     # Explicit opt-out: identity_method="did:pkh" (classical secp256k1).
-    method = resolve_identity_method(identity_method)
+    # Method / domain / slug were resolved and validated pre-DB above.
     identity_paths: list[Path]
 
     if method == IDENTITY_METHOD_DID_WEB:
-        domain = did_web_domain or os.environ.get(DID_WEB_DOMAIN_ENV)
-        if not domain:
-            if not using_external_db:
-                await db.close()
-                cleanup_artifacts([db_path])
-            raise ValueError(
-                "Born-hybrid inception (identity_method='did:web') requires "
-                "a domain for the agent's DID document. Pass did_web_domain= "
-                f"or set {DID_WEB_DOMAIN_ENV} (e.g. agents.example.com). To "
-                "mint a classical wallet-bound identity instead, pass "
-                "identity_method='did:pkh'."
-            )
         try:
-            slug = did_web_slug or slugify_agent_name(agent_name)
             backup_or_refuse_existing_identity(Path(output_dir), slug, force)
             # A malformed domain (scheme, port, path) raises in here —
             # keep it inside the cleanup path so a failed mint never

@@ -79,6 +79,30 @@ def test_slugify_rejects_empty():
         slugify_agent_name("!!!")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_slug", ["Upper", "a/b", "a.b", "a%b", "", "a_b"])
+async def test_explicit_slug_validated_before_any_disk_writes(tmp_path, hybrid_env, bad_slug):
+    """An explicit did_web_slug is a DID segment, a filename prefix, AND a
+    key-storage id — reject anything outside [a-z0-9-] before touching disk."""
+    with pytest.raises(ValueError, match="did_web_slug"):
+        await create_kestrel_identity_async(
+            str(tmp_path), CONSTITUTION, agent_name="Slugtest",
+            did_web_slug=bad_slug,
+        )
+    assert not (tmp_path / "kestrel_prime.db").exists()
+    assert not list(tmp_path.glob("*.enc"))
+
+
+@pytest.mark.asyncio
+async def test_invalid_identity_method_leaves_no_db(tmp_path, hybrid_env):
+    with pytest.raises(ValueError, match="Unknown identity method"):
+        await create_kestrel_identity_async(
+            str(tmp_path), CONSTITUTION, agent_name="Badmethod",
+            identity_method="did:ethr",
+        )
+    assert not (tmp_path / "kestrel_prime.db").exists()
+
+
 # ---------------------------------------------------------------------------
 # Birth: inception mints born-hybrid by default
 # ---------------------------------------------------------------------------

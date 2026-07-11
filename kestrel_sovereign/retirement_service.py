@@ -230,6 +230,12 @@ async def retire_agent(
     db_dir = db_path.parent
     archived_keys = False
     for did_doc in db_dir.glob("*kestrel*.json"):
+        # Born-hybrid DID docs (<slug>_did.json, #2397) can match this
+        # glob when the slug contains "kestrel" (e.g. the default agent
+        # name) — they belong to the born-hybrid branch below, which
+        # archives the full hybrid key set, not just the document.
+        if did_doc.name.endswith("_did.json"):
+            continue
         try:
             doc = json.loads(did_doc.read_text(encoding="utf-8"))
         except (OSError, ValueError):
