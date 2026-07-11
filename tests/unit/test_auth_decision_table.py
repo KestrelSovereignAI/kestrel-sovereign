@@ -3,8 +3,12 @@
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+import pytest
+from starlette.middleware.sessions import SessionMiddleware
+
+from kestrel_sovereign.server import auth_middleware
 
 
 class _SessionAgentManager:
@@ -146,6 +150,71 @@ def test_sse_query_param_auth_reaches_stream_endpoint_and_preserves_400():
         assert response.json()["detail"] == "Input not provided."
     finally:
         _restore_app(app, original)
+
+
+def test_sse_query_param_auth_rejects_wrong_key():
+    app, original = _prepare_app()
+    app.state.agent = _make_agent()
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/agent/stream?api_key=wrong-key", json={}
+                )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or missing API Key"
+    finally:
+        _restore_app(app, original)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "query_key", "expected_status"),
+    [
+        pytest.param(
+            "/api/agent/notifications/sse", "test-key", 200,
+            id="notifications-valid",
+        ),
+        pytest.param(
+            "/api/agent/stream", "test-key", 200,
+            id="stream-valid",
+        ),
+        pytest.param(
+            "/api/agent/notifications/sse", "wrong-key", 401,
+            id="notifications-wrong-key",
+        ),
+        pytest.param(
+            "/api/agent/stream", "wrong-key", 401,
+            id="stream-wrong-key",
+        ),
+    ],
+)
+def test_prefixed_sse_query_auth_uses_real_middleware(
+    monkeypatch, suffix, query_key, expected_status,
+):
+    """The deployed multi-agent URL shape uses canonical server auth."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key")
+    test_app = FastAPI()
+    test_app.middleware("http")(auth_middleware)
+    test_app.add_middleware(
+        SessionMiddleware,
+        secret_key="test-session-secret",
+        session_cookie="kestrel_session",
+    )
+
+    @test_app.get("/api/agents/{agent}/api/agent/notifications/sse")
+    @test_app.get("/api/agents/{agent}/api/agent/stream")
+    def prefixed_sse(agent: str):
+        return {"agent": agent}
+
+    response = TestClient(test_app).get(
+        f"/api/agents/Kite{suffix}", params={"api_key": query_key}
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.json() == {"agent": "Kite"}
+    else:
+        assert response.json()["detail"] == "Invalid or missing API Key"
 
 
 def test_non_sse_query_param_auth_is_rejected():

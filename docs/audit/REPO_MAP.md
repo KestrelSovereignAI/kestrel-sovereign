@@ -285,8 +285,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/ephemeral_session.py** — Ephemeral Session Handler for Kestrel Privacy System.
   - `class EphemeralSession`
 - **kestrel_sovereign/extensions/__init__.py** — —
-- **kestrel_sovereign/extensions/app_extension.py** — Base class for Kestrel Application Extensions.
-  - `class AppExtension`
+- **kestrel_sovereign/extensions/app_extension.py** — Compatibility re-export for the SDK-owned application extension contract.
 - **kestrel_sovereign/extensions/elderly_extension.py** — Elderly Companion App Extension for the Kestrel Agent.
   - `class ElderlyExtension`
 - **kestrel_sovereign/feature_inventory.py** — Canonical feature/tool/endpoint inventory discovery and rendering.
@@ -307,7 +306,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/audit_anchor/hasher.py** — Deterministic hashing of audit log entries.
   - `class AuditHasher`
 - **kestrel_sovereign/features/base.py** — —
-  - `def is_flat_toolresult_envelope(value)`; `class TaskHandler`; `class UIContributions`; `class Feature`
+  - `def is_flat_toolresult_envelope(value)`; `class TaskHandler`; `class Feature`
 - **kestrel_sovereign/features/bootstrap/__init__.py** — Bootstrap feature for agent wake-up, discovery commands, and file convention.
 - **kestrel_sovereign/features/bootstrap/feature.py** — Bootstrap Feature - Commands for agent wake-up and discovery management.
   - `class RenameOutcome`; `async def rename_agent_core(agent, new_name)`; `class BootstrapFeature`
@@ -1191,7 +1190,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/ui/theme_loader.py** — Theme/locale label resolver for the UI theme + i18n system (epic #986).
   - `class ThemeNotFoundError`; `class ThemeBundle`; `def load_theme(theme, locale)`; `def list_available_themes()`; `def clear_cache()`
 - **kestrel_sovereign/ui_capabilities.py** — Derive the UI capability set from an agent's enabled features (#2041).
-  - `def compute_feature_capabilities(agent)`; `def render_config_script(payload)`; `def render_ui_config_script(agent)`; `def render_multi_agent_host_config_script()`
+  - `def active_feature_class_names(agent)`; `def compute_feature_capabilities(agent)`; `def render_config_script(payload)`; `def render_ui_config_script(agent)`; `def render_multi_agent_host_config_script()`
 - **kestrel_sovereign/ui_contributions.py** — Merge out-of-tree feature UI assets into a boot manifest (#2043, epic #2038).
   - `def feature_static_mounts(agent)`; `def compute_ui_manifest(agent)`
 - **kestrel_sovereign/waits/__init__.py** — Generic wait engine — one poll loop for every feature's blocking wait.
@@ -2111,8 +2110,6 @@ Repo entry points and standard project files.
   - `async def test_api_route_does_not_inject_identity()`; `async def test_plan_route_prepends_identity_as_first_block()`; `async def test_plan_route_identity_when_no_system_prompt()`; `async def test_plan_route_identity_first_with_tools_and_history()`; `def test_coerce_expires_at_ms_vs_seconds()`; `def test_parse_credentials_claude_code_wrapper()`; `def test_parse_credentials_snake_case_and_missing_access()`; `def test_needs_refresh_requires_refresh_and_expiry()`; `…`
 - **tests/unit/test_anthropic_wire_model_id.py** — Unit tests for AnthropicAdapter wire model-id normalization (#1420).
   - `def test_resolve_wire_model_id_strips_anthropic_prefix()`; `def test_resolve_wire_model_id_is_case_insensitive()`; `def test_resolve_wire_model_id_passes_through_bare_id()`; `def test_resolve_wire_model_id_passes_through_other_vendor_prefix()`; `def test_resolve_wire_model_id_handles_empty_and_none_gracefully()`; `def test_resolve_wire_model_id_does_not_strip_prefix_inside_id()`; `def test_resolve_wire_model_id_inherited_by_claude_max()`; `async def test_get_response_sends_bare_model_id_when_prefixed()`; `…`
-- **tests/unit/test_api_key_query_param.py** — Unit tests for API key query parameter restriction (GitHub issue #149).
-  - `def app()`; `def client(app)`; `class TestQueryParamAuthOnSSEPaths`; `def test_real_auth_accepts_agent_prefixed_sse_query_key(monkeypatch)`; `class TestQueryParamAuthRejectedOnOtherPaths`; `class TestHeaderAuthStillWorks`; `class TestWrongKeyRejected`; `class TestSSEPathsConstant`
 - **tests/unit/test_associative_linker.py** — Unit tests for AssociativeLinker typed LinkedConcept return shape.
   - `class TestExtractAndLinkTypedReturn`; `class TestPersonNameCategorization`
 - **tests/unit/test_async_storage_conversation_delegators.py** — Regression test: ``AsyncStorage`` exposes delegator methods for every conversation-session write path the privacy wrapper calls through it.
@@ -2124,11 +2121,11 @@ Repo entry points and standard project files.
 - **tests/unit/test_audit_timestamp_canonicalization.py** — F092: audit timestamps are canonicalized to UTC ISO-8601 so entries from security_audit_log (CURRENT_TIMESTAMP) and destructive_audit_log (isoformat) sort/compare correctly for anchor boundaries and…
   - `def test_normalize_sqlite_and_iso_agree()`; `def test_normalize_is_idempotent_and_handles_z_and_empty()`; `def test_normalize_fixes_cross_format_ordering()`; `def test_utc_now_iso_is_canonical()`; `async def test_log_decision_writes_canonical_timestamp(tmp_path)`; `async def test_initialize_does_not_mutate_legacy_row_bytes(tmp_path)`
 - **tests/unit/test_auth_decision_table.py** — Decision-table tests for auth classes in server.py.
-  - `def test_root_html_is_public_when_oauth_not_required()`; `def test_root_html_redirects_when_oauth_required()`; `def test_bootstrap_key_is_localhost_only_when_enabled()`; `def test_auth_me_rejects_api_key_without_session()`; `def test_auth_me_returns_session_payload_when_session_present()`; `def test_sse_query_param_auth_reaches_stream_endpoint_and_preserves_400()`; `def test_non_sse_query_param_auth_is_rejected()`; `def test_protected_agent_route_accepts_api_key_and_multi_agent_rewrite_matches()`
+  - `def test_root_html_is_public_when_oauth_not_required()`; `def test_root_html_redirects_when_oauth_required()`; `def test_bootstrap_key_is_localhost_only_when_enabled()`; `def test_auth_me_rejects_api_key_without_session()`; `def test_auth_me_returns_session_payload_when_session_present()`; `def test_sse_query_param_auth_reaches_stream_endpoint_and_preserves_400()`; `def test_sse_query_param_auth_rejects_wrong_key()`; `def test_prefixed_sse_query_auth_uses_real_middleware(monkeypatch, suffix, query_key, expected_status)`; `…`
 - **tests/unit/test_auth_hardening.py** — Auth hardening (#1724): fail-closed allowlist, JWT/API-key decoupling, /auth/token rate limit, and narrowed bootstrap-key host gating.
   - `class TestEmailAuthorized`; `class TestJwtSecret`; `class TestBootstrapHostGating`; `async def test_auth_token_is_rate_limited(monkeypatch)`
 - **tests/unit/test_auth_oauth.py** — Unit tests for Google OAuth authentication endpoints and middleware.
-  - `def oauth_env()`; `def app(oauth_env)`; `def client(app)`; `class TestOAuthEndpoints`; `class TestEmailAllowlist`; `class TestAuthMiddleware`; `class TestOAuthDisabled`
+  - `def oauth_env()`; `def app(oauth_env)`; `def client(app)`; `class TestOAuthEndpoints`; `class TestEmailAllowlist`; `class TestOAuthDisabled`
 - **tests/unit/test_auto_model_selection_contracts.py** — Contracts for auto model selection from config, cache, and discovery.
   - `def test_auto_resolution_uses_selection_hints_over_discovery_order()`; `def test_auto_resolution_prefers_featured_when_no_selection_hints_exist()`; `def test_auto_resolution_avoids_preview_models_when_choosing_fallback()`; `def test_auto_resolution_for_subscription_route_shares_vendor_catalog()`; `def test_openai_plan_resolves_against_codex_catalog_not_openai_api()`; `def test_openai_plan_empty_codex_cache_stays_auto_never_inherits_api_catalog()`; `async def test_openai_plan_inside_running_loop_never_inherits_api_catalog()`; `def test_shipped_llm_config_uses_auto_models_for_primary_routes()`
 - **tests/unit/test_avatar_storage.py** — Unit tests for avatar storage in AsyncFileStore
@@ -2875,6 +2872,8 @@ Repo entry points and standard project files.
   - `def temp_db()`; `def script()`; `async def test_sign_without_keys_raises(temp_db, script)`; `async def test_sign_without_did_raises(temp_db, script)`; `async def test_sign_propagates_signing_failure(temp_db, script)`; `async def test_verify_rejects_hmac_prefix_even_when_math_verifies(temp_db, script)`; `async def test_verify_rejects_hmac_with_unsigned_default(temp_db, script)`; `async def test_verify_genuine_ecdsa_signature(temp_db, script)`; `…`
 - **tests/unit/test_script_signer_hybrid.py** — ScriptSigner hybrid-format tests — Quantum Hardening epic, signing-path follow-up to PR #999.
   - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key)`; `async def test_legacy_agent_signs_ecdsa(legacy_agent_dir)`; `async def test_hybrid_agent_signs_hybrid_format(post_ceremony_agent_dir)`; `async def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `async def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `async def test_hybrid_payload_tamper_detected(post_ceremony_agent_dir)`; `…`
+- **tests/unit/test_sdk_extension_ownership.py** — Sovereign consumes and compatibility-exports SDK extension contracts.
+  - `def test_ui_contributions_is_the_sdk_type()`; `def test_app_extension_compatibility_path_is_the_sdk_type()`
 - **tests/unit/test_sealed_capsule.py** — Sealed capsule tests — Wave 4 sub-PR 3 (#919).
   - `def hybrid_kp()`; `def test_round_trip_basic(hybrid_kp)`; `def test_open_capsule_two_calling_conventions(hybrid_kp)`; `def test_round_trip_empty_payload(hybrid_kp)`; `def test_round_trip_large_payload(hybrid_kp)`; `def test_distinct_seals_produce_distinct_envelopes(hybrid_kp)`; `def test_envelope_has_expected_structure(hybrid_kp)`; `def test_wrong_recipient_aead_authentication_fails(hybrid_kp)`; `…`
 - **tests/unit/test_search_history_tokenized_fallback.py** — Regression: broad natural-language queries must find relevant memories.
