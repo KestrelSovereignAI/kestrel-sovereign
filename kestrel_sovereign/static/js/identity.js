@@ -6,7 +6,7 @@
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
 // consumer — one list orchestrator (fetch / refresh / seq-guard / views /
@@ -1435,9 +1435,70 @@ export function _pickMostRecentConversation(conversations) {
 // Mirrors ``history.js::renderAssistantWithParts`` at this loader's simpler
 // altitude (no tool-card interleaving): the first rendered bubble anchors the
 // message id + delete control + model footer so they aren't duplicated.
+// Message-level controls shared by every bubble this loader paints: soft
+// delete (✕, #763) and permanent purge (⊘, #765) — both handlers live in
+// history.js and are shared across loaders. Ported from the legacy loader's
+// affordance set (#2380 codex P2: purge was loader-only and got dropped).
+function buildMessageDeleteBtn(messageId, node) {
+    const btn = document.createElement('button');
+    btn.className = 'msg-delete-btn';
+    btn.title = 'Delete message';
+    btn.textContent = '✕';
+    btn.onclick = (e) => {
+        e.stopPropagation();
+        if (typeof window.deleteMessage === 'function') {
+            window.deleteMessage(messageId, node);
+        }
+    };
+    return btn;
+}
+
+function buildMessagePurgeBtn(messageId, node) {
+    const btn = document.createElement('button');
+    btn.className = 'msg-purge-btn';
+    btn.title = 'Delete permanently (cannot be restored)';
+    btn.textContent = '⊘';
+    btn.onclick = (e) => {
+        e.stopPropagation();
+        if (typeof window.purgeMessage === 'function') {
+            window.purgeMessage(messageId, node);
+        }
+    };
+    return btn;
+}
+
+// KaTeX post-pass for reloaded assistant markup: renderAgentContentHtml
+// returns sanitized markdown HTML only — math delimiters render via the
+// shared pass once the element is live (#2380 codex P2).
+function renderMathIn(el) {
+    const SM = window.SharedMarkdown;
+    if (el && SM && typeof SM.renderMath === 'function') SM.renderMath(el);
+}
+
 function renderAssistantMessageWithParts(msg, container) {
-    const renderMd = window.SharedMarkdown?.renderMarkdown;
-    const segments = splitContentByParts(msg.content, msg.metadata?.parts);
+    const text = String(msg.content || '');
+    const len = text.length;
+    const clampPos = (p) => Math.max(0, Math.min(len, typeof p === 'number' ? p : len));
+    // Merge position-stamped tool events and typed parts into ONE wire-ordered
+    // timeline — primary key ``pos`` (text offset), tie-broken by ``seq`` (the
+    // shared wire-order counter persisted by the server) — so a reload
+    // interleaves tool cards and component bubbles exactly as they streamed
+    // (#1914). An assistant row carrying BOTH parts and tool_events must not
+    // lose its tool cards (#2380 codex P2).
+    const toolEventsRaw = msg.metadata?.tool_events;
+    const tools = Array.isArray(toolEventsRaw)
+        ? toolEventsRaw.filter((e) => typeof e.pos === 'number')
+        : [];
+    const validParts = (Array.isArray(msg.metadata?.parts) ? msg.metadata.parts : [])
+        .filter((p) => p && typeof p.type === 'string');
+    const entries = [
+        ...tools.map((t) => ({ kind: 'tool', pos: clampPos(t.pos), seq: t.seq || 0, item: t })),
+        ...validParts.map((p) => ({ kind: 'part', pos: clampPos(p.pos), seq: p.seq || 0, item: p })),
+    ].sort((a, b) => (a.pos - b.pos) || (a.seq - b.seq));
+
+    // Every bubble carries the message id (a delete removes ALL of them); only
+    // the FIRST rendered bubble anchors the delete/purge controls + model
+    // footer so they aren't duplicated.
     let anchored = false;
     const anchor = (node) => {
         if (!node) return;
@@ -1445,40 +1506,56 @@ function renderAssistantMessageWithParts(msg, container) {
         if (anchored) return;
         anchored = true;
         if (msg.id) {
-            const deleteBtn = document.createElement('button');
-            deleteBtn.className = 'msg-delete-btn';
-            deleteBtn.title = 'Delete message';
-            deleteBtn.textContent = '✕';
-            deleteBtn.onclick = (e) => {
-                e.stopPropagation();
-                if (typeof window.deleteMessage === 'function') {
-                    window.deleteMessage(msg.id, node);
-                }
-            };
-            node.appendChild(deleteBtn);
+            node.appendChild(buildMessageDeleteBtn(msg.id, node));
+            node.appendChild(buildMessagePurgeBtn(msg.id, node));
         }
         const footer = renderModelFooterHtml({ model: msg.model, provider: msg.provider });
         if (footer) node.insertAdjacentHTML('beforeend', footer);
     };
-    for (const seg of segments) {
-        if (seg.kind === 'part') {
-            const pnode = appendMessagePart(seg.part.type, seg.part.data, container);
-            anchor(pnode);
-            continue;
-        }
-        // Skip an empty prose run (e.g. the gap between two adjacent parts, or a
-        // part-only message) so no blank bubble appears.
-        if (!String(seg.text || '').trim()) continue;
+
+    const renderProseBubble = (segText, segTools) => {
+        // Skip an empty run (the gap between two adjacent parts) unless it
+        // carries tool cards to place.
+        if (!String(segText || '').trim() && !(segTools && segTools.length)) return;
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message agent-message';
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
-        if (renderMd) contentDiv.innerHTML = renderMd(seg.text);
-        else contentDiv.textContent = seg.text;
+        contentDiv.innerHTML = renderAgentContentHtml(segText, {
+            toolEvents: segTools && segTools.length ? segTools : null,
+        });
         messageDiv.appendChild(contentDiv);
         container.appendChild(messageDiv);
+        mountToolRenderers(contentDiv);
+        renderMathIn(contentDiv);
         anchor(messageDiv);
+    };
+
+    let cursor = 0;       // text offset where the current prose run starts
+    let segTools = [];    // tool events accumulated for the current prose run
+    let firstPartNode = null;
+    for (const ev of entries) {
+        if (ev.kind === 'tool') {
+            // Tool cards render by position within their prose bubble; rebase.
+            segTools.push({ ...ev.item, pos: Math.max(0, ev.pos - cursor) });
+            continue;
+        }
+        // A part closes the current prose run (text + its tool cards) into a
+        // bubble, then renders the component as its own bubble.
+        renderProseBubble(text.slice(cursor, ev.pos), segTools);
+        cursor = ev.pos;
+        segTools = [];
+        const pnode = appendMessagePart(ev.item.type, ev.item.data, container);
+        if (pnode && msg.id) pnode.dataset.messageId = msg.id;
+        if (!firstPartNode) firstPartNode = pnode;
     }
+    // Trailing prose + any tool cards after the last part.
+    renderProseBubble(text.slice(cursor), segTools);
+
+    // A part-only message (empty content) produced no prose anchor — attach
+    // the controls + footer to the first part bubble so the row stays
+    // manageable like every other row.
+    if (!anchored && firstPartNode) anchor(firstPartNode);
 }
 
 // Parse a stored timestamp into an epoch-ms sort key for interleaving the
@@ -1676,6 +1753,10 @@ window.loadConversation = async function(sessionId, options = {}) {
         // strings to UTC before comparing (see timelineTs).
         const timeline = [];
         for (const msg of messages) {
+            // System rows (context summaries, compaction markers, audits) are
+            // internal bookkeeping — never render them into the visible chat
+            // (#2380 codex P2, behavior carried from the legacy loader).
+            if (msg.role === 'system') continue;
             timeline.push({ ts: timelineTs(msg.created_at), kind: 'message', item: msg });
         }
         restartEvents.forEach((ev) => {
@@ -1733,17 +1814,8 @@ window.loadConversation = async function(sessionId, options = {}) {
             // to delete anything.
             if (msg.id) {
                 messageDiv.dataset.messageId = msg.id;
-                const deleteBtn = document.createElement('button');
-                deleteBtn.className = 'msg-delete-btn';
-                deleteBtn.title = 'Delete message';
-                deleteBtn.textContent = '✕';
-                deleteBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    if (typeof window.deleteMessage === 'function') {
-                        window.deleteMessage(msg.id, messageDiv);
-                    }
-                };
-                messageDiv.appendChild(deleteBtn);
+                messageDiv.appendChild(buildMessageDeleteBtn(msg.id, messageDiv));
+                messageDiv.appendChild(buildMessagePurgeBtn(msg.id, messageDiv));
             }
 
             if (isEncrypted) {
@@ -1813,8 +1885,10 @@ window.loadConversation = async function(sessionId, options = {}) {
                 contentDiv.innerHTML = bodyHtml;
                 messageDiv.appendChild(contentDiv);
                 // Reloaded tool cards may carry feature-renderer wrappers; mount
-                // their imperative hooks now that the markup is live.
+                // their imperative hooks now that the markup is live, then run
+                // the shared math pass (KaTeX) over the inserted markdown.
                 mountToolRenderers(contentDiv);
+                renderMathIn(contentDiv);
             } else {
                 contentDiv.textContent = msg.content;
                 messageDiv.appendChild(contentDiv);
