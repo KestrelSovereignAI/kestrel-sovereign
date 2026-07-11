@@ -190,12 +190,19 @@ def verify_mandate(
         # Binding check: the caller's loaded identity must be for
         # mandate.parent_did. If they don't match the receiver loaded
         # the wrong agent (or an attacker is feeding us VMs from a
-        # different agent's identity).
-        if parent_identity.legacy_did != mandate.parent_did:
+        # different agent's identity). A rotated parent legitimately
+        # holds two DIDs (legacy did:pkh + new did:web); a born-hybrid
+        # parent (#2397) holds only the did:web — accept a mandate
+        # naming either, never one naming neither.
+        bound_dids = {
+            d for d in (parent_identity.legacy_did, parent_identity.new_did) if d
+        }
+        if mandate.parent_did not in bound_dids:
             logger.warning(
                 f"Mandate parent_did={mandate.parent_did!r} doesn't match "
-                f"parent_identity.legacy_did={parent_identity.legacy_did!r} "
-                f"— refusing to verify against unrelated identity"
+                f"any DID of the loaded parent identity "
+                f"({sorted(bound_dids)}) — refusing to verify against "
+                f"unrelated identity"
             )
             return False
         return _verify_mandate_hybrid(

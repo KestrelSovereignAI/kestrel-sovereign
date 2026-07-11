@@ -277,6 +277,132 @@ def generate_kestrel_identity() -> tuple[dict, dict]:
 
     return did_document, keys
 
+
+# ---------------------------------------------------------------------------
+# Born-hybrid inception (#2397): new agents mint a hybrid did:web identity
+# (Ed25519 + ML-DSA-65) by default — no classical secp256k1 key ever exists.
+# ---------------------------------------------------------------------------
+
+IDENTITY_METHOD_DID_WEB = "did:web"
+IDENTITY_METHOD_DID_PKH = "did:pkh"
+_IDENTITY_METHODS = (IDENTITY_METHOD_DID_WEB, IDENTITY_METHOD_DID_PKH)
+
+IDENTITY_METHOD_ENV = "KESTREL_IDENTITY_METHOD"
+DID_WEB_DOMAIN_ENV = "KESTREL_DID_WEB_DOMAIN"
+
+
+def resolve_identity_method(identity_method: Optional[str] = None) -> str:
+    """Resolve the inception identity method: param > env > did:web.
+
+    ``did:web`` (hybrid, post-quantum) is the default. ``did:pkh``
+    (classical secp256k1) remains available as an explicit opt-out for
+    wallet-bound identities and legacy-path tests.
+    """
+    method = identity_method or os.environ.get(IDENTITY_METHOD_ENV) or IDENTITY_METHOD_DID_WEB
+    if method not in _IDENTITY_METHODS:
+        raise ValueError(
+            f"Unknown identity method {method!r}; expected one of "
+            f"{_IDENTITY_METHODS}."
+        )
+    return method
+
+
+def slugify_agent_name(name: str) -> str:
+    """Derive a did:web path slug from an agent name.
+
+    Lowercase, alphanumerics kept, everything else collapsed to single
+    dashes. Must produce a non-empty slug — the slug is both a DID path
+    segment and the key-file prefix, so ``:`` and path separators are
+    structurally excluded.
+    """
+    slug = "".join(c if c.isalnum() else "-" for c in name.lower())
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    slug = slug.strip("-")
+    if not slug:
+        raise ValueError(
+            f"Agent name {name!r} produces an empty did:web slug; "
+            f"pass did_web_slug explicitly."
+        )
+    return slug
+
+
+def generate_born_hybrid_identity(domain: str, slug: str):
+    """Mint a fresh born-hybrid identity: did:web DID document, hybrid
+    keypair (Ed25519 + ML-DSA-65), and an archival SLH-DSA keypair for
+    countersigning a future succession statement.
+
+    Returns ``(did_document, hybrid_identity, archival_keypair)``.
+    """
+    from kestrel_sovereign.identity.inception_did_web import create_did_web_identity
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_SLH_DSA_SHA2_128S, get_suite,
+    )
+
+    identity = create_did_web_identity(domain, slug)
+    archival_kp = get_suite(ALG_SLH_DSA_SHA2_128S).generate_keypair()
+    return identity.did_document, identity, archival_kp
+
+
+def save_born_hybrid_identity(
+    did_document: dict,
+    identity,
+    archival_keypair,
+    slug: str,
+    output_dir: Path,
+) -> list[Path]:
+    """Persist a born-hybrid identity to the agent data dir.
+
+    Written files (all keys encrypted at rest under KESTREL_DATA_KEY):
+
+    - ``<slug>_ed25519.key.enc``            — classical private (PEM)
+    - ``<slug>_mldsa65.bytes.enc``          — PQ private (raw bytes)
+    - ``<slug>_archival_slhdsa.bytes.enc``  — archival private
+    - ``<slug>_archival_slhdsa_pub.bytes.enc`` — archival public sidecar
+    - ``<slug>_did.json``                   — the did:web DID document
+
+    Unlike the legacy path there is NO plaintext fallback: refusing to
+    write post-quantum private keys unencrypted is deliberate. Set
+    KESTREL_DATA_KEY, or opt out with identity_method="did:pkh".
+
+    Returns the list of created paths so a failed inception can clean up.
+    """
+    from kestrel_sovereign.security.key_storage import (
+        MasterKeyNotConfiguredError, SecureKeyStorage,
+    )
+
+    output_dir = Path(output_dir)
+    created: list[Path] = []
+    try:
+        storage = SecureKeyStorage(storage_dir=output_dir)
+        storage.save_private_key(identity.keypair.classical.private_key, f"{slug}_ed25519")
+        created.append(output_dir / f"{slug}_ed25519.key.enc")
+        storage.save_secret_bytes(identity.keypair.pq.private_key, f"{slug}_mldsa65")
+        created.append(output_dir / f"{slug}_mldsa65.bytes.enc")
+        storage.save_secret_bytes(archival_keypair.private_key, f"{slug}_archival_slhdsa")
+        created.append(output_dir / f"{slug}_archival_slhdsa.bytes.enc")
+        storage.save_secret_bytes(archival_keypair.public_key, f"{slug}_archival_slhdsa_pub")
+        created.append(output_dir / f"{slug}_archival_slhdsa_pub.bytes.enc")
+    except MasterKeyNotConfiguredError as e:
+        cleanup_artifacts(created)
+        raise MasterKeyNotConfiguredError(
+            "Born-hybrid inception requires KESTREL_DATA_KEY: post-quantum "
+            "private keys are never written to disk in plaintext. Set "
+            "KESTREL_DATA_KEY, or explicitly opt out with "
+            "identity_method='did:pkh' (classical, quantum-vulnerable)."
+        ) from e
+    except Exception:
+        cleanup_artifacts(created)
+        raise
+
+    did_path = output_dir / f"{slug}_did.json"
+    with open(did_path, "w", encoding="utf-8") as f:
+        json.dump(did_document, f, indent=2)
+    created.append(did_path)
+    logging.info(f"Saved born-hybrid identity for {did_document['id']} in {output_dir}")
+    return created
+
+
 def cleanup_artifacts(paths):
     """
     Securely delete artifact files.
@@ -348,11 +474,22 @@ async def create_kestrel_identity_async(
     is_demo: bool = False,
     emancipation_contract: Optional["EmancipationContract"] = None,
     force: bool = False,
+    identity_method: Optional[str] = None,
+    did_web_domain: Optional[str] = None,
+    did_web_slug: Optional[str] = None,
 ) -> AgentCredentials:
     """
     Generates a new Kestrel identity, including cryptographic keys, a W3C DID,
     and an initial knowledge graph representation in a new database.
     This function is the "spark" that creates a new sovereign agent.
+
+    Identity method (#2397): the default is ``did:web`` — a born-hybrid
+    post-quantum identity (Ed25519 + ML-DSA-65, no classical secp256k1
+    key ever minted). Requires a domain via ``did_web_domain`` or the
+    ``KESTREL_DID_WEB_DOMAIN`` env var, and KESTREL_DATA_KEY for
+    encrypted key storage — both fail loud if missing. Pass
+    ``identity_method="did:pkh"`` (or set KESTREL_IDENTITY_METHOD) to
+    opt into the classical wallet-bound path.
 
     Args:
         output_dir: Directory to save agent files. Defaults to agent_data/
@@ -438,25 +575,65 @@ async def create_kestrel_identity_async(
     files = AsyncFileStore(db)
     graph = AsyncGraphStore(db)
 
-    # 1. Generate cryptographic keys
-    did_document, keys = generate_kestrel_identity()
-    agent_did = did_document["id"]
+    # 1+2. Generate cryptographic identity and persist it.
+    # Default (#2397): born-hybrid did:web (Ed25519 + ML-DSA-65).
+    # Explicit opt-out: identity_method="did:pkh" (classical secp256k1).
+    method = resolve_identity_method(identity_method)
+    identity_paths: list[Path]
 
-    # If spawned by a parent, add controller field to DID document
-    if parent_did:
-        did_document["controller"] = parent_did
-        logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+    if method == IDENTITY_METHOD_DID_WEB:
+        domain = did_web_domain or os.environ.get(DID_WEB_DOMAIN_ENV)
+        if not domain:
+            if not using_external_db:
+                await db.close()
+                cleanup_artifacts([db_path])
+            raise ValueError(
+                "Born-hybrid inception (identity_method='did:web') requires "
+                "a domain for the agent's DID document. Pass did_web_domain= "
+                f"or set {DID_WEB_DOMAIN_ENV} (e.g. agents.example.com). To "
+                "mint a classical wallet-bound identity instead, pass "
+                "identity_method='did:pkh'."
+            )
+        slug = did_web_slug or slugify_agent_name(agent_name)
+        did_document, hybrid_identity, archival_kp = generate_born_hybrid_identity(
+            domain, slug,
+        )
+        agent_did = did_document["id"]
+        if parent_did:
+            did_document["controller"] = parent_did
+            logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+        else:
+            logging.info(f"Generated DID: {agent_did}")
+        try:
+            identity_paths = save_born_hybrid_identity(
+                did_document, hybrid_identity, archival_kp, slug, Path(output_dir),
+            )
+        except Exception:
+            if not using_external_db:
+                await db.close()
+                cleanup_artifacts([db_path])
+            raise
+        logging.info(f"Saved born-hybrid keys ({slug}_*) to {output_dir}")
     else:
-        logging.info(f"Generated DID: {agent_did}")
+        did_document, keys = generate_kestrel_identity()
+        agent_did = did_document["id"]
 
-    # 2. Save keys (encrypted if KESTREL_DATA_KEY is set)
-    key_id = f"kestrel_{keys['address']}"
-    save_kestrel_identity(did_document, keys, key_id, Path(output_dir))
-    key_path = Path(output_dir) / f"{key_id}.key.enc"
-    if not key_path.exists():
-        # Fallback path for plaintext
-        key_path = Path(output_dir) / f"{key_id}.pem"
-    logging.info(f"Saved keys to {key_path}")
+        # If spawned by a parent, add controller field to DID document
+        if parent_did:
+            did_document["controller"] = parent_did
+            logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+        else:
+            logging.info(f"Generated DID: {agent_did}")
+
+        # Save keys (encrypted if KESTREL_DATA_KEY is set)
+        key_id = f"kestrel_{keys['address']}"
+        save_kestrel_identity(did_document, keys, key_id, Path(output_dir))
+        key_path = Path(output_dir) / f"{key_id}.key.enc"
+        if not key_path.exists():
+            # Fallback path for plaintext
+            key_path = Path(output_dir) / f"{key_id}.pem"
+        identity_paths = [key_path]
+        logging.info(f"Saved keys to {key_path}")
 
     # 3. Anchor the Kestrel Constitution as the first document
     # Resolve constitution path if not provided
@@ -484,17 +661,17 @@ async def create_kestrel_identity_async(
         logging.error(f"FATAL: Constitution file not found at {constitution_path}")
         if not using_external_db:
             await db.close()
-            cleanup_artifacts([key_path, db_path])
+            cleanup_artifacts([*identity_paths, db_path])
         else:
-            cleanup_artifacts([key_path])  # Only clean up key file, not external DB
+            cleanup_artifacts(identity_paths)  # Only clean up key files, not external DB
         raise
     except Exception as e:
         logging.error(f"Agent creation failed during constitution anchoring: {e}")
         if not using_external_db:
             await db.close()
-            cleanup_artifacts([key_path, db_path])
+            cleanup_artifacts([*identity_paths, db_path])
         else:
-            cleanup_artifacts([key_path])  # Only clean up key file, not external DB
+            cleanup_artifacts(identity_paths)  # Only clean up key files, not external DB
         raise e
 
     # 4. Create the Kestrel Constitution node in the graph (keyed by content hash)
@@ -656,6 +833,9 @@ def create_kestrel_identity(
     is_demo: bool = False,
     emancipation_contract: Optional["EmancipationContract"] = None,
     force: bool = False,
+    identity_method: Optional[str] = None,
+    did_web_domain: Optional[str] = None,
+    did_web_slug: Optional[str] = None,
 ) -> AgentCredentials:
     """
     Sync wrapper for create_kestrel_identity_async.
@@ -678,6 +858,9 @@ def create_kestrel_identity(
         is_demo=is_demo,
         emancipation_contract=emancipation_contract,
         force=force,
+        identity_method=identity_method,
+        did_web_domain=did_web_domain,
+        did_web_slug=did_web_slug,
     ))
 
 
@@ -706,6 +889,27 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Overwrite an existing agent database (backs it up first). Without "
              "--force, inception refuses to overwrite an existing agent.",
     )
+    parser.add_argument(
+        "--identity-method",
+        choices=list(_IDENTITY_METHODS),
+        default=None,
+        help="Identity method for the new agent. Default did:web mints a "
+             "born-hybrid post-quantum identity (Ed25519 + ML-DSA-65; needs "
+             f"--did-domain or {DID_WEB_DOMAIN_ENV}). did:pkh mints the "
+             "classical wallet-bound secp256k1 identity.",
+    )
+    parser.add_argument(
+        "--did-domain",
+        type=str,
+        default=None,
+        help="Domain for the did:web DID document (e.g. agents.example.com).",
+    )
+    parser.add_argument(
+        "--did-slug",
+        type=str,
+        default=None,
+        help="did:web path slug; defaults to a slugified agent name.",
+    )
     return parser
 
 
@@ -732,6 +936,9 @@ def main():
         expected_duration=args.duration,
         is_demo=args.demo,
         force=args.force,
+        identity_method=args.identity_method,
+        did_web_domain=args.did_domain,
+        did_web_slug=args.did_slug,
     )
 
     if args.test:

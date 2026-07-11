@@ -334,16 +334,37 @@ class KestrelAgent(
         if self.storage_path and self.did:
             legacy_key_id = self._derive_legacy_key_id(self.did)
             storage_dir = Path(self.storage_path).parent
-            if legacy_key_id and (storage_dir / f"{legacy_key_id}.json").exists():
+            has_legacy_doc = bool(
+                legacy_key_id and (storage_dir / f"{legacy_key_id}.json").exists()
+            )
+            # Born-hybrid agents (#2397) have no legacy material at all;
+            # their identity is the <slug>_did.json + hybrid keys written
+            # at inception. Detect by the DID document's presence.
+            has_born_hybrid_doc = (
+                not has_legacy_doc
+                and storage_dir.is_dir()
+                and any(storage_dir.glob("*_did.json"))
+            )
+            if has_legacy_doc or has_born_hybrid_doc:
                 try:
                     from kestrel_sovereign.identity.runtime_identity import (
                         load_agent_identity,
                     )
                     self.identity = load_agent_identity(
-                        legacy_key_id, storage_dir=storage_dir,
+                        legacy_key_id if has_legacy_doc else None,
+                        storage_dir=storage_dir,
                     )
-                    self._private_key = self.identity.legacy_keypair.private_key
-                    if self.identity.is_hybrid:
+                    # Born-hybrid agents have no legacy keypair; consumers
+                    # of _private_key (e.g. wallet plumbing in spawn) get
+                    # None and already guard for it.
+                    if self.identity.legacy_keypair is not None:
+                        self._private_key = self.identity.legacy_keypair.private_key
+                    if self.identity.is_born_hybrid:
+                        logging.info(
+                            "Agent identity loaded as BORN-HYBRID: %s",
+                            self.identity.new_did,
+                        )
+                    elif self.identity.is_hybrid:
                         logging.info(
                             "Agent identity loaded as HYBRID: legacy=%s -> new=%s",
                             self.identity.legacy_did, self.identity.new_did,

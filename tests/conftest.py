@@ -374,7 +374,7 @@ def test_master_key() -> str:
 def env_with_master_key(test_master_key: str, monkeypatch) -> Generator[str, None, None]:
     """
     Set KESTREL_DATA_KEY environment variable for tests.
-    
+
     Usage:
         def test_encryption(env_with_master_key):
             # KESTREL_DATA_KEY is now set
@@ -383,6 +383,21 @@ def env_with_master_key(test_master_key: str, monkeypatch) -> Generator[str, Non
     """
     monkeypatch.setenv("KESTREL_DATA_KEY", test_master_key)
     yield test_master_key
+
+
+@pytest.fixture(autouse=True)
+def _born_hybrid_inception_env(monkeypatch):
+    """#2397: default inception mints born-hybrid did:web identities,
+    which require a DID domain and encrypted key storage — both fail
+    loud when missing. Provide suite-wide test values so any test that
+    mints an agent exercises the real default path.
+
+    Tests that assert the fail-loud contracts delenv these themselves
+    (monkeypatch runs after this fixture, so per-test overrides win);
+    tests about the classical path pass identity_method="did:pkh".
+    """
+    monkeypatch.setenv("KESTREL_DID_WEB_DOMAIN", "agents.kestrel-sovereign.test")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
 
 
 # =============================================================================

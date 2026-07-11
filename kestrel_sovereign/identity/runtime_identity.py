@@ -76,14 +76,27 @@ class AgentIdentity:
     - Verify older artifacts under the chain walker (use
       ``succession_chain`` if ``is_hybrid``).
     - Identify itself when publishing (``signing_did``).
+
+    Three on-disk states map onto this dataclass:
+
+    - **legacy-only**: ``legacy_*`` set, hybrid fields ``None``.
+    - **rotated hybrid**: everything set — the legacy identity is
+      retained for pre-cutoff verification; the succession statement
+      links the two.
+    - **born-hybrid** (#2397): ``legacy_*`` are ``None`` — the agent
+      never had a classical secp256k1 key. ``new_did`` and the
+      verification methods come from the locally stored did:web
+      document; there is no succession statement.
     """
 
-    # Always present (every agent has a legacy identity)
-    legacy_did: str
-    legacy_keypair: Keypair
-    legacy_did_document: dict
+    # Set for agents minted on the classical did:pkh path, and for
+    # rotated agents (which keep the legacy identity to verify
+    # pre-cutoff artifacts). None for born-hybrid agents.
+    legacy_did: Optional[str] = None
+    legacy_keypair: Optional[Keypair] = None
+    legacy_did_document: Optional[dict] = None
 
-    # Set iff the agent's data dir contains a succession statement
+    # Set iff the agent has a hybrid keypair (rotated OR born-hybrid)
     hybrid_keypair: Optional[HybridKeypair] = None
     new_did: Optional[str] = None
     # Verification methods (Multikey VMs) for the new DID, copied
@@ -99,16 +112,29 @@ class AgentIdentity:
     archival_keypair: Optional[Keypair] = None
     succession_statement: Optional[SuccessionStatement] = None
 
+    def __post_init__(self) -> None:
+        if self.hybrid_keypair is None and self.legacy_keypair is None:
+            raise RuntimeIdentityError(
+                "AgentIdentity requires at least one keypair "
+                "(legacy or hybrid); refusing to construct an identity "
+                "with no signing capability at all."
+            )
+
     @property
     def is_hybrid(self) -> bool:
         return self.hybrid_keypair is not None
 
     @property
+    def is_born_hybrid(self) -> bool:
+        """True iff the agent never had a classical identity."""
+        return self.is_hybrid and self.legacy_did is None
+
+    @property
     def signing_did(self) -> str:
         """The DID the agent should sign new artifacts AS, right now.
 
-        Post-ceremony, that's the new ``did:web`` identity. Before any
-        rotation, it's the legacy ``did:pkh``.
+        Hybrid (rotated or born-hybrid): the ``did:web`` identity.
+        Legacy-only: the ``did:pkh``.
         """
         return self.new_did if self.is_hybrid else self.legacy_did
 
@@ -370,30 +396,166 @@ def _load_hybrid_part(
     return hybrid, new_verification_methods, archival_kp
 
 
+def _find_born_hybrid_did_doc(storage_dir: Path) -> Optional[Path]:
+    """Locate a born-hybrid agent's locally stored DID document.
+
+    Born-hybrid inception (#2397) writes ``<slug>_did.json`` next to the
+    hybrid key files. Returns None if absent (agent is legacy or
+    rotated-hybrid). Raises on ambiguity — one agent dir holds exactly
+    one identity.
+    """
+    candidates = sorted(storage_dir.glob("*_did.json"))
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise RuntimeIdentityError(
+            f"multiple born-hybrid DID documents in {storage_dir}: "
+            f"{[c.name for c in candidates]}. One agent dir must hold "
+            f"exactly one identity."
+        )
+    return candidates[0]
+
+
+def _load_born_hybrid(
+    storage: SecureKeyStorage,
+    storage_dir: Path,
+    did_doc_path: Path,
+) -> AgentIdentity:
+    """Load a born-hybrid agent: hybrid keys + locally stored did:web
+    document, no legacy identity and no succession statement.
+
+    The ML-DSA-65 public key is recovered from the DID document's
+    Multikey verification methods (the same source a remote verifier
+    uses), keeping a single authoritative statement of the public
+    identity on disk.
+    """
+    did_document = json.loads(did_doc_path.read_text())
+    new_did = did_document.get("id")
+    if not isinstance(new_did, str) or not new_did.startswith("did:web:"):
+        raise RuntimeIdentityError(
+            f"born-hybrid DID document at {did_doc_path} has id="
+            f"{new_did!r}; expected a did:web URI."
+        )
+
+    slug = did_doc_path.name.removesuffix("_did.json")
+    file_slug = _detect_hybrid_slug(storage_dir)
+    if file_slug != slug:
+        raise RuntimeIdentityError(
+            f"born-hybrid DID document slug {slug!r} does not match the "
+            f"hybrid key-file slug {file_slug!r} in {storage_dir}. "
+            f"Mixed identity material; refusing to load."
+        )
+
+    # Classical half (Ed25519, PEM under SecureKeyStorage)
+    classical_key_id = f"{slug}_ed25519"
+    if not storage.has_key(classical_key_id):
+        raise RuntimeIdentityError(
+            f"born-hybrid DID document present at {did_doc_path} but "
+            f"classical key {classical_key_id}.key.enc is missing. "
+            f"Inception output is incomplete; refusing to load."
+        )
+    ed_priv = storage.load_private_key(classical_key_id)
+    if not isinstance(ed_priv, Ed25519PrivateKey):
+        raise RuntimeIdentityError(
+            f"{classical_key_id}.key.enc is not an Ed25519 key: "
+            f"{type(ed_priv).__name__}"
+        )
+    classical_kp = Keypair(
+        suite_id=ALG_ED25519,
+        private_key=ed_priv,
+        public_key=ed_priv.public_key(),
+    )
+
+    # PQ half (ML-DSA-65 raw secret bytes; public recovered from the doc)
+    pq_key_id = f"{slug}_mldsa65"
+    if not storage.has_secret_bytes(pq_key_id):
+        raise RuntimeIdentityError(
+            f"born-hybrid DID document present at {did_doc_path} but "
+            f"post-quantum key {pq_key_id}.bytes.enc is missing."
+        )
+    pq_priv_bytes = storage.load_secret_bytes(pq_key_id)
+
+    from kestrel_sovereign.identity.did_web import DidWebError, parse_did_document
+    try:
+        parsed_vms = parse_did_document(did_document)
+    except DidWebError as e:
+        raise RuntimeIdentityError(
+            f"born-hybrid DID document at {did_doc_path} failed to parse: {e}"
+        ) from e
+    pq_pub = None
+    for _kid, suite, pub in parsed_vms:
+        if suite.alg_id == ALG_ML_DSA_65:
+            pq_pub = pub
+            break
+    if pq_pub is None:
+        raise RuntimeIdentityError(
+            f"born-hybrid DID document at {did_doc_path} carries no "
+            f"ML-DSA-65 verification method; cannot recover the hybrid "
+            f"PQ public key."
+        )
+    pq_kp = Keypair(
+        suite_id=ALG_ML_DSA_65,
+        private_key=pq_priv_bytes,
+        public_key=pq_pub,
+    )
+    hybrid = HybridKeypair(classical=classical_kp, pq=pq_kp)
+
+    # Archival SLH-DSA pair — minted at inception so a future rotation
+    # can countersign its succession statement hash-based. Required for
+    # born-hybrid agents for parity with rotated ones.
+    archival_priv_id = f"{slug}_archival_slhdsa"
+    archival_pub_id = f"{slug}_archival_slhdsa_pub"
+    if not storage.has_secret_bytes(archival_priv_id) or not storage.has_secret_bytes(archival_pub_id):
+        raise RuntimeIdentityError(
+            f"born-hybrid agent in {storage_dir} is missing its archival "
+            f"SLH-DSA keypair ({archival_priv_id}/{archival_pub_id}). "
+            f"Inception output is incomplete; refusing to load."
+        )
+    archival_kp = Keypair(
+        suite_id=ALG_SLH_DSA_SHA2_128S,
+        private_key=storage.load_secret_bytes(archival_priv_id),
+        public_key=storage.load_secret_bytes(archival_pub_id),
+    )
+
+    logger.info(f"Loaded born-hybrid agent identity: {new_did}")
+    return AgentIdentity(
+        hybrid_keypair=hybrid,
+        new_did=new_did,
+        new_verification_methods=list(did_document.get("verificationMethod") or []),
+        archival_keypair=archival_kp,
+    )
+
+
 def load_agent_identity(
-    legacy_key_id: str,
+    legacy_key_id: Optional[str] = None,
     storage_dir: Optional[Path] = None,
 ) -> AgentIdentity:
     """Load an agent's full runtime identity from disk.
 
-    Always loads the legacy ECDSA keypair + DID document (every Kestrel
-    agent has those). If a succession statement exists in
-    ``<storage_dir>/successions/``, also loads the corresponding hybrid
-    + archival keypairs and exposes them on the returned
-    :class:`AgentIdentity`.
+    Handles all three on-disk identity states:
+
+    - **legacy-only / rotated-hybrid** (``legacy_key_id`` given): loads
+      the legacy ECDSA keypair + DID document; if a succession statement
+      exists in ``<storage_dir>/successions/``, also loads the hybrid +
+      archival keypairs.
+    - **born-hybrid** (``legacy_key_id`` is None, or no legacy material
+      on disk): loads the hybrid keys + the locally stored
+      ``<slug>_did.json`` did:web document. No succession statement is
+      required or expected.
 
     Args:
-        legacy_key_id: ``kestrel_<eth_address>`` — the legacy key id.
+        legacy_key_id: ``kestrel_<eth_address>`` for classical/rotated
+            agents; None for born-hybrid agents.
         storage_dir: Agent data dir. Defaults to
             ``get_default_agent_data_dir()``.
 
     Returns:
-        :class:`AgentIdentity`. ``is_hybrid`` is ``True`` if the agent has
-        completed a rotation ceremony.
+        :class:`AgentIdentity`. ``is_hybrid`` is ``True`` for rotated and
+        born-hybrid agents.
 
     Raises:
-        FileNotFoundError: legacy key + DID doc not on disk.
-        RuntimeIdentityError: succession state is partial / inconsistent
+        FileNotFoundError: no identity material on disk.
+        RuntimeIdentityError: identity state is partial / inconsistent
             (e.g. statement present but hybrid keys missing).
     """
     if storage_dir is None:
@@ -403,6 +565,28 @@ def load_agent_identity(
         storage_dir = Path(storage_dir)
 
     storage = SecureKeyStorage(storage_dir=storage_dir)
+
+    # Born-hybrid path: no legacy key id supplied. A succession
+    # statement without legacy material is an inconsistent state (a
+    # rotation implies a predecessor), so refuse loudly rather than
+    # guessing.
+    if legacy_key_id is None:
+        born_doc = _find_born_hybrid_did_doc(storage_dir)
+        if born_doc is None:
+            raise FileNotFoundError(
+                f"no identity material found in {storage_dir}: "
+                f"legacy_key_id not supplied and no *_did.json "
+                f"(born-hybrid) document present."
+            )
+        if _find_succession_statement(storage_dir) is not None:
+            raise RuntimeIdentityError(
+                f"{storage_dir} has BOTH a born-hybrid DID document and "
+                f"a succession statement. A rotated agent must be loaded "
+                f"with its legacy_key_id; a born-hybrid agent must not "
+                f"have successions/. Resolve the mixed state."
+            )
+        return _load_born_hybrid(storage, storage_dir, born_doc)
+
     # Look for a succession statement BEFORE loading the legacy
     # keypair so we can decide whether a missing legacy private key
     # is a recoverable post-destruction state (succession exists =
