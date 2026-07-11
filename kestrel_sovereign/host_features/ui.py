@@ -1,7 +1,7 @@
 """Aggregate host-feature UI contributions into a host-scoped console surface.
 
 Host features return the SDK :class:`~kestrel_sdk.features.ui.UIContributions`
-shape (``static_dir`` + ``modules`` + ``capability``) from
+shape (``static_dir`` + ``modules`` + ``capability`` + ``css``) from
 ``get_ui_contributions()``. Unlike per-agent contributions (served under
 ``/features/{name}/static`` and listed at ``GET /api/ui/contributions``), host
 contributions are a **distinct host-scoped surface**:
@@ -45,24 +45,31 @@ def _has_traversal(path: str) -> bool:
     return any(part == ".." for part in re.split(r"[\\/]+", path))
 
 
-def _resolve_module_url(path: str, mount_path: Optional[str], *, feature: str) -> Optional[str]:
+def _resolve_asset_url(
+    path: str,
+    mount_path: Optional[str],
+    *,
+    feature: str,
+    kind: str,
+) -> Optional[str]:
     if _is_remote(path):
-        logger.warning("Rejecting remote host UI module %r from %s", path, feature)
+        logger.warning("Rejecting remote host UI %s %r from %s", kind, path, feature)
         return None
     if _has_traversal(path):
-        logger.warning("Rejecting traversal host UI module %r from %s", path, feature)
+        logger.warning("Rejecting traversal host UI %s %r from %s", kind, path, feature)
         return None
     if mount_path is None:
         if not path.startswith("/"):
             logger.warning(
-                "Host feature %s module %r without a static_dir must be root-relative",
-                feature, path,
+                "Host feature %s %s %r without a static_dir must be root-relative",
+                feature, kind, path,
             )
             return None
         return path
     if path.startswith("/"):
         logger.warning(
-            "Host feature %s module %r must be relative to its static mount", feature, path
+            "Host feature %s %s %r must be relative to its static mount",
+            feature, kind, path,
         )
         return None
     return f"{mount_path}/{path}"
@@ -114,7 +121,7 @@ def host_feature_static_mounts(features: List[HostFeature]) -> List[Tuple[str, s
 def compute_host_ui_manifest(features: List[HostFeature]) -> List[Dict[str, Any]]:
     """Build the validated host-scoped UI manifest.
 
-    Each entry: ``{feature, capability, modules: [url, ...]}``. Served at
+    Each entry: ``{feature, capability, modules: [url, ...], css: [url, ...]}``. Served at
     ``GET /api/host/ui/contributions`` for the console to ``import()`` in order.
     """
     manifest: List[Dict[str, Any]] = []
@@ -127,15 +134,29 @@ def compute_host_ui_manifest(features: List[HostFeature]) -> List[Dict[str, Any]
         modules = [
             url
             for m in contrib.modules
-            if (url := _resolve_module_url(m, mount_path, feature=slug))
+            if (
+                url := _resolve_asset_url(
+                    m, mount_path, feature=slug, kind="module"
+                )
+            )
         ]
         if not modules:
             continue
+        css = [
+            url
+            for path in contrib.css
+            if (
+                url := _resolve_asset_url(
+                    path, mount_path, feature=slug, kind="css"
+                )
+            )
+        ]
         manifest.append(
             {
                 "feature": slug,
                 "capability": contrib.capability or slug,
                 "modules": modules,
+                "css": css,
             }
         )
     return manifest
