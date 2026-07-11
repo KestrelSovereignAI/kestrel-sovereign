@@ -466,6 +466,24 @@ def is_sealed_identity_export(serialized: str) -> bool:
     return isinstance(data, dict) and data.get("format") == CAPSULE_FORMAT_ID
 
 
+def _looks_like_tampered_capsule(serialized: str) -> bool:
+    """True if ``serialized`` carries capsule envelope fields but does
+    NOT match the exact format id — i.e. a sealed capsule whose
+    ``format`` was stripped or altered in transit. Such input must be
+    rejected, never downgraded to the plaintext identity-package parser
+    (which would silently produce an empty package)."""
+    if not isinstance(serialized, str):
+        return False
+    try:
+        data = json.loads(serialized)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("format") == CAPSULE_FORMAT_ID:
+        return False
+    # The capsule envelope's structural fingerprint (see sealed_capsule).
+    return "kem" in data and "ciphertext" in data
+
+
 def unseal_identity_package(
     capsule: str,
     kem_keypair: HybridKEMKeypair,
@@ -485,7 +503,7 @@ def unseal_identity_package(
             f"tampered with in transit."
         ) from e
     try:
-        return AgentIdentityPackage.from_json(payload.decode("utf-8"))
+        package = AgentIdentityPackage.from_json(payload.decode("utf-8"))
     except (
         UnicodeDecodeError,
         json.JSONDecodeError,
@@ -502,6 +520,17 @@ def unseal_identity_package(
             f"capsule unsealed but the payload is not a valid identity "
             f"package: {e}"
         ) from e
+    # from_json fills required fields with empty defaults rather than
+    # raising, so a garbage object like {} decodes to a package with an
+    # empty did. Reject it here — the sealed-export contract is
+    # fail-closed, and a downstream import with allow_unsigned=True must
+    # never act on a bogus empty agent (codex P2).
+    if not package.did:
+        raise SealedExportError(
+            "capsule unsealed but the payload has no agent DID; it is "
+            "not a valid identity package (fail-closed)."
+        )
+    return package
 
 
 def open_identity_export(
@@ -530,6 +559,16 @@ def open_identity_export(
                 )
             kem_keypair = load_agent_kem_keypair(slug, storage_dir)
         return unseal_identity_package(serialized, kem_keypair)
+    if _looks_like_tampered_capsule(serialized):
+        # A sealed capsule whose format id was stripped/altered in
+        # transit. Never downgrade it to the plaintext parser (which
+        # would yield an empty package) — fail closed (codex P2).
+        raise SealedExportError(
+            "input carries sealed-capsule envelope fields (kem + "
+            "ciphertext) but not the expected format identifier; the "
+            "capsule appears tampered with. Refusing to parse it as a "
+            "plaintext identity package."
+        )
     return AgentIdentityPackage.from_json(serialized)
 
 

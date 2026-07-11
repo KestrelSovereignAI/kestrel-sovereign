@@ -465,3 +465,46 @@ def test_generate_kem_keypair_refuses_partial_existing_set(tmp_path, monkeypatch
     # The surviving private material was NOT clobbered
     assert (tmp_path / "partialbird_x25519.key.enc").exists()
     assert (tmp_path / "partialbird_mlkem768.bytes.enc").exists()
+
+
+def test_unseal_rejects_empty_object_payload():
+    """A decrypted JSON object that isn't an identity package (e.g. {})
+    must fail closed, not decode to an empty-DID package that a
+    downstream allow_unsigned import would act on (codex round 3)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.security.sealed_capsule import seal_capsule
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, unseal_identity_package,
+    )
+
+    kp = generate_hybrid_kem_keypair()
+    capsule = seal_capsule(
+        b"{}",
+        recipient_classical_public_key=kp.classical.public_key,
+        recipient_pq_public_key=kp.pq.public_key,
+    )
+    with pytest.raises(SealedExportError, match="no agent DID"):
+        unseal_identity_package(capsule, kp)
+
+
+def test_open_export_rejects_format_stripped_capsule():
+    """A capsule with its format id removed must NOT downgrade to the
+    plaintext parser (which yields an empty package) — codex round 3."""
+    import json as _json
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.security.sealed_capsule import seal_capsule
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, open_identity_export,
+    )
+
+    kp = generate_hybrid_kem_keypair()
+    capsule = seal_capsule(
+        b'{"did": "did:web:x:y", "agent_name": "Y", "created_at": "t", '
+        b'"constitution_hash": "h", "constitution_text": "c"}',
+        recipient_classical_public_key=kp.classical.public_key,
+        recipient_pq_public_key=kp.pq.public_key,
+    )
+    envelope = _json.loads(capsule)
+    del envelope["format"]  # tamper: strip the format id
+    with pytest.raises(SealedExportError, match="tampered"):
+        open_identity_export(_json.dumps(envelope), kem_keypair=kp)
