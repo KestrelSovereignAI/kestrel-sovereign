@@ -248,6 +248,31 @@ async def retire_agent(
         archived_keys = True
         break
     if not archived_keys:
+        # Born-hybrid agents (#2397) store their identity as
+        # <slug>_did.json + hybrid key files. Same DID-binding scoping
+        # as the legacy branch: only archive the slug whose DID document
+        # ``id`` matches this agent.
+        for did_doc in db_dir.glob("*_did.json"):
+            try:
+                doc = json.loads(did_doc.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if doc.get("id") != agent_did:
+                continue
+            slug = did_doc.name.removesuffix("_did.json")
+            for sibling in (
+                did_doc,
+                db_dir / f"{slug}_ed25519.key.enc",
+                db_dir / f"{slug}_mldsa65.bytes.enc",
+                db_dir / f"{slug}_archival_slhdsa.bytes.enc",
+                db_dir / f"{slug}_archival_slhdsa_pub.bytes.enc",
+            ):
+                if sibling.exists():
+                    shutil.move(str(sibling), str(agent_archive_path / sibling.name))
+                    logger.info(f"Archived {sibling.name}")
+            archived_keys = True
+            break
+    if not archived_keys:
         logger.warning(
             "No DID document matching %s found in %s; key files not archived "
             "(refusing to glob a possibly-shared directory).",

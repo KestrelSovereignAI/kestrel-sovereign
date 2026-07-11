@@ -635,24 +635,21 @@ async def create_kestrel_identity_async(
                 "mint a classical wallet-bound identity instead, pass "
                 "identity_method='did:pkh'."
             )
-        slug = did_web_slug or slugify_agent_name(agent_name)
         try:
+            slug = did_web_slug or slugify_agent_name(agent_name)
             backup_or_refuse_existing_identity(Path(output_dir), slug, force)
-        except FileExistsError:
-            if not using_external_db:
-                await db.close()
-                cleanup_artifacts([db_path])
-            raise
-        did_document, hybrid_identity, archival_kp = generate_born_hybrid_identity(
-            domain, slug,
-        )
-        agent_did = did_document["id"]
-        if parent_did:
-            did_document["controller"] = parent_did
-            logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
-        else:
-            logging.info(f"Generated DID: {agent_did}")
-        try:
+            # A malformed domain (scheme, port, path) raises in here —
+            # keep it inside the cleanup path so a failed mint never
+            # leaves a half-created database behind.
+            did_document, hybrid_identity, archival_kp = generate_born_hybrid_identity(
+                domain, slug,
+            )
+            agent_did = did_document["id"]
+            if parent_did:
+                did_document["controller"] = parent_did
+                logging.info(f"Generated child DID: {agent_did} (controller: {parent_did})")
+            else:
+                logging.info(f"Generated DID: {agent_did}")
             identity_paths = save_born_hybrid_identity(
                 did_document, hybrid_identity, archival_kp, slug, Path(output_dir),
             )

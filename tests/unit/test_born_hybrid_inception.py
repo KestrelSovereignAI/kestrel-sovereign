@@ -289,6 +289,76 @@ async def test_sign_mandate_with_born_hybrid_parent_no_legacy_key(tmp_path, hybr
     assert verify_mandate(mandate, None, parent_identity=parent)
 
 
+@pytest.mark.asyncio
+async def test_malformed_domain_cleans_up_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("KESTREL_DATA_KEY", TEST_DATA_KEY)
+    monkeypatch.setenv(DID_WEB_DOMAIN_ENV, "https://agents.example.com")  # scheme = malformed
+    monkeypatch.delenv(IDENTITY_METHOD_ENV, raising=False)
+
+    with pytest.raises(Exception):
+        await create_kestrel_identity_async(
+            str(tmp_path), CONSTITUTION, agent_name="Baddomain",
+        )
+    # No half-created database left behind — a retry must not need force=True
+    assert not (tmp_path / "kestrel_prime.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_identity_package_sign_verify_roundtrip_born_hybrid(tmp_path, hybrid_env):
+    """A born-hybrid agent can produce and verify a signed identity
+    package (codex round-2 P2: signing used to anchor via the legacy
+    key id, which cannot parse did:web)."""
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.signing import (
+        sign_package, verify_package_signature,
+    )
+
+    creds = await create_kestrel_identity_async(
+        str(tmp_path), CONSTITUTION, agent_name="Exporter",
+    )
+    package = AgentIdentityPackage(
+        did=creds.agent_did, agent_name="Exporter",
+        created_at="2026-07-11T00:00:00Z",
+        constitution_hash="abc123", constitution_text="# Test",
+    )
+    signed = sign_package(package, storage_dir=tmp_path)
+    assert signed.signatures, "expected v2 hybrid signatures"
+    algs = {s["alg"] for s in signed.signatures}
+    assert algs == {"ed25519", "ml-dsa-65"}
+
+    ok, msg = verify_package_signature(signed, storage_dir=tmp_path)
+    assert ok, msg
+
+
+@pytest.mark.asyncio
+async def test_identity_package_verify_rejects_wrong_local_agent(tmp_path, hybrid_env):
+    """The local trust anchor must BE the package's DID — a dir holding a
+    different born-hybrid agent cannot anchor someone else's package."""
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.signing import (
+        sign_package, verify_package_signature,
+    )
+
+    creds = await create_kestrel_identity_async(
+        str(tmp_path), CONSTITUTION, agent_name="Realbird",
+    )
+    other_dir = tmp_path / "other-agent"
+    other_dir.mkdir()
+    await create_kestrel_identity_async(
+        str(other_dir), CONSTITUTION, agent_name="Otherbird",
+    )
+
+    package = AgentIdentityPackage(
+        did=creds.agent_did, agent_name="Realbird",
+        created_at="2026-07-11T00:00:00Z",
+        constitution_hash="abc123", constitution_text="# Test",
+    )
+    signed = sign_package(package, storage_dir=tmp_path)
+    ok, msg = verify_package_signature(signed, storage_dir=other_dir)
+    assert not ok
+    assert "custody" in msg or "not" in msg
+
+
 def test_sign_mandate_refuses_keyless_parent():
     from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 
