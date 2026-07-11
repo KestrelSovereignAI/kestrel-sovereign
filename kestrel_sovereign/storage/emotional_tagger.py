@@ -13,7 +13,11 @@ import logging
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional
 
-from .memory_models import MemoryMetadata, EmotionalCategory
+from .memory_models import (
+    EMOTIONAL_TAG_VERSION,
+    EmotionalCategory,
+    MemoryMetadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +237,13 @@ class EmotionalTagger:
         r"\b(maybe|perhaps|possibly)\b",
     ]
 
+    TAG_VERSION = EMOTIONAL_TAG_VERSION
+    _NEGATION_PREFIX = re.compile(
+        r"\b(?:not|never|hardly|barely|isn['’]?t|wasn['’]?t|don['’]?t feel)"
+        r"\s+(?:\w+\s+){0,3}$",
+        re.IGNORECASE,
+    )
+
     def __init__(self, use_spacy: bool = False):
         """
         Initialize the emotional tagger.
@@ -274,9 +285,15 @@ class EmotionalTagger:
 
         # Detect emotional categories
         categories = self._detect_emotions(content)
+        emotional_subject = self._infer_emotional_subject(content, role)
+        emotional_confidence = self._emotional_confidence(
+            categories, emotional_subject
+        )
 
         # Detect importance
-        importance, reasons = self._detect_importance(content, role)
+        importance, reasons = self._detect_importance(
+            content, role, emotional_subject=emotional_subject
+        )
 
         # Get temporal context
         time_of_day = self._get_time_of_day()
@@ -289,6 +306,9 @@ class EmotionalTagger:
             emotional_valence=valence,
             emotional_intensity=intensity,
             emotional_categories=categories,
+            emotional_confidence=emotional_confidence,
+            emotional_subject=emotional_subject,
+            emotional_tag_version=self.TAG_VERSION,
             importance=importance,
             importance_reasons=reasons,
             time_of_day=time_of_day,
@@ -317,14 +337,14 @@ class EmotionalTagger:
         # Check positive keywords
         for category, keywords in self.POSITIVE_KEYWORDS.items():
             for keyword in keywords:
-                if keyword in content_lower:
+                if self._keyword_present(content_lower, keyword):
                     positive_count += 1
                     total_matches += 1
 
         # Check negative keywords
         for category, keywords in self.NEGATIVE_KEYWORDS.items():
             for keyword in keywords:
-                if keyword in content_lower:
+                if self._keyword_present(content_lower, keyword):
                     negative_count += 1
                     total_matches += 1
 
@@ -380,23 +400,77 @@ class EmotionalTagger:
         # Check positive categories
         for category, keywords in self.POSITIVE_KEYWORDS.items():
             for keyword in keywords:
-                if keyword in content_lower:
+                if self._keyword_present(content_lower, keyword):
                     detected.add(category.value)
                     break
 
         # Check negative categories
         for category, keywords in self.NEGATIVE_KEYWORDS.items():
             for keyword in keywords:
-                if keyword in content_lower:
+                if self._keyword_present(content_lower, keyword):
                     detected.add(category.value)
                     break
 
         return list(detected)
 
+    @classmethod
+    def _keyword_present(cls, content_lower: str, keyword: str) -> bool:
+        """Return True for a non-negated, token-bounded keyword occurrence."""
+        escaped = re.escape(keyword.lower()).replace(" ", r"\s+")
+        pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
+        for match in pattern.finditer(content_lower):
+            prefix = content_lower[max(0, match.start() - 48):match.start()]
+            if cls._NEGATION_PREFIX.search(prefix):
+                continue
+            return True
+        return False
+
+    @staticmethod
+    def _infer_emotional_subject(content: str, role: str) -> str:
+        """Conservatively identify whose affect the message describes."""
+        lower = content.lower()
+        if role == "assistant":
+            if re.search(
+                r"\bi(?:['’]m|\s+(?:am|feel|felt|was|have been))\b", lower
+            ):
+                return "assistant"
+            if re.search(
+                r"\b(?:you(?:['’]re|\s+(?:are|feel|felt|were|seem|sound))|"
+                r"he|she|they|your\s+\w+)\b",
+                lower,
+            ):
+                return "other"
+            return "unknown"
+        if role != "user":
+            return "unknown"
+        if re.search(
+            r"\bi(?:['’]m|\s+(?:am|feel|felt|was|have been))\b", lower
+        ):
+            return "user"
+        if re.search(
+            r"\b(?:he|she|they|my\s+(?:mom|dad|partner|friend|boss))\s+"
+            r"(?:is|was|felt|feels|said|seemed)\b",
+            lower,
+        ):
+            return "other"
+        return "unknown"
+
+    @staticmethod
+    def _emotional_confidence(categories: List[str], subject: str) -> float:
+        if not categories:
+            return 0.0
+        base = min(0.9, 0.55 + 0.1 * len(categories))
+        if subject == "other":
+            return min(base, 0.4)
+        if subject == "unknown":
+            return min(base, 0.5)
+        return base
+
     def _detect_importance(
         self,
         content: str,
-        role: str = "user"
+        role: str = "user",
+        emotional_subject: str = "unknown",
     ) -> Tuple[float, List[str]]:
         """
         Detect importance signals in content.
@@ -406,45 +480,49 @@ class EmotionalTagger:
             - importance_score: 0.0 to 1.0
             - reasons: List of why this is important
         """
-        score = 0.5  # Base importance
+        # Absence of a signal is not medium importance. Strong evidence below
+        # maps directly into the upper part of the scale.
+        score = 0.0
         reasons: List[str] = []
         content_lower = content.lower()
 
-        # Personal disclosure patterns (high importance)
-        for pattern in self.DISCLOSURE_PATTERNS:
-            if re.search(pattern, content_lower, re.I):
-                score += 0.25
-                if "personal_disclosure" not in reasons:
-                    reasons.append("personal_disclosure")
-                break
+        # Disclosure/life-event/remember heuristics describe user evidence.
+        # Applying them to the assistant's acknowledgement duplicates the
+        # user's event as a second, highly-important assistant memory (e.g.
+        # "I'm sorry your sister died" became an assistant life event).
+        if role == "user":
+            for pattern in self.DISCLOSURE_PATTERNS:
+                if re.search(pattern, content_lower, re.I):
+                    score += 0.7
+                    if "personal_disclosure" not in reasons:
+                        reasons.append("personal_disclosure")
+                    break
 
-        # Life event patterns (highest importance)
-        for pattern in self.LIFE_EVENT_PATTERNS:
-            if re.search(pattern, content_lower, re.I):
-                score += 0.35
-                if "life_event" not in reasons:
-                    reasons.append("life_event")
-                break
+            for pattern in self.LIFE_EVENT_PATTERNS:
+                if re.search(pattern, content_lower, re.I):
+                    score += 0.75
+                    if "life_event" not in reasons:
+                        reasons.append("life_event")
+                    break
 
-        # Explicit memory markers (user directly asks to remember)
-        for pattern in self.EXPLICIT_MARKERS:
-            if re.search(pattern, content_lower, re.I):
-                score += 0.3
-                if "explicit_marker" not in reasons:
-                    reasons.append("explicit_marker")
-                break
+            for pattern in self.EXPLICIT_MARKERS:
+                if re.search(pattern, content_lower, re.I):
+                    score += 0.75
+                    if "explicit_marker" not in reasons:
+                        reasons.append("explicit_marker")
+                    break
 
         # Emotional intensity adds importance
         valence, intensity = self._analyze_sentiment(content)
-        if intensity > 0.6:
-            score += 0.15
+        if intensity > 0.6 and emotional_subject != "other":
+            score += 0.2
             if "high_emotion" not in reasons:
                 reasons.append("high_emotion")
 
         # Long, detailed messages tend to be more important
         word_count = len(content.split())
         if word_count > 100:
-            score += 0.1
+            score += 0.15
             if "detailed_content" not in reasons:
                 reasons.append("detailed_content")
 

@@ -153,6 +153,11 @@ class TestMemoryStatus:
         assert data["total_messages"] >= 5  # We added 5 test messages
         assert "agent_id" in data
         assert "consolidator_available" in data
+        assert data["lexical_index"]["available"] is True
+        assert data["lexical_index"]["coverage"] == 1.0
+        assert "last_bridge" in data["lexical_index"]
+        assert data["embedding_profiles"]["available"] is True
+        assert "null_profile" in data["embedding_profiles"]
 
 
 class TestSearchMemoryEncryptionAware:

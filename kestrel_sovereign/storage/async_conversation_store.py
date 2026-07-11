@@ -15,8 +15,10 @@ import logging
 import os
 import re
 import struct
+import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from time import perf_counter
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
@@ -27,6 +29,7 @@ from .session_grouping import (
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
+from .lexical_memory_index import ConversationLexicalIndex
 from .encryption import (
     get_fernet, get_agent_fernet, encrypt_string, decrypt_string, remove_enc_flag,
     DecryptionError
@@ -115,6 +118,23 @@ def _rows_affected(result) -> int:
     if hasattr(result, "rowcount") and result.rowcount is not None:
         return result.rowcount
     return 0
+
+
+def _is_missing_column_error(exc: Exception, *columns: str) -> bool:
+    """Whether a backend error says one of ``columns`` is absent."""
+    message = str(exc).lower()
+    missing_column = any(
+        marker in message
+        for marker in ("no such column", "no column named", "does not exist")
+    )
+    return missing_column and any(column.lower() in message for column in columns)
+
+
+def _is_missing_lexical_column_error(exc: Exception) -> bool:
+    """Whether an INSERT failed only because the additive migration is absent."""
+    return _is_missing_column_error(
+        exc, "lexical_index_id", "lexical_index_version"
+    )
 
 
 # Stopwords excluded from tokenized fallback matching so that common
@@ -437,6 +457,9 @@ class AsyncConversationStore:
         self._agent_fernet = get_agent_fernet(agent_id) if agent_id else None
         # Auto-migration on read (can be disabled via env var)
         self._migrate_on_read = os.environ.get("KESTREL_DISABLE_MIGRATION") != "true"
+        self._lexical_index = ConversationLexicalIndex(db, agent_id)
+        self._last_lexical_bridge_stats: Dict[str, Any] = {}
+        self._lexical_coverage_index_available: Optional[bool] = None
 
     async def _audit_destructive_operation(
         self,
@@ -991,16 +1014,44 @@ class AsyncConversationStore:
                         self.agent_id, exc,
                     )
 
-        await self._insert_message(
-            role=role,
-            content=to_store,
-            rendered_content=rendered_to_store,
-            metadata=json.dumps(meta) if meta else None,
-            embedding=embedding_vec_val,
-            embedding_profile_id=profile_id,
-            model=model,
-            provider=provider,
-        )
+        lexical_index_id: Optional[str] = uuid.uuid4().hex
+        lexical_tokens = _tokenize_for_search(_strip_search_wrappers(content))
+        lexical_index_version: Optional[str] = self._lexical_index.version
+        try:
+            # Completion protocol: token rows commit first, then the message
+            # row and its coverage marker commit together.  A crash can leave
+            # harmless orphan tokens, but never a falsely-covered message.
+            await self._lexical_index.index_message(
+                lexical_index_id, lexical_tokens
+            )
+        except Exception as exc:  # noqa: BLE001 - recall falls back safely
+            logger.error(
+                "Blind lexical index write failed for agent %s: %s. "
+                "Persisting the message on the correctness fallback.",
+                self.agent_id, exc,
+            )
+            lexical_index_id = None
+            lexical_index_version = None
+
+        try:
+            lexical_columns_written = await self._insert_message(
+                role=role,
+                content=to_store,
+                rendered_content=rendered_to_store,
+                metadata=json.dumps(meta) if meta else None,
+                embedding=embedding_vec_val,
+                embedding_profile_id=profile_id,
+                model=model,
+                provider=provider,
+                lexical_index_id=lexical_index_id,
+                lexical_index_version=lexical_index_version,
+            )
+        except Exception:
+            if lexical_index_id:
+                await self._discard_lexical_tokens(lexical_index_id)
+            raise
+        if not lexical_columns_written and lexical_index_id:
+            await self._discard_lexical_tokens(lexical_index_id)
 
         # Upsert the profile descriptor into the registry table so
         # ``kestrel-sovereign embeddings audit`` can map id →
@@ -1090,6 +1141,17 @@ class AsyncConversationStore:
             return None
         return list(embedding)
 
+    async def _discard_lexical_tokens(self, lexical_index_id: str) -> None:
+        """Best-effort cleanup for a token-first write whose row did not land."""
+        try:
+            await self.db.execute(
+                "DELETE FROM conversation_lexical_tokens "
+                "WHERE agent_id = ? AND lexical_index_id = ?",
+                (self.agent_id, lexical_index_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - original write error wins
+            logger.debug("Could not clean orphan lexical tokens: %s", exc)
+
     async def _insert_message(
         self,
         *,
@@ -1101,7 +1163,9 @@ class AsyncConversationStore:
         embedding_profile_id: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
-    ) -> None:
+        lexical_index_id: Optional[str] = None,
+        lexical_index_version: Optional[str] = None,
+    ) -> bool:
         """Persist a conversation row, optionally co-writing
         ``embedding_vec`` and ``embedding_profile_id``.
 
@@ -1125,21 +1189,40 @@ class AsyncConversationStore:
         """
         base_cols = (
             "agent_id, role, content, rendered_content, model, provider, "
-            "metadata, created_at"
+            "metadata, lexical_index_id, lexical_index_version, created_at"
         )
         base_vals_suffix = f", {self._now_sql()}"
         base_params = (
             self.agent_id, role, content, rendered_content, model, provider,
-            metadata,
+            metadata, lexical_index_id, lexical_index_version,
         )
+        legacy_cols = (
+            "agent_id, role, content, rendered_content, model, provider, "
+            "metadata, created_at"
+        )
+        legacy_params = base_params[:7]
 
         if embedding is None:
             sql = (
                 f"INSERT INTO conversation_history ({base_cols}) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
             )
-            await self.db.execute_commit(sql, base_params)
-            return
+            try:
+                await self.db.execute_commit(sql, base_params)
+                return True
+            except Exception as exc:
+                if not _is_missing_lexical_column_error(exc):
+                    raise
+                logger.info(
+                    "Lexical-index columns unavailable for agent %s (%s); "
+                    "persisting without the blind index.", self.agent_id, exc,
+                )
+                await self.db.execute_commit(
+                    f"INSERT INTO conversation_history ({legacy_cols}) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                    legacy_params,
+                )
+                return False
 
         backend_type = getattr(self.db, "backend_type", None)
         try:
@@ -1157,12 +1240,32 @@ class AsyncConversationStore:
             sql = (
                 f"INSERT INTO conversation_history "
                 f"({base_cols}, embedding_vec, embedding_profile_id) "
-                f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder}, ?)"
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                f"{emb_placeholder}, ?)"
             )
             await self.db.execute_commit(
                 sql, base_params + (emb_bind, embedding_profile_id),
             )
         except Exception as e:
+            if _is_missing_lexical_column_error(e):
+                # The lexical migration is additive/non-fatal. Preserve the
+                # independently-migrated vector + profile stamp before trying
+                # older schema shapes; otherwise failed lexical DDL silently
+                # removes the row from profile-filtered kNN.
+                try:
+                    await self.db.execute_commit(
+                        f"INSERT INTO conversation_history "
+                        f"({legacy_cols}, embedding_vec, embedding_profile_id) "
+                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"{emb_placeholder}, ?)",
+                        legacy_params + (emb_bind, embedding_profile_id),
+                    )
+                    return False
+                except Exception as legacy_exc:
+                    if not _is_missing_column_error(
+                        legacy_exc, "embedding_profile_id", "embedding_vec"
+                    ):
+                        raise
             # The most informative thing to try first is "drop the
             # NEW column but keep the embedding_vec" — that catches
             # the partial-migration shape where Phase-2 ran (vec
@@ -1179,26 +1282,37 @@ class AsyncConversationStore:
                 sql = (
                     f"INSERT INTO conversation_history "
                     f"({base_cols}, embedding_vec) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder})"
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                    f"{emb_placeholder})"
                 )
                 await self.db.execute_commit(sql, base_params + (emb_bind,))
+                return True
             except Exception as e2:
-                # Even the legacy embedding_vec column is missing
-                # (Phase-2 migration hasn't run either). Fall all
-                # the way back to the original column list so the
-                # message still persists; the retriever uses
-                # keyword overlap until the next boot finishes the
-                # migrations.
                 logger.info(
-                    "Legacy embedding_vec-only INSERT also failed for "
-                    "agent %s (%s); persisting the message without any "
-                    "embedding column.", self.agent_id, e2,
+                    "New lexical-index INSERT paths failed for agent %s (%s); "
+                    "retrying the legacy embedding_vec path.", self.agent_id, e2,
                 )
-                sql = (
-                    f"INSERT INTO conversation_history ({base_cols}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})"
-                )
-                await self.db.execute_commit(sql, base_params)
+                try:
+                    await self.db.execute_commit(
+                        f"INSERT INTO conversation_history "
+                        f"({legacy_cols}, embedding_vec) "
+                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix}, "
+                        f"{emb_placeholder})",
+                        legacy_params + (emb_bind,),
+                    )
+                    return False
+                except Exception as e3:
+                    logger.info(
+                        "Legacy embedding_vec INSERT also failed for agent %s "
+                        "(%s); persisting without an embedding.", self.agent_id, e3,
+                    )
+                    await self.db.execute_commit(
+                        f"INSERT INTO conversation_history ({legacy_cols}) "
+                        f"VALUES (?, ?, ?, ?, ?, ?, ?{base_vals_suffix})",
+                        legacy_params,
+                    )
+                    return False
+        return True
 
     def _decrypt_with_fallback(self, content: str, meta: Optional[Dict]) -> tuple[str, bool]:
         """Decrypt content, trying per-agent key first then global.
@@ -1387,7 +1501,9 @@ class AsyncConversationStore:
         """
         if session_id:
             # Session-aware retrieval: get messages from the specified session
-            rows = await self._get_session_messages(session_id, limit)
+            rows = await self._get_session_messages(
+                session_id, limit, include_archived=False
+            )
         else:
             # Default behavior: get most recent live messages.
             # rendered_content (#1402) appended at row[5] so existing
@@ -1396,7 +1512,7 @@ class AsyncConversationStore:
                 "SELECT id, role, content, metadata, created_at, rendered_content, "
                 "model, provider "
                 "FROM conversation_history "
-                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "ORDER BY id DESC LIMIT ?",
                 (self.agent_id, limit)
             )
@@ -1483,7 +1599,9 @@ class AsyncConversationStore:
         conversation endpoints) can resolve a session by either a UUID or a
         legacy row-id without reaching into a private method (#2012).
         """
-        return await self._get_session_messages(session_id, limit)
+        return await self._get_session_messages(
+            session_id, limit, include_archived=False
+        )
 
     async def _get_session_messages(
         self,
@@ -1491,6 +1609,7 @@ class AsyncConversationStore:
         limit: int,
         deleted_filter: str = "live",
         include_markers: bool = False,
+        include_archived: bool = True,
     ) -> List[tuple]:
         """Get messages belonging to a specific session.
 
@@ -1514,6 +1633,9 @@ class AsyncConversationStore:
                 a session's content leaves a live orphan marker that keeps the
                 session in the active list yet unresolvable by a later delete
                 (#2027).
+            include_archived: Include rows with ``archived_at`` set. Lifecycle
+                operations keep the default so archived sessions can be
+                unarchived/purged; normal conversation replay passes False.
 
         Returns:
             List of raw rows
@@ -1522,6 +1644,7 @@ class AsyncConversationStore:
             so existing positional accesses below don't shift.
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
+        archive_clause = "" if include_archived else " AND archived_at IS NULL"
         from datetime import datetime
         from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
 
@@ -1548,7 +1671,7 @@ class AsyncConversationStore:
                     f"""SELECT id, role, content, metadata, created_at,
                               rendered_content, model, provider
                        FROM conversation_history
-                       WHERE agent_id = ? AND created_at >= ?{del_clause}
+                       WHERE agent_id = ? AND created_at >= ?{del_clause}{archive_clause}
                        ORDER BY created_at ASC
                        LIMIT ?""",
                     (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
@@ -1564,7 +1687,7 @@ class AsyncConversationStore:
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
+               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
             (self.agent_id, f'%"session_id": "{esc}"%', limit)
@@ -1575,7 +1698,7 @@ class AsyncConversationStore:
             f"""SELECT id, role, content, metadata, created_at, rendered_content,
                       model, provider
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
+               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}{archive_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
             (self.agent_id, f'%"session_id":"{esc}"%', limit)
@@ -1671,14 +1794,14 @@ class AsyncConversationStore:
     async def get_full_history(self) -> List[Dict[str, Any]]:
         """Get complete live conversation history with automatic decryption.
 
-        Soft-deleted rows (#763) are filtered out — use
+        Soft-deleted and archived rows are filtered out — use
         ``get_full_history_with_ids(include_deleted=True)`` if you need
         to see Trash too.
         """
         rows = await self.db.fetchall(
             "SELECT id, role, content, metadata, rendered_content "
             "FROM conversation_history "
-            "WHERE agent_id = ? AND deleted_at IS NULL "
+            "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
             "ORDER BY id ASC",
             (self.agent_id,)
         )
@@ -1750,7 +1873,7 @@ class AsyncConversationStore:
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, rendered_content "
                 "FROM conversation_history "
-                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
                 "ORDER BY id DESC LIMIT 5000",
                 (
@@ -1765,7 +1888,7 @@ class AsyncConversationStore:
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, rendered_content "
                 "FROM conversation_history "
-                "WHERE agent_id = ? AND deleted_at IS NULL "
+                "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "ORDER BY id DESC LIMIT 5000",
                 (self.agent_id,)
             )
@@ -2660,8 +2783,9 @@ class AsyncConversationStore:
         include_deleted: bool = False,
         only_deleted: bool = False,
         only_archived: bool = False,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Get complete conversation history with message IDs.
+        """Get conversation history with message IDs, optionally bounded.
 
         Args:
             include_excluded: If True, include messages marked as excluded from context.
@@ -2672,6 +2796,9 @@ class AsyncConversationStore:
                 the Trash UI (#765). Implies ``include_deleted``.
             only_archived: If True, return ONLY archived rows that are not
                 soft-deleted. Used by the Archive UI (#2149).
+            limit: When provided, fetch only the newest N matching database
+                rows while still returning them oldest-first. Filtering
+                excluded/stashed rows are filtered in SQL before the bound.
 
         Returns:
             List of message dicts with 'id', 'role', 'content', 'metadata',
@@ -2687,12 +2814,50 @@ class AsyncConversationStore:
         else:
             del_clause = " AND deleted_at IS NULL"
 
-        rows = await self.db.fetchall(
-            f"SELECT id, role, content, metadata, created_at, deleted_at, archived_at "
-            f"FROM conversation_history "
-            f"WHERE agent_id = ?{del_clause} ORDER BY id ASC",
-            (self.agent_id,)
+        visibility_clause = ""
+        if not include_excluded or not include_stashed:
+            if self.db.backend_type == "postgres":
+                if not include_excluded:
+                    visibility_clause += (
+                        " AND COALESCE((metadata::jsonb ->> "
+                        "'excluded_from_context')::boolean, false) = false"
+                    )
+                if not include_stashed:
+                    visibility_clause += (
+                        " AND COALESCE((metadata::jsonb ->> "
+                        "'stashed')::boolean, false) = false"
+                    )
+            else:
+                if not include_excluded:
+                    visibility_clause += (
+                        " AND COALESCE(json_extract(metadata, "
+                        "'$.excluded_from_context'), 0) != 1"
+                    )
+                if not include_stashed:
+                    visibility_clause += (
+                        " AND COALESCE(json_extract(metadata, '$.stashed'), 0) != 1"
+                    )
+
+        columns = (
+            "id, role, content, metadata, created_at, deleted_at, archived_at"
         )
+        if limit is None:
+            sql = (
+                f"SELECT {columns} FROM conversation_history "
+                f"WHERE agent_id = ?{del_clause}{visibility_clause} ORDER BY id ASC"
+            )
+            params: Tuple[Any, ...] = (self.agent_id,)
+        else:
+            bounded_limit = max(1, int(limit))
+            sql = (
+                f"SELECT {columns} FROM ("
+                f"SELECT {columns} FROM conversation_history "
+                f"WHERE agent_id = ?{del_clause}{visibility_clause} "
+                f"ORDER BY id DESC LIMIT ?"
+                f") AS recent_history ORDER BY id ASC"
+            )
+            params = (self.agent_id, bounded_limit)
+        rows = await self.db.fetchall(sql, params)
         history = []
         for row in rows:
             row_id = row[0]
@@ -2737,9 +2902,9 @@ class AsyncConversationStore:
     ) -> bool:
         """Update metadata for a specific message using atomic JSON merge.
 
-        Uses SQL-level json_patch (PostgreSQL) or a SELECT-then-UPDATE with
-        optimistic locking (SQLite) to avoid race conditions when multiple
-        callers update metadata on the same message concurrently.
+        Uses one SQL JSON merge statement on both backends so concurrent
+        rehearsal, reflection, tagging, and routing writes cannot be erased by
+        a stale Python read-modify-write cycle.
 
         Args:
             message_id: The message ID to update
@@ -2748,9 +2913,8 @@ class AsyncConversationStore:
         Returns:
             True if message was found and updated, False otherwise
         """
-        updates_json = json.dumps(metadata_updates)
-
         if self.db.backend_type == "postgres":
+            updates_json = json.dumps(metadata_updates)
             # PostgreSQL: atomic JSON merge via || operator
             # COALESCE handles NULL metadata columns gracefully
             result = await self.db.execute_commit(
@@ -2764,23 +2928,33 @@ class AsyncConversationStore:
                 logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
             return updated
         else:
-            # SQLite: SELECT-then-UPDATE (single-writer, no true race condition)
-            row = await self.db.fetchone(
-                "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
-                (message_id, self.agent_id)
-            )
-            if not row:
+            # json_patch implements MergePatch, where a JSON null DELETES a
+            # key. Python dict.update (and PostgreSQL ||) stores null, so use
+            # variadic json_set with parsed JSON values to preserve the public
+            # contract for None/list/dict/bool as well as scalar values.
+            if metadata_updates:
+                assignments = ", ".join("?, json(?)" for _ in metadata_updates)
+                merge_params: List[Any] = []
+                for key, value in metadata_updates.items():
+                    escaped_key = str(key).replace('"', '\\"')
+                    merge_params.extend((f'$."{escaped_key}"', json.dumps(value)))
+                sql = (
+                    "UPDATE conversation_history SET metadata = "
+                    f"json_set(COALESCE(metadata, '{{}}'), {assignments}) "
+                    "WHERE id = ? AND agent_id = ?"
+                )
+                params = (*merge_params, message_id, self.agent_id)
+            else:
+                sql = (
+                    "UPDATE conversation_history SET metadata = "
+                    "COALESCE(metadata, '{}') WHERE id = ? AND agent_id = ?"
+                )
+                params = (message_id, self.agent_id)
+            result = await self.db.execute_commit(sql, params)
+            updated = _rows_affected(result) > 0
+            if not updated:
                 logger.warning(f"Message {message_id} not found for agent {self.agent_id}")
-                return False
-
-            current_meta = json.loads(row[0]) if row[0] else {}
-            current_meta.update(metadata_updates)
-
-            await self.db.execute_commit(
-                "UPDATE conversation_history SET metadata = ? WHERE id = ? AND agent_id = ?",
-                (json.dumps(current_meta), message_id, self.agent_id)
-            )
-            return True
+            return updated
 
     async def atomic_increment_metadata_counter(
         self,
@@ -2938,9 +3112,10 @@ class AsyncConversationStore:
 
         placeholders = ",".join("?" * len(message_ids))
         rows = await self.db.fetchall(
-            f"SELECT id, role, content, metadata, created_at FROM conversation_history "
+            f"SELECT id, role, content, metadata, created_at, rendered_content "
+            f"FROM conversation_history "
             f"WHERE id IN ({placeholders}) AND agent_id = ? "
-            f"AND deleted_at IS NULL ORDER BY id ASC",
+            f"AND deleted_at IS NULL AND archived_at IS NULL ORDER BY id ASC",
             (*message_ids, self.agent_id)
         )
 
@@ -2949,6 +3124,9 @@ class AsyncConversationStore:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else {}
             content, _ = self._decrypt_with_fallback(row[2], meta)
+            content, _ = await self._resolve_canonical(
+                row_id, row[1], meta, content, row[5]
+            )
 
             cleaned_meta = remove_enc_flag(meta)
             if cleaned_meta:
@@ -2963,6 +3141,383 @@ class AsyncConversationStore:
             }
             history.append(entry)
         return history
+
+    async def get_salient_memory_candidates(
+        self, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Return pinned/high-importance rows from across the live corpus."""
+        if self.db.backend_type == "postgres":
+            salience_order = """
+                 CASE WHEN (metadata::jsonb ->> 'decay_protected')::boolean
+                      THEN 1 ELSE 0 END DESC,
+                 COALESCE((metadata::jsonb ->> 'importance')::double precision, 0) DESC,"""
+        else:
+            salience_order = """
+                 CASE WHEN json_extract(metadata, '$.decay_protected') = 1
+                      THEN 1 ELSE 0 END DESC,
+                 COALESCE(CAST(json_extract(metadata, '$.importance') AS REAL), 0) DESC,"""
+        rows = await self.db.fetchall(
+            f"""SELECT id, role, content, metadata, created_at, rendered_content
+               FROM conversation_history
+               WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL
+               ORDER BY {salience_order}
+                 id DESC
+               LIMIT ?""",
+            (self.agent_id, max(1, int(limit))),
+        )
+        candidates: List[Dict[str, Any]] = []
+        for row_id, role, encrypted_content, raw_meta, created_at, rendered in rows:
+            try:
+                meta = json.loads(raw_meta) if raw_meta else {}
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            content, _ = self._decrypt_with_fallback(encrypted_content, meta)
+            content, _ = await self._resolve_canonical(
+                row_id, role, meta, content, rendered
+            )
+            cleaned_meta = remove_enc_flag(meta)
+            cleaned_meta.pop("key_version", None)
+            candidates.append({
+                "id": row_id,
+                "role": role,
+                "content": content,
+                "metadata": cleaned_meta,
+                "created_at": created_at,
+            })
+        return candidates
+
+    async def get_lexical_memory_candidates(
+        self,
+        query: str,
+        limit: int = 100,
+        page_size: int = 1000,
+        excluded_embedding_profile_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return bounded lexical top-k while scanning eligible live rows.
+
+        When ``excluded_embedding_profile_id`` is supplied, scan only rows
+        outside that vector space (NULL/legacy or a different profile). This
+        is the mixed-corpus bridge: active-profile rows arrive through kNN,
+        while exact legacy matches remain recallable during backfill/migration.
+        """
+        started = perf_counter()
+        query_tokens = set(_tokenize_for_search(_strip_search_wrappers(query)))
+        if not query_tokens:
+            return []
+        ranked: List[Tuple[float, int, Dict[str, Any]]] = []
+        indexed_candidates = 0
+        fallback_rows_scanned = 0
+        fallback_reason: Optional[str] = None
+
+        def rank_candidate(candidate: Dict[str, Any]) -> None:
+            content = candidate.get("content") or ""
+            candidate_tokens = set(
+                _tokenize_for_search(_strip_search_wrappers(content))
+            )
+            overlap = len(query_tokens & candidate_tokens) / len(query_tokens)
+            if overlap <= 0:
+                return
+            ranked.append((overlap, int(candidate["id"]), candidate))
+
+        index_available = True
+        try:
+            indexed_ids = await self._lexical_index.candidate_message_ids(
+                sorted(query_tokens),
+                limit=max(1, int(limit)),
+                excluded_embedding_profile_id=excluded_embedding_profile_id,
+            )
+            indexed_rows = await self.get_messages_by_ids(indexed_ids)
+            indexed_candidates = len(indexed_rows)
+            for candidate in indexed_rows:
+                rank_candidate(candidate)
+        except ValueError as exc:
+            fallback_reason = "query_token_budget"
+            logger.info(
+                "Blind lexical index budget exceeded for agent %s (%s); "
+                "using the complete decrypt-scan fallback.", self.agent_id, exc,
+            )
+            index_available = False
+        except Exception as exc:  # noqa: BLE001 - pre-migration compatibility
+            fallback_reason = "index_unavailable"
+            logger.warning(
+                "Blind lexical candidate index unavailable for agent %s (%s); "
+                "using the complete decrypt-scan fallback.", self.agent_id, exc,
+            )
+            index_available = False
+
+        before_id: Optional[int] = None
+        use_coverage_hint = index_available and await self._has_lexical_coverage_index()
+        while True:
+            cursor_clause = " AND id < ?" if before_id is not None else ""
+            profile_clause = ""
+            params_list: List[Any] = [self.agent_id]
+            if excluded_embedding_profile_id is not None:
+                profile_clause = (
+                    " AND (embedding_profile_id IS NULL "
+                    "OR embedding_profile_id != ?)"
+                )
+                params_list.append(excluded_embedding_profile_id)
+            coverage_hint = (
+                " INDEXED BY idx_conversation_lexical_coverage"
+                if use_coverage_hint
+                else ""
+            )
+            base_sql = (
+                "SELECT id, role, content, metadata, created_at, rendered_content "
+                f"FROM conversation_history{coverage_hint} WHERE agent_id = ? "
+                "AND deleted_at IS NULL AND archived_at IS NULL"
+                f"{profile_clause}"
+            )
+            if index_available:
+                # Four disjoint range probes keep the complete-coverage path
+                # on idx_conversation_lexical_coverage. A single OR predicate
+                # made SQLite scan every live row even when there were no gaps.
+                gap_rows: Dict[int, Any] = {}
+                for gap, gap_params in self._lexical_index.coverage_gap_predicates(
+                    "conversation_history"
+                ):
+                    gap_query_params = [*params_list, *gap_params]
+                    if before_id is not None:
+                        gap_query_params.append(before_id)
+                    gap_query_params.append(page_size)
+                    for row in await self.db.fetchall(
+                        f"{base_sql} AND {gap}{cursor_clause} "
+                        "ORDER BY id DESC LIMIT ?",
+                        tuple(gap_query_params),
+                    ):
+                        gap_rows[int(row[0])] = row
+                rows = sorted(
+                    gap_rows.values(), key=lambda row: int(row[0]), reverse=True
+                )[:page_size]
+            else:
+                if before_id is not None:
+                    params_list.append(before_id)
+                params_list.append(page_size)
+                rows = await self.db.fetchall(
+                    f"{base_sql}{cursor_clause} ORDER BY id DESC LIMIT ?",
+                    tuple(params_list),
+                )
+            if not rows:
+                break
+            fallback_rows_scanned += len(rows)
+            for row_id, role, encrypted_content, raw_meta, created_at, rendered in rows:
+                try:
+                    meta = json.loads(raw_meta) if raw_meta else {}
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+                content, _ = self._decrypt_with_fallback(encrypted_content, meta)
+                content, _ = await self._resolve_canonical(
+                    row_id, role, meta, content, rendered
+                )
+                cleaned_meta = remove_enc_flag(meta) or {}
+                cleaned_meta.pop("key_version", None)
+                rank_candidate({
+                    "id": row_id,
+                    "role": role,
+                    "content": content,
+                    "metadata": cleaned_meta,
+                    "created_at": created_at,
+                })
+            ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            del ranked[max(1, int(limit)):]
+            before_id = int(rows[-1][0])
+            if len(rows) < page_size:
+                break
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        del ranked[max(1, int(limit)):]
+        elapsed_ms = (perf_counter() - started) * 1000.0
+        self._last_lexical_bridge_stats = {
+            "elapsed_ms": round(elapsed_ms, 3),
+            "indexed_candidates": indexed_candidates,
+            "fallback_rows_scanned": fallback_rows_scanned,
+            "index_available": index_available,
+            "fallback_reason": fallback_reason,
+            "query_token_count": len(query_tokens),
+        }
+        return [item[2] for item in ranked]
+
+    async def _has_lexical_coverage_index(self) -> bool:
+        """Verify SQLite's optional planner hint before naming the index.
+
+        The migration is intentionally non-fatal.  A partially migrated DB
+        must therefore degrade to the slower complete scan, never fail recall
+        with ``no such index``.
+        """
+        if getattr(self.db, "backend_type", None) != "sqlite":
+            return False
+        if self._lexical_coverage_index_available is not None:
+            return self._lexical_coverage_index_available
+        try:
+            row = await self.db.fetchone(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                ("idx_conversation_lexical_coverage",),
+            )
+            self._lexical_coverage_index_available = bool(row and row[0])
+        except Exception as exc:  # noqa: BLE001 - performance hint only
+            logger.debug("Could not inspect lexical coverage index: %s", exc)
+            self._lexical_coverage_index_available = False
+        return self._lexical_coverage_index_available
+
+    async def get_lexical_index_health(self) -> Dict[str, Any]:
+        """Return durable coverage plus the most recent bridge cost."""
+        health = (await self._lexical_index.health()).as_dict()
+        health["last_bridge"] = dict(self._last_lexical_bridge_stats)
+        return health
+
+    async def get_embedding_profile_health(
+        self, current_profile_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Return active/null/stale vector coverage without materializing rows."""
+        if current_profile_id is None:
+            service = self._lazy_embedding_service()
+            if service is not None and hasattr(service, "current_profile_id"):
+                try:
+                    current_profile_id = service.current_profile_id()
+                except Exception as exc:  # pragma: no cover - provider defensive
+                    logger.debug("Could not resolve current embedding profile: %s", exc)
+        row = await self.db.fetchone(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN embedding_profile_id IS NULL THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN embedding_profile_id = ? "
+            "AND embedding_vec IS NOT NULL THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN embedding_profile_id IS NOT NULL "
+            "AND embedding_profile_id != ? THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN embedding_profile_id = ? "
+            "AND embedding_vec IS NULL THEN 1 ELSE 0 END) "
+            "FROM conversation_history WHERE agent_id = ? "
+            "AND deleted_at IS NULL AND archived_at IS NULL",
+            (current_profile_id, current_profile_id, current_profile_id, self.agent_id),
+        )
+        values = tuple(row or (0, 0, 0, 0, 0))
+        return {
+            "current_profile_id": current_profile_id,
+            "total_live": int(values[0] or 0),
+            "null_profile": int(values[1] or 0),
+            "active_profile_vectors": int(values[2] or 0),
+            "other_profile": int(values[3] or 0),
+            "active_profile_missing_vector": int(values[4] or 0),
+        }
+
+    async def backfill_lexical_index(
+        self,
+        *,
+        batch_size: int = 500,
+        max_rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Resumably blind-index every current live conversation row.
+
+        Token rows are committed before the conversation's coverage marker.
+        An interruption can therefore leave only harmless orphan tokens; the
+        message itself stays on the complete decrypt-scan fallback until the
+        marker update succeeds.
+        """
+        started = perf_counter()
+        initial_health = await self._lexical_index.health()
+        scanned = attempted = failed = 0
+        after_id: Optional[int] = None
+        page_size = max(1, int(batch_size))
+        while max_rows is None or scanned < max_rows:
+            gap, gap_params = self._lexical_index.coverage_gap_sql("c")
+            cursor_clause = " AND c.id > ?" if after_id is not None else ""
+            params: List[Any] = [*gap_params, self.agent_id]
+            if after_id is not None:
+                params.append(after_id)
+            remaining = (
+                page_size if max_rows is None
+                else min(page_size, max_rows - scanned)
+            )
+            params.append(remaining)
+            rows = await self.db.fetchall(
+                f"SELECT c.id, c.lexical_index_id FROM conversation_history c WHERE {gap} "
+                "AND c.agent_id = ? AND c.deleted_at IS NULL "
+                f"AND c.archived_at IS NULL{cursor_clause} "
+                "ORDER BY c.id LIMIT ?",
+                tuple(params),
+            )
+            if not rows:
+                break
+            ids = [int(row[0]) for row in rows]
+            old_keys = [str(row[1]) for row in rows if row[1]]
+            after_id = ids[-1]
+            scanned += len(ids)
+            hydrated = {
+                int(row["id"]): row
+                for row in await self.get_messages_by_ids(ids)
+            }
+            index_entries: List[Tuple[str, Iterable[str]]] = []
+            update_rows: List[Tuple[str, str, str, int]] = []
+            for row_id in ids:
+                row = hydrated.get(row_id)
+                if row is None:
+                    failed += 1
+                    continue
+                content = row.get("content") or ""
+                tokens = _tokenize_for_search(_strip_search_wrappers(content))
+                message_key = self._lexical_index.backfill_message_key(row_id)
+                index_entries.append((message_key, tokens))
+                update_rows.append((
+                    message_key,
+                    self._lexical_index.version,
+                    self.agent_id,
+                    row_id,
+                ))
+            try:
+                await self._lexical_index.index_messages(index_entries)
+                await self.db.execute_many(
+                    "UPDATE conversation_history SET lexical_index_id = ?, "
+                    "lexical_index_version = ? WHERE agent_id = ? AND id = ?",
+                    update_rows,
+                )
+                attempted += len(update_rows)
+                new_keys = {entry[0] for entry in index_entries}
+                obsolete_keys = [key for key in old_keys if key not in new_keys]
+                if obsolete_keys:
+                    await self.db.execute_many(
+                        "DELETE FROM conversation_lexical_tokens "
+                        "WHERE agent_id = ? AND lexical_index_id = ?",
+                        [(self.agent_id, old_key) for old_key in obsolete_keys],
+                    )
+            except Exception as exc:  # noqa: BLE001 - continue resumable sweep
+                logger.warning(
+                    "Lexical index backfill batch ending at message %s failed: %s",
+                    after_id, exc,
+                )
+                failed += len(update_rows)
+            if len(rows) < remaining:
+                break
+        health = await self.get_lexical_index_health()
+        # asyncpg.executemany does not report affected rows.  Derive the
+        # truthful durable gain from coverage instead of treating attempts as
+        # successes (concurrent deletion is harmless and not a failed row).
+        indexed = max(
+            0,
+            min(scanned, int(health["indexed_current"]) - initial_health.indexed_current),
+        )
+        garbage_collected = 0
+        try:
+            deleted = await self.db.execute_commit(
+                "DELETE FROM conversation_lexical_tokens "
+                "WHERE agent_id = ? AND NOT EXISTS ("
+                "SELECT 1 FROM conversation_history c "
+                "WHERE c.agent_id = conversation_lexical_tokens.agent_id "
+                "AND c.lexical_index_id = "
+                "conversation_lexical_tokens.lexical_index_id)",
+                (self.agent_id,),
+            )
+            garbage_collected = _rows_affected(deleted)
+        except Exception as exc:  # noqa: BLE001 - coverage work already durable
+            logger.warning("Lexical orphan-token cleanup failed: %s", exc)
+        return {
+            "scanned": scanned,
+            "attempted": attempted,
+            "indexed": indexed,
+            "failed": failed,
+            "garbage_collected": garbage_collected,
+            "remaining": health["unindexed"],
+            "coverage": health["coverage"],
+            "elapsed_ms": round((perf_counter() - started) * 1000.0, 3),
+            "index_version": health["index_version"],
+        }
 
     async def search_messages_by_content(
         self,

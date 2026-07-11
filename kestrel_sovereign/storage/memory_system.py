@@ -24,9 +24,7 @@ Usage:
     report = await memory.consolidate()
 """
 import logging
-from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
-import uuid
 
 from .memory_models import MemoryMetadata, TemporalPattern, MemoryEpisode
 from .emotional_tagger import EmotionalTagger
@@ -193,19 +191,18 @@ class MemorySystem:
         # Analyze emotional content
         memory_meta = await self.tagger.analyze(content, role)
 
-        # Merge with existing metadata
-        enriched = memory_meta.merge_with(existing_metadata or {})
-
-        # Add message ID for concept linking
-        enriched["memory_message_id"] = str(uuid.uuid4())
-
-        return enriched
+        # Message identity belongs to the conversation store.  Do not mint a
+        # second UUID here: graph nodes, schema artifacts, and metadata must all
+        # refer to the persisted conversation_history.id.
+        return memory_meta.merge_with(existing_metadata or {})
 
     async def process_message(
         self,
         content: str,
         role: str = "user",
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        *,
+        message_id: int | str,
     ) -> Dict[str, Any]:
         """
         Full message processing: enrich metadata and extract concepts.
@@ -216,6 +213,7 @@ class MemorySystem:
             content: Message content
             role: Message role
             metadata: Existing metadata
+            message_id: Canonical persisted conversation-history row ID.
 
         Returns:
             Enriched metadata (concepts extracted as side effect)
@@ -223,43 +221,65 @@ class MemorySystem:
         # Enrich with emotional analysis
         enriched = await self.enrich_metadata(content, role, metadata)
 
-        # Extract concepts and link in graph (for user messages)
-        if role == "user" and self.linker:
-            message_id = enriched.get("memory_message_id", str(uuid.uuid4()))
-            linked_concepts = await self.linker.extract_and_link(
-                message_id,
-                content,
-                self.agent_id
-            )
-            # Store bare labels for backward compat in metadata
-            enriched["extracted_concepts"] = [c.label for c in linked_concepts]
-
-            # Schema-aware routing: action items / decisions / interaction
-            # enrichment. Best-effort — a failure here never blocks the
-            # message save or other enrichment. Privacy gating happens at
-            # the MemoryFeature layer via skip_schema_routing in metadata;
-            # EPHEMERAL/ISOLATED agents never reach this code path because
-            # the underlying storage is not persistent.
-            if self.router and not _routing_suppressed(metadata):
-                try:
-                    routing_summary = await self.router.route(
-                        message_id=message_id,
-                        content=content,
-                        concepts=linked_concepts,
-                        role=role,
-                        metadata=enriched,
-                    )
-                    enriched["schema_routing"] = routing_summary
-                except Exception as e:
-                    logger.warning("Schema routing failed for message: %s", e)
+        derived = await self.link_and_route_message(
+            message_id=message_id,
+            content=content,
+            role=role,
+            metadata=enriched,
+        )
+        enriched.update(derived)
 
         return enriched
+
+    async def link_and_route_message(
+        self,
+        *,
+        message_id: int | str,
+        content: str,
+        role: str = "user",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create graph-derived memory state for one persisted message.
+
+        This is the canonical post-storage graph path.  The caller supplies the
+        real conversation row ID so message nodes, action items, decisions, and
+        interaction edges all share one identity.
+        """
+        if role != "user" or not self.linker:
+            return {}
+        if message_id is None or str(message_id).strip() == "":
+            raise ValueError("message_id is required for memory graph processing")
+
+        canonical_id = str(message_id)
+        linked_concepts = await self.linker.extract_and_link(
+            canonical_id,
+            content,
+            self.agent_id,
+        )
+        derived: Dict[str, Any] = {
+            "extracted_concepts": [concept.label for concept in linked_concepts]
+        }
+
+        if self.router and not _routing_suppressed(metadata):
+            try:
+                derived["schema_routing"] = await self.router.route(
+                    message_id=canonical_id,
+                    content=content,
+                    concepts=linked_concepts,
+                    role=role,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                logger.warning("Schema routing failed for message %s: %s", canonical_id, exc)
+
+        return derived
 
     async def retrieve(
         self,
         query: str,
         limit: int = 10,
-        emotional_context: Optional[MemoryMetadata] = None
+        emotional_context: Optional[MemoryMetadata] = None,
+        min_relevance: float = 0.2,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve memories relevant to query with human-like weighting.
@@ -268,6 +288,8 @@ class MemorySystem:
             query: Search query
             limit: Max results
             emotional_context: Current emotional state for mood-congruent retrieval
+            min_relevance: Semantic/lexical/associative eligibility floor. Set
+                to 0 only for intentionally relevance-free emotional recall.
 
         Returns:
             List of message dicts with retrieval_score
@@ -280,7 +302,8 @@ class MemorySystem:
             query,
             self.agent_id,
             emotional_context=emotional_context,
-            limit=limit
+            limit=limit,
+            min_relevance=min_relevance,
         )
 
     async def retrieve_important(

@@ -12,10 +12,16 @@ available for local dev (separate OS processes per agent).
 import asyncio
 import logging
 import os
+from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.spawn.delegated_wallet import (
+    _default_currency_for,
+    create_delegated_wallet,
+    release_delegated_wallet,
+)
 from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.storage.async_storage import AsyncStorage
@@ -55,12 +61,19 @@ class AgentManager:
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
         self._child_mandates: dict[str, SpawnMandate] = {}  # child_name -> mandate
+        # child_name -> (DelegatedWallet, parent_wallet) for budgeted children, so
+        # termination can release the unspent hold back to the parent (#2113).
+        self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = base_data_dir or Path.cwd()
         self._lock = asyncio.Lock()
-        # MONOTONIC port allocator (#1729). ``8800 + len(self._agents) + 1``
-        # collides after an agent is unloaded — len shrinks and the next spawn
-        # reuses a live port. A counter that only ever increases avoids reuse.
-        self._port_seq = 8800
+        # Reserved-port allocator (#1729 → #2358 codex rounds 4-6). A bare
+        # monotonic counter avoided unload-reuse but couldn't express "this
+        # port is taken by the HOST" without starving every port below it.
+        # Reservations are NEVER removed (an unloaded agent's port stays
+        # reserved — the #1729 guarantee); allocation scans for the first
+        # free in-range port instead of incrementing.
+        self._reserved_ports: set[int] = set()
+        self._port_scan_start = 8801
         # Hard cap on dynamically-spawned agents so a runaway spawn loop can't
         # exhaust ports / resources (#1729).
         self._max_spawned_agents = int(os.environ.get("KESTREL_MAX_SPAWNED_AGENTS", "64"))
@@ -71,6 +84,9 @@ class AgentManager:
         # the FastAPI lifespan can surface them via /health (#377 lifecycle
         # hardening for multi-agent boot).
         self._init_failures: list[tuple[str, Exception]] = []
+        # LocalAgentConfig per agent created at runtime via create_agent —
+        # consumed by the create-agent endpoint to persist registrations.
+        self._created_configs: dict[str, "LocalAgentConfig"] = {}
 
     async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
         """Create and initialize a KestrelAgent from a multi_agent config entry.
@@ -156,6 +172,17 @@ class AgentManager:
         loaded = 0
         # Reset failure list — fresh load attempt.
         self._init_failures = []
+        # RESERVE every configured port and the host's own port (codex P1
+        # rounds 4-5 on #2358): a runtime-created agent must never take a port
+        # something already owns — once persisted, the next boot fails
+        # MultiAgentConfig's port-conflict validation and bricks startup. A
+        # high host port must NOT starve the range below it (round 6).
+        host_port = getattr(getattr(config, "host", None), "port", None)
+        if isinstance(host_port, int):
+            self._reserved_ports.add(host_port)
+        for agent_cfg in config.agents.values():
+            if isinstance(agent_cfg, LocalAgentConfig):
+                self._reserved_ports.add(agent_cfg.port)
         for name, agent_cfg in config.agents.items():
             if not isinstance(agent_cfg, LocalAgentConfig):
                 logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
@@ -206,18 +233,56 @@ class AgentManager:
         Returns:
             True if agent was found and removed.
         """
+        # Refuse to remove an agent that still has budgeted descendants (#2113):
+        # remove_agent is a single-agent primitive, so releasing this agent's hold
+        # while a budgeted grandchild still holds from its (about-to-be-removed)
+        # wallet would strand the grandchild's unspent budget on its later
+        # release. Such teardown must go through terminate_child, which cascades
+        # and releases nested budgets leaf-first. terminate_child/shutdown_all
+        # remove descendants BEFORE the parent, so they never trip this.
+        if self._has_budgeted_descendants(name):
+            raise ValueError(
+                f"Cannot remove '{name}' directly: it has budgeted child agents. "
+                f"Use terminate_child, which cascades and releases nested budgets "
+                f"leaf-first (#2113)."
+            )
+
         async with self._lock:
             agent = self._agents.pop(name, None)
-            if not agent:
-                return False
-            agent_id = agent.agent_id
-            self._agent_names.pop(agent_id, None)
-            try:
-                await asyncio.wait_for(agent.shutdown(), timeout=5.0)
-                logger.info(f"Agent '{name}' shut down")
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning(f"Agent '{name}' shutdown issue: {e}")
-            return True
+            if agent is not None:
+                self._agent_names.pop(agent.agent_id, None)
+                try:
+                    await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+                    logger.info(f"Agent '{name}' shut down")
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Agent '{name}' shutdown issue: {e}")
+
+        # Release THIS agent's own budget hold AFTER it is stopped (#2113):
+        # releasing before shutdown would let a still-running child spend
+        # already-refunded funds. remove_agent is a SINGLE-AGENT primitive — it
+        # does not cascade. Budgeted subtrees are torn down via terminate_child
+        # (cascade) or shutdown_all (leaf-first), which release nested holds in
+        # the correct order; directly remove_agent-ing a budgeted PARENT is not a
+        # supported budget teardown (folded into #2348 with reload durability).
+        # Idempotent — a no-op when those paths already released this entry.
+        await self._release_child_budget(name)
+        return agent is not None
+
+    def _allocate_port(self) -> int:
+        """Pick the first FREE in-range agent port and reserve it.
+
+        Reservations cover configured agents, the host itself, and every
+        prior runtime allocation — and are never released (an unloaded
+        agent's port stays reserved, the #1729 guarantee). Scanning instead
+        of incrementing means a high host port can't starve the range.
+        """
+        candidate = self._port_scan_start
+        while candidate in self._reserved_ports:
+            candidate += 1
+            if candidate > 65535:
+                raise ValueError("No free agent ports remain in 8801-65535.")
+        self._reserved_ports.add(candidate)
+        return candidate
 
     async def create_agent(
         self,
@@ -255,6 +320,10 @@ class AgentManager:
         if self.get_agent(name) is not None:
             raise ValueError(f"Agent '{name}' already exists")
 
+        # Allocate the port BEFORE inception (codex round 6): failing the
+        # allocation after inception leaves an orphaned identity directory.
+        port = self._allocate_port()
+
         from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
         agent_dir = self._base_data_dir / "agent_data" / name
@@ -268,15 +337,23 @@ class AgentManager:
                 spawn_mandate=mandate,
             )
         except Exception as e:
+            # No agent came into being — release the reservation so repeated
+            # failures can't drain the allocator (codex P3 round 12). Ports of
+            # agents that EXISTED keep their never-reuse guarantee (#1729).
+            self._reserved_ports.discard(port)
             raise ValueError(f"Inception failed for '{name}': {e}")
 
-        self._port_seq += 1
         config = LocalAgentConfig(
             data_dir=Path("agent_data") / name,
-            port=self._port_seq,  # monotonic — never reuses an unloaded agent's port
+            port=port,  # reserved — never reused, never colliding (see _allocate_port)
             autostart=True,
             features=features,
         )
+        # Retain the created config so callers (the create-agent endpoint) can
+        # PERSIST the registration into multi_agent.toml — without that, a
+        # config-file-driven deployment silently loses UI-created agents on
+        # the next restart (codex P1 on #2358).
+        self._created_configs[name] = config
         return await self.load_agent(name, config)
 
     def _parent_feature_names(self, parent_agent: KestrelAgent) -> set[str]:
@@ -314,6 +391,143 @@ class AgentManager:
         if not ok:
             raise ValueError(f"Spawn refused: {msg}")
 
+    # ------------------------------------------------------------------
+    # Per-child spawn budgets (#2113): hold from the parent on spawn, route the
+    # child's spend through a ceiling'd DelegatedWallet, release the unspent hold
+    # on termination.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mandate_budget(mandate: SpawnMandate) -> Decimal:
+        """The mandate's requested budget as a Decimal (0 when unset/invalid)."""
+        raw = getattr(mandate, "budget_allocation", 0) or 0
+        try:
+            return Decimal(str(raw))
+        except Exception:  # noqa: BLE001 — a malformed budget is treated as none
+            return Decimal("0")
+
+    def _validate_budget_precondition(
+        self, parent_agent: KestrelAgent, mandate: SpawnMandate
+    ) -> None:
+        """Refuse a positive budget the parent can't back (#2113), before spawn."""
+        budget = self._mandate_budget(mandate)
+        if budget <= 0:
+            return
+        # Budgets are enforced IN-PROCESS only: the ceiling + hold live in memory
+        # and are released on termination/shutdown. A persistent (non-TTL) child
+        # could outlive the process and be reloaded WITHOUT the delegated wrapper,
+        # bypassing the cap — so restrict budgets to ephemeral (TTL-bounded)
+        # children, which are torn down within the process and never reloaded.
+        # Durable budgets for persistent children (persist `spent` + rehydrate on
+        # load + crash reconciliation) are tracked in #2348.
+        ttl = getattr(mandate, "ttl_seconds", 0) or 0
+        if ttl <= 0:
+            raise ValueError(
+                "Spawn refused: a per-child budget requires an ephemeral child "
+                "(ttl_seconds > 0). Budgets are enforced in-process and are not yet "
+                "durable across a reload of a persistent child (#2348). Set a TTL, "
+                "or spawn without a budget."
+            )
+        parent_wallet = getattr(parent_agent, "wallet", None)
+        if parent_wallet is None:
+            raise ValueError(
+                "Spawn refused: a per-child budget requires the parent to have a "
+                "funded wallet (enable the wallet feature). Spawn without a budget "
+                "or fund the parent's wallet."
+            )
+        currency = _default_currency_for(parent_wallet)
+        if not parent_wallet.can_afford(budget, currency):
+            raise ValueError(
+                f"Spawn refused: parent wallet cannot afford the requested budget "
+                f"of {budget}."
+            )
+
+    async def _apply_delegated_budget(
+        self,
+        name: str,
+        parent_agent: KestrelAgent,
+        child: KestrelAgent,
+        mandate: SpawnMandate,
+    ) -> None:
+        """Hold the budget from the parent and point the child's wallet at a
+        ceiling'd DelegatedWallet (#2113). No-op for budget<=0."""
+        budget = self._mandate_budget(mandate)
+        if budget <= 0:
+            return
+        parent_wallet = getattr(parent_agent, "wallet", None)
+        if parent_wallet is None:
+            return  # precondition already refused this; defensive.
+        try:
+            delegated = await create_delegated_wallet(
+                parent_wallet=parent_wallet,
+                parent_did=parent_agent.agent_id,
+                child_did=child.agent_id,
+                budget=budget,
+            )
+        except Exception:
+            # The hold failed AFTER the child was created (e.g. a concurrent
+            # spend drained the parent). Don't leave an uncapped child running.
+            await self.remove_agent(name)
+            raise
+        child.wallet = delegated
+        child.wallet_agent = delegated
+        # Also expose it as ``_delegated_wallet`` so the spawn-status endpoint
+        # reports live budget_spent / budget_remaining (#2113).
+        child._delegated_wallet = delegated
+        self._child_budgets[name] = (delegated, parent_wallet)
+        logger.info(
+            "Applied delegated budget %s to child '%s' — spend now ceiling'd (#2113).",
+            budget, name,
+        )
+
+    def _has_budgeted_descendants(self, name: str) -> bool:
+        """True if any descendant of ``name`` still holds a budget (#2113).
+
+        Keys on ``_child_budgets`` membership (not just the parent-child graph),
+        so an already-released descendant — remove_agent pops its budget but not
+        its ``_parent_children`` entry — no longer counts.
+        """
+        seen: set = set()
+
+        def visit(n: str) -> bool:
+            agent = self._agents.get(n)
+            did = getattr(agent, "agent_id", None) if agent is not None else None
+            if not did:
+                return False
+            for child in self._parent_children.get(did, []):
+                if child in seen:
+                    continue
+                seen.add(child)
+                if child in self._child_budgets:
+                    return True
+                if visit(child):
+                    return True
+            return False
+
+        return visit(name)
+
+    async def _release_child_budget(self, child_name: str) -> None:
+        """Credit a terminated child's unspent budget back to its parent (#2113).
+
+        Best-effort: a wallet error must not block termination/cleanup. The
+        cascade case (a budgeted child with budgeted descendants) is handled by
+        ``terminate_child`` recursing — each descendant releases its own hold.
+        """
+        entry = self._child_budgets.pop(child_name, None)
+        if entry is None:
+            return
+        delegated, parent_wallet = entry
+        try:
+            returned = await release_delegated_wallet(delegated, parent_wallet)
+            logger.info(
+                "Released delegated budget for '%s': returned %s to parent (#2113).",
+                child_name, returned,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to release delegated budget for '%s': %s", child_name, e
+            )
+
     async def spawn_agent(
         self,
         name: str,
@@ -342,6 +556,12 @@ class AgentManager:
         # before any inception work, so an over-broad mandate is refused rather
         # than silently producing a child with more authority than its parent.
         self._validate_mandate_subset(parent_agent, mandate)
+
+        # Budget precondition (#2113): a positive budget requires a funded parent
+        # wallet to hold from, or the ceiling would be advertised-but-unenforced.
+        # Validated before any inception work so it is refused rather than
+        # producing an uncapped child.
+        self._validate_budget_precondition(parent_agent, mandate)
 
         # Spawn caps (#1729): bound runaway spawning. The check + reservation run
         # under the manager lock so concurrent spawn_agent calls can't all read
@@ -391,22 +611,13 @@ class AgentManager:
         # Ed25519 and ML-DSA-65; legacy parents fall through to the
         # bare-hex ECDSA path. The parent's runtime identity is set
         # on the agent at startup by KestrelAgent.__init__ (#999).
-        parent_private_key = getattr(parent_agent, '_private_key', None)
-        parent_identity = getattr(parent_agent, 'identity', None)
-        if parent_private_key is not None:
-            sign_mandate(
-                mandate, parent_private_key,
-                parent_identity=parent_identity,
-            )
-
-        # Create the child via the existing create_agent flow. Thread the
-        # mandate's feature allowlist into the child's config so the grant is
-        # actually enforced at load time — without this the child loads ALL
-        # features regardless of what the mandate permitted (#1946). An empty
-        # list is a real (empty) allowlist; only ``None`` means "load all".
-        features_allowed = getattr(mandate, "features_allowed", None)
-        if features_allowed:
-            child_features = list(features_allowed)
+        # Resolve the child's feature ceiling BEFORE signing so the signed
+        # mandate — and the spawned_by edge inception persists from it — records
+        # the ACTUAL ceiling, explicit or inherited (#1946). An empty list is a
+        # real (empty) allowlist; only ``None`` means "load all".
+        explicit_features = getattr(mandate, "features_allowed", None)
+        if explicit_features:
+            child_features = list(explicit_features)
         else:
             # No explicit allowlist ⇒ inherit the PARENT's feature ceiling, NOT
             # "load all discovered features" (F277 / codex P1). Otherwise a
@@ -414,6 +625,21 @@ class AgentManager:
             # omitting features_allowed. A parent with no resolvable feature set
             # (degenerate/test doubles) falls back to None (load all).
             child_features = sorted(self._parent_feature_names(parent_agent)) or None
+            # Persist the INHERITED ceiling onto the mandate so it is durable on
+            # the edge and enforced on every boot path (#2226) — not just via
+            # this process's config threading. Without this, an inherited-ceiling
+            # child persists an empty features_allowed and, on a direct restart
+            # outside AgentManager, would escape its ceiling and load everything.
+            if child_features:
+                mandate.features_allowed = list(child_features)
+
+        parent_private_key = getattr(parent_agent, '_private_key', None)
+        parent_identity = getattr(parent_agent, 'identity', None)
+        if parent_private_key is not None:
+            sign_mandate(
+                mandate, parent_private_key,
+                parent_identity=parent_identity,
+            )
         child = await self.create_agent(
             name,
             parent_did=parent_agent.agent_id,
@@ -423,6 +649,12 @@ class AgentManager:
 
         # Fill in child DID on the mandate
         mandate.child_did = child.agent_id
+
+        # Per-child budget (#2113): hold from the parent and route the child's
+        # spend through a ceiling'd DelegatedWallet. On hold failure this removes
+        # the just-created child and re-raises (no uncapped orphan).
+        await self._apply_delegated_budget(name, parent_agent, child, mandate)
+
         # Runtime enforcement (spawn_mandate attach + restricted_tools hook) is
         # applied uniformly in load_agent from the persisted delegation edge
         # (#2137), which already ran for this child inside create_agent — so it
@@ -473,6 +705,10 @@ class AgentManager:
         if child_agent is not None:
             await self.terminate_children(child_agent.agent_id)
 
+        # NB: the child's own budget hold is released inside remove_agent below
+        # (stop-then-release), after the cascade above has already stopped and
+        # released every descendant — so refunds flow up leaf-first (#2113).
+
         # Remove from parent tracking
         children.remove(child_name)
         if not children:
@@ -505,6 +741,15 @@ class AgentManager:
 
     async def shutdown_all(self) -> None:
         """Gracefully shutdown all agents."""
+        # Stop + release budgeted children leaf-first (#2113): reverse insertion
+        # order is leaf-first (a descendant is always spawned after its ancestor),
+        # so each is quiesced and its unspent hold refunded UP into its (budgeted)
+        # parent before that parent is released to the root. remove_agent does the
+        # stop-then-release. (A follow-up covers durable reconciliation across an
+        # *ungraceful* crash.)
+        for child_name in reversed(list(self._child_budgets.keys())):
+            await self.remove_agent(child_name)
+
         # Clear parent-child tracking
         self._parent_children.clear()
         self._child_mandates.clear()

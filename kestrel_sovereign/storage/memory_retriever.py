@@ -2,10 +2,11 @@
 Human-like memory retrieval with weighted scoring.
 
 Retrieves memories using human-like weighting:
-- Semantic relevance (30%)
-- Emotional congruence (25%)
+- Semantic relevance (25%)
+- Emotional congruence (20%)
 - Importance (20%)
 - Recency with decay (15%)
+- Epistemic certainty (10%)
 - Access frequency (10%)
 
 This creates retrieval that feels like human memory:
@@ -36,12 +37,18 @@ import asyncio
 import logging
 import math
 import struct
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
 import json
 
 from .memory_models import MemoryMetadata
-from .async_conversation_store import AsyncConversationStore
+from .async_conversation_store import (
+    AsyncConversationStore,
+    _TOKEN_MATCH_THRESHOLD,
+    _strip_search_wrappers,
+    _token_match_score,
+    _tokenize_for_search,
+)
 from .associative_linker import AssociativeLinker
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
@@ -79,15 +86,57 @@ def _normalize_for_echo_check(text: str) -> str:
     return " ".join(tokens)
 
 
+_INTERROGATIVE_OPENERS = frozenset({
+    "what", "which", "who", "whom", "whose", "how", "when", "where", "why",
+    "do", "does", "did", "can", "could", "would", "should", "is", "are",
+    "was", "were", "have", "has", "will",
+})
+
+
+def _is_user_query_echo(content: str, query: str) -> bool:
+    """Drop a prior user *question* that contains this retrieval query.
+
+    Exact normalization remains the first guard.  The containment rule applies
+    only to interrogative/request-shaped turns, so factual user memories remain
+    eligible (``"my favorite color is blue"`` queried with ``"blue"``), while
+    dogfood probes such as ``"Which memory mentions absentneedle?"`` cannot
+    manufacture evidence for the later query ``"absentneedle"``.
+    """
+    if _normalize_for_echo_check(content) == _normalize_for_echo_check(query):
+        return True
+    stripped = content.strip()
+    first = (
+        stripped.split(maxsplit=1)[0].strip(_ECHO_EDGE_PUNCT).lower()
+        if stripped else ""
+    )
+    if "?" not in stripped and first not in _INTERROGATIVE_OPENERS:
+        return False
+    query_tokens = set(_tokenize_for_search(_strip_search_wrappers(query)))
+    content_tokens = set(_tokenize_for_search(_strip_search_wrappers(stripped)))
+    if bool(query_tokens) and query_tokens <= content_tokens:
+        return True
+    # Adversarial/dogfood probes often suffix a nonce to prove that no stored
+    # fact exists (``absentneedle-7f3c91``). The canonical tokenizer splits
+    # that into a distinctive stem plus nonce. A prior question containing the
+    # stem must not become its own evidence merely because the full query has
+    # an extra token. Keep this deliberately narrow: a shared token must be
+    # long enough to carry real identity, and this runs only on questions.
+    return any(
+        len(token) >= 8 and token in content_tokens
+        for token in query_tokens
+    )
+
+
 def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
-    """Cosine similarity normalised into ``[0, 1]``.
+    """Return positive cosine relevance in ``[0, 1]``.
 
     Returns ``None`` when the inputs are unusable (empty, length
     mismatch, zero norm) so the caller can fall back to keyword
     overlap for THIS row without mistaking "no signal" for
-    "neutral score." Otherwise returns ``(cos + 1) / 2`` so the
-    output sits in the same ``[0, 1]`` band the rest of
-    ``_score_semantic`` uses.
+    "neutral score." Orthogonal and negatively-correlated vectors are
+    irrelevant, not half-relevant, so both clamp to zero. This makes the
+    vector signal comparable to lexical overlap, whose no-match value is
+    also zero.
 
     Pure-Python (no numpy) — the retriever rescores ~1000 rows
     per call and a numpy import here adds a few ms of cold-start
@@ -105,7 +154,7 @@ def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
     if norm_a <= 0.0 or norm_b <= 0.0:
         return None
     raw = dot / math.sqrt(norm_a * norm_b)
-    return max(0.0, min(1.0, (raw + 1.0) / 2.0))
+    return max(0.0, min(1.0, raw))
 
 
 def _pack_embedding(embedding: Sequence[float]) -> bytes:
@@ -114,8 +163,8 @@ def _pack_embedding(embedding: Sequence[float]) -> bytes:
 
 
 def _similarity_to_unit(similarity: float) -> float:
-    """Normalize backend cosine similarity from ``[-1, 1]`` to ``[0, 1]``."""
-    return max(0.0, min(1.0, (float(similarity) + 1.0) / 2.0))
+    """Normalize backend cosine to positive relevance in ``[0, 1]``."""
+    return max(0.0, min(1.0, float(similarity)))
 
 
 class MemoryRetriever:
@@ -141,6 +190,7 @@ class MemoryRetriever:
 
     # Decay parameters (Ebbinghaus-inspired)
     DECAY_HALF_LIFE_DAYS = 30  # Memory strength halves every 30 days
+    RELATIVE_RELEVANCE_RATIO = 0.75
 
     def __init__(
         self,
@@ -158,6 +208,7 @@ class MemoryRetriever:
         self.linker = linker
         self._access_update_tasks: set[asyncio.Task[None]] = set()
         self._sqla_factory_unavailable = False
+        self._unprofiled_lexical_scan_warned = False
 
     async def retrieve(
         self,
@@ -166,6 +217,7 @@ class MemoryRetriever:
         emotional_context: Optional[MemoryMetadata] = None,
         limit: int = 10,
         min_score: float = 0.1,
+        min_relevance: float = 0.2,
         read_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
@@ -177,6 +229,8 @@ class MemoryRetriever:
             emotional_context: Current emotional context for matching
             limit: Max results to return
             min_score: Minimum score threshold
+            min_relevance: Independent semantic/lexical/associative eligibility
+                floor. Salience signals cannot rescue a candidate below it.
             read_only: When True, skip access-count update scheduling so
                 callers can estimate the memory block without rehearsal-effect
                 writes.
@@ -189,27 +243,9 @@ class MemoryRetriever:
         # Note: AsyncConversationStore's get_conversation_history doesn't take agent_id
         # because it's already scoped via self.agent_id in the store
         history = await self.conversations.get_conversation_history(limit=1000)
-
-        if not history:
-            return []
-
-        # Get expanded concepts if linker available
-        expanded_concepts: List[str] = []
-        if self.linker:
-            expanded_concepts = await self.linker.find_concepts_for_query(
-                query, agent_id
-            )
-
-        # Compute the query embedding ONCE if the conversation store
-        # has an embedding service. Done before the loop so we don't
-        # pay an Ollama round-trip per row. Any failure → None, which
-        # ``_score_semantic`` reads as "fall back to keyword overlap"
-        # for every row in this call.
         query_embedding = await self._embed_query(query)
+        vector_cosine_floor = self._query_similarity_floor()
 
-        # #1477 — only compare rows stamped with the current embedding
-        # profile id. Cross-profile rows return as absent from the vector
-        # signal and naturally fall through to keyword overlap.
         current_profile_id: Optional[str] = None
         embedding_service_for_profile = getattr(
             self.conversations, "embedding_service", None
@@ -226,7 +262,73 @@ class MemoryRetriever:
                     "current_profile_id() failed during retriever load: %s",
                     exc,
                 )
+        if (
+            query_embedding is not None
+            and current_profile_id is None
+            and not self._unprofiled_lexical_scan_warned
+        ):
+            logger.warning(
+                "Embedding service has no profile id; memory retrieval must "
+                "lexically scan the full live corpus until the model is "
+                "profiled or backfilled."
+            )
+            self._unprofiled_lexical_scan_warned = True
 
+        # Recent history is only one candidate source. Pinned and important
+        # rows must remain recallable after they age beyond that window.
+        try:
+            salient = await self.conversations.get_salient_memory_candidates(
+                limit=max(100, limit * 10)
+            )
+            if not isinstance(salient, list):
+                salient = []
+        except Exception as exc:  # noqa: BLE001 - optional candidate source
+            logger.debug("Salient memory candidate generation unavailable: %s", exc)
+            salient = []
+        lexical: List[Dict[str, Any]] = []
+        try:
+            # Always cover rows outside the active vector space. A deployment
+            # is commonly mixed during backfill/model migration; treating one
+            # non-empty kNN result as proof that every row is embedded makes
+            # exact legacy facts permanently invisible. When no query vector
+            # exists, scan every live row as the complete fallback.
+            lexical = await self.conversations.get_lexical_memory_candidates(
+                query,
+                limit=max(100, limit * 10),
+                excluded_embedding_profile_id=(
+                    current_profile_id if query_embedding is not None else None
+                ),
+            )
+            if not isinstance(lexical, list):
+                lexical = []
+        except Exception as exc:  # noqa: BLE001 - candidate source is degradable
+            logger.warning("Lexical memory candidate generation unavailable: %s", exc)
+            lexical = []
+        by_id = {
+            str(row.get("id")): row
+            for row in [*history, *salient, *lexical]
+            if row.get("id") is not None
+        }
+        history = list(by_id.values())
+
+        if not history:
+            return []
+
+        # Get expanded concepts if linker available
+        expanded_concepts: List[str] = []
+        if self.linker:
+            expanded_concepts = await self.linker.find_concepts_for_query(
+                query, agent_id
+            )
+
+        # Compute the query embedding ONCE if the conversation store
+        # has an embedding service. Done before the loop so we don't
+        # pay an Ollama round-trip per row. Any failure → None, which
+        # ``_score_semantic`` reads as "fall back to keyword overlap"
+        # for every row in this call.
+        # #1477 — only compare rows stamped with the current embedding
+        # profile id. Cross-profile rows return as absent from the vector
+        # signal and naturally fall through to keyword overlap.
         # If we have a query embedding, ask the sovereign vector backend for
         # per-row semantic similarities. We still score the full recent-history
         # slice below so emotional/importance/recency/access/certainty ranking
@@ -237,8 +339,34 @@ class MemoryRetriever:
                 query_embedding=query_embedding,
                 agent_id=agent_id,
                 current_profile_id=current_profile_id,
-                k=len(history),
+                k=max(200, limit * 20),
             )
+
+            # Active-profile rows are represented by this bounded kNN source;
+            # lexical scanning below deliberately covers rows *outside* that
+            # space. Searching every active embedded row lexically would turn
+            # every healthy encrypted-vector query into an O(total corpus)
+            # decrypt pass. Keep k comfortably above the rendered result count
+            # and rely on embedding backfill/profile audits for coverage.
+
+            # Vector kNN searches the whole live corpus. Hydrate older hits so
+            # reranking is not constrained to recent/salient seed rows.
+            missing_vector_ids = [
+                int(row_id) for row_id in semantic_similarities
+                if row_id not in by_id and str(row_id).isdigit()
+            ]
+            if missing_vector_ids:
+                try:
+                    vector_rows = await self.conversations.get_messages_by_ids(
+                        missing_vector_ids
+                    )
+                except Exception as exc:  # noqa: BLE001 - vector hydration fallback
+                    logger.debug("Could not hydrate vector memory candidates: %s", exc)
+                    vector_rows = []
+                if isinstance(vector_rows, list):
+                    for row in vector_rows:
+                        by_id[str(row.get("id"))] = row
+                    history = list(by_id.values())
 
         # SQLAlchemy/vector backend unavailable (in-memory SQLite, from_pool,
         # migration in progress, optional pgvector package missing, etc.) falls
@@ -283,10 +411,30 @@ class MemoryRetriever:
         query_normalized = _normalize_for_echo_check(query)
 
         # Score each message
-        scored: List[Tuple[Dict[str, Any], float]] = []
+        scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]] = []
 
         for msg in history:
             content = msg.get("content", "")
+            metadata = msg.get("metadata", {}) or {}
+
+            # Operator/signal transport and explicit commands are control
+            # plane records, not autobiographical memories. They can contain
+            # vocabulary that spuriously dominates kNN (especially the query
+            # embedded in a prior !memory command), so fail closed here.
+            if metadata.get("operator_signal") or metadata.get("signal_wake"):
+                continue
+            # Structured claim tools already hide superseded decisions/action
+            # items by default. General recall must honor the same explicit
+            # stale marker or it can inject an obsolete fact beside its
+            # replacement and ask the LLM to guess which one is current.
+            if metadata.get("superseded_by"):
+                continue
+            raw_user_content = (
+                extract_raw_user_content(content)
+                if msg.get("role") == "user" else content
+            )
+            if msg.get("role") == "user" and raw_user_content.lstrip().startswith("!"):
+                continue
 
             # Skip messages that are near-duplicates of the current query.
             # This is the ONLY echo guard now — the prior blanket
@@ -305,33 +453,69 @@ class MemoryRetriever:
             # rows, not just on synthetic test data. (Codex P2 on PR-1481.)
             comparison_content = content
             if msg.get("role") == "user":
-                comparison_content = extract_raw_user_content(content)
-            if _normalize_for_echo_check(comparison_content) == query_normalized:
+                comparison_content = raw_user_content
+            if (
+                _normalize_for_echo_check(comparison_content) == query_normalized
+                or (
+                    msg.get("role") == "user"
+                    and _is_user_query_echo(comparison_content, query)
+                )
+            ):
                 continue
 
-            score = self._calculate_score(
+            components = self._calculate_score_components(
                 content=content,
                 query=query,
-                metadata=msg.get("metadata", {}),
+                metadata=metadata,
                 emotional_context=emotional_context,
                 created_at=msg.get("created_at"),
                 expanded_concepts=expanded_concepts,
                 query_embedding=query_embedding,
                 content_embedding=row_embeddings.get(msg.get("id")),
                 semantic_similarity=semantic_similarities.get(str(msg.get("id"))),
+                vector_cosine_floor=vector_cosine_floor,
             )
 
-            if score >= min_score:
-                scored.append((msg, score))
+            relevance = components["semantic"]
+            score = components["total"]
+            logger.debug(
+                "memory candidate id=%s relevance=%.4f total=%.4f "
+                "components=%s eligible=%s",
+                msg.get("id"), relevance, score, components,
+                relevance >= min_relevance and score >= min_score,
+            )
+            if relevance >= min_relevance and score >= min_score:
+                scored.append((msg, score, components))
 
-        # Sort by score descending
+        # Salience reranks genuinely competitive memories; it must not let a
+        # merely-above-threshold fresh/important row outrank the query's much
+        # stronger semantic match. The relative gate adapts to each query and
+        # embedding model while the absolute ``min_relevance`` gate still
+        # provides abstention. Empirical suite v1 selected 0.75: all 15
+        # answerable Qwen-8B and Nomic cases remained recallable/top-1 while
+        # high-salience distractors stopped winning.
+        if scored:
+            strongest_relevance = max(item[2]["semantic"] for item in scored)
+            competitive_floor = (
+                strongest_relevance * self.RELATIVE_RELEVANCE_RATIO
+            )
+            scored = [
+                item for item in scored
+                if item[2]["semantic"] >= competitive_floor
+            ]
+
+        # Sort competitive candidates by human-like salience score.
         scored.sort(key=lambda x: x[1], reverse=True)
 
         # Return top results with scores
         results = []
-        for msg, score in scored[:limit]:
+        for msg, score, components in scored[:limit]:
             result = dict(msg)
             result["retrieval_score"] = round(score, 4)
+            result["relevance_score"] = round(components["semantic"], 4)
+            result["retrieval_components"] = {
+                key: round(value, 4) for key, value in components.items()
+            }
             results.append(result)
 
         if not read_only:
@@ -351,6 +535,11 @@ class MemoryRetriever:
         self._access_update_tasks.add(task)
         task.add_done_callback(self._access_update_tasks.discard)
         return task
+
+    async def record_accesses(self, message_ids: Iterable[int], agent_id: str) -> None:
+        """Record rehearsal only for memories a caller actually surfaced."""
+        for message_id in dict.fromkeys(message_ids):
+            self._schedule_access_update(message_id, agent_id)
 
     async def drain_access_updates(self, *, cancel: bool = False) -> None:
         """Wait for scheduled access-count updates before storage lifecycle changes."""
@@ -380,6 +569,7 @@ class MemoryRetriever:
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
         semantic_similarity: Optional[float] = None,
+        vector_cosine_floor: float = 0.0,
     ) -> float:
         """
         Calculate weighted retrieval score.
@@ -393,6 +583,33 @@ class MemoryRetriever:
         - certainty: 10% (epistemic weight)
         - access: 10% (rehearsal effect)
         """
+        return self._calculate_score_components(
+            content=content,
+            query=query,
+            metadata=metadata,
+            emotional_context=emotional_context,
+            created_at=created_at,
+            expanded_concepts=expanded_concepts,
+            query_embedding=query_embedding,
+            content_embedding=content_embedding,
+            semantic_similarity=semantic_similarity,
+            vector_cosine_floor=vector_cosine_floor,
+        )["total"]
+
+    def _calculate_score_components(
+        self,
+        content: str,
+        query: str,
+        metadata: Dict[str, Any],
+        emotional_context: Optional[MemoryMetadata],
+        created_at: Optional[str],
+        expanded_concepts: List[str],
+        query_embedding: Optional[List[float]] = None,
+        content_embedding: Optional[List[float]] = None,
+        semantic_similarity: Optional[float] = None,
+        vector_cosine_floor: float = 0.0,
+    ) -> Dict[str, float]:
+        """Return calibrated component scores and their weighted total."""
         # Parse metadata if string
         if isinstance(metadata, str):
             try:
@@ -411,6 +628,7 @@ class MemoryRetriever:
             query_embedding=query_embedding,
             content_embedding=content_embedding,
             semantic_similarity=semantic_similarity,
+            vector_cosine_floor=vector_cosine_floor,
         )
 
         # 2. Emotional score (mood congruence)
@@ -442,7 +660,15 @@ class MemoryRetriever:
             certainty * self.WEIGHT_CERTAINTY
         )
 
-        return total
+        return {
+            "semantic": semantic,
+            "emotional": emotional,
+            "importance": importance,
+            "recency": recency,
+            "access": access,
+            "certainty": certainty,
+            "total": total,
+        }
 
     def _score_semantic(
         self,
@@ -452,6 +678,7 @@ class MemoryRetriever:
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
         semantic_similarity: Optional[float] = None,
+        vector_cosine_floor: float = 0.0,
     ) -> float:
         """
         Score semantic relevance.
@@ -465,32 +692,56 @@ class MemoryRetriever:
            concept-expansion path from :class:`AssociativeLinker` still
            rewards related-concept matches the embedding might miss
            on short utterances.
-        2. **Keyword overlap** fallback when embeddings aren't
-           available — same shape as the original
-           ``TODO: can be upgraded to embeddings`` implementation,
-           preserved verbatim so a deployment without Ollama keeps
-           the prior behaviour.
+        2. **Tokenized lexical overlap** fallback when embeddings aren't
+           available. It reuses conversation search's canonical wrapper,
+           punctuation, stopword, and negation semantics rather than a second
+           whitespace tokenizer.
 
         Mixing both paths within a single ``retrieve()`` call is
         intentional: rows written before the Phase-2 migration / while
         Ollama was down get keyword scores; new rows get cosine. The
-        scores are normalised into the same 0..1 band so this doesn't
+        scores use the same no-match=0 and exact-match=1 calibration so this doesn't
         produce a discontinuity in the final ranking.
         """
+        projected_content = _strip_search_wrappers(content)
+        query_tokens = list(dict.fromkeys(
+            _tokenize_for_search(_strip_search_wrappers(query))
+        ))
+        lexical = _token_match_score(query_tokens, projected_content.lower())
+        # Candidate generation deliberately accepts any overlap so it cannot
+        # hide an old exact fact before final scoring. Eligibility uses the
+        # canonical match threshold: a single shared word in a two-token
+        # unknown query ("favorite planet" → "favorite breakfast") is noise,
+        # not 50%-relevant memory evidence.
+        if lexical < _TOKEN_MATCH_THRESHOLD:
+            lexical = 0.0
+
         if semantic_similarity is not None:
-            content_lower = content.lower()
+            calibrated_vector = max(
+                0.0,
+                (semantic_similarity - vector_cosine_floor)
+                / (1.0 - vector_cosine_floor),
+            )
+            core_relevance = max(lexical, min(1.0, calibrated_vector))
+            content_lower = projected_content.lower()
             concept_score = 0.0
             if expanded_concepts:
                 concept_matches = sum(
                     1 for c in expanded_concepts if c in content_lower
                 )
                 concept_score = min(1.0, concept_matches / len(expanded_concepts))
-            return semantic_similarity * 0.7 + concept_score * 0.3
+            return core_relevance * 0.7 + concept_score * 0.3
 
         if query_embedding is not None and content_embedding is not None:
             cosine = _cosine_unit(query_embedding, content_embedding)
             if cosine is not None:
-                content_lower = content.lower()
+                calibrated_vector = max(
+                    0.0,
+                    (cosine - vector_cosine_floor)
+                    / (1.0 - vector_cosine_floor),
+                )
+                core_relevance = max(lexical, min(1.0, calibrated_vector))
+                content_lower = projected_content.lower()
                 concept_score = 0.0
                 if expanded_concepts:
                     concept_matches = sum(
@@ -502,27 +753,9 @@ class MemoryRetriever:
                 # Same 70/30 split the keyword path uses — keeps the
                 # weighting between "core signal" and "concept-expansion
                 # bonus" consistent across paths.
-                return cosine * 0.7 + concept_score * 0.3
+                return core_relevance * 0.7 + concept_score * 0.3
 
-        content_lower = content.lower()
-        query_lower = query.lower()
-
-        # Split into words
-        query_words = set(query_lower.split())
-        content_words = set(content_lower.split())
-
-        # Remove very common words
-        stop_words = {"the", "a", "an", "is", "are", "was", "were", "i", "you",
-                      "to", "and", "of", "in", "it", "that", "this", "for"}
-        query_words -= stop_words
-        content_words -= stop_words
-
-        if not query_words:
-            return 0.5  # Neutral if no meaningful query words
-
-        # Keyword overlap
-        overlap = len(query_words & content_words)
-        keyword_score = min(1.0, overlap / len(query_words))
+        content_lower = projected_content.lower()
 
         # Concept match bonus
         concept_score = 0.0
@@ -533,7 +766,7 @@ class MemoryRetriever:
             concept_score = min(1.0, concept_matches / len(expanded_concepts))
 
         # Combine: 70% keyword, 30% concept
-        return keyword_score * 0.7 + concept_score * 0.3
+        return lexical * 0.7 + concept_score * 0.3
 
     def _get_vector_session_factory(self):
         """Build/reuse the SQLAlchemy factory backing vector search."""
@@ -586,6 +819,7 @@ class MemoryRetriever:
             filter_kwargs: Dict[str, Any] = {
                 "agent_id": agent_id,
                 "deleted_at": None,
+                "archived_at": None,
             }
             if current_profile_id is not None:
                 filter_kwargs["embedding_profile_id"] = current_profile_id
@@ -631,7 +865,11 @@ class MemoryRetriever:
         if not query or not query.strip():
             return None
         try:
-            embedding = await service.aembed(query)
+            from kestrel_sovereign.llm.embedding_service import (
+                aembed_retrieval_query,
+            )
+
+            embedding = await aembed_retrieval_query(service, query)
         except Exception as e:
             logger.warning(
                 "Query embedding failed (falling back to keyword "
@@ -641,6 +879,18 @@ class MemoryRetriever:
         if not embedding:
             return None
         return list(embedding)
+
+    def _query_similarity_floor(self) -> float:
+        """Read model-specific cosine calibration from the embedding service."""
+        service = getattr(self.conversations, "embedding_service", None)
+        floor_getter = getattr(service, "retrieval_similarity_floor", None)
+        if not callable(floor_getter):
+            return 0.0
+        try:
+            floor = float(floor_getter())
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(0.99, floor))
 
     def _score_emotional(
         self,
@@ -657,6 +907,14 @@ class MemoryRetriever:
             return 0.5  # Neutral if no context
 
         memory_valence = metadata.get("emotional_valence", 0.0)
+        # New tagger rows carry attribution confidence. Legacy rows omit it
+        # and retain their historical full-strength behavior.
+        confidence = metadata.get("emotional_confidence")
+        if confidence is not None:
+            try:
+                memory_valence *= max(0.0, min(1.0, float(confidence)))
+            except (TypeError, ValueError):
+                memory_valence = 0.0
         context_valence = emotional_context.emotional_valence
 
         # Same-direction valence is a match
@@ -666,8 +924,12 @@ class MemoryRetriever:
             match_strength = min(abs(memory_valence), abs(context_valence))
             return 0.5 + match_strength * 0.5
         elif memory_valence * context_valence < 0:
-            # Opposite valence - lower score
-            return 0.3
+            # Opposite valence lowers recall in proportion to reliable
+            # evidence. Confidence has already attenuated memory_valence;
+            # using only the sign here would give a 1%-confidence third-party
+            # emotion the same full penalty as a certain first-person one.
+            mismatch_strength = min(abs(memory_valence), abs(context_valence))
+            return 0.5 - mismatch_strength * 0.2
         else:
             # One or both neutral
             return 0.5

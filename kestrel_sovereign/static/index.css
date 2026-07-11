@@ -361,6 +361,21 @@ nav {
     color: rgba(255, 255, 255, 0.85);
 }
 
+/* mountAgentList (#2278, design §3.2): the shared list surface budgets vertical
+   room for a per-card actions row by DEFAULT so a host's portrait-card renderer
+   has real space for buttons under the portrait — that budget is a component
+   responsibility, not a per-host CSS patch. The console row lays out
+   horizontally and its actions anchor is usually empty; `:not(:empty)` keeps
+   the budget from adding height to a bare console row, so the standalone list is
+   visually unchanged from the pre-#2278 hand-rolled loop. */
+.agent-list-component .agent-card-actions:not(:empty) {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 1.75rem;
+    margin-top: 0.25rem;
+}
+
 /* Per-agent chat pane element. Each agent owns one of these
    detached fragments; mountChatPane() attaches the visible
    agent's pane as the sole child of #chat-container (the scroll
@@ -373,7 +388,10 @@ nav {
 
 /* Conversation items in Conversations pane */
 .conversation-item {
-    padding: 0.75rem;
+    /* #2254: reserve right padding so the tile's text (meta row + preview)
+       never underlaps the kebab, which is now absolutely pinned to the tile's
+       right edge and vertically centered (see `.conversation-item .kebab-btn`). */
+    padding: 0.75rem 2.25rem 0.75rem 0.75rem;
     border-radius: 8px;
     cursor: pointer;
     margin-bottom: 0.5rem;
@@ -385,10 +403,6 @@ nav {
 
 .conversation-item:hover {
     background: var(--bg-tertiary);
-}
-
-.conversation-item .conversation-meta-row {
-    padding-right: 2rem;
 }
 
 /* Hover-reveal delete affordance on conversation rows (#715). */
@@ -603,14 +617,17 @@ nav {
     opacity: 1;
 }
 
-/* #2216: the conversations pane has exactly TWO states — open (full pane) and
-   fully HIDDEN. "Closed" is NOT the thin `.pane-sidebar.collapsed` chevron rail
-   (that idiom still serves the Agents pane); it is `display:none`, taking zero
-   width. mountConversationsPane sets `display:none` inline and toggles this
-   class in lock-step; this rule backs the inline hide so no rail can leak
-   through. The pane also lives inside #panel-chat, so it's scoped to the chat
-   tab automatically. */
-.conversations-pane.collapsed {
+/* #2216 / #2279: both sidebar panes now have exactly TWO states — open (full
+   pane) and fully HIDDEN. "Closed" is NOT the thin `.pane-sidebar.collapsed`
+   chevron rail (48px, see above); it is `display:none`, taking zero width.
+   mountConversationsPane / mountAgentListPane set `display:none` inline and
+   toggle `.collapsed` in lock-step; these rules back the inline hide so no rail
+   can leak through. The conversations pane lives inside #panel-chat (scoped to
+   the chat tab); the agents pane is a top-level nav surface reopened by the
+   nav's #agents-toggle-btn (identity.js toggleAgentsPane). The 48px
+   `.pane-sidebar.collapsed` rail above is no longer used by either pane. */
+.conversations-pane.collapsed,
+.agent-list-pane.collapsed {
     display: none;
 }
 
@@ -627,9 +644,10 @@ nav {
     padding: 0.5rem 0.25rem 0.25rem;
 }
 
-/* Meta row: time + message count on the left, kebab pinned right. Never wraps
-   (#2165) — at ~220px the compact time truncates with an ellipsis while the
-   count and kebab hold their size and the kebab stays pinned right. */
+/* Meta row: time + message count on the left. Never wraps (#2165) — at ~220px
+   the compact time truncates with an ellipsis while the count holds its size.
+   #2254: the kebab no longer lives in this row's flow; it is absolutely pinned
+   to the RIGHT of the whole tile, vertically centered (see below). */
 .conversation-item .conversation-meta-row {
     display: flex;
     flex-wrap: nowrap;
@@ -650,11 +668,8 @@ nav {
 }
 
 /* Kebab (⋯) button: a quiet icon button. Hover-reveal on row hover, but
-   always focusable (keyboard) — matching the old conv-delete-btn pattern.
-   Sits at the right end of the meta row via margin-left:auto. */
+   always focusable (keyboard) — matching the old conv-delete-btn pattern. */
 .kebab-btn {
-    margin-left: auto;
-    flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -670,6 +685,19 @@ nav {
     cursor: pointer;
     opacity: 0;
     transition: opacity 0.15s, background-color 0.15s;
+}
+
+/* #2254: pin the kebab to the RIGHT side of the tile, VERTICALLY CENTERED in
+   the row, rather than at the right end of the meta (time + count) line where
+   it read as awkward. `.conversation-item` is `position: relative`, so the
+   absolute kebab centers against the whole tile; the tile reserves right
+   padding so text never underlaps it. Hover-reveal + focusability are preserved
+   by the shared rules below, which are class-based (not layout-dependent). */
+.conversation-item .kebab-btn {
+    position: absolute;
+    right: 0.5rem;
+    top: 50%;
+    transform: translateY(-50%);
 }
 
 .conversation-item:hover .kebab-btn,
@@ -1633,6 +1661,86 @@ nav {
     word-break: break-word;
 }
 
+/* #1894: a todo mutation (delta) rendered as its own component bubble —
+   status chip + title + terminal condition + external links. Accent reflects
+   the todo status. */
+.part-todo {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.5rem 0.65rem;
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    border-left: 3px solid var(--accent-color);
+}
+.part-todo.todo-status-in_progress { border-left-color: #3b82f6; }
+.part-todo.todo-status-waiting { border-left-color: #f59e0b; }
+.part-todo.todo-status-blocked { border-left-color: #ef4444; }
+.part-todo.todo-status-done { border-left-color: #22c55e; }
+.part-todo.todo-status-cancelled { border-left-color: #6b7280; }
+.todo-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+.todo-status-chip {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    white-space: nowrap;
+}
+.todo-status-chip.todo-status-in_progress { color: #3b82f6; }
+.todo-status-chip.todo-status-waiting { color: #f59e0b; }
+.todo-status-chip.todo-status-blocked { color: #ef4444; }
+.todo-status-chip.todo-status-done { color: #22c55e; }
+.todo-status-chip.todo-status-cancelled { color: #6b7280; }
+.todo-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+    word-break: break-word;
+}
+.todo-meta {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    font-size: 0.72rem;
+    opacity: 0.85;
+}
+.todo-scope,
+.todo-priority {
+    padding: 0.05rem 0.35rem;
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+}
+.todo-priority-high { color: #f59e0b; }
+.todo-priority-urgent { color: #ef4444; }
+.todo-terminal {
+    font-size: 0.78rem;
+    opacity: 0.9;
+    word-break: break-word;
+}
+.todo-links {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+.todo-link {
+    font-size: 0.72rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    text-decoration: none;
+}
+a.todo-link:hover { text-decoration: underline; }
+
 .tool-activity-expandable {
     display: block;
 }
@@ -1924,6 +2032,112 @@ nav {
 .model-selector:focus {
     outline: none;
     border-color: var(--accent-color);
+}
+
+/* Unified Model-settings popover (#2264) */
+.model-settings-button {
+    padding: 0.5rem 0.9rem;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 280px;
+}
+
+.model-settings-button:hover,
+.model-settings-button[aria-expanded="true"] {
+    border-color: var(--accent-color);
+}
+
+.model-settings-summary {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-settings-panel {
+    /* Positioned as a fixed overlay by ModelSettingsPopover on open; these
+       styles cover the resting appearance and scoped-embed fallback. */
+    min-width: 260px;
+    max-width: 340px;
+    padding: 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--bg-secondary, var(--bg-primary));
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.model-settings-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.model-settings-section .model-selector {
+    max-width: none;
+    width: 100%;
+}
+
+.model-settings-section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary, var(--text-primary));
+}
+
+.embedding-dim-readout {
+    font-size: 0.72rem;
+    color: var(--text-secondary, var(--text-primary));
+}
+
+.embedding-dim-warning {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--warning-color, #b45309);
+    background: rgba(180, 83, 9, 0.1);
+    border-radius: 6px;
+    padding: 0.4rem 0.5rem;
+}
+
+/* #2336 — actionable "Re-embed N memories" control + progress readout. */
+.embedding-reindex-button {
+    align-self: flex-start;
+    margin-top: 0.15rem;
+}
+
+.embedding-reindex-status {
+    font-size: 0.72rem;
+    color: var(--text-secondary, var(--text-primary));
+}
+
+/* #2290 — shared local/cloud embedding space, rendered as one entry. */
+.embedding-shared-space {
+    font-size: 0.72rem;
+    color: var(--text-secondary, var(--text-primary));
+}
+
+/* #2337 — featured "Universal" option pinned at the top of the section. */
+.embedding-universal {
+    align-self: stretch;
+    text-align: left;
+    font-size: 0.75rem;
+    line-height: 1.3;
+    border-color: var(--accent-color, #2563eb);
+}
+
+.embedding-setup-status {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--text-secondary, var(--text-primary));
 }
 
 /* Model Controls Container */

@@ -467,3 +467,25 @@ def test_read_hash_handles_corrupt_properties_json(tmp_path):
         )
         conn.commit()
     assert isinstance(_read_anchored_constitution_hash(db), _NoHashProperty)
+
+
+def test_doctor_accepts_openrouter_management_key_only(tmp_path):
+    """#2245: a management-key-only OpenRouter route (api_key_env unset in .env,
+    but management_api_key_env present) must NOT be flagged — doctor must agree
+    with `kestrel setup --check`, which now accepts this shape."""
+    _seed_ready(tmp_path)
+    write_toml(tmp_path / "kestrel.toml", {"llm": {
+        "route_priority": ["openrouter:api"],
+        "vendors": {"openrouter": {"routes": {"api": {
+            "adapter": "OpenRouterAdapter",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY",
+            "model": "auto",
+        }}}},
+    }}, deep_merge=False)
+    # Only the management key is present in .env (no OPENROUTER_API_KEY).
+    p = tmp_path / ".env"
+    p.write_text(p.read_text() + "\nOPENROUTER_MANAGEMENT_API_KEY=sk-or-mgmt-xyz\n")
+    report = diagnose(tmp_path)
+    assert report.ready, f"fail={report.fail}"
+    assert not any("OPENROUTER_API_KEY" in m for m in report.fail)

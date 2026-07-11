@@ -37,6 +37,9 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     restart_coordinator   -- execute pending restart requests (#1512)
     github_pr_watch       -- poll a GitHub PR/issue, wake on relevant
                              state/comment/check/merge changes (#1618)
+    ecosystem_discovery_watch -- run stale-work/red-CI discovery and wake
+                             only on actionable new/changed/resolved findings
+                             (#2281)
     bootstrap_timeout_check -- flag agents left bootstrap_state=pending
                               past the timeout (#378)
 
@@ -59,7 +62,7 @@ from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.base import Feature, _serialize_tool_result, tool
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run, parse
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from kestrel_sovereign.features.storage_access import resolve_feature_database
@@ -138,6 +141,7 @@ class SchedulerFeature(Feature):
                     "backup_snapshot": self._handle_backup_snapshot,
                     "trash_retention": self._run_trash_retention,
                     "github_pr_watch": self._run_github_pr_watch,
+                    "ecosystem_discovery_watch": self._run_ecosystem_discovery_watch,
                     "sleep": self._handle_sleep,
                     "wait_reconcile": self._run_wait_reconcile,
                     "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
@@ -163,6 +167,14 @@ class SchedulerFeature(Feature):
 
             if _PR_ACTIVITY_SOURCE not in registry:
                 registry.register(build_github_pr_activity_registration())
+
+            from kestrel_sovereign.signals.sources.ecosystem_discovery import (
+                SOURCE_NAME as _DISCOVERY_SOURCE,
+                build_ecosystem_discovery_registration,
+            )
+
+            if _DISCOVERY_SOURCE not in registry:
+                registry.register(build_ecosystem_discovery_registration())
         else:
             logger.warning(
                 "SchedulerFeature: no signal_registry on agent, "
@@ -576,7 +588,7 @@ class SchedulerFeature(Feature):
                     # endpoints/agent.py history view).
                     if isinstance(result, str):
                         return result
-                    return json.dumps(result, default=str)
+                    return json.dumps(_serialize_tool_result(result), default=str)
 
         # Also check our own tools (SchedulerFeature has !schedule
         # commands but they're not typically scheduled themselves).
@@ -587,7 +599,7 @@ class SchedulerFeature(Feature):
                 )
                 if isinstance(result, str):
                     return result
-                return json.dumps(result, default=str)
+                return json.dumps(_serialize_tool_result(result), default=str)
 
         # A persisted built-in cron task (e.g. restart_coordinator) can
         # fire on the first scheduler tick after a restart BEFORE its
@@ -1005,6 +1017,173 @@ class SchedulerFeature(Feature):
                 now_iso,
             ),
         )
+
+    # ------------------------------------------------------------------
+    # ecosystem_discovery_watch (#2281)
+    # ------------------------------------------------------------------
+
+    async def _ensure_ecosystem_discovery_table(self) -> None:
+        """Lazily create the per-agent discovery-watch fingerprint table."""
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ecosystem_discovery_watch_state (
+                agent_id        TEXT NOT NULL,
+                watch_key       TEXT NOT NULL,
+                fingerprint     TEXT NOT NULL,
+                state_json      TEXT,
+                updated_at      TEXT,
+                PRIMARY KEY (agent_id, watch_key)
+            )
+            """
+        )
+
+    async def _load_ecosystem_discovery_state(self, watch_key: str):
+        """Return ``(fingerprint, state_dict)`` for a discovery watch."""
+        from kestrel_sovereign.signals.sources.ecosystem_discovery import (
+            state_from_json,
+        )
+
+        await self._ensure_ecosystem_discovery_table()
+        row = await self._db.fetchone(
+            "SELECT fingerprint, state_json FROM ecosystem_discovery_watch_state "
+            "WHERE agent_id = ? AND watch_key = ?",
+            (self._agent_id, watch_key),
+        )
+        if not row:
+            return None, None
+        return row[0], state_from_json(row[1])
+
+    async def _save_ecosystem_discovery_state(
+        self, watch_key: str, fingerprint: str, state_json: str
+    ) -> None:
+        """Upsert the latest observed discovery fingerprint."""
+        await self._ensure_ecosystem_discovery_table()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await self._db.execute(
+            """
+            INSERT INTO ecosystem_discovery_watch_state
+                (agent_id, watch_key, fingerprint, state_json, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id, watch_key) DO UPDATE SET
+                fingerprint = excluded.fingerprint,
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at
+            """,
+            (self._agent_id, watch_key, fingerprint, state_json, now_iso),
+        )
+
+    async def _run_ecosystem_discovery_watch(self, args: dict) -> str:
+        """Run stale-work/red-CI discovery and wake on actionable changes.
+
+        Args:
+            tool: discovery tool name, default ``scan_stale_work``.
+            tool_args: kwargs passed to that tool. Any top-level args other
+                than watcher control keys are also forwarded for convenience.
+            watch_key: optional dedupe key. Defaults to tool + repo/filter args.
+            notify: optional target agent DID (defaults to this agent).
+            max_findings: maximum findings included in the cognition payload.
+        """
+        from kestrel_sovereign.signals.sources.ecosystem_discovery import (
+            DEFAULT_DISCOVERY_TOOL,
+            build_signal_for_discovery_findings,
+            evaluate_discovery_watch,
+            state_to_json,
+        )
+
+        tool_name = str(args.get("tool") or DEFAULT_DISCOVERY_TOOL)
+        control_keys = {"tool", "tool_args", "watch_key", "notify", "max_findings"}
+        tool_args = dict(args.get("tool_args") or {})
+        for key, value in args.items():
+            if key not in control_keys:
+                tool_args.setdefault(key, value)
+
+        repo = str(tool_args.get("repo") or tool_args.get("repository") or "")
+        try:
+            max_findings = int(args.get("max_findings") or 20)
+        except (TypeError, ValueError):
+            max_findings = 20
+
+        watch_key = str(
+            args.get("watch_key")
+            or f"{tool_name}:{repo or json.dumps(tool_args, sort_keys=True, default=str)}"
+        )
+
+        try:
+            raw_result = await self._lookup_and_run_tool(tool_name, tool_args)
+        except Exception as e:
+            return json.dumps({
+                "signaled": False,
+                "blocked": "tool_error",
+                "error": f"{type(e).__name__}: {e}",
+                "watch_key": watch_key,
+                "tool": tool_name,
+            })
+
+        last_fp, last_state = await self._load_ecosystem_discovery_state(watch_key)
+        decision = evaluate_discovery_watch(
+            raw_result,
+            last_fingerprint=last_fp,
+            last_state=last_state,
+            default_repo=repo,
+            max_findings=max_findings,
+        )
+        state_json = state_to_json(decision.state)
+
+        if not decision.should_signal:
+            await self._save_ecosystem_discovery_state(
+                watch_key, decision.state.fingerprint, state_json,
+            )
+            return json.dumps({
+                "signaled": False,
+                "reason": decision.reason,
+                "watch_key": watch_key,
+                "findings_count": len(decision.state.findings),
+            })
+
+        target = args.get("notify") or getattr(self.agent, "did", "") or self._agent_id
+        signal = build_signal_for_discovery_findings(
+            watch_key=watch_key,
+            tool_name=tool_name,
+            decision=decision,
+            target_agent=str(target),
+        )
+
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
+            return json.dumps({
+                "signaled": False,
+                "blocked": "no_dispatcher",
+                "reason": "agent has no signal dispatcher",
+                "watch_key": watch_key,
+                "findings_count": len(decision.state.findings),
+            })
+
+        try:
+            enq = dispatcher.enqueue_signal(signal)
+            if hasattr(enq, "__await__"):
+                await enq
+        except Exception as e:
+            logger.warning(
+                "ecosystem_discovery_watch: enqueue_signal raised for %s: %s",
+                watch_key, e,
+            )
+            return json.dumps({
+                "signaled": False,
+                "blocked": "dispatch_error",
+                "error": f"{type(e).__name__}: {e}",
+                "watch_key": watch_key,
+                "findings_count": len(decision.state.findings),
+            })
+
+        await self._save_ecosystem_discovery_state(
+            watch_key, decision.state.fingerprint, state_json,
+        )
+        return json.dumps({
+            "signaled": True,
+            "reason": decision.reason,
+            "watch_key": watch_key,
+            "findings_count": len(decision.state.findings),
+        })
 
     async def _run_github_pr_watch(self, args: dict) -> str:
         """Built-in handler for the ``github_pr_watch`` cron task (#1618).

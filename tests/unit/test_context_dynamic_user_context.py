@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sovereign.agent.context_manager import ContextManager, ContextResult
+from kestrel_sovereign.agent.memory_manager import RetrievedMemoryBlock
 
 
 def _make_cm(
@@ -54,6 +55,8 @@ def _make_cm(
 
     # Memory retriever: if memories_result non-empty, retrieval returns it
     cm.memory_retriever = MagicMock() if memories_result else None
+    if cm.memory_retriever is not None:
+        cm.memory_retriever.record_accesses = AsyncMock()
     cm.memory_manager = MagicMock()
     cm.memory_manager.retrieve_memories = AsyncMock(return_value=memories_result)
 
@@ -156,6 +159,28 @@ async def test_dynamic_user_context_memories_only_when_rag_empty():
     assert "<retrieved_context>" in result.dynamic_user_context
     assert "<memories>" in result.dynamic_user_context
     assert "<documents>" not in result.dynamic_user_context
+
+
+@pytest.mark.asyncio
+async def test_memory_access_recorded_only_after_context_insertion():
+    cm = _make_cm(memories_result="placeholder", rag_result="")
+    cm.memory_manager.retrieve_memories.return_value = RetrievedMemoryBlock(
+        text="[Memory 1] inserted",
+        message_ids=(41, 42),
+    )
+
+    result = await cm.build_context(
+        query="substantive memory query",
+        constitution="CONSTITUTION_TEXT",
+    )
+
+    assert "[Memory 1] inserted" in result.dynamic_user_context
+    kwargs = cm.memory_manager.retrieve_memories.await_args.kwargs
+    assert kwargs["read_only"] is True
+    assert kwargs["return_details"] is True
+    cm.memory_retriever.record_accesses.assert_awaited_once_with(
+        (41, 42), "test-agent"
+    )
 
 
 @pytest.mark.asyncio

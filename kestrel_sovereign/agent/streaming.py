@@ -601,10 +601,22 @@ class StreamingMixin:
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
 
-        # Commands are not streamable - delegate to non-streaming handler
+        # Commands are not streamable - delegate to non-streaming handler.
+        # #1894: the delegate runs OUTSIDE the per-turn ``part_collector()``
+        # bound on the normal streaming path below, so a ``!todo add/update/
+        # complete`` command (todo tools advertise ``command_prefix``) would
+        # mutate the graph but ``emit_part`` would see no active collector and
+        # no-op — the typed todo bubble would never reach the stream. Bind a
+        # collector around the delegation and flush any parts it emitted as
+        # PART sentinels after the command result, mirroring the normal path.
         if user_input.startswith("!"):
-            result = await self.process_input(user_input, model_override, session_id=session_id, caller=caller)
-            yield result
+            with part_collector():
+                result = await self.process_input(user_input, model_override, session_id=session_id, caller=caller)
+                yield result
+                for part in drain_parts():
+                    sentinel = build_part_sentinel(part)
+                    if sentinel:
+                        yield sentinel
             return
 
         # Start OTEL span for streaming request lifecycle

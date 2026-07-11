@@ -34,6 +34,50 @@ DISABLED_FEATURES_ENV = "KESTREL_DISABLED_FEATURES"
 FEATURE_ENTRY_POINT_GROUP = "kestrel_sovereign.features"
 
 
+class DuplicateFeatureEntryPointError(RuntimeError):
+    """Raised when multiple distributions claim one external feature class."""
+
+
+def _reject_duplicate_feature_entry_points(feature_eps) -> None:
+    """Fail deterministically before entry-point enumeration can pick a winner."""
+    claims: Dict[str, List[str]] = {}
+    for ep in feature_eps:
+        class_name = _entrypoint_class_name(
+            getattr(ep, "value", "") or "", ep.name
+        )
+        dist = getattr(ep, "dist", None)
+        owner = getattr(dist, "name", None) or getattr(ep, "value", None) or ep.name
+        claims.setdefault(class_name, []).append(str(owner))
+
+    distinct_claims = {
+        name: sorted(set(owners)) for name, owners in claims.items()
+    }
+    conflicts = {
+        name: owners
+        for name, owners in distinct_claims.items()
+        if len(owners) > 1
+    }
+    if conflicts:
+        details = "; ".join(
+            f"{name}: {', '.join(owners)}"
+            for name, owners in sorted(conflicts.items())
+        )
+        remediation = ""
+        if any(
+            "kestrel-feature-intelligence" in owners
+            for owners in conflicts.values()
+        ):
+            remediation = (
+                " The archived kestrel-feature-intelligence bundle publishes "
+                "stale Reflection/Council entry points; uninstall it and use "
+                "the canonical standalone packages."
+            )
+        raise DuplicateFeatureEntryPointError(
+            "Conflicting external feature entry points detected (each class "
+            f"must have one owning distribution): {details}.{remediation}"
+        )
+
+
 def get_disabled_features() -> Set[str]:
     """
     Get the set of disabled feature names from environment and kestrel.toml.
@@ -192,9 +236,11 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
 
     # Python 3.12+ returns a SelectableGroups; 3.9-3.11 returns a dict
     if hasattr(eps, "select"):
-        feature_eps = eps.select(group=FEATURE_ENTRY_POINT_GROUP)
+        feature_eps = list(eps.select(group=FEATURE_ENTRY_POINT_GROUP))
     else:
-        feature_eps = eps.get(FEATURE_ENTRY_POINT_GROUP, [])
+        feature_eps = list(eps.get(FEATURE_ENTRY_POINT_GROUP, []))
+
+    _reject_duplicate_feature_entry_points(feature_eps)
 
     for ep in feature_eps:
         try:
@@ -283,9 +329,11 @@ def discover_entrypoint_feature_dists() -> Dict[str, str]:
         return dist_by_class
 
     if hasattr(eps, "select"):
-        feature_eps = eps.select(group=FEATURE_ENTRY_POINT_GROUP)
+        feature_eps = list(eps.select(group=FEATURE_ENTRY_POINT_GROUP))
     else:
-        feature_eps = eps.get(FEATURE_ENTRY_POINT_GROUP, [])
+        feature_eps = list(eps.get(FEATURE_ENTRY_POINT_GROUP, []))
+
+    _reject_duplicate_feature_entry_points(feature_eps)
 
     for ep in feature_eps:
         dist = getattr(ep, "dist", None)

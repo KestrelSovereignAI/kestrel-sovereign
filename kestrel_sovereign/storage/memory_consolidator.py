@@ -13,10 +13,21 @@ unimportant details fade.
 """
 import logging
 import json
+import re
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
+
+from .memory_models import MemoryEpisode, TemporalPattern
+from .async_database import AsyncDatabase
+from .memory_retriever import calculate_decay
+from .async_conversation_store import (
+    _strip_search_wrappers,
+    _token_match_score,
+    _tokenize_for_search,
+)
+from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 # ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
 # importing it here would create a circular import via
@@ -25,10 +36,6 @@ from typing import List, Dict, Any, Optional, Tuple
 _SALVAGE_STATE_POINTER_ONLY = "pointer-only"
 _SALVAGE_STATE_PENDING_SUMMARY = "pending-summary"
 _SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
-
-from .memory_models import MemoryEpisode, TemporalPattern
-from .async_database import AsyncDatabase
-from .memory_retriever import calculate_decay
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +219,7 @@ class MemoryConsolidator:
             """SELECT id, content, metadata, created_at, role
                FROM conversation_history
                WHERE agent_id = ? AND created_at > ?
+                 AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
             (self.agent_id, cutoff)
         )
@@ -224,8 +232,9 @@ class MemoryConsolidator:
         # down messages so nightly runs don't duplicate prior work (#1489 P2).
         covered_message_ids = await self._covered_message_ids()
 
-        # Group messages by date
-        by_date: Dict[str, List[Dict]] = defaultdict(list)
+        # Prefer explicit conversation sessions. Legacy rows without a session
+        # ID retain the date bucket as a bounded fallback.
+        clusters: Dict[str, List[Dict]] = defaultdict(list)
         for row in rows:
             msg_id, content, metadata, created_at, role = row
 
@@ -245,7 +254,10 @@ class MemoryConsolidator:
             except (ValueError, TypeError):
                 continue
 
-            by_date[date_key].append({
+            if metadata.get("type") in {"new_session", "compaction", "compression"}:
+                continue
+            cluster_key = str(metadata.get("session_id") or f"date:{date_key}")
+            clusters[cluster_key].append({
                 "id": msg_id,
                 "content": content,
                 "metadata": metadata,
@@ -253,8 +265,15 @@ class MemoryConsolidator:
                 "role": role,
             })
 
-        # For each day, check if there's a significant cluster
-        for date_key, day_messages in by_date.items():
+        # For each session/date fallback, check if there's a significant cluster
+        for cluster_key, day_messages in clusters.items():
+            first_created = day_messages[0].get("created_at")
+            try:
+                date_key = datetime.fromisoformat(
+                    str(first_created).replace("Z", "+00:00")
+                ).strftime("%Y-%m-%d")
+            except (TypeError, ValueError):
+                date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             original_count = len(day_messages)
             if original_count < self.MIN_EPISODE_MESSAGES:
                 report_skipped.append(
@@ -572,7 +591,8 @@ class MemoryConsolidator:
         elif avg_intensity > 0.6:
             return "An emotional conversation"
         else:
-            return "A memorable exchange"
+            topics = self._extract_episode_topics(messages, limit=3)
+            return f"Discussion of {', '.join(topics)}" if topics else "A memorable exchange"
 
     def _generate_episode_summary(
         self,
@@ -584,11 +604,48 @@ class MemoryConsolidator:
         message_count = len(messages)
         user_count = len(user_messages)
 
-        # Simple summary (could be LLM-generated for richer summaries)
+        topics = self._extract_episode_topics(messages, limit=8)
+        topic_sentence = (
+            f" Topics: {', '.join(topics)}." if topics else ""
+        )
         return (
             f"A conversation with {message_count} messages "
-            f"({user_count} from user). Emotional trajectory: {emotional_arc}."
+            f"({user_count} from user).{topic_sentence} "
+            f"Emotional trajectory: {emotional_arc}."
         )
+
+    @staticmethod
+    def _extract_episode_topics(messages: List[Dict], limit: int = 8) -> List[str]:
+        """Extract bounded topic terms without persisting rendered context.
+
+        Message IDs remain the provenance trail; summaries contain only
+        normalized terms from canonical content, avoiding transport wrappers
+        and verbatim prompt-injection text.
+        """
+        stop_words = {
+            "about", "after", "again", "also", "and", "are", "been", "but",
+            "can", "could", "did", "for", "from", "have", "her", "him", "his",
+            "how", "into", "just", "not", "our", "she", "that", "the", "their",
+            "them", "then", "there", "they", "this", "was", "were", "what",
+            "when", "where", "which", "with", "would", "you", "your", "context",
+            "conversation", "conversations", "document", "documents", "end",
+            "memories", "memory", "relevant", "retrieved",
+        }
+        counts: Counter[str] = Counter()
+        first_seen: Dict[str, int] = {}
+        position = 0
+        for message in messages:
+            content = str(message.get("content") or "")
+            if message.get("role") == "user":
+                content = extract_raw_user_content(content)
+            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9'-]{2,}", content.lower()):
+                if token in stop_words:
+                    continue
+                counts[token] += 1
+                first_seen.setdefault(token, position)
+                position += 1
+        ranked = sorted(counts, key=lambda term: (-counts[term], first_seen[term], term))
+        return ranked[:limit]
 
     async def _save_episode(self, episode: MemoryEpisode) -> None:
         """Save episode to database and optionally to the Knowledge Graph."""
@@ -832,7 +889,16 @@ class MemoryConsolidator:
         if service is None:
             return None
         try:
-            query_embedding = await service.aembed(query)
+            from kestrel_sovereign.llm.embedding_service import (
+                EPISODE_RETRIEVAL_INSTRUCTION,
+                aembed_retrieval_query,
+            )
+
+            query_embedding = await aembed_retrieval_query(
+                service,
+                query,
+                instruction=EPISODE_RETRIEVAL_INSTRUCTION,
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("episode query embed failed: %s", e)
             return None
@@ -871,41 +937,67 @@ class MemoryConsolidator:
     async def _keyword_episode_ids(
         self, query: str, limit: int, exclude_ids: Optional[List[str]] = None
     ) -> List[str]:
-        """Keyword LIKE recall over title+summary, ranked by recency.
+        """Token-aware keyword recall over title+summary.
 
         ``exclude_ids`` (the vector hits) are filtered out IN SQL so the LIMIT
         returns up to ``limit`` genuinely-NEW matches — otherwise a query that
         the vector path already satisfied would consume the whole LIMIT with
         rows already surfaced, starving keyword-only legacy episodes."""
-        # Case-insensitive via LOWER() on both sides — portable across SQLite
-        # (LIKE is ASCII-case-insensitive) AND Postgres (LIKE is case-SENSITIVE).
-        # On PG the kNN path is gated off, so this keyword fallback is the only
-        # recall; a case-sensitive match there would miss "sailing" vs
-        # "Sailing trip" and record no access heat.
-        like = f"%{query.lower()}%"
+        query_projection = _strip_search_wrappers(query)
+        query_tokens = list(dict.fromkeys(_tokenize_for_search(query_projection)))
+        if not query_tokens:
+            return []
         exclude_ids = exclude_ids or []
         exclude_clause = ""
-        params: list = [self.agent_id, like, like]
+        token_clause = " OR ".join(
+            "(LOWER(title) LIKE ? OR LOWER(COALESCE(summary, '')) LIKE ?)"
+            for _ in query_tokens
+        )
+        score_clause = " + ".join(
+            "CASE WHEN LOWER(title) LIKE ? "
+            "OR LOWER(COALESCE(summary, '')) LIKE ? THEN 1 ELSE 0 END"
+            for _ in query_tokens
+        )
+        score_params: list = []
+        match_params: list = []
+        for token in query_tokens:
+            like = f"%{token}%"
+            score_params.extend((like, like))
+            match_params.extend((like, like))
+        params: list = [*score_params, self.agent_id, *match_params]
         if exclude_ids:
             exclude_clause = (
                 " AND id NOT IN (" + ",".join("?" for _ in exclude_ids) + ")"
             )
             params.extend(exclude_ids)
-        params.append(limit)
+        # Fetch a bounded superset so overlap ranking, not raw recency, chooses
+        # the final rows. Exact phrases receive a deterministic preference.
+        params.append(max(limit * 5, limit))
         try:
             rows = await self._db.fetchall(
-                f"""SELECT id FROM memory_episodes
+                f"""SELECT id, title, summary, created_at,
+                           ({score_clause}) AS token_match_count
+                    FROM memory_episodes
                     WHERE agent_id = ?
-                      AND (LOWER(title) LIKE ? OR LOWER(summary) LIKE ?)
+                      AND ({token_clause})
                     {exclude_clause}
-                    ORDER BY created_at DESC
+                    ORDER BY token_match_count DESC, created_at DESC
                     LIMIT ?""",
                 tuple(params),
             )
         except Exception as e:  # noqa: BLE001
             logger.debug("episode keyword recall failed: %s", e)
             return []
-        return [r[0] for r in rows or []]
+        query_lower = " ".join(query_projection.lower().split())
+        ranked: List[Tuple[float, int, str]] = []
+        for position, row in enumerate(rows or []):
+            episode_id, title, summary, _created_at, _match_count = row
+            combined = f"{title or ''} {summary or ''}".lower()
+            overlap = _token_match_score(query_tokens, combined)
+            phrase_bonus = 1.0 if query_lower and query_lower in combined else 0.0
+            ranked.append((overlap + phrase_bonus, -position, episode_id))
+        ranked.sort(reverse=True)
+        return [episode_id for _score, _position, episode_id in ranked[:limit]]
 
     async def _episodes_by_ids(self, ids: List[str]) -> List[MemoryEpisode]:
         """Materialize MemoryEpisode rows by id, preserving the given order."""
@@ -939,6 +1031,7 @@ class MemoryConsolidator:
             """SELECT content, metadata, created_at
                FROM conversation_history
                WHERE agent_id = ? AND created_at > ?
+                 AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
             (self.agent_id, cutoff)
         )
@@ -970,7 +1063,8 @@ class MemoryConsolidator:
         """
         Mark fully decayed messages as archived.
 
-        Archived messages are not deleted, just marked in metadata.
+        Archived messages are not deleted; ``conversation_history.archived_at``
+        is the sole archive-state field. Metadata retains decay evidence only.
         They won't appear in normal retrieval but can still be
         accessed if specifically requested.
 
@@ -984,6 +1078,7 @@ class MemoryConsolidator:
             """SELECT id, metadata, created_at
                FROM conversation_history
                WHERE agent_id = ?
+                 AND deleted_at IS NULL AND archived_at IS NULL
                ORDER BY created_at""",
             (self.agent_id,)
         )
@@ -997,8 +1092,24 @@ class MemoryConsolidator:
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
 
-            # Skip already archived
-            if metadata.get("archived"):
+            # Migrate the legacy dual-state representation. Older releases
+            # wrote metadata.archived without the dedicated column, making
+            # those rows visible to normal retrieval forever. Canonicalize
+            # them in-place and remove the redundant state keys.
+            legacy_archived = metadata.get("archived") in (True, 1, "true", "True")
+            if legacy_archived:
+                archived_at = metadata.pop("archived_at", None)
+                metadata.pop("archived", None)
+                if not archived_at:
+                    archived_at = datetime.now(timezone.utc).isoformat()
+                await self._db.execute(
+                    """UPDATE conversation_history
+                       SET metadata = ?, archived_at = ?
+                       WHERE id = ? AND agent_id = ?
+                         AND deleted_at IS NULL AND archived_at IS NULL""",
+                    (json.dumps(metadata), archived_at, msg_id, self.agent_id),
+                )
+                archived_count += 1
                 continue
 
             # decay_protected pins prevent ROUTINE archival only.
@@ -1026,15 +1137,15 @@ class MemoryConsolidator:
 
             # Archive if below threshold
             if strength < self.DECAY_ARCHIVE_THRESHOLD:
-                metadata["archived"] = True
-                metadata["archived_at"] = datetime.now(timezone.utc).isoformat()
+                archived_at = datetime.now(timezone.utc).isoformat()
                 metadata["archived_strength"] = strength
 
                 await self._db.execute(
                     """UPDATE conversation_history
-                       SET metadata = ?
-                       WHERE id = ?""",
-                    (json.dumps(metadata), msg_id)
+                       SET metadata = ?, archived_at = ?
+                       WHERE id = ? AND agent_id = ?
+                         AND deleted_at IS NULL AND archived_at IS NULL""",
+                    (json.dumps(metadata), archived_at, msg_id, self.agent_id)
                 )
                 archived_count += 1
 
@@ -1118,6 +1229,7 @@ class MemoryConsolidator:
                 """SELECT id, content, metadata, created_at, role
                    FROM conversation_history
                    WHERE agent_id = ? AND created_at > ?
+                     AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
                 (self.agent_id, cutoff)
             )
@@ -1130,6 +1242,7 @@ class MemoryConsolidator:
                 """SELECT id, content, metadata, created_at, role
                    FROM conversation_history
                    WHERE agent_id = ? AND created_at > ?
+                     AND deleted_at IS NULL AND archived_at IS NULL
                    ORDER BY created_at""",
                 (self.agent_id, cutoff_time)
             )

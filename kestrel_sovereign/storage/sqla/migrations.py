@@ -511,6 +511,55 @@ async def _migrate_pg_greenfield(db: "AsyncDatabase", *, table: str) -> None:
 
 # --- #1477 embedding_profile_id stamping ------------------------------------
 
+async def migrate_conversation_lexical_index(db: "AsyncDatabase") -> None:
+    """Create the #2339 keyed blind-token index on both storage backends."""
+    async with db.transaction():
+        if db.backend_type == "postgres":
+            await db.execute(
+                "ALTER TABLE conversation_history ADD COLUMN IF NOT EXISTS "
+                "lexical_index_id TEXT"
+            )
+            await db.execute(
+                "ALTER TABLE conversation_history ADD COLUMN IF NOT EXISTS "
+                "lexical_index_version TEXT"
+            )
+        else:
+            for column in ("lexical_index_id", "lexical_index_version"):
+                exists = await db.fetchone(
+                    "SELECT COUNT(*) FROM pragma_table_info('conversation_history') "
+                    "WHERE name = ?",
+                    (column,),
+                )
+                if not exists or not exists[0]:
+                    await db.execute(
+                        f"ALTER TABLE conversation_history ADD COLUMN {column} TEXT"
+                    )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS conversation_lexical_tokens ("
+            "agent_id TEXT NOT NULL, lexical_index_id TEXT NOT NULL, "
+            "token_hash TEXT NOT NULL, "
+            "PRIMARY KEY (agent_id, lexical_index_id, token_hash))"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_lexical_token_lookup "
+            "ON conversation_lexical_tokens(agent_id, token_hash)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_lexical_coverage "
+            "ON conversation_history(agent_id, lexical_index_version, "
+            "lexical_index_id)"
+        )
+        # Orphan-token cleanup probes by agent + stable blind-index key.  The
+        # coverage index above cannot serve that lookup efficiently because
+        # lexical_index_version sits between those columns.  Without this
+        # index a cleanup after a large backfill degenerates into one full
+        # per-agent history scan for every token row.
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_lexical_message "
+            "ON conversation_history(agent_id, lexical_index_id)"
+        )
+
+
 async def migrate_add_embedding_profile_id(
     db: "AsyncDatabase", *, table: str
 ) -> None:
@@ -669,6 +718,48 @@ async def migrate_create_embedding_profiles(db: "AsyncDatabase") -> None:
                 (),
             )
         logger.info("embedding_profiles created (SQLite, #1477).")
+
+
+async def migrate_embedding_profiles_add_parity(db: "AsyncDatabase") -> None:
+    """Add ``parity_cosine`` to ``embedding_profiles`` (#2290).
+
+    Records the measured worst-case pairwise cosine from the shared-space
+    parity probe on the pinned space's registry row, so operators can see how
+    far two servings of the same weights drifted before the alias was accepted.
+    Nullable and descriptive — not part of the profile-id hash and never read
+    by the kNN filter. Idempotent: skips when the column already exists.
+    """
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type == "postgres":
+        rows = await db.fetchall(
+            """SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'embedding_profiles'
+                 AND column_name = 'parity_cosine'""",
+            (),
+        )
+        if rows:
+            return
+        async with db.transaction():
+            await db.execute(
+                "ALTER TABLE embedding_profiles ADD COLUMN parity_cosine "
+                "DOUBLE PRECISION",
+                (),
+            )
+        logger.info("embedding_profiles.parity_cosine added (PG, #2290).")
+    elif backend_type == "sqlite":
+        cols = await db.fetchall(
+            "PRAGMA table_info(embedding_profiles)", ()
+        )
+        names = {row[1] for row in cols} if cols else set()
+        if not names or "parity_cosine" in names:
+            # No table yet (create migration will make it) or already migrated.
+            return
+        async with db.transaction():
+            await db.execute(
+                "ALTER TABLE embedding_profiles ADD COLUMN parity_cosine REAL",
+                (),
+            )
+        logger.info("embedding_profiles.parity_cosine added (SQLite, #2290).")
 
 
 async def _migrate_sqlite_greenfield(db: "AsyncDatabase", *, table: str) -> None:

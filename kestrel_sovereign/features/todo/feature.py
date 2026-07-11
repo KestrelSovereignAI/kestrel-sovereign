@@ -63,6 +63,44 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _shape_todo_part(props: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a stored todo's props onto the compact delta the console's
+    ``todo`` part renderer consumes (#1894).
+
+    Only the fields the card paints travel to the client — id/title/status/
+    scope/priority/terminal_condition/updated_at plus a trimmed ``links`` list
+    (type/target/title/status/url). The rich internal props (source_turn,
+    completion_evidence, next_check_at, …) are deliberately withheld so the
+    part payload stays small and carries no more than the card needs. Free-form
+    string fields (title/terminal_condition/link titles) are passed through
+    verbatim; the renderer owns their sanitization per the part-registry
+    contract.
+    """
+    links: List[Dict[str, Any]] = []
+    for link in props.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        links.append(
+            {
+                "type": link.get("type"),
+                "target": link.get("target"),
+                "title": link.get("title"),
+                "status": link.get("status"),
+                "url": link.get("url"),
+            }
+        )
+    return {
+        "id": props.get("id"),
+        "title": props.get("title"),
+        "status": props.get("status"),
+        "scope": props.get("scope"),
+        "priority": props.get("priority"),
+        "terminal_condition": props.get("terminal_condition"),
+        "links": links,
+        "updated_at": props.get("updated_at"),
+    }
+
+
 def _as_list(
     value: Optional[Any], *, field: str
 ) -> tuple[Optional[List[Any]], Optional[str]]:
@@ -172,6 +210,23 @@ class TodoFeature(Feature):
         if (node.properties or {}).get("agent_id") != self.agent_id:
             return None, f"Todo {todo_id} not found"
         return node, None
+
+    def _emit_todo_part(self, props: Dict[str, Any]) -> None:
+        """Emit a typed ``todo`` part (delta) for the mutated item (#1894).
+
+        Rides the in-band part collector so the console renders the changed
+        todo as its own component bubble, in stream order, and persists it for
+        replay. ``emit_part`` is a no-op off a streaming turn, so this is safe
+        on every call path (background loops, wakes, direct CLI). Best-effort:
+        a part-emission failure must never fail the underlying mutation.
+        """
+        try:
+            from kestrel_sovereign.agent.parts import emit_part
+
+            part = _shape_todo_part(props)
+            emit_part("todo", part, part_id=part.get("id"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("todo emit_part failed: %s", exc)
 
     async def _persist(self, props: Dict[str, Any]) -> None:
         await self._graph().add_node(
@@ -355,6 +410,7 @@ class TodoFeature(Feature):
             logger.error("todo_add write failed: %s", e, exc_info=True)
             return ToolResult.failed(str(e))
 
+        self._emit_todo_part(props)
         return ToolResult.ok(
             confirmation=f"Created todo {todo_id}: {props['title']}",
             data={"todo": props},
@@ -461,6 +517,7 @@ class TodoFeature(Feature):
             logger.error("todo_update write failed: %s", e, exc_info=True)
             return ToolResult.failed(str(e))
 
+        self._emit_todo_part(props)
         return ToolResult.ok(
             confirmation=f"Updated todo {todo_id}: {', '.join(updates)}",
             data={"todo": props, "updates": updates},
@@ -657,6 +714,7 @@ class TodoFeature(Feature):
             logger.error("todo_complete write failed: %s", e, exc_info=True)
             return ToolResult.failed(str(e))
 
+        self._emit_todo_part(props)
         return ToolResult.ok(
             confirmation=f"Completed todo {todo_id} as {props['status']}",
             data={"todo": props},

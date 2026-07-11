@@ -50,6 +50,14 @@ class ModelSelector {
         this.routeSelect = options.routeSelectId
             ? document.getElementById(options.routeSelectId)
             : null;
+        // Optional meta-provider "Upstream" facet. Appears only when the
+        // selected route's catalog carries ``underlying_provider`` values
+        // (openrouter, and any future aggregator). It FILTERS the model combo
+        // by upstream vendor — a DISPLAY filter only, never an OpenRouter
+        // provider-preferences routing pin. See #2264.
+        this.upstreamSelect = options.upstreamSelectId
+            ? document.getElementById(options.upstreamSelectId)
+            : null;
         this.apiEndpoint = options.apiEndpoint || '/api/models';
         // Use 'in' check to allow explicit null (disables server sync)
         this.currentModelEndpoint = 'currentModelEndpoint' in options
@@ -64,6 +72,17 @@ class ModelSelector {
         this.selectedProvider = '';
         this.selectedModel = '';
         this.selectedRoute = '';
+        // Meta-provider upstream filter. Sentinel ``'All'`` = no filter. This is
+        // pure display state (never sent to the server) so it is kept in memory
+        // and restored from localStorage like the other picks. See #2264.
+        this.selectedUpstream = 'All';
+        // Route-scoped model cache (#2262/#2264). When the operator picks a
+        // route whose model list must come from THAT route's own discovery
+        // (e.g. anthropic:plan vs anthropic:api, or an OpenRouter route), the
+        // component re-fetches ``/api/models?vendor=&route=`` and stashes the
+        // result here keyed by ``"<vendor>::<route>"``. ``_currentModelList``
+        // prefers this over the vendor-wide ``by_vendor`` bucket.
+        this._routeModels = null;
         this.isInitialLoad = true;
         // The dropdown defaults to the featured set (a clean handful of current
         // models per vendor) with an explicit "Show all" expander. Flips to true
@@ -101,6 +120,7 @@ class ModelSelector {
         this.selectedProvider = localStorage.getItem(`${this.storagePrefix}_selected_provider`) || '';
         this.selectedModel = localStorage.getItem(`${this.storagePrefix}_selected_model`) || '';
         this.selectedRoute = localStorage.getItem(`${this.storagePrefix}_selected_route`) || '';
+        this.selectedUpstream = localStorage.getItem(`${this.storagePrefix}_selected_upstream`) || 'All';
     }
 
     /**
@@ -117,6 +137,11 @@ class ModelSelector {
             localStorage.setItem(`${this.storagePrefix}_selected_route`, this.selectedRoute);
         } else {
             localStorage.removeItem(`${this.storagePrefix}_selected_route`);
+        }
+        if (this.selectedUpstream && this.selectedUpstream !== 'All') {
+            localStorage.setItem(`${this.storagePrefix}_selected_upstream`, this.selectedUpstream);
+        } else {
+            localStorage.removeItem(`${this.storagePrefix}_selected_upstream`);
         }
     }
 
@@ -142,6 +167,9 @@ class ModelSelector {
         }
         if (this.routeSelect) {
             this.routeSelect.addEventListener('change', () => this._handleRouteChange());
+        }
+        if (this.upstreamSelect) {
+            this.upstreamSelect.addEventListener('change', () => this._handleUpstreamChange());
         }
     }
 
@@ -290,6 +318,98 @@ class ModelSelector {
     }
 
     /**
+     * Resolve the model list backing the model combo for the current
+     * (vendor, route). Prefers a route-scoped catalog fetched from
+     * ``/api/models?vendor=&route=`` (#2262 route-scoped discovery) so a plan
+     * route never offers api-only models; falls back to the vendor-wide
+     * ``by_vendor`` bucket when no route-scoped catalog has been fetched.
+     */
+    _currentModelList() {
+        const vendor = this.providerSelect?.value;
+        if (!vendor) return [];
+        const route = this.selectedRoute || '';
+        if (this._routeModels && this._routeModels.key === `${vendor}::${route}`) {
+            return this._routeModels.models || [];
+        }
+        return this.allModelsData?.by_vendor?.[vendor] || [];
+    }
+
+    /**
+     * Re-fetch the model catalog scoped to the current (vendor, route) so the
+     * model combo reflects THAT route's own discovery (#2262). Best-effort:
+     * on any failure the combo keeps its vendor-wide list. Awaitable so callers
+     * (and tests) can sequence a repopulation; also fired from the route/vendor
+     * change handlers.
+     */
+    async _refreshRouteScopedModels() {
+        const vendor = this.providerSelect?.value;
+        if (!vendor || !this.apiEndpoint) return;
+        const route = this.selectedRoute || '';
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(await this.getAuthHeader()),
+            };
+            const sep = this.apiEndpoint.includes('?') ? '&' : '?';
+            let url = `${this.apiEndpoint}${sep}vendor=${encodeURIComponent(vendor)}`;
+            if (route) url += `&route=${encodeURIComponent(route)}`;
+            const response = await fetch(url, { headers });
+            if (!response.ok) return;
+            const data = await response.json();
+            const models = (data.by_vendor && data.by_vendor[vendor]) || data.all || [];
+            this._routeModels = { key: `${vendor}::${route}`, models };
+            this._populateModels();
+            // The repopulate may have COERCED the selection (previous model
+            // absent from this route's catalog → first valid route model).
+            // The change handlers committed the PRE-fetch selection, so
+            // without a re-commit here the UI shows the coerced model while
+            // the server keeps the stale one (codex P2 on #2275).
+            // _maybeCommit diffs against _lastSyncedSelection, so this is a
+            // no-op whenever the selection survived the route switch.
+            this._maybeCommit();
+        } catch (e) {
+            // Keep the vendor-wide list on failure — never blank the combo.
+        }
+    }
+
+    /**
+     * Populate the meta-provider "Upstream" facet from the current model
+     * list's distinct ``underlying_provider`` values. Hidden (and the filter
+     * reset to ``'All'``) when the catalog carries no upstream values. This is
+     * a DISPLAY filter over the model combo only — it is never persisted to
+     * the server and must not become a routing pin. See #2264.
+     */
+    _populateUpstream(models) {
+        if (!this.upstreamSelect) return;
+        const upstreams = [...new Set(
+            (models || []).map(m => m.underlying_provider).filter(Boolean)
+        )].sort((a, b) => a.localeCompare(b));
+
+        if (upstreams.length === 0) {
+            this.upstreamSelect.style.display = 'none';
+            this.upstreamSelect.innerHTML = '';
+            this.selectedUpstream = 'All';
+            return;
+        }
+
+        this.upstreamSelect.style.display = '';
+        const values = ['All', ...upstreams];
+        this.upstreamSelect.innerHTML = values.map(v => {
+            const label = v === 'All' ? 'All upstreams' : v;
+            return `<option value="${v}">${label}</option>`;
+        }).join('');
+
+        if (!values.includes(this.selectedUpstream)) this.selectedUpstream = 'All';
+        this.upstreamSelect.value = this.selectedUpstream;
+    }
+
+    /** Apply the current upstream display filter to a model list. */
+    _filterByUpstream(models) {
+        if (!this.selectedUpstream || this.selectedUpstream === 'All') return models;
+        return models.filter(m => m.underlying_provider === this.selectedUpstream);
+    }
+
+    /**
      * Populate model dropdown based on selected vendor
      */
     _populateModels() {
@@ -297,7 +417,11 @@ class ModelSelector {
         const buckets = this.allModelsData?.by_vendor;
         if (!vendor || !buckets) return;
 
-        const all = [...(buckets[vendor] || [])];
+        const fullList = this._currentModelList();
+        // Populate the upstream facet from the UNFILTERED list so switching
+        // away from a specific upstream can always get back to "All".
+        this._populateUpstream(fullList);
+        const all = [...this._filterByUpstream(fullList)];
 
         if (all.length === 0) {
             this.modelSelect.innerHTML = '<option value="">No models available</option>';
@@ -419,14 +543,19 @@ class ModelSelector {
     _handleProviderChange() {
         this.selectedProvider = this.providerSelect.value;
         this.selectedRoute = '';
-        // Each vendor switch starts collapsed to the featured set.
+        // Each vendor switch starts collapsed to the featured set, drops any
+        // stale route-scoped catalog, and clears the upstream display filter.
         this.showAllModels = false;
+        this._routeModels = null;
+        this.selectedUpstream = 'All';
         this._saveState();
         this._populateRoutes();
         this._populateModels();
         this.selectedModel = this.modelSelect.value;
         this._saveState();
         this._maybeCommit();
+        // Refine the model combo from the newly-selected route's own discovery.
+        this._refreshRouteScopedModels();
     }
 
     _handleModelChange() {
@@ -446,8 +575,32 @@ class ModelSelector {
 
     _handleRouteChange() {
         this.selectedRoute = this.routeSelect.value;
+        // A route change repopulates the model combo from THAT route's
+        // discovery (#2262). Clear the previous route's cache + upstream filter,
+        // repopulate immediately from what we have, then refine via re-fetch.
+        this._routeModels = null;
+        this.selectedUpstream = 'All';
+        this.showAllModels = false;
+        this._saveState();
+        // ``_populateModels`` reseeds ``selectedModel`` when the current pick is
+        // absent from the new list and leaves it untouched otherwise (including
+        // when there is no catalog to populate from yet), so the model is
+        // preserved across a route change.
+        this._populateModels();
         this._saveState();
         this._maybeCommit();
+        this._refreshRouteScopedModels();
+    }
+
+    /**
+     * Upstream (meta-provider) facet change — re-filter the model combo. This
+     * is a DISPLAY filter only: it never commits a model change and is never
+     * sent to the server as an OpenRouter provider-preferences pin (#2264).
+     */
+    _handleUpstreamChange() {
+        this.selectedUpstream = this.upstreamSelect.value || 'All';
+        this._saveState();
+        this._populateModels();
     }
 
     /**
@@ -677,6 +830,11 @@ class ModelSelector {
             route: this.selectedRoute || null,
             model: this.selectedModel,
             provider: this.selectedProvider,  // alias for back-compat
+            // Display-only upstream filter (meta-provider facet). Never a
+            // routing pin; surfaced so callers can reflect the visible filter.
+            upstream: this.selectedUpstream && this.selectedUpstream !== 'All'
+                ? this.selectedUpstream
+                : null,
         };
     }
 

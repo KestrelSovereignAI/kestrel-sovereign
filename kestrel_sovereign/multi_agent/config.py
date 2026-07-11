@@ -340,19 +340,101 @@ class MultiAgentConfig(BaseModel):
 
         for name, agent in self.agents.items():
             if isinstance(agent, LocalAgentConfig):
-                data["agents"][name] = {
+                entry = {
                     "data_dir": str(agent.data_dir),
                     "port": agent.port,
                     "autostart": agent.autostart,
                 }
+                # A missing features key means "all features" on reload —
+                # dropping a configured allowlist here would silently LIFT an
+                # agent's feature restriction on the next boot (codex P1 on
+                # #2358: the create-agent endpoint rewrites the whole file).
+                if agent.features is not None:
+                    entry["features"] = list(agent.features)
+                data["agents"][name] = entry
             elif isinstance(agent, RemoteAgentConfig):
                 data["agents"][name] = {
                     "url": agent.url,
                 }
 
-        # Save to file
-        with open(path, "w", encoding="utf-8") as f:
-            toml.dump(data, f)
+        # Save ATOMICALLY (codex P2 on #2358): writing the target in place
+        # truncates it first — a failure mid-write (full disk, kill) leaves
+        # multi_agent.toml empty/partial and the whole fleet unregistered on
+        # the next boot. Write a sibling temp file and os.replace() it in.
+        import os
+        import tempfile
+        # Write THROUGH symlinks (codex P2 round 9): os.replace on the link
+        # path would swap the SYMLINK for a regular file, silently severing an
+        # operator-managed config link — the in-place open('w') this replaced
+        # followed the link. Resolve to the real target and replace that.
+        if path.exists():
+            path = path.resolve()
+        # Ownership (codex P2 rounds 8-11): os.replace transfers the temp
+        # file's owner onto the target, and uid can't be preserved without
+        # root. When the file exists but ISN'T ours, write IN PLACE — that
+        # keeps the inode, so owner/group/mode/ACLs all survive untouched;
+        # the atomic strategy is reserved for files we own.
+        try:
+            if path.exists() and hasattr(os, "getuid") and path.stat().st_uid != os.getuid():
+                with open(path, "w", encoding="utf-8") as f:
+                    toml.dump(data, f)
+                logger.info(f"Saved multi_agent config to {path} (in-place: preserving foreign ownership)")
+                return
+        except OSError:
+            pass  # stat/uid unavailable — fall through to the atomic path
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+            )
+        except OSError:
+            # The parent directory isn't writable but the FILE may be (a
+            # group-writable config under an operator-owned directory) — the
+            # in-place write this strategy replaced handled that fine. Fall
+            # back to it: non-atomic, but strictly better than refusing to
+            # persist at all (codex P2 round 10).
+            with open(path, "w", encoding="utf-8") as f:
+                toml.dump(data, f)
+            logger.info(f"Saved multi_agent config to {path} (in-place: parent dir not writable)")
+            return
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                toml.dump(data, f)
+            # mkstemp minted 0600 owned by this process — carrying that onto
+            # the target would strip metadata an operator deliberately set
+            # (codex P2 rounds 7-8):
+            #   - EXISTING file: preserve its mode AND its group (another
+            #     service account may read the config via group access);
+            #     chown is best-effort — group changes need membership.
+            #   - NEW file: derive from the process umask exactly like the
+            #     plain open(..., 'w') this replaced (0666 & ~umask) — a
+            #     hardcoded 0644 would bypass restrictive umasks and expose
+            #     fleet topology / remote-agent URLs to other local users.
+            try:
+                if path.exists():
+                    st = path.stat()
+                    os.chmod(tmp_path, st.st_mode & 0o7777)
+                    try:
+                        # uid preservation only works as root; gid works with
+                        # membership — try both, degrade per-field (round 10).
+                        os.chown(tmp_path, st.st_uid, st.st_gid)
+                    except (OSError, AttributeError):
+                        try:
+                            os.chown(tmp_path, -1, st.st_gid)
+                        except (OSError, AttributeError):
+                            pass  # non-POSIX or not a member of the group
+                else:
+                    current_umask = os.umask(0)
+                    os.umask(current_umask)
+                    os.chmod(tmp_path, 0o666 & ~current_umask)
+            except OSError:
+                pass  # never fail the save over metadata
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
         logger.info(f"Saved multi_agent config to {path}")
 

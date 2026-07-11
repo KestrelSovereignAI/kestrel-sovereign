@@ -1,9 +1,10 @@
-// #2229: the standalone console is chat-first — the static `.nav-tabs` strip
-// starts hidden and a chat-header "Advanced" toggle reveals the capability-gated
-// strip through the SAME reveal implementation the embeddable `mountPanels` host
-// uses (`Panels.initReveal`). These tests drive that shared helper against the
-// REAL index.html markup (hidden nav strip + `#advanced-toggle-btn`), exactly as
-// identity.js wires it at boot, and cover:
+// #2229/#2350: the standalone console is chat-first — the static `.nav-tabs`
+// strip starts hidden and an app-level "Advanced" toggle (in the top nav bar's
+// `.nav-status` area, frinz-placement parity per #2350) reveals the
+// capability-gated strip through the SAME reveal implementation the embeddable
+// `mountPanels` host uses (`Panels.initReveal`). These tests drive that shared
+// helper against the REAL index.html markup (hidden nav strip +
+// `#advanced-toggle-btn`), exactly as identity.js wires it at boot, and cover:
 //   - boot starts COLLAPSED with the toggle present + aria-pressed=false;
 //   - reveal/collapse roundtrip incl. aria + return-to-Chat;
 //   - persistence across a "reload" (destroy + re-init reads localStorage);
@@ -50,7 +51,8 @@ function bootConsole(store) {
     }
     const navEl = dom.window.document.querySelector('.nav-tabs');
     const toggle = dom.window.document.getElementById('advanced-toggle-btn');
-    return { dom, navEl, toggle };
+    const navStatus = dom.window.document.querySelector('nav .nav-status');
+    return { dom, navEl, toggle, navStatus };
 }
 
 // api.js (imported transitively by mount-panels.js) constructs its client from
@@ -82,14 +84,27 @@ test('index.html ships the nav strip hidden and an Advanced toggle button', () =
     // The tab strip starts hidden so the console is chat-first before JS runs.
     assert.match(navEl.getAttribute('style') || '', /display:\s*none/,
         'nav-tabs strip starts hidden in markup');
-    // The Advanced toggle exists in the chat header, starts hidden + collapsed,
+    // The Advanced toggle exists in the app nav bar, starts hidden + collapsed,
     // and carries the i18n label key (no existing key renamed — #2180 lesson).
-    assert.ok(toggle, '#advanced-toggle-btn present in the chat header');
+    assert.ok(toggle, '#advanced-toggle-btn present in the nav bar');
     assert.match(toggle.getAttribute('style') || '', /display:\s*none/,
         'toggle starts hidden until the shared code decides');
     assert.equal(toggle.getAttribute('aria-pressed'), 'false', 'starts un-pressed');
     assert.ok(toggle.querySelector('[data-label-key="btn_advanced"]'),
         'toggle label carries the btn_advanced i18n key');
+});
+
+// #2350: the toggle governs the whole workspace (tab strip), so it lives on the
+// app-level top nav bar (`.nav-status`), matching frinz placement — NOT in the
+// chat pane header.
+test('index.html places the Advanced toggle in the app nav bar, not the chat header', () => {
+    const { toggle, navStatus } = bootConsole(makeStore());
+    assert.ok(navStatus, 'nav .nav-status area present');
+    assert.ok(navStatus.contains(toggle),
+        '#advanced-toggle-btn lives in the top nav bar .nav-status area');
+    // Guard against regression: it must not be back inside the chat header.
+    assert.equal(toggle.closest('.chat-header'), null,
+        'toggle is no longer in the chat-header left group');
 });
 
 // --- standalone reveal wiring (Panels.initReveal, as identity.js calls it) ---
@@ -304,9 +319,26 @@ test('SOURCE CONTRACT: a chat-disabled console falls back to a visible strip (co
     // unreachable behind a hidden nav with no reveal control.
     const identity = readFileSync(
         resolve(here, '../../kestrel_sovereign/static/js/identity.js'), 'utf8');
-    const guard = identity.match(/const advancedToggle = document\.getElementById\('advanced-toggle-btn'\);[\s\S]{0,900}/);
+    const guard = identity.match(/const advancedToggle = document\.getElementById\('advanced-toggle-btn'\);[\s\S]{0,1600}/);
     assert.ok(guard, 'reveal wiring guard present');
     assert.match(guard[0], /else if \(navEl\)/, 'fallback branch exists for a missing toggle');
     assert.match(guard[0], /navEl\.style\.display = ''/,
         'fallback unhides the strip so remaining panels stay reachable');
+});
+
+test('chat-disabled console: reveal is BYPASSED — nav strip permanent, Advanced toggle hidden (codex P2 on #2355)', async () => {
+    // Since #2350 the toggle lives in the app nav bar and SURVIVES the
+    // pruning of #panel-chat — reveal must be explicitly capability-gated or
+    // a chat-less console boots with every panel hidden behind a collapsed
+    // strip (the #2231 lockout, resurfaced by placement).
+    const identitySrc = readFileSync(
+        new URL('../../kestrel_sovereign/static/js/identity.js', import.meta.url), 'utf8');
+    const start = identitySrc.indexOf('const advancedToggle');
+    const block = identitySrc.slice(start, start + 1200);
+    assert.match(block, /hasCapability\(\s*['"]chat['"]\s*\)/,
+        'reveal init is gated on the chat capability');
+    assert.match(block, /advancedToggle\.style\.display\s*=\s*'none'/,
+        'the surviving toggle is hidden on the all-panels path');
+    assert.match(block, /navEl\.style\.display\s*=\s*''/,
+        'the nav strip shows permanently on the all-panels path');
 });

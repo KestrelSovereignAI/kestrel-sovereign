@@ -144,6 +144,250 @@ class TestTalonClaim:
         assert meta["auth_lane"] == "oauth"
         mock_mesh.assert_not_awaited()
 
+    @staticmethod
+    def _ready_state(tmp_path):
+        return {
+            "repo": "org/repo",
+            "path": str(tmp_path / "org__repo"),
+            "exists": True,
+            "is_git": True,
+            "head": "main",
+            "clean": True,
+            "last_fetch_at": None,
+            "safe": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_claim_explicit_self_review_forces_cli(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P2: an explicitly-set self_review must never ride A2A.
+
+        The A2A payload carries repo/issue only, so choosing that path
+        would silently drop the flag and apply the daemon default. With
+        A2A available, an explicit self_review must go CLI with the flag
+        in argv.
+        """
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            # A2A is AVAILABLE — the wrong path would succeed silently.
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "abc", "pid": 1234,
+            }
+            result = await feature.talon_claim(
+                repo="org/repo", issue=42, self_review=True,
+            )
+        assert result.status is ToolResultStatus.OK
+        mock_mesh.assert_not_awaited()
+        mock_bg.assert_awaited_once()
+        argv = mock_bg.call_args[0][0]
+        assert "--self-review" in argv
+        assert mock_bg.call_args.kwargs["env"]["GITHUB_TOKEN"]
+
+    @pytest.mark.asyncio
+    async def test_claim_explicit_self_review_false_forces_cli(
+        self, tmp_path, monkeypatch
+    ):
+        """Explicit False is still explicit: it must reach the CLI argv
+        (as the ABSENCE of --self-review), not be dropped on A2A where the
+        daemon default (possibly True) would silently apply."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "abc", "pid": 1234,
+            }
+            result = await feature.talon_claim(
+                repo="org/repo", issue=42, self_review=False,
+            )
+        assert result.status is ToolResultStatus.OK
+        mock_mesh.assert_not_awaited()
+        mock_bg.assert_awaited_once()
+        assert "--self-review" not in mock_bg.call_args[0][0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kwargs, argv_probe", [
+        ({"skip_clarification": True}, "--skip-clarification"),
+        ({"max_iterations": 5}, "5"),
+        ({"max_turns": 99}, "99"),
+        ({"demo_check": True}, "--demo-check"),
+        ({"eye_check": True}, "--eye-check"),
+    ])
+    async def test_claim_any_explicit_per_run_flag_forces_cli(
+        self, tmp_path, monkeypatch, kwargs, argv_probe
+    ):
+        """Every explicit per-run control has the same silent-drop hole on
+        A2A; all of them must force the CLI path that carries them."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "abc", "pid": 1234,
+            }
+            result = await feature.talon_claim(
+                repo="org/repo", issue=42, **kwargs,
+            )
+        assert result.status is ToolResultStatus.OK
+        mock_mesh.assert_not_awaited()
+        mock_bg.assert_awaited_once()
+        assert argv_probe in mock_bg.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_claim_explicit_worktree_opt_out_never_rides_a2a(
+        self, tmp_path, monkeypatch
+    ):
+        """worktree=False is an explicit per-run control too: it must not
+        ride A2A (which would silently ignore it). Under the default
+        require_worktree policy the CLI path then rejects it loudly."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            result = await feature.talon_claim(
+                repo="org/repo", issue=42, worktree=False,
+            )
+        mock_mesh.assert_not_awaited()
+        assert result.data["dispatched"] is False
+        assert result.data["state"] == "talon_policy_rejected"
+
+    @pytest.mark.asyncio
+    async def test_claim_bare_still_prefers_a2a(self, tmp_path, monkeypatch):
+        """Control: a claim with NO explicit per-run flags keeps the
+        A2A-preferred path — the force-CLI condition must not over-trigger."""
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a",
+                "task_id": "t1", "repo": "org/repo", "issue": 42,
+            }
+            result = await feature.talon_claim(repo="org/repo", issue=42)
+        assert result.status is ToolResultStatus.OK
+        assert result.data["method"] == "a2a"
+        mock_mesh.assert_awaited_once_with("org/repo", 42)
+        mock_bg.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_pipeline_force_cli_skips_a2a(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P2 (detached waits): dispatch_pipeline(force_cli=True)
+        must land a durable cli_background job even when A2A is available —
+        A2A jobs are in-memory only, so their wait refs die with the
+        process."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            # A2A is AVAILABLE — riding it would succeed silently and hand
+            # back a wait ref that breaks after restart.
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "durable1", "pid": 1234,
+            }
+            result = await feature.dispatch_pipeline(
+                repo="org/repo", issue=42, mode="claim", force_cli=True,
+            )
+        mock_mesh.assert_not_awaited()
+        mock_bg.assert_awaited_once()
+        assert result["dispatched"] is True
+        assert result["method"] == "cli_background"
+        assert result["job_id"] == "durable1"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_pipeline_default_keeps_a2a_preference(
+        self, tmp_path, monkeypatch
+    ):
+        """Control: without force_cli a bare pipeline claim still prefers
+        A2A, and the ContextVar override does not leak between calls."""
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg:
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a",
+                "task_id": "t1", "repo": "org/repo", "issue": 42,
+            }
+            result = await feature.dispatch_pipeline(
+                repo="org/repo", issue=42, mode="claim",
+            )
+        assert result["dispatched"] is True
+        assert result["method"] == "a2a"
+        mock_mesh.assert_awaited_once_with("org/repo", 42)
+        mock_bg.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_pipeline_force_cli_does_not_leak(
+        self, tmp_path, monkeypatch
+    ):
+        """A force_cli call followed by a plain claim in the same task must
+        not leave the override set (token reset in finally)."""
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state",
+                          return_value=self._ready_state(tmp_path)):
+            mock_mesh.return_value = {
+                "dispatched": True, "method": "a2a", "task_id": "t1",
+            }
+            mock_bg.return_value = {
+                "dispatched": True, "method": "cli_background",
+                "job_id": "durable1", "pid": 1234,
+            }
+            await feature.dispatch_pipeline(
+                repo="org/repo", issue=42, mode="claim", force_cli=True,
+            )
+            mock_mesh.assert_not_awaited()
+            result = await feature.talon_claim(repo="org/repo", issue=42)
+        assert result.data["method"] == "a2a"
+        mock_mesh.assert_awaited_once_with("org/repo", 42)
+        mock_bg.assert_awaited_once()  # only the force_cli call
+
     @pytest.mark.asyncio
     async def test_talon_set_config_updates_preference_only(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
@@ -1207,6 +1451,39 @@ class TestSurveyStalledTalonJobs:
         assert [j["id"] for j in stalled] == ["job-x"]
 
     @pytest.mark.asyncio
+    async def test_scan_stale_work_tool_wraps_live_survey(self):
+        from datetime import datetime, timedelta, timezone
+
+        feature = self._feature()
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        feature._jobs = {
+            "job-1": {
+                "status": "running",
+                "started_at": old,
+                "label": "issue-1",
+                "repo": "org/repo",
+                "issue": 1,
+            },
+            "job-2": {
+                "status": "running",
+                "started_at": old,
+                "repo": "other/repo",
+                "issue": 2,
+            },
+        }
+
+        result = await feature.scan_stale_work(stale_days=3, repo="org/repo")
+
+        assert result.status is ToolResultStatus.OK
+        findings = result.data["findings"]
+        assert len(findings) == 1
+        assert findings[0]["id"] == "job-1"
+        assert findings[0]["repo"] == "org/repo"
+        assert findings[0]["kind"] == "talon_job"
+        assert findings[0]["issue"] == 1
+        assert findings[0]["suggested_gate"] == "govern_stalled_work_rescue"
+
+    @pytest.mark.asyncio
     async def test_survey_is_registered_as_fleet_discover(self):
         # The coordinator binds its survey onto fleet_stalled_sweep so a
         # recurring tick observes real candidates without pre-seeding.
@@ -1227,3 +1504,435 @@ class TestSurveyStalledTalonJobs:
         result = await reg.handler({"stale_days": 3, "recurring": True})
         assert result["discovered"] is True
         assert [j["id"] for j in result["stalled_items"]] == ["job-1"]
+
+
+class TestScanStaleWorkRoster:
+    """Roster-mode scan_stale_work: org/allowlist/prefix expansion (#2269)."""
+
+    def _feature(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = MagicMock()
+        return feature
+
+    def _stalled_jobs(self):
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        return {
+            "job-a": {"status": "running", "started_at": old,
+                      "repo": "KestrelSovereignAI/kestrel-feature-github", "issue": 1},
+            "job-b": {"status": "running", "started_at": old,
+                      "repo": "KestrelSovereignAI/kestrel-sovereign", "issue": 2},
+        }
+
+    @pytest.mark.asyncio
+    async def test_prefix_wildcard_is_not_treated_as_repo_name(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = self._stalled_jobs()
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            {
+                "KestrelSovereignAI/kestrel-feature-github",
+                "KestrelSovereignAI/kestrel-feature-voice",
+                "KestrelSovereignAI/kestrel-sovereign",
+            },
+            None,
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, repos=["KestrelSovereignAI/kestrel-feature-*"],
+        )
+        assert result.status is ToolResultStatus.OK
+        scanned = set(result.data["scanned_repos"])
+        assert scanned == {
+            "KestrelSovereignAI/kestrel-feature-github",
+            "KestrelSovereignAI/kestrel-feature-voice",
+        }
+        # Only the stalled job in a rostered repo becomes a finding.
+        repos = {f["repo"] for f in result.data["findings"]}
+        assert repos == {"KestrelSovereignAI/kestrel-feature-github"}
+        assert result.data["scan_failures"] == []
+
+    @pytest.mark.asyncio
+    async def test_tekspear_repos_excluded(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = {}
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            {
+                "KestrelSovereignAI/kestrel-sovereign",
+                "KestrelSovereignAI/tekspear-core",
+            },
+            None,
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, org="KestrelSovereignAI",
+        )
+        assert "KestrelSovereignAI/tekspear-core" not in result.data["scanned_repos"]
+        assert "KestrelSovereignAI/tekspear-core" in result.data["excluded_repos"]
+
+    @pytest.mark.asyncio
+    async def test_inaccessible_explicit_repo_is_scan_failure(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = {}
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            {"KestrelSovereignAI/kestrel-sovereign"},
+            None,
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, repos=["KestrelSovereignAI/does-not-exist"],
+        )
+        failures = result.data["scan_failures"]
+        assert len(failures) == 1
+        assert failures[0]["target"] == "KestrelSovereignAI/does-not-exist"
+        assert failures[0]["kind"] == "scan_failure"
+        # Failures also surface as actionable findings (never silently skipped).
+        assert any(f.get("kind") == "scan_failure" for f in result.data["findings"])
+
+    @pytest.mark.asyncio
+    async def test_discovery_failure_reports_all_targets(self):
+        from unittest.mock import AsyncMock
+
+        feature = self._feature()
+        feature._jobs = {}
+        feature._discover_roster_universe = AsyncMock(return_value=(
+            set(), "HTTPException: 503 No GITHUB_TOKEN configured",
+        ))
+
+        result = await feature.scan_stale_work(
+            stale_days=3, org="KestrelSovereignAI",
+        )
+        assert result.data["scanned_repos"] == []
+        assert len(result.data["scan_failures"]) == 1
+        assert "503" in result.data["scan_failures"][0]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_single_repo_mode_unchanged(self):
+        feature = self._feature()
+        feature._jobs = self._stalled_jobs()
+
+        result = await feature.scan_stale_work(
+            stale_days=3, repo="KestrelSovereignAI/kestrel-sovereign",
+        )
+        assert result.status is ToolResultStatus.OK
+        assert "scan_failures" not in result.data
+        assert [f["repo"] for f in result.data["findings"]] == [
+            "KestrelSovereignAI/kestrel-sovereign"
+        ]
+
+
+class TestVerifyPipelineCI:
+    """The ``fleet_ci_probe`` verify seam bound to the dispatched job (#2303)."""
+
+    def _feature(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = MagicMock()
+        return feature
+
+    @staticmethod
+    def _stub_green_ci(monkeypatch, feature):
+        """Stub the GitHub PR-head lookup + workflows ci_green machinery green.
+
+        Returns the ``talon_pipeline`` module so the caller can also stub
+        ``_find_pr_url`` / ``_await_completion`` (both imported inside
+        ``verify_pipeline_ci``).
+        """
+        import kestrel_sovereign.signals.sources.talon_pipeline as tp
+
+        wfr = pytest.importorskip("kestrel_feature_workflows.runner")
+
+        monkeypatch.setattr(
+            feature,
+            "_github_pr_head",
+            lambda repo, pr: {"ref": f"talon/pr-{pr}", "sha": f"sha-{pr}"},
+        )
+
+        async def _provider(gate, link):
+            return {"status": "green"}
+
+        monkeypatch.setattr(wfr, "_default_ci_green_provider", _provider)
+        monkeypatch.setattr(wfr, "_ci_marker_green", lambda gate, marker: True)
+        return tp
+
+    @pytest.mark.asyncio
+    async def test_run_binding_selects_own_job_exclusively(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # Two COMPLETE jobs for the same repo/issue; B started later, so a bare
+        # (repo, issue) correlation would pick B. The run→job map binds THIS run
+        # to A, and that is the ONLY thing consulted — B is never read.
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-01-01T00:00:00",
+            },
+            "B": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-02-01T00:00:00",
+            },
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        read: list = []
+
+        def _find_pr_url(coord, jid):
+            read.append(jid)
+            return f"https://github.com/org/repo/pull/{101 if jid == 'A' else 202}"
+
+        monkeypatch.setattr(tp, "_find_pr_url", _find_pr_url)
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["job_id"] == "A"
+        assert verdict["pr"] == 101
+        assert "B" not in read  # job B was never read
+
+    @pytest.mark.asyncio
+    async def test_no_run_bound_job_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # A completed green job exists, but THIS run has no entry in the run→job
+        # map. There is no correlation fallback: the verify must fail closed and
+        # never touch the unrelated job.
+        feature._jobs = {
+            "B": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-02-01T00:00:00",
+            }
+        }
+        tp = self._stub_green_ci(monkeypatch, feature)
+        read: list = []
+        monkeypatch.setattr(
+            tp, "_find_pr_url", lambda coord, jid: read.append(jid) or None
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"] == "no_run_bound_job"
+        assert read == []  # never resolved a PR for any job
+
+    @pytest.mark.asyncio
+    async def test_no_workflow_run_id_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        # No run_id passed and no signal context → cannot bind → fail closed.
+        monkeypatch.setattr(feature, "_current_workflow_run_id", lambda: None)
+        verdict = await feature.verify_pipeline_ci(repo="org/repo")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"] == "no_workflow_run_id"
+
+    @pytest.mark.asyncio
+    async def test_iterate_pr_read_from_job_record_not_param(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # An iterate job records its target PR (55). Verification reads the PR
+        # off the job record, not from any caller param.
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "pr": 55, "status": "complete",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        monkeypatch.setattr(tp, "_find_pr_url", lambda coord, jid: None)
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["pr"] == 55
+
+    @pytest.mark.asyncio
+    async def test_terminal_failed_job_never_reports_green(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # The job ended terminal-FAILED but still opened a green-CI PR. It must
+        # NOT be accepted as ci_green (the P2 gate: require job success first).
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "failed",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"].startswith("job_not_complete")
+
+    @pytest.mark.asyncio
+    async def test_reap_to_terminal_failed_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        feature._persist_jobs = MagicMock()
+        # A cli_background job whose live process finished with rc!=0. The
+        # point-in-time reap resolves it to ``failed`` (no hold), and a
+        # terminal-failed job never reports green even if its PR is green.
+        class _Proc:
+            returncode = 2
+
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "running",
+                "method": "cli_background", "process": _Proc(),
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert "job_not_complete:failed" in verdict["reason"]
+
+    @pytest.mark.asyncio
+    async def test_still_running_job_waits_then_verifies(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # A job still running at verify time (a2a → _reap_cli_job is a no-op, so
+        # the fast path leaves it running). The workflows runner has no
+        # waiting-stage primitive that parks a signal_status_ok stage on
+        # talon:<job_id>, so verify_ci itself absorbs the wait on the durable
+        # rail; once the job completes it verifies the PR's CI green (#2303,
+        # sixth pass — the real dispatch(wait:false)→verify production path).
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "running",
+                "method": "a2a",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+
+        waited: list = []
+
+        async def _await(coord, jid, timeout):  # the rail reaps job → complete
+            waited.append((jid, timeout))
+            feature._jobs[jid]["status"] = "complete"
+            return MagicMock(data={"status": "complete"})
+
+        monkeypatch.setattr(tp, "_await_completion", _await, raising=False)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["job_id"] == "A"
+        # Waited on THIS run's own job, up to the held-turn ceiling.
+        assert waited and waited[0][0] == "A"
+
+    @pytest.mark.asyncio
+    async def test_still_running_past_ceiling_fails_closed(self, monkeypatch):
+        pytest.importorskip("kestrel_feature_workflows")
+        feature = self._feature()
+        # The job never reaches a terminal state within the wait ceiling: the
+        # rail returns still-running. verify_ci fails closed (the run can be
+        # re-verified) and never advances to PR resolution — it must not claim
+        # CI state for an unfinished job.
+        feature._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "running",
+                "method": "a2a",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        feature._pipeline_run_jobs["run-1"] = "A"
+        tp = self._stub_green_ci(monkeypatch, feature)
+
+        async def _await(coord, jid, timeout):  # times out; job still running
+            return MagicMock(data={"status": "running", "timed_out": True})
+
+        monkeypatch.setattr(tp, "_await_completion", _await, raising=False)
+        read: list = []
+        monkeypatch.setattr(
+            tp, "_find_pr_url", lambda coord, jid: read.append(jid) or None
+        )
+
+        verdict = await feature.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is False
+        assert verdict["reason"].startswith("job_still_running")
+        assert read == []  # never advanced to PR resolution
+
+    @pytest.mark.asyncio
+    async def test_run_binding_survives_restart(self, monkeypatch, tmp_path):
+        pytest.importorskip("kestrel_feature_workflows")
+
+        def _agent():
+            agent = _make_agent()
+            agent.storage_path = str(tmp_path / "kestrel_prime.db")
+            return agent
+
+        import kestrel_sovereign.signals.context as ctx
+
+        sig = MagicMock()
+        sig.session_id = "run-1"
+        monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
+
+        # --- process 1: dispatch stamps the run→job binding on the persisted
+        # cli_background job record and flushes the durable registry.
+        f1 = TalonCoordinatorFeature(_agent())
+        f1._jobs = {
+            "A": {
+                "repo": "org/repo", "issue": 9, "status": "complete",
+                "method": "cli_background",
+                "started_at": "2026-01-01T00:00:00",
+            }
+        }
+        f1._record_pipeline_run_job({"dispatched": True, "job_id": "A"})
+        assert f1._pipeline_run_jobs["run-1"] == "A"
+
+        # --- process 2 (simulated restart): a fresh instance over the same
+        # registry reloads BOTH the job AND the run→job binding, even though the
+        # in-memory map was lost on restart.
+        f2 = TalonCoordinatorFeature(_agent())
+        assert "A" in f2._jobs
+        assert f2._pipeline_run_jobs.get("run-1") == "A"
+
+        tp = self._stub_green_ci(monkeypatch, f2)
+        monkeypatch.setattr(
+            tp, "_find_pr_url",
+            lambda coord, jid: "https://github.com/org/repo/pull/101",
+        )
+        verdict = await f2.verify_pipeline_ci(repo="org/repo", run_id="run-1")
+        assert verdict["ci_green"] is True
+        assert verdict["job_id"] == "A"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_records_run_to_job_binding(self, monkeypatch):
+        feature = self._feature()
+        # Simulate being inside a workflow.stage signal dispatch.
+        import kestrel_sovereign.signals.context as ctx
+
+        sig = MagicMock()
+        sig.session_id = "run-42"
+        monkeypatch.setattr(ctx, "get_current_signal", lambda: sig)
+
+        feature._record_pipeline_run_job({"dispatched": True, "job_id": "job-99"})
+        assert feature._pipeline_run_jobs["run-42"] == "job-99"
+        # A non-dispatched result records nothing.
+        feature._record_pipeline_run_job({"dispatched": False, "job_id": "x"})
+        assert "x" not in feature._pipeline_run_jobs.values()

@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
+import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml, getOverlayRoot } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import bus from './ui-ext/bus.js';
 import {
@@ -41,14 +41,33 @@ export function setChatDeps(partial) {
 // corrects the preview text). Debounced so rapid/queued turns coalesce into a
 // single reload instead of thrashing the list request.
 let _conversationsStaleTimer = null;
-function notifyConversationsStale() {
+let _conversationsStaleDetail = null;
+// #2254: carry `{ sessionId, agent }` in the stale event so identity.js's
+// listener can sync the active-row highlight for ORGANIC sessions — the ones
+// the user reaches by just typing, where the effective session id is learned
+// from the X-Session-Id header onto `pane.sessionId` and identity.js's
+// `activeConversationId` was never updated. The detail is captured at call time
+// (the latest turn wins) and read at fire time, since the dispatch is debounced.
+function notifyConversationsStale(sessionId, agent) {
     if (typeof window === 'undefined'
         || typeof window.dispatchEvent !== 'function') return;
     if (_conversationsStaleTimer) clearTimeout(_conversationsStaleTimer);
+    _conversationsStaleDetail = {
+        sessionId: sessionId || null,
+        agent: agent || null,
+    };
     _conversationsStaleTimer = setTimeout(() => {
         _conversationsStaleTimer = null;
+        const detail = _conversationsStaleDetail;
+        _conversationsStaleDetail = null;
         try {
-            window.dispatchEvent(new Event('kestrel:conversations-stale'));
+            const EventCtor = typeof window.CustomEvent === 'function'
+                ? window.CustomEvent
+                : (typeof CustomEvent === 'function' ? CustomEvent : null);
+            const evt = EventCtor
+                ? new EventCtor('kestrel:conversations-stale', { detail })
+                : new Event('kestrel:conversations-stale');
+            window.dispatchEvent(evt);
         } catch (_) { /* best-effort — the pane refresh is non-critical */ }
     }, 400);
 }
@@ -60,6 +79,8 @@ function deps() {
         markdown: _deps.markdown || globalWindow.SharedMarkdown,
         kicon: _deps.kicon || globalWindow.kicon || globalThis.kicon,
         ModelSelector: _deps.ModelSelector || globalWindow.SharedModelSelector,
+        EmbeddingSelector: _deps.EmbeddingSelector || globalWindow.EmbeddingSelector,
+        ModelSettingsPopover: _deps.ModelSettingsPopover || globalWindow.ModelSettingsPopover,
         toast: _deps.toast || Toast,
         escapeHtml: _deps.escapeHtml || escapeHtml,
         commands: _deps.commands || AGENT_COMMANDS,
@@ -290,6 +311,100 @@ function noticePartRenderer(data) {
     return `<div class="part-notice part-notice-${level}">${titleHtml}${bodyHtml}</div>`;
 }
 
+// #1894: neutralize a free-form, (transitively) agent/user-influenceable todo
+// string before it is escaped and painted. Mirrors the pre-turn ``_inert``
+// treatment (agent/preturn_state.py): collapse whitespace, drop non-printable /
+// control chars (incl. the 0x1e stream-sentinel byte, so a title can never
+// smuggle wire framing back into the DOM), and collapse any run of 2+ dashes to
+// one so a value like ``--- END ---`` can't fake an operational-block boundary.
+// Length-capped. ``deps().escapeHtml`` still HTML-escapes on top of this.
+function _inertTodoText(text, maxLen = 200) {
+    let s = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+    // Drop C0/C1 control chars and DEL (incl. \x1e); keep printable text.
+    s = s.replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
+    s = s.replace(/-{2,}/g, '-');
+    return s.slice(0, maxLen);
+}
+
+// #1894: render a todo mutation (delta) as its own first-class component
+// bubble. The part carries the shaped item
+// ``{id,title,status,scope,priority,terminal_condition,links[],updated_at}``
+// emitted by ``TodoFeature._emit_todo_part``. The console owns sanitization:
+// free-form fields (title / terminal_condition / link titles) run through
+// ``_inertTodoText`` then ``escapeHtml``; status/scope/priority come from
+// controlled vocabularies but are still class-guarded before use in a
+// classname. Delta semantics — each mutation renders one card in stream order;
+// a cross-session rollup panel is a separate surface (a follow-up).
+const _TODO_STATUSES = ['open', 'in_progress', 'waiting', 'done', 'blocked', 'cancelled'];
+const _TODO_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+// Only these link URL schemes are safe to hyperlink; anything else (javascript:,
+// data:, …) renders as inert text so a crafted link can't inject a live URI.
+function _safeTodoUrl(url) {
+    const u = String(url == null ? '' : url).trim();
+    if (!u) return '';
+    if (/^https?:\/\//i.test(u) || u.startsWith('/')) return u;
+    return '';
+}
+function todoPartRenderer(data) {
+    const esc = deps().escapeHtml;
+    const d = (data && typeof data === 'object') ? data : {};
+
+    const status = _TODO_STATUSES.includes(d.status) ? d.status : 'open';
+    const priority = _TODO_PRIORITIES.includes(d.priority) ? d.priority : '';
+    const scope = typeof d.scope === 'string' && /^[a-z_]{1,32}$/.test(d.scope) ? d.scope : '';
+    const title = _inertTodoText(d.title || d.id || 'todo', 160);
+    const terminal = _inertTodoText(d.terminal_condition, 200);
+
+    const statusLabel = status.replace(/_/g, ' ');
+    const chipHtml =
+        `<span class="todo-status-chip todo-status-${status}">${esc(statusLabel)}</span>`;
+    const metaBits = [];
+    if (scope) metaBits.push(`<span class="todo-scope">${esc(scope)}</span>`);
+    if (priority) {
+        metaBits.push(
+            `<span class="todo-priority todo-priority-${priority}">${esc(priority)}</span>`,
+        );
+    }
+    const metaHtml = metaBits.length
+        ? `<div class="todo-meta">${metaBits.join('')}</div>`
+        : '';
+    const titleHtml = `<div class="todo-title">${esc(title)}</div>`;
+    const terminalHtml = terminal
+        ? `<div class="todo-terminal">done when: ${esc(terminal)}</div>`
+        : '';
+
+    let linksHtml = '';
+    const links = Array.isArray(d.links) ? d.links : [];
+    const linkChips = [];
+    for (const link of links) {
+        if (!link || typeof link !== 'object') continue;
+        const type = _inertTodoText(link.type, 32);
+        const target = _inertTodoText(link.target, 80);
+        const label = _inertTodoText(link.title, 80);
+        const text = label || (type && target ? `${type}: ${target}` : (type || target));
+        if (!text) continue;
+        const href = _safeTodoUrl(link.url);
+        if (href) {
+            linkChips.push(
+                `<a class="todo-link" href="${esc(href)}" target="_blank" ` +
+                `rel="noopener noreferrer">${esc(text)}</a>`,
+            );
+        } else {
+            linkChips.push(`<span class="todo-link">${esc(text)}</span>`);
+        }
+    }
+    if (linkChips.length) {
+        linksHtml = `<div class="todo-links">${linkChips.join('')}</div>`;
+    }
+
+    return (
+        `<div class="part-todo todo-status-${status}">` +
+        `<div class="todo-header">${chipHtml}${titleHtml}</div>` +
+        `${metaHtml}${terminalHtml}${linksHtml}` +
+        `</div>`
+    );
+}
+
 // #2081: a persisted, reference-based channel pairing card. The part carries
 // only ``{channel_type}`` (NOT the QR bytes), so it rides the turn that asked
 // for the link and persists in that conversation — surviving a hard refresh
@@ -500,6 +615,7 @@ function channelLinkPartRenderer(data, context) {
 export function registerCoreParts() {
     registerPartRenderer('notice', noticePartRenderer);
     registerPartRenderer('channel_link', channelLinkPartRenderer);
+    registerPartRenderer('todo', todoPartRenderer);
 }
 
 // ============================================================================
@@ -1102,6 +1218,9 @@ let composerModeToggle = null;  // #1257 send-while-busy mode toggle
 
 // Shared model selector instance
 let sharedModelSelector = null;
+// Embeddings section controller + the popover that houses both sections (#2264).
+let embeddingSelector = null;
+let modelSettingsPopover = null;
 // One-time guard: the selector claim auto-release bridge (capabilities:changed →
 // claims.onCapabilitiesChanged) is wired once, then forwards to whatever
 // selector is live. See loadModels(). (#2047)
@@ -2133,8 +2252,10 @@ function renderRestartStatusBody(div, payload) {
     }
     rows.push(['Policy / urgency',
         `${String(payload.policy || '—')} · ${String(payload.urgency || '—')}`]);
-    if (payload.requested_by_agent) {
-        rows.push(['Requested by', String(payload.requested_by_agent)]);
+    const requestedByName = String(payload.requested_by_agent_name || '').trim();
+    const requestedByAgent = String(payload.requested_by_agent || '').trim();
+    if (requestedByName || requestedByAgent) {
+        rows.push(['Requested by', requestedByName || requestedByAgent]);
     }
     if (payload.reason) rows.push(['Reason', String(payload.reason)]);
     if (deferralReason) rows.push(['Deferred', deferralReason]);
@@ -2996,7 +3117,9 @@ export async function sendMessage(overrideText, overrideAgent) {
         // non-aborted turn signals (an orphaned prior turn's late finally must
         // not); the debounced dispatch is a no-op when the pane isn't mounted.
         if (ownsStream() && !wasAborted) {
-            notifyConversationsStale();
+            // #2254: carry this turn's learned session id + agent so the pane
+            // can highlight the active row for an organic (just-typed) session.
+            notifyConversationsStale(pane.sessionId, dispatchAgent);
         }
         // Toast the user when a non-visible agent finishes responding,
         // so a long-running answer on Agent A surfaces while they're
@@ -4037,6 +4160,7 @@ export async function loadModels() {
     sharedModelSelector = new ModelSelector({
         providerSelectId: 'provider-selector',
         routeSelectId: 'route-selector',
+        upstreamSelectId: 'upstream-selector',
         modelSelectId: 'model-selector',
         apiEndpoint: deps().api.buildAgentUrl('/api/models'),
         currentModelEndpoint: deps().api.buildAgentUrl('/api/model/current'),
@@ -4120,6 +4244,58 @@ export async function loadModels() {
     // or temporarily seize it can (re)attach (#2047). chat.js itself stays
     // feature-agnostic: it publishes the event, it does not know who listens.
     UI.emit('model-selector:ready', { selector: sharedModelSelector });
+
+    // Embeddings section (#2263/#2264) — reads/writes the embedding-settings
+    // API and lists only embedding-capable routes surfaced by /api/models.
+    const EmbeddingSelectorCtor = deps().EmbeddingSelector;
+    if (EmbeddingSelectorCtor && el('embedding-mode-selector')) {
+        embeddingSelector = new EmbeddingSelectorCtor({
+            settingsEndpoint: deps().api.buildAgentUrl('/api/embedding/settings'),
+            modelsEndpoint: deps().api.buildAgentUrl('/api/embedding/models'),
+            routeModelEndpoint: deps().api.buildAgentUrl('/api/embedding/route-model'),
+            verifyEndpoint: deps().api.buildAgentUrl('/api/embedding/space/verify'),
+            modeSelectId: 'embedding-mode-selector',
+            routeSelectId: 'embedding-route-selector',
+            universalId: 'embedding-universal',
+            modelSelectId: 'embedding-model-selector',
+            setupStatusId: 'embedding-setup-status',
+            dimReadoutId: 'embedding-dim-readout',
+            warningId: 'embedding-dim-warning',
+            sharedSpaceId: 'embedding-shared-space',
+            reindexButtonId: 'embedding-reindex-button',
+            reindexStatusId: 'embedding-reindex-status',
+            reindexEndpoint: deps().api.buildAgentUrl('/api/embedding/reindex'),
+            getAuthHeader: async () => await deps().api.applyAuth({}),
+            getEmbeddingRoutes: () => {
+                const routes = (sharedModelSelector?.allModelsData?.routes) || [];
+                return routes
+                    .filter(r => r.supports_embeddings)
+                    // #2337 — carry locality so the section can label each route's
+                    // hidden tradeoff (cloud-only degrades private sessions).
+                    .map(r => ({
+                        vendor: r.vendor,
+                        route: r.route,
+                        is_local: r.is_local,
+                        is_cloud: r.is_cloud,
+                    }));
+            },
+        });
+        await embeddingSelector.init();
+        window._embeddingSelector = embeddingSelector;
+    }
+
+    // The single toolbar button that toggles the two-section popover. Built
+    // once; it targets the live panel across selector rebuilds. Respects the
+    // configured overlay root so scoped embeds aren't clipped (#2233).
+    const PopoverCtor = deps().ModelSettingsPopover;
+    if (PopoverCtor && !modelSettingsPopover && el('model-settings-button') && el('model-settings-panel')) {
+        modelSettingsPopover = new PopoverCtor({
+            buttonId: 'model-settings-button',
+            panelId: 'model-settings-panel',
+            getOverlayRoot: () => getOverlayRoot(),
+        });
+        window._modelSettingsPopover = modelSettingsPopover;
+    }
 }
 
 /**

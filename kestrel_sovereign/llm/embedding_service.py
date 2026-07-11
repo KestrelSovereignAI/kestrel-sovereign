@@ -15,6 +15,132 @@ from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
 logger = logging.getLogger(__name__)
 
 
+MEMORY_RETRIEVAL_INSTRUCTION = (
+    "Retrieve conversation memories that are relevant to the query"
+)
+EPISODE_RETRIEVAL_INSTRUCTION = (
+    "Retrieve memory episodes that are relevant to the query"
+)
+
+
+def _is_qwen3_embedding_model(model: Optional[str]) -> bool:
+    """Return whether ``model`` uses Qwen3's asymmetric query contract."""
+    normalized = (model or "").lower().replace("_", "-")
+    return "qwen3-embedding" in normalized
+
+
+def _is_nomic_embedding_model(model: Optional[str]) -> bool:
+    """Return whether ``model`` requires Nomic retrieval task prefixes."""
+    return "nomic-embed-text" in (model or "").lower().replace("_", "-")
+
+
+def _prepare_retrieval_document(
+    text: str,
+    model: Optional[str],
+    document_format: Optional[str] = None,
+) -> str:
+    """Apply the model's document-side retrieval representation."""
+    normalized_format = (document_format or "").strip().lower()
+    if normalized_format == "raw":
+        return text
+    if normalized_format == "nomic" or (
+        not normalized_format and _is_nomic_embedding_model(model)
+    ):
+        return f"search_document: {text}"
+    return text
+
+
+def _prepare_retrieval_query(
+    text: str,
+    model: Optional[str],
+    instruction: str,
+    query_format: Optional[str] = None,
+) -> str:
+    """Apply a model's documented retrieval-query representation.
+
+    Qwen3-Embedding expects instructions on queries, while stored documents
+    remain unchanged. Providers that manage this server-side can declare the
+    ``raw`` format; ``qwen3`` forces client-side formatting. With no explicit
+    capability, the model name selects the documented Qwen3 contract.
+    """
+    normalized_format = (query_format or "").strip().lower()
+    if normalized_format == "raw":
+        return text
+    if _is_nomic_embedding_model(model):
+        return f"search_query: {text}"
+    if normalized_format == "qwen3" or (
+        not normalized_format and _is_qwen3_embedding_model(model)
+    ):
+        return f"<Instruct>: {instruction}\n<Query>: {text}"
+    return text
+
+
+def _retrieval_similarity_floor(
+    model: Optional[str], override: Optional[float] = None
+) -> float:
+    """Return the calibrated raw-cosine no-match floor for ``model``.
+
+    The versioned Kestrel quality suite measures each model's positive
+    no-match band alongside valid paraphrases. Qwen3 projects from 0.27;
+    Nomic's correctly-prefixed retrieval space projects from 0.35. The public
+    semantic eligibility threshold and relative gate reject the remaining
+    measured noise. Models without live calibration retain the historical
+    zero floor.
+    """
+    if override is not None:
+        return max(0.0, min(0.99, float(override)))
+    if _is_qwen3_embedding_model(model):
+        return 0.27
+    if _is_nomic_embedding_model(model):
+        return 0.35
+    return 0.0
+
+
+def _document_space_id(
+    provider: str,
+    model: str,
+    declared_space_id: Optional[str] = None,
+    document_format: Optional[str] = None,
+) -> Optional[str]:
+    """Version stored-vector preprocessing in the embedding profile.
+
+    Adding Nomic's required document prefix changes every stored vector.  The
+    profile must therefore change too, forcing a safe reindex instead of
+    comparing new instructed queries with legacy raw-document vectors.
+    """
+    normalized_format = (document_format or "").strip().lower()
+    instructed = normalized_format == "nomic" or (
+        not normalized_format and _is_nomic_embedding_model(model)
+    )
+    if not instructed:
+        return declared_space_id
+    base = declared_space_id or f"{provider}:{model}"
+    return f"{base}|document=search_document:v1"
+
+
+async def aembed_retrieval_query(
+    service: Any,
+    text: str,
+    *,
+    instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
+) -> Optional[List[float]]:
+    """Use the asymmetric query API with compatibility for legacy services."""
+    embed_query = getattr(type(service), "aembed_query", None)
+    if callable(embed_query):
+        return await embed_query(service, text, instruction=instruction)
+    model = getattr(service, "model", None)
+    if isinstance(model, str) and _is_nomic_embedding_model(model):
+        # Calling a legacy service's document API here would silently apply
+        # ``search_document:`` to a query. Fail closed instead of comparing
+        # incompatible representations; Nomic services must expose the
+        # asymmetric query method.
+        logger.warning(
+            "Nomic embedding service lacks aembed_query; query embedding disabled"
+        )
+        return None
+    return await service.aembed(text)
+
+
 @dataclass(frozen=True)
 class EmbeddingProfile:
     """Identity of an embedding configuration (#1477).
@@ -183,7 +309,10 @@ class EmbeddingService:
             return None
 
         try:
-            response = self.client.embed(model=self.model, input=text)
+            response = self.client.embed(
+                model=self.model,
+                input=_prepare_retrieval_document(text, self.model),
+            )
             # Ollama returns embeddings in response['embeddings']
             embeddings = response.get('embeddings', [])
             if embeddings:
@@ -208,7 +337,10 @@ class EmbeddingService:
             return [None] * len(texts)
 
         try:
-            response = self.client.embed(model=self.model, input=texts)
+            response = self.client.embed(
+                model=self.model,
+                input=[_prepare_retrieval_document(text, self.model) for text in texts],
+            )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
             self._handle_embed_error(e, "Batch embedding failed")
@@ -229,7 +361,10 @@ class EmbeddingService:
             return None
 
         try:
-            response = await self.async_client.embed(model=self.model, input=text)
+            response = await self.async_client.embed(
+                model=self.model,
+                input=_prepare_retrieval_document(text, self.model),
+            )
             embeddings = response.get('embeddings', [])
             if embeddings:
                 return embeddings[0]
@@ -237,6 +372,30 @@ class EmbeddingService:
         except Exception as e:
             self._handle_embed_error(e, "Async embedding failed")
             return None
+
+    async def aembed_query(
+        self,
+        text: str,
+        *,
+        instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
+    ) -> Optional[List[float]]:
+        """Embed a retrieval query using the model's query-side contract."""
+        if not OLLAMA_AVAILABLE:
+            return None
+        try:
+            response = await self.async_client.embed(
+                model=self.model,
+                input=_prepare_retrieval_query(text, self.model, instruction),
+            )
+            embeddings = response.get("embeddings", [])
+            return embeddings[0] if embeddings else None
+        except Exception as exc:
+            self._handle_embed_error(exc, "Async query embedding failed")
+            return None
+
+    def retrieval_similarity_floor(self) -> float:
+        """Raw-cosine floor used to project retrieval relevance."""
+        return _retrieval_similarity_floor(self.model)
 
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         """
@@ -253,7 +412,10 @@ class EmbeddingService:
             return [None] * len(texts)
 
         try:
-            response = await self.async_client.embed(model=self.model, input=texts)
+            response = await self.async_client.embed(
+                model=self.model,
+                input=[_prepare_retrieval_document(text, self.model) for text in texts],
+            )
             return response.get('embeddings', [None] * len(texts))
         except Exception as e:
             self._handle_embed_error(e, "Async batch embedding failed")
@@ -280,6 +442,7 @@ class EmbeddingService:
         known_dims = {
             "nomic-embed-text": 768,
             "mxbai-embed-large": 1024,
+            "qwen3-embedding:0.6b": 1024,
         }
         dim = known_dims.get(self.model)
         if not dim:
@@ -290,6 +453,7 @@ class EmbeddingService:
                 model=self.model,
                 dim=dim,
                 normalized=False,
+                space_id=_document_space_id("ollama", self.model),
             )
         except ValueError:
             return None
@@ -311,13 +475,22 @@ class ProviderEmbeddingService:
     interchangeable and should be re-embedded before mixing in one index.
     """
 
-    def __init__(self, provider: dict[str, Any]):
+    def __init__(
+        self,
+        provider: dict[str, Any],
+        *,
+        space_id_override: Optional[str] = None,
+        normalized_override: Optional[bool] = None,
+    ):
         self.provider = provider
         self.adapter = provider["adapter"]
         self.client = provider["client"]
         capabilities = provider.get("capabilities") or {}
         self.model = capabilities.get("embedding_model")
         self.embedding_dim = capabilities.get("embedding_dim")
+        self._query_format = capabilities.get("embedding_query_format")
+        self._document_format = capabilities.get("embedding_document_format")
+        self._similarity_floor = capabilities.get("embedding_similarity_floor")
         # #1477 normalization flag — capability-declared; defaults to
         # False because most providers (OpenAI, Vertex, Ollama
         # nomic-embed-text) return raw vectors and let the caller
@@ -328,19 +501,97 @@ class ProviderEmbeddingService:
         # the same upstream model (rare). Default profile uses
         # ``"<provider>:<model>"``.
         self._space_id = capabilities.get("embedding_space_id")
+        # Meta-providers (OpenRouter) key the space on the *upstream* model,
+        # not on the route vendor, so the same upstream model reached through
+        # different routes shares a coordinate space (#2288). When capabilities
+        # carry no explicit override, let the adapter declare its space id.
+        if not self._space_id:
+            adapter_space_id = getattr(self.adapter, "embedding_space_id", None)
+            if callable(adapter_space_id):
+                try:
+                    declared = adapter_space_id()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "adapter.embedding_space_id() failed for %s: %s",
+                        type(self.adapter).__name__,
+                        exc,
+                    )
+                    declared = None
+                # Only a non-empty string is a valid override — ignore mocks /
+                # stubs whose attribute access auto-vivifies a truthy object.
+                if isinstance(declared, str) and declared:
+                    self._space_id = declared
+
+        # #2290 — a verified shared-space pin force-merges this member route
+        # into a single model-identity space (``<model>@<dim>``) shared with
+        # its sibling routes. Applied ONLY after the parity probe passes, so it
+        # wins over both the capability override and the adapter's own derived
+        # space id. ``normalized_override`` pins the normalization convention
+        # the pin declared so both members hash to the same profile id.
+        if space_id_override:
+            self._space_id = str(space_id_override)
+        self._normalized_override = normalized_override
+        if normalized_override is not None:
+            self._normalized = bool(normalized_override)
+
+    def _embed_kwargs(self) -> dict[str, Any]:
+        """Adapter kwargs that carry the embedding-space identity.
+
+        ``embedding_dim`` is half of an embedding profile's identity
+        (``<model>@<dim>``), so it must ride EVERY embed request as the
+        Matryoshka ``dimensions`` param — not be left to whatever ambient
+        default the calling path happened to configure. Omitting it caused
+        the reindex endpoint to receive native-dim vectors (4096) that the
+        column guard then rejected as dim-mismatch even under an explicit
+        768 pin (#2371). Only forwarded when a dim is actually pinned;
+        adapters that don't support the param must truthfully not advertise
+        dim options rather than silently dropping it.
+        """
+        if self.embedding_dim is not None:
+            return {"dimensions": int(self.embedding_dim)}
+        return {}
 
     async def aembed(self, text: str) -> Optional[List[float]]:
         return await self.adapter.aembed(
             self.client,
-            text,
+            _prepare_retrieval_document(
+                text, self.model, self._document_format
+            ),
             model=self.model,
+            **self._embed_kwargs(),
         )
+
+    async def aembed_query(
+        self,
+        text: str,
+        *,
+        instruction: str = MEMORY_RETRIEVAL_INSTRUCTION,
+    ) -> Optional[List[float]]:
+        """Embed a retrieval query using the model's query-side contract."""
+        return await self.adapter.aembed(
+            self.client,
+            _prepare_retrieval_query(
+                text, self.model, instruction, self._query_format
+            ),
+            model=self.model,
+            **self._embed_kwargs(),
+        )
+
+    def retrieval_similarity_floor(self) -> float:
+        """Raw-cosine floor used to project retrieval relevance."""
+        return _retrieval_similarity_floor(self.model, self._similarity_floor)
 
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         return await self.adapter.aembed_batch(
             self.client,
-            texts,
+            [
+                _prepare_retrieval_document(
+                    text, self.model, self._document_format
+                )
+                for text in texts
+            ],
             model=self.model,
+            **self._embed_kwargs(),
         )
 
     def describe(self) -> Optional[EmbeddingProfile]:
@@ -373,7 +624,12 @@ class ProviderEmbeddingService:
                 model=self.model,
                 dim=self.embedding_dim,
                 normalized=self._normalized,
-                space_id=self._space_id,
+                space_id=_document_space_id(
+                    provider_label,
+                    self.model,
+                    self._space_id,
+                    self._document_format,
+                ),
             )
         except ValueError as exc:
             logger.warning(
@@ -450,7 +706,7 @@ async def semantic_search(
         return []
 
     # Get query embedding
-    query_embedding = await embedding_service.aembed(query)
+    query_embedding = await aembed_retrieval_query(embedding_service, query)
     if query_embedding is None:
         logger.warning("Failed to embed query, falling back to empty results")
         return []

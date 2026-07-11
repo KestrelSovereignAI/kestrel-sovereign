@@ -106,6 +106,74 @@ class DelegatedWallet:
         """Check whether *cost* fits within the remaining budget."""
         return self.allocation.spent + cost <= self.allocation.amount
 
+    # ------------------------------------------------------------------
+    # WalletProtocol drop-in surface (#2113).
+    #
+    # A child's spend paths (backups/anchoring in ``agent/backup.py`` and
+    # ``features/sovereignty``, metered LLM cost, etc.) call the wallet's
+    # ``can_afford`` / ``transfer`` — NOT ``spend``. So for the budget to be
+    # enforced, ``child.wallet`` is set to this DelegatedWallet and it must be a
+    # drop-in: override the spend-affecting methods with the ceiling check and
+    # delegate everything else (``deposit``/``_balances``/``initialize``/…) to the
+    # wrapped funded wallet via ``__getattr__``.
+    # ------------------------------------------------------------------
+
+    def can_afford(self, amount: Decimal, currency: Any = None) -> bool:
+        """True only if *amount* is within BOTH the remaining budget ceiling and
+        the wrapped wallet's funds."""
+        if not self.can_spend(amount):
+            return False
+        currency = currency or _default_currency_for(self._wallet)
+        return self._wallet.can_afford(amount, currency)
+
+    async def transfer(
+        self, amount: Decimal, memo: str = "", currency: Any = None
+    ) -> bool:
+        """Ceiling-enforced transfer — the drop-in for ``WalletAgent.transfer``.
+
+        Routes through :meth:`spend`, so an overspend raises
+        ``BudgetExceededError`` and a successful debit advances ``allocation.spent``.
+        """
+        return await self.spend(amount, memo, currency)
+
+    def get_balance(self, currency: Any = None, balance_type: str = "main") -> Decimal:
+        """Spendable balance = the smaller of the wrapped wallet's balance and the
+        remaining budget, so a child never appears to hold more than its ceiling."""
+        currency = currency or _default_currency_for(self._wallet)
+        wrapped = self._wallet.get_balance(currency, balance_type)
+        if balance_type == "main":
+            return min(wrapped, self.remaining)
+        return wrapped
+
+    def restore_headroom(self, amount: Decimal) -> None:
+        """Reduce ``allocation.spent`` by *amount*, restoring budget headroom.
+
+        Called ONLY for an explicit budget refund — when a budgeted grandchild's
+        unspent hold is released back into this (budgeted) child
+        (``release_delegated_wallet``). This is deliberately NOT wired into
+        ``deposit``: a normal external top-up must not restore budget headroom, or
+        the child could spend past its ceiling after any deposit. Bounded at 0 so
+        a refund can never lift ``spent`` below zero / inflate the ceiling beyond
+        ``allocation.amount``. ``deposit`` itself is delegated to the wrapped
+        wallet unchanged (via ``__getattr__``)."""
+        self.allocation.spent = max(
+            Decimal("0"), self.allocation.spent - Decimal(amount)
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate any attribute this wrapper doesn't define to the wrapped
+        wallet, so DelegatedWallet is a transparent drop-in (deposit, _balances,
+        initialize, provider-specific helpers, …). Only ``transfer`` /
+        ``can_afford`` / ``get_balance`` are overridden above to enforce the
+        ceiling. ``_wallet`` itself is a real instance attribute set in __init__,
+        so this never recurses on it."""
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        wallet = self.__dict__.get("_wallet")
+        if wallet is None:
+            raise AttributeError(name)
+        return getattr(wallet, name)
+
     async def spend(
         self,
         cost: Decimal,
@@ -226,16 +294,50 @@ async def create_delegated_wallet(
     if not success:
         raise ValueError("Failed to debit parent wallet for budget hold")
 
-    # Create child wallet with the delegated budget (all goes to main, no 90/10 split)
-    wallet_cls = type(parent_wallet)
-    child_wallet = wallet_cls(
-        agent_id=child_did,
-        initial_balance=Decimal("0"),
-        initial_currency=currency,
-    )
-    await child_wallet.initialize()
-    # Deposit full budget to main (bypass the 90/10 split used for normal deposits)
-    child_wallet._balances[currency]["main"] = budget
+    # Transactional after the debit: if child-wallet construction/init fails, the
+    # parent has already been debited, so refund the hold before propagating —
+    # otherwise the funds are stranded (#2113, codex).
+    try:
+        # Construct from the CONCRETE wallet class: when the parent's wallet is
+        # itself a DelegatedWallet (a budgeted child spawning a budgeted
+        # grandchild), unwrap to the underlying funded wallet — DelegatedWallet's
+        # constructor is (wallet, allocation), not the funded-wallet constructor,
+        # so nested budgeted spawns would otherwise raise. The hold above still
+        # went through the parent's (delegated) ceiling.
+        base_wallet = (
+            parent_wallet._wallet
+            if isinstance(parent_wallet, DelegatedWallet)
+            else parent_wallet
+        )
+        wallet_cls = type(base_wallet)
+        child_wallet = wallet_cls(
+            agent_id=child_did,
+            initial_balance=Decimal("0"),
+            initial_currency=currency,
+        )
+        await child_wallet.initialize()
+        # Deposit full budget to main (bypass the 90/10 split used for deposits)
+        child_wallet._balances[currency]["main"] = budget
+    except Exception:
+        try:
+            await parent_wallet.deposit(
+                budget,
+                currency,
+                to_audit=False,
+                memo=f"budget hold refund (child wallet setup failed) for {child_did}",
+            )
+            # If the parent is itself budgeted, the failed hold incremented its
+            # allocation.spent — restore that headroom too, mirroring the normal
+            # release path (otherwise a failed nested spawn permanently shrinks
+            # the parent's budget until termination).
+            if isinstance(parent_wallet, DelegatedWallet):
+                parent_wallet.restore_headroom(budget)
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "CRITICAL: budget hold for child %s could not be refunded after a "
+                "setup failure — parent funds may be stranded.", child_did,
+            )
+        raise
 
     allocation = BudgetAllocation(
         child_did=child_did,
@@ -280,6 +382,12 @@ async def release_delegated_wallet(
             to_audit=False,
             memo=f"budget release from child {delegated_wallet.allocation.child_did}",
         )
+        # If the parent is itself budgeted (a grandchild being released back into
+        # its budgeted parent), restore that parent's budget headroom for the
+        # refunded amount — its ceiling had counted the whole child hold as spent.
+        # Done here (not in deposit) so ONLY an explicit release adjusts spent.
+        if isinstance(parent_wallet, DelegatedWallet):
+            parent_wallet.restore_headroom(unspent)
 
     logger.info(
         "Released delegated wallet: child=%s, returned=%s %s, spent=%s %s",

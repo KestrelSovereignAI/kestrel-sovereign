@@ -58,7 +58,12 @@ Run it in **multi-agent mode** so the agent is addressed by name in the URL.
   (note: the field is `key`, not `api_key`).
 - In multi-agent mode the single-agent path `/api/agent/invoke` returns `503 "Agent not
   initialized"` — always use the `/api/agents/<name>/...` form.
-- `!`-commands go through the same endpoint (`{"input": "!audit"}`, `{"input": "!memory episodes <query>"}`).
+- `!`-commands go through the same endpoint (`{"input": "!audit"}`, `{"input": "!memory episodes 10 axolotl"}`).
+  Command args are parsed **positionally** in the tool's signature order, with no `key=value`
+  syntax — so `!memory episodes` takes `limit` first and `query` second
+  (`!memory episodes <limit> <query text>`). A bare `!memory episodes axolotl` fails
+  (`limit must be an integer, got 'axolotl'`); pass the limit first, e.g.
+  `!memory episodes 10 axolotl` for a topic recall (the trailing words become the query).
 
 Minimal probe helper — **fetch the key once** (repeatedly hitting `/api/auth/key` returns HTTP 429):
 

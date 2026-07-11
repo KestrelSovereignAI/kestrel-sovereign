@@ -5,9 +5,11 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 import aiohttp
 import httpx
+import asyncio
 import os
 import re
 import time
+import uuid
 import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
@@ -98,6 +100,11 @@ async def get_agents(request: Request):
             "agents": agents_list,
             "mode": "multi_agent",
             "server_demo_mode": server_demo_mode,
+            # POST /api/agents works on THIS host (in-process manager). The
+            # subprocess host serves its own /api/agents without this flag —
+            # clients must treat absence as false (codex P2 on #2358: its
+            # POST route doesn't exist and every create 405'd).
+            "can_create_agents": True,
         }
 
     # Single-agent mode
@@ -112,6 +119,7 @@ async def get_agents(request: Request):
             "agents": [card_dict],
             "mode": "standalone",
             "server_demo_mode": server_demo_mode,
+            "can_create_agents": False,
         }
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
@@ -142,8 +150,89 @@ async def create_agent(request: Request, body: CreateAgentRequest):
             detail="Agent name must start with a letter and contain only letters, numbers, hyphens, or underscores.",
         )
 
+    # A name can be REGISTERED without being LOADED (remote agents,
+    # autostart=false locals) — the manager's duplicate check only sees loaded
+    # agents, so creation would silently REPLACE that registration in
+    # multi_agent.toml (codex P2 round 7). Check against the CURRENT ON-DISK
+    # config, not the startup-time snapshot: an operator can edit the file
+    # while the server runs, and saving the stale snapshot back would discard
+    # every external change (codex P1 round 10). Case-insensitive: the toml is
+    # the routing namespace and case-folded collisions are operator error.
+    def _current_config():
+        """(config, path, reload_ok). For CONFIG-DRIVEN deployments a reload
+        failure fails CLOSED (codex P2 round 12): writing the startup
+        snapshot over a file we couldn't read would discard operator edits —
+        or clobber a malformed file mid-repair."""
+        cfg_path = getattr(request.app.state, 'multi_agent_config_path', None)
+        if cfg_path:
+            from kestrel_sovereign.multi_agent.config import MultiAgentConfig as _MAC
+            try:
+                return _MAC.from_file(cfg_path), cfg_path, True
+            except Exception as reload_err:
+                logger.error(
+                    f"Could not reload {cfg_path} ({reload_err}); refusing to "
+                    "persist over a file that can't be read (fail closed)."
+                )
+                return getattr(request.app.state, 'multi_agent_config', None), cfg_path, False
+        return getattr(request.app.state, 'multi_agent_config', None), cfg_path, True
+
+    ma_config_pre, _, _reload_ok_pre = _current_config()
+    if ma_config_pre is not None:
+        taken = {existing.lower() for existing in getattr(ma_config_pre, 'agents', {})}
+        if name.lower() in taken:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An agent named '{name}' is already registered in the multi-agent config.",
+            )
+        # Reserve every port the CURRENT config knows about (codex P1 round
+        # 11): an agent or host-port added to the file after startup isn't in
+        # the manager's boot-time reservations, and allocating it would
+        # persist a port conflict that fails validation on the next boot.
+        from kestrel_sovereign.multi_agent.config import LocalAgentConfig as _LAC
+        host_port = getattr(getattr(ma_config_pre, 'host', None), 'port', None)
+        if isinstance(host_port, int):
+            agent_manager._reserved_ports.add(host_port)
+        for _cfg in getattr(ma_config_pre, 'agents', {}).values():
+            if isinstance(_cfg, _LAC):
+                agent_manager._reserved_ports.add(_cfg.port)
+
     try:
         agent = await agent_manager.create_agent(name)
+        # Persist the registration when the deployment is config-file-driven
+        # (codex P1 on #2358): startup loads multi_agent.toml whenever it
+        # exists, so an unpersisted runtime creation silently vanishes on the
+        # next restart. Auto-discovered deployments (no toml) re-discover from
+        # agent_data/ and need no write. Best-effort: a persistence failure is
+        # SURFACED in the response, never a rollback of the live agent.
+        persisted = None
+        # RE-read the on-disk config for the merge (codex P1 round 10): the
+        # inception above awaited, so even our own pre-check snapshot may be
+        # stale. The fresh object carries every external edit forward.
+        ma_config, config_path, reload_ok = _current_config()
+        if config_path and not reload_ok:
+            # Agent is live but we refuse the stale rewrite — surfaced to the
+            # dialog exactly like a write failure.
+            persisted = False
+        elif config_path and ma_config is not None:
+            try:
+                created_cfg = agent_manager._created_configs.get(name)
+                if created_cfg is not None:
+                    ma_config.agents[name] = created_cfg
+                    # Mutating .agents doesn't rerun the model validator —
+                    # re-validate the merged config so a conflict is surfaced
+                    # HERE (persisted:false + intact file) instead of bricking
+                    # the next boot (codex P1 round 11).
+                    type(ma_config).model_validate(ma_config.model_dump())
+                    ma_config.save(config_path)
+                    # Keep the app-state snapshot current for the next reader.
+                    request.app.state.multi_agent_config = ma_config
+                    persisted = True
+            except Exception as persist_err:
+                logger.error(
+                    f"Agent '{name}' created but NOT persisted to {config_path}: {persist_err}",
+                    exc_info=True,
+                )
+                persisted = False
         return {
             "success": True,
             "agent": {
@@ -151,6 +240,9 @@ async def create_agent(request: Request, body: CreateAgentRequest):
                 "name": name,
                 "status": "online",
             },
+            # None = auto-discovered deployment (no write needed);
+            # True/False = toml-driven write outcome.
+            "persisted": persisted,
         }
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -176,7 +268,13 @@ async def delete_agent(request: Request, agent_name: str):
             detail="Agent management is only available in multi-agent mode.",
         )
 
-    removed = await agent_manager.remove_agent(agent_name)
+    try:
+        removed = await agent_manager.remove_agent(agent_name)
+    except ValueError as e:
+        # remove_agent refuses to delete an agent that still has budgeted child
+        # agents (#2113) — that teardown must go through terminate_child. Surface
+        # it as a controlled 409, not a 500.
+        raise HTTPException(status_code=409, detail=str(e))
     if not removed:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found.")
 
@@ -1155,6 +1253,8 @@ async def list_agent_models(
     featured_only: bool = Query(False, description="Only return featured models"),
     category: Optional[str] = Query(None, description="Filter by category (chat, embedding, image, audio)"),
     providers: Optional[str] = Query(None, description="Comma-separated provider names to filter"),
+    vendor: Optional[str] = Query(None, description="Scope the list to a single vendor (pairs with 'route')"),
+    route: Optional[str] = Query(None, description="Scope the list to a single route of 'vendor' (e.g. plan, api)"),
     use_cache: bool = Query(True, description="Use cached results if available"),
 ):
     """
@@ -1166,6 +1266,13 @@ async def list_agent_models(
             client-side via the "Show all" expander)
         category: Filter by category (chat, embedding, image, audio)
         providers: Comma-separated list of providers to include
+        vendor: Scope the returned list to a single vendor. When combined
+            with ``route``, the list is drawn from THAT route's own serveable
+            set (route-scoped discovery), so a plan route no longer offers
+            api-only models it can't serve (#2262). Requires ``route``.
+        route: The route of ``vendor`` to scope to (e.g. ``plan``, ``api``).
+            Requires ``vendor``. A route change on the UI selector re-fetches
+            with the new pair to repopulate the model combo.
         use_cache: Use cached results (default: true)
 
     Returns:
@@ -1196,13 +1303,33 @@ async def list_agent_models(
         if providers:
             provider_list = [p.strip() for p in providers.split(",")]
 
-        if hasattr(agent, 'llm_service') and agent.llm_service:
-            models = await agent.llm_service.discover_all_models(
-                use_cache=use_cache,
-                featured_only=featured_only,
-                category=model_category,
-                providers=provider_list
+        # ``route`` without ``vendor`` is ambiguous — a route name (plan/api)
+        # only identifies a serveable set relative to its vendor.
+        if route and not vendor:
+            raise HTTPException(
+                status_code=400,
+                detail="'route' requires 'vendor' — a route is only meaningful within a vendor.",
             )
+
+        if hasattr(agent, 'llm_service') and agent.llm_service:
+            if vendor:
+                # Route-scoped discovery: the returned set comes from THIS
+                # (vendor, route)'s own adapter discovery, so a plan route's
+                # list never cross-contaminates with api-only models (#2262).
+                models = await agent.llm_service.discover_models_for_route(
+                    vendor,
+                    route,
+                    use_cache=use_cache,
+                    featured_only=featured_only,
+                    category=model_category,
+                )
+            else:
+                models = await agent.llm_service.discover_all_models(
+                    use_cache=use_cache,
+                    featured_only=featured_only,
+                    category=model_category,
+                    providers=provider_list
+                )
 
         # Convert to dicts for JSON response
         models_data = [m.to_dict() for m in models]
@@ -1242,12 +1369,35 @@ async def list_agent_models(
         # the UI can show a per-vendor route selector without extra round-trips.
         routes = []
         if hasattr(agent, 'llm_service') and agent.llm_service:
+            # #2338: a route advertises embedding capability when discovery
+            # finds ≥1 embedding model FOR THAT ROUTE — not only when a config
+            # pin set ``supports_embeddings``, and NOT collapsed by vendor (an
+            # embedding-capable openai:api must not flip capability on for a
+            # non-embedding openai:plan/codex sibling). Key the discovered set by
+            # the model's originating route.
+            embedding_routes: set = set()
+            try:
+                discovered = await agent.llm_service.discover_embedding_models()
+                embedding_routes = {m.route for m in discovered if m.route}
+            except Exception as e:  # pragma: no cover - never fail the list
+                logger.debug(f"embedding discovery skipped in /api/models: {e}")
             for p in agent.llm_service.providers:
+                capabilities = p.get("capabilities") or {}
+                route_name = p.get("name")
+                supports_embeddings = bool(
+                    capabilities.get("supports_embeddings")
+                ) or (route_name in embedding_routes)
                 routes.append({
                     "vendor": p.get("vendor"),
                     "route": p.get("route"),
                     "is_local": p.get("is_local"),
                     "model": p.get("model"),
+                    # Whether this route can serve embeddings — lets the model
+                    # settings popover's Embeddings section list only
+                    # embedding-capable routes without a second round-trip (#2264).
+                    # Discovery flips this on for routes with a discovered
+                    # embedding model even without a TOML pin (#2338).
+                    "supports_embeddings": supports_embeddings,
                 })
 
         return {
@@ -1356,6 +1506,769 @@ async def set_current_model(request: Request):
     except Exception as e:
         logger.error(f"Error setting model: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error setting model.")
+
+
+@router.get("/api/embedding/models")
+async def get_embedding_models(request: Request):
+    """Return dynamically-discovered embedding models per vendor (#2338).
+
+    Chat models are discovered dynamically; embedding models must be too. This
+    reads the discovered catalog (OpenRouter's dedicated ``/embeddings/models``
+    endpoint, Ollama's ``/api/show`` capability check, OpenAI's id-prefix
+    filter) so the embeddings settings UI (#2337) populates its provider
+    dropdown and model picker with NO TOML editing. Config pins are folded in
+    as overrides (``is_pinned``), not prerequisites.
+
+    ``shared_space_candidates`` are models discovered on BOTH a local and a
+    cloud route (#2290/#2337 "Universal" option), computed by intersection
+    rather than hardcoded to qwen3.
+    """
+    try:
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+
+        discovered = await agent.llm_service.discover_embedding_models()
+        shared = await agent.llm_service.shared_embedding_space_candidates()
+        # #2337 — the featured "Universal" options: shared models enriched with
+        # their member routes (each carrying that route's own slug) so the UI can
+        # render the pinned-at-top option and run guided setup across both members.
+        universal = await agent.llm_service.universal_embedding_space_options()
+
+        by_vendor: Dict[str, list] = {}
+        for m in discovered:
+            by_vendor.setdefault(m.provider, []).append(m.to_dict())
+
+        return {
+            "by_vendor": by_vendor,
+            "all": [m.to_dict() for m in discovered],
+            "shared_space_candidates": [m.to_dict() for m in shared],
+            "universal": universal,
+            "count": len(discovered),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing embedding models: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error listing embedding models.")
+
+
+@router.get("/api/embedding/settings")
+async def get_embedding_settings(request: Request):
+    """Return the resolved embedding-channel state for the active session (#2263).
+
+    Surfaces enough for a UI to render an "Auto — follow chat" default and a
+    dimension-mismatch warning: the configured ``embedding_route`` (or null =
+    auto), the RESOLVED provider for the active session, its ``embedding_model``
+    and ``embedding_dim``, and the deployment's ``KESTREL_EMBEDDING_DIM``.
+    """
+    try:
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+        # Fold live embedding discovery into route capabilities before reading
+        # settings (#2366). ``get_embedding_settings`` surfaces the corpus
+        # space-change warning from ``_embedding_space_change_warnings``, but that
+        # record is only produced by ``reconcile_embedding_capabilities`` (the
+        # POST/PUT paths reconcile; a fresh GET after startup would otherwise
+        # report stale/empty capability state and no warning). Best-effort — a
+        # discovery hiccup must not fail the read.
+        if hasattr(agent.llm_service, "reconcile_embedding_capabilities"):
+            try:
+                await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as e:  # pragma: no cover - never fail the GET
+                logger.debug(f"embedding capability reconcile skipped in GET: {e}")
+        # Resolve the active route's model/dim through the single #2372 resolver
+        # so a cleared pin falls through to corpus-match/catalog rather than
+        # surfacing ``None`` (silent-off). Falls back to the sync read if the
+        # service predates the async resolver.
+        if hasattr(agent.llm_service, "aget_embedding_settings"):
+            settings = await agent.llm_service.aget_embedding_settings()
+        else:
+            settings = agent.llm_service.get_embedding_settings()
+        # #2289 — surface how many stored rows are on a different (or no)
+        # embedding profile than the one currently resolved, so the UI can
+        # render "Re-embed N memories". ``None`` when no profile resolves
+        # (keyword-search fallback) or storage is unavailable.
+        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
+        return settings
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting embedding settings: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error getting embedding settings.")
+
+
+def _agent_raw_db(agent):
+    """Return the raw ``AsyncDatabase`` handle behind the agent's storage.
+
+    ``agent.storage`` is usually a PrivacyEnforcingStorage wrapper (no
+    ``.db`` of its own) around the real AsyncStorage, which owns the
+    ``.db`` handle. Reach through the wrapper's ``_storage`` when the outer
+    object doesn't expose ``db`` directly. Returns ``None`` when no handle
+    is reachable.
+    """
+    storage = getattr(agent, "storage", None)
+    db = getattr(storage, "db", None) if storage else None
+    if db is None and storage is not None:
+        inner = getattr(storage, "_storage", None)
+        db = getattr(inner, "db", None) if inner else None
+    return db
+
+
+async def _count_stale_embedding_rows(agent, service=None) -> Optional[int]:
+    """Count stored rows whose embedding profile != the resolved profile (#2289).
+
+    Scoped to the agent for the per-agent tables (conversation_history,
+    saved_items); document_chunks is global. Returns ``None`` when no
+    embedding profile resolves or storage isn't available — the caller
+    treats that as "re-embed action not applicable".
+
+    ``service`` pins the count to a SPECIFIC route's embedding profile (#2372):
+    the route-model echo passes the just-configured route's service so the
+    stale-row count matches the echoed ``resolved_route`` instead of the globally
+    active route's. Defaults to the active-route embedding service.
+    """
+    try:
+        if service is None:
+            service = agent.llm_service.get_embedding_service()
+        if service is None:
+            return None
+        target = service.current_profile_id()
+        if not target:
+            return None
+        db = _agent_raw_db(agent)
+        if db is None:
+            return None
+        from kestrel_sovereign.storage.embedding_reindex import EmbeddingReindexer
+
+        reindexer = EmbeddingReindexer(db, service, target)
+        counts = await reindexer.count_all_stale(
+            agent_id=getattr(agent, "agent_id", None)
+        )
+        return sum(counts.values())
+    except Exception as e:  # pragma: no cover - defensive; never crash the GET
+        logger.debug("stale_rows count failed: %s", e)
+        return None
+
+
+@router.api_route("/api/embedding/settings", methods=["POST", "PUT"])
+async def set_embedding_settings(request: Request):
+    """Set or clear the top-level ``embedding_route`` knob at runtime (#2263).
+
+    Accepts JSON body ``{"embedding_route": "<vendor>:<route>"}`` to set, or
+    ``{"embedding_route": null}`` (or ``""``/``"auto"``) to clear back to
+    auto/follow-chat. Persists the value the same way runtime model selection
+    persists (agent_metadata row), so it survives restart.
+    """
+    try:
+        data = await request.json()
+        if "embedding_route" not in data:
+            raise HTTPException(
+                status_code=400,
+                detail="'embedding_route' field is required (use null to clear).",
+            )
+        route = data.get("embedding_route")
+        # ``embedding_route`` must be a string selector or null (clear). A
+        # non-string (e.g. 42, a list, a dict) would raise AttributeError deep
+        # in set_embedding_route's ``route.strip()`` and surface as a 500 —
+        # reject it here as plain bad input, consistent with the unknown-route
+        # / no-embedding-support 400s below (#2286).
+        if route is not None and not isinstance(route, str):
+            raise HTTPException(
+                status_code=400,
+                detail="'embedding_route' must be a string or null.",
+            )
+
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+
+        # Fold live embedding discovery into route capabilities BEFORE the sync
+        # validator runs (#2338). ``set_embedding_route`` → ``_validate_embedding_route``
+        # reads the static ``supports_embeddings`` capability; without this a
+        # dynamically-discovered route (e.g. OpenRouter with no TOML pin) would
+        # be rejected as "does not advertise embedding support" even though the
+        # embeddings UI just listed it. Best-effort — a discovery hiccup must
+        # not block clearing/setting a route that already has a static pin.
+        if route not in (None, "", "auto", "none"):
+            try:
+                await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as e:  # pragma: no cover - never block the setter
+                logger.debug(f"embedding capability reconcile skipped in setter: {e}")
+
+        try:
+            # Async set (#2326): after static validation, a cloud route is
+            # live-probed with a canary embed so a listed-but-dead upstream
+            # model (e.g. OpenRouter empty provider pool) is refused here rather
+            # than silently 404'ing to keyword fallback on the next write.
+            await agent.llm_service.aset_embedding_route(route)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+        if hasattr(agent.llm_service, "aget_embedding_settings"):
+            settings = await agent.llm_service.aget_embedding_settings()
+        else:
+            settings = agent.llm_service.get_embedding_settings()
+        # Echo the authoritative stale-row count alongside the resolved settings
+        # (#2338): changing the route can create stale memories, and the UI's
+        # ``_renderReindex`` hides the "Re-embed N memories" button whenever
+        # ``stale_rows`` is absent. Mirror the GET endpoint so the button state
+        # is correct immediately after a route change without a second reload.
+        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
+        return {"success": True, **settings}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting embedding route: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error setting embedding route.")
+
+
+@router.api_route("/api/embedding/route-model", methods=["POST", "PUT"])
+async def set_route_embedding_model(request: Request):
+    """Pin (or clear) a route's embedding model at runtime (#2337).
+
+    The embeddings UI's per-route model picker persists here instead of
+    demanding a hand-edited ``embedding_model``/``embedding_dim`` under the route
+    in kestrel.toml. Accepts JSON:
+
+        {"route": "<vendor>:<route>",
+         "embedding_model": "qwen/qwen3-embedding-8b",   # null/"" to clear
+         "embedding_dim": 768}                            # optional
+
+    Setting a cloud route's model runs a live canary probe (#2326) so a dead or
+    misspelled upstream slug is refused with a 400 at configuration time rather
+    than silently degrading to keyword search on the next write. Clearing
+    restores the route's config/discovery default. The pin persists the same way
+    the embedding_route knob does (agent_metadata) — not a new store. The
+    response echoes the resolved embedding settings.
+    """
+    try:
+        data = await request.json()
+        route = data.get("route")
+        if not route or not isinstance(route, str):
+            raise HTTPException(
+                status_code=400,
+                detail="'route' field is required (a '<vendor>:<route>' selector).",
+            )
+        model = data.get("embedding_model")
+        if model is not None and not isinstance(model, str):
+            raise HTTPException(
+                status_code=400,
+                detail="'embedding_model' must be a string or null (to clear).",
+            )
+        dim = data.get("embedding_dim")
+        if dim is not None:
+            try:
+                dim = int(dim)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="'embedding_dim' must be an integer or null.",
+                )
+
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+        if not hasattr(agent.llm_service, "aset_route_embedding_model"):
+            raise HTTPException(
+                status_code=501,
+                detail="Per-route embedding model configuration is not supported.",
+            )
+
+        # Fold live embedding discovery into route capabilities first (#2338), so
+        # a dynamically-discovered route (e.g. OpenRouter with no TOML pin) is
+        # recognized when its model is being pinned. Best-effort.
+        setting = model is not None and str(model).strip() != ""
+        if setting:
+            try:
+                await agent.llm_service.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as e:  # pragma: no cover - never block the setter
+                logger.debug(
+                    f"embedding capability reconcile skipped in model setter: {e}"
+                )
+
+        try:
+            # Live probe-on-save for cloud routes rejects a dead slug (#2337/#2326).
+            await agent.llm_service.aset_route_embedding_model(route, model, dim)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+        # Echo the settings for the PINNED route through the single #2372
+        # resolver so the response reflects THIS route's own slug — not whatever
+        # the globally-resolved embedding provider (embedding_route/chat) picks
+        # (the cross-route echo the issue flagged).
+        if hasattr(agent.llm_service, "aget_embedding_settings_for_route"):
+            settings = await agent.llm_service.aget_embedding_settings_for_route(route)
+        else:
+            settings = agent.llm_service.get_embedding_settings()
+        # Count stale rows against the ECHOED route's own embedding profile, not
+        # the globally-active route's (#2372) — else a response that resolves
+        # ``openrouter:api`` could report ``ollama:local``'s stale counts.
+        route_service = None
+        getter = getattr(agent.llm_service, "get_embedding_service_for_route", None)
+        if callable(getter):
+            try:
+                route_service = getter(route)
+            except Exception as e:  # pragma: no cover - defensive; fall back to active
+                logger.debug(f"route embedding service build failed for {route}: {e}")
+        settings["stale_rows"] = await _count_stale_embedding_rows(
+            agent, service=route_service
+        )
+        return {"success": True, **settings}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting route embedding model: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="Error setting route embedding model."
+        )
+
+
+# In-memory registry of in-flight / recently-finished reindex jobs (#2336).
+# Keyed by opaque ``job_id``. A UI POSTs to start a job and then polls
+# ``GET /api/embedding/reindex/{job_id}`` until ``status`` is a terminal state
+# (``done`` / ``partial`` / ``error``).
+# Re-embedding is idempotent + resumable (see storage.embedding_reindex), so a
+# lost job registry (process restart) loses no data — the operator just re-runs.
+_REINDEX_JOBS: Dict[str, Dict] = {}
+_REINDEX_JOBS_MAX = 32
+
+
+def _reindex_job_public(job: Dict) -> Dict:
+    """The subset of a job record that is safe to return to a client."""
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "target_profile": job["target_profile"],
+        "embedding_dim": job["embedding_dim"],
+        "tables": list(job["tables"]),
+        "total_stale": job["total_stale"],
+        "reembedded": dict(job["reembedded"]),
+        "scanned": dict(job["scanned"]),
+        # Full per-table stats so failed / skipped_empty / skipped_dim_mismatch
+        # are visible instead of vanishing (#2360).
+        "stats": {t: dict(s) for t, s in job.get("stats", {}).items()},
+        "total_reembedded": job["total_reembedded"],
+        "total_failed": job.get("total_failed", 0),
+        "total_skipped_empty": job.get("total_skipped_empty", 0),
+        "total_skipped_dim_mismatch": job.get("total_skipped_dim_mismatch", 0),
+        "error": job["error"],
+        "updated_at": job["updated_at"],
+    }
+
+
+def _finalize_reindex_status(job: Dict) -> None:
+    """Set the terminal ``status``/``error`` from the accumulated stats (#2360).
+
+    ``done`` with ``total_reembedded == 0`` while rows were stale — or any
+    ``failed`` rows — is NOT success: a dead/mis-resolved embedding service
+    returns empty vectors for every row with no exception, which the old code
+    reported as ``status: done, error: null``. Classify honestly:
+
+    - ``error``   — stale rows existed but nothing was re-embedded (total wipe-
+      out; almost always a dead embedding service), or every attempt failed.
+    - ``partial`` — some rows re-embedded but some failed / were skipped for a
+      dimension mismatch (empty source text is expected and not counted here).
+    - ``done``    — all stale rows re-embedded, no failures.
+    """
+    total_reembedded = job["total_reembedded"]
+    total_failed = job.get("total_failed", 0)
+    total_dim_mismatch = job.get("total_skipped_dim_mismatch", 0)
+    total_stale = job.get("total_stale", 0)
+
+    if total_stale > 0 and total_reembedded == 0:
+        job["status"] = "error"
+        job["error"] = (
+            f"re-embedded 0 of {total_stale} stale row(s) "
+            f"({total_failed} failed, {total_dim_mismatch} dim-mismatch). "
+            "The resolved embedding service returned no usable vectors — it is "
+            "likely dead or mis-configured; check the active embedding route."
+        )
+        return
+    if total_failed or total_dim_mismatch:
+        job["status"] = "partial"
+        job["error"] = (
+            f"re-embedded {total_reembedded} row(s) but {total_failed} failed "
+            f"and {total_dim_mismatch} were skipped for a dimension mismatch."
+        )
+        return
+    job["status"] = "done"
+
+
+def _accumulate_reindex_stats(job: Dict) -> None:
+    """Recompute the job's roll-up totals from its per-table ``stats``."""
+    stats = job.get("stats", {})
+    job["total_reembedded"] = sum(job["reembedded"].values())
+    job["total_failed"] = sum(int(s.get("failed", 0)) for s in stats.values())
+    job["total_skipped_empty"] = sum(
+        int(s.get("skipped_empty", 0)) for s in stats.values()
+    )
+    job["total_skipped_dim_mismatch"] = sum(
+        int(s.get("skipped_dim_mismatch", 0)) for s in stats.values()
+    )
+
+
+async def _run_reindex_job(job: Dict, reindexer, tables, agent_id) -> None:
+    """Background worker: re-embed each table, streaming progress into *job*."""
+    try:
+        for tname in tables:
+            def _progress(stats, _tname=tname):
+                job["reembedded"][_tname] = stats.reembedded
+                job["scanned"][_tname] = stats.scanned
+                job["stats"][_tname] = stats.as_dict()
+                _accumulate_reindex_stats(job)
+                job["updated_at"] = time.time()
+
+            stats = await reindexer.reindex_table(
+                tname, agent_id=agent_id, progress=_progress
+            )
+            job["reembedded"][tname] = stats.reembedded
+            job["scanned"][tname] = stats.scanned
+            job["stats"][tname] = stats.as_dict()
+        _accumulate_reindex_stats(job)
+        _finalize_reindex_status(job)
+    except Exception as e:  # pragma: no cover - defensive; surfaced via status
+        logger.error("reindex job %s failed: %s", job["job_id"], e, exc_info=True)
+        job["status"] = "error"
+        job["error"] = str(e)
+    finally:
+        job["updated_at"] = time.time()
+
+
+def _prune_reindex_jobs() -> None:
+    """Bound the registry: drop the oldest finished jobs past the cap."""
+    if len(_REINDEX_JOBS) <= _REINDEX_JOBS_MAX:
+        return
+    finished = sorted(
+        (
+            j
+            for j in _REINDEX_JOBS.values()
+            if j["status"] in ("done", "error", "partial")
+        ),
+        key=lambda j: j["updated_at"],
+    )
+    while len(_REINDEX_JOBS) > _REINDEX_JOBS_MAX and finished:
+        _REINDEX_JOBS.pop(finished.pop(0)["job_id"], None)
+
+
+async def _resolve_reindex_target(agent, db=None, agent_id=None):
+    """Resolve ``(embedding_service, target_profile_id, target_dim, column_dim)``.
+
+    Resolves the embedding service **fresh** from the currently-resolved route
+    so a route change made after the agent booted (or via the settings API) is
+    honoured — the #2360 live-dogfood failure was a stale/cached embedding
+    service that no longer matched the persisted route, producing scanned-N /
+    reembedded-0 with no error. Two things guarantee freshness, mirroring the
+    CLI's ``_reindex`` path:
+
+    1. Apply the agent's persisted runtime ``embedding_route`` (#2263) to the
+       live ``llm_service`` before resolving, so the endpoint targets the same
+       profile the live agent (and the CLI) resolve — not the config default.
+    2. Invalidate the per-instance embedding discovery cache so a re-pinned /
+       changed model is reflected instead of a stale resolution.
+
+    Raises :class:`HTTPException` (409) with the same refusal reasons the CLI
+    prints when reindexing can't proceed: no embedding provider resolves,
+    ``embedding_route = "none"``, the service can't describe itself, or the
+    resolved embedding dimension doesn't match the vector-column width.
+    """
+    from kestrel_sovereign import cli_embeddings
+
+    llm_service = agent.llm_service
+
+    # (1) Load the persisted embedding_route so we resolve the profile the
+    # live agent actually uses (route changes since boot included). Applying it
+    # is deferred until AFTER capabilities are reconciled (step 3): a cleared
+    # per-route pin drops ``supports_embeddings``, and ``set_embedding_route``'s
+    # sync validator (``_validate_embedding_route``) would reject the route as
+    # "does not advertise embedding support" if it ran against the stale flag —
+    # 409'ing before the fix could re-advertise capability (#2372).
+    found, route = False, None
+    if db is not None:
+        try:
+            found, route = await cli_embeddings._load_persisted_embedding_route(
+                db, agent_id
+            )
+        except Exception as exc:
+            logger.debug("could not load persisted embedding_route: %s", exc)
+            found, route = False, None
+
+    # (2) Bypass whatever the embedding resolver cached so a changed route /
+    # re-pinned model is re-discovered instead of served stale.
+    if hasattr(llm_service, "_embedding_discovery_cache"):
+        try:
+            llm_service._embedding_discovery_cache = None
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    # (3) Re-advertise capability across every discovering route BEFORE applying
+    # the persisted route: a cleared per-route pin drops ``supports_embeddings``,
+    # and both ``set_embedding_route``'s validator and
+    # ``resolve_embedding_provider`` gate on that sync flag — so without this the
+    # cleared-pin route is rejected (409) or resolves to None here (the wrong /
+    # stale profile the settings GET now avoids) rather than the corpus/catalog
+    # default. Mirrors the settings POST + ``aget_embedding_settings`` ordering so
+    # the reindex target and the settings GET agree in the cleared-pin state
+    # (#2372).
+    if hasattr(llm_service, "reconcile_embedding_capabilities"):
+        try:
+            await llm_service.reconcile_embedding_capabilities(use_cache=True)
+        except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            logger.debug("reindex embedding capability reconcile skipped: %s", exc)
+
+    # (4) Now apply the persisted route — capability has been re-advertised, so a
+    # cleared-pin route that legitimately discovers embedding models validates
+    # instead of 409'ing on the stale flag. If it still can't be applied, REFUSE:
+    # continuing would silently reindex production rows into whatever route was
+    # already active (the wrong embedding profile). Mirrors the CLI, which exits
+    # non-zero here (cli_embeddings._reindex ~line 566) rather than falling
+    # through to the previously-active route.
+    if found:
+        try:
+            llm_service.set_embedding_route(route, persist=False)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"the persisted embedding_route {route!r} is no longer "
+                    f"valid ({exc}); fix the embedding route (via the "
+                    "settings API/UI or config) before reindexing."
+                ),
+            )
+
+    # (5) Resolve the active route's (model, dim) through the SINGLE #2372
+    # resolver so the reindex target matches the settings GET and the route-model
+    # echo — the #2372 failure was three surfaces resolving three different
+    # profiles (including a stale one) for the same cleared-pin state.
+    if hasattr(llm_service, "resolve_route_embedding_model"):
+        try:
+            active = llm_service.resolve_embedding_provider()
+            if active is not None:
+                await llm_service.resolve_route_embedding_model(active)
+        except Exception as exc:  # pragma: no cover - defensive; keep prior behaviour
+            logger.debug("reindex active-route embedding resolve skipped: %s", exc)
+
+    err, embedding_service, target = cli_embeddings._resolve_target(llm_service)
+    if err is not None:
+        raise HTTPException(status_code=409, detail=err)
+
+    target_dim = getattr(embedding_service, "embedding_dim", None)
+    column_dim = cli_embeddings._resolve_column_dim()
+    if target_dim and column_dim and int(target_dim) != int(column_dim):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"resolved embedding dimension ({target_dim}) does not match the "
+                f"vector-column width ({column_dim}); re-embedding at the new "
+                "dimension requires a column migration first (set "
+                f"KESTREL_EMBEDDING_DIM={target_dim}, drop + recreate the "
+                "embedding_vec columns, restart, then re-embed)."
+            ),
+        )
+    return embedding_service, target, target_dim, column_dim
+
+
+@router.post("/api/embedding/reindex")
+async def reindex_embeddings(request: Request):
+    """Re-embed stored vectors to the resolved embedding profile from the UI (#2336).
+
+    Wraps the same checkpointed/resumable core the CLI's ``kestrel embeddings
+    reindex`` uses. JSON body:
+
+    - ``dry_run`` (default ``true``): report per-table stale counts only — no
+      writes. Mirrors the CLI's dry-run scope.
+    - ``dry_run: false``: execute. Small/empty corpora complete inline; a
+      non-empty corpus is re-embedded in a background job and the response
+      carries a ``job_id`` the caller polls via
+      ``GET /api/embedding/reindex/{job_id}`` so a big corpus never blocks the
+      request for minutes.
+    - ``tables``: optional list restricting the sweep (default: all three
+      embedding-bearing tables).
+
+    Agent scoping comes from the request's agent context (per-agent tables are
+    filtered to ``agent.agent_id``; ``document_chunks`` is global), so there is
+    no ``KESTREL_DB_PATH`` ambiguity (#2327). Refuses with 409 when no embedding
+    provider resolves, ``embedding_route = "none"``, or on a dimension mismatch.
+    """
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        dry_run = bool(data.get("dry_run", True))
+        tables_req = data.get("tables")
+
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+
+        from kestrel_sovereign.storage.embedding_reindex import (
+            REINDEX_TABLES,
+            EmbeddingReindexer,
+        )
+
+        if tables_req is not None:
+            if not isinstance(tables_req, list) or not all(
+                isinstance(t, str) for t in tables_req
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="'tables' must be a list of table names.",
+                )
+            unknown = [t for t in tables_req if t not in REINDEX_TABLES]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"unknown table(s): {', '.join(unknown)}. "
+                        f"Valid: {', '.join(REINDEX_TABLES)}."
+                    ),
+                )
+            tables = tuple(tables_req) or REINDEX_TABLES
+        else:
+            tables = REINDEX_TABLES
+
+        db = _agent_raw_db(agent)
+        if db is None:
+            raise HTTPException(status_code=503, detail="Storage not available.")
+
+        agent_id = getattr(agent, "agent_id", None)
+
+        embedding_service, target, target_dim, column_dim = (
+            await _resolve_reindex_target(agent, db=db, agent_id=agent_id)
+        )
+
+        reindexer = EmbeddingReindexer(
+            db, embedding_service, target, column_dim=column_dim
+        )
+
+        counts = await reindexer.count_all_stale(agent_id=agent_id, tables=tables)
+        total_stale = sum(counts.values())
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "target_profile": target,
+                "embedding_dim": target_dim,
+                "stale_rows": counts,
+                "total_stale": total_stale,
+            }
+
+        # Execute. Nothing stale → report done inline (no job needed).
+        if not total_stale:
+            return {
+                "dry_run": False,
+                "status": "done",
+                "target_profile": target,
+                "embedding_dim": target_dim,
+                "stale_rows": counts,
+                "total_stale": 0,
+                "reembedded": {t: 0 for t in tables},
+                "total_reembedded": 0,
+            }
+
+        # Non-empty corpus: run in the background so the request never blocks
+        # for minutes. The caller polls GET /api/embedding/reindex/{job_id}.
+        job_id = uuid.uuid4().hex[:16]
+        job = {
+            "job_id": job_id,
+            # Owner scoping (#2336): the job is readable only by the agent
+            # context that created it. Never surfaced via _reindex_job_public.
+            "owner_agent_id": agent_id,
+            "status": "running",
+            "target_profile": target,
+            "embedding_dim": target_dim,
+            "tables": list(tables),
+            "total_stale": total_stale,
+            "reembedded": {t: 0 for t in tables},
+            "scanned": {t: 0 for t in tables},
+            # Full per-table ReindexStats (#2360): failed / skipped_empty /
+            # skipped_dim_mismatch were previously computed but never surfaced,
+            # so 63 rows could vanish into invisible buckets while the job
+            # reported "done, error: null".
+            "stats": {t: {} for t in tables},
+            "total_reembedded": 0,
+            "total_failed": 0,
+            "total_skipped_empty": 0,
+            "total_skipped_dim_mismatch": 0,
+            "error": None,
+            "updated_at": time.time(),
+        }
+        _REINDEX_JOBS[job_id] = job
+        _prune_reindex_jobs()
+        asyncio.create_task(_run_reindex_job(job, reindexer, tables, agent_id))
+        return {"dry_run": False, **_reindex_job_public(job)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting embedding reindex: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error starting embedding reindex.")
+
+
+@router.get("/api/embedding/reindex/{job_id}")
+async def get_reindex_job(job_id: str, request: Request):
+    """Return progress for a background reindex job started via POST (#2336).
+
+    Scoped to the creating agent context (#2336): a job is readable only by the
+    agent that started it. Any other routed agent gets 404 (not 403 — the job's
+    existence is not disclosed across agents).
+    """
+    try:
+        agent = get_agent(request)  # auth / agent-context gate
+        job = _REINDEX_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="reindex job not found.")
+        requester_agent_id = getattr(agent, "agent_id", None)
+        if job.get("owner_agent_id") != requester_agent_id:
+            # Do not leak existence of another agent's job.
+            raise HTTPException(status_code=404, detail="reindex job not found.")
+        return _reindex_job_public(job)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reading reindex job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error reading reindex job.")
+
+
+@router.api_route("/api/embedding/space/verify", methods=["POST"])
+async def verify_embedding_space(request: Request):
+    """Run the shared-space parity probe and apply passing pins (#2290).
+
+    Embeds K canary texts through each declared shared space's member routes and
+    requires pairwise cosine ``>= parity_threshold`` before the pin's
+    model-identity ``space_id`` is applied. Optional JSON body
+    ``{"name": "<pin>"}`` limits to one pin. Measured drift is recorded on the
+    pinned space's ``embedding_profiles`` row when storage is available.
+    """
+    try:
+        agent = get_agent(request)
+        if not hasattr(agent, "llm_service") or not agent.llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not available.")
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        pin_name = data.get("name") if isinstance(data, dict) else None
+
+        # Reach the raw DB handle (through the privacy wrapper) so measured
+        # drift can be recorded; best-effort, verification runs regardless.
+        db = _agent_raw_db(agent)
+
+        results = await agent.llm_service.verify_embedding_space_parity(
+            pin_name, record_to=db
+        )
+        return {
+            "success": True,
+            "results": {name: r.to_dict() for name, r in results.items()},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error verifying embedding space: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error verifying embedding space.")
 
 
 @router.get("/v1/models")

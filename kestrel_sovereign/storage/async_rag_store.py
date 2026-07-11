@@ -373,7 +373,13 @@ class AsyncRAGStore:
             return []
 
         try:
-            query_embedding = await embedding_service.aembed(query)
+            from kestrel_sovereign.llm.embedding_service import (
+                aembed_retrieval_query,
+            )
+
+            query_embedding = await aembed_retrieval_query(
+                embedding_service, query
+            )
             if not query_embedding:
                 return []
         except Exception as e:
@@ -912,7 +918,7 @@ class AsyncRAGStore:
             return []
 
         try:
-            from kestrel_sovereign.llm.embedding_service import semantic_search, cosine_similarity
+            from kestrel_sovereign.llm.embedding_service import semantic_search
 
             # Build corpus from failures
             failure_texts = [

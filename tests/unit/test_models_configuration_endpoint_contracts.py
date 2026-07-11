@@ -391,6 +391,51 @@ def test_models_endpoint_groups_results_and_rejects_invalid_category():
         _restore_app(app, original)
 
 
+def test_models_endpoint_scopes_list_to_vendor_route():
+    """``/api/models?vendor=openai&route=plan`` must draw the list from the
+    route-scoped discovery, not the flattened vendor discovery (#2262)."""
+    plan_model = MagicMock()
+    plan_model.provider = "openai"
+    plan_model.is_featured = True
+    plan_model.to_dict.return_value = {"id": "gpt-5.5", "provider": "openai"}
+
+    llm_service = MagicMock()
+    llm_service.discover_models_for_route = AsyncMock(return_value=[plan_model])
+    llm_service.discover_all_models = AsyncMock(return_value=[])
+    llm_service.get_active_model_id = MagicMock(return_value="openai:plan/gpt-5.5")
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                scoped = client.get(
+                    "/api/models?vendor=openai&route=plan",
+                    headers=_api_headers(),
+                )
+                bad = client.get(
+                    "/api/models?route=plan",
+                    headers=_api_headers(),
+                )
+        assert scoped.status_code == 200
+        payload = scoped.json()
+        assert payload["count"] == 1
+        assert set(payload["by_vendor"]) == {"openai"}
+        llm_service.discover_models_for_route.assert_awaited_once_with(
+            "openai",
+            "plan",
+            use_cache=True,
+            featured_only=False,
+            category=None,
+        )
+        # The vendor-scoped path must NOT fall through to global discovery.
+        llm_service.discover_all_models.assert_not_awaited()
+        # route without vendor is a 400.
+        assert bad.status_code == 400
+    finally:
+        _restore_app(app, original)
+
+
 def test_current_and_set_model_endpoints_share_runtime_preference_contract():
     # Simulate a realistic set→get roundtrip: the endpoint now re-reads the
     # persisted mandate after set_model_preference (so auto-resolution or
@@ -447,6 +492,180 @@ def test_current_and_set_model_endpoints_share_runtime_preference_contract():
         llm_service.set_model_preference.assert_any_call("claude-opus", "anthropic", "plan")
         assert missing_response.status_code == 400
         assert missing_response.json()["detail"] == "'model' field is required."
+    finally:
+        _restore_app(app, original)
+
+
+def test_embedding_settings_endpoints_round_trip_and_expose_dims():
+    """#2263 — GET reports the resolved embedding state (incl. dim fields);
+    POST sets/clears the embedding_route and echoes the updated settings."""
+    _state = {"embedding_route": None}
+
+    def _set(route, persist=True):
+        _state["embedding_route"] = route
+
+    def _settings():
+        return {
+            "embedding_route": _state["embedding_route"],
+            "resolved_route": _state["embedding_route"] or "openai:api",
+            "embedding_model": "text-embedding-3-small",
+            "embedding_dim": 1536,
+            "kestrel_embedding_dim": 768,
+        }
+
+    llm_service = MagicMock()
+    # The endpoint now uses the async, live-probing setter (#2326).
+    llm_service.aset_embedding_route = AsyncMock(side_effect=_set)
+    llm_service.get_embedding_settings = MagicMock(side_effect=_settings)
+    # The endpoints now resolve the active route through the async single
+    # resolver (#2372) before reading; mirror the sync stub for it.
+    llm_service.aget_embedding_settings = AsyncMock(side_effect=_settings)
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                get_response = client.get(
+                    "/api/embedding/settings", headers=_api_headers()
+                )
+                set_response = client.post(
+                    "/api/embedding/settings",
+                    headers=_api_headers(),
+                    json={"embedding_route": "ollama:local"},
+                )
+                clear_response = client.put(
+                    "/api/embedding/settings",
+                    headers=_api_headers(),
+                    json={"embedding_route": None},
+                )
+                missing_response = client.post(
+                    "/api/embedding/settings",
+                    headers=_api_headers(),
+                    json={},
+                )
+        assert get_response.status_code == 200
+        body = get_response.json()
+        assert body["embedding_route"] is None
+        assert body["embedding_dim"] == 1536
+        assert body["kestrel_embedding_dim"] == 768
+
+        assert set_response.status_code == 200
+        assert set_response.json()["embedding_route"] == "ollama:local"
+        llm_service.aset_embedding_route.assert_any_call("ollama:local")
+
+        assert clear_response.status_code == 200
+        assert clear_response.json()["embedding_route"] is None
+        llm_service.aset_embedding_route.assert_any_call(None)
+
+        assert missing_response.status_code == 400
+    finally:
+        _restore_app(app, original)
+
+
+def test_embedding_settings_post_round_trip_for_none_off_state():
+    """#2287 — POST ``embedding_route="none"`` is a first-class off-switch:
+    it round-trips through the endpoint (no ValueError), and GET reports the
+    off state (embedding_route == "none", null resolved fields) while still
+    exposing ``kestrel_embedding_dim``."""
+    _state = {"embedding_route": None}
+
+    def _set(route, persist=True):
+        _state["embedding_route"] = route
+
+    def _settings():
+        off = _state["embedding_route"] == "none"
+        return {
+            "embedding_route": _state["embedding_route"],
+            "resolved_route": None if off else (
+                _state["embedding_route"] or "openai:api"
+            ),
+            "embedding_model": None if off else "text-embedding-3-small",
+            "embedding_dim": None if off else 1536,
+            "kestrel_embedding_dim": 768,
+        }
+
+    llm_service = MagicMock()
+    llm_service.aset_embedding_route = AsyncMock(side_effect=_set)
+    llm_service.get_embedding_settings = MagicMock(side_effect=_settings)
+    llm_service.aget_embedding_settings = AsyncMock(side_effect=_settings)
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                set_response = client.post(
+                    "/api/embedding/settings",
+                    headers=_api_headers(),
+                    json={"embedding_route": "none"},
+                )
+                get_response = client.get(
+                    "/api/embedding/settings", headers=_api_headers()
+                )
+        assert set_response.status_code == 200
+        set_body = set_response.json()
+        assert set_body["embedding_route"] == "none"
+        assert set_body["resolved_route"] is None
+        assert set_body["embedding_dim"] is None
+        # Off does not erase the deployment's stored dimension.
+        assert set_body["kestrel_embedding_dim"] == 768
+        llm_service.aset_embedding_route.assert_any_call("none")
+
+        assert get_response.status_code == 200
+        get_body = get_response.json()
+        assert get_body["embedding_route"] == "none"
+        assert get_body["resolved_route"] is None
+        assert get_body["kestrel_embedding_dim"] == 768
+    finally:
+        _restore_app(app, original)
+
+
+def test_embedding_settings_post_surfaces_validation_error():
+    """#2263/#2326 — a ValueError from the (async) setter (unknown/non-embedding
+    route, or a failed live probe) becomes a 400 with the reason, not a 500."""
+    llm_service = MagicMock()
+    llm_service.aset_embedding_route = AsyncMock(
+        side_effect=ValueError("no configured route matches 'gemini:api'.")
+    )
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/api/embedding/settings",
+                    headers=_api_headers(),
+                    json={"embedding_route": "gemini:api"},
+                )
+        assert resp.status_code == 400
+        assert "no configured route matches" in resp.json()["detail"]
+    finally:
+        _restore_app(app, original)
+
+
+def test_embedding_settings_post_rejects_non_string_route():
+    """#2286 — a non-string ``embedding_route`` (int/list/dict) is bad input
+    and must return 400, not fall through to a 500. The setter must
+    never be reached with a non-string value."""
+    llm_service = MagicMock()
+    llm_service.aset_embedding_route = AsyncMock()
+    agent = MagicMock(llm_service=llm_service)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                for bad in (42, ["ollama:local"], {"route": "ollama:local"}):
+                    resp = client.post(
+                        "/api/embedding/settings",
+                        headers=_api_headers(),
+                        json={"embedding_route": bad},
+                    )
+                    assert resp.status_code == 400, bad
+                    assert "must be a string or null" in resp.json()["detail"]
+        llm_service.aset_embedding_route.assert_not_called()
     finally:
         _restore_app(app, original)
 

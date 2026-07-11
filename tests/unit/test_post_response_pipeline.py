@@ -16,8 +16,10 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 from kestrel_sovereign.agent.memory_manager import MemoryManager
+from kestrel_sovereign.security.input_guardrails import wrap_user_input
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.storage.emotional_tagger import EmotionalTagger
+from kestrel_sovereign.storage.associative_linker import LinkedConcept
 from kestrel_sovereign.storage.memory_system import MemorySystem
 
 
@@ -33,6 +35,7 @@ class TestMemorySystemTagMessage:
     def memory_system(self):
         storage = MagicMock()
         conv_store = AsyncMock()
+        conv_store.resolve_session_id = AsyncMock(return_value="sess-1")
         storage.conversation = conv_store
         storage.db = MagicMock()
         storage.graph = MagicMock()
@@ -101,6 +104,35 @@ class TestMemorySystemTagMessage:
         ms.tagger = EmotionalTagger()
         result = await ms.tag_message(1, "hello", "user")
         assert "emotional_valence" in result
+
+    @pytest.mark.asyncio
+    async def test_link_and_route_uses_persisted_message_id(self, memory_system):
+        """Graph and schema artifacts must share the conversation row ID."""
+        memory_system.linker = AsyncMock()
+        concept = LinkedConcept(
+            node_id="concept:test-agent:mom", label="mom", category="person"
+        )
+        memory_system.linker.extract_and_link.return_value = [concept]
+        memory_system.router = AsyncMock()
+        memory_system.router.route.return_value = {
+            "action_items": 1,
+            "decisions": 1,
+            "interactions": 1,
+        }
+
+        result = await memory_system.link_and_route_message(
+            message_id=42,
+            content="I decided to call mom tomorrow",
+            role="user",
+            metadata={"claim_certainty": 0.9},
+        )
+
+        memory_system.linker.extract_and_link.assert_awaited_once_with(
+            "42", "I decided to call mom tomorrow", "test-agent"
+        )
+        assert memory_system.router.route.await_args.kwargs["message_id"] == "42"
+        assert result["extracted_concepts"] == ["mom"]
+        assert result["schema_routing"]["decisions"] == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,16 +226,12 @@ class TestUpdateMessageMetadataAtomicMerge:
 
     @pytest.mark.asyncio
     async def test_sqlite_merge_preserves_existing_fields(self):
-        """SQLite path: SELECT + UPDATE should merge, not overwrite."""
+        """SQLite path uses one json_set UPDATE, not a stale pre-read."""
         from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 
         db = AsyncMock()
         db.backend_type = "sqlite"
-        # Existing metadata has enc and session_id
-        db.fetchone = AsyncMock(
-            return_value=(json.dumps({"enc": True, "session_id": "abc", "old_field": 1}),)
-        )
-        db.execute_commit = AsyncMock()
+        db.execute_commit = AsyncMock(return_value=1)
 
         store = AsyncConversationStore(db, agent_id="test")
         # Patch out encryption
@@ -215,13 +243,15 @@ class TestUpdateMessageMetadataAtomicMerge:
             metadata_updates={"emotional_valence": 0.8, "importance": 0.9},
         )
         assert result is True
-        # Verify the merged metadata was written
-        written_meta = json.loads(db.execute_commit.call_args[0][1][0])
-        assert written_meta["enc"] is True  # preserved
-        assert written_meta["session_id"] == "abc"  # preserved
-        assert written_meta["old_field"] == 1  # preserved
-        assert written_meta["emotional_valence"] == 0.8  # added
-        assert written_meta["importance"] == 0.9  # added
+        sql, params = db.execute_commit.await_args.args
+        assert "json_set(COALESCE(metadata" in sql
+        assert "SELECT" not in sql
+        assert params[:-2] == (
+            '$."emotional_valence"', "0.8",
+            '$."importance"', "0.9",
+        )
+        assert params[-2:] == (42, "test")
+        db.fetchone.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sqlite_returns_false_on_missing_message(self):
@@ -230,7 +260,7 @@ class TestUpdateMessageMetadataAtomicMerge:
 
         db = AsyncMock()
         db.backend_type = "sqlite"
-        db.fetchone = AsyncMock(return_value=None)
+        db.execute_commit = AsyncMock(return_value=0)
 
         store = AsyncConversationStore(db, agent_id="test")
         store._global_fernet = None
@@ -238,6 +268,21 @@ class TestUpdateMessageMetadataAtomicMerge:
 
         result = await store.update_message_metadata(99, {"foo": "bar"})
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_sqlite_merge_preserves_json_null_semantics(self):
+        from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+
+        db = AsyncMock()
+        db.backend_type = "sqlite"
+        db.execute_commit = AsyncMock(return_value=1)
+        store = AsyncConversationStore(db, agent_id="test")
+
+        assert await store.update_message_metadata(1, {"last_accessed": None})
+
+        sql, params = db.execute_commit.await_args.args
+        assert "json_set" in sql
+        assert params[:2] == ('$.' + '"last_accessed"', "null")
 
     @pytest.mark.asyncio
     async def test_postgres_uses_jsonb_merge(self):
@@ -330,13 +375,15 @@ class TestPostResponsePipeline:
         agent.memory_system = MagicMock()
         agent.memory_system.analyzer = None  # Disable Phase 2 temporal for unit test
         agent.memory_system.linker = None  # Disable Phase 2 associative for unit test
+        agent.memory_system.link_and_route_message = AsyncMock(return_value={})
 
         # Raw storage with conversation store
         conv_store = AsyncMock()
+        conv_store.resolve_session_id = AsyncMock(return_value="sess-1")
         conv_store.get_full_history_with_ids = AsyncMock(
             return_value=[
-                {"id": 100, "role": "user", "content": "I am happy", "metadata": {}},
-                {"id": 101, "role": "assistant", "content": "Glad to hear!", "metadata": {}},
+                {"id": 100, "role": "user", "content": wrap_user_input("I am happy"), "metadata": {"session_id": "sess-1"}},
+                {"id": 101, "role": "assistant", "content": "Glad to hear!", "metadata": {"session_id": "sess-1"}},
             ]
         )
         agent._raw_storage = MagicMock()
@@ -367,6 +414,9 @@ class TestPostResponsePipeline:
         )
 
         mock_agent.context_manager.memory_manager.tag_exchange.assert_awaited_once()
+        mock_agent._raw_storage.conversation.get_full_history_with_ids.assert_any_await(
+            limit=20
+        )
         call_kwargs = mock_agent.context_manager.memory_manager.tag_exchange.call_args[1]
         assert call_kwargs["user_message_id"] == 100
         assert call_kwargs["assistant_message_id"] == 101
@@ -436,25 +486,56 @@ class TestPostResponsePipeline:
 
     @pytest.mark.asyncio
     async def test_pipeline_phase2_background_associative(self, mock_agent):
-        """Phase 2 should fire associative linker in background."""
+        """Phase 2 should run the canonical graph + schema route."""
         from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-        # Enable linker
-        mock_agent.memory_system.linker = AsyncMock()
-        mock_agent.memory_system.linker.extract_and_link = AsyncMock()
+        mock_agent.memory_system.link_and_route_message = AsyncMock(
+            return_value={"extracted_concepts": ["mom", "brooklyn"]}
+        )
 
         mock_agent.context_manager.memory_manager.tag_exchange = AsyncMock(
             return_value={"user": {}, "assistant": {}}
         )
 
         await KestrelAgent._post_response_pipeline(
-            mock_agent, "My mom lives in Brooklyn", "That sounds nice!", session_id=None
+            mock_agent, "I am happy", "Glad to hear!", session_id="sess-1"
         )
 
         # Give the background task a chance to run
         await asyncio.sleep(0.1)
 
-        mock_agent.memory_system.linker.extract_and_link.assert_awaited_once()
+        mock_agent.memory_system.link_and_route_message.assert_awaited_once_with(
+            message_id=100,
+            content="I am happy",
+            role="user",
+            metadata={},
+        )
+        mock_agent._raw_storage.conversation.update_message_metadata.assert_awaited_once_with(
+            100, {"extracted_concepts": ["mom", "brooklyn"]}
+        )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_does_not_cross_session_for_identical_content(self, mock_agent):
+        """Content reuse in another session cannot steal enrichment."""
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        mock_agent._raw_storage.conversation.get_full_history_with_ids.return_value = [
+            {"id": 90, "role": "user", "content": wrap_user_input("I am happy"), "metadata": {"session_id": "other"}},
+            {"id": 91, "role": "assistant", "content": "Glad to hear!", "metadata": {"session_id": "other"}},
+            {"id": 100, "role": "user", "content": wrap_user_input("I am happy"), "metadata": {"session_id": "sess-1"}},
+            {"id": 101, "role": "assistant", "content": "Glad to hear!", "metadata": {"session_id": "sess-1"}},
+        ]
+        mock_agent.context_manager.memory_manager.tag_exchange = AsyncMock(
+            return_value={"user": {}, "assistant": {}}
+        )
+
+        await KestrelAgent._post_response_pipeline(
+            mock_agent, "I am happy", "Glad to hear!", session_id="sess-1"
+        )
+
+        kwargs = mock_agent.context_manager.memory_manager.tag_exchange.await_args.kwargs
+        assert kwargs["user_message_id"] == 100
+        assert kwargs["assistant_message_id"] == 101
 
     @pytest.mark.asyncio
     async def test_pipeline_phase2_temporal_detection(self, mock_agent):
@@ -477,14 +558,16 @@ class TestPostResponsePipeline:
         await asyncio.sleep(0.1)
 
         mock_agent.memory_system.analyzer.detect_patterns.assert_awaited_once()
+        mock_agent._raw_storage.conversation.get_full_history_with_ids.assert_any_await(
+            limit=50
+        )
 
     @pytest.mark.asyncio
     async def test_pipeline_phase2_error_isolation(self, mock_agent):
         """Phase 2 errors should be logged, not propagated."""
         from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-        mock_agent.memory_system.linker = AsyncMock()
-        mock_agent.memory_system.linker.extract_and_link = AsyncMock(
+        mock_agent.memory_system.link_and_route_message = AsyncMock(
             side_effect=RuntimeError("graph write failed")
         )
 

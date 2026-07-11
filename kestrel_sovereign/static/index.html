@@ -16,6 +16,13 @@
 <body>
     <nav>
         <div class="nav-brand">
+            <!-- #2279: always-visible agents-pane trigger. The agents pane
+                 (#agents-pane, top-level left sidebar) collapses to fully hidden
+                 (display:none) via its own chevron; this button — which lives in
+                 the top nav, OUTSIDE the pane, so it survives the hide — is the
+                 sole reopen affordance. Mirrors the chat-header
+                 #conversations-toggle-btn for the conversations pane. -->
+            <button id="agents-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_toggle_agents" title="Agents" aria-label="Toggle agents pane" style="padding: 0.4rem 0.6rem; font-size: 0.85rem; margin-right: 0.5rem;"><span class="ki ki-users"></span></button>
             <span class="kestrel-icon" id="nav-agent-icon"><img src="/static/favicon.svg" alt="Kestrel"></span>
             <img id="nav-agent-avatar" src="" alt="" style="display: none; width: 32px; height: 32px; border-radius: 50%; object-fit: cover;">
             <h1 id="nav-agent-name">Kestrel</h1>
@@ -73,6 +80,13 @@
             </button>
         </div>
         <div class="nav-status">
+            <!-- #2350: app-level "Advanced" toggle (frinz-placement parity).
+                 Reveals the capability-gated tab strip (hidden by default);
+                 aria-pressed + visibility are managed by the shared reveal
+                 code (Panels.initReveal). Starts hidden so a single-tab
+                 console never shows it. Governs the whole workspace (tab
+                 strip), so it lives on the top nav bar, not the chat header. -->
+            <button id="advanced-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_advanced" title="Advanced" aria-label="Toggle advanced panels" aria-pressed="false" style="display: none; padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-gear"></span> <span data-label-key="btn_advanced">Advanced</span></button>
             <!-- Privacy indicator moved to chat header -->
             <div id="privacy-indicator" style="display: none;"></div>
         </div>
@@ -145,28 +159,58 @@
                                  the standalone conversations pane. -->
                             <button id="conversations-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_toggle_conversations" title="Conversations" aria-label="Toggle conversations pane" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-history"></span></button>
                             <button id="new-chat-btn" onclick="clearChat()" class="btn btn-primary" data-label-attr-title="btn_new_chat" title="New Chat" style="padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-sparkles"></span></button>
-                            <!-- #2229: chat-first "Advanced" toggle. Reveals the
-                                 capability-gated tab strip (hidden by default);
-                                 aria-pressed + visibility are managed by the shared
-                                 reveal code (Panels.initReveal). Starts hidden so a
-                                 single-tab console never shows it. -->
-                            <button id="advanced-toggle-btn" class="btn btn-secondary" data-label-attr-title="btn_advanced" title="Advanced" aria-label="Toggle advanced panels" aria-pressed="false" style="display: none; padding: 0.4rem 0.6rem; font-size: 0.85rem;"><span class="ki ki-gear"></span> <span data-label-key="btn_advanced">Advanced</span></button>
                         </div>
 
-                        <!-- Center: Model Selection (Vendor → [Route] → Model).
-                             The route selector is populated only when the selected
-                             vendor has >1 configured route (e.g. anthropic:api vs
-                             anthropic:plan). Hidden otherwise. -->
+                        <!-- Center: unified Model-settings popover (#2264). One
+                             button opens a panel with two labeled sections —
+                             Chat (vendor → [route] → [upstream] → model) and
+                             Embeddings (Auto-follow or an explicit provider:route).
+                             The canonical select IDs live inside the panel so the
+                             shared selector keeps driving them. -->
                         <div style="display: flex; gap: 0.5rem; align-items: center; flex: 1; justify-content: center;">
-                            <select id="provider-selector" class="model-selector" data-label-attr-title="model_selector_vendor_title" title="Select vendor" style="min-width: 120px;">
-                                <option value="" data-label-key="model_selector_vendor_placeholder">Vendor...</option>
-                            </select>
-                            <select id="route-selector" class="model-selector" data-label-attr-title="model_selector_route_title" title="Select route (auth/endpoint)" style="min-width: 90px; display: none;">
-                                <option value="" data-label-key="model_selector_route_placeholder">Route...</option>
-                            </select>
-                            <select id="model-selector" class="model-selector" data-label-attr-title="model_selector_model_title" title="Select model" style="min-width: 180px;">
-                                <option value="" data-label-key="model_selector_model_placeholder">Model...</option>
-                            </select>
+                            <button id="model-settings-button" class="model-settings-button" type="button"
+                                    data-label-attr-title="model_settings_button_title" title="Model settings">
+                                <span id="model-settings-summary" class="model-settings-summary">Model settings</span>
+                            </button>
+                            <div id="model-settings-panel" class="model-settings-panel" style="display: none;" role="dialog" aria-label="Model settings">
+                                <div class="model-settings-section">
+                                    <div class="model-settings-section-title" data-label-key="model_settings_chat_section">Chat</div>
+                                    <select id="provider-selector" class="model-selector" data-label-attr-title="model_selector_vendor_title" title="Select vendor">
+                                        <option value="" data-label-key="model_selector_vendor_placeholder">Vendor...</option>
+                                    </select>
+                                    <select id="route-selector" class="model-selector" data-label-attr-title="model_selector_route_title" title="Select route (auth/endpoint)" style="display: none;">
+                                        <option value="" data-label-key="model_selector_route_placeholder">Route...</option>
+                                    </select>
+                                    <select id="upstream-selector" class="model-selector" title="Filter by upstream provider" style="display: none;">
+                                        <option value="All">All upstreams</option>
+                                    </select>
+                                    <select id="model-selector" class="model-selector" data-label-attr-title="model_selector_model_title" title="Select model">
+                                        <option value="" data-label-key="model_selector_model_placeholder">Model...</option>
+                                    </select>
+                                </div>
+                                <div class="model-settings-section">
+                                    <div class="model-settings-section-title" data-label-key="model_settings_embeddings_section">Embeddings</div>
+                                    <!-- #2337 — featured "Universal" option, pinned at the top:
+                                         local + cloud, one search space; works in every privacy mode. -->
+                                    <button id="embedding-universal" class="btn btn-secondary text-sm embedding-universal" type="button" style="display: none;" title="Recommended: one searchable memory space across local and cloud sessions."></button>
+                                    <div id="embedding-setup-status" class="embedding-setup-status" style="display: none;"></div>
+                                    <select id="embedding-mode-selector" class="model-selector" title="Embedding provider mode">
+                                        <option value="auto" data-label-key="model_settings_embeddings_auto">Auto — follow chat provider</option>
+                                        <option value="explicit" data-label-key="model_settings_embeddings_explicit">Choose provider…</option>
+                                        <option value="off" data-label-key="model_settings_embeddings_off">Off — keyword search only</option>
+                                    </select>
+                                    <select id="embedding-route-selector" class="model-selector" title="Embedding provider:route" style="display: none;"></select>
+                                    <!-- #2337 — per-route embedding-model picker (runtime equivalent of the TOML embedding_model key). -->
+                                    <select id="embedding-model-selector" class="model-selector" title="Embedding model for this route" style="display: none;"></select>
+                                    <div id="embedding-dim-readout" class="embedding-dim-readout"></div>
+                                    <div id="embedding-dim-warning" class="embedding-dim-warning" style="display: none;"></div>
+                                    <!-- #2336 — actionable "Re-embed N memories" when stale_rows > 0 -->
+                                    <button id="embedding-reindex-button" class="btn btn-secondary text-sm embedding-reindex-button" type="button" style="display: none;" title="Re-embed stale memories into the current embedding provider."></button>
+                                    <div id="embedding-reindex-status" class="embedding-reindex-status" style="display: none;"></div>
+                                    <!-- #2290 — shared local/cloud embedding space as one entry -->
+                                    <div id="embedding-shared-space" class="embedding-shared-space" style="display: none;"></div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Right: Global security mode + Privacy Mode -->
@@ -867,6 +911,8 @@
     <script src="shared/markdown/katex.js"></script>
     <script src="shared/markdown/index.js"></script>
     <script src="shared/model-selector/index.js"></script>
+    <script src="shared/model-selector/embeddings.js"></script>
+    <script src="shared/model-selector/popover.js"></script>
     <script type="module" src="js/resources.js"></script>
     <script type="module" src="js/app.js"></script>
 </body>

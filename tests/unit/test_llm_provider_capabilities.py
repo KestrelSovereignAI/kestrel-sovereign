@@ -1,6 +1,7 @@
+import json
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from kestrel_sdk.llm import (
     ProviderCapabilities,
@@ -583,6 +584,359 @@ def test_provider_registry_blank_sibling_normalizes_to_none():
     assert getattr(info, "_kestrel_embedding_sibling", None) is None
 
 
+# --- #2263 top-level embedding_route knob -----------------------------------
+
+def _embedding_service(providers, *, embedding_route=None):
+    """Build a bare LLMService wired for embedding-route resolution tests."""
+    service = LLMService.__new__(LLMService)
+    service.providers = list(providers)
+    service._disabled_routes = {}
+    service._embedding_route = embedding_route
+    # Explicit branch is terminal — routing must NOT be consulted when the knob
+    # resolves. Point it at an assertion so any accidental fall-through fails.
+    service.resolve_provider_routing = lambda **_: (
+        (_ for _ in ()).throw(
+            AssertionError("explicit embedding_route branch must be terminal")
+        )
+    )
+    return service
+
+
+def test_explicit_embedding_route_wins_over_native_chat_route():
+    """#2263 — an explicit embedding_route wins even when the active chat route
+    embeds natively (the deliberate-choice-wins rule)."""
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    ollama = _route("ollama:local", "ollama", OpenAIAdapter(), is_local=True)
+    service = _embedding_service([openai, ollama], embedding_route="ollama:local")
+
+    assert service.resolve_embedding_provider() is ollama
+
+
+def test_explicit_embedding_route_used_when_chat_route_cannot_embed():
+    """#2263 — explicit route resolves for a chat route that can't embed."""
+    anthropic = _route("anthropic:api", "anthropic", AnthropicAdapter())
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service = _embedding_service([anthropic, openai], embedding_route="openai:api")
+
+    assert service.resolve_embedding_provider() is openai
+
+
+def test_explicit_embedding_route_refused_under_force_local_only():
+    """#2263 + #1492 — the privacy gate applies to the explicit knob too: a
+    cloud embedding_route is refused for local-only sessions (keyword
+    fallback), never a crash."""
+    openai = _route("openai:api", "openai", OpenAIAdapter(), is_local=False)
+    service = _embedding_service([openai], embedding_route="openai:api")
+    service.set_force_local_only_provider(lambda: True)
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_explicit_local_embedding_route_accepted_under_force_local_only():
+    """#2263 — a local explicit route survives local-only sessions."""
+    ollama = _route("ollama:local", "ollama", OpenAIAdapter(), is_local=True)
+    service = _embedding_service([ollama], embedding_route="ollama:local")
+    service.set_force_local_only_provider(lambda: True)
+
+    assert service.resolve_embedding_provider() is ollama
+
+
+def test_explicit_embedding_route_missing_provider_falls_back():
+    """#2263 — an embedding_route pointing at an uninitialized provider falls
+    back to keyword search (None), terminal — does not consult the chat route."""
+    anthropic = _route("anthropic:api", "anthropic", AnthropicAdapter())
+    service = _embedding_service([anthropic], embedding_route="openai:api")
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_explicit_embedding_route_non_embedding_route_falls_back():
+    """#2263 — an embedding_route naming a route with no embedding support
+    falls back to keyword search."""
+    anthropic = _route("anthropic:api", "anthropic", AnthropicAdapter())
+    service = _embedding_service([anthropic], embedding_route="anthropic:api")
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_explicit_embedding_route_vendor_only_form():
+    """#2263 — a bare ``"<vendor>"`` embedding_route resolves to the first
+    matching route for that vendor."""
+    anthropic = _route("anthropic:api", "anthropic", AnthropicAdapter())
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service = _embedding_service([anthropic, openai], embedding_route="openai")
+
+    assert service.resolve_embedding_provider() is openai
+
+
+def test_set_embedding_route_round_trip_and_clear():
+    """#2263 — set/get round-trip, and clear returns to auto (None)."""
+    service = LLMService.__new__(LLMService)
+    service.providers = [_route("openai:api", "openai", OpenAIAdapter())]
+    service._embedding_route = None
+    service._embedding_route_persistence_callback = None
+
+    service.set_embedding_route("openai:api")
+    assert service.get_embedding_route() == "openai:api"
+
+    # "auto" and "" normalize to None (cleared).
+    service.set_embedding_route("auto")
+    assert service.get_embedding_route() is None
+    service.set_embedding_route("openai:api")
+    service.clear_embedding_route()
+    assert service.get_embedding_route() is None
+
+
+def test_set_embedding_route_validation_rejects_unknown_and_non_embedding():
+    """#2263 — set-time validation rejects an unknown route and a route with no
+    embedding support."""
+    import pytest
+
+    service = LLMService.__new__(LLMService)
+    service.providers = [
+        _route("anthropic:api", "anthropic", AnthropicAdapter()),
+        _route("openai:api", "openai", OpenAIAdapter()),
+    ]
+    service._embedding_route = None
+    service._embedding_route_persistence_callback = None
+
+    with pytest.raises(ValueError, match="no configured route matches"):
+        service.set_embedding_route("gemini:api")
+    with pytest.raises(ValueError, match="does not advertise embedding support"):
+        service.set_embedding_route("anthropic:api")
+    # The good route still sets.
+    service.set_embedding_route("openai:api")
+    assert service.get_embedding_route() == "openai:api"
+
+
+# --- #2326 live upstream probe on explicit set -------------------------------
+
+
+class _ProbeAdapter:
+    """Adapter whose embed either raises or returns a fixed vector, so the
+    #2326 live-probe path can be exercised without a real provider."""
+
+    def __init__(self, *, raise_exc: Optional[Exception] = None, vector=None):
+        self._raise_exc = raise_exc
+        self._vector = vector if vector is not None else [0.1, 0.2, 0.3]
+
+    def provider_capabilities(self):
+        return OpenAIAdapter().provider_capabilities()
+
+    async def aembed(self, client, text, model=None, dimensions=None, **kwargs):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return self._vector
+
+    async def aembed_batch(self, client, texts, model=None, dimensions=None, **kwargs):
+        return [self._vector for _ in texts]
+
+
+def _probe_service(providers):
+    service = LLMService.__new__(LLMService)
+    service.providers = list(providers)
+    service._disabled_routes = {}
+    service._embedding_route = None
+    service._embedding_route_persistence_callback = None
+    return service
+
+
+async def test_aset_embedding_route_refuses_dead_upstream_cloud_route():
+    """#2326 — a cloud route that passes static validation but whose upstream
+    model is dead (aembed 404s) is refused with the upstream error surfaced."""
+    import pytest
+
+    dead = _route(
+        "openrouter:api", "openrouter",
+        _ProbeAdapter(raise_exc=Exception(
+            "Error code: 404 - No endpoints found for qwen/qwen3-embedding-0.6b."
+        )),
+    )
+    service = _probe_service([dead])
+
+    with pytest.raises(ValueError, match="live embedding probe failed"):
+        await service.aset_embedding_route("openrouter:api")
+    # The knob must NOT have been set — refusing means the prior state stands.
+    assert service.get_embedding_route() is None
+
+
+async def test_aset_embedding_route_refuses_when_probe_returns_no_vector():
+    """#2326 — an upstream that returns no embedding (None/empty) is refused."""
+    import pytest
+
+    empty = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[]))
+    service = _probe_service([empty])
+
+    with pytest.raises(ValueError, match="returned no embedding"):
+        await service.aset_embedding_route("openrouter:api")
+    assert service.get_embedding_route() is None
+
+
+async def test_aset_embedding_route_accepts_live_cloud_route():
+    """#2326 — a cloud route whose canary probe succeeds is accepted and set."""
+    live = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[0.4, 0.5]))
+    service = _probe_service([live])
+
+    await service.aset_embedding_route("openrouter:api")
+    assert service.get_embedding_route() == "openrouter:api"
+
+
+async def test_aset_embedding_route_skips_probe_for_local_route():
+    """#2326 — local routes are not live-probed (the empty-pool failure mode is
+    a cloud-meta-provider property); a would-be-failing local adapter still
+    sets."""
+    local = _route(
+        "ollama:local", "ollama",
+        _ProbeAdapter(raise_exc=Exception("would fail if probed")),
+        is_local=True,
+    )
+    service = _probe_service([local])
+
+    await service.aset_embedding_route("ollama:local")
+    assert service.get_embedding_route() == "ollama:local"
+
+
+async def test_aset_embedding_route_refuses_disabled_route():
+    """#2326 — a route that statically matches an embedding-capable provider but
+    is currently disabled (``_disabled_routes``) resolves to no *available*
+    probe target. Committing it would degrade every write to keyword fallback
+    with no probe, so the set is refused rather than silently accepted."""
+    import pytest
+
+    disabled = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[0.1]))
+    service = _probe_service([disabled])
+    service._disabled_routes = {"openrouter:api": "auth_failed"}
+
+    with pytest.raises(ValueError, match="not currently available"):
+        await service.aset_embedding_route("openrouter:api")
+    assert service.get_embedding_route() is None
+
+
+async def test_aset_embedding_route_still_enforces_static_validation():
+    """#2326 — the async setter runs static validation first: an unknown route
+    is refused before any probe."""
+    import pytest
+
+    openai = _route("openai:api", "openai", _ProbeAdapter(vector=[0.1]))
+    service = _probe_service([openai])
+
+    with pytest.raises(ValueError, match="no configured route matches"):
+        await service.aset_embedding_route("gemini:api")
+
+
+async def test_aset_embedding_route_none_and_auto_skip_probe():
+    """#2326 — the ``none`` off-switch and ``auto`` clear are never probed."""
+    live = _route("openrouter:api", "openrouter", _ProbeAdapter(vector=[0.1]))
+    service = _probe_service([live])
+
+    await service.aset_embedding_route("none")
+    assert service.get_embedding_route() == "none"
+    await service.aset_embedding_route("auto")
+    assert service.get_embedding_route() is None
+
+
+async def test_load_persisted_embedding_route_dead_route_logs_loud_no_crash(caplog):
+    """#2326 — boot-time load of a persisted (possibly dead-upstream) route does
+    NOT probe: it applies via the sync setter and logs loudly, never crashing."""
+    import logging as _logging
+
+    from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
+
+    mixin = ModelPreferenceMixin.__new__(ModelPreferenceMixin)
+    mixin.agent_id = "a1"
+
+    dead = _route("openrouter:api", "openrouter", _ProbeAdapter(
+        raise_exc=Exception("404 - No endpoints found")))
+    llm = _probe_service([dead])
+    mixin.llm_service = llm
+
+    class _DB:
+        async def fetchall(self, *_a, **_k):
+            return [(json.dumps("openrouter:api"),)]
+
+    mixin._raw_storage = SimpleNamespace(db=_DB())
+
+    with caplog.at_level(_logging.WARNING):
+        await mixin._load_embedding_route()
+
+    # No crash, route applied without a live probe, and a loud warning emitted.
+    assert llm.get_embedding_route() == "openrouter:api"
+    assert any(
+        "without a live upstream probe" in r.getMessage() for r in caplog.records
+    )
+
+
+# --- #2287 first-class "none" (embeddings deliberately off) ------------------
+
+
+def test_embedding_route_none_short_circuits_resolution():
+    """#2287 — ``embedding_route == "none"`` is a deliberate off-switch:
+    ``resolve_embedding_provider`` short-circuits to None at step 0, even when
+    the active chat route embeds natively. Routing must NOT be consulted."""
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service = _embedding_service([openai], embedding_route="none")
+
+    # The chat route (openai) embeds natively, yet "none" wins — and the
+    # terminal short-circuit means resolve_provider_routing (rigged to raise)
+    # is never reached.
+    assert service.resolve_embedding_provider() is None
+    assert service.get_embedding_service() is None
+
+
+def test_set_embedding_route_none_skips_validation_and_persists():
+    """#2287 — setting ``"none"`` bypasses provider validation (it names no
+    route) and round-trips through get_embedding_route. Casing/whitespace is
+    canonicalized to the bare sentinel."""
+    service = LLMService.__new__(LLMService)
+    # No embedding-capable route configured — an explicit selector would be
+    # refused, but "none" must still be accepted.
+    service.providers = [_route("anthropic:api", "anthropic", AnthropicAdapter())]
+    service._embedding_route = None
+    service._embedding_route_persistence_callback = None
+
+    service.set_embedding_route("none")
+    assert service.get_embedding_route() == "none"
+    # Canonicalization: mixed case / padding still lands on "none".
+    service._embedding_route = None
+    service.set_embedding_route("  NONE ")
+    assert service.get_embedding_route() == "none"
+
+    # Auto still clears back to None (distinct from off).
+    service.set_embedding_route("auto")
+    assert service.get_embedding_route() is None
+
+
+def test_get_embedding_settings_reports_resolved_state_and_dims():
+    """#2263 — GET-settings surfaces configured route, resolved route, model,
+    embedding_dim, and the deployment KESTREL_EMBEDDING_DIM."""
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service = _embedding_service([openai], embedding_route="openai:api")
+
+    settings = service.get_embedding_settings()
+    assert settings["embedding_route"] == "openai:api"
+    assert settings["resolved_route"] == "openai:api"
+    assert settings["embedding_model"] == "text-embedding-3-small"
+    assert settings["embedding_dim"] == 1536
+    assert "kestrel_embedding_dim" in settings
+    assert isinstance(settings["kestrel_embedding_dim"], int)
+
+
+def test_get_embedding_settings_auto_default():
+    """#2263 — with no knob set and a native chat route, settings report
+    embedding_route=None (auto) and the resolved native route."""
+    service = LLMService.__new__(LLMService)
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service.providers = [openai]
+    service._disabled_routes = {}
+    service._embedding_route = None
+    service.resolve_provider_routing = lambda **_: ([openai], None)
+
+    settings = service.get_embedding_settings()
+    assert settings["embedding_route"] is None
+    assert settings["resolved_route"] == "openai:api"
+    assert settings["embedding_dim"] == 1536
+
+
 def test_llm_service_embedding_provider_honors_disabled_policy():
     service = LLMService.__new__(LLMService)
     service.disabled = True
@@ -632,9 +986,13 @@ async def test_provider_embedding_service_uses_common_batch_contract():
 
     assert await service.aembed("hello") == [1.0, 2.0]
     assert await service.aembed_batch(["a", "b"]) == [[1.0, 2.0], None]
-    adapter.aembed.assert_awaited_once_with(client, "hello", model="embed-model")
+    # The pinned embedding_dim rides every embed as the Matryoshka
+    # ``dimensions`` param (#2371).
+    adapter.aembed.assert_awaited_once_with(
+        client, "hello", model="embed-model", dimensions=2
+    )
     adapter.aembed_batch.assert_awaited_once_with(
-        client, ["a", "b"], model="embed-model"
+        client, ["a", "b"], model="embed-model", dimensions=2
     )
 
 
@@ -941,3 +1299,33 @@ def test_in_tree_adapter_capability_matrix():
         assert capabilities.structured_output_mode == structured_output_mode
         assert capabilities.tool_streaming_mode == tool_streaming_mode
         assert capabilities.vision_input_mode == vision_input_mode
+
+
+def test_config_seeded_auto_embedding_route_normalizes_to_none():
+    """codex P2 on #2270 — the documented ``embedding_route = "auto"`` config
+    value must seed as None (follow-chat), not as a literal explicit route that
+    resolve treats as a nonexistent provider and keyword-falls-back."""
+    with patch(
+        "kestrel_sovereign.llm.service.load_section",
+        return_value={"embedding_route": "auto"},
+    ), patch("kestrel_sovereign.llm.service.ProviderRegistry") as mock_registry_class:
+        mock_registry = MagicMock()
+        mock_registry.initialize_providers.return_value = []
+        mock_registry.providers = []
+        mock_registry_class.return_value = mock_registry
+        service = LLMService()
+    assert service.get_embedding_route() is None
+    # And explicit set is case-insensitive about the sentinel too.
+    service.set_embedding_route("AUTO", persist=False)
+    assert service.get_embedding_route() is None
+
+
+def test_bare_vendor_embedding_route_prefers_embedding_capable_route():
+    """codex P2 on #2270 — ``embedding_route = "openai"`` must resolve to the
+    vendor's embedding-capable route even when a non-embedding route for the
+    same vendor sorts first in the provider table."""
+    compat = _route("openai:compat", "openai", AnthropicAdapter())  # no embeddings
+    api = _route("openai:api", "openai", OpenAIAdapter())           # embeddings
+    service = _embedding_service([compat, api], embedding_route="openai")
+
+    assert service.resolve_embedding_provider() is api

@@ -168,6 +168,7 @@ class ConversationMessage(SovereignBase):
 
     created_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
     # Parallel-column embedding. Unlike saved_items / document_chunks
     # there's no legacy BYTEA column on conversation_history — the
@@ -209,6 +210,8 @@ def build_conversation_message_spec(dimension: int) -> VectorTableSpec:
       ``deleted_at IS NULL`` (SQLAlchemy renders ``column == None``
       as ``IS NULL``). Omit to include soft-deleted rows; the
       retriever will always pass ``None``.
+    - ``archived_at`` (optional WHERE) — pass ``None`` so decay/manual
+      archives cannot re-enter semantic candidate generation.
 
     Args:
         dimension: Embedding dimension. The retriever should pass
@@ -234,6 +237,7 @@ def build_conversation_message_spec(dimension: int) -> VectorTableSpec:
             "agent_id": ConversationMessage.agent_id,
             "role": ConversationMessage.role,
             "deleted_at": ConversationMessage.deleted_at,
+            "archived_at": ConversationMessage.archived_at,
             # #1477 — kNN skips rows whose profile id doesn't match
             # the caller-provided one. MemoryRetriever passes the
             # service's ``current_profile_id()``; legacy NULL rows

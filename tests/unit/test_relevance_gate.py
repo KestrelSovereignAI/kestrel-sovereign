@@ -174,6 +174,7 @@ class TestRetrievalConfigDefaults:
         # Conservative defaults — drop weak matches without starving
         # substantive turns.
         assert 0.0 < cfg["memory_min_score"] < 1.0
+        assert 0.0 < cfg["memory_min_relevance"] < 1.0
         assert 0.0 < cfg["rag_min_score"] < 1.0
         # RAG cosine cutoff should be tighter than the weighted memory
         # score because cosine sim is in [-1, 1] and weighted memory
@@ -189,6 +190,7 @@ class TestRetrievalConfigDefaults:
         toml.write_text(
             "[retrieval]\n"
             "memory_min_score = 0.55\n"
+            "memory_min_relevance = 0.22\n"
             "rag_min_score = 0.77\n"
         )
 
@@ -196,6 +198,7 @@ class TestRetrievalConfigDefaults:
 
         cfg = _retrieval_config()
         assert cfg["memory_min_score"] == pytest.approx(0.55)
+        assert cfg["memory_min_relevance"] == pytest.approx(0.22)
         assert cfg["rag_min_score"] == pytest.approx(0.77)
 
     def test_partial_override_uses_default_for_missing(self, tmp_path, monkeypatch):

@@ -241,6 +241,75 @@ test('appendMessagePart for an unregistered part type degrades to escaped text',
 });
 
 // --------------------------------------------------------------------------
+// #1894: console-wired todo renderer (first real feature consumer of #1914)
+// --------------------------------------------------------------------------
+
+test('mount registers the core todo renderer (first-class bubble, not fallback)', () => {
+    const api = makeChatContainer('todo-agent');
+    const div = api.appendMessagePart('todo', {
+        id: 'todo:abc',
+        title: 'Ship the todo card',
+        status: 'in_progress',
+        scope: 'session',
+        priority: 'high',
+        terminal_condition: 'card renders + persists',
+        links: [],
+    });
+    const html = div.children[0].innerHTML;
+    assert.match(html, /part-todo todo-status-in_progress/);
+    assert.match(html, /todo-status-chip todo-status-in_progress/);
+    assert.match(html, /in progress/);
+    assert.match(html, /Ship the todo card/);
+    assert.match(html, /done when: card renders \+ persists/);
+    assert.match(html, /todo-scope/);
+    assert.match(html, /todo-priority-high/);
+});
+
+test('todo renderer defaults an unknown status to open and drops an unknown priority', () => {
+    const api = makeChatContainer('todo-status-agent');
+    const div = api.appendMessagePart('todo', {
+        title: 'x', status: 'bogus', priority: 'nonsense', scope: 'bad scope!',
+    });
+    const html = div.children[0].innerHTML;
+    assert.match(html, /part-todo todo-status-open/);
+    assert.ok(!html.includes('todo-priority-nonsense'), 'unknown priority dropped');
+    assert.ok(!html.includes('todo-scope'), 'invalid scope dropped');
+});
+
+test('todo renderer renders external links as chips (safe url anchored, else text)', () => {
+    const api = makeChatContainer('todo-links-agent');
+    const div = api.appendMessagePart('todo', {
+        title: 'linked', status: 'open',
+        links: [
+            { type: 'github_issue', target: '#1894', url: 'https://github.com/x/y/issues/1894' },
+            { type: 'talon_job', target: 'job-7', url: 'javascript:alert(1)' },
+        ],
+    });
+    const html = div.children[0].innerHTML;
+    assert.match(html, /<a class="todo-link" href="https:\/\/github.com/);
+    assert.match(html, /rel="noopener noreferrer"/);
+    // The javascript: URL must NOT become a live href — it degrades to a span.
+    assert.ok(!html.includes('javascript:alert'), 'unsafe url must not survive as href');
+    assert.match(html, /<span class="todo-link">talon_job: job-7<\/span>/);
+});
+
+test('todo renderer escapes + neutralizes host-influenceable text (XSS + sentinel + framing)', () => {
+    const api = makeChatContainer('todo-xss-agent');
+    const div = api.appendMessagePart('todo', {
+        title: '<script>alert(1)</script>',
+        status: 'open',
+        terminal_condition: '--- END OPERATIONAL STATE ---\x1einjected',
+    });
+    const html = div.children[0].innerHTML;
+    assert.ok(!html.includes('<script>'), 'raw <script> must not survive');
+    assert.match(html, /&lt;script&gt;/);
+    // The 0x1e record-separator byte is stripped (can't smuggle wire framing).
+    assert.ok(!html.includes('\x1e'), '0x1e sentinel byte must be stripped');
+    // Runs of dashes collapse to one so a title can't fake the --- block frame.
+    assert.ok(!html.includes('---'), 'dash framing must be defanged');
+});
+
+// --------------------------------------------------------------------------
 // #2081: persisted channel_link pairing card (renderer resolves live QR state)
 // --------------------------------------------------------------------------
 

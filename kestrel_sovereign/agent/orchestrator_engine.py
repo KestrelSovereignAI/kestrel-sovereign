@@ -1341,6 +1341,7 @@ class OrchestratorEngineMixin:
         tool_results: Optional[list] = None,
         streaming: bool = False,
         session_id: str = "orchestrator",
+        effective_model: Optional[str] = None,
     ):
         """
         Dispatch a single tool call — used by both streaming and non-streaming loops.
@@ -1459,6 +1460,7 @@ class OrchestratorEngineMixin:
                 tool_call, feature, args, dispatch_start, dispatch_event_id,
                 user_message, tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
+                effective_model=effective_model,
             )
         elif tool_name in self._direct_tools:
             result = await self._dispatch_direct_tool(
@@ -1503,7 +1505,11 @@ class OrchestratorEngineMixin:
             result_json = _build_persisted_preview(result_json, tool_name, original_len)
             logging.info(f"{log_prefix} Large tool result ({original_len} chars) replaced with preview")
         else:
-            logging.info(f"{log_prefix} Tool result ({len(result_json)} chars): {result_json[:200]}...")
+            logging.debug(
+                "%s Tool result: chars=%d",
+                log_prefix,
+                len(result_json),
+            )
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
@@ -1608,9 +1614,14 @@ class OrchestratorEngineMixin:
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
         user_message, *, tool_events=None, streaming=False, session_id="orchestrator",
-        dispatch_meta=None,
+        dispatch_meta=None, effective_model=None,
     ):
-        """Dispatch to a feature subagent with hook enforcement."""
+        """Dispatch to a feature subagent with hook enforcement.
+
+        ``effective_model`` is the route/model the orchestrator resolved for
+        this turn; it's forwarded into ``execute_as_subagent`` so the subagent's
+        own reasoning call targets the same route the main turn used (#2352).
+        """
         tool_name = tool_call.name
         hook_feature_name = type(feature).__name__
 
@@ -1665,7 +1676,7 @@ class OrchestratorEngineMixin:
         if denied_tools:
             logging.info(f"[SECURITY] Stripping denied tools from {hook_feature_name}: {denied_tools}")
 
-        async def _exec_feature(effective_args, f=feature, dt=denied_tools):
+        async def _exec_feature(effective_args, f=feature, dt=denied_tools, em=effective_model):
             task = effective_args.get("task", "")
             context = effective_args.get("context")
             if not context and user_message:
@@ -1673,7 +1684,9 @@ class OrchestratorEngineMixin:
             log_tag = "[STREAM] " if streaming else ""
             logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
             with optional_span("agent.feature_dispatch", {"feature.name": f.tool_name}):
-                r = await f.execute_as_subagent(task=task, context=context, denied_tools=dt)
+                r = await f.execute_as_subagent(
+                    task=task, context=context, denied_tools=dt, model_override=em,
+                )
             self._register_explored_feature_tools(f)
             return r
 
@@ -1950,6 +1963,7 @@ class OrchestratorEngineMixin:
         streaming: bool = False,
         session_id: str = "orchestrator",
         part_emit_buffer: Optional[list] = None,
+        effective_model: Optional[str] = None,
     ):
         """
         Execute a batch of tool calls, using parallelism where safe.
@@ -1989,6 +2003,7 @@ class OrchestratorEngineMixin:
                     iteration, user_message,
                     tool_events=tool_events, tool_results=tool_results,
                     streaming=streaming, session_id=session_id,
+                    effective_model=effective_model,
                 )
                 _collect_parts()
             return
@@ -2004,6 +2019,7 @@ class OrchestratorEngineMixin:
                         iteration, user_message,
                         tool_events=tool_events, tool_results=tool_results,
                         streaming=streaming, session_id=session_id,
+                        effective_model=effective_model,
                     )
                     _collect_parts()
             else:
@@ -2026,13 +2042,14 @@ class OrchestratorEngineMixin:
                     [[] for _ in batch_tcs] if tool_results is not None else None
                 )
 
-                async def _run_one(tc, msg_list, res_list):
+                async def _run_one(tc, msg_list, res_list, em=effective_model):
                     async with semaphore:
                         await self._dispatch_tool_call(
                             tc, features_by_tool_name, known_tools, msg_list,
                             iteration, user_message,
                             tool_events=tool_events, tool_results=res_list,
                             streaming=streaming, session_id=session_id,
+                            effective_model=em,
                         )
 
                 await asyncio.gather(
@@ -2154,6 +2171,7 @@ class OrchestratorEngineMixin:
                 messages, iteration, user_message,
                 tool_results=tool_results,
                 session_id=session_id,
+                effective_model=effective_model,
             )
 
             # Continue conversation with tool results
@@ -2171,7 +2189,10 @@ class OrchestratorEngineMixin:
             )
 
             if isinstance(response, str):
-                logging.info(f"[ORCHESTRATOR] Final response (string): {response[:300]}...")
+                logging.debug(
+                    "[ORCHESTRATOR] Final response (string): chars=%d",
+                    len(response),
+                )
                 return response
 
             if not response.has_tool_calls:
@@ -2185,13 +2206,19 @@ class OrchestratorEngineMixin:
                         session_id=session_id,
                     )
                     if isinstance(response, str):
-                        logging.info(f"[ORCHESTRATOR] Final response after repair (string): {response[:300]}...")
+                        logging.debug(
+                            "[ORCHESTRATOR] Final response after repair: chars=%d",
+                            len(response),
+                        )
                         return response
                     if response.has_tool_calls:
                         messages.append(self._build_assistant_tool_history_msg(response))
                         continue
                 final_content = response.content or ""
-                logging.info(f"[ORCHESTRATOR] Final response (no more tool calls): {final_content[:300]}...")
+                logging.debug(
+                    "[ORCHESTRATOR] Final response (no more tool calls): chars=%d",
+                    len(final_content),
+                )
                 return final_content
 
             # Track diminishing returns on this response before continuing
@@ -2388,6 +2415,7 @@ class OrchestratorEngineMixin:
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
                 session_id=session_id, part_emit_buffer=part_emit_buffer,
+                effective_model=effective_model,
             )
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:

@@ -20,7 +20,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from scripts import docs_okf
+# Load the sibling ``docs_okf`` module by its own file path rather than via
+# ``from scripts import docs_okf``. The bare package name ``scripts`` is not
+# unique across the venv — a sibling editable install (e.g.
+# ``kestrel-feature-workflows``) can ship its own top-level ``scripts`` package
+# and shadow this repo's, making the package-name import resolve to the wrong
+# module. Path-based loading is collision-proof and independent of sys.path
+# ordering.
+import importlib.util as _importlib_util
+
+_DOCS_OKF_PATH = Path(__file__).resolve().parent / "docs_okf.py"
+_docs_okf_spec = _importlib_util.spec_from_file_location(
+    "kestrel_scripts_docs_okf", _DOCS_OKF_PATH
+)
+docs_okf = _importlib_util.module_from_spec(_docs_okf_spec)
+# Register before executing so machinery that resolves a class's module by name
+# (e.g. ``dataclasses`` inspecting ``sys.modules[cls.__module__]``) finds it.
+sys.modules[_docs_okf_spec.name] = docs_okf
+_docs_okf_spec.loader.exec_module(docs_okf)
 
 
 PROJECT_ROOT = docs_okf.PROJECT_ROOT

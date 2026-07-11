@@ -144,6 +144,70 @@ async def test_increment_preserves_other_metadata_fields(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_atomic_metadata_merge_preserves_counter_and_json_null(tmp_path):
+    """#2329: derived metadata merges cannot rewind rehearsal state."""
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.conversation.add_conversation("assistant", "hello")
+        row = (await storage.conversation.get_full_history_with_ids())[0]
+        msg_id = row["id"]
+        await storage.conversation.atomic_increment_metadata_counter(
+            msg_id, counter_field="access_count", timestamp_field="last_accessed"
+        )
+
+        assert await storage.conversation.update_message_metadata(
+            msg_id,
+            {
+                "extracted_concepts": ["zirconium"],
+                "schema_routing": {"decisions": 1},
+                "context_priority": None,
+            },
+        )
+
+        row = (await storage.conversation.get_full_history_with_ids())[0]
+        meta = row["metadata"]
+        assert meta["access_count"] == 1
+        assert meta["last_accessed"]
+        assert meta["extracted_concepts"] == ["zirconium"]
+        assert meta["schema_routing"] == {"decisions": 1}
+        assert "context_priority" in meta and meta["context_priority"] is None
+
+
+@pytest.mark.asyncio
+async def test_bounded_history_returns_newest_rows_oldest_first(tmp_path):
+    """#2328: small post-response windows must stay bounded in SQL."""
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        for index in range(6):
+            await storage.conversation.add_conversation(
+                "user", f"message-{index}", session_id="bounded"
+            )
+
+        rows = await storage.conversation.get_full_history_with_ids(limit=2)
+
+        assert [row["content"] for row in rows] == ["message-4", "message-5"]
+
+
+@pytest.mark.asyncio
+async def test_bounded_history_filters_hidden_rows_before_limit(tmp_path):
+    """Excluded/stashed rows cannot consume the bounded temporal window."""
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        for index in range(3):
+            await storage.conversation.add_conversation(
+                "user", f"visible-{index}", session_id="bounded"
+            )
+        await storage.conversation.add_conversation(
+            "user", "hidden-newest",
+            metadata={"excluded_from_context": True}, session_id="bounded",
+        )
+
+        rows = await storage.conversation.get_full_history_with_ids(limit=2)
+
+        assert [row["content"] for row in rows] == ["visible-1", "visible-2"]
+
+
+@pytest.mark.asyncio
 async def test_postgres_sql_shape_uses_jsonb_cast(tmp_path):
     """Regression guard for codex round-2 #1326: the PostgreSQL branch
     used ``metadata->>?`` directly, but ``conversation_history.metadata``

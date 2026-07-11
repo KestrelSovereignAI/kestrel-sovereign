@@ -14,6 +14,7 @@
 
 import API from './api.js';
 import { Toast } from './ui.js';
+import { extractUpgradeRequired, upgradeToastHtml } from './upgrade-prompt.js';
 
 let listEl = null;
 let rulesEl = null;
@@ -70,7 +71,14 @@ async function decide(approvalId, approved, scope, remember) {
             Toast.error('Decision failed');
         }
     } catch (e) {
-        Toast.error(`Decision failed: ${e.message || e}`);
+        // A host policy layer can tier-gate a scope with a structured 403
+        // (#2232). Render it as an upgrade prompt instead of a generic error.
+        const upgrade = extractUpgradeRequired(e);
+        if (upgrade) {
+            Toast.warning(upgradeToastHtml(upgrade));
+        } else {
+            Toast.error(`Decision failed: ${e.message || e}`);
+        }
     }
     loadApprovals();
 }

@@ -16,6 +16,8 @@ class ModelPreferenceMixin:
     """Mixin providing model preference and solvency methods for KestrelAgent."""
 
     MODEL_PREFERENCE_KEY = "model_preference"
+    EMBEDDING_ROUTE_KEY = "embedding_route"
+    EMBEDDING_MODEL_OVERRIDES_KEY = "embedding_model_overrides"
 
     async def list_available_models(self, use_cache: bool = True) -> List[Dict[str, Any]]:
         """
@@ -122,6 +124,162 @@ class ModelPreferenceMixin:
             )
         except Exception as e:
             logging.warning(f"Failed to persist model preference: {e}")
+
+    async def _load_embedding_route(self) -> None:
+        """Load the persisted top-level embedding_route knob (#2263).
+
+        Mirrors ``_load_model_preference``: a persisted runtime value in
+        agent_metadata overrides the config default. Absence leaves the
+        config-seeded value (or None = auto) in place.
+        """
+        try:
+            result = await self._raw_storage.db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (self.agent_id, self.EMBEDDING_ROUTE_KEY),
+            )
+            if not result:
+                return
+            route = json.loads(result[0][0])
+            # ``route`` may be a string (explicit selector) or None (auto).
+            # For an explicit route, fold live embedding discovery into route
+            # capabilities BEFORE the sync validator runs (#2338), mirroring the
+            # settings endpoint. A route discovered dynamically (e.g. OpenRouter
+            # with no TOML ``embedding_model`` pin) advertises embedding support
+            # only after reconciliation; without this, ``set_embedding_route`` ->
+            # ``_validate_embedding_route`` would reject the persisted route as
+            # "does not advertise embedding support", the exception would be
+            # swallowed, and the persisted route would silently not apply after
+            # restart. Best-effort — a discovery hiccup must not fail boot.
+            if route not in (None, "", "auto", "none") and hasattr(
+                self.llm_service, "reconcile_embedding_capabilities"
+            ):
+                try:
+                    await self.llm_service.reconcile_embedding_capabilities(
+                        use_cache=True
+                    )
+                except Exception as e:  # pragma: no cover - never block boot
+                    logging.debug(
+                        "embedding capability reconcile skipped at boot: %s", e
+                    )
+            # Boot applies the persisted value WITHOUT the live upstream probe
+            # that explicit sets run (#2326): probing at boot could fail startup
+            # on a transient upstream outage. Instead we log loudly so a
+            # persisted route that is dead upstream is visible in the boot logs
+            # (the write path still degrades gracefully to keyword search).
+            self.llm_service.set_embedding_route(route, persist=False)
+            if route and route != "none":
+                logging.warning(
+                    "Loaded persisted embedding_route %r without a live upstream "
+                    "probe (#2326): if the route's model is not currently served, "
+                    "storage writes will degrade to keyword search. Re-set it via "
+                    "the settings API/UI to live-validate.",
+                    route,
+                )
+            elif route == "none":
+                logging.info(
+                    "Loaded persisted embedding_route: none (embeddings disabled)"
+                )
+            else:
+                logging.info("Loaded persisted embedding_route: auto (follow chat)")
+        except Exception as e:
+            logging.warning(f"Failed to load embedding_route: {e}")
+
+    async def _persist_embedding_route(self, route: str | None) -> None:
+        """Persist the top-level embedding_route knob to agent_metadata (#2263)."""
+        try:
+            value = json.dumps(route)
+            await self._raw_storage.db.execute(
+                """INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (self.agent_id, self.EMBEDDING_ROUTE_KEY, value, datetime.now(timezone.utc)),
+            )
+        except Exception as e:
+            logging.warning(f"Failed to persist embedding_route: {e}")
+
+    async def _dominant_embedding_profile(self) -> Optional[Dict[str, Any]]:
+        """Return the DB's dominant existing embedding profile, or ``None`` (#2366).
+
+        Wired into the LLM service as the corpus-profile provider so auto
+        embedding-model resolution prefers a model that keeps new memories in
+        the same coordinate space the existing corpus already uses. Best-effort:
+        an empty corpus, an unreadable table, or a missing DB handle yields
+        ``None`` and resolution falls back to hint/catalog order.
+        """
+        try:
+            db = getattr(self._raw_storage, "db", None)
+            if db is None:
+                return None
+            from kestrel_sovereign.storage.embedding_reindex import (
+                dominant_embedding_profile,
+            )
+
+            return await dominant_embedding_profile(
+                db, agent_id=getattr(self, "agent_id", None)
+            )
+        except Exception as e:  # pragma: no cover - never break resolution
+            logging.debug(f"dominant embedding profile lookup failed: {e}")
+            return None
+
+    async def _load_route_embedding_models(self) -> None:
+        """Load persisted per-route embedding_model overrides (#2337).
+
+        Mirrors ``_load_embedding_route``: a persisted runtime map in
+        agent_metadata (``{"<vendor>:<route>": {"model": str, "dim": int|None}}``)
+        re-applies the operator's UI-chosen model pins over the config/discovery
+        default. Applied WITHOUT the live probe explicit sets run — probing at
+        boot could fail startup on a transient upstream outage; the write path
+        still degrades gracefully to keyword search if a pinned model is dead.
+        """
+        try:
+            result = await self._raw_storage.db.fetchall(
+                "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = ?",
+                (self.agent_id, self.EMBEDDING_MODEL_OVERRIDES_KEY),
+            )
+            if not result:
+                return
+            overrides = json.loads(result[0][0])
+            if not isinstance(overrides, dict):
+                return
+            for route, spec in overrides.items():
+                if not isinstance(spec, dict):
+                    continue
+                model = spec.get("model")
+                dim = spec.get("dim")
+                if not model:
+                    continue
+                try:
+                    self.llm_service.set_route_embedding_model(
+                        route, model, dim, persist=False
+                    )
+                    logging.info(
+                        "Loaded persisted embedding_model pin for %s: %s%s",
+                        route,
+                        model,
+                        f" @ {dim}" if dim is not None else "",
+                    )
+                except Exception as e:  # pragma: no cover - never block boot
+                    logging.warning(
+                        "Skipping persisted embedding_model pin for %s: %s", route, e
+                    )
+        except Exception as e:
+            logging.warning(f"Failed to load embedding_model overrides: {e}")
+
+    async def _persist_route_embedding_models(self, overrides: dict) -> None:
+        """Persist per-route embedding_model overrides to agent_metadata (#2337)."""
+        try:
+            value = json.dumps(overrides or {})
+            await self._raw_storage.db.execute(
+                """INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    self.agent_id,
+                    self.EMBEDDING_MODEL_OVERRIDES_KEY,
+                    value,
+                    datetime.now(timezone.utc),
+                ),
+            )
+        except Exception as e:
+            logging.warning(f"Failed to persist embedding_model overrides: {e}")
 
     def _get_local_model_fallback(self) -> str:
         """Get the configured local (ollama) model for economy/solvency fallback."""

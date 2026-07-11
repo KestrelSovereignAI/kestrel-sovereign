@@ -64,6 +64,12 @@ _LAST_RESPONSE_IDENTITY: ContextVar[Optional[Dict[str, Optional[str]]]] = (
     ContextVar("kestrel_last_response_identity", default=None)
 )
 
+# Vendors whose server ignores the requested model ID and serves whatever
+# weights are loaded. Explicit-route callers must still catalog-validate on
+# these, otherwise the response is silently metered as the requested model
+# even though a different one produced it (codex round-2 P2 on #2352).
+_MODEL_IGNORING_VENDORS = frozenset({"llama_cpp", "ollama"})
+
 
 class AuditResult(BaseModel):
     """Structured result of a response-integrity audit.
@@ -326,6 +332,53 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._mandate_preference = {"vendor": None, "model": None, "route": None}
         self._mandate_fallbacks = []
 
+        # Top-level embedding-route knob (#2263). ``[llm] embedding_route =
+        # "<vendor>:<route>"`` selects the embedding channel independently of
+        # the chat route — one setting instead of repeating ``embedding_sibling``
+        # under every vendor. ``None`` means "auto / follow chat route" (the
+        # pre-#2263 default). The config value seeds the runtime state; a
+        # persisted runtime override (agent_metadata) is applied on startup and
+        # wins over config, mirroring how model preference persists.
+        configured_embedding_route = None
+        if isinstance(self.config, dict):
+            raw_embedding_route = self.config.get("embedding_route")
+            if raw_embedding_route:
+                configured_embedding_route = str(raw_embedding_route).strip() or None
+        # Same normalization as set_embedding_route: the documented
+        # ``embedding_route = "auto"`` means "follow chat" — storing the
+        # literal would make resolve treat it as an explicit (nonexistent)
+        # provider and silently keyword-fallback (codex P2 on #2270).
+        # ``"none"`` is the deliberate off-switch (#2287) — canonicalize its
+        # casing so resolve's step-0 short-circuit recognizes it.
+        if configured_embedding_route:
+            if configured_embedding_route.lower() == "auto":
+                configured_embedding_route = None
+            elif configured_embedding_route.lower() == "none":
+                configured_embedding_route = "none"
+        self._embedding_route: Optional[str] = configured_embedding_route
+
+        # Shared local/cloud embedding-space pins (#2290). ``[llm.embedding_spaces]``
+        # declares open-weight models served on BOTH a local and a cloud route so
+        # their rows share ONE model-identity space (``<model>@<dim>``) instead of
+        # fracturing by serving route. A pin is only APPLIED after its parity
+        # probe passes (see ``verify_embedding_space_parity``); until then members
+        # keep their own route-scoped space ids. Parse defensively so a malformed
+        # declaration degrades to "no shared space" rather than crashing init.
+        self._embedding_space_pins: List["EmbeddingSpacePin"] = []
+        try:
+            from .embedding_space import parse_embedding_space_pins
+
+            self._embedding_space_pins = parse_embedding_space_pins(self.config)
+        except Exception as exc:
+            logger.error(
+                "Invalid [llm.embedding_spaces] config; shared embedding spaces "
+                "are DISABLED until fixed: %s",
+                exc,
+            )
+        # Parity-probe results keyed by pin name; only a pin present here with
+        # ``passed=True`` has its shared space_id applied to member routes.
+        self._verified_space_pins: Dict[str, "ParityResult"] = {}
+
         # Remote GPU backend state (merged from BrainRouter)
         self._backend = BackendType.CLOUD
         self._default_backend = BackendType.CLOUD
@@ -365,6 +418,34 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Set via set_preference_persistence_callback() after initialization
         self._preference_persistence_callback = None
         self._preference_persistence_tasks: set[asyncio.Task[None]] = set()
+
+        # Persistence callback for the top-level embedding_route knob (#2263).
+        # Set via set_embedding_route_persistence_callback(); mirrors the model
+        # preference persistence mechanism so a runtime change survives restart.
+        self._embedding_route_persistence_callback = None
+
+        # Per-route embedding_model overrides chosen at runtime (#2337). Keyed by
+        # exact route name ("<vendor>:<route>") -> {"model": str, "dim": int|None}.
+        # These mirror the config-file ``embedding_model``/``embedding_dim`` keys
+        # under a route but are set from the UI (no TOML editing), and persist the
+        # same way as the embedding_route knob (agent_metadata) — NOT a new store.
+        self._route_embedding_model_overrides: Dict[str, Dict[str, Any]] = {}
+        # Snapshot of each route's capability keys BEFORE its first runtime
+        # override, so clearing restores the pre-override (config/discovery) state
+        # exactly instead of leaving a stale pin behind.
+        self._route_embedding_caps_backup: Dict[str, Dict[str, Any]] = {}
+        # Persistence callback for the per-route embedding_model overrides (#2337).
+        self._route_embedding_model_persistence_callback = None
+
+        # Corpus embedding-profile provider (#2366). An ``async () -> dict|None``
+        # callback wired by the agent that returns the DB's DOMINANT existing
+        # embedding profile ({"provider", "model", "dim", "space_id",
+        # "row_count"}). Auto-resolution prefers a model matching it so a fresh
+        # default doesn't silently move the agent into a new embedding space.
+        self._corpus_embedding_profile_provider = None
+        # Per-route records of an auto-default that changed the corpus embedding
+        # space (#2366). Keyed by route name; surfaced in get_embedding_settings.
+        self._embedding_space_change_warnings: Dict[str, Dict[str, Any]] = {}
 
         # Routes that have failed with a permanent auth error (401/403 or
         # the equivalent "User not found" / "invalid api key" message). Once
@@ -418,6 +499,647 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """
         self._preference_persistence_callback = callback
         logger.info("Model preference persistence enabled")
+
+    def set_embedding_route_persistence_callback(self, callback) -> None:
+        """Set the persistence callback for the embedding_route knob (#2263).
+
+        The callback is ``async (route: str|None) -> None`` and is invoked
+        whenever ``set_embedding_route`` / ``clear_embedding_route`` changes the
+        value, so the caller can persist it the same way model preference is
+        persisted (agent_metadata row).
+        """
+        self._embedding_route_persistence_callback = callback
+        logger.info("Embedding route persistence enabled")
+
+    def get_embedding_route(self) -> Optional[str]:
+        """Return the configured top-level embedding_route (#2263).
+
+        ``None`` means "auto — embedding follows the active chat route" (the
+        pre-#2263 default). ``"none"`` means embeddings are deliberately off
+        (#2287). Otherwise a ``"<vendor>"`` or ``"<vendor>:<route>"`` selector
+        chosen deliberately by the operator.
+        """
+        return getattr(self, "_embedding_route", None)
+
+    def set_embedding_route(self, route: Optional[str], *, persist: bool = True) -> None:
+        """Set the top-level embedding_route knob (#2263).
+
+        ``route`` is a ``"<vendor>"`` or ``"<vendor>:<route>"`` selector. An
+        empty string or ``"auto"`` clears the knob (falls back to
+        follow-chat/auto). The special value ``"none"`` (#2287) is a
+        first-class off-switch: embeddings are disabled deliberately, storage
+        writes skip embedding calls, and semantic search uses keyword fallback
+        with no per-write warnings. The route is validated against the
+        configured providers — an unknown route, or one that advertises no
+        embedding support, is refused so the setting can never silently degrade
+        to keyword search on the next storage write. ``"none"`` bypasses this
+        validation because it names no provider.
+
+        Args:
+            route: The embedding route selector, ``"none"`` to disable
+                embeddings deliberately, or ``None``/``""``/``"auto"`` to clear
+                (auto/follow-chat).
+            persist: When True (default) and a persistence callback is bound,
+                schedule the value to be persisted. Set False when applying a
+                value that was just loaded from storage.
+
+        Raises:
+            ValueError: if the route names no configured provider, or the
+                matched route(s) advertise no embedding support.
+        """
+        if route is not None:
+            route = route.strip()
+            if not route or route.lower() == "auto":
+                route = None
+            elif route.lower() == "none":
+                # Canonicalize the deliberate off-switch (#2287) to the bare
+                # sentinel regardless of input casing/whitespace.
+                route = "none"
+
+        # ``"none"`` is a first-class off-switch (#2287): the operator has
+        # turned embeddings off on purpose. It names no provider, so skip
+        # validation — validating it would reject it as an unknown route.
+        if route is not None and route != "none":
+            self._validate_embedding_route(route)
+
+        self._embedding_route = route
+        if route == "none":
+            logger.info(
+                'Embeddings disabled by operator (embedding_route = "none"): '
+                "storage writes will skip embedding calls and semantic search "
+                "uses keyword fallback."
+            )
+        elif route:
+            logger.info("Embedding route set: %s", route)
+        else:
+            logger.info(
+                "Embedding route cleared — embeddings follow the active chat "
+                "route (auto)."
+            )
+
+        if persist and self._embedding_route_persistence_callback:
+            self._schedule_embedding_route_persistence(route)
+
+    async def aset_embedding_route(
+        self, route: Optional[str], *, persist: bool = True
+    ) -> None:
+        """Set the embedding_route, adding a live upstream probe (#2326).
+
+        ``set_embedding_route`` only runs *static* validation: the route is
+        known and advertises embedding support. That is not enough for cloud
+        meta-providers (OpenRouter et al.) which list models whose serving
+        provider pool can be empty — the route passes static validation yet
+        every real embed 404s and rows silently persist with NULL vectors.
+
+        For an explicit **cloud** route, this async variant embeds one canary
+        string through the resolved provider after static validation passes and
+        refuses the set (``ValueError``) on any upstream failure, so the knob can
+        never be accepted in a state that degrades to keyword search on the next
+        storage write. Local routes and the ``"none"``/auto sentinels are not
+        probed. Use this on explicit sets (the settings endpoint); the boot-time
+        persisted-value load stays on the sync, probe-free
+        :meth:`set_embedding_route`.
+
+        Raises:
+            ValueError: if static validation fails, or the live canary embed
+                against a cloud route fails / returns no vector.
+        """
+        # Normalize identically to set_embedding_route so the probe resolves the
+        # canonical selector (and "auto"/"" clear, "none" off-switch, are seen).
+        normalized = route
+        if normalized is not None:
+            normalized = normalized.strip()
+            if not normalized or normalized.lower() == "auto":
+                normalized = None
+            elif normalized.lower() == "none":
+                normalized = "none"
+
+        if normalized is not None and normalized != "none":
+            # Static validation first (unknown route / no embedding support).
+            self._validate_embedding_route(normalized)
+            # Then the live probe for cloud routes (#2326).
+            await self._probe_embedding_route_live(normalized)
+
+        # Commit through the sync setter (re-runs the cheap static validation,
+        # owns logging + persistence).
+        self.set_embedding_route(route, persist=persist)
+
+    async def _probe_embedding_route_live(self, route: str) -> None:
+        """Embed one canary through a cloud embedding route to prove it's live (#2326).
+
+        Static validation only proves the route is known and advertises
+        embedding support; a meta-provider can list a model whose provider pool
+        is empty (dead upstream), so every real embed 404s. Probe the resolved
+        provider with a single canary — reusing the #2290 parity canaries — and
+        raise ``ValueError`` on failure so the set is refused with the upstream
+        error surfaced to the operator.
+
+        Local routes are skipped: the empty-pool failure mode is a live-catalog
+        property of cloud meta-providers, and a missing local model is a
+        separate, already-handled setup issue. When no embedding-capable
+        provider resolves (pre-init / bare harness), there is nothing live to
+        probe, so this is a no-op.
+        """
+        candidates = self._lookup_embedding_route_candidates(route)
+        target = next(
+            (c for c in candidates if self._provider_supports_embeddings(c)),
+            None,
+        )
+        if target is None:
+            # Static validation (against ``self.providers``) already passed, but
+            # the live probe resolves through ``_available_providers()``, which
+            # filters out routes in ``_disabled_routes``. If the route statically
+            # matches an embedding-capable provider yet none is *available*, the
+            # route is disabled in this service — committing it would degrade
+            # every subsequent write to keyword fallback with no probe. Refuse
+            # the set rather than silently accepting a dead route.
+            providers = getattr(self, "providers", None) or []
+            if providers:
+                static_matching = self._filter_providers_by_selector(
+                    providers, route
+                )
+                if any(
+                    self._provider_supports_embeddings(p) for p in static_matching
+                ):
+                    disabled = self._disabled_routes.get(route)
+                    reason = f" ({disabled})" if disabled else ""
+                    raise ValueError(
+                        f"Cannot set embedding_route '{route}': the route is "
+                        f"configured but not currently available"
+                        f"{reason}, so it cannot be probed and would fall back "
+                        f"to keyword search on the next storage write."
+                    )
+            # Otherwise no providers are initialized (pre-init / bare harness):
+            # nothing live to probe, so this is a legitimate no-op.
+            return
+        if target.get("is_local") or not target.get("is_cloud", True):
+            return
+
+        from .embedding_service import ProviderEmbeddingService
+        from .embedding_space import DEFAULT_PARITY_CANARIES
+
+        service = ProviderEmbeddingService(target)
+        canary = DEFAULT_PARITY_CANARIES[0]
+        try:
+            vector = await service.aembed(canary)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot set embedding_route '{route}': live embedding probe "
+                f"failed against the upstream provider ({exc}). The route may "
+                f"list a model that is not currently served."
+            ) from exc
+        if not vector:
+            raise ValueError(
+                f"Cannot set embedding_route '{route}': the upstream provider "
+                f"returned no embedding for a canary probe. The route may list "
+                f"a model that is not currently served."
+            )
+
+    def clear_embedding_route(self) -> None:
+        """Clear the embedding_route knob, returning to auto/follow-chat (#2263)."""
+        self.set_embedding_route(None)
+
+    def _validate_embedding_route(self, route: str) -> None:
+        """Validate an embedding_route selector against configured providers.
+
+        Permissive about UNKNOWN state (mirrors ``_validate_explicit_mandate``):
+        when no providers are configured yet (pre-init / bare harness) the
+        route is trusted. Once providers exist, the selector must match at
+        least one, and at least one matched route must advertise embedding
+        support.
+        """
+        providers = getattr(self, "providers", None) or []
+        if not providers:
+            return
+
+        matching = self._filter_providers_by_selector(providers, route)
+        if not matching:
+            known = sorted({p.get("name") for p in providers if p.get("name")})
+            raise ValueError(
+                f"Cannot set embedding_route: no configured route matches "
+                f"'{route}'. Known routes: {known or '(none)'}."
+            )
+        if not any(self._provider_supports_embeddings(p) for p in matching):
+            raise ValueError(
+                f"Cannot set embedding_route '{route}': that route does not "
+                f"advertise embedding support."
+            )
+
+    def _schedule_embedding_route_persistence(
+        self, route: Optional[str]
+    ) -> Optional["asyncio.Task[None]"]:
+        """Own embedding_route persistence callbacks so close() can await them.
+
+        Callback signature is ``async (route) -> None``. Tasks are tracked in
+        the shared ``_preference_persistence_tasks`` set so
+        ``drain_preference_persistence`` covers them too.
+        """
+        if not self._embedding_route_persistence_callback:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — skip persistence (tests / sync contexts).
+            return None
+        task = loop.create_task(
+            self._embedding_route_persistence_callback(route),
+            name="llm-embedding-route-persistence",
+        )
+        self._preference_persistence_tasks.add(task)
+        task.add_done_callback(self._handle_preference_persistence_done)
+        return task
+
+    # --- Per-route embedding_model overrides (#2337) -------------------------
+
+    def set_route_embedding_model_persistence_callback(self, callback) -> None:
+        """Set the persistence callback for per-route embedding_model pins (#2337).
+
+        The callback is ``async (overrides: dict) -> None`` and is invoked
+        whenever a per-route embedding_model override is set or cleared, so the
+        caller can persist the whole override map the same way the embedding_route
+        knob and model preference persist (agent_metadata row) — not a new store.
+        """
+        self._route_embedding_model_persistence_callback = callback
+        logger.info("Per-route embedding_model persistence enabled")
+
+    def get_route_embedding_model_overrides(self) -> Dict[str, Dict[str, Any]]:
+        """Return a copy of the runtime per-route embedding_model overrides (#2337)."""
+        overrides = getattr(self, "_route_embedding_model_overrides", None) or {}
+        return {route: dict(spec) for route, spec in overrides.items()}
+
+    def set_corpus_embedding_profile_provider(self, callback) -> None:
+        """Wire the DB's dominant embedding-profile provider (#2366).
+
+        ``callback`` is ``async () -> dict|None`` returning the corpus's
+        dominant embedding profile (``{"provider", "model", "dim", "space_id",
+        "row_count"}``) or ``None`` for an empty/unreadable corpus. Auto
+        embedding-model resolution consults it so a fresh default prefers
+        continuity with the existing corpus over catalog order.
+        """
+        self._corpus_embedding_profile_provider = callback
+        logger.info("Corpus embedding-profile provider enabled")
+
+    def _find_route_provider(self, route: str) -> Optional[Dict[str, Any]]:
+        """Return the configured provider whose ``name`` matches ``route`` exactly."""
+        providers = getattr(self, "providers", None) or []
+        return next((p for p in providers if p.get("name") == route), None)
+
+    def set_route_embedding_model(
+        self,
+        route: str,
+        model: Optional[str],
+        dim: Optional[int] = None,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Pin (or clear) a route's embedding model at runtime (#2337).
+
+        Config pins ``embedding_model``/``embedding_dim`` under a route in
+        kestrel.toml; this is the runtime equivalent set from the embeddings UI
+        so the operator never hand-edits TOML. Writing the pin into the route's
+        ``capabilities`` re-advertises embedding support for that exact route
+        (mirrors :meth:`reconcile_embedding_capabilities`), making it selectable
+        and usable by storage immediately. Passing ``model`` as ``None``/``""``
+        clears the override and restores the route's pre-override
+        (config/discovery) capability state.
+
+        Route-specific by design: a pin on ``openai:api`` never flips capability
+        on for a sibling ``openai:plan``. ``route`` must name an exact configured
+        route (``"<vendor>:<route>"``).
+
+        Args:
+            route: Exact route name to pin the model on.
+            model: The embedding model id, or ``None``/``""`` to clear.
+            dim: Optional embedding dimension forwarded as the Matryoshka
+                ``dimensions`` param and used to key the embedding space.
+            persist: When True (default) and a persistence callback is bound,
+                schedule the override map to be persisted.
+
+        Raises:
+            ValueError: if ``route`` names no configured route.
+        """
+        if not route or not isinstance(route, str):
+            raise ValueError("A route name is required to pin an embedding model.")
+        route = route.strip()
+
+        provider = self._find_route_provider(route)
+        # Permissive about UNKNOWN state (mirrors _validate_embedding_route):
+        # pre-init / bare harness has no providers to validate against.
+        providers = getattr(self, "providers", None) or []
+        if providers and provider is None:
+            known = sorted({p.get("name") for p in providers if p.get("name")})
+            raise ValueError(
+                f"Cannot set embedding_model: no configured route matches "
+                f"'{route}'. Known routes: {known or '(none)'}."
+            )
+
+        clearing = model is None or (isinstance(model, str) and not model.strip())
+
+        if provider is not None:
+            caps = provider.get("capabilities")
+            if not isinstance(caps, dict):
+                caps = {}
+                provider["capabilities"] = caps
+            # Snapshot the pre-override capability keys once, so a later clear
+            # restores exactly what config/discovery had established.
+            if route not in self._route_embedding_caps_backup:
+                self._route_embedding_caps_backup[route] = {
+                    key: caps[key]
+                    for key in ("embedding_model", "embedding_dim", "supports_embeddings")
+                    if key in caps
+                }
+
+            if clearing:
+                backup = self._route_embedding_caps_backup.pop(route, {})
+                for key in ("embedding_model", "embedding_dim", "supports_embeddings"):
+                    if key in backup:
+                        caps[key] = backup[key]
+                    else:
+                        caps.pop(key, None)
+                # Drop any auto-resolved marker left by a prior default; the next
+                # resolve re-adds it if the restored state is still auto (#2372).
+                caps.pop("embedding_model_auto_resolved", None)
+            else:
+                caps["embedding_model"] = model.strip()
+                if dim is not None:
+                    caps["embedding_dim"] = int(dim)
+                caps["supports_embeddings"] = True
+                # A runtime pin is operator intent, not an auto default — clear
+                # the marker so discovery folds it in as ``is_pinned`` (#2372).
+                caps.pop("embedding_model_auto_resolved", None)
+
+        if clearing:
+            self._route_embedding_model_overrides.pop(route, None)
+            logger.info("Cleared runtime embedding_model override for %s", route)
+        else:
+            spec: Dict[str, Any] = {"model": model.strip()}
+            if dim is not None:
+                spec["dim"] = int(dim)
+            self._route_embedding_model_overrides[route] = spec
+            logger.info(
+                "Pinned embedding_model for %s: %s%s",
+                route,
+                spec["model"],
+                f" @ {spec['dim']}" if spec.get("dim") is not None else "",
+            )
+
+        # Discovery results are cached per instance; invalidate so the newly
+        # pinned/cleared model is reflected on the next discover call.
+        self._embedding_discovery_cache = None
+
+        if persist and self._route_embedding_model_persistence_callback:
+            self._schedule_route_embedding_model_persistence()
+
+    async def aset_route_embedding_model(
+        self,
+        route: str,
+        model: Optional[str],
+        dim: Optional[int] = None,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Set a per-route embedding_model, adding a live probe on save (#2337/#2326).
+
+        Mirrors :meth:`aset_embedding_route`: a cloud route's candidate model is
+        embedded once (a canary) BEFORE the pin is committed, so a dead/misspelled
+        upstream slug is refused with a ``ValueError`` at configuration time rather
+        than silently 404'ing to keyword fallback on the next storage write. Local
+        routes and the clear path skip the probe.
+
+        Raises:
+            ValueError: if ``route`` is unknown, or the live canary embed against
+                a cloud route with the candidate model fails / returns no vector.
+        """
+        clearing = model is None or (isinstance(model, str) and not model.strip())
+        if not clearing:
+            # Validate the route exists before probing (raises on unknown route).
+            if not route or not isinstance(route, str):
+                raise ValueError("A route name is required to pin an embedding model.")
+            provider = self._find_route_provider(route.strip())
+            providers = getattr(self, "providers", None) or []
+            if providers and provider is None:
+                known = sorted({p.get("name") for p in providers if p.get("name")})
+                raise ValueError(
+                    f"Cannot set embedding_model: no configured route matches "
+                    f"'{route.strip()}'. Known routes: {known or '(none)'}."
+                )
+            await self._probe_route_embedding_model_live(route.strip(), model.strip(), dim)
+
+        self.set_route_embedding_model(route, model, dim, persist=persist)
+
+    async def _probe_route_embedding_model_live(
+        self, route: str, model: str, dim: Optional[int]
+    ) -> None:
+        """Embed one canary through ``route`` using ``model`` to prove it's live (#2337).
+
+        Reuses the #2326 canary machinery, but against a candidate model that is
+        not yet committed to the route's capabilities: builds a throwaway provider
+        copy whose capabilities carry the candidate model/dim and embeds a single
+        canary. Cloud routes only — a local route's missing model is a separate
+        (already-handled) setup problem, and a bare harness with no live provider
+        has nothing to probe.
+        """
+        provider = self._find_route_provider(route)
+        if provider is None:
+            # No providers initialized (pre-init / bare harness) — nothing live.
+            return
+        if provider.get("is_local") or not provider.get("is_cloud", True):
+            return
+
+        # Shallow-copy the provider and overlay the candidate model/dim onto a
+        # copied capabilities dict so the real route config is untouched if the
+        # probe fails.
+        probe_provider = dict(provider)
+        caps = dict(provider.get("capabilities") or {})
+        caps["embedding_model"] = model
+        if dim is not None:
+            caps["embedding_dim"] = int(dim)
+        probe_provider["capabilities"] = caps
+
+        from .embedding_service import ProviderEmbeddingService
+        from .embedding_space import DEFAULT_PARITY_CANARIES
+
+        service = ProviderEmbeddingService(probe_provider)
+        canary = DEFAULT_PARITY_CANARIES[0]
+        try:
+            vector = await service.aembed(canary)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot pin embedding_model '{model}' on '{route}': live "
+                f"embedding probe failed against the upstream provider ({exc}). "
+                f"The model may not be currently served."
+            ) from exc
+        if not vector:
+            raise ValueError(
+                f"Cannot pin embedding_model '{model}' on '{route}': the upstream "
+                f"provider returned no embedding for a canary probe. The model may "
+                f"not be currently served."
+            )
+
+    def _schedule_route_embedding_model_persistence(
+        self,
+    ) -> Optional["asyncio.Task[None]"]:
+        """Own per-route embedding_model persistence so close() can await it (#2337)."""
+        if not self._route_embedding_model_persistence_callback:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(
+            self._route_embedding_model_persistence_callback(
+                self.get_route_embedding_model_overrides()
+            ),
+            name="llm-route-embedding-model-persistence",
+        )
+        self._preference_persistence_tasks.add(task)
+        task.add_done_callback(self._handle_preference_persistence_done)
+        return task
+
+    def get_embedding_settings(self) -> Dict[str, Any]:
+        """Return the resolved embedding-channel state for the active session (#2263).
+
+        Shape (enough for a UI to render an "Auto — follow chat" default and a
+        dimension-mismatch warning). ``embedding_route`` distinguishes the
+        three states (#2287): ``None`` == auto/follow-chat, a
+        ``"<vendor>:<route>"`` selector == explicit, and ``"none"`` ==
+        deliberately off (keyword search only). In the off state
+        ``resolved_route``/``embedding_model``/``embedding_dim`` are ``None``
+        while ``kestrel_embedding_dim`` is still reported:
+
+            embedding_route:        the configured knob: ``None`` == auto,
+                                    ``"none"`` == off, else explicit selector.
+            resolved_route:         the ``"<vendor>:<route>"`` actually resolved
+                                    for the active session, or ``None`` when
+                                    embedding is unavailable (keyword fallback).
+            embedding_model:        the resolved provider's embedding model id.
+            embedding_dim:          the resolved provider's embedding dimension.
+            kestrel_embedding_dim:  the deployment's effective embedding dim
+                                    (driven by ``KESTREL_EMBEDDING_DIM``), which
+                                    the vector columns are sized to.
+        """
+        configured = getattr(self, "_embedding_route", None)
+        provider = self.resolve_embedding_provider()
+        resolved_route = None
+        embedding_model = None
+        embedding_dim = None
+        if provider is not None:
+            resolved_route = provider.get("name")
+            capabilities = provider.get("capabilities") or {}
+            embedding_model = capabilities.get("embedding_model")
+            embedding_dim = capabilities.get("embedding_dim")
+
+        try:
+            from kestrel_sovereign.storage.sqla.conversation_message import (
+                resolve_embedding_dim,
+            )
+
+            deployment_dim = resolve_embedding_dim()
+        except Exception:  # pragma: no cover - defensive; never crash a GET
+            deployment_dim = None
+
+        # #2290 — surface the shared local/cloud embedding space so the UI can
+        # render it as ONE entry ("qwen3-embedding-0.6b — local + cloud")
+        # instead of two routes. Only the pin covering the resolved route is
+        # reported, with its verification/drift state.
+        shared_space = self._shared_space_payload(provider)
+
+        # #2366 — surface an auto-default that moved the resolved route into a
+        # NEW embedding space (away from the corpus's dominant profile). The UI
+        # mismatch banner renders this so the operator can re-embed or pin.
+        space_change_warning = None
+        warnings = getattr(self, "_embedding_space_change_warnings", None)
+        if isinstance(warnings, dict) and resolved_route:
+            space_change_warning = warnings.get(resolved_route)
+
+        return {
+            "embedding_route": configured,
+            "resolved_route": resolved_route,
+            "embedding_model": embedding_model,
+            "embedding_dim": embedding_dim,
+            "kestrel_embedding_dim": deployment_dim,
+            "shared_space": shared_space,
+            # #2337 — the runtime per-route embedding_model pins the UI's model
+            # picker reflects (keyed by "<vendor>:<route>"). Empty when none set.
+            "route_embedding_models": self.get_route_embedding_model_overrides(),
+            # #2366 — non-null when the auto default changed the corpus space.
+            "space_change_warning": space_change_warning,
+        }
+
+    async def aget_embedding_settings(self) -> Dict[str, Any]:
+        """Async settings read that RESOLVES the active route's model/dim first (#2372).
+
+        ``get_embedding_settings`` (sync) reads whatever is in the resolved
+        route's capabilities; if a cleared pin left them empty it surfaced
+        ``embedding_model: null`` — embeddings silently off — even while a
+        corpus-matching model was discoverable. This resolves the active route
+        through the single :meth:`resolve_route_embedding_model` (the #2366 order
+        with normalized matching) BEFORE the sync read, so the GET falls through
+        corpus-match → catalog fallback instead of reporting ``None``.
+
+        Round-4 (#2372): a cleared per-route pin drops the route's
+        ``supports_embeddings`` flag, and ``resolve_embedding_provider`` GATES
+        the explicit-route branch on that sync flag — so it returned ``None``
+        (silent-off) before we ever got a provider to resolve, even though the
+        route could still discover a capable model. The capability advertise and
+        the resolution are circular (can't advertise without resolving, won't
+        resolve the provider ``resolve_embedding_provider`` gates away). Break the
+        cycle by re-advertising capability across every discovering route FIRST
+        (the single resolver, funnelled through ``reconcile_embedding_capabilities``)
+        so the read is self-sufficient regardless of whether the caller
+        pre-reconciled. Best-effort — a discovery hiccup must never fail the read.
+        """
+        if hasattr(self, "reconcile_embedding_capabilities"):
+            try:
+                await self.reconcile_embedding_capabilities(use_cache=True)
+            except Exception as exc:  # pragma: no cover - never fail the read
+                logger.debug("embedding capability reconcile skipped in aget: %s", exc)
+        provider = self.resolve_embedding_provider()
+        if provider is not None:
+            try:
+                await self.resolve_route_embedding_model(provider)
+            except Exception as exc:  # pragma: no cover - never fail the read
+                logger.debug("active-route embedding resolve skipped: %s", exc)
+        return self.get_embedding_settings()
+
+    async def aget_embedding_settings_for_route(
+        self, route: str
+    ) -> Dict[str, Any]:
+        """Settings echo for a SPECIFIC route (#2372) — never crosses routes.
+
+        The route-model POST echoes the settings the operator just configured.
+        Reading the globally-resolved embedding provider crossed routes — a pin
+        on ``openrouter:api`` echoed whatever the active ``embedding_route`` /
+        chat route resolved (e.g. an Ollama slug). This resolves the NAMED route
+        through the single :meth:`resolve_route_embedding_model` and overlays its
+        own ``resolved_route`` / ``embedding_model`` / ``embedding_dim`` so the
+        echo reflects the pinned route's own slug.
+        """
+        settings = self.get_embedding_settings()
+        provider = self._find_route_provider(route)
+        if provider is not None:
+            try:
+                model, dim = await self.resolve_route_embedding_model(provider)
+            except Exception as exc:  # pragma: no cover - never fail the echo
+                logger.debug("route embedding resolve skipped for %s: %s", route, exc)
+            else:
+                route_name = provider.get("name")
+                settings["resolved_route"] = route_name
+                settings["embedding_model"] = model
+                settings["embedding_dim"] = dim
+                # #2372 — the base echo started from ``get_embedding_settings()``,
+                # which resolves the GLOBAL active provider, so its
+                # ``shared_space``/``space_change_warning`` describe that route,
+                # not the one being echoed. Overlay the route-scoped values so no
+                # field crosses routes.
+                settings["shared_space"] = self._shared_space_payload(provider)
+                warnings = getattr(self, "_embedding_space_change_warnings", None)
+                settings["space_change_warning"] = (
+                    warnings.get(route_name)
+                    if isinstance(warnings, dict)
+                    else None
+                )
+        return settings
 
     @staticmethod
     def _is_permanent_auth_error(exc: Exception) -> bool:
@@ -1123,27 +1845,61 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             None,
         )
 
+    def _lookup_embedding_route_candidates(
+        self, selector: str
+    ) -> List[Dict[str, Any]]:
+        """Return ALL available providers an embedding_route selector matches.
+
+        Same availability source and selector semantics as
+        ``_lookup_sibling_provider`` (``"<vendor>"`` or ``"<vendor>:<route>"``),
+        but returns every match instead of the first — the explicit
+        embedding_route branch picks the first EMBEDDING-CAPABLE match, so a
+        bare-vendor selector isn't defeated by a non-embedding route sorting
+        first (codex P2 on #2270).
+        """
+        if hasattr(self, "_available_providers") and callable(
+            getattr(self, "_available_providers")
+        ):
+            try:
+                candidates = self._available_providers()
+            except Exception:
+                candidates = getattr(self, "providers", None) or []
+        else:
+            candidates = getattr(self, "providers", None) or []
+        if not candidates:
+            return []
+        if ":" in selector:
+            return [p for p in candidates if p.get("name") == selector]
+        return [p for p in candidates if p.get("vendor") == selector]
+
     def resolve_embedding_provider(self) -> Optional[Dict[str, Any]]:
         """Return a provider that can embed text for the active chat session.
 
-        Resolution order (#1494 — sibling-route per chat provider):
+        Resolution order (#2263 — top-level embedding_route + #1494 sibling):
 
-        1. Active chat route supports embeddings → return it. (Today's
+        1. Explicit top-level ``embedding_route`` (#2263) is set → resolve it.
+           The user's deliberate choice wins even when the active chat route
+           embeds natively. This branch is terminal: if the configured route is
+           unavailable, refused by the privacy gate, or advertises no embedding
+           support, we log and fall back to keyword search (``None``) rather
+           than second-guessing with the chat route.
+        2. Active chat route supports embeddings → return it. (Today's
            "embedding follows chat provider" behavior — preserved as
-           the default.)
-        2. Active route has ``embedding_sibling`` configured AND the
+           the default when no explicit ``embedding_route`` is set.)
+        3. Active route has ``embedding_sibling`` configured AND the
            sibling exists in ``self.providers`` AND it supports
            embeddings AND it passes the ``force_local_only`` filter →
            return the sibling.
-        3. Otherwise → ``None``. Storage callers fall back to
+        4. Otherwise → ``None``. Storage callers fall back to
            keyword / LIKE search; never an unrelated global Ollama
            singleton, never a cloud route under local-only mode.
 
         Privacy gate (#1492): the bound ``force_local_only`` provider
-        is applied at every routing call here AND on the sibling
-        lookup. A cloud sibling for an ISOLATED/EPHEMERAL session is
-        rejected — privacy wins, even at the cost of losing
-        embedding for the operator who configured a non-local sibling.
+        is applied to EVERY branch — the explicit ``embedding_route``,
+        the active chat route, AND the sibling lookup. A cloud channel
+        for an ISOLATED/EPHEMERAL session is rejected — privacy wins,
+        even at the cost of losing embedding for the operator who
+        configured a non-local channel.
 
         Sibling resolution is one hop only. The chosen sibling is
         used directly; ``embedding_sibling`` on the sibling itself is
@@ -1153,7 +1909,62 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if getattr(self, "disabled", False):
             return None
 
+        # --- 0. Deliberate off-switch: embedding_route == "none" (#2287) -----
+        # A first-class "embeddings off" set by the operator. Short-circuit to
+        # None (keyword fallback) with NO per-write warning — the single INFO
+        # was logged once at set time. This is distinct from the accidental
+        # no-provider state below, which KEEPS its warning because that IS
+        # degradation, not a choice.
+        if getattr(self, "_embedding_route", None) == "none":
+            return None
+
         force_local_only = self._current_force_local_only()
+
+        # --- 1. Explicit top-level embedding_route knob (#2263) --------------
+        # The user's deliberate choice wins even when the chat route embeds
+        # natively. Terminal branch — never falls through to chat/sibling.
+        explicit_route = getattr(self, "_embedding_route", None)
+        if explicit_route:
+            # Consider EVERY available route the selector matches, not just the
+            # vendor's first route (codex P2 on #2270): a bare-vendor selector
+            # like "openai" must find openai:api's embedding support even when
+            # a non-embedding openai-compatible route sorts first.
+            matches = self._lookup_embedding_route_candidates(explicit_route)
+            if not matches:
+                logger.warning(
+                    "Configured embedding_route %s matches no initialized "
+                    "provider; semantic storage search will use keyword "
+                    "fallback.",
+                    explicit_route,
+                )
+                return None
+            if force_local_only:
+                matches = [p for p in matches if p.get("is_local")]
+                if not matches:
+                    logger.info(
+                        "Configured embedding_route %s is non-local under "
+                        "force_local_only=True; semantic storage search will use "
+                        "keyword fallback (privacy mode overrides embedding_route).",
+                        explicit_route,
+                    )
+                    return None
+            target = next(
+                (p for p in matches if self._provider_supports_embeddings(p)),
+                None,
+            )
+            if target is None:
+                logger.warning(
+                    "Configured embedding_route %s does not advertise "
+                    "supports_embeddings; semantic storage search will use "
+                    "keyword fallback.",
+                    explicit_route,
+                )
+                return None
+            logger.info(
+                "Using configured embedding_route %s for embeddings.",
+                explicit_route,
+            )
+            return target
 
         # ``resolve_provider_routing`` raises RuntimeError when
         # force_local_only=True and no local provider exists. For
@@ -1235,14 +2046,275 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         )
         return None
 
+    def _pin_for_provider(
+        self, provider: Optional[Dict[str, Any]]
+    ) -> Optional["EmbeddingSpacePin"]:
+        """Return the shared-space pin whose members include this provider.
+
+        Matches on the provider's ``"<vendor>:<route>"`` name (or bare vendor).
+        Returns ``None`` when no pin covers the route — the common case.
+        """
+        pins = getattr(self, "_embedding_space_pins", None)
+        if not provider or not pins:
+            return None
+        name = provider.get("name")
+        vendor = provider.get("vendor")
+        for pin in pins:
+            if pin.covers(name, vendor):
+                return pin
+        return None
+
+    def _shared_space_payload(
+        self, provider: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Build the #2290 shared-space echo for ``provider``'s route, or ``None``.
+
+        Route-scoped: only the pin covering THIS provider is described, so a
+        per-route echo (#2372) never reports the globally-active route's space.
+        """
+        pin = self._pin_for_provider(provider)
+        if pin is None:
+            return None
+        parity = self._verified_space_pins.get(pin.name)
+        return {
+            "name": pin.name,
+            "space_id": pin.space_id,
+            "model": pin.model,
+            "dim": pin.dim,
+            "members": list(pin.members),
+            "verified": bool(parity and parity.passed),
+            "parity": parity.to_dict() if parity else None,
+        }
+
     def get_embedding_service(self):
-        """Return a provider-backed embedding service for the active route."""
+        """Return a provider-backed embedding service for the active route.
+
+        When the resolved route is a member of a shared-space pin (#2290) whose
+        parity probe has PASSED, the pin's model-identity ``space_id`` is force-
+        applied so this route's rows land in the same coordinate space as its
+        sibling members (local ⇆ cloud). An unverified pin is NOT applied — the
+        route keeps its own route-scoped space id, so "detected" never becomes
+        "aliased" without the mandatory parity gate.
+        """
         provider = self.resolve_embedding_provider()
+        return self._build_embedding_service(provider)
+
+    def get_embedding_service_for_route(self, route: str):
+        """Return a provider-backed embedding service for a SPECIFIC route (#2372).
+
+        The route-model echo must count stale rows against the route the operator
+        just configured, not the globally-resolved active route — a response that
+        says ``resolved_route: openrouter:api`` must never report
+        ``ollama:local``'s stale-row counts. Applies the same shared-space pin
+        logic as :meth:`get_embedding_service`. Returns ``None`` when the route is
+        unknown / not configured.
+        """
+        provider = self._find_route_provider(route) if route else None
+        return self._build_embedding_service(provider)
+
+    def _build_embedding_service(self, provider: Optional[Dict[str, Any]]):
+        """Construct a :class:`ProviderEmbeddingService` for a resolved provider.
+
+        Shared by the active-route and per-route (#2372) accessors so the pin /
+        parity-gate handling stays identical. A verified #2290 shared-space pin
+        force-applies its model-identity ``space_id``; an unverified pin is not
+        applied. Returns ``None`` when ``provider`` is ``None``.
+        """
         if provider is None:
             return None
         from .embedding_service import ProviderEmbeddingService
 
+        pin = self._pin_for_provider(provider)
+        verified = (
+            pin is not None
+            and self._verified_space_pins.get(pin.name) is not None
+            and self._verified_space_pins[pin.name].passed
+        )
+        if pin is not None and verified:
+            return ProviderEmbeddingService(
+                provider,
+                space_id_override=pin.space_id,
+                normalized_override=pin.normalized,
+            )
         return ProviderEmbeddingService(provider)
+
+    async def verify_embedding_space_parity(
+        self,
+        pin_name: Optional[str] = None,
+        *,
+        record_to: Any = None,
+    ) -> Dict[str, "ParityResult"]:
+        """Run the mandatory parity probe for shared-space pins (#2290).
+
+        For each pin (or just ``pin_name``), embed K canary texts through every
+        pair of member routes and require pairwise cosine ``>=
+        parity_threshold``. On pass, the pin is cached in
+        ``self._verified_space_pins`` and its model-identity ``space_id`` starts
+        being applied by ``get_embedding_service``; on fail, the pin is left
+        unverified so members keep their route-scoped ids (the alias is
+        refused). Also enforces the dims pin: a member whose configured
+        ``embedding_dim`` differs from the pin's ``dim`` fails the probe — both
+        sides must pin the SAME dims value.
+
+        ``record_to`` (an ``AsyncDatabase``) is best-effort: when provided, the
+        measured drift is written onto the pinned space's ``embedding_profiles``
+        row so operators can see it. Failure to record never fails the probe.
+
+        Returns a ``{pin_name: ParityResult}`` map for the pins probed.
+        """
+        from .embedding_space import ParityResult, probe_parity
+        from .embedding_service import ProviderEmbeddingService
+
+        results: Dict[str, "ParityResult"] = {}
+        pins = self._embedding_space_pins
+        if pin_name is not None:
+            pins = [p for p in pins if p.name == pin_name]
+        for pin in pins:
+            member_services = []
+            dim_mismatch = None
+            for selector in pin.members:
+                candidates = self._lookup_embedding_route_candidates(selector)
+                target = next(
+                    (c for c in candidates if self._provider_supports_embeddings(c)),
+                    None,
+                )
+                if target is None:
+                    continue
+                caps = target.get("capabilities") or {}
+                member_dim = caps.get("embedding_dim")
+                if member_dim is not None and int(member_dim) != int(pin.dim):
+                    dim_mismatch = (
+                        f"member {selector} serves dim {member_dim} but pin "
+                        f"{pin.name!r} declares dim {pin.dim} — both sides must "
+                        "pin the SAME dims value"
+                    )
+                    break
+                member_services.append(ProviderEmbeddingService(target))
+
+            if dim_mismatch is not None:
+                result = ParityResult(
+                    passed=False, threshold=pin.parity_threshold,
+                    min_cosine=0.0, mean_cosine=0.0, n=0, error=dim_mismatch,
+                )
+            elif len(member_services) < 2:
+                result = ParityResult(
+                    passed=False, threshold=pin.parity_threshold,
+                    min_cosine=0.0, mean_cosine=0.0, n=0,
+                    error=(
+                        f"fewer than two embedding-capable member routes "
+                        f"available for pin {pin.name!r}"
+                    ),
+                )
+            else:
+                # Probe every member against the first — one hub is enough to
+                # transitively certify a shared space; the worst pair wins.
+                hub = member_services[0]
+                pair_results = []
+                for other in member_services[1:]:
+                    pair_results.append(
+                        await probe_parity(
+                            hub, other, threshold=pin.parity_threshold
+                        )
+                    )
+                worst = min(pair_results, key=lambda r: r.min_cosine)
+                result = worst
+
+            results[pin.name] = result
+            if result.passed:
+                self._verified_space_pins[pin.name] = result
+                logger.info(
+                    "Shared embedding space %r verified: %d members share "
+                    "space_id %s (min cosine %.4f >= %.2f).",
+                    pin.name, len(member_services), pin.space_id,
+                    result.min_cosine, pin.parity_threshold,
+                )
+                if record_to is not None:
+                    await self._record_space_parity(record_to, pin, result)
+            else:
+                self._verified_space_pins.pop(pin.name, None)
+                logger.warning(
+                    "Shared embedding space %r REFUSED (parity below "
+                    "threshold): %s. Member routes keep their own space ids.",
+                    pin.name, result.error or f"min cosine {result.min_cosine}",
+                )
+        return results
+
+    async def _record_space_parity(
+        self, db: Any, pin: "EmbeddingSpacePin", result: "ParityResult"
+    ) -> None:
+        """Best-effort: durably persist measured drift for the pinned space.
+
+        Upserts the canonical shared-space registry row so the parity survives
+        a restart (see :meth:`hydrate_verified_space_pins`), even though the
+        verify probe usually runs before any shared-space rows exist.
+        """
+        try:
+            from kestrel_sovereign.storage.sqla.embedding_profile import (
+                record_space_parity,
+            )
+
+            await record_space_parity(
+                db,
+                space_id=pin.space_id,
+                model=pin.model,
+                dim=pin.dim,
+                normalized=pin.normalized,
+                parity_cosine=result.min_cosine,
+            )
+        except Exception as exc:  # pragma: no cover - defensive, never fatal
+            logger.debug("Recording embedding-space parity failed: %s", exc)
+
+    async def hydrate_verified_space_pins(self, db: Any) -> None:
+        """Re-apply previously-verified shared spaces from persisted parity (#2290).
+
+        ``_verified_space_pins`` is process-local, so after a restart the pins
+        parse again but no shared ``space_id`` would be applied until an operator
+        re-POSTs the parity probe — silently stranding reindexed shared-space
+        rows outside kNN. This hydrates that state from the durable
+        ``embedding_profiles.parity_cosine`` written by :meth:`_record_space_parity`.
+
+        A pin is re-verified only when its persisted parity still clears the
+        pin's *current* ``parity_threshold`` — so raising the threshold (or
+        changing the model/dim, which changes ``space_id`` and therefore the
+        looked-up row) correctly invalidates a stale alias. Best-effort: any DB
+        error leaves the pin unverified rather than crashing startup.
+        """
+        pins = getattr(self, "_embedding_space_pins", None)
+        if db is None or not pins:
+            return
+        from .embedding_space import ParityResult
+
+        for pin in pins:
+            try:
+                row = await db.fetchone(
+                    "SELECT parity_cosine FROM embedding_profiles "
+                    "WHERE space_id = ? AND parity_cosine IS NOT NULL "
+                    "ORDER BY parity_cosine DESC LIMIT 1",
+                    (pin.space_id,),
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Hydrating parity for space %s failed: %s", pin.space_id, exc
+                )
+                continue
+            if not row or row[0] is None:
+                continue
+            parity_cosine = float(row[0])
+            if parity_cosine >= pin.parity_threshold:
+                self._verified_space_pins[pin.name] = ParityResult(
+                    passed=True,
+                    threshold=pin.parity_threshold,
+                    min_cosine=round(parity_cosine, 6),
+                    mean_cosine=round(parity_cosine, 6),
+                    n=0,
+                )
+                logger.info(
+                    "Shared embedding space %r rehydrated from persisted parity "
+                    "(cosine %.4f >= %.2f); shared space_id %s active.",
+                    pin.name, parity_cosine, pin.parity_threshold, pin.space_id,
+                )
+            else:
+                self._verified_space_pins.pop(pin.name, None)
 
     def _model_available_for_route(self, provider: Dict[str, Any], model_id: str) -> bool:
         """Return True iff the model is discoverable in this route's vendor catalog.
@@ -1981,6 +3053,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         start_time: float,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
+        explicit_selection: bool = False,
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
@@ -1994,10 +3067,33 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
           * callers mistakenly targeting a vendor that doesn't serve the model.
         Skipping raises ``ModelNotAvailableForRoute`` so the outer fallback
         loop can move on to the next provider.
+
+        The catalog gate only guards **blind fallback**. When the caller has
+        explicitly pinned this route (``explicit_selection=True`` — a
+        ``vendor:route/model`` override or a route-qualified mandate, as feature
+        subagents produce), the streaming chat path (``streaming.py`` never calls
+        ``_model_available_for_route``) already trusts the selection and calls the
+        route directly. This non-streaming path must match that contract, or a
+        valid model the route genuinely serves — but which discovery hasn't
+        cached (e.g. a brand-new OpenRouter slug, or a paginated/capped catalog) —
+        gets a false-negative ``ModelNotAvailableForRoute`` and the whole call
+        fails with "All providers failed". That asymmetry is what broke feature
+        subagent dispatch (#2352): the same ``openrouter:api/openai/...`` route
+        that streamed fine on the chat path was rejected here. There is no
+        cross-vendor cascade risk when the route is explicitly pinned, so honour
+        it exactly as streaming does.
+
+        EXCEPTION: local vendors whose server ignores the requested model ID and
+        serves whatever weights are loaded (e.g. ``llama_cpp``, ``ollama:local``
+        with a preloaded model) — trusting an explicit selection there would
+        silently mislabel the response (codex round-2 P2). Keep catalog
+        validation on those so a mismatched pin fails loud instead of being
+        metered as the wrong model.
         """
         messages = messages_for(provider["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
-        if target_model and target_model != "auto":
+        skip_catalog = explicit_selection and provider.get("vendor") not in _MODEL_IGNORING_VENDORS
+        if target_model and target_model != "auto" and not skip_catalog:
             if not self._model_available_for_route(provider, target_model):
                 raise ModelNotAvailableForRoute(
                     vendor=provider.get("vendor"),
@@ -2337,6 +3433,7 @@ No other text or formatting.
                         start_time=start_time,
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
+                        explicit_selection=explicit_selection,
                     )
                     if llm_span and isinstance(result, LLMResponse):
                         if result.input_tokens is not None:

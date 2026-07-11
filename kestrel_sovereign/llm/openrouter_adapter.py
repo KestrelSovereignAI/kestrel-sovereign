@@ -21,8 +21,11 @@ import os
 import logging
 from dataclasses import replace
 import httpx
-from typing import List, Optional, Dict, Any, Type, AsyncIterator, Union
+from typing import List, Optional, Dict, Any, Type, AsyncIterator, TYPE_CHECKING, Union
 import openai
+
+if TYPE_CHECKING:
+    from .embedding_discovery import EmbeddingModelInfo
 
 from pydantic import BaseModel
 
@@ -50,8 +53,28 @@ class OpenRouterAdapter(OpenAIAdapter):
         OPENROUTER_APP_NAME: Optional app name for leaderboard attribution
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        embedding_model: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
+        supports_embeddings: Optional[bool] = None,
+    ):
+        # Start from the base with embeddings OFF; OpenRouter must NOT inherit
+        # OpenAI's ``text-embedding-3-small`` default. As a meta-provider it
+        # only embeds when a route explicitly configures an embedding model
+        # (#2288) — advertising what the ROUTE serves, not what the vendor's
+        # catalog theoretically offers.
         super().__init__(name="openrouter", supports_embeddings=False)
+        self._embedding_model = str(embedding_model) if embedding_model else None
+        self._embedding_dim = int(embedding_dim) if embedding_dim else None
+        if supports_embeddings is None:
+            supports_embeddings = bool(self._embedding_model)
+        # A route can't claim embeddings without a model to serve them.
+        self._supports_embeddings = bool(supports_embeddings) and bool(
+            self._embedding_model
+        )
+
         self.base_url = get_openrouter_api_base()
 
         # Get API key
@@ -65,14 +88,87 @@ class OpenRouterAdapter(OpenAIAdapter):
         capabilities = super().provider_capabilities()
         return replace(
             capabilities,
-            supports_embeddings=False,
-            embedding_model=None,
-            embedding_dim=None,
+            # Truthful, ROUTE-scoped embedding advertisement (#2288): only when
+            # an embedding model is actually configured for this route.
+            supports_embeddings=self._supports_embeddings,
+            embedding_model=self._embedding_model,
+            embedding_dim=self._embedding_dim,
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
                 "OpenRouter forwards requests to many upstream providers; per-model support is authoritative.",
                 "The adapter can send OpenAI-compatible tools, images, and response_format payloads.",
             ),
+        )
+
+    def embedding_space_id(self) -> Optional[str]:
+        """Model-keyed embedding space id for the meta-provider route (#2288).
+
+        OpenRouter is a meta-provider, so the coordinate space a vector lives
+        in is determined by the *upstream* model, not by "openrouter". Two
+        different upstream models reached through the same route are different
+        spaces; the SAME upstream model reached through OpenRouter or directly
+        is the same space. Key on the upstream model id (stripped of the
+        ``vendor/`` routing prefix) plus the served dimension — e.g.
+        ``qwen/qwen3-embedding-0.6b`` at 768 dims → ``qwen3-embedding-0.6b@768``.
+        Matryoshka truncation makes the same model at a different dimension a
+        different space, so the dim is part of the key. Returns ``None`` when no
+        embedding model / dimension is configured (nothing to stamp).
+        """
+        if not self._embedding_model or not self._embedding_dim:
+            return None
+        upstream = self._embedding_model.split("/", 1)[-1]
+        return f"{upstream}@{int(self._embedding_dim)}"
+
+    async def aembed(
+        self,
+        client: openai.AsyncOpenAI,
+        text: str,
+        *,
+        model: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Optional[List[float]]:
+        """Embed one text via OpenRouter's OpenAI-compatible ``/v1/embeddings``.
+
+        No hardcoded default model: a meta-provider embedding call requires an
+        explicit model (route config ``embedding_model`` or the ``model`` arg).
+        Forwards the configured ``dimensions`` for Matryoshka-capable models.
+        """
+        model = model or self._embedding_model
+        if not model:
+            raise ValueError(
+                "OpenRouter embeddings require an explicit embedding model "
+                "(set route-level 'embedding_model', e.g. "
+                "'qwen/qwen3-embedding-0.6b'); no default is assumed for a "
+                "meta-provider."
+            )
+        if dimensions is None:
+            dimensions = self._embedding_dim
+        return await super().aembed(
+            client, text, model=model, dimensions=dimensions, **kwargs
+        )
+
+    async def aembed_batch(
+        self,
+        client: openai.AsyncOpenAI,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        dimensions: Optional[int] = None,
+        **kwargs: Any,
+    ) -> List[Optional[List[float]]]:
+        model = model or self._embedding_model
+        if not model:
+            raise ValueError(
+                "OpenRouter embeddings require an explicit embedding model "
+                "(set route-level 'embedding_model', e.g. "
+                "'qwen/qwen3-embedding-0.6b'); no default is assumed for a "
+                "meta-provider."
+            )
+        if dimensions is None:
+            dimensions = self._embedding_dim
+        return await super().aembed_batch(
+            client, texts, model=model, dimensions=dimensions, **kwargs
         )
 
     def _get_client(self) -> openai.AsyncOpenAI:
@@ -264,6 +360,10 @@ class OpenRouterAdapter(OpenAIAdapter):
                     supports_vision=supports_vision,
                     supports_tools=supports_tools,
                     supports_streaming=True,  # OpenRouter streams every chat route
+                    # Carry the upstream substrate (e.g. ``anthropic`` from
+                    # ``anthropic/claude-3-opus``) so UI can facet the
+                    # meta-provider catalog without re-parsing ids (#2262).
+                    underlying_provider=underlying_provider,
                 ))
 
             logger.info(f"OpenRouter: discovered {len(models)} models")
@@ -275,6 +375,95 @@ class OpenRouterAdapter(OpenAIAdapter):
         except Exception as e:
             logger.warning(f"OpenRouter model discovery failed: {e}")
             return []
+
+    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+        """Discover OpenRouter embedding models from the DEDICATED endpoint (#2338).
+
+        OpenRouter serves embedding models from ``GET /api/v1/embeddings/models``,
+        NOT the generic ``/models`` list (which omits them entirely, and
+        ``?category=embedding`` returns empty). Verified live 2026-07-10: 26
+        models with metadata (gemini-embedding-2, pplx-embed-v1,
+        qwen3-embedding-8b, gte, e5, ...).
+
+        ``client`` is accepted for contract symmetry; OpenRouter's catalog is
+        fetched with this adapter's own bearer-token ``httpx.AsyncClient``.
+        """
+        from .embedding_discovery import EmbeddingModelInfo
+
+        if not self.api_key:
+            logger.warning(
+                "OPENROUTER_API_KEY not set, returning empty embedding model list"
+            )
+            return []
+
+        url = f"{self.base_url}/embeddings/models"
+        try:
+            async with httpx.AsyncClient() as http_client:
+                response = await http_client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=HTTP_TIMEOUT_DEFAULT,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPError as e:
+            logger.warning(f"OpenRouter embedding discovery HTTP error: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"OpenRouter embedding discovery failed: {e}")
+            return []
+
+        results: List[EmbeddingModelInfo] = []
+        for m in payload.get("data", []):
+            model_id = m.get("id") or m.get("canonical_slug") or ""
+            if not model_id:
+                continue
+            native_dim, dim_options = self._parse_openrouter_embedding_dims(m)
+            results.append(EmbeddingModelInfo(
+                id=model_id,
+                provider="openrouter",
+                display_name=m.get("name") or model_id,
+                native_dim=native_dim,
+                dim_options=dim_options,
+                context_limit=m.get("context_length"),
+                description=m.get("description"),
+            ))
+
+        logger.info(f"OpenRouter: discovered {len(results)} embedding models")
+        return results
+
+    @staticmethod
+    def _parse_openrouter_embedding_dims(model_data: Dict[str, Any]):
+        """Extract (native_dim, dim_options) from an OpenRouter embedding entry.
+
+        The dedicated endpoint reports dimensions in a few shapes across models:
+        a scalar ``output_dimensions`` / ``dimensions`` for fixed-size models,
+        and a ``[min, max]`` (or explicit list) Matryoshka range for MRL models.
+        Missing dims are fine — the set-time probe (#2326) proves the served
+        size before use.
+        """
+        arch = model_data.get("architecture") or {}
+        raw = (
+            model_data.get("output_dimensions")
+            or model_data.get("dimensions")
+            or arch.get("output_dimensions")
+            or arch.get("dimensions")
+        )
+        native_dim: Optional[int] = None
+        dim_options: List[int] = []
+        if isinstance(raw, (int, float)):
+            native_dim = int(raw)
+        elif isinstance(raw, dict):
+            hi = raw.get("max") or raw.get("default")
+            if hi is not None:
+                native_dim = int(hi)
+            dim_options = [int(v) for v in raw.values() if isinstance(v, (int, float))]
+        elif isinstance(raw, (list, tuple)) and raw:
+            nums = [int(v) for v in raw if isinstance(v, (int, float))]
+            if nums:
+                native_dim = max(nums)
+                dim_options = sorted(set(nums))
+        return native_dim, dim_options
 
     def _extract_tags(self, model_data: Dict[str, Any]) -> List[str]:
         """Extract tags from OpenRouter model data."""

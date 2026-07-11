@@ -106,7 +106,9 @@ async def get_spawn_children(request: Request):
         if child_agent is not None:
             wallet = getattr(child_agent, '_delegated_wallet', None)
             if wallet is not None:
-                allocation = getattr(wallet, '_allocation', None)
+                # DelegatedWallet exposes ``allocation`` (public); read that so
+                # live budget_spent/remaining reflect the child's real spend (#2113).
+                allocation = getattr(wallet, 'allocation', None)
                 if allocation is not None:
                     child_info["budget_spent"] = float(allocation.spent)
                     child_info["budget_remaining"] = float(allocation.remaining)

@@ -39,6 +39,7 @@
 
 import { UI } from './registry.js';
 import bus from './bus.js';
+import { storeGet, storeSet } from '../ui_state.mjs';
 
 /** @type {Map<string, object>} */
 const _panels = new Map();
@@ -300,13 +301,9 @@ export function _reset() {
 //   - `storageKey` localStorage key persisting the revealed state across reloads
 //                  (default on for both callers). `false`/`null` disables it.
 
-function _revealStorage() {
-    try {
-        return (typeof globalThis !== 'undefined' && globalThis.localStorage) || null;
-    } catch (_) {
-        return null;
-    }
-}
+// Reveal-state persistence delegates to the shared ui_state.mjs raw helpers
+// (#2298). The on-disk format ('1'/'0', with legacy 'true' still read) is
+// unchanged, so no stored `panels-revealed` state migrates or breaks.
 
 /**
  * Wire the collapsed/"Advanced" reveal behavior against an existing nav strip.
@@ -350,24 +347,14 @@ export function initReveal(opts = {}) {
 
     function _readPersisted() {
         if (!_key) return null;
-        const store = _revealStorage();
-        if (!store) return null;
-        try {
-            const v = store.getItem(_key);
-            if (v === null || v === undefined) return null;
-            return v === '1' || v === 'true';
-        } catch (_) {
-            return null;
-        }
+        const v = storeGet(_key);
+        if (v === null || v === undefined) return null;
+        return v === '1' || v === 'true';
     }
 
     function _writePersisted(val) {
         if (!_key) return;
-        const store = _revealStorage();
-        if (!store) return;
-        try {
-            store.setItem(_key, val ? '1' : '0');
-        } catch (_) { /* best-effort */ }
+        storeSet(_key, val ? '1' : '0');
     }
 
     function _applyRevealState() {

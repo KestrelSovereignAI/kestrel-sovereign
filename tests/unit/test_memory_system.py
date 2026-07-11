@@ -98,6 +98,59 @@ class TestEmotionalTagger:
             "friday", "saturday", "sunday"
         ]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", [
+        "I tightened the saddle.",
+        "This was made yesterday.",
+    ])
+    async def test_substrings_do_not_create_emotions(self, tagger, text):
+        result = await tagger.analyze(text, "user")
+        assert result.emotional_valence == 0.0
+        assert result.emotional_intensity == 0.0
+        assert result.emotional_categories == []
+
+    @pytest.mark.asyncio
+    async def test_negated_emotion_is_not_positive(self, tagger):
+        result = await tagger.analyze("I am not happy about this", "user")
+        assert "joy" not in result.emotional_categories
+        assert result.emotional_valence <= 0.0
+
+    @pytest.mark.asyncio
+    async def test_third_party_emotion_has_low_confidence_attribution(self, tagger):
+        result = await tagger.analyze("She was sad after the meeting", "user")
+        assert "sadness" in result.emotional_categories
+        assert result.emotional_subject == "other"
+        assert result.emotional_confidence <= 0.4
+
+    @pytest.mark.asyncio
+    async def test_contracted_first_person_emotion_is_attributed_to_user(self, tagger):
+        result = await tagger.analyze("I'm happy about the result", "user")
+        assert result.emotional_subject == "user"
+        assert result.emotional_confidence > 0.5
+
+    @pytest.mark.asyncio
+    async def test_no_importance_signal_starts_at_zero(self, tagger):
+        result = await tagger.analyze("The build completed.", "assistant")
+        assert result.importance == 0.0
+        assert result.importance_reasons == []
+        assert result.emotional_tag_version == "heuristic-v2"
+
+    @pytest.mark.asyncio
+    async def test_assistant_acknowledgement_is_not_a_second_life_event(self, tagger):
+        """#2333: user-event language in a reply must not duplicate importance."""
+        result = await tagger.analyze(
+            "I'm so sad that your sister died yesterday.", "assistant"
+        )
+
+        assert "sadness" in result.emotional_categories
+        assert "life_event" not in result.importance_reasons
+        assert result.importance <= 0.2
+
+    @pytest.mark.asyncio
+    async def test_second_person_assistant_affect_is_attributed_to_other(self, tagger):
+        result = await tagger.analyze("You sound devastated today.", "assistant")
+        assert result.emotional_subject == "other"
+
 
 class TestTemporalAnalyzer:
     """Tests for TemporalAnalyzer pattern detection."""
@@ -147,6 +200,90 @@ class TestTemporalAnalyzer:
             None
         )
         assert late_night_pattern is not None
+
+    @pytest.mark.asyncio
+    async def test_save_patterns_binds_datetime_not_isostring(self):
+        """save_patterns must bind datetime objects, not ISO strings.
+
+        Regression for frinz #525: asyncpg rejects an ISO-8601 string for a
+        TIMESTAMP column ("expected a datetime.date or datetime.datetime
+        instance, got 'str'"), so the created_at/updated_at binds must be
+        real datetime instances.
+        """
+        mock_db = MagicMock()
+        mock_db.fetchone = AsyncMock(return_value=None)  # force INSERT path
+        mock_db.execute = AsyncMock(return_value=1)
+        analyzer = TemporalAnalyzer(mock_db)
+
+        pattern = TemporalPattern(
+            id="p1",
+            agent_id="agent-1",
+            pattern_type="time_preference",
+            description="active late at night",
+            trigger_conditions={"time_of_day": "late_night"},
+            confidence=0.9,
+            observations=5,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        saved = await analyzer.save_patterns([pattern])
+        assert saved == 1
+
+        params = mock_db.execute.call_args.args[1]
+        created_at, updated_at = params[-2], params[-1]
+        assert isinstance(created_at, datetime)
+        assert isinstance(updated_at, datetime)
+        assert not any(isinstance(p, str) and "T" in p and ":" in p for p in params[-2:])
+
+    @pytest.mark.asyncio
+    async def test_save_patterns_update_binds_datetime(self):
+        """The UPDATE path must also bind a datetime, not an ISO string."""
+        mock_db = MagicMock()
+        mock_db.fetchone = AsyncMock(return_value=("p1",))  # force UPDATE path
+        mock_db.execute = AsyncMock(return_value=1)
+        analyzer = TemporalAnalyzer(mock_db)
+
+        pattern = TemporalPattern(
+            id="p1",
+            agent_id="agent-1",
+            pattern_type="time_preference",
+            description="active late at night",
+            trigger_conditions={},
+            confidence=0.9,
+            observations=5,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        await analyzer.save_patterns([pattern])
+        params = mock_db.execute.call_args.args[1]
+        # UPDATE binds (..., updated_at, id); updated_at is second-to-last.
+        assert isinstance(params[-2], datetime)
+
+    @pytest.mark.asyncio
+    async def test_get_patterns_coerces_both_backends(self):
+        """get_patterns must accept datetime (asyncpg) and str (SQLite) rows."""
+        pg_row = (
+            "p1", "agent-1", "time_preference", "desc",
+            "{}", 0.9, 5,
+            datetime(2026, 7, 10, 15, 24, tzinfo=timezone.utc),  # asyncpg
+            datetime(2026, 7, 10, 15, 24, tzinfo=timezone.utc),
+        )
+        sqlite_row = (
+            "p2", "agent-1", "time_preference", "desc",
+            "{}", 0.8, 3,
+            "2026-07-10T15:24:57.421502+00:00",  # SQLite ISO string
+            "2026-07-10T15:24:57.421502+00:00",
+        )
+        mock_db = MagicMock()
+        mock_db.fetchall = AsyncMock(return_value=[pg_row, sqlite_row])
+        analyzer = TemporalAnalyzer(mock_db)
+
+        patterns = await analyzer.get_patterns("agent-1")
+        assert len(patterns) == 2
+        assert all(isinstance(p.created_at, datetime) for p in patterns)
+        assert all(isinstance(p.updated_at, datetime) for p in patterns)
 
     def test_get_time_of_day(self):
         """Should correctly classify times."""
@@ -244,6 +381,20 @@ class TestMemoryRetriever:
         )
 
         assert score_match > score_mismatch
+
+    def test_emotional_mismatch_penalty_scales_with_confidence(self):
+        """#2333: weak attribution cannot receive a full opposite-mood penalty."""
+        retriever = MemoryRetriever(MagicMock())
+        context = MemoryMetadata(emotional_valence=0.8)
+
+        certain = retriever._score_emotional(
+            {"emotional_valence": -1.0, "emotional_confidence": 1.0}, context
+        )
+        uncertain = retriever._score_emotional(
+            {"emotional_valence": -1.0, "emotional_confidence": 0.01}, context
+        )
+
+        assert 0.3 <= certain < uncertain < 0.5
 
     def test_recency_score_decay(self):
         """Recent memories should score higher than old ones."""
@@ -373,6 +524,103 @@ class TestMemoryRetriever:
         assert "user" in roles, (
             f"Expected at least one user-role memory in results; got roles={roles!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_retrieve_rejects_fresh_unrelated_row_before_salience_rerank(self):
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [{
+            "role": "assistant",
+            "id": 9,
+            "content": "The garden gate is painted red.",
+            "metadata": {"importance": 1.0, "access_count": 50},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="database encryption",
+            agent_id="test-agent",
+            min_score=0.0,
+        )
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_relevant_old_important_row_clears_live_thresholds(self):
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [{
+            "role": "user",
+            "id": 8,
+            "content": "Sailing on Lake Michigan is my favorite hobby.",
+            "metadata": {"importance": 0.9, "decay_protected": True},
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="sailing hobby",
+            agent_id="test-agent",
+            min_score=0.3,
+            min_relevance=0.1,
+            read_only=True,
+        )
+
+        assert [row["id"] for row in results] == [8]
+
+    @pytest.mark.asyncio
+    async def test_salient_candidate_outside_recent_window_can_surface(self):
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [
+            {
+                "id": index,
+                "role": "assistant",
+                "content": f"routine status row {index}",
+                "metadata": {},
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+            for index in range(2, 1002)
+        ]
+        old_important = {
+            "id": 1,
+            "role": "user",
+            "content": "Sailing on Lake Michigan is my defining hobby.",
+            "metadata": {"importance": 0.95, "decay_protected": True},
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }
+        store.get_salient_memory_candidates.return_value = [old_important]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="sailing hobby",
+            agent_id="test-agent",
+            min_score=0.0,
+            read_only=True,
+        )
+
+        assert 1 in {row["id"] for row in results}
+        store.get_salient_memory_candidates.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_retrieve_rejects_orthogonal_vector_at_default_relevance(self):
+        store = AsyncMock()
+        store.embedding_service = MagicMock()
+        store.embedding_service.aembed = AsyncMock(return_value=[1.0, 0.0])
+        store.get_conversation_history.return_value = [{
+            "role": "assistant",
+            "id": 10,
+            "content": "an unrelated but important event",
+            "metadata": {"importance": 1.0},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }]
+        store.get_message_embeddings.return_value = {10: [0.0, 1.0]}
+
+        results = await MemoryRetriever(store).retrieve(
+            query="database encryption",
+            agent_id="test-agent",
+            min_score=0.0,
+        )
+
+        assert results == []
 
     @pytest.mark.asyncio
     async def test_retrieve_skips_exact_query_echo(self):
@@ -509,8 +757,120 @@ class TestMemoryRetriever:
             f"Wrapped-content echo should still be dropped after unwrap; "
             f"got ids={ids!r}"
         )
-        # Row 2 (biographical fact, not the query) MUST still surface.
-        assert 2 in ids, f"Expected row 2 to surface; got ids={ids!r}"
+        # Row 2 is not an echo, but it is also unrelated to this query. The
+        # independent relevance gate correctly rejects it instead of letting
+        # freshness/salience turn it into context noise.
+        assert 2 not in ids
+
+    @pytest.mark.asyncio
+    async def test_lexical_relevance_uses_candidate_tokenizer_for_punctuation(self):
+        """#2335: candidate generation and final gating share token rules."""
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [{
+            "role": "user",
+            "id": 1,
+            "content": "My cobalt axolotl is named Quasar-17.",
+            "metadata": {},
+            "created_at": "2025-01-15T10:00:00+00:00",
+        }]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="axolotl?", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert [row["id"] for row in results] == [1]
+        assert results[0]["relevance_score"] == pytest.approx(0.7)
+
+    @pytest.mark.asyncio
+    async def test_mixed_vector_corpus_merges_old_lexical_exact_match(self):
+        """#2334: non-empty kNN must not hide rows outside its profile."""
+        store = AsyncMock()
+        store.embedding_service = MagicMock()
+        store.embedding_service.aembed = AsyncMock(return_value=[1.0, 0.0])
+        store.embedding_service.current_profile_id.return_value = "active-profile"
+        store.get_conversation_history.return_value = [{
+            "role": "assistant", "id": 10, "content": "routine gardening",
+            "metadata": {}, "created_at": "2026-01-01T00:00:00+00:00",
+        }]
+        old_exact = {
+            "role": "user", "id": 1,
+            "content": "The ancient zirconium compass belongs north.",
+            "metadata": {"importance": 0.0},
+            "created_at": "2020-01-01T00:00:00+00:00",
+        }
+        store.get_lexical_memory_candidates.return_value = [old_exact]
+        retriever = MemoryRetriever(store)
+        retriever._semantic_similarities_via_vector_backend = AsyncMock(
+            return_value={"10": 0.50}
+        )
+
+        results = await retriever.retrieve(
+            query="zirconium", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert [row["id"] for row in results] == [1]
+        store.get_lexical_memory_candidates.assert_awaited_once_with(
+            "zirconium", limit=100,
+            excluded_embedding_profile_id="active-profile",
+        )
+
+    @pytest.mark.asyncio
+    async def test_vector_positive_floor_does_not_admit_unrelated_salience(self):
+        """#2334: dense-model positive cosine is not lexical relevance."""
+        store = AsyncMock()
+        store.embedding_service = MagicMock()
+        store.embedding_service.aembed = AsyncMock(return_value=[1.0, 0.0])
+        store.embedding_service.current_profile_id.return_value = "active-profile"
+        store.get_conversation_history.return_value = [{
+            "role": "assistant", "id": 10, "content": "routine gardening",
+            "metadata": {"importance": 1.0, "access_count": 100},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }]
+        store.get_lexical_memory_candidates.return_value = []
+        retriever = MemoryRetriever(store)
+        retriever._semantic_similarities_via_vector_backend = AsyncMock(
+            return_value={"10": 0.50}
+        )
+
+        results = await retriever.retrieve(
+            query="absentneedle", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_control_plane_rows_are_not_recalled_as_memory(self):
+        """Control transport and commands cannot become autobiographical facts."""
+        store = AsyncMock()
+        store.embedding_service = None
+        store.get_conversation_history.return_value = [
+            {
+                "role": "user", "id": 1, "content": "operator zirconium",
+                "metadata": {"operator_signal": True},
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "role": "user", "id": 2, "content": "!memory recall zirconium",
+                "metadata": {}, "created_at": "2026-01-01T00:00:01+00:00",
+            },
+            {
+                "role": "user", "id": 3,
+                "content": "My zirconium compass points north.",
+                "metadata": {}, "created_at": "2026-01-01T00:00:02+00:00",
+            },
+            {
+                "role": "user", "id": 4,
+                "content": "/r/zirconium is my favorite materials forum.",
+                "metadata": {}, "created_at": "2026-01-01T00:00:03+00:00",
+            },
+        ]
+
+        results = await MemoryRetriever(store).retrieve(
+            query="zirconium", agent_id="test-agent", min_score=0.0,
+        )
+
+        assert {row["id"] for row in results} == {3, 4}
 
 
 class TestDecayCalculation:
@@ -871,6 +1231,37 @@ class TestMemoryConsolidatorEpisodeCreation:
             f"Expected at least 1 episode from 5 unenriched messages, "
             f"got {len(episodes)}; skipped={skipped}"
         )
+
+    @pytest.mark.asyncio
+    async def test_automatic_episode_summary_contains_conversation_topics(self, _now):
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(5, date=date)
+        rows = [
+            (
+                row[0],
+                "We discussed sailing on Lake Michigan and repairing the sailboat",
+                row[2],
+                row[3],
+                row[4],
+            )
+            for row in rows
+        ]
+        mock_db = AsyncMock()
+        mock_db.fetchall.return_value = rows
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
+
+        episodes, skipped = await MemoryConsolidator(
+            db=mock_db, agent_id="did:test:agent1"
+        )._create_episodes()
+
+        assert not skipped
+        assert len(episodes) == 1
+        searchable_text = f"{episodes[0].title} {episodes[0].summary}".lower()
+        assert "sailing" in searchable_text
+        assert "michigan" in searchable_text
 
     @pytest.mark.asyncio
     async def test_enriched_high_importance_messages_produce_episodes(self, _now):

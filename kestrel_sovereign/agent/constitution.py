@@ -1097,6 +1097,33 @@ class ConstitutionMixin:
                         constitution_text = f"{constitution_text}\n\n--- APP AMENDMENTS ---\n{amendments.strip()}"
                 except Exception:
                     pass
+            # Append this spawned child's mandate constraints (#2225) so its
+            # behavioral_rules / restrictions reach the model in the governing
+            # constitution — the anchored base is left untouched (no hash change;
+            # mirrors the runtime APP AMENDMENTS append above). ``spawn_mandate``
+            # is attached durably on every boot by #2137's reload path; a
+            # restriction only ever tightens, so this cannot weaken the base.
+            try:
+                from kestrel_sovereign.spawn.scoped_constitution import (
+                    render_mandate_constitution_block,
+                )
+
+                block = render_mandate_constitution_block(
+                    getattr(self, "spawn_mandate", None)
+                )
+                if block:
+                    constitution_text = f"{constitution_text}\n\n{block}"
+            except Exception:
+                # Rendering coerces to str and shouldn't raise on accepted
+                # values; if it somehow does, surface it loudly rather than
+                # silently ship a governing constitution missing the mandate's
+                # restrictions (the control this adds). Don't abort the whole
+                # constitution — that would break the prompt entirely.
+                logging.exception(
+                    "Failed to render spawn-mandate constraints into governing "
+                    "constitution for %s; the mandate block is MISSING from this "
+                    "render.", getattr(self, "agent_id", "?"),
+                )
             return constitution_text
         except Exception as e:
             return f"Error: Could not retrieve constitution for hash {constitution_hash}. Reason: {e}"

@@ -120,6 +120,13 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # SchedulerFeature._run_github_pr_watch. Per-watch config (repo, pr,
     # triggers, notify) travels in the scheduled task's args_json.
     ("github_pr_watch", SignalMode.ACTION, frozenset()),
+    # Ecosystem discovery watcher (#2281). ACTION — no LLM cost in the
+    # scheduler handler itself beyond the delegated discovery tool. It
+    # fingerprints stale-work / red-CI findings and ENQUEUES one
+    # ecosystem.discovery_findings COGNITION signal only when actionable
+    # findings are new, changed, or just resolved. The COGNITION wake
+    # comes from that downstream signal, not from the watch task itself.
+    ("ecosystem_discovery_watch", SignalMode.ACTION, frozenset()),
     # Bootstrap watchdog (#378). ACTION — no LLM cost. Checks whether a
     # never-contacted agent is still bootstrap_state=pending past the timeout
     # and escalates status to stale_bootstrap.

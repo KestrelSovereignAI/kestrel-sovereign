@@ -218,6 +218,29 @@ test('same dedupe_signature updates one bubble in place (no duplicates from vola
 });
 
 
+test('restart status shows requester name when payload resolves it', () => {
+    resetPane();
+    chatModule.handleRestartStatus(basePayload({
+        requested_by_agent_name: 'Emma',
+    }));
+
+    const bubble = pane.element.querySelectorAll('.restart-status-message')[0];
+    assert.match(bubble._innerHTML, /Requested by/);
+    assert.match(bubble._innerHTML, /Emma/);
+    assert.doesNotMatch(bubble._innerHTML, /did:test:emma/);
+});
+
+
+test('restart status falls back to requester DID for older or unresolved payloads', () => {
+    resetPane();
+    chatModule.handleRestartStatus(basePayload());
+
+    const bubble = pane.element.querySelectorAll('.restart-status-message')[0];
+    assert.match(bubble._innerHTML, /Requested by/);
+    assert.match(bubble._innerHTML, /did:test:emma/);
+});
+
+
 test('stream-boundary: status mid-stream finalizes current bubble and arms a fresh one below', () => {
     resetPane();
     const streamingBubble = makeNode();

@@ -375,6 +375,17 @@ class SignalDispatcher:
         (scheduler, heartbeat). Always returns a `SignalResult` — failures
         are encoded as `Status.FAILED` with `error` set, never raised."""
         start = time.monotonic()
+        # Publish the in-flight signal for the duration of this dispatch so
+        # code running inside handlers/turns (e.g. the Talon coordinator's
+        # orchestrator/workflow correlation stamping, kestrel-talon#53) can
+        # observe the envelope that drove it. Per-task ContextVar —
+        # concurrent enqueue_signal dispatches stay isolated.
+        from kestrel_sovereign.signals.context import (
+            reset_current_signal,
+            set_current_signal,
+        )
+
+        ctx_token = set_current_signal(signal)
         try:
             return await self._run(signal, start)
         except Exception as e:
@@ -393,6 +404,8 @@ class SignalDispatcher:
                 duration_ms=int((time.monotonic() - start) * 1000),
                 error=f"{type(e).__name__}: {e}",
             )
+        finally:
+            reset_current_signal(ctx_token)
 
     async def enqueue_signal(self, signal: Signal) -> SignalHandle:
         """Returns immediately with a tracked handle. The dispatch runs as

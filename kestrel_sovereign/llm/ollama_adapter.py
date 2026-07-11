@@ -44,6 +44,7 @@ except ImportError:
 
 if TYPE_CHECKING:
     import ollama
+    from .embedding_discovery import EmbeddingModelInfo
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,38 @@ class OllamaAdapter(LLMAdapter):
     - Vision models with base64 images
     """
 
+    DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
+    DEFAULT_EMBEDDING_DIM = 768
+
+    def __init__(
+        self,
+        *,
+        embedding_model: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
+    ):
+        """Ollama is a local runtime; embeddings default to nomic-embed-text.
+
+        A route may pin a different open-weight model (#2290) — e.g.
+        ``qwen3-embedding-0.6b`` served locally to share a coordinate space
+        with the same weights served in the cloud. ``embedding_dim`` is
+        forwarded as the ``dimensions`` param for Matryoshka-capable models and
+        keys the model-identity embedding space (``<model>@<dim>``).
+        """
+        self._embedding_model = (
+            str(embedding_model) if embedding_model else self.DEFAULT_EMBEDDING_MODEL
+        )
+        self._embedding_dim = (
+            int(embedding_dim) if embedding_dim else self.DEFAULT_EMBEDDING_DIM
+        )
+        # Only forward the ``dimensions`` param when a route explicitly pinned an
+        # embedding model/dim (#2290). The bare default (nomic-embed-text) is a
+        # fixed-768 model with no Matryoshka truncation, and the native
+        # ``client.embed`` should not receive an unrequested ``dimensions``
+        # kwarg — so an unconfigured adapter behaves exactly as before.
+        self._embedding_configured = (
+            embedding_model is not None or embedding_dim is not None
+        )
+
     def provider_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             supports_tools=True,
@@ -98,8 +131,8 @@ class OllamaAdapter(LLMAdapter):
             structured_output_mode=StructuredOutputMode.SCHEMA_FORMAT,
             tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
             vision_input_mode=VisionInputMode.OLLAMA_IMAGES,
-            embedding_model="nomic-embed-text",
-            embedding_dim=768,
+            embedding_model=self._embedding_model,
+            embedding_dim=self._embedding_dim,
             raw_operations=("chat", "generate", "embed", "show", "list", "ps", "pull"),
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
@@ -213,16 +246,55 @@ class OllamaAdapter(LLMAdapter):
         except httpx.HTTPError:
             return False
 
+    def embedding_space_id(self) -> Optional[str]:
+        """Model-identity embedding-space key for this local route (#2290).
+
+        Keyed on the served open-weight model + dimension (``<model>@<dim>``),
+        NOT on ``"ollama"``. This is what lets a locally-served open-weight
+        model (e.g. ``qwen3-embedding-0.6b`` at 768 dims →
+        ``qwen3-embedding-0.6b@768``) share a coordinate space with the SAME
+        weights served in the cloud (OpenRouter emits the identical key).
+        Matryoshka truncation makes the same model at a different dimension a
+        different space, so the dim is part of the key. Returns ``None`` when no
+        embedding model / dimension is configured (nothing to stamp).
+        """
+        if not self._embedding_model or not self._embedding_dim:
+            return None
+        upstream = self._embedding_model.split("/", 1)[-1]
+        return f"{upstream}@{int(self._embedding_dim)}"
+
+    def _embed_kwargs(self, dimensions: Optional[int]) -> Dict[str, Any]:
+        """Build optional embed kwargs, forwarding ``dimensions`` for Matryoshka.
+
+        Ollama's OpenAI-compatible ``/v1/embeddings`` honors ``dimensions`` for
+        MRL-capable models (qwen3-embedding: 32 → native). Fall back to the
+        route-configured dim so a pinned local member truncates to the SAME
+        dimension its cloud sibling does. Only sent when known, so models that
+        don't support truncation are unaffected.
+        """
+        if dimensions is not None:
+            dim = dimensions
+        elif self._embedding_configured:
+            dim = self._embedding_dim
+        else:
+            dim = None
+        return {"dimensions": int(dim)} if dim else {}
+
     async def aembed(
         self,
         client: "ollama.AsyncClient",
         text: str,
         *,
         model: Optional[str] = None,
+        dimensions: Optional[int] = None,
         **kwargs: Any,
     ) -> Optional[List[float]]:
         try:
-            response = await client.embed(model=model or "nomic-embed-text", input=text)
+            response = await client.embed(
+                model=model or self._embedding_model,
+                input=text,
+                **self._embed_kwargs(dimensions),
+            )
         except Exception as exc:
             logger.warning("Ollama embedding failed: %s", exc)
             return None
@@ -235,12 +307,17 @@ class OllamaAdapter(LLMAdapter):
         texts: List[str],
         *,
         model: Optional[str] = None,
+        dimensions: Optional[int] = None,
         **kwargs: Any,
     ) -> List[Optional[List[float]]]:
         if not texts:
             return []
         try:
-            response = await client.embed(model=model or "nomic-embed-text", input=texts)
+            response = await client.embed(
+                model=model or self._embedding_model,
+                input=texts,
+                **self._embed_kwargs(dimensions),
+            )
         except Exception as exc:
             logger.warning("Ollama batch embedding failed: %s", exc)
             return [None] * len(texts)
@@ -861,6 +938,89 @@ class OllamaAdapter(LLMAdapter):
             return []
         except Exception as e:
             logger.error(f"Failed to list Ollama models: {e}", exc_info=True)
+            return []
+
+    async def _check_embedding_support(
+        self, client: "ollama.AsyncClient", model_name: str
+    ) -> bool:
+        """Check if a local model serves embeddings via /api/show capabilities.
+
+        Ollama reports per-model ``capabilities`` (``/api/show``); an embedding
+        model lists ``"embedding"`` there (verified live 2026-07-10 for
+        nomic-embed-text, qwen3-embedding:*). Trusting that provider signal
+        replaces the name-substring heuristic in :meth:`list_models`, so a
+        differently-named embedding model is still discovered.
+        """
+        try:
+            info = await client.show(model_name)
+            if isinstance(info, dict):
+                capabilities = info.get("capabilities") or []
+            else:
+                capabilities = getattr(info, "capabilities", None) or []
+            return "embedding" in capabilities
+        except Exception as e:
+            logger.warning(f"Could not check embedding support for {model_name}: {e}")
+            return False
+
+    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+        """Discover locally-available embedding models (#2338).
+
+        ``/api/tags`` lists installed models, ``/api/show`` reports each model's
+        ``capabilities``; we keep only those advertising ``"embedding"``. This
+        is the local counterpart to OpenRouter's dedicated embedding endpoint,
+        and makes local models (nomic-embed-text, qwen3-embedding:*)
+        discoverable without a config pin.
+
+        Uses the caller-provided ``client`` (built during provider init from the
+        route's ``host``/``OLLAMA_HOST``) so discovery queries the SAME daemon
+        the route serves from. Only falls back to a default ``AsyncClient()``
+        when no client was passed — otherwise a route pointed at a remote or
+        non-default Ollama would be silently probed against localhost (#2338).
+        """
+        from .embedding_discovery import EmbeddingModelInfo
+
+        if not OLLAMA_AVAILABLE:
+            logger.warning(
+                "Ollama library not available, returning empty embedding model list"
+            )
+            return []
+
+        try:
+            if client is None:
+                client = ollama.AsyncClient()
+            response = await client.list()
+
+            if hasattr(response, "models"):
+                raw_models = response.models
+            elif isinstance(response, dict):
+                raw_models = response.get("models", [])
+            else:
+                raw_models = []
+
+            results: List[EmbeddingModelInfo] = []
+            for model_data in raw_models:
+                if hasattr(model_data, "model"):
+                    model_name = model_data.model or ""
+                elif hasattr(model_data, "name"):
+                    model_name = model_data.name or ""
+                elif isinstance(model_data, dict):
+                    model_name = model_data.get("model", "") or model_data.get("name", "")
+                else:
+                    continue
+                if not model_name:
+                    continue
+                if not await self._check_embedding_support(client, model_name):
+                    continue
+                results.append(EmbeddingModelInfo(
+                    id=model_name,
+                    provider="ollama",
+                    display_name=model_name.split(":")[0],
+                ))
+
+            logger.info(f"Ollama: discovered {len(results)} embedding models")
+            return results
+        except Exception as e:
+            logger.error(f"Failed to list Ollama embedding models: {e}", exc_info=True)
             return []
 
     # ---- Provider metadata (SDK 0.6.0) -------------------------------------

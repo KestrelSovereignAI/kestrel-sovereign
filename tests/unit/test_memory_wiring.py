@@ -91,6 +91,7 @@ class TestRetrieveTriggersAccessUpdate:
             query="sunny weather",
             agent_id="test-agent",
             min_score=0.0,  # don't filter anything out
+            min_relevance=0.0,
             limit=2,
         )
 
@@ -125,6 +126,7 @@ class TestRetrieveTriggersAccessUpdate:
             query="sunny weather",
             agent_id="test-agent",
             min_score=0.0,
+            min_relevance=0.0,
             limit=2,
             read_only=True,
         )
@@ -156,6 +158,7 @@ class TestRetrieveTriggersAccessUpdate:
             query="sunny weather",
             agent_id="test-agent",
             min_score=0.0,
+            min_relevance=0.0,
             limit=1,
         )
         await started.wait()

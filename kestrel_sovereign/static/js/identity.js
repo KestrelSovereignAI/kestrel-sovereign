@@ -15,6 +15,14 @@ import { generateIdenticon } from './identicon.js';
 // the sidebar-specific hooks (agent pinning, #714 auto-load, chat-state
 // coordination on delete) through the component's config.
 import { mountConversationsPane } from './conversations.js';
+// #2278: the standalone agents pane is now a `mountAgentList` consumer — one
+// list orchestrator (adapter fetch / render / selection / per-card
+// `agent-card-actions` slot / active highlight) shared with embedding hosts
+// (Frinz's companion list). identity.js keeps NO bespoke agent loop; it wires
+// the console-specific policy (demo banner, demo-misconfig-gated auto-select,
+// standalone conversations-pane refresh) through the component's config hooks.
+import { mountAgentListPane, createDefaultAgentAdapter } from './agent_list.js';
+import { openCreateAgentDialog } from './new_agent_dialog.js';
 // Voice mounts via the slot registry now (#2038, ticket 04); the only remaining
 // named coupling is the model-selector ownership lock, deferred to ticket 09.
 import { reapplyActiveSelectorLock } from './voice/ui.js';
@@ -27,6 +35,10 @@ import { loadFeatureUIContributions } from './ui-ext/feature-loader.js';
 // path reused by the embeddable mountPanels host so there is a single activation
 // path (`Panels.activate`) for standalone and embed.
 import { registerCorePanels, makePanelActivator, attachDelegatedNav } from './ui-ext/mount-panels.js';
+// #2298: shared best-effort UI view-state persistence. The selected-agent
+// restore (below) and the privacy-mode cloud-model stash delegate here instead
+// of hand-rolling localStorage.
+import { uiStateGet, uiStateSet, storeGet, storeSet, storeRemove, UI_STATE_PREFIX } from './ui_state.mjs';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -34,6 +46,32 @@ import { registerCorePanels, makePanelActivator, attachDelegatedNav } from './ui
 
 // Local reference to current agent ID (for use in loadIdentity title update)
 let currentAgentId = null;
+
+// #2298: persist the multi-agent selection across a hard refresh. The value is
+// a validated soft preference — restored only when the agent still exists and
+// is online in the freshly-fetched /api/agents list (see handleAgentsLoaded);
+// a stale value never hard-fails, it just falls back to first-online.
+const SELECTED_AGENT_KEY = `${UI_STATE_PREFIX}selected-agent`;
+
+// #2298: decide which agent boot should auto-select, given the freshly-fetched
+// list. Pure so the restore contract is unit-testable in isolation. Precedence,
+// each candidate validated as still-online (a stale value never hard-fails):
+//   1. `?agent=` URL pin (embed/agent-mode) — keeps precedence over persisted;
+//   2. the persisted selection from a prior session (soft preference);
+//   3. current behavior — the first online agent.
+// Returns the chosen agent name, or null when the list has no online agent.
+export function pickInitialAgent({ items = [], urlAgent = null, persisted = null } = {}) {
+    const isOnline = (name) =>
+        !!name && items.some((i) => i.name === name && i.status !== 'offline');
+    if (urlAgent) {
+        // URL pin wins outright; the persisted value is ignored when it's set.
+        if (isOnline(urlAgent)) return urlAgent;
+    } else if (isOnline(persisted)) {
+        return persisted;
+    }
+    const firstOnline = items.find((i) => i.status !== 'offline');
+    return firstOnline ? firstOnline.name : null;
+}
 
 export function initAgentFromUrl() {
     const params = new URLSearchParams(window.location.search);
@@ -145,9 +183,10 @@ export function initNavigation() {
     // doesn't open onto a vanished panel.
     promoteActiveTabIfNeeded();
 
-    // #2229: the standalone console is chat-first, exactly like every embed.
-    // The tab strip starts hidden (index.html) and the chat-header "Advanced"
-    // toggle reveals the capability-gated strip through the SAME reveal
+    // #2229/#2350: the standalone console is chat-first, exactly like every
+    // embed. The tab strip starts hidden (index.html) and the app-level
+    // "Advanced" toggle (top nav bar `.nav-status`, frinz-placement parity per
+    // #2350) reveals the capability-gated strip through the SAME reveal
     // implementation the embeddable mountPanels host uses (Panels.initReveal).
     // Collapsed = chat only; revealing shows the gated strip (Chat first);
     // collapsing returns to the Chat tab; the toggle hides when only one tab is
@@ -155,7 +194,14 @@ export function initNavigation() {
     // revealed state persists across reloads so an operator who lives in
     // Advanced isn't re-collapsed every load.
     const advancedToggle = document.getElementById('advanced-toggle-btn');
-    if (navEl && advancedToggle) {
+    // Chat-first reveal only makes sense when there IS a chat to be first:
+    // a `chat`-disabled console is an ALL-PANELS console. Before #2350 this
+    // fell out structurally (the toggle lived inside #panel-chat and was
+    // pruned with it); now the toggle survives in the app nav bar, so gate
+    // it explicitly — hide the toggle and show the strip permanently
+    // (codex P2 on #2355, same lockout class as #2231's P2).
+    const chatEnabled = API.hasCapability('chat');
+    if (navEl && advancedToggle && chatEnabled) {
         Panels.initReveal({
             navEl,
             activate: activatePanel,
@@ -163,11 +209,10 @@ export function initNavigation() {
             storageKey: 'kestrel:console-advanced',
         });
     } else if (navEl) {
-        // A host that disables the `chat` capability had #panel-chat pruned —
-        // and the Advanced toggle lives in the chat header, so it went with it.
-        // A chat-less console is all-panels: show the strip permanently instead
-        // of leaving every remaining panel unreachable behind a hidden nav with
-        // no surviving reveal control (codex P2 on #2231).
+        // All-panels fallback: chat disabled, or a custom build dropped the
+        // toggle. Show the strip permanently instead of leaving every panel
+        // unreachable behind a hidden nav (codex P2 on #2231).
+        if (advancedToggle) advancedToggle.style.display = 'none';
         navEl.style.display = '';
     }
 
@@ -676,8 +721,8 @@ window.showPrivacySelector = function() {
                     // Save current cloud selection before switching to local
                     if (result.allows_cloud_llm === false) {
                         const current = window._sharedModelSelector.getSelection();
-                        localStorage.setItem('kestrel_saved_cloud_provider', current.provider);
-                        localStorage.setItem('kestrel_saved_cloud_model', current.model);
+                        storeSet('kestrel_saved_cloud_provider', current.provider);
+                        storeSet('kestrel_saved_cloud_model', current.model);
                     }
                     window._sharedModelSelector.setSelection(
                         result.model_switched.vendor,
@@ -686,13 +731,13 @@ window.showPrivacySelector = function() {
                     Toast.success(`Privacy: ${appliedLabel} — switched to ${result.model_switched.vendor} (local only)`);
                 } else if (result.allows_cloud_llm !== false) {
                     // Switching back to cloud-allowing mode — restore saved cloud selection
-                    const savedProvider = localStorage.getItem('kestrel_saved_cloud_provider');
-                    const savedModel = localStorage.getItem('kestrel_saved_cloud_model');
+                    const savedProvider = storeGet('kestrel_saved_cloud_provider');
+                    const savedModel = storeGet('kestrel_saved_cloud_model');
                     if (savedProvider && savedModel && window._sharedModelSelector) {
                         window._sharedModelSelector.setSelection(savedProvider, savedModel);
                         Toast.success(`Privacy: ${appliedLabel} — restored ${savedProvider} model`);
-                        localStorage.removeItem('kestrel_saved_cloud_provider');
-                        localStorage.removeItem('kestrel_saved_cloud_model');
+                        storeRemove('kestrel_saved_cloud_provider');
+                        storeRemove('kestrel_saved_cloud_model');
                     } else {
                         Toast.success(`Privacy mode set to ${appliedLabel}`);
                     }
@@ -763,6 +808,82 @@ function _renderHybridIdentityRow(identity) {
 // ============================================================================
 
 let selectedAgentName = null;
+// #2278 / #2279: the mounted `mountAgentListPane` handle + its default
+// `/api/agents` adapter. Mounted once (into `#agents-pane`) on the first
+// `loadAgents`; later calls just `refresh()`. #2279 wraps the shared list in the
+// conversations-pane chrome (chevron collapse, drag-resize + persistence) and a
+// component-owned "+ New" header action. The adapter is retained so `onLoaded`
+// can read the response `mode` / `server_demo_mode` back for the demo banner +
+// misconfig gate. The inner `mountAgentList` handle is `agentListPaneHandle.list`.
+let agentListHandle = null;
+let agentListPaneHandle = null;
+let agentListDefaultAdapter = null;
+
+// The standalone console's new-agent affordance (#2279 — same-everywhere rule,
+// the console gains an affordance it lacked). #2351: the pane's "+ New" opens a
+// Create Agent dialog that POSTs to `/api/agents` (the multi-agent manager's
+// native top-level inception). Creating a parentless agent is a DIFFERENT intent
+// than Spawn (which creates a CHILD of an existing parent), so the Spawn tab —
+// when its feature-contributed panel is installed — is offered as a SECONDARY
+// link inside the dialog rather than being the whole affordance.
+function goToSpawnTab() {
+    const spawnTab = document.querySelector('.nav-tab[data-panel="spawn"]');
+    if (spawnTab) { spawnTab.click(); return true; }
+    return false;
+}
+
+function openNewAgentFlow() {
+    const spawnAvailable = !!document.querySelector('.nav-tab[data-panel="spawn"]');
+    // FAIL CLOSED until the server has classified itself (codex P1 round 2):
+    // before the first /api/agents payload parses — or forever, if it keeps
+    // failing — the adapter still holds fail-OPEN defaults (multi_agent,
+    // serverDemoMode false), which would bypass both gates below.
+    if (!agentListDefaultAdapter || !agentListDefaultAdapter.classificationLoaded) {
+        Toast.info('Agent list is still loading — try again in a moment.');
+        return;
+    }
+    // POST /api/agents must actually exist AND work on this host: standalone
+    // consoles 400 it (no manager) and the subprocess host doesn't route it at
+    // all (405) — the server advertises `can_create_agents` and the client
+    // treats absence as false (codex P2 rounds 1-2). Those consoles route to
+    // the legacy Spawn flow instead.
+    if (!agentListDefaultAdapter.canCreateAgents) {
+        if (!goToSpawnTab()) Toast.info('Creating a new agent requires the Spawn feature.');
+        return;
+    }
+    // Demo rail (#868, codex P1): AgentManager.create_agent mints a LIVE
+    // (non-demo-scoped) agent, and on a demo-classified server the dialog's
+    // post-create select() would install a host-agent prefix targeting it —
+    // the exact routing precondition the misconfig gate exists to refuse.
+    // Creation is an operator action for real servers; refuse it here.
+    if (agentListDefaultAdapter && agentListDefaultAdapter.serverDemoMode) {
+        Toast.warning('This server is in demo mode — creating live agents is disabled.');
+        return;
+    }
+    openCreateAgentDialog({
+        modal: Modal,
+        api: API,
+        toast: Toast,
+        spawnAvailable,
+        onSpawn: () => goToSpawnTab(),
+        onCreated: async (name) => {
+            // Refresh the list so the freshly-minted agent appears, then select
+            // it — the full product wiring runs through the component's select().
+            try {
+                if (agentListHandle) await agentListHandle.refresh();
+            } catch (_) { /* best-effort refresh */ }
+            try {
+                // Defense in depth for the demo rail: if the refresh above
+                // reclassified the server into misconfig (demo server + live
+                // agent — which a freshly-minted agent IS), selection must
+                // honor the same refusal handleAgentsLoaded applies.
+                if (agentListDefaultAdapter && agentListDefaultAdapter.serverDemoMode) return;
+                if (agentListHandle) agentListHandle.select(name);
+                else if (window.selectAgent) await window.selectAgent(name);
+            } catch (_) { /* selection is best-effort */ }
+        },
+    });
+}
 
 /**
  * Render the DEMO MODE banner from the /api/agents response (#868).
@@ -811,6 +932,61 @@ function renderDemoModeBanner({ serverDemoMode, agents, isStandalone }) {
     document.body.insertBefore(banner, document.body.firstChild);
 }
 
+// Console-specific policy fired after each agent-list load (#2278). The shared
+// component owns fetch/render/selection/slot; this keeps the demo banner, the
+// demo-misconfig auto-select gate, and the standalone conversations-pane refresh
+// host-side — reading the response `mode` / `server_demo_mode` back off the
+// retained default adapter.
+function handleAgentsLoaded(items) {
+    const isStandalone = agentListDefaultAdapter
+        && agentListDefaultAdapter.mode === 'standalone';
+    const serverDemoMode = !!(agentListDefaultAdapter && agentListDefaultAdapter.serverDemoMode);
+    const rawAgents = items.map((i) => i.raw).filter(Boolean);
+
+    // DEMO MODE banner (#868) — visible warning so an operator notices when a
+    // demo server has somehow mounted a live agent.
+    renderDemoModeBanner({
+        serverDemoMode,
+        agents: rawAgents,
+        isStandalone,
+    });
+
+    // Demo-server misconfig (#868): a server in demo_mode that mounted any
+    // non-demo agent is the routing precondition that wiped Meridian. The page
+    // MUST refuse to install a host-agent prefix, otherwise every subsequent
+    // click still routes to whichever agent auto-select would have picked.
+    const hasLiveAgent = serverDemoMode && rawAgents.some((a) => a.is_demo !== true);
+
+    // Auto-select an agent only in multi_agent mode (not standalone) and never
+    // when the demo server is in misconfig — the banner explicitly tells the
+    // operator the auto-select is disabled. Driven through the component's
+    // selection path (setHostAgent → onSelect → window.selectAgent).
+    //
+    // #2298: selection precedence, each candidate validated as still-online in
+    // the freshly-fetched list (a stale value never hard-fails):
+    //   1. the `?agent=` URL pin (embed/agent-mode) — keeps precedence;
+    //   2. the persisted selection from a prior session (soft preference);
+    //   3. current behavior — the first online agent.
+    if (!selectedAgentName && !isStandalone && !hasLiveAgent && agentListHandle) {
+        const target = pickInitialAgent({
+            items,
+            urlAgent: currentAgentId,
+            persisted: uiStateGet(SELECTED_AGENT_KEY, null),
+        });
+        if (target) agentListHandle.select(target);
+    }
+
+    // Standalone mode: mount + target the conversations pane so its list
+    // populates against the un-prefixed routes (selectAgent installs a
+    // host-agent URL prefix that only exists in multi_agent routing — using it
+    // in standalone 404s /api/conversations and /agent/invoke). #2216: this does
+    // NOT reveal the pane — visibility is the component's persisted collapse
+    // state (default hidden). Skip in misconfig — the list is not safe to target.
+    if (isStandalone && items.length > 0 && !hasLiveAgent && API.hasCapability('conversations')) {
+        try { refreshConversationsPane(); } catch (_) { /* best-effort */ }
+    }
+}
+
 export async function loadAgents() {
     // #879: hosts that aren't a multi_agent (e.g. Frinz) don't have an
     // /api/agents endpoint — skip the fetch entirely and hide the agents
@@ -818,126 +994,64 @@ export async function loadAgents() {
     if (!API.hasCapability('multi_agent')) {
         const pane = document.getElementById('agents-pane');
         if (pane) pane.style.display = 'none';
+        // No agents pane → hide its nav reopen trigger too (#2279), so a host
+        // without the multi_agent flow doesn't show a dead toggle button.
+        const trigger = document.getElementById('agents-toggle-btn');
+        if (trigger) trigger.style.display = 'none';
         return;
     }
-    try {
-        const data = await API.getAgents();
-        const agents = data.agents || [];
-        const isStandalone = data.mode === 'standalone';
+    // #2279: mount the shared list wrapped in the pane chrome. The container is
+    // the static `#agents-pane` (whose `.pane-header` / `.collapse-btn` /
+    // `#agents-list` body / `.resize-handle` the pane ADOPTS); the pane owns the
+    // chevron collapse, drag-resize + persistence, and the "+ New" action.
+    const container = document.getElementById('agents-pane');
+    if (!container) return;
 
-        // DEMO MODE banner (#868) — visible warning so an operator notices
-        // when a demo server has somehow mounted a live agent.  Demo mode
-        // is determined server-side at startup (every loaded agent is
-        // demo-scoped); the banner names the agent the page would target.
-        renderDemoModeBanner({
-            serverDemoMode: !!data.server_demo_mode,
-            agents,
-            isStandalone,
+    // Mount the shared pane once; later loadAgents() calls just refresh.
+    // The default `/api/agents` adapter + default console-row renderer make the
+    // standalone console behavior-identical to the pre-#2278 hand-rolled loop.
+    if (!agentListPaneHandle) {
+        agentListDefaultAdapter = createDefaultAgentAdapter(API);
+        agentListPaneHandle = mountAgentListPane(container, {
+            api: API,
+            adapter: agentListDefaultAdapter,
+            storageKey: 'kestrel:agents-pane',
+            title: 'Agents',
+            selectedName: selectedAgentName,
+            // Per-agent thinking pulse is driven by `state.waitingAgents` (the
+            // Set sendMessage adds to on dispatch); the stop control aborts that
+            // exact agent's stream via stopAgent().
+            isThinking: (name) => state.waitingAgents.has(name),
+            onStop: (name) => stopAgent(name),
+            // Selecting a card runs the full product wiring (capability refresh,
+            // chat mount, agent:switch bus emit); the component already pinned
+            // routing via setHostAgent before this fires.
+            onSelect: (item) => window.selectAgent(item.name),
+            onLoaded: (items) => handleAgentsLoaded(items),
+            // #2279: the console GAINS a new-agent affordance via the pane's
+            // component-owned "+ New" header action, routed to the Spawn flow.
+            onNew: () => openNewAgentFlow(),
+            // Auto-select is host policy here (demo-misconfig gated); drive it
+            // from onLoaded rather than the component's blanket autoSelectFirst.
+            autoLoad: false,
         });
-
-        const container = document.getElementById('agents-list');
-        if (agents.length === 0) {
-            container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No agents available</p>';
-            return;
-        }
-
-        container.innerHTML = '';
-        for (const agent of agents) {
-            const isOnline = agent.status !== 'offline';
-            const isThinking = state.waitingAgents.has(agent.name);
-            const item = document.createElement('div');
-            item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}${isThinking ? ' agent-thinking' : ''}`;
-            // Always carry the real agent name — thinking-dot / stop-button
-            // lookups (refreshAgentThinkingDot, etc.) depend on it in every mode.
-            // The voice controls key off a separate data-voice-agent-key.
-            item.dataset.agentName = agent.name;
-
-            // Only enable multi_agent agent selection in non-standalone mode
-            if (isOnline && !isStandalone) {
-                item.addEventListener('click', () => window.selectAgent(agent.name));
-            }
-
-            // Per-agent thinking pulse + stop control. Pulse is driven
-            // by `state.waitingAgents` (the same Set sendMessage adds
-            // to on dispatch and removes from in finally). The stop
-            // button is rendered always but only visible while
-            // `.agent-thinking` is on (CSS gate); a click reaches the
-            // exact agent's /stop endpoint via stopAgent().
-            item.innerHTML = `
-                <span class="agent-status-dot ${isOnline ? 'online' : 'offline'}"></span>
-                <span class="agent-thinking-dot" title="${escapeHtml(agent.name || 'Agent')} is thinking"></span>
-                <div class="agent-info">
-                    <div class="agent-name">${escapeHtml(agent.name || 'Unnamed Agent')}</div>
-                    <div class="agent-description">${escapeHtml(agent.description || 'No description')}</div>
-                </div>
-                <button class="agent-stop-btn" title="Stop ${escapeHtml(agent.name || 'agent')}" aria-label="Stop ${escapeHtml(agent.name || 'agent')}">&times;</button>
-            `;
-
-            const stopBtn = item.querySelector('.agent-stop-btn');
-            if (stopBtn) {
-                stopBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();  // don't also fire selectAgent
-                    stopAgent(agent.name);
-                });
-            }
-            container.appendChild(item);
-
-            // UI extension slot (#2038): per-card actions zone. The anchor is a
-            // dedicated container appended to the card; the registry mounts
-            // contributions (voice's 🎧/🎤 controls register into this zone as of
-            // ticket 04) and tears them down when the card detaches on the next
-            // list rebuild.
-            const cardActionsAnchor = document.createElement('div');
-            cardActionsAnchor.dataset.slot = 'agent-card-actions';
-            cardActionsAnchor.className = 'agent-card-actions';
-            item.appendChild(cardActionsAnchor);
-            UI.renderSlot('agent-card-actions', {
-                element: cardActionsAnchor,
-                api: API,
-                agentName: agent.name,
-                standalone: isStandalone,
-            });
-        }
-
-        // Demo-server misconfig (#868): a server in demo_mode that mounted
-        // any non-demo agent is the routing precondition that wiped
-        // Meridian.  The banner already names the bad state — but words
-        // alone aren't enough; the page MUST also refuse to install a
-        // host-agent prefix, otherwise every subsequent UI click still
-        // routes to whichever agent ``selectAgent`` would have picked.
-        const hasLiveAgent = (data.server_demo_mode === true) && agents.some(
-            (a) => a.is_demo !== true,
-        );
-
-        // Auto-select first online agent only in multi_agent mode (not standalone)
-        // and never when the demo server is in misconfig — the banner
-        // explicitly tells the operator the auto-select is disabled.
-        if (!selectedAgentName && !isStandalone && !hasLiveAgent) {
-            const firstOnline = agents.find(a => a.status !== 'offline');
-            if (firstOnline) {
-                window.selectAgent(firstOnline.name);
-            }
-        }
-
-        // Standalone mode: mount + target the conversations pane so its list
-        // populates against the un-prefixed routes (selectAgent installs a
-        // host-agent URL prefix that only exists in multi_agent routing — using
-        // it in standalone 404s /api/conversations and /agent/invoke). #2216:
-        // this does NOT reveal the pane — visibility is the component's persisted
-        // collapse state (default hidden), nothing else. Skip in misconfig — the
-        // agent list is not safe to auto-target.
-        if (isStandalone && agents.length > 0 && !hasLiveAgent && API.hasCapability('conversations')) {
-            try { refreshConversationsPane(); } catch (_) { /* best-effort */ }
-        }
-    } catch (e) {
-        const container = document.getElementById('agents-list');
-        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load agents</p>';
+        // Retain the inner list handle so the existing select/setActiveName
+        // call sites keep working unchanged.
+        agentListHandle = agentListPaneHandle.list;
     }
+    // Await the load so routing is pinned (setHostAgent runs synchronously
+    // inside the onLoaded auto-select) before app.js runs Security.init().
+    await agentListHandle.refresh();
 }
 
 window.selectAgent = async function(agentName) {
     const previousAgentName = selectedAgentName;
     selectedAgentName = agentName;
+
+    // #2298: persist the selection so a hard refresh restores it (validated
+    // against the live agent list on the next loadAgents). Best-effort — a
+    // disabled localStorage is a silent no-op.
+    uiStateSet(SELECTED_AGENT_KEY, agentName);
 
     // Set host agent routing in API layer
     API.setHostAgent(agentName);
@@ -983,10 +1097,11 @@ window.selectAgent = async function(agentName) {
     // reflected in the UI.
     updateThinkingIndicator();
 
-    // Update selection UI
-    document.querySelectorAll('.agent-item').forEach(item => {
-        item.classList.toggle('selected', item.dataset.agentName === agentName);
-    });
+    // Update selection UI — the agent-list component owns the active highlight
+    // (#2278). setActiveName repaints the highlight only (no re-fire), so a
+    // direct selectAgent call (or the auto-select path) reconciles the row state
+    // without a selection round-trip.
+    if (agentListHandle) agentListHandle.setActiveName(agentName);
 
     // Update chat header with agent name
     const navName = document.getElementById('nav-agent-name');
@@ -1567,44 +1682,12 @@ export function initTrashToggle() {
 // ============================================================================
 // Pane Collapse/Expand + Resize
 // ============================================================================
-
-window.togglePane = function(paneId) {
-    const pane = document.getElementById(paneId);
-    if (pane) {
-        pane.classList.toggle('collapsed');
-    }
-};
-
-function initPaneResize(handleId, paneId) {
-    const handle = document.getElementById(handleId);
-    const pane = document.getElementById(paneId);
-    if (!handle || !pane) return;
-
-    let startX, startWidth;
-
-    handle.addEventListener('mousedown', (e) => {
-        startX = e.clientX;
-        startWidth = pane.offsetWidth;
-        document.body.style.cursor = 'col-resize';
-        document.body.style.userSelect = 'none';
-
-        function onMouseMove(e) {
-            const diff = e.clientX - startX;
-            const newWidth = Math.max(200, Math.min(500, startWidth + diff));
-            pane.style.width = newWidth + 'px';
-        }
-
-        function onMouseUp() {
-            document.removeEventListener('mousemove', onMouseMove);
-            document.removeEventListener('mouseup', onMouseUp);
-            document.body.style.cursor = '';
-            document.body.style.userSelect = '';
-        }
-
-        document.addEventListener('mousemove', onMouseMove);
-        document.addEventListener('mouseup', onMouseUp);
-    });
-}
+//
+// #2279: both sidebar panes' collapse + drag-resize chrome are now owned by
+// their pane components (`mountAgentListPane` / `mountConversationsPane`), which
+// adopt the static `.collapse-btn` / `.resize-handle` on mount. The former
+// `window.togglePane` + `initPaneResize` helpers (only the agents pane still
+// used them) were retired here to avoid double-binding the adopted chrome.
 
 // #2199: the chat-header `ki-history` trigger (icon-only, tooltip + aria) opens
 // or collapses the conversations pane. It drives the SAME mount handle the
@@ -1631,11 +1714,67 @@ window.toggleConversationsPane = function() {
     handle.toggle();
 };
 
+// #2279: the agents pane's chevron only CLOSES it (to fully hidden, #2216
+// two-state), exactly like the conversations pane. That makes an external reopen
+// trigger mandatory — otherwise the collapse is a one-way trip (the chevron
+// vanishes with the pane and the state persists across reloads). This is the
+// agents-pane analogue of `toggleConversationsPane`: the always-visible top-nav
+// `#agents-toggle-btn` (which lives OUTSIDE #agents-pane, so it survives the
+// pane's display:none) drives the SAME mount handle the sidebar chevron uses.
+window.toggleAgentsPane = function() {
+    // The pane is only mounted for multi_agent hosts (loadAgents hides it and
+    // skips the mount otherwise), so the toggle must be a no-op elsewhere.
+    if (!API.hasCapability('multi_agent')) return;
+    if (!agentListPaneHandle) return;
+    agentListPaneHandle.toggle();
+};
+
 // Setup collapse buttons and resize handles
+// Turn-end / voice staleness → conversations pane sync (#2250/#2254).
+// Registered at MODULE SCOPE, not inside the DOMContentLoaded block: embedding
+// hosts (Frinz) dynamically import this module long after DOMContentLoaded has
+// fired, so a listener wired there never attaches in an embed — the tile
+// counts refreshed only via the host's own listener and the ORGANIC-session
+// highlight sync never ran at all (user report: selected conversation card not
+// highlighted in the embed). The event carries `{ sessionId, agent }`; adopt it
+// into the per-agent active-id map (and the live highlight when it's the
+// current host agent) BEFORE the refresh repaints.
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('kestrel:conversations-stale', (event) => {
+        const detail = event && event.detail;
+        // A NULL agent is the single-agent console: getHostAgent() is null by
+        // definition there (isMultiAgentMode = selectedHostAgent !== null), so
+        // chat.js's dispatchAgent — and this event's `agent` — is null for
+        // every turn. The old `detail.agent` truthiness guard therefore
+        // skipped the highlight sync in exactly the most common standalone
+        // setup. Gate on sessionId only; currentAgentMatches(null) is true
+        // precisely when the console is single-agent, so the match check
+        // below stays correct in both modes.
+        if (detail && detail.sessionId) {
+            const agentKey = detail.agent !== undefined ? detail.agent : null;
+            activeConversationIdsByAgent.set(agentKey, detail.sessionId);
+            if (currentAgentMatches(agentKey)) {
+                activeConversationId = detail.sessionId;
+                if (conversationsHandle) {
+                    conversationsHandle.setActiveSessionId(activeConversationId);
+                }
+            }
+        }
+        if (conversationsHandle) conversationsHandle.refresh();
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-    const collapseAgentsBtn = document.getElementById('collapse-agents-btn');
-    if (collapseAgentsBtn) {
-        collapseAgentsBtn.addEventListener('click', () => togglePane('agents-pane'));
+    // #2279: the agents pane's collapse chevron + drag-resize handle are now
+    // owned by the `mountAgentListPane` export (it adopts the static
+    // `.collapse-btn` / `.resize-handle` inside `#agents-pane` when it mounts),
+    // so identity.js no longer wires them here — that would double-bind, exactly
+    // as it stopped wiring the conversations pane's chrome under #2199. What
+    // identity.js DOES still own is the external reopen trigger: the chevron
+    // only closes the pane, so without this the collapse is irreversible.
+    const agentsTriggerBtn = document.getElementById('agents-toggle-btn');
+    if (agentsTriggerBtn) {
+        agentsTriggerBtn.addEventListener('click', () => window.toggleAgentsPane());
     }
 
     // #2199: the conversations pane's collapse chevron + drag-resize handle are
@@ -1649,14 +1788,9 @@ document.addEventListener('DOMContentLoaded', () => {
         historyTriggerBtn.addEventListener('click', () => window.toggleConversationsPane());
     }
 
-    // A realtime/pipeline voice session persists its turns server-side as a
-    // new conversation, but the sidebar never hears about it (the browser
-    // talks straight to OpenAI). voice/ui.js fires this when a call ends with
-    // real turns; reload the list so the new conversation shows up without a
-    // manual page refresh.
-    window.addEventListener('kestrel:conversations-stale', () => {
-        if (conversationsHandle) conversationsHandle.refresh();
-    });
+    // (#2254 stale-event listener moved to MODULE SCOPE below — embeds import
+    // this module long after DOMContentLoaded, so wiring it here meant the
+    // highlight sync never ran in a mounted host. See the top-level listener.)
 
     // #2222: the New-conversation button is now component-owned. The pane mount
     // (`mountConversationsPane`) adopts the static `#new-conversation-sidebar-btn`
@@ -1665,10 +1799,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // highlight, with the host-side chat wiring supplied via the
     // `onNewConversation` config. identity.js owns no new-conversation wiring.
 
-    // Initialize resize handles. The conversations pane's resize is owned by
-    // the mountConversationsPane export (#2199); only the agents pane keeps the
-    // bespoke handler here.
-    initPaneResize('resize-agents', 'agents-pane');
+    // #2279: both sidebar panes' resize handles are now owned by their pane
+    // components (`mountAgentListPane` / `mountConversationsPane`), which adopt
+    // the static `.resize-handle` on mount — so identity.js wires neither here.
     // Wire the Trash toggle in the conversations pane header (#765).
     initTrashToggle();
 });

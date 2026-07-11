@@ -129,6 +129,19 @@ def handle_llm_errors(
                 if reraise_as:
                     raise reraise_as(str(error)) from e
                 raise error
+            except LLMError as e:
+                # Already a classified LLM error (e.g. ModelNotAvailableForRoute
+                # raised to signal the outer fallback loop to skip a route). Do
+                # NOT re-wrap it into ``LLMProviderError(provider='unknown', ...)``
+                # — that both fabricated the misleading "Provider unknown"
+                # wording and hid the concrete error type from callers that catch
+                # it specifically (e.g. ``get_response``'s
+                # ``except ModelNotAvailableForRoute``). See #2352.
+                if log_errors:
+                    logger.debug(f"LLM error in {func.__name__} for provider {provider}: {e}")
+                if reraise_as:
+                    raise reraise_as(str(e)) from e
+                raise
             except Exception as e:
                 # Classify common provider errors from error message
                 error_msg = str(e).lower()
@@ -181,6 +194,14 @@ def handle_llm_errors(
                 if reraise_as:
                     raise reraise_as(str(error)) from e
                 raise error
+            except LLMError as e:
+                # Already-classified LLM error — pass it through unchanged
+                # rather than re-wrapping as "Provider unknown" (#2352).
+                if log_errors:
+                    logger.debug(f"LLM error in {func.__name__} for provider {provider}: {e}")
+                if reraise_as:
+                    raise reraise_as(str(e)) from e
+                raise
             except Exception as e:
                 # Same error classification as async version
                 error_msg = str(e).lower()

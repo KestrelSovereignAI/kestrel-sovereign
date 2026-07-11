@@ -45,6 +45,7 @@ from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
+    extract_raw_user_content,
     check_prompt_injection,
     append_security_addendum,
 )
@@ -876,6 +877,21 @@ class KestrelAgent(
             # Wrap storage with privacy-enforcing layer
             self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
+            # #2290 — re-apply any previously-verified shared embedding-space
+            # pins from the persisted parity record. ``_verified_space_pins`` is
+            # process-local, so without this a restart would silently drop the
+            # shared local/cloud space until an operator re-ran the parity probe,
+            # stranding reindexed rows outside kNN. Best-effort; never blocks init.
+            try:
+                if self.llm_service and hasattr(
+                    self.llm_service, "hydrate_verified_space_pins"
+                ):
+                    await self.llm_service.hydrate_verified_space_pins(
+                        getattr(self._raw_storage, "db", None)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Embedding-space pin hydration skipped: %s", exc)
+
             early_agent_node = None
             try:
                 early_agent_node = await self.storage.get_node(self.agent_id)
@@ -1398,6 +1414,33 @@ class KestrelAgent(
             # follow-up PRs. With no deltas the effective set == the bootstrap
             # allowlist, so behavior is unchanged today.
             effective_features = await self._effective_allowed_features()
+            # Enforce a spawned child's mandate feature ceiling (#2226) on EVERY
+            # boot path. The AgentManager spawn path threads mandate.features_
+            # allowed into config (#1946), but single-agent server / CLI / direct
+            # KestrelAgent boots do not — so without this a restarted child would
+            # load features beyond its mandate. The ceiling is read from the
+            # durable spawned_by edge and INTERSECTED with any operator allowlist
+            # (never widening it). discover_features always force-loads
+            # MANDATORY_FEATURES regardless, so this can't drop constitution/
+            # security. Fail-closed: a read error propagates (see mandate_reload).
+            if self.did and self.storage is not None:
+                from kestrel_sovereign.spawn.mandate_reload import (
+                    read_spawn_features_allowed,
+                )
+
+                mandate_features = await read_spawn_features_allowed(
+                    self.storage, self.did
+                )
+                # A recorded ceiling is always a non-empty list; None/empty means
+                # "no explicit ceiling" (root, legacy, or inherit-from-degenerate-
+                # parent) → load all. See read_spawn_features_allowed.
+                if mandate_features:
+                    ceiling = set(mandate_features)
+                    effective_features = (
+                        ceiling
+                        if effective_features is None
+                        else set(effective_features) & ceiling
+                    )
             # Disabled deltas must be honored even when there is no bootstrap
             # allowlist (effective is None → discover_features loads all), so a
             # runtime feature_remove survives restart for bootstrap-less agents
@@ -1657,6 +1700,33 @@ class KestrelAgent(
             # Load persisted model preference from database and register persistence callback
             await self._load_model_preference()
             self.llm_service.set_preference_persistence_callback(self._persist_model_preference)
+
+            # Wire the corpus dominant-embedding-profile provider (#2366) so auto
+            # embedding-model resolution prefers continuity with the DB's
+            # existing embedding space over catalog order. This MUST be registered
+            # BEFORE any path that reconciles embedding capabilities
+            # (``_load_embedding_route`` / ``_load_route_embedding_models`` below
+            # both call ``reconcile_embedding_capabilities``): reconcile only
+            # writes ``caps["embedding_model"]`` when it is empty, so a reconcile
+            # that ran without the corpus provider would latch the catalog-first
+            # default and later corpus-aware reconciles could not correct it.
+            if hasattr(self.llm_service, "set_corpus_embedding_profile_provider"):
+                self.llm_service.set_corpus_embedding_profile_provider(
+                    self._dominant_embedding_profile
+                )
+
+            # Load persisted embedding_route knob and register persistence (#2263)
+            await self._load_embedding_route()
+            self.llm_service.set_embedding_route_persistence_callback(self._persist_embedding_route)
+
+            # Load persisted per-route embedding_model pins and register
+            # persistence (#2337) — the runtime equivalent of the TOML
+            # embedding_model/embedding_dim keys, set from the embeddings UI.
+            if hasattr(self.llm_service, "set_route_embedding_model_persistence_callback"):
+                await self._load_route_embedding_models()
+                self.llm_service.set_route_embedding_model_persistence_callback(
+                    self._persist_route_embedding_models
+                )
 
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
@@ -2684,6 +2754,14 @@ Expected Duration: {expected_duration}
                 else:
                     bootstrap_response = await self._handle_bootstrap(user_input, session_id)
                     if bootstrap_response:
+                        # Bootstrap persists real conversation rows and must
+                        # enter the same privacy-gated memory ingestion path as
+                        # every later exchange. Returning here without this
+                        # call leaves first-turn importance, emotion, concepts,
+                        # and schema routing permanently absent (#2331).
+                        await self._post_response_pipeline(
+                            user_input, bootstrap_response, session_id
+                        )
                         return bootstrap_response
 
             # Handle explicit commands first (using the CommandHandler)
@@ -3097,11 +3175,12 @@ Expected Duration: {expected_duration}
         # assembly (below).
         constitution = await self._get_governing_constitution()
         try:
-            logging.info(f"[SESSION-DEBUG] Fetching history with session_id={session_id}")
             history = await self.privacy_agent.get_conversation_history(limit=50, session_id=session_id)
-            logging.info(f"[SESSION-DEBUG] Got {len(history)} messages for session_id={session_id}")
-            if history:
-                logging.info(f"[SESSION-DEBUG] First message: {history[0].get('content', '')[:50]}...")
+            logging.debug(
+                "Conversation history loaded: count=%d session_scoped=%s",
+                len(history),
+                session_id is not None,
+            )
         except DecryptionError as e:
             logging.error(f"DecryptionError retrieving history: {e}")
             # Return empty history but allow query to proceed
@@ -3383,7 +3462,10 @@ Expected Duration: {expected_duration}
         if has_tool_calls:
             logging.info(f"[AGENTIC] Tool calls: {[tc.name for tc in response.tool_calls]}")
         elif isinstance(response, LLMResponse) and response.content:
-            logging.info(f"[AGENTIC] LLM returned TEXT (no tool calls): {response.content[:150]}...")
+            logging.debug(
+                "[AGENTIC] LLM returned text (no tool calls): chars=%d",
+                len(response.content),
+            )
 
         await self.observability_store.log_tool_response(
             event_id=llm_event_id,
@@ -3565,29 +3647,53 @@ Expected Duration: {expected_duration}
 
         # ── Phase 1: Inline emotional tagging (CPU-bound, safe) ─────────
         # Look up the two most recent messages (user + assistant just stored)
+        conv_store = None
+        user_msg = None
+        assistant_msg = None
+        tag_results = {"user": None, "assistant": None}
         try:
             conv_store = getattr(self._raw_storage, 'conversation', None)
             if not conv_store:
                 return
 
-            recent = await conv_store.get_full_history_with_ids()
+            # Only rows written around this serialized turn can be our pair.
+            # Never decrypt/materialize an agent's entire lifetime merely to
+            # locate two canonical IDs.
+            recent = await conv_store.get_full_history_with_ids(limit=20)
             if len(recent) < 2:
                 return
 
-            # Find OUR user+assistant pair by content match (avoids race
-            # with concurrent requests that might insert between us)
-            user_msg = None
-            assistant_msg = None
+            canonical_session_id = None
+            if session_id:
+                canonical_session_id = await conv_store.resolve_session_id(
+                    session_id
+                )
+
+            # Find OUR user+assistant pair by canonical content. User turns are
+            # persisted in sent form, so compare their raw projection rather
+            # than the transport wrapper. Scope to the active session when one
+            # is available so identical text in another conversation cannot be
+            # selected.
             for msg in reversed(recent):
+                msg_meta = msg.get('metadata') or {}
+                if (
+                    canonical_session_id
+                    and str(msg_meta.get('session_id')) != str(canonical_session_id)
+                ):
+                    continue
                 if not assistant_msg and msg.get('role') == 'assistant' and msg.get('content') == response_text:
                     assistant_msg = msg
-                elif not user_msg and msg.get('role') == 'user' and msg.get('content') == user_input:
+                elif (
+                    not user_msg
+                    and msg.get('role') == 'user'
+                    and extract_raw_user_content(msg.get('content') or '') == user_input
+                ):
                     user_msg = msg
                 if user_msg and assistant_msg:
                     break
 
             if user_msg and assistant_msg:
-                await self.context_manager.memory_manager.tag_exchange(
+                tag_results = await self.context_manager.memory_manager.tag_exchange(
                     user_content=user_input,
                     assistant_content=response_text,
                     user_message_id=user_msg.get('id'),
@@ -3599,16 +3705,20 @@ Expected Duration: {expected_duration}
 
         # ── Phase 2: Background temporal + associative processing ───────
         # Snapshot IDs before spawning background work to avoid races
-        snapshot_user_msg_id = str(user_msg.get('id', '')) if user_msg else ""
+        snapshot_user_msg_id = user_msg.get('id') if user_msg else None
+        snapshot_user_metadata = dict((tag_results or {}).get("user") or {})
+
+        # Phase 1 can fail before a conversation store is acquired. Do not
+        # enqueue background work that is guaranteed to dereference None.
+        if conv_store is None:
+            return
 
         async def _background_memory_processing():
             try:
                 # Temporal pattern detection on recent history window
                 if self.memory_system.analyzer:
                     try:
-                        recent_msgs = await conv_store.get_full_history_with_ids()
-                        # Use last 50 messages as the detection window
-                        window = recent_msgs[-50:] if len(recent_msgs) > 50 else recent_msgs
+                        window = await conv_store.get_full_history_with_ids(limit=50)
                         patterns = await self.memory_system.analyzer.detect_patterns(
                             messages=window,
                             agent_id=self.agent_id,
@@ -3619,16 +3729,22 @@ Expected Duration: {expected_duration}
                     except Exception as e:
                         logging.error(f"Post-response temporal analysis failed: {e}", exc_info=True)
 
-                # Associative linking (concept graph writes)
-                if self.memory_system.linker:
+                # Associative linking + schema routing share one canonical
+                # stored-message path and the real conversation row ID.
+                if snapshot_user_msg_id:
                     try:
-                        await self.memory_system.linker.extract_and_link(
+                        derived = await self.memory_system.link_and_route_message(
                             message_id=snapshot_user_msg_id,
                             content=user_input,
-                            agent_id=self.agent_id,
+                            role="user",
+                            metadata=snapshot_user_metadata,
                         )
+                        if derived:
+                            await conv_store.update_message_metadata(
+                                snapshot_user_msg_id, derived
+                            )
                     except Exception as e:
-                        logging.error(f"Post-response associative linking failed: {e}", exc_info=True)
+                        logging.error(f"Post-response memory graph processing failed: {e}", exc_info=True)
 
             except Exception as e:
                 logging.error(f"Post-response Phase 2 (background) failed: {e}", exc_info=True)

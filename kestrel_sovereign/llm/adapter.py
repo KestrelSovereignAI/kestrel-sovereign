@@ -24,13 +24,16 @@ framework-side.
 
 from dataclasses import dataclass
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
 
 from kestrel_sdk.llm import LLMResponse, ToolCall
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
 from .cancellation import CancelToken
 from .image_utils import process_images
+
+if TYPE_CHECKING:
+    from .embedding_discovery import EmbeddingModelInfo
 
 @dataclass(frozen=True)
 class ThinkingDelta:
@@ -278,6 +281,23 @@ class LLMAdapter(_SDKLLMAdapter):
         startup latency and transient-network failure modes.
         """
         return None
+
+    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+        """Discover the embedding models this route can serve (#2338).
+
+        The embedding facet of :meth:`list_models`: chat discovery answers
+        "what can I chat with", this answers "what can I embed with". A route
+        advertises embedding capability when this returns ≥1 model — advertised
+        because *discovered*, not because an operator pinned ``embedding_model``
+        in TOML (which becomes an override, never a prerequisite).
+
+        Adapters override with their vendor's dedicated source (OpenRouter's
+        ``/embeddings/models`` endpoint, Ollama's ``/api/show`` capability
+        check, OpenAI's id-prefix filter). The base returns ``[]`` — a route
+        whose adapter has no embedding discovery simply reports none, exactly
+        as chat discovery inherits ``NotImplementedError`` gracefully.
+        """
+        return []
 
     def create_messages(
         self,

@@ -406,10 +406,17 @@ function mountAgentVoiceControls(el, ctx) {
   if (!el || !ctx) return;
   injectStyles();
   const agentKey = ctx.standalone ? null : ctx.agentName;
-  // Voice cards are located by their OWN attribute, NOT `data-agent-name`. The
-  // zone anchor (`ctx.element`) is appended into the `.agent-item` card, so its
-  // parent is the row we tag + repaint.
-  const row = ctx.element && ctx.element.parentNode;
+  // Voice cards are located by their OWN attribute, NOT `data-agent-name`.
+  // Tag the enclosing CARD SHELL (`.agent-card` — always present on
+  // mountAgentList shells; `.agent-item` covers the default console row), not
+  // the anchor's blind parentNode: a host `renderCard` may nest the actions
+  // anchor inside its own body layout, where parentNode is an inner div the
+  // refresh selectors would never find (codex P2 on #2282).
+  const row = ctx.element && (
+      (typeof ctx.element.closest === 'function'
+          && ctx.element.closest('.agent-card, .agent-item'))
+      || ctx.element.parentNode
+  );
   if (row && row.dataset) row.dataset.voiceAgentKey = voiceKeyToAttr(agentKey);
   const controls = document.createElement('div');
   controls.className = 'agent-voice-controls';
@@ -454,7 +461,9 @@ function cssEscape(s) {
 }
 
 function refreshAgentVoiceCard(agentName) {
-  const selector = `.agent-item[data-voice-agent-key="${cssEscape(voiceKeyToAttr(agentName))}"]`;
+  // Attribute-only: custom renderCard shells carry `.agent-card` but not
+  // `.agent-item`, and the voice key attribute is voice-owned anyway.
+  const selector = `[data-voice-agent-key="${cssEscape(voiceKeyToAttr(agentName))}"]`;
   const row = document.querySelector(selector);
   if (!row) return;
   const session = sessionForAgent(agentName);
@@ -522,7 +531,7 @@ function setArmedAgent(agentName) {
   for (const [agent] of sessionByAgent.entries()) {
     getOrCreateChatPane(agent).micArmed = agent === armedAgent;
   }
-  for (const row of document.querySelectorAll('.agent-item[data-voice-agent-key]')) {
+  for (const row of document.querySelectorAll('[data-voice-agent-key]')) {
     const agent = attrToVoiceKey(row.dataset.voiceAgentKey);
     getOrCreateChatPane(agent).micArmed = agent === armedAgent;
   }

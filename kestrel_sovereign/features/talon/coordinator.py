@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,12 +36,14 @@ from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
 from kestrel_sovereign.features.talon.runtime import (
     TalonBatchExecution,
     TalonExecution,
+    TalonIterateExecution,
     TalonPolicy,
     TalonPreference,
     TalonRuntimeError,
     TalonRuntimeRequest,
     build_talon_batch_invocation,
     build_talon_invocation,
+    build_talon_iterate_invocation,
     load_talon_policy_preference,
     normalize_auth_lane,
     normalize_backend,
@@ -57,6 +60,7 @@ from kestrel_sovereign.features.talon.verification import (
     VerificationEvidence,
     VerificationState,
 )
+from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +108,67 @@ _TALON_RESERVED_LABELS = frozenset({
     "agent-failed",
     "agent-complete",
 })
+
+
+# Orchestrator identity + workflow correlation keys stamped onto every
+# outgoing talon invocation at the coordinator boundary (contract with the
+# observability team — kestrel-talon#53). Names are FROZEN; do not rename.
+#
+#   ORCHESTRATOR    — friendly agent name driving this dispatch (unset when
+#                     genuinely no agent drove it; downstream renders null
+#                     as "Direct").
+#   WORKFLOW_RUN_ID — the workflow run id (the driving Signal's session_id
+#                     when kind == "workflow.stage"); unset otherwise.
+#   STAGE           — the workflow stage name; unset for non-workflow
+#                     dispatches.
+#
+# Transport: CLI dispatches carry them as process env vars on the spawned
+# talon process; A2A/AMP dispatches carry the same three keys as structured
+# metadata fields on the message. The daemon-side read is kestrel-talon#53.
+OBSERVABILITY_ORCHESTRATOR_KEY = "KESTREL_OBSERVABILITY_ORCHESTRATOR"
+OBSERVABILITY_WORKFLOW_RUN_ID_KEY = "KESTREL_OBSERVABILITY_WORKFLOW_RUN_ID"
+OBSERVABILITY_STAGE_KEY = "KESTREL_OBSERVABILITY_STAGE"
+
+
+# Per-task suppression of the A2A-preferred claim path (codex P2, detached
+# waits). ``dispatch_pipeline(force_cli=True)`` sets this around its
+# delegated ``talon_claim`` call so a DETACHED dispatch (the caller keeps a
+# ``talon:<job_id>`` wait ref for later) always lands a durable
+# ``cli_background`` job: A2A jobs live only in the coordinator's in-memory
+# ``_jobs`` map (``_persist_jobs`` persists cli_background rows only), so an
+# A2A-shaped wait ref would resolve to an unknown job after an agent
+# restart. A ContextVar (not an instance flag) keeps concurrent dispatches
+# in the same event loop isolated, and — deliberately — this is NOT a
+# ``talon_claim`` tool parameter: the @tool decorator advertises every
+# signature param to the LLM, and transport selection is coordinator
+# plumbing, not an LLM control.
+_FORCE_CLI_DISPATCH: "ContextVar[bool]" = ContextVar(
+    "talon_force_cli_dispatch", default=False
+)
+
+# Terminal talon job states — a job in one of these has finished (and, on
+# success, opened its PR). ``verify_pipeline_ci`` requires a job to be in one
+# — settling it first with a fast point-in-time reap, then a bounded wait on
+# the durable ``talon:<job_id>`` rail if still running — before binding to the
+# PR it produced.
+_TERMINAL_TALON_STATES = frozenset(
+    {"complete", "failed", "reject", "finished_unknown"}
+)
+
+# The one terminal state that means the run actually succeeded (opened its PR
+# through a passing pipeline). Every other terminal state is a FAILURE — a PR it
+# left behind must not be accepted as CI-green (#2303).
+_SUCCESSFUL_TALON_STATE = "complete"
+
+_PR_NUMBER_FROM_URL_RE = re.compile(r"/pull/(\d+)")
+
+
+def _pr_number_from_url(url: Optional[str]) -> Optional[int]:
+    """Parse the PR number out of a ``.../pull/<n>`` GitHub URL, or None."""
+    if not url:
+        return None
+    match = _PR_NUMBER_FROM_URL_RE.search(url)
+    return int(match.group(1)) if match else None
 
 
 # Discriminated reason codes for ``talon_file_and_claim`` failures.
@@ -287,6 +352,11 @@ class TalonCoordinatorFeature(Feature):
         # message_id -> {pid, started_at, log_path, command, repo,
         # issue, status, returncode, completed_at, process}
         self._jobs: Dict[str, Dict[str, Any]] = {}
+        # workflow run_id -> the talon job_id THAT run's talon_run stage
+        # dispatched. Lets ``verify_pipeline_ci`` bind CI verification to this
+        # run's own job instead of a repo/issue correlation that a concurrent
+        # run (e.g. a retry for the same issue) could poison (#2303).
+        self._pipeline_run_jobs: Dict[str, str] = {}
         # Eager reload so a fresh feature instance immediately sees
         # jobs from a previous process — dispatch-then-persist would
         # otherwise truncate the registry to the new job alone.
@@ -350,6 +420,46 @@ class TalonCoordinatorFeature(Feature):
                 logger.info(
                     "TalonCoordinatorFeature registered workflow-rescue "
                     "signal sources: %s", ", ".join(registered),
+                )
+
+            # Register the purpose-built talon pipeline dispatch source so
+            # workflow stages can ACTUALLY dispatch a full kestrel-talon
+            # pipeline run (claim/iterate) and resolve on completion via the
+            # talon.job_complete / TalonWaitable rail. Bound to this feature
+            # because the dispatch plumbing (A2A preferred, CLI fallback,
+            # observability stamping) lives here. Idempotent like the rest.
+            from kestrel_sovereign.signals.sources.talon_pipeline import (
+                register_talon_pipeline_source,
+            )
+            if register_talon_pipeline_source(registry, self):
+                logger.info(
+                    "TalonCoordinatorFeature registered the "
+                    "talon_pipeline_dispatch signal source",
+                )
+
+            # Register the support sources the built-in ``fleet_coding_pipeline``
+            # workflow names (#2303) and inject the workflow itself into the
+            # workflows package's built-in registry so workflow_load_builtin /
+            # workflow_run can load and start it. Fleet-coordination domain, so
+            # the coordinator owns these registrations (same posture as the
+            # workflow-rescue sources above). Both calls are idempotent and the
+            # built-in injection no-ops when kestrel-feature-workflows is absent.
+            from kestrel_sovereign.signals.sources.fleet_coding_pipeline import (
+                register_fleet_coding_pipeline_builtin,
+                register_fleet_coding_pipeline_sources,
+            )
+            fleet_registered = register_fleet_coding_pipeline_sources(
+                registry, coordinator=self
+            )
+            if fleet_registered:
+                logger.info(
+                    "TalonCoordinatorFeature registered fleet-coding-pipeline "
+                    "signal sources: %s", ", ".join(fleet_registered),
+                )
+            if register_fleet_coding_pipeline_builtin():
+                logger.info(
+                    "TalonCoordinatorFeature registered the fleet_coding_pipeline "
+                    "built-in workflow",
                 )
 
     async def post_all_features_loaded(self, agent):
@@ -417,6 +527,213 @@ class TalonCoordinatorFeature(Feature):
     # ------------------------------------------------------------------
 
     @tool(
+        name="scan_stale_work",
+        description=(
+            "Read-only ecosystem discovery scan for stale Talon work. "
+            "Returns actionable findings for scheduler discovery watches; "
+            "never dispatches repairs or closes issues."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!talon scan-stale-work",
+    )
+    async def scan_stale_work(
+        self,
+        stale_days: int = 3,
+        repo: Optional[str] = None,
+        repos: Optional[Any] = None,
+        org: Optional[Any] = None,
+        repo_prefix: Optional[Any] = None,
+        exclude_repos: Optional[Any] = None,
+    ) -> ToolResult:
+        """Scan for stale work without taking action (#2281, #2269).
+
+        This is the scheduler-facing wrapper around Talon's existing live
+        stalled-job survey. It keeps ``ecosystem_discovery_watch`` wired to a
+        real in-tree tool while preserving the evidence boundary: discovery
+        returns findings only, and any repair/closure still needs a later gate.
+
+        Two modes:
+
+        * **Single-repo / no filter (legacy).** With no roster args, it surveys
+          all live stalled Talon jobs, optionally filtered to one ``repo`` slug.
+        * **Roster mode (#2269).** When any of ``repos`` / ``org`` /
+          ``repo_prefix`` is given — or ``repo`` carries a wildcard — the args
+          are parsed into a durable ecosystem roster and expanded against the
+          repos accessible to the agent's GitHub token. Wildcards like
+          ``KestrelSovereignAI/kestrel-feature-*`` are treated as prefixes, not
+          literal repo names; tekspear repos are always excluded; and repos that
+          could not be resolved are reported as explicit ``scan_failures``.
+
+        Args:
+            stale_days: How many idle days mark Talon work as stalled.
+            repo: Optional ``owner/name`` filter (or a wildcard → roster mode).
+            repos: Explicit allowlist of ``owner/name`` slugs (or wildcards).
+            org: Org(s) whose accessible repos form the roster.
+            repo_prefix: Prefix(es) matched against accessible repos.
+            exclude_repos: Explicit ``owner/name`` slugs to drop from the roster.
+        """
+        from kestrel_sovereign.signals.sources.ecosystem_roster import (
+            is_wildcard,
+            parse_roster_spec,
+            expand_roster,
+        )
+
+        roster_requested = bool(repos or org or repo_prefix) or bool(
+            repo and is_wildcard(str(repo))
+        )
+
+        stalled = await self._survey_stalled_talon_jobs(stale_days)
+
+        if not roster_requested:
+            if repo:
+                stalled = [item for item in stalled if item.get("repo") == repo]
+            findings = self._stale_findings(stalled, default_repo=repo or "")
+            return ToolResult.ok(
+                confirmation=(
+                    f"Found {len(findings)} stale work item(s) "
+                    f"older than {stale_days} day(s)."
+                ),
+                data={
+                    "summary": (
+                        f"{len(findings)} stale work item(s)"
+                        if findings
+                        else "No actionable stale work findings."
+                    ),
+                    "findings": findings,
+                    "stale_days": stale_days,
+                    "repo": repo or "",
+                },
+            )
+
+        spec = parse_roster_spec(
+            org=org,
+            repos=repos,
+            repo=repo,
+            repo_prefix=repo_prefix,
+            exclude_repos=exclude_repos,
+        )
+        accessible, discovery_error = await self._discover_roster_universe(spec.orgs)
+        expansion = expand_roster(
+            spec,
+            accessible_repos=accessible,
+            discovery_error=discovery_error,
+        )
+
+        roster = set(expansion.repos)
+        findings = self._stale_findings(
+            [item for item in stalled if item.get("repo") in roster],
+        )
+
+        scan_failures: List[Dict[str, Any]] = []
+        for failure in expansion.failures:
+            target = (
+                failure.get("repo")
+                or failure.get("pattern")
+                or failure.get("scope")
+                or "?"
+            )
+            entry = {
+                "repo": failure.get("repo", ""),
+                "kind": "scan_failure",
+                "status": "inaccessible",
+                "severity": "high",
+                "title": f"Roster scan failure: {target} ({failure.get('reason', '')})",
+                "reason": failure.get("reason", ""),
+                "target": target,
+                "suggested_gate": "triage_lane",
+                "actionable": True,
+            }
+            scan_failures.append(entry)
+            # Surface failures as findings too so the discovery watch never
+            # silently drops an inaccessible repo (#2269 AC3).
+            findings.append(entry)
+
+        summary_bits = []
+        if findings:
+            summary_bits.append(f"{len(findings)} finding(s)")
+        summary_bits.append(f"{len(expansion.repos)} repo(s) scanned")
+        if scan_failures:
+            summary_bits.append(f"{len(scan_failures)} scan failure(s)")
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Scanned {len(expansion.repos)} roster repo(s) for stale work "
+                f"older than {stale_days} day(s); "
+                f"{len(scan_failures)} inaccessible."
+            ),
+            data={
+                "summary": (
+                    ", ".join(summary_bits)
+                    if findings or scan_failures
+                    else "No actionable stale work findings."
+                ),
+                "findings": findings,
+                "scan_failures": scan_failures,
+                "scanned_repos": list(expansion.repos),
+                "excluded_repos": list(expansion.excluded),
+                "stale_days": stale_days,
+                "repo": repo or "",
+            },
+        )
+
+    def _stale_findings(
+        self,
+        stalled: List[Dict[str, Any]],
+        default_repo: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Shape surveyed stalled Talon jobs into actionable discovery findings."""
+        findings: List[Dict[str, Any]] = []
+        for item in stalled:
+            issue = item.get("issue")
+            repo_name = item.get("repo") or default_repo or ""
+            title_parts = ["Stalled Talon job", str(item.get("id") or "?")]
+            if repo_name and issue:
+                title_parts.append(f"for {repo_name}#{issue}")
+            findings.append({
+                "id": item.get("id"),
+                "repo": repo_name,
+                "kind": item.get("kind") or "talon_job",
+                "issue": issue,
+                "job": item.get("id"),
+                "status": item.get("status") or "stalled",
+                "severity": "high",
+                "title": " ".join(title_parts),
+                "started_at": item.get("started_at"),
+                "suggested_gate": "govern_stalled_work_rescue",
+                "actionable": True,
+            })
+        return findings
+
+    async def _discover_roster_universe(
+        self, orgs: tuple[str, ...]
+    ) -> tuple[set[str], Optional[str]]:
+        """Fetch the set of repos accessible to the agent's GitHub token.
+
+        Returns ``(accessible_repos, error)``. ``error`` is set when a listing
+        could not be fetched at all; a partial set with an error means some orgs
+        listed and others did not — :func:`expand_roster` turns the missing ones
+        into explicit failures. ``orgs`` empty falls back to the configured
+        default orgs (``[github].orgs`` or ``KestrelSovereignAI``).
+        """
+        from kestrel_sovereign.endpoints.github import discover_accessible_repos
+
+        accessible: set[str] = set()
+        error: Optional[str] = None
+        targets: List[Optional[str]] = list(orgs) if orgs else [None]
+        for target in targets:
+            try:
+                found = await discover_accessible_repos(org=target)
+                accessible.update(found)
+            except Exception as exc:  # noqa: BLE001 - inaccessible → explicit failure
+                error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "scan_stale_work: could not list repos for org %s: %s",
+                    target or "<default>",
+                    exc,
+                )
+        return accessible, error
+
+    @tool(
         name="talon_claim",
         description=(
             "Dispatch a single issue to Talon for autonomous "
@@ -439,6 +756,8 @@ class TalonCoordinatorFeature(Feature):
         skip_clarification: Optional[bool] = None,
         worktree: bool = True,
         self_review: Optional[bool] = None,
+        demo_check: Optional[bool] = None,
+        eye_check: Optional[bool] = None,
     ) -> ToolResult:
         """Claim an issue for Talon to implement.
 
@@ -473,6 +792,12 @@ class TalonCoordinatorFeature(Feature):
                 target checkout isn't clobbered. README marks this
                 "strongly recommended" — don't disable unless you
                 know what you're doing.
+            demo_check: If True, run kestrel-talon's demo gate
+                (``--demo-check``). CLI-only — requesting it forces the
+                CLI dispatch path since A2A dispatch carries repo/issue
+                only.
+            eye_check: If True, run kestrel-eye visual verification
+                (``--eye-check``). CLI-only, same as demo_check.
 
         Returns:
             ``{"dispatched": True, "method": "cli_background",
@@ -512,8 +837,14 @@ class TalonCoordinatorFeature(Feature):
                 },
             )
 
-        # A2A dispatch only carries repo/issue today, so using it for a
-        # non-default runtime would silently ignore the agent's Talon controls.
+        # A2A dispatch only carries repo/issue today, so ANY explicitly
+        # provided per-run control — runtime (backend/model/auth_lane),
+        # iteration caps, clarification/self-review behavior, quality
+        # gates, or a worktree opt-out — would be silently dropped on that
+        # path and the daemon's defaults would apply instead (codex P2).
+        # Every explicit flag therefore forces the CLI invocation, which
+        # carries them all. Do NOT widen the A2A payload here — that is
+        # the daemon team's side of the contract.
         use_a2a = (
             resolved_backend == "claude"
             and resolved_model == "opus"
@@ -521,6 +852,17 @@ class TalonCoordinatorFeature(Feature):
             and backend is None
             and model is None
             and auth_lane is None
+            and max_iterations is None
+            and max_turns is None
+            and skip_clarification is None
+            and self_review is None
+            and worktree is True
+            and demo_check is None
+            and eye_check is None
+            # Detached dispatches (dispatch_pipeline force_cli) need a
+            # durable cli_background job — A2A jobs are in-memory only
+            # and their wait refs die with the process.
+            and not _FORCE_CLI_DISPATCH.get()
         )
         if use_a2a:
             a2a_result = await self._dispatch_via_a2a(repo, issue)
@@ -613,6 +955,16 @@ class TalonCoordinatorFeature(Feature):
                     if self_review is not None
                     else preference.self_review
                 ),
+                demo_check=(
+                    parse_talon_bool(demo_check, "demo_check")
+                    if demo_check is not None
+                    else False
+                ),
+                eye_check=(
+                    parse_talon_bool(eye_check, "eye_check")
+                    if eye_check is not None
+                    else False
+                ),
             )
             invocation = build_talon_invocation(
                 runtime_request,
@@ -655,6 +1007,445 @@ class TalonCoordinatorFeature(Feature):
             cli_result.get("error") or "talon CLI dispatch failed",
             data=cli_result,
         )
+
+    async def dispatch_pipeline(
+        self,
+        *,
+        repo: str,
+        issue: Optional[int] = None,
+        pr: Optional[int] = None,
+        mode: str = "claim",
+        self_review: Optional[bool] = None,
+        demo_check: bool = False,
+        eye_check: bool = False,
+        force_cli: bool = False,
+    ) -> Dict[str, Any]:
+        """Dispatch a full talon pipeline run (claim or iterate).
+
+        The dispatch seam behind the ``talon_pipeline_dispatch`` signal
+        source: NOT an LLM tool. Claim mode delegates to :meth:`talon_claim`
+        so it inherits the A2A-preferred/CLI-fallback plumbing, policy
+        enforcement, and workspace safeguards unchanged. Iterate mode
+        builds a ``kestrel-talon iterate`` invocation through the same
+        runtime policy layer and the same background-CLI funnel — which
+        also stamps the observability keys (kestrel-talon#53).
+
+        ``force_cli=True`` suppresses the A2A-preferred claim path for this
+        call (via the task-local ``_FORCE_CLI_DISPATCH`` override). Callers
+        that hand back a ``talon:<job_id>`` wait ref for later use (the
+        source's detached ``wait: false`` mode) MUST set it: A2A jobs live
+        only in the in-memory ``_jobs`` map (``_persist_jobs`` persists
+        cli_background rows only), so an A2A wait ref would resolve to an
+        unknown job after an agent restart.
+
+        Returns a plain dispatch dict (``{"dispatched": bool, ...}`` with
+        ``job_id``/``task_id`` on success), never a ToolResult, so signal
+        handlers can fail closed on it directly.
+        """
+        if mode == "claim":
+            if issue is None:
+                return {
+                    "dispatched": False,
+                    "error": "dispatch_pipeline: claim mode requires issue",
+                }
+            token = _FORCE_CLI_DISPATCH.set(True) if force_cli else None
+            try:
+                claim = await self.talon_claim(
+                    repo=repo,
+                    issue=int(issue),
+                    self_review=self_review,
+                    demo_check=demo_check or None,
+                    eye_check=eye_check or None,
+                )
+            finally:
+                if token is not None:
+                    _FORCE_CLI_DISPATCH.reset(token)
+            data = dict(claim.data or {})
+            if not data.get("dispatched") and claim.error:
+                data.setdefault("error", claim.error)
+            self._record_pipeline_run_job(data)
+            return data
+
+        if mode != "iterate":
+            return {
+                "dispatched": False,
+                "error": f"dispatch_pipeline: unknown mode {mode!r}",
+            }
+        if pr is None:
+            return {
+                "dispatched": False,
+                "error": "dispatch_pipeline: iterate mode requires pr",
+            }
+
+        try:
+            policy, preference = load_talon_policy_preference()
+        except TalonRuntimeError as e:
+            return {
+                "dispatched": False,
+                "state": "invalid_talon_runtime",
+                "error": str(e),
+            }
+
+        repo_resolved = self._resolve_repo(repo)
+        workspace = self._workspace_path_for(repo_resolved)
+
+        unsafe_reason = (
+            self._assert_workspace_safe(workspace)
+            if policy.require_sandboxed_workspace
+            else None
+        )
+        if unsafe_reason:
+            return {
+                "dispatched": False,
+                "state": "unsafe_workspace",
+                "error": unsafe_reason,
+            }
+
+        state = self._workspace_state(repo_resolved)
+        if not state["exists"] or not state["is_git"]:
+            err_msg = (
+                f"No talon workspace exists for {repo_resolved} at "
+                f"{workspace}. The dispatcher will not operate on the "
+                "running agent's source tree. Call "
+                "talon_setup_workspace(repo) to provision a sandboxed "
+                "clone, then retry."
+            )
+            return {
+                "dispatched": False,
+                "state": "workspace_not_provisioned",
+                "error": err_msg,
+                "workspace": state,
+                "next_step": f"talon_setup_workspace(repo='{repo_resolved}')",
+            }
+
+        worktree_base = (
+            os.environ.get("KESTREL_TALON_WORKTREE_BASE")
+            or str(workspace.parent)
+        )
+
+        try:
+            execution = TalonIterateExecution(
+                repo=repo_resolved,
+                pr=int(pr),
+                repo_dir=workspace,
+                worktree_base=Path(worktree_base),
+                worktree=True,
+                max_turns=preference.max_turns,
+                self_review=(
+                    parse_talon_bool(self_review, "self_review")
+                    if self_review is not None
+                    else preference.self_review
+                ),
+                demo_check=bool(demo_check),
+                eye_check=bool(eye_check),
+            )
+            invocation = build_talon_iterate_invocation(
+                TalonRuntimeRequest(),
+                execution,
+                policy=policy,
+                preference=preference,
+            )
+        except TalonRuntimeError as e:
+            return {
+                "dispatched": False,
+                "state": "talon_policy_rejected",
+                "error": str(e),
+            }
+
+        dispatch = await self._dispatch_via_cli_background(
+            invocation.argv,
+            label=f"iterate:{repo_resolved}#{pr}",
+            env=invocation.env,
+            extra_meta={
+                "repo": repo_resolved,
+                "pr": int(pr),
+                "workspace": str(workspace),
+                **invocation.metadata(),
+            },
+        )
+        self._record_pipeline_run_job(dispatch)
+        return dispatch
+
+    def _current_workflow_run_id(self) -> Optional[str]:
+        """The in-flight workflow run id (the driving Signal's ``session_id``).
+
+        Both the ``talon_run`` and ``verify_ci`` stages of a
+        ``fleet_coding_pipeline`` run dispatch through this coordinator inside
+        that run's signal context, so this is a stable key for pairing the CI
+        verification with the job the run's own dispatch produced (#2303).
+        Returns None outside a signal dispatch.
+        """
+        try:
+            from kestrel_sovereign.signals.context import get_current_signal
+
+            signal = get_current_signal()
+        except Exception:  # pragma: no cover - defensive import guard
+            return None
+        run_id = getattr(signal, "session_id", None) if signal is not None else None
+        return run_id if isinstance(run_id, str) and run_id else None
+
+    def _record_pipeline_run_job(self, dispatch: Any) -> None:
+        """Bind the current workflow run to the talon job it just dispatched.
+
+        Durable with the same guarantees as the job registry (#2303, fifth
+        pass): besides the in-memory ``_pipeline_run_jobs`` map, the binding is
+        stamped onto the persisted job record (``workflow_run_id``) and flushed
+        via :meth:`_persist_jobs`. :meth:`_reload_persisted_jobs` reconstructs
+        the map from those records on boot, so a restart between the
+        ``talon_run`` and ``verify_ci`` stages still resolves this run's own job
+        instead of failing closed on a lost in-memory map.
+        """
+        if not isinstance(dispatch, dict) or not dispatch.get("dispatched"):
+            return
+        job_id = dispatch.get("job_id") or dispatch.get("task_id")
+        run_id = self._current_workflow_run_id()
+        if not (isinstance(job_id, str) and job_id and run_id):
+            return
+        self._pipeline_run_jobs[run_id] = job_id
+        info = self._jobs.get(job_id)
+        if isinstance(info, dict):
+            # Persist the binding on the job record so it survives a restart
+            # (only cli_background rows are persisted — exactly the durable
+            # ``wait: false`` dispatch path this pipeline uses).
+            info["workflow_run_id"] = run_id
+            self._persist_jobs()
+
+    async def verify_pipeline_ci(
+        self,
+        *,
+        repo: Optional[str] = None,
+        run_id: Optional[str] = None,
+        poll_interval_seconds: int = 15,
+        max_ci_wait_seconds: int = 1800,
+        max_job_wait_seconds: int = MAX_HANDLE_WAIT_SECONDS,
+        required_checks: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Confirm the CI of the PR THIS pipeline's talon run produced is green.
+
+        The verify seam behind the ``fleet_ci_probe`` signal source (#2303).
+        Verification is bound to the *dispatched run's own output* — never a
+        caller-supplied branch, job id, or repo/issue correlation. It resolves
+        the talon job **exclusively** from the coordinator's run_id→job_id map
+        (recorded at dispatch time by :meth:`_record_pipeline_run_job`), keyed
+        by the workflow run's ``session_id``. The workflows runner sets that
+        ``session_id`` to the run id, and the caller cannot control it — so no
+        payload field can redirect verification to a different job. It then
+        resolves that job's PR, reads the PR's head branch from GitHub, and
+        polls the PR head's CI (reusing the workflows ``ci_green`` gate
+        machinery).
+
+        This method absorbs the wait for the coding run to finish (#2303,
+        sixth pass). The ``talon_run`` stage dispatches ``wait: false`` and
+        returns within seconds; the workflows runner has **no** primitive that
+        parks a ``signal_status_ok`` stage on the ``talon:<job_id>`` waitable
+        the dispatch hands back (only ``consent_collect`` / ``council_approve``
+        gates induce WAITING), so the SEQUENTIAL edge fires ``verify_ci``
+        immediately, while the (hour-plus) coding job is still running. This
+        method therefore first does a fast point-in-time reap (settling a job
+        that already finished — including one recovered across a restart from
+        its exit sidecar), and if the job is still non-terminal it waits on the
+        durable ``talon:<job_id>`` rail (the same rail ``wait('talon:...')``
+        uses) up to ``max_job_wait_seconds`` before reading its final status.
+        Only after the ceiling elapses without the job going terminal does it
+        fail closed (the run can be re-verified) — it never claims CI state for
+        an unfinished job.
+
+        Every verification fact (repo, PR number, claim/iterate mode) is read
+        from the resolved **job record** the coordinator itself established at
+        dispatch — never from caller-influenceable payload. This categorically
+        ends the untrusted-payload pattern: approval markers, branch, job id,
+        and repo/issue correlation were all caller-influenceable and are all now
+        ignored for binding (#2303, fourth-pass structural directive).
+
+        Fail-closed: returns ``{"ci_green": False, "reason": ...}`` whenever the
+        run has no bound job in the map, the job never reached a terminal state
+        within ``max_job_wait_seconds``, the job did not COMPLETE, the PR/branch
+        cannot be resolved, or CI is not observably green.
+        """
+
+        # 1. Resolve the talon job THIS run dispatched — EXCLUSIVELY from the
+        # run_id→job_id map keyed by the workflow run's session_id. No
+        # caller-supplied job_id, no (repo, issue|pr) correlation fallback: if
+        # the map has no entry for this run_id, fail closed (#2303).
+        effective_run_id = run_id or self._current_workflow_run_id()
+        if not effective_run_id:
+            return {
+                "ci_green": False,
+                "repo": self._resolve_repo(repo) if repo else repo,
+                "reason": "no_workflow_run_id",
+            }
+        target_id = self._pipeline_run_jobs.get(effective_run_id)
+        if not target_id or target_id not in self._jobs:
+            return {
+                "ci_green": False,
+                "repo": self._resolve_repo(repo) if repo else repo,
+                "run_id": effective_run_id,
+                "reason": "no_run_bound_job",
+            }
+
+        # Every verification fact is read from the job record the coordinator
+        # established at dispatch, never from caller payload.
+        info = self._jobs.get(target_id) or {}
+        repo_resolved = self._resolve_repo(info.get("repo") or repo or "")
+        job_issue = info.get("issue")
+        job_pr = info.get("pr")
+        # A job dispatched in iterate mode records its target ``pr``; a claim
+        # job records its ``issue``. Derive the mode from the job, not payload.
+        job_mode = "iterate" if job_pr is not None else "claim"
+
+        def _fail(reason: str, **extra: Any) -> Dict[str, Any]:
+            return {
+                "ci_green": False,
+                "repo": repo_resolved,
+                "issue": job_issue,
+                "pr": job_pr,
+                "job_id": target_id,
+                "reason": reason,
+                **extra,
+            }
+
+        from kestrel_sovereign.signals.sources.talon_pipeline import (
+            _await_completion,
+            _find_pr_url,
+        )
+
+        # 2. Ensure the talon job is terminal before verifying its PR's CI
+        # (#2303, sixth pass). Fast path: a point-in-time reap settles a job
+        # that already finished (reaping its process handle / exit sidecar —
+        # this also recovers a job whose process finished across a restart).
+        if self._reap_cli_job(info):
+            self._persist_jobs()
+        final_status = info.get("status")
+
+        if final_status not in _TERMINAL_TALON_STATES:
+            # Still running. The ``talon_run`` stage dispatched ``wait: false``
+            # and the workflows runner has no primitive that parks a
+            # ``signal_status_ok`` stage on the ``talon:<job_id>`` waitable, so
+            # ``verify_ci`` fires seconds after dispatch while the (hour-plus)
+            # coding job is still going. Absorb the wait HERE, on the durable
+            # rail the dispatch handed back — the same one ``wait('talon:...')``
+            # drives — up to the held-turn ceiling. Failing closed instead
+            # would make the pipeline never go green for any real run.
+            try:
+                await _await_completion(self, target_id, max_job_wait_seconds)
+            except Exception as exc:  # noqa: BLE001 - fail closed on wait error
+                return _fail(f"job_wait_error:{exc}", job_id=target_id)
+            # The wait rail reaps + persists in place (and may reload the job
+            # dict across a restart), so re-read the record for its final state.
+            info = self._jobs.get(target_id) or info
+            final_status = info.get("status")
+
+        if final_status not in _TERMINAL_TALON_STATES:
+            # The job outlasted the ceiling. Fail closed — the run can be
+            # re-verified — rather than claim CI state for an unfinished job.
+            return _fail(
+                f"job_still_running:{final_status or 'unknown'}",
+                job_id=target_id,
+                detail=(
+                    f"talon job did not reach a terminal state within "
+                    f"{max_job_wait_seconds}s; watch it via "
+                    f"wait('talon:{target_id}') (fail closed)"
+                ),
+            )
+
+        # 2b. Require the talon job to have SUCCEEDED before polling CI. A job
+        # that ended terminal-failed (``failed`` / ``reject`` /
+        # ``finished_unknown``) may still have opened a PR whose checks are
+        # green; treating that as ``ci_green`` would greenlight a failed run.
+        # Only ``complete`` proceeds to CI verification (#2303, fail closed).
+        if final_status != _SUCCESSFUL_TALON_STATE:
+            return _fail(
+                f"job_not_complete:{final_status or 'unknown'}", job_id=target_id
+            )
+
+        # 3. Resolve the PR the talon job opened. In iterate mode the job record
+        # already carries its target ``pr``; else parse it from the PR the job
+        # opened. Both come from the job the coordinator dispatched, not payload.
+        pr_url = _find_pr_url(self, target_id)
+        target_pr = int(job_pr) if (job_mode == "iterate" and job_pr) else None
+        if target_pr is None:
+            target_pr = _pr_number_from_url(pr_url)
+        if target_pr is None:
+            return _fail("pr_not_found", job_id=target_id, pr_url=pr_url)
+
+        # 4. Resolve the PR's head branch from GitHub — never a caller branch.
+        head = self._github_pr_head(repo_resolved, target_pr)
+        if not head or not head.get("ref"):
+            return _fail("pr_head_unresolved", job_id=target_id, pr=target_pr)
+        branch = str(head["ref"])
+
+        # 5. Poll the PR head branch's CI, reusing the workflows ci_green gate.
+        try:
+            from kestrel_feature_workflows.models import Gate
+            from kestrel_feature_workflows.runner import (
+                _ci_marker_green,
+                _default_ci_green_provider,
+            )
+        except Exception as exc:  # noqa: BLE001 - workflows feature is optional
+            return _fail(
+                f"ci_green_unavailable:{exc}",
+                job_id=target_id,
+                pr=target_pr,
+                branch=branch,
+            )
+
+        gate_params: Dict[str, Any] = {
+            "repo": repo_resolved,
+            "branch": branch,
+            "poll_interval_seconds": poll_interval_seconds,
+            "max_wait_seconds": max_ci_wait_seconds,
+        }
+        if required_checks:
+            gate_params["required_checks"] = list(required_checks)
+        gate = Gate(type="ci_green", params=gate_params)
+        marker = await _default_ci_green_provider(gate, None)
+        green = _ci_marker_green(gate, marker)
+        marker_status = marker.get("status") if isinstance(marker, dict) else None
+        return {
+            "ci_green": bool(green),
+            "repo": repo_resolved,
+            "issue": job_issue,
+            "pr": target_pr,
+            "pr_url": pr_url,
+            "branch": branch,
+            "head_sha": head.get("sha"),
+            "job_id": target_id,
+            "marker_status": marker_status,
+            "reason": None if green else (marker_status or "ci_not_green"),
+        }
+
+    def _github_pr_head(self, repo: str, pr: int) -> Optional[Dict[str, Any]]:
+        """Fetch a PR's head ``{ref, sha}`` from GitHub (read-only).
+
+        Uses the same token env as the git/clone paths. Returns None on any
+        error so the caller fails closed rather than trusting stale data.
+        """
+        token = (
+            os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GH_TOKEN")
+            or os.environ.get("GITHUB_PAT")
+        )
+        if not token:
+            return None
+        url = f"https://api.github.com/repos/{repo.strip()}/pulls/{int(pr)}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "kestrel-fleet-ci-probe",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310
+                doc = json.loads(response.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - fail closed on any GitHub error
+            return None
+        head = doc.get("head") if isinstance(doc, dict) else None
+        if not isinstance(head, dict):
+            return None
+        return {"ref": head.get("ref"), "sha": head.get("sha")}
 
     @tool(
         name="talon_file_and_claim",
@@ -2577,6 +3368,89 @@ class TalonCoordinatorFeature(Feature):
         return _wrap(report)
 
     # ------------------------------------------------------------------
+    # Internal: orchestrator identity + workflow correlation (talon#53)
+    # ------------------------------------------------------------------
+
+    def _observability_context(self) -> Dict[str, str]:
+        """The three frozen observability keys for the current dispatch.
+
+        Built at the coordinator boundary so EVERY outgoing talon
+        invocation — direct tool calls and workflow-stage signal-source
+        dispatches alike — carries the same correlation fields:
+
+        * ``KESTREL_OBSERVABILITY_ORCHESTRATOR``: the friendly agent name
+          driving this dispatch. Read off the owning agent; when the
+          dispatch runs inside a workflow stage the workflow executes on
+          this same agent, so its identity is the workflow's
+          owning/triggering identity too. Omitted (never empty-string)
+          when no real agent name is available — downstream treats null
+          as "Direct".
+        * ``KESTREL_OBSERVABILITY_WORKFLOW_RUN_ID`` /
+          ``KESTREL_OBSERVABILITY_STAGE``: only present when the dispatch
+          is running inside a ``kind == "workflow.stage"`` signal dispatch
+          (the workflows runner sets ``Signal.session_id = run.run_id``).
+          Read from the dispatcher's per-task current-signal context so
+          the coordinator needs no cooperation from individual handlers.
+        """
+        ctx: Dict[str, str] = {}
+
+        agent = getattr(self, "agent", None)
+        # Real KestrelAgent instances store the friendly name on
+        # ``_agent_name`` (there is no ``agent_name`` property) — the same
+        # attribute the rest of the codebase reads first (SecurityFeature,
+        # approval_queue, lifecycle_checks, codex adapters). ``agent_name``
+        # is kept as a fallback for stubs/alternate agent shapes. Mock/stub
+        # agents can expose a non-string attribute; only a real, non-empty
+        # string is a usable identity — otherwise the key is omitted (never
+        # empty-string) and downstream renders "Direct".
+        if agent is not None:
+            for attr in ("_agent_name", "agent_name"):
+                candidate = getattr(agent, attr, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    ctx[OBSERVABILITY_ORCHESTRATOR_KEY] = candidate.strip()
+                    break
+
+        try:
+            from kestrel_sovereign.signals.context import get_current_signal
+            signal = get_current_signal()
+        except Exception:  # pragma: no cover - defensive import guard
+            signal = None
+        if signal is not None and getattr(signal, "kind", None) == "workflow.stage":
+            run_id = getattr(signal, "session_id", None)
+            if isinstance(run_id, str) and run_id:
+                ctx[OBSERVABILITY_WORKFLOW_RUN_ID_KEY] = run_id
+            stage = self._stage_name_from_signal(signal)
+            if stage:
+                ctx[OBSERVABILITY_STAGE_KEY] = stage
+        return ctx
+
+    @staticmethod
+    def _stage_name_from_signal(signal: Any) -> Optional[str]:
+        """Best-effort workflow stage name off a ``workflow.stage`` Signal.
+
+        The workflows runner injects ``workflow_stage_name`` into the payload
+        only for ``feature_features.*`` sources, so fall back to the causation
+        frame it always emits (``source = "workflow.<spec>.<stage>"``): strip
+        the known ``workflow.<spec>.`` prefix by splitting on the first two
+        dots so a stage name that itself contains dots (the workflows name
+        grammar permits them, e.g. ``deploy.v2``) survives intact.
+        """
+        payload = getattr(signal, "payload", None)
+        if isinstance(payload, dict):
+            stage = payload.get("workflow_stage_name")
+            if isinstance(stage, str) and stage:
+                return stage
+        for frame in reversed(list(getattr(signal, "causation_chain", None) or [])):
+            frame_source = getattr(frame, "source", None)
+            if isinstance(frame_source, str) and frame_source.startswith(
+                "workflow."
+            ):
+                parts = frame_source.split(".", 2)
+                if len(parts) == 3 and parts[2]:
+                    return parts[2]
+        return None
+
+    # ------------------------------------------------------------------
     # Internal: Mesh dispatch (preferred)
     # ------------------------------------------------------------------
 
@@ -2609,6 +3483,17 @@ class TalonCoordinatorFeature(Feature):
             f"({title or 'no title'}). Take the work and report back "
             f"via task completion."
         )
+        metadata: Dict[str, Any] = {
+            "sender": sender,
+            "skill": "workflow.assign",
+            "repo": repo,
+            "issue_number": issue_number,
+            "issue_title": title or f"#{issue_number}",
+        }
+        # Orchestrator identity + workflow correlation (kestrel-talon#53):
+        # carried as structured metadata fields on the A2A message so the
+        # talon daemon can map them into its invocation context.
+        metadata.update(self._observability_context())
         payload = json.dumps({
             "id": task_id,
             "sessionId": session_id,
@@ -2616,13 +3501,7 @@ class TalonCoordinatorFeature(Feature):
                 "role": "user",
                 "parts": [{"type": "text", "text": body}],
             },
-            "metadata": {
-                "sender": sender,
-                "skill": "workflow.assign",
-                "repo": repo,
-                "issue_number": issue_number,
-                "issue_title": title or f"#{issue_number}",
-            },
+            "metadata": metadata,
         }).encode("utf-8")
 
         url = f"{host_url}/api/agents/talon/api/agent/tasks/send"
@@ -3006,6 +3885,12 @@ class TalonCoordinatorFeature(Feature):
             # Reloaded jobs have no live process handle.
             info.pop("process", None)
             self._jobs[jid] = info
+            # Reconstruct the workflow run→job binding (#2303, fifth pass) so a
+            # restart between the talon_run and verify_ci stages still resolves
+            # this run's own job. In-process bindings win (setdefault).
+            run_id = info.get("workflow_run_id")
+            if isinstance(run_id, str) and run_id:
+                self._pipeline_run_jobs.setdefault(run_id, jid)
 
     async def _survey_stalled_talon_jobs(
         self, stale_days: Any = 3,
@@ -3089,6 +3974,14 @@ class TalonCoordinatorFeature(Feature):
                 env = self._build_subprocess_env()
             except RuntimeError as e:
                 return {"dispatched": False, "error": str(e)}
+
+        # Orchestrator identity + workflow correlation (kestrel-talon#53):
+        # set as process env vars on the spawned talon process. Stamped here
+        # — the single CLI dispatch funnel — so claim, batch, iterate, and
+        # every workflow-stage source carry them without per-caller wiring.
+        observability = self._observability_context()
+        if observability:
+            env = {**env, **observability}
 
         job_id = uuid.uuid4().hex
         log_path = self._job_log_dir() / f"{job_id}.log"
@@ -3180,6 +4073,11 @@ class TalonCoordinatorFeature(Feature):
             env = self._build_subprocess_env()
         except RuntimeError as e:
             return {"dispatched": False, "error": str(e)}
+
+        # Same env stamping as the background funnel (kestrel-talon#53).
+        observability = self._observability_context()
+        if observability:
+            env = {**env, **observability}
 
         cmd = [talon_bin] + args
         try:
