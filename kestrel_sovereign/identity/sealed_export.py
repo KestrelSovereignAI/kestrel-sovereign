@@ -452,30 +452,49 @@ def seal_identity_package(
         ) from e
 
 
-def is_sealed_identity_export(serialized: str) -> bool:
-    """True if ``serialized`` is a sealed-capsule envelope (as opposed
-    to a legacy plaintext identity-package JSON). Detection is by the
-    envelope's ``format`` field; non-JSON input returns False and is
-    left for the plaintext path to reject."""
-    if not isinstance(serialized, str):
+def _as_text(serialized) -> Optional[str]:
+    """Normalize str/bytes input to text. Returns None for anything
+    else. Bytes are accepted because ``Path.read_bytes()`` and network
+    reads are common capsule sources, and ``json.loads`` would accept
+    them too — so the capsule detectors MUST see them or a byte-encoded
+    capsule could slip past into the plaintext parser."""
+    if isinstance(serialized, str):
+        return serialized
+    if isinstance(serialized, (bytes, bytearray)):
+        try:
+            return bytes(serialized).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
+def is_sealed_identity_export(serialized) -> bool:
+    """True if ``serialized`` (str or bytes) is a sealed-capsule
+    envelope (as opposed to a legacy plaintext identity-package JSON).
+    Detection is by the envelope's ``format`` field; non-JSON input
+    returns False and is left for the plaintext path to reject."""
+    text = _as_text(serialized)
+    if text is None:
         return False
     try:
-        data = json.loads(serialized)
+        data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return False
     return isinstance(data, dict) and data.get("format") == CAPSULE_FORMAT_ID
 
 
-def _looks_like_tampered_capsule(serialized: str) -> bool:
-    """True if ``serialized`` carries capsule envelope fields but does
-    NOT match the exact format id — i.e. a sealed capsule whose
-    ``format`` was stripped or altered in transit. Such input must be
-    rejected, never downgraded to the plaintext identity-package parser
-    (which would silently produce an empty package)."""
-    if not isinstance(serialized, str):
+def _looks_like_tampered_capsule(serialized) -> bool:
+    """True if ``serialized`` (str or bytes) carries capsule envelope
+    fields but does NOT match the exact format id — i.e. a sealed
+    capsule whose ``format`` was stripped or altered in transit. Such
+    input must be rejected, never downgraded to the plaintext
+    identity-package parser (which would silently produce an empty
+    package)."""
+    text = _as_text(serialized)
+    if text is None:
         return False
     try:
-        data = json.loads(serialized)
+        data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return False
     if not isinstance(data, dict) or data.get("format") == CAPSULE_FORMAT_ID:
@@ -539,13 +558,13 @@ def unseal_identity_package(
 
 
 def open_identity_export(
-    serialized: str,
+    serialized,
     *,
     kem_keypair: Optional[HybridKEMKeypair] = None,
     slug: Optional[str] = None,
     storage_dir: Optional[Path] = None,
 ) -> AgentIdentityPackage:
-    """Parse an identity export, sealed or plaintext.
+    """Parse an identity export (str or bytes), sealed or plaintext.
 
     - Sealed capsule → unseal with ``kem_keypair`` if provided, else
       load the local keypair for ``slug`` from ``storage_dir``. A
@@ -553,6 +572,13 @@ def open_identity_export(
     - Legacy plaintext JSON → routed straight to
       ``AgentIdentityPackage.from_json`` (path unchanged).
     """
+    # Normalize bytes → str at the boundary: json.loads (inside
+    # from_json) accepts bytes, so without this a byte-encoded capsule
+    # would slip past the detectors into the plaintext parser and
+    # deserialize as an empty package (codex round 8, fail-closed).
+    text = _as_text(serialized)
+    if text is not None:
+        serialized = text
     if is_sealed_identity_export(serialized):
         if kem_keypair is None:
             if slug is None:

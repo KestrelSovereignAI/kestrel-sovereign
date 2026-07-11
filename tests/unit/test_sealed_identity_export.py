@@ -710,3 +710,30 @@ def test_partial_capsule_fingerprint_rejected():
     tampered = _json.dumps({"kem": {"whatever": 1}})
     with pytest.raises(SealedExportError, match="tampered"):
         open_identity_export(tampered)
+
+
+def test_bytes_capsule_not_downgraded_to_plaintext():
+    """A sealed capsule passed as BYTES (e.g. Path.read_bytes()) must be
+    unsealed/rejected, never fall through to the plaintext parser as an
+    empty package (codex round 8)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.security.sealed_capsule import seal_capsule
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, is_sealed_identity_export, open_identity_export,
+    )
+
+    kp = generate_hybrid_kem_keypair()
+    capsule = seal_capsule(
+        b'{"did": "did:web:x:y", "agent_name": "Y", "created_at": "t", '
+        b'"constitution_hash": "h", "constitution_text": "c"}',
+        recipient_classical_public_key=kp.classical.public_key,
+        recipient_pq_public_key=kp.pq.public_key,
+    )
+    capsule_bytes = capsule.encode("utf-8")
+    assert is_sealed_identity_export(capsule_bytes)
+    # No KEM keys provided → fails closed (not a silent empty package)
+    with pytest.raises(SealedExportError, match="SEALED"):
+        open_identity_export(capsule_bytes)
+    # With keys, it round-trips
+    pkg = open_identity_export(capsule_bytes, kem_keypair=kp)
+    assert pkg.did == "did:web:x:y"
