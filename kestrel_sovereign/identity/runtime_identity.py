@@ -517,11 +517,24 @@ def _load_born_hybrid(
         public_key=storage.load_secret_bytes(archival_pub_id),
     )
 
+    # new_verification_methods drives signing-package VMs and mandate
+    # signing — it must contain ONLY signing methods. A DID document may
+    # also publish KEM keyAgreement methods (#2398 sealed-capsule
+    # recipients); including those would make hybrid package signatures
+    # unverifiable (the verifier rejects VMs whose multicodec isn't a
+    # signing suite). parse_did_document already dropped KEM methods, so
+    # filter the raw array down to the signing kids it returned.
+    signing_kids = {kid for kid, _suite, _pub in parsed_vms}
+    signing_vms = [
+        vm for vm in (did_document.get("verificationMethod") or [])
+        if isinstance(vm, dict) and vm.get("id") in signing_kids
+    ]
+
     logger.info(f"Loaded born-hybrid agent identity: {new_did}")
     return AgentIdentity(
         hybrid_keypair=hybrid,
         new_did=new_did,
-        new_verification_methods=list(did_document.get("verificationMethod") or []),
+        new_verification_methods=signing_vms,
         archival_keypair=archival_kp,
     )
 

@@ -620,3 +620,58 @@ def test_unseal_rejects_non_string_did():
     )
     with pytest.raises(SealedExportError, match="no valid agent DID"):
         unseal_identity_package(capsule, kp)
+
+
+@pytest.mark.asyncio
+async def test_kem_publishing_agent_still_signs_verifiable_packages(tmp_path, monkeypatch):
+    """A born-hybrid agent that ALSO published KEM keyAgreement methods
+    in its DID doc must still produce verifiable hybrid identity
+    packages — new_verification_methods excludes KEM VMs (codex r6)."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv("KESTREL_DID_WEB_DOMAIN", "agents.kestrel-sovereign.test")
+    monkeypatch.delenv("KESTREL_IDENTITY_METHOD", raising=False)
+    import json as _json
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.signing import sign_package, verify_package_signature
+    from kestrel_sovereign.identity.sealed_export import (
+        generate_agent_kem_keypair, agent_kem_public_multibases,
+    )
+
+    creds = await create_kestrel_identity_async(
+        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md",
+        agent_name="Publisher",
+    )
+    slug = creds.agent_did.rsplit(":", 1)[-1]
+
+    # Publish KEM keyAgreement methods into the on-disk DID document
+    kem = generate_agent_kem_keypair(slug, tmp_path)
+    c_mb, pq_mb = agent_kem_public_multibases(kem)
+    did_path = next(tmp_path.glob("*_did.json"))
+    doc = _json.loads(did_path.read_text())
+    doc["verificationMethod"].append(
+        {"id": f"{creds.agent_did}#kem-1", "type": "Multikey", "publicKeyMultibase": c_mb})
+    doc["verificationMethod"].append(
+        {"id": f"{creds.agent_did}#kem-2", "type": "Multikey", "publicKeyMultibase": pq_mb})
+    doc["keyAgreement"] = [f"{creds.agent_did}#kem-1", f"{creds.agent_did}#kem-2"]
+    did_path.write_text(_json.dumps(doc))
+
+    ident = load_agent_identity(None, storage_dir=tmp_path)
+    # Only signing VMs are exposed for signing
+    assert len(ident.new_verification_methods) == 2
+    algs = set()
+    from kestrel_sovereign.security.multikey import multibase_to_public_key
+    for vm in ident.new_verification_methods:
+        suite, _ = multibase_to_public_key(vm["publicKeyMultibase"])
+        algs.add(suite.alg_id)
+    assert algs == {"ed25519", "ml-dsa-65"}
+
+    package = AgentIdentityPackage(
+        did=creds.agent_did, agent_name="Publisher",
+        created_at="2026-07-11T00:00:00Z",
+        constitution_hash="h", constitution_text="c",
+    )
+    signed = sign_package(package, storage_dir=tmp_path)
+    ok, msg = verify_package_signature(signed, storage_dir=tmp_path)
+    assert ok, msg
