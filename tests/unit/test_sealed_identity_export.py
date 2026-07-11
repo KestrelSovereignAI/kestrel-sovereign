@@ -508,3 +508,62 @@ def test_open_export_rejects_format_stripped_capsule():
     del envelope["format"]  # tamper: strip the format id
     with pytest.raises(SealedExportError, match="tampered"):
         open_identity_export(_json.dumps(envelope), kem_keypair=kp)
+
+
+def test_did_parser_skips_kem_key_agreement_methods():
+    """A born-hybrid signing identity that ALSO publishes KEM
+    keyAgreement methods must still load: parse_did_document skips KEM
+    Multikeys instead of raising on their multicodec (codex round 4)."""
+    from kestrel_sovereign.identity.did_web import build_did_document, parse_did_document
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.security.crypto_suite import get_suite
+    from kestrel_sovereign.identity.sealed_export import agent_kem_public_multibases
+
+    sign_kp = generate_hybrid_keypair()
+    did = "did:web:example.com:mixed"
+    doc = build_did_document(did, sign_kp.public_keys())
+    # Append KEM keyAgreement methods (the #2398 publication shape)
+    kem = generate_hybrid_kem_keypair()
+    c_mb, pq_mb = agent_kem_public_multibases(kem)
+    doc["verificationMethod"].append(
+        {"id": f"{did}#kem-1", "type": "Multikey", "publicKeyMultibase": c_mb})
+    doc["verificationMethod"].append(
+        {"id": f"{did}#kem-2", "type": "Multikey", "publicKeyMultibase": pq_mb})
+    doc["keyAgreement"] = [f"{did}#kem-1", f"{did}#kem-2"]
+
+    parsed = parse_did_document(doc)  # must not raise
+    algs = {suite.alg_id for _kid, suite, _pub in parsed}
+    assert "ed25519" in algs and "ml-dsa-65" in algs
+    assert "x25519" not in algs and "ml-kem-768" not in algs
+
+
+def test_colliding_fragment_relative_ref_is_not_hijacked():
+    """A relative #frag ref must resolve against THIS doc's id, not a
+    colliding fragment on an unrelated VM (codex round 4)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, agent_kem_public_multibases,
+        recipient_keys_from_did_document,
+    )
+
+    mine = generate_hybrid_kem_keypair()
+    other = generate_hybrid_kem_keypair()
+    my_c, my_pq = agent_kem_public_multibases(mine)
+    other_c, _ = agent_kem_public_multibases(other)
+    did = "did:web:example.com:me"
+    doc = {
+        "id": did,
+        "verificationMethod": [
+            {"id": f"{did}#kem-1", "type": "Multikey", "publicKeyMultibase": my_c},
+            {"id": f"{did}#kem-2", "type": "Multikey", "publicKeyMultibase": my_pq},
+            # A colliding fragment on a DIFFERENT did — must not be picked
+            {"id": "did:web:evil.example#kem-1", "type": "Multikey",
+             "publicKeyMultibase": other_c},
+        ],
+        "keyAgreement": [f"{did}#kem-1", f"{did}#kem-2"],
+    }
+    keys = recipient_keys_from_did_document(doc)
+    # Resolved against doc id → MY classical key, not evil's
+    assert keys.classical_public_key.public_bytes_raw() == \
+        mine.classical.public_key.public_bytes_raw()
