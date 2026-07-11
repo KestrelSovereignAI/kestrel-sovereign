@@ -1639,16 +1639,22 @@ window.loadConversation = async function(sessionId, options = {}) {
     const host = API.getHostAgent();
     const loadToken = ++conversationLoadSeq;
 
-    // Roll the selection back to the session the pane ACTUALLY renders (not
-    // the previously *pending* selection — that one may itself have never
-    // rendered). No-ops when a newer load owns the UI.
+    // Roll the selection back to the session the CAPTURED host's pane actually
+    // renders (not the previously *pending* selection — that one may itself
+    // have never rendered, and not the global currentSessionId — the operator
+    // may have switched to another agent mid-load, #2380 codex round 5).
+    // No-ops when a newer load owns the UI; only repaints the visible
+    // selection when the captured host still owns the visible pane.
     const rollbackToRendered = () => {
         if (loadToken !== conversationLoadSeq) return;
-        const rendered = state.currentSessionId || null;
-        activeConversationId = rendered;
+        const pane = state.chatPanes.get(host);
+        const rendered = (pane && pane.sessionId) || null;
         if (rendered == null) activeConversationIdsByAgent.delete(host);
         else activeConversationIdsByAgent.set(host, rendered);
-        applyHighlight(rendered);
+        if (API.getHostAgent() === host) {
+            activeConversationId = rendered;
+            applyHighlight(rendered);
+        }
     };
 
     const applyHighlight = (sid) => {
@@ -1719,6 +1725,16 @@ window.loadConversation = async function(sessionId, options = {}) {
         // token — drop this load entirely (its render would clobber the newer
         // conversation's pane).
         if (loadToken !== conversationLoadSeq) {
+            return;
+        }
+
+        // Host recheck after the SECOND await (#2380 codex round 5 P1): an
+        // agent switch doesn't necessarily start another conversation load, so
+        // the token check alone can't catch it — and proceeding would wipe the
+        // captured host's pane while assigning state.currentSessionId through
+        // the NEWLY-visible agent's pane. (Covers the no-expectedAgent callers
+        // too; the expectedAgent guards above only ran for pinned loads.)
+        if (API.getHostAgent() !== host) {
             return;
         }
 
