@@ -212,12 +212,15 @@ def recipient_keys_from_did_document(did_document: Dict[str, Any]) -> RecipientK
     pq: List[tuple] = []
     for entry in key_agreement:
         if isinstance(entry, str):
-            # DID Core resolution: an exact absolute id, or a relative
-            # "#fragment" against THIS document's id. No global fragment
-            # search — that could bind to another DID's key.
-            vm = vm_by_id.get(entry)
-            if vm is None and entry.startswith("#") and doc_id:
-                vm = vm_by_id.get(doc_id + entry)
+            # DID Core resolution. A relative "#fragment" resolves ONLY
+            # against this document's id — never against a VM whose raw
+            # id happens to be "#fragment" (a malformed/injected VM must
+            # not be selectable). An absolute reference is an exact id
+            # match.
+            if entry.startswith("#"):
+                vm = vm_by_id.get(doc_id + entry) if doc_id else None
+            else:
+                vm = vm_by_id.get(entry)
             if vm is None:
                 # A dangling reference is a malformed document; note it
                 # but keep scanning — the required-key check below is
@@ -478,7 +481,11 @@ def _looks_like_tampered_capsule(serialized: str) -> bool:
     if not isinstance(data, dict) or data.get("format") == CAPSULE_FORMAT_ID:
         return False
     # The capsule envelope's structural fingerprint (see sealed_capsule).
-    return "kem" in data and "ciphertext" in data
+    # EITHER field is enough: a legitimate identity package never carries
+    # a top-level "kem" or "ciphertext", so their presence on a
+    # non-matching-format object means a stripped/altered capsule — even
+    # if the other field was also stripped in the same tamper.
+    return "kem" in data or "ciphertext" in data
 
 
 def unseal_identity_package(

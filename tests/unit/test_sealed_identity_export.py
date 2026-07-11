@@ -675,3 +675,38 @@ async def test_kem_publishing_agent_still_signs_verifiable_packages(tmp_path, mo
     signed = sign_package(package, storage_dir=tmp_path)
     ok, msg = verify_package_signature(signed, storage_dir=tmp_path)
     assert ok, msg
+
+
+def test_malformed_relative_vm_id_not_selectable():
+    """A VM whose raw id is the relative '#kem-1' must not satisfy a
+    '#kem-1' keyAgreement ref — only <doc-id>#kem-1 resolves (r7)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, agent_kem_public_multibases,
+        recipient_keys_from_did_document,
+    )
+    evil = generate_hybrid_kem_keypair()
+    ec, epq = agent_kem_public_multibases(evil)
+    did = "did:web:example.com:me"
+    doc = {
+        "id": did,
+        "verificationMethod": [
+            {"id": "#kem-1", "type": "Multikey", "publicKeyMultibase": ec},
+            {"id": "#kem-2", "type": "Multikey", "publicKeyMultibase": epq},
+        ],
+        "keyAgreement": ["#kem-1", "#kem-2"],
+    }
+    with pytest.raises(SealedExportError):
+        recipient_keys_from_did_document(doc)
+
+
+def test_partial_capsule_fingerprint_rejected():
+    """A capsule stripped of format AND ciphertext (only 'kem' left)
+    must still fail closed, not parse as an empty package (r7)."""
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, open_identity_export,
+    )
+    import json as _json
+    tampered = _json.dumps({"kem": {"whatever": 1}})
+    with pytest.raises(SealedExportError, match="tampered"):
+        open_identity_export(tampered)
