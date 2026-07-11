@@ -483,7 +483,7 @@ def test_unseal_rejects_empty_object_payload():
         recipient_classical_public_key=kp.classical.public_key,
         recipient_pq_public_key=kp.pq.public_key,
     )
-    with pytest.raises(SealedExportError, match="no agent DID"):
+    with pytest.raises(SealedExportError, match="no valid agent DID"):
         unseal_identity_package(capsule, kp)
 
 
@@ -567,3 +567,56 @@ def test_colliding_fragment_relative_ref_is_not_hijacked():
     # Resolved against doc id → MY classical key, not evil's
     assert keys.classical_public_key.public_bytes_raw() == \
         mine.classical.public_key.public_bytes_raw()
+
+
+def test_relative_ref_without_self_vm_fails_closed():
+    """A relative '#kem-1' with no <doc-id>#kem-1 VM must fail closed —
+    never borrow a foreign VM that merely shares the fragment
+    (codex round 5, P1)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, agent_kem_public_multibases,
+        recipient_keys_from_did_document,
+    )
+
+    other = generate_hybrid_kem_keypair()
+    other_c, other_pq = agent_kem_public_multibases(other)
+    did = "did:web:example.com:me"
+    doc = {
+        "id": did,
+        "verificationMethod": [
+            # Only FOREIGN VMs carry the #kem-* fragments
+            {"id": "did:web:evil.example#kem-1", "type": "Multikey",
+             "publicKeyMultibase": other_c},
+            {"id": "did:web:evil.example#kem-2", "type": "Multikey",
+             "publicKeyMultibase": other_pq},
+        ],
+        "keyAgreement": ["#kem-1", "#kem-2"],
+    }
+    with pytest.raises(SealedExportError):
+        recipient_keys_from_did_document(doc)
+
+
+def test_unseal_rejects_non_string_did():
+    """A sealed payload with a truthy non-string did (e.g. 123) must
+    fail closed, not leak a TypeError from downstream import (codex
+    round 5, P2)."""
+    import json as _json
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.security.sealed_capsule import seal_capsule
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, unseal_identity_package,
+    )
+
+    kp = generate_hybrid_kem_keypair()
+    payload = _json.dumps({
+        "did": 123, "agent_name": "X", "created_at": "t",
+        "constitution_hash": "h", "constitution_text": "c",
+    }).encode()
+    capsule = seal_capsule(
+        payload,
+        recipient_classical_public_key=kp.classical.public_key,
+        recipient_pq_public_key=kp.pq.public_key,
+    )
+    with pytest.raises(SealedExportError, match="no valid agent DID"):
+        unseal_identity_package(capsule, kp)

@@ -188,28 +188,15 @@ def recipient_keys_from_did_document(did_document: Dict[str, Any]) -> RecipientK
             f"DID document must be a dict; got {type(did_document).__name__}"
         )
 
-    # Index VMs by absolute id. DID Core allows relative DID-URL
-    # references (keyAgreement: ["#kem-1"]) resolved against this
-    # document's ``id``. A "#fragment" alias is only built when the
-    # fragment is UNIQUE across VMs — otherwise resolving a bare
-    # fragment could silently pick the wrong key (e.g. a colliding
-    # did:web:other#kem-1) and seal to the wrong recipient.
+    # Index VMs by absolute id only. Relative keyAgreement references
+    # ("#kem-1") resolve strictly against THIS document's ``id`` — never
+    # by a global fragment search, which could match an unrelated
+    # did:web:other#kem-1 and seal the export to the wrong recipient.
     doc_id = did_document.get("id") or ""
     vm_by_id: Dict[str, Dict[str, Any]] = {}
-    fragment_counts: Dict[str, int] = {}
     for vm in did_document.get("verificationMethod") or []:
         if isinstance(vm, dict) and vm.get("id"):
-            vm_id = vm["id"]
-            vm_by_id[vm_id] = vm
-            if "#" in vm_id:
-                frag = vm_id.rsplit("#", 1)[-1]
-                fragment_counts[frag] = fragment_counts.get(frag, 0) + 1
-    vm_by_fragment: Dict[str, Dict[str, Any]] = {}
-    for vm in did_document.get("verificationMethod") or []:
-        if isinstance(vm, dict) and vm.get("id") and "#" in vm["id"]:
-            frag = vm["id"].rsplit("#", 1)[-1]
-            if fragment_counts.get(frag) == 1:
-                vm_by_fragment["#" + frag] = vm
+            vm_by_id[vm["id"]] = vm
 
     key_agreement = did_document.get("keyAgreement") or []
     if not isinstance(key_agreement, list) or not key_agreement:
@@ -225,16 +212,12 @@ def recipient_keys_from_did_document(did_document: Dict[str, Any]) -> RecipientK
     pq: List[tuple] = []
     for entry in key_agreement:
         if isinstance(entry, str):
-            # Resolution order (DID Core): exact absolute id, then a
-            # relative "#fragment" against THIS document's id, then a
-            # unique-fragment alias as a last resort. Resolving against
-            # doc_id first prevents a colliding fragment from another
-            # DID from hijacking the reference.
+            # DID Core resolution: an exact absolute id, or a relative
+            # "#fragment" against THIS document's id. No global fragment
+            # search — that could bind to another DID's key.
             vm = vm_by_id.get(entry)
             if vm is None and entry.startswith("#") and doc_id:
                 vm = vm_by_id.get(doc_id + entry)
-            if vm is None and "#" in entry:
-                vm = vm_by_fragment.get("#" + entry.rsplit("#", 1)[-1])
             if vm is None:
                 # A dangling reference is a malformed document; note it
                 # but keep scanning — the required-key check below is
@@ -539,10 +522,11 @@ def unseal_identity_package(
     # empty did. Reject it here — the sealed-export contract is
     # fail-closed, and a downstream import with allow_unsigned=True must
     # never act on a bogus empty agent (codex P2).
-    if not package.did:
+    if not isinstance(package.did, str) or not package.did:
         raise SealedExportError(
-            "capsule unsealed but the payload has no agent DID; it is "
-            "not a valid identity package (fail-closed)."
+            f"capsule unsealed but the payload has no valid agent DID "
+            f"(got {type(package.did).__name__}); it is not a valid "
+            f"identity package (fail-closed)."
         )
     return package
 
