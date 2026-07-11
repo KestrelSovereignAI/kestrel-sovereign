@@ -344,6 +344,47 @@ def generate_born_hybrid_identity(domain: str, slug: str):
     return identity.did_document, identity, archival_kp
 
 
+def _born_hybrid_identity_paths(output_dir: Path, slug: str) -> list[Path]:
+    """The five files a born-hybrid inception writes for ``slug``."""
+    return [
+        output_dir / f"{slug}_ed25519.key.enc",
+        output_dir / f"{slug}_mldsa65.bytes.enc",
+        output_dir / f"{slug}_archival_slhdsa.bytes.enc",
+        output_dir / f"{slug}_archival_slhdsa_pub.bytes.enc",
+        output_dir / f"{slug}_did.json",
+    ]
+
+
+def backup_or_refuse_existing_identity(output_dir: Path, slug: str, force: bool) -> None:
+    """Guard against silently overwriting an existing born-hybrid identity.
+
+    Key file names are deterministic from the slug, so re-running
+    inception with the same agent name would clobber the private keys —
+    and unlike the database, destroyed keys are unrecoverable. Without
+    ``force`` this refuses; with ``force`` the existing files are moved
+    to timestamped ``.backup-*`` siblings first (mirroring the DB
+    force-backup behavior) so the prior identity stays recoverable.
+    """
+    existing = [p for p in _born_hybrid_identity_paths(Path(output_dir), slug) if p.exists()]
+    if not existing:
+        return
+    if not force:
+        raise FileExistsError(
+            f"Born-hybrid identity files for slug {slug!r} already exist in "
+            f"{output_dir} ({[p.name for p in existing]}). Refusing to "
+            f"overwrite an agent's keys; pass force=True to back them up "
+            f"and mint a fresh identity."
+        )
+    import shutil
+    import time
+    import uuid
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
+    for p in existing:
+        backup = Path(f"{p}.backup-{stamp}")
+        shutil.move(str(p), backup)
+        logging.warning("Backed up existing %s → %s before re-inception.", p, backup)
+
+
 def save_born_hybrid_identity(
     did_document: dict,
     identity,
@@ -595,6 +636,13 @@ async def create_kestrel_identity_async(
                 "identity_method='did:pkh'."
             )
         slug = did_web_slug or slugify_agent_name(agent_name)
+        try:
+            backup_or_refuse_existing_identity(Path(output_dir), slug, force)
+        except FileExistsError:
+            if not using_external_db:
+                await db.close()
+                cleanup_artifacts([db_path])
+            raise
         did_document, hybrid_identity, archival_kp = generate_born_hybrid_identity(
             domain, slug,
         )

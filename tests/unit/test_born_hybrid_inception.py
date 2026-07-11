@@ -231,3 +231,70 @@ async def test_loader_refuses_incomplete_born_hybrid(tmp_path, hybrid_env):
     (tmp_path / "partial_mldsa65.bytes.enc").unlink()
     with pytest.raises(RuntimeIdentityError, match="mldsa65"):
         load_agent_identity(None, storage_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Re-inception must not clobber an existing identity (codex P2)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reinception_refuses_to_overwrite_keys_without_force(tmp_path, hybrid_env):
+    await create_kestrel_identity_async(
+        str(tmp_path), CONSTITUTION, agent_name="Keeper",
+    )
+    with pytest.raises(FileExistsError):
+        await create_kestrel_identity_async(
+            str(tmp_path), CONSTITUTION, agent_name="Keeper",
+        )
+
+
+@pytest.mark.asyncio
+async def test_reinception_with_force_backs_up_old_keys(tmp_path, hybrid_env):
+    await create_kestrel_identity_async(
+        str(tmp_path), CONSTITUTION, agent_name="Reborn",
+    )
+    old_key = (tmp_path / "reborn_ed25519.key.enc").read_bytes()
+
+    await create_kestrel_identity_async(
+        str(tmp_path), CONSTITUTION, agent_name="Reborn", force=True,
+    )
+    # Fresh identity in place, prior keys recoverable from backups
+    assert (tmp_path / "reborn_ed25519.key.enc").exists()
+    backups = list(tmp_path.glob("reborn_ed25519.key.enc.backup-*"))
+    assert backups, "expected the prior classical key to be backed up"
+    assert backups[0].read_bytes() == old_key
+    assert list(tmp_path.glob("reborn_mldsa65.bytes.enc.backup-*"))
+
+
+# ---------------------------------------------------------------------------
+# Spawn mandates from a born-hybrid parent (codex P1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_sign_mandate_with_born_hybrid_parent_no_legacy_key(tmp_path, hybrid_env):
+    from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate, verify_mandate
+
+    creds = await create_kestrel_identity_async(
+        str(tmp_path), CONSTITUTION, agent_name="Parentbird",
+    )
+    parent = load_agent_identity(None, storage_dir=tmp_path)
+    assert parent.legacy_keypair is None
+
+    mandate = SpawnMandate(
+        parent_did=creds.agent_did, purpose="hatch a helper",
+        ttl_seconds=3600, max_child_depth=1,
+    )
+    sign_mandate(mandate, None, parent_identity=parent)
+    assert mandate.parent_signature and mandate.parent_signature.startswith("hybrid:")
+    assert verify_mandate(mandate, None, parent_identity=parent)
+
+
+def test_sign_mandate_refuses_keyless_parent():
+    from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
+
+    mandate = SpawnMandate(
+        parent_did="did:web:example.com:ghost", purpose="none",
+        ttl_seconds=60, max_child_depth=1,
+    )
+    with pytest.raises(ValueError, match="neither a hybrid identity nor a legacy"):
+        sign_mandate(mandate, None, parent_identity=None)

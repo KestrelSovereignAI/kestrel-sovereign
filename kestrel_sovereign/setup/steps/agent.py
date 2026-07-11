@@ -167,6 +167,9 @@ def run(ctx: SetupContext) -> None:
         # inception so we never anchor a malformed contract.
         return
 
+    if not _ensure_did_web_domain(ctx):
+        return
+
     if not (ctx.agent_data_root / name / "kestrel_prime.db").exists():
         suffix = " (test instance)" if ctx.is_test_instance else ""
         ctx.prompter.info(
@@ -219,6 +222,53 @@ def _prompt_name(ctx: SetupContext, existing: dict) -> str:
             ctx.prompter.info("Names must be alphanumeric (with optional _ or -).")
             continue
         return name
+
+
+def _ensure_did_web_domain(ctx: SetupContext) -> bool:
+    """Born-hybrid inception (#2397) needs a did:web domain. Resolve it
+    before inception so the wizard surfaces a clear blocker (or prompt)
+    instead of a mid-inception traceback.
+
+    Returns True when inception can proceed (domain available, or the
+    operator explicitly configured the classical did:pkh method).
+    """
+    import os
+
+    from kestrel_sovereign.inception_service import (
+        DID_WEB_DOMAIN_ENV,
+        IDENTITY_METHOD_DID_WEB,
+        resolve_identity_method,
+    )
+
+    try:
+        method = resolve_identity_method(None)
+    except ValueError as exc:
+        ctx.block(str(exc))
+        return False
+    if method != IDENTITY_METHOD_DID_WEB or os.environ.get(DID_WEB_DOMAIN_ENV):
+        return True
+
+    if ctx.flow is Flow.INTERACTIVE:
+        domain = ctx.prompter.text(
+            "did:web domain for new agents' DID documents "
+            "(e.g. agents.example.com; published at "
+            "https://<domain>/<agent>/did.json)",
+            default="",
+        ).strip()
+        if domain:
+            from kestrel_sovereign.setup.env_file import write_env
+
+            os.environ[DID_WEB_DOMAIN_ENV] = domain
+            write_env(ctx.env_path, {DID_WEB_DOMAIN_ENV: domain})
+            ctx.record(f"Saved {DID_WEB_DOMAIN_ENV}={domain} to {ctx.env_path}")
+            return True
+
+    ctx.block(
+        f"Born-hybrid inception requires {DID_WEB_DOMAIN_ENV} (the domain "
+        f"for new agents' did:web DID documents). Set it in .env, or set "
+        f"KESTREL_IDENTITY_METHOD=did:pkh to mint classical identities."
+    )
+    return False
 
 
 def _prompt_autostart(ctx: SetupContext) -> bool:

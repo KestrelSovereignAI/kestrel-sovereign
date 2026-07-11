@@ -30,7 +30,7 @@ PORT="${PORT:-8080}"
 
 # Bootstrap agent identity if none exists
 mkdir -p "$AGENT_DIR"
-if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null; then
+if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null && ! ls "$AGENT_DIR"/*_did.json &>/dev/null; then
     echo "No agent identity found. Creating new Kestrel agent in ${AGENT_DIR}..."
     /app/.venv/bin/python -c "
 import sys; sys.path.insert(0, '/app')
