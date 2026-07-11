@@ -71,19 +71,19 @@ test.describe('Conversation highlight follows the clicked row (#2380)', () => {
         const convList = await request.get(`${BASE_URL}/api/conversations?limit=20`, { headers });
         expect(convList.status()).toBe(200);
         const conversations = (await convList.json()).conversations || [];
-        if (conversations.length < 2) {
-            test.skip(true, 'Need at least two conversations to test highlight movement');
-            return;
-        }
+        // The two seeds above guarantee ≥2 conversations — a shortfall means
+        // seeding misfiled (e.g. both turns landed in one session) and must
+        // FAIL, not skip (no skip-on-failure).
+        expect(conversations.length).toBeGreaterThanOrEqual(2);
         // The just-seeded newer conversation is most-recent; pick an OLDER row.
         const olderSessionId = conversations[1].session_id;
 
         // --- Drive the standalone console ------------------------------------
+        // Chat is the console's default surface (post-#2149 layout — no nav
+        // tab); the conversation list lives in the hidden `#conversations-pane`
+        // sidebar, opened via the chat-header trigger (#2171/#2216).
         await page.goto(BASE_URL);
-        await page.locator('.nav-tab').filter({ hasText: /chat/i }).click();
-
-        // #2171/#2216: the single conversation surface is the hidden
-        // `#conversations-pane` sidebar; open it via the chat-header trigger.
+        await expect(page.locator('#conversations-toggle-btn')).toBeVisible({ timeout: 15000 });
         const pane = page.locator('#conversations-pane');
         if (!(await pane.isVisible())) {
             await page.click('#conversations-toggle-btn');
@@ -96,9 +96,11 @@ test.describe('Conversation highlight follows the clicked row (#2380)', () => {
         );
         await expect(olderRow).toHaveCount(1, { timeout: 10000 });
 
-        // The auto-loaded (most-recent) row is the one initially active — and it
-        // must NOT be the older row we are about to click.
-        await expect(page.locator('.conversation-item.active')).toHaveCount(1, { timeout: 10000 });
+        // Pre-click, the older row must not be active. (Whether the auto-loaded
+        // most-recent row is already highlighted is NOT asserted — pre-fix, the
+        // clobbered legacy loader meant even auto-load painted no highlight, so
+        // pinning "exactly one active" here would fail on setup rather than on
+        // the behavior under test. The click below is the load-bearing check.)
         await expect(olderRow).not.toHaveClass(/\bactive\b/);
 
         // --- Click the older row: the highlight must MOVE to it --------------
