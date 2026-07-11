@@ -1176,6 +1176,10 @@ window.selectAgent = async function(agentName) {
 
 let activeConversationId = null;
 const activeConversationIdsByAgent = new Map();
+// Monotonic load-request counter for window.loadConversation (#2380): the
+// latest call holds the token; earlier in-flight loads detect supersession by
+// comparing their captured token against it.
+let conversationLoadSeq = 0;
 
 // #2199: the ONE mount handle for the standalone conversations pane. All list
 // fetch / refresh / request-sequencing / view filtering lives inside the shared
@@ -1626,12 +1630,26 @@ window.loadConversation = async function(sessionId, options = {}) {
         return;
     }
 
-    // Snapshot the selection state BEFORE committing the new one, so a failed
-    // load can roll the highlight back instead of leaving it pointing at a
-    // conversation that never rendered (#2380 codex round 2).
+    // Load-request token (#2380 codex round 4): each call claims the token;
+    // any later call supersedes every earlier in-flight one. This is the
+    // ownership primitive for both the superseded-load drop and the rollback
+    // guards below — deliberately NOT ``activeConversationId``, which other
+    // listeners (e.g. the debounced ``kestrel:conversations-stale`` handler)
+    // legitimately mutate while a load is in flight.
     const host = API.getHostAgent();
-    const prevActiveId = activeConversationId;
-    const prevMappedId = activeConversationIdsByAgent.get(host);
+    const loadToken = ++conversationLoadSeq;
+
+    // Roll the selection back to the session the pane ACTUALLY renders (not
+    // the previously *pending* selection — that one may itself have never
+    // rendered). No-ops when a newer load owns the UI.
+    const rollbackToRendered = () => {
+        if (loadToken !== conversationLoadSeq) return;
+        const rendered = state.currentSessionId || null;
+        activeConversationId = rendered;
+        if (rendered == null) activeConversationIdsByAgent.delete(host);
+        else activeConversationIdsByAgent.set(host, rendered);
+        applyHighlight(rendered);
+    };
 
     const applyHighlight = (sid) => {
         // #2222: keep the shared pane's highlight unified with our active-id.
@@ -1696,11 +1714,11 @@ window.loadConversation = async function(sessionId, options = {}) {
             restartEvents = [];
         }
 
-        // Superseded-load check: if the operator clicked ANOTHER conversation
-        // while this one's fetches were in flight, the later click owns the
-        // selection — drop this load entirely (its render would clobber the
-        // newer conversation's pane).
-        if (activeConversationId !== sessionId) {
+        // Superseded-load check: if the operator selected ANOTHER conversation
+        // while this one's fetches were in flight, the later call holds the
+        // token — drop this load entirely (its render would clobber the newer
+        // conversation's pane).
+        if (loadToken !== conversationLoadSeq) {
             return;
         }
 
@@ -1722,13 +1740,11 @@ window.loadConversation = async function(sessionId, options = {}) {
             if (!paneIsCold || userBusy || sessionAlreadySet) {
                 // User started a turn while auto-load was in flight. Drop the
                 // auto-load — the in-flight stream is what the user actually
-                // wants to see — and roll the pre-committed selection back so
-                // the sidebar doesn't stay pinned to a conversation that never
-                // rendered (#2380 codex round 3 P2).
-                activeConversationId = prevActiveId;
-                if (prevMappedId === undefined) activeConversationIdsByAgent.delete(host);
-                else activeConversationIdsByAgent.set(host, prevMappedId);
-                applyHighlight(prevActiveId);
+                // wants to see — and roll the pre-committed selection back to
+                // the session the pane actually holds, so the sidebar doesn't
+                // stay pinned to a conversation that never rendered (#2380
+                // codex round 3 P2).
+                rollbackToRendered();
                 return;
             }
         }
@@ -1967,17 +1983,11 @@ window.loadConversation = async function(sessionId, options = {}) {
         updateContextStatus();
     } catch (e) {
         console.error('Failed to load conversation:', e);
-        // Roll the selection back to what was actually loaded — the clicked
-        // row never rendered, so leaving it highlighted would let subsequent
-        // sends continue in the OLD session under the WRONG highlight (#2380
-        // codex round 2). Only roll back if no later click has already moved
-        // the selection on.
-        if (activeConversationId === sessionId) {
-            activeConversationId = prevActiveId;
-            if (prevMappedId === undefined) activeConversationIdsByAgent.delete(host);
-            else activeConversationIdsByAgent.set(host, prevMappedId);
-            applyHighlight(prevActiveId);
-        }
+        // Roll the selection back to the session the pane actually renders —
+        // the clicked row never loaded, so leaving it highlighted would let
+        // subsequent sends continue in the OLD session under the WRONG
+        // highlight (#2380 codex round 2). No-ops if a later load owns the UI.
+        rollbackToRendered();
         Toast.error(`Failed to load conversation: ${e.message}`);
     }
 };
