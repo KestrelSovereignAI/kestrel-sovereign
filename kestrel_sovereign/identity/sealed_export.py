@@ -292,6 +292,31 @@ def _kem_key_ids(slug: str) -> tuple[str, str, str]:
     return f"{slug}_x25519", f"{slug}_mlkem768", f"{slug}_mlkem768_pub"
 
 
+def detect_agent_kem_slug(storage_dir: Optional[Path] = None) -> Optional[str]:
+    """Discover the local KEM keypair's slug by globbing for the
+    classical-half file (``<slug>_x25519.key.enc``), the same
+    file-driven approach ``runtime_identity._detect_hybrid_slug`` uses
+    for signing keys.
+
+    Returns None if no KEM keys are present. Raises
+    :class:`SealedExportError` if more than one slug is present (the
+    directory holds an ambiguous set — the caller must pass an explicit
+    slug). This avoids deriving the slug from a DID tail, which is wrong
+    for multi-segment DIDs (``did:web:host:agent:v1`` → files use
+    ``agent_*``, not ``v1_*``) and for legacy did:pkh recipients.
+    """
+    directory = Path(storage_dir) if storage_dir is not None else Path.cwd()
+    candidates = sorted(directory.glob("*_x25519.key.enc"))
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise SealedExportError(
+            f"multiple KEM keypairs in {directory} "
+            f"({[c.name for c in candidates]}); pass an explicit slug."
+        )
+    return candidates[0].name.removesuffix("_x25519.key.enc")
+
+
 def has_agent_kem_keypair(slug: str, storage_dir: Optional[Path] = None) -> bool:
     """True if all three KEM key files exist for ``slug``."""
     storage = SecureKeyStorage(storage_dir)
@@ -591,12 +616,17 @@ def open_identity_export(
         serialized = text
     if is_sealed_identity_export(serialized):
         if kem_keypair is None:
+            # Prefer an explicit slug; otherwise discover it from the
+            # local key files (robust to multi-segment / did:pkh DIDs).
+            if slug is None and storage_dir is not None:
+                slug = detect_agent_kem_slug(storage_dir)
             if slug is None:
                 raise SealedExportError(
                     "this is a SEALED identity export but no KEM keys "
-                    "were provided (pass kem_keypair=, or slug= to load "
-                    "this agent's local keypair). Sealed exports cannot "
-                    "be opened without the recipient's private keys."
+                    "were provided and none were found locally (pass "
+                    "kem_keypair=, or slug=/storage_dir= to load this "
+                    "agent's local keypair). Sealed exports cannot be "
+                    "opened without the recipient's private keys."
                 )
             kem_keypair = load_agent_kem_keypair(slug, storage_dir)
         return unseal_identity_package(serialized, kem_keypair)

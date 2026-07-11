@@ -803,3 +803,36 @@ def test_feature_load_import_package_unseals(tmp_path, monkeypatch):
     loaded = feature._load_import_package(capsule)
     assert loaded.did == did
     assert loaded.agent_name == "ImporterBird"
+
+
+def test_open_export_detects_kem_slug_from_files_multisegment(tmp_path, monkeypatch):
+    """A multi-segment did:web (files use the AGENT segment, not the DID
+    tail) still opens: the slug is discovered from local files, not the
+    DID tail (codex round 11)."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.sealed_export import (
+        generate_agent_kem_keypair, seal_identity_package, open_identity_export,
+        RecipientKEMKeys, agent_kem_public_multibases, detect_agent_kem_slug,
+    )
+    from kestrel_sovereign.security.multikey import multibase_to_kem_public_key
+
+    slug = "meridian"  # DID is did:web:host:meridian:v1 → tail is "v1"
+    did = "did:web:host:meridian:v1"
+    kem = generate_agent_kem_keypair(slug, tmp_path)
+    assert detect_agent_kem_slug(tmp_path) == slug
+    c_mb, pq_mb = agent_kem_public_multibases(kem)
+    c_suite, c_pub = multibase_to_kem_public_key(c_mb)
+    pq_suite, pq_pub = multibase_to_kem_public_key(pq_mb)
+    recipient = RecipientKEMKeys(
+        classical_public_key=c_pub, pq_public_key=pq_pub,
+        classical_alg=c_suite.alg_id, pq_alg=pq_suite.alg_id,
+    )
+    pkg = AgentIdentityPackage(
+        did=did, agent_name="Meridian", created_at="t",
+        constitution_hash="h", constitution_text="c",
+    )
+    capsule = seal_identity_package(pkg, recipient)
+    # No slug passed — must be discovered from the *_x25519.key.enc file
+    loaded = open_identity_export(capsule, storage_dir=tmp_path)
+    assert loaded.did == did

@@ -86,13 +86,12 @@ class IdentityFeature(Feature):
         """
         from kestrel_sovereign.identity.sealed_export import open_identity_export
 
-        signing_did = getattr(self.agent, "signing_did", None) or ""
-        slug = signing_did.rsplit(":", 1)[-1] if signing_did.startswith("did:web:") else None
+        # Let open_identity_export discover the KEM slug from the local
+        # key files (robust to multi-segment did:web and did:pkh agents)
+        # — the DID tail is not a reliable slug.
         storage_path = getattr(self.agent, "storage_path", None)
         storage_dir = Path(storage_path).parent if storage_path else None
-        return open_identity_export(
-            package_json, slug=slug, storage_dir=storage_dir,
-        )
+        return open_identity_export(package_json, storage_dir=storage_dir)
 
     @tool(
         name="export_identity",
