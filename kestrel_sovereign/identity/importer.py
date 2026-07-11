@@ -113,6 +113,53 @@ class IdentityImporter:
         self.warnings: List[str] = []
         self.stats: Dict[str, int] = {}
 
+    async def import_serialized(
+        self,
+        serialized: str,
+        *,
+        kem_keypair: Optional[Any] = None,
+        kem_slug: Optional[str] = None,
+        kem_storage_dir: Optional[Path] = None,
+        **import_kwargs: Any,
+    ) -> ImportResult:
+        """Import from a serialized export — sealed capsule or plaintext JSON.
+
+        Counterpart to ``IdentityExporter.export_sealed`` (#2398).
+        Detects a ``kestrel-sealed-capsule-v1`` envelope by its
+        ``format`` field and unseals it with the local hybrid KEM
+        private keys before the existing :meth:`import_package` path
+        runs. Legacy plaintext-JSON exports are parsed exactly as
+        before.
+
+        Fail-loud contract: a sealed capsule with no local KEM keys
+        available, a capsule sealed for a different recipient, or a
+        tampered capsule raises
+        :class:`~kestrel_sovereign.identity.sealed_export.SealedExportError`
+        — nothing is imported and there is no plaintext fallback.
+
+        Args:
+            serialized: the export string (sealed capsule or package JSON).
+            kem_keypair: this agent's ``HybridKEMKeypair``, if already
+                loaded. Takes precedence over ``kem_slug``.
+            kem_slug: key-file slug used to load the local KEM keypair
+                from encrypted storage (``<slug>_x25519`` +
+                ``<slug>_mlkem768``). Required for sealed input when
+                ``kem_keypair`` is not passed.
+            kem_storage_dir: storage dir for the key files (defaults to
+                the agent data dir).
+            **import_kwargs: forwarded to :meth:`import_package`
+                (verify_signature, merge_mode, grant, ...).
+        """
+        from .sealed_export import open_identity_export
+
+        package = open_identity_export(
+            serialized,
+            kem_keypair=kem_keypair,
+            slug=kem_slug,
+            storage_dir=kem_storage_dir,
+        )
+        return await self.import_package(package, **import_kwargs)
+
     async def import_package(
         self,
         package: AgentIdentityPackage,

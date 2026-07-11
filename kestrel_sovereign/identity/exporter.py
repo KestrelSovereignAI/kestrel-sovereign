@@ -32,6 +32,7 @@ from .personality_analyzer import PersonalityAnalyzer, generate_calibration_prom
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from .sealed_export import RecipientKEMKeys
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,40 @@ class IdentityExporter:
 
         logger.info(f"Identity package created: {package.get_summary()}")
         return package
+
+    async def export_sealed(
+        self,
+        recipient: "RecipientKEMKeys",
+        **export_kwargs: Any,
+    ) -> str:
+        """Export identity SEALED for a specific recipient (#2398).
+
+        Runs the normal :meth:`export`, then wraps the package's JSON
+        in a hybrid-KEM sealed capsule (X25519 + ML-KEM-768 →
+        AES-256-GCM) so the serialized identity never leaves the
+        process in plaintext. Resolve ``recipient`` beforehand via
+        ``sealed_export.recipient_keys_from_multibase`` or
+        ``recipient_keys_from_did_document`` — missing/invalid
+        recipient keys fail loud; there is no plaintext fallback.
+
+        For sender-authenticated exports, sign the package first and
+        seal via ``sealed_export.seal_identity_package`` directly:
+
+            package = await exporter.export()
+            sign_package(package, ...)
+            capsule = seal_identity_package(package, recipient)
+
+        Args:
+            recipient: the recipient's resolved hybrid KEM public keys.
+            **export_kwargs: forwarded to :meth:`export`.
+
+        Returns:
+            The sealed-capsule JSON string (``kestrel-sealed-capsule-v1``).
+        """
+        from .sealed_export import seal_identity_package
+
+        package = await self.export(**export_kwargs)
+        return seal_identity_package(package, recipient)
 
     async def _get_agent_metadata(self) -> Dict[str, Any]:
         """Get agent metadata from graph."""
