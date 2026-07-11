@@ -374,23 +374,47 @@ def _born_hybrid_identity_paths(output_dir: Path, slug: str) -> list[Path]:
 
 
 def backup_or_refuse_existing_identity(output_dir: Path, slug: str, force: bool) -> None:
-    """Guard against silently overwriting an existing born-hybrid identity.
+    """Guard against silently overwriting or shadowing an existing
+    hybrid identity in ``output_dir``.
 
-    Key file names are deterministic from the slug, so re-running
-    inception with the same agent name would clobber the private keys —
-    and unlike the database, destroyed keys are unrecoverable. Without
-    ``force`` this refuses; with ``force`` the existing files are moved
-    to timestamped ``.backup-*`` siblings first (mirroring the DB
-    force-backup behavior) so the prior identity stays recoverable.
+    Covers ALL identity slugs in the directory, not just the one being
+    minted (codex round 4 P2): re-incepting with a different name would
+    otherwise leave the old ``<old>_did.json`` beside the new one, and
+    ``load_agent_identity(None)`` rightly refuses ambiguous identity
+    material — the new agent would boot without signing keys. And keys,
+    unlike the database, are unrecoverable once clobbered. Without
+    ``force`` this refuses; with ``force`` every existing identity file
+    is moved to a timestamped ``.backup-*`` sibling first (mirroring the
+    DB force-backup behavior).
     """
-    existing = [p for p in _born_hybrid_identity_paths(Path(output_dir), slug) if p.exists()]
+    output_dir = Path(output_dir)
+    existing: set = set()
+    for doc in output_dir.glob("*_did.json"):
+        doc_slug = doc.name.removesuffix("_did.json")
+        existing.update(
+            p for p in _born_hybrid_identity_paths(output_dir, doc_slug) if p.exists()
+        )
+    # Orphaned hybrid key files without a DID document (partial prior
+    # state, or a rotated agent's ceremony output) block loading just
+    # the same — sweep them too.
+    for pattern in (
+        "*_ed25519.key.enc",
+        "*_mldsa65.bytes.enc",
+        "*_archival_slhdsa.bytes.enc",
+        "*_archival_slhdsa_pub.bytes.enc",
+    ):
+        existing.update(output_dir.glob(pattern))
+    existing.update(
+        p for p in _born_hybrid_identity_paths(output_dir, slug) if p.exists()
+    )
+    existing = sorted(existing)
     if not existing:
         return
     if not force:
         raise FileExistsError(
-            f"Born-hybrid identity files for slug {slug!r} already exist in "
-            f"{output_dir} ({[p.name for p in existing]}). Refusing to "
-            f"overwrite an agent's keys; pass force=True to back them up "
+            f"Hybrid identity files already exist in {output_dir} "
+            f"({[p.name for p in existing]}). Refusing to overwrite or "
+            f"shadow an agent's keys; pass force=True to back them up "
             f"and mint a fresh identity."
         )
     import shutil
@@ -601,9 +625,20 @@ async def create_kestrel_identity_async(
                 "mint a classical wallet-bound identity instead, pass "
                 "identity_method='did:pkh'."
             )
-        slug = validate_did_web_slug(
-            did_web_slug if did_web_slug is not None else slugify_agent_name(agent_name)
-        )
+        if did_web_slug is not None:
+            # Explicit slug = the operator asserts uniqueness under the
+            # domain (deliberate identities like "emma", "meridian").
+            slug = validate_did_web_slug(did_web_slug)
+        else:
+            # Derived slugs get an entropy suffix: agent names are NOT
+            # unique across a domain (every default bootstrap is
+            # "Kestrel Agent"), and a did:web URI is a public trust
+            # anchor — one published document cannot represent two
+            # keypairs. codex round 4 P1.
+            import secrets
+            slug = validate_did_web_slug(
+                f"{slugify_agent_name(agent_name)}-{secrets.token_hex(3)}"
+            )
 
     # Determine if we're using external database or creating SQLite
     using_external_db = database is not None

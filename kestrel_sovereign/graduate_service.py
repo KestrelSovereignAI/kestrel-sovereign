@@ -170,35 +170,70 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
     except Exception as e:
         checklist.add_check("Has conversation history", False, f"Error: {e}")
 
-    # 4. DID document exists on disk
-    address = did.split(":")[-1] if did else None
+    # 4 + 5. Identity material exists on disk. Two shapes (#2397):
+    # born-hybrid did:web agents store <slug>_did.json + hybrid keys;
+    # classical did:pkh agents store kestrel_<address>.json + ECDSA key.
     db_path = Path(storage.db_path)
-    if address:
-        did_doc_path = db_path.parent / f"kestrel_{address}.json"
-        has_did_doc = did_doc_path.exists()
+    if did and did.startswith("did:web:"):
+        import json as _json
+        did_doc_path = None
+        for cand in sorted(db_path.parent.glob("*_did.json")):
+            try:
+                if _json.loads(cand.read_text(encoding="utf-8")).get("id") == did:
+                    did_doc_path = cand
+                    break
+            except (OSError, ValueError):
+                continue
+        has_did_doc = did_doc_path is not None
         checklist.add_check(
             "DID document exists",
             has_did_doc,
-            str(did_doc_path) if has_did_doc else f"Missing: {did_doc_path}"
+            str(did_doc_path) if has_did_doc
+            else f"No *_did.json with id={did!r} in {db_path.parent}",
         )
+        if has_did_doc:
+            slug = did_doc_path.name.removesuffix("_did.json")
+            classical = db_path.parent / f"{slug}_ed25519.key.enc"
+            pq = db_path.parent / f"{slug}_mldsa65.bytes.enc"
+            has_key = classical.exists() and pq.exists()
+            checklist.add_check(
+                "Encrypted key file exists",
+                has_key,
+                f"{classical.name} + {pq.name}" if has_key
+                else f"Missing hybrid key file(s) for slug {slug!r}",
+            )
+        else:
+            checklist.add_check(
+                "Encrypted key file exists", False,
+                "No born-hybrid DID document found",
+            )
     else:
-        checklist.add_check(
-            "DID document exists",
-            False,
-            "Could not parse DID from agent node",
-        )
+        address = did.split(":")[-1] if did else None
+        if address:
+            did_doc_path = db_path.parent / f"kestrel_{address}.json"
+            has_did_doc = did_doc_path.exists()
+            checklist.add_check(
+                "DID document exists",
+                has_did_doc,
+                str(did_doc_path) if has_did_doc else f"Missing: {did_doc_path}"
+            )
+        else:
+            checklist.add_check(
+                "DID document exists",
+                False,
+                "Could not parse DID from agent node",
+            )
 
-    # 5. Encrypted key file exists on disk
-    if address:
-        key_path = db_path.parent / f"kestrel_{address}.key.enc"
-        has_key = key_path.exists()
-        checklist.add_check(
-            "Encrypted key file exists",
-            has_key,
-            str(key_path) if has_key else f"Missing: {key_path}"
-        )
-    else:
-        checklist.add_check("Encrypted key file exists", False, "No DID address available")
+        if address:
+            key_path = db_path.parent / f"kestrel_{address}.key.enc"
+            has_key = key_path.exists()
+            checklist.add_check(
+                "Encrypted key file exists",
+                has_key,
+                str(key_path) if has_key else f"Missing: {key_path}"
+            )
+        else:
+            checklist.add_check("Encrypted key file exists", False, "No DID address available")
 
     # 6. Sovereignty backup exists — accept either surface:
     #    (a) backup_artifact graph nodes (discrete sovereignty exports via

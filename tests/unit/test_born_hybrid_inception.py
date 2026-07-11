@@ -113,16 +113,19 @@ async def test_inception_defaults_to_born_hybrid(tmp_path, hybrid_env):
         str(tmp_path), CONSTITUTION, agent_name="Testbird",
     )
 
-    assert creds.agent_did == f"did:web:{TEST_DOMAIN}:testbird"
+    # Derived slugs carry an entropy suffix (names aren't unique across
+    # a domain); the DID prefix is deterministic.
+    assert creds.agent_did.startswith(f"did:web:{TEST_DOMAIN}:testbird-")
+    slug = creds.agent_did.rsplit(":", 1)[-1]
 
     # Hybrid material on disk, encrypted
-    assert (tmp_path / "testbird_ed25519.key.enc").exists()
-    assert (tmp_path / "testbird_mldsa65.bytes.enc").exists()
-    assert (tmp_path / "testbird_archival_slhdsa.bytes.enc").exists()
-    assert (tmp_path / "testbird_archival_slhdsa_pub.bytes.enc").exists()
+    assert (tmp_path / f"{slug}_ed25519.key.enc").exists()
+    assert (tmp_path / f"{slug}_mldsa65.bytes.enc").exists()
+    assert (tmp_path / f"{slug}_archival_slhdsa.bytes.enc").exists()
+    assert (tmp_path / f"{slug}_archival_slhdsa_pub.bytes.enc").exists()
 
     # DID document stored locally, publishable verbatim
-    doc = json.loads((tmp_path / "testbird_did.json").read_text())
+    doc = json.loads((tmp_path / f"{slug}_did.json").read_text())
     assert doc["id"] == creds.agent_did
     vm_types = {vm["type"] for vm in doc["verificationMethod"]}
     assert vm_types == {"Multikey"}
@@ -132,6 +135,28 @@ async def test_inception_defaults_to_born_hybrid(tmp_path, hybrid_env):
     assert not list(tmp_path.glob("kestrel_0x*"))
     assert not list(tmp_path.glob("*.pem"))
     assert not (tmp_path / "successions").exists()
+
+
+@pytest.mark.asyncio
+async def test_derived_slugs_are_unique_across_inceptions(tmp_path, hybrid_env):
+    """Same agent name twice under one domain must NOT mint the same DID
+    (a did:web URI is a public trust anchor — codex round 4 P1)."""
+    a = await create_kestrel_identity_async(
+        str(tmp_path / "a"), CONSTITUTION, agent_name="Kestrel Agent",
+    )
+    b = await create_kestrel_identity_async(
+        str(tmp_path / "b"), CONSTITUTION, agent_name="Kestrel Agent",
+    )
+    assert a.agent_did != b.agent_did
+
+
+@pytest.mark.asyncio
+async def test_explicit_slug_used_verbatim(tmp_path, hybrid_env):
+    creds = await create_kestrel_identity_async(
+        str(tmp_path), CONSTITUTION, agent_name="Emma", did_web_slug="emma",
+    )
+    assert creds.agent_did == f"did:web:{TEST_DOMAIN}:emma"
+    assert (tmp_path / "emma_did.json").exists()
 
 
 @pytest.mark.asyncio
@@ -162,7 +187,9 @@ async def test_child_did_document_carries_controller(tmp_path, hybrid_env):
         str(tmp_path), CONSTITUTION, agent_name="Chick",
         parent_did=f"did:web:{TEST_DOMAIN}:parent",
     )
-    doc = json.loads((tmp_path / "chick_did.json").read_text())
+    docs = list(tmp_path.glob("*_did.json"))
+    assert len(docs) == 1
+    doc = json.loads(docs[0].read_text())
     assert doc["controller"] == f"did:web:{TEST_DOMAIN}:parent"
 
 
@@ -182,7 +209,7 @@ async def test_missing_domain_fails_loud_and_cleans_up(tmp_path, monkeypatch):
         )
     # No half-born agent left behind
     assert not (tmp_path / "kestrel_prime.db").exists()
-    assert not list(tmp_path.glob("nodomain_*"))
+    assert not list(tmp_path.glob("nodomain*"))
 
 
 @pytest.mark.asyncio
@@ -197,7 +224,7 @@ async def test_missing_data_key_fails_loud_no_plaintext_pq(tmp_path, monkeypatch
             str(tmp_path), CONSTITUTION, agent_name="Nokey",
         )
     # Nothing secret written in plaintext, no partial key material
-    assert not list(tmp_path.glob("nokey_*"))
+    assert not list(tmp_path.glob("nokey*"))
     assert not (tmp_path / "kestrel_prime.db").exists()
 
 
@@ -252,7 +279,7 @@ async def test_loader_refuses_incomplete_born_hybrid(tmp_path, hybrid_env):
     await create_kestrel_identity_async(
         str(tmp_path), CONSTITUTION, agent_name="Partial",
     )
-    (tmp_path / "partial_mldsa65.bytes.enc").unlink()
+    next(tmp_path.glob("*_mldsa65.bytes.enc")).unlink()
     with pytest.raises(RuntimeIdentityError, match="mldsa65"):
         load_agent_identity(None, storage_dir=tmp_path)
 
@@ -274,20 +301,27 @@ async def test_reinception_refuses_to_overwrite_keys_without_force(tmp_path, hyb
 
 @pytest.mark.asyncio
 async def test_reinception_with_force_backs_up_old_keys(tmp_path, hybrid_env):
-    await create_kestrel_identity_async(
+    old = await create_kestrel_identity_async(
         str(tmp_path), CONSTITUTION, agent_name="Reborn",
     )
-    old_key = (tmp_path / "reborn_ed25519.key.enc").read_bytes()
+    old_slug = old.agent_did.rsplit(":", 1)[-1]
+    old_key = (tmp_path / f"{old_slug}_ed25519.key.enc").read_bytes()
 
-    await create_kestrel_identity_async(
+    new = await create_kestrel_identity_async(
         str(tmp_path), CONSTITUTION, agent_name="Reborn", force=True,
     )
-    # Fresh identity in place, prior keys recoverable from backups
-    assert (tmp_path / "reborn_ed25519.key.enc").exists()
-    backups = list(tmp_path.glob("reborn_ed25519.key.enc.backup-*"))
+    new_slug = new.agent_did.rsplit(":", 1)[-1]
+    # Fresh identity in place, prior keys recoverable from backups, and
+    # exactly ONE live DID document (the loader refuses ambiguity)
+    assert (tmp_path / f"{new_slug}_ed25519.key.enc").exists()
+    assert [d.name for d in tmp_path.glob("*_did.json")] == [f"{new_slug}_did.json"]
+    backups = list(tmp_path.glob(f"{old_slug}_ed25519.key.enc.backup-*"))
     assert backups, "expected the prior classical key to be backed up"
     assert backups[0].read_bytes() == old_key
-    assert list(tmp_path.glob("reborn_mldsa65.bytes.enc.backup-*"))
+    assert list(tmp_path.glob(f"{old_slug}_mldsa65.bytes.enc.backup-*"))
+    # And the new agent actually loads
+    ident = load_agent_identity(None, storage_dir=tmp_path)
+    assert ident.new_did == new.agent_did
 
 
 # ---------------------------------------------------------------------------
