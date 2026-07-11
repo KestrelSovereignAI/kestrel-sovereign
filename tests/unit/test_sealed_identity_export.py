@@ -737,3 +737,69 @@ def test_bytes_capsule_not_downgraded_to_plaintext():
     # With keys, it round-trips
     pkg = open_identity_export(capsule_bytes, kem_keypair=kp)
     assert pkg.did == "did:web:x:y"
+
+
+def test_duplicate_vm_id_fails_closed():
+    """A DID document repeating a verificationMethod.id is ambiguous —
+    resolving recipient keys from it must fail closed (codex round 9)."""
+    from kestrel_sovereign.security.hybrid_kem import generate_hybrid_kem_keypair
+    from kestrel_sovereign.identity.sealed_export import (
+        SealedExportError, agent_kem_public_multibases,
+        recipient_keys_from_did_document,
+    )
+    a = generate_hybrid_kem_keypair()
+    b = generate_hybrid_kem_keypair()
+    ac, apq = agent_kem_public_multibases(a)
+    bc, _ = agent_kem_public_multibases(b)
+    did = "did:web:example.com:me"
+    doc = {
+        "id": did,
+        "verificationMethod": [
+            {"id": f"{did}#kem-1", "type": "Multikey", "publicKeyMultibase": ac},
+            {"id": f"{did}#kem-1", "type": "Multikey", "publicKeyMultibase": bc},  # dup id
+            {"id": f"{did}#kem-2", "type": "Multikey", "publicKeyMultibase": apq},
+        ],
+        "keyAgreement": [f"{did}#kem-1", f"{did}#kem-2"],
+    }
+    with pytest.raises(SealedExportError, match="duplicate"):
+        recipient_keys_from_did_document(doc)
+
+
+def test_feature_load_import_package_unseals(tmp_path, monkeypatch):
+    """The live IdentityFeature import path routes sealed capsules
+    through open_identity_export with the agent's local KEM keys
+    (codex round 9 — the user-facing !identity import path)."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    from types import SimpleNamespace
+    from kestrel_sovereign.features.identity.feature import IdentityFeature
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.sealed_export import (
+        generate_agent_kem_keypair, seal_identity_package, RecipientKEMKeys,
+        agent_kem_public_multibases,
+    )
+    from kestrel_sovereign.security.multikey import multibase_to_kem_public_key
+
+    slug = "importer-bird"
+    did = f"did:web:agents.kestrel-sovereign.test:{slug}"
+    kem = generate_agent_kem_keypair(slug, tmp_path)
+    c_mb, pq_mb = agent_kem_public_multibases(kem)
+    c_suite, c_pub = multibase_to_kem_public_key(c_mb)
+    pq_suite, pq_pub = multibase_to_kem_public_key(pq_mb)
+    recipient = RecipientKEMKeys(
+        classical_public_key=c_pub, pq_public_key=pq_pub,
+        classical_alg=c_suite.alg_id, pq_alg=pq_suite.alg_id,
+    )
+
+    pkg = AgentIdentityPackage(
+        did=did, agent_name="ImporterBird", created_at="2026-07-11T00:00:00Z",
+        constitution_hash="h", constitution_text="c",
+    )
+    capsule = seal_identity_package(pkg, recipient)
+
+    feature = IdentityFeature.__new__(IdentityFeature)
+    feature.agent = SimpleNamespace(
+        signing_did=did, storage_path=str(tmp_path / "kestrel_prime.db"),
+    )
+    loaded = feature._load_import_package(capsule)
+    assert loaded.did == did
+    assert loaded.agent_name == "ImporterBird"

@@ -196,7 +196,17 @@ def recipient_keys_from_did_document(did_document: Dict[str, Any]) -> RecipientK
     vm_by_id: Dict[str, Dict[str, Any]] = {}
     for vm in did_document.get("verificationMethod") or []:
         if isinstance(vm, dict) and vm.get("id"):
-            vm_by_id[vm["id"]] = vm
+            vm_id = vm["id"]
+            if vm_id in vm_by_id:
+                # A repeated verificationMethod.id is a malformed/merged
+                # document. Silently keeping the last would let a
+                # reference resolve to the wrong key — fail closed.
+                raise SealedExportError(
+                    f"DID document for {doc_id!r} has duplicate "
+                    f"verificationMethod id {vm_id!r}; refusing to "
+                    f"resolve recipient keys from an ambiguous document."
+                )
+            vm_by_id[vm_id] = vm
 
     key_agreement = did_document.get("keyAgreement") or []
     if not isinstance(key_agreement, list) or not key_agreement:
