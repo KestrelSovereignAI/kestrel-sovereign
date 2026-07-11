@@ -72,6 +72,31 @@ def get_key_id(did: str) -> str:
     return f"kestrel_{address}"
 
 
+def _load_local_identity_for_did(did: str, storage_dir):
+    """Load the local trust-anchor identity for ``did``.
+
+    - ``did:pkh`` (classical / rotated): via the legacy key id.
+    - ``did:web`` (born-hybrid, #2397): via the slug-based loader —
+      then require the loaded identity to actually BE ``did`` so a
+      data dir holding a different born-hybrid agent can't anchor a
+      package for someone else's DID.
+
+    Raises FileNotFoundError when no matching identity is on disk
+    (same contract as ``load_agent_identity``).
+    """
+    from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+
+    if did.startswith("did:web:"):
+        identity = load_agent_identity(None, storage_dir=storage_dir)
+        if identity.new_did != did:
+            raise FileNotFoundError(
+                f"local born-hybrid identity is {identity.new_did!r}, "
+                f"not {did!r} — no local key custody for this DID."
+            )
+        return identity
+    return load_agent_identity(get_key_id(did), storage_dir=storage_dir)
+
+
 def sign_package(
     package: AgentIdentityPackage,
     storage_dir: Optional[Path] = None,
@@ -114,13 +139,20 @@ def sign_package(
         # signatures for an agent that should be hybrid-only, masking
         # a security-critical key-state problem.
         from kestrel_sovereign.identity.runtime_identity import (
-            RuntimeIdentityError, load_agent_identity,
+            RuntimeIdentityError,
         )
         agent_identity = None
         try:
-            key_id = get_key_id(package.did)
-            agent_identity = load_agent_identity(key_id, storage_dir=storage_dir)
+            agent_identity = _load_local_identity_for_did(
+                package.did, storage_dir,
+            )
         except FileNotFoundError as e:
+            if package.did.startswith("did:web:"):
+                # Born-hybrid DIDs have no legacy key file to fall
+                # through to — an absent identity means we cannot sign.
+                raise SigningError(
+                    f"No local born-hybrid identity for {package.did!r}: {e}"
+                )
             logger.debug(f"No identity on disk yet, using legacy path: {e}")
         except RuntimeIdentityError:
             # Inconsistent post-ceremony state — fail loud, do NOT
@@ -322,11 +354,7 @@ def _verify_v2_signatures(
     # in-package chain shape is implemented, this path requires
     # local custody and rejects cross-substrate cleanly.
     try:
-        from kestrel_sovereign.identity.runtime_identity import (
-            load_agent_identity,
-        )
-        key_id = get_key_id(package.did)
-        anchor = load_agent_identity(key_id, storage_dir=storage_dir)
+        anchor = _load_local_identity_for_did(package.did, storage_dir)
     except FileNotFoundError:
         return False, (
             f"Cannot verify v2 hybrid package: no local identity "

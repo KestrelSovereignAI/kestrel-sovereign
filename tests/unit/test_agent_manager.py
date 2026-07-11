@@ -319,6 +319,7 @@ class TestSpawnAgent:
 
         parent = _make_mock_agent("did:parent-xyz")
         parent._private_key = None  # No key — skip signing
+        parent.identity = None
 
         mandate = SpawnMandate(
             parent_did="did:parent-xyz",
@@ -363,6 +364,7 @@ class TestSpawnAgent:
 
         parent = _make_mock_agent("did:parent-feat")
         parent._private_key = None  # No key — skip signing
+        parent.identity = None
 
         mandate = SpawnMandate(
             parent_did="did:parent-feat",
@@ -395,6 +397,7 @@ class TestSpawnAgent:
 
         parent = _make_mock_agent("did:parent-open")
         parent._private_key = None
+        parent.identity = None
 
         # No features_allowed → default empty list → load all features.
         mandate = SpawnMandate(parent_did="did:parent-open", purpose="open child")
@@ -419,6 +422,7 @@ class TestSpawnAgent:
 
         parent = _make_mock_agent("did:parent")
         parent._private_key = None
+        parent.identity = None
 
         mandate = SpawnMandate(parent_did="did:parent", purpose="dupe test")
 

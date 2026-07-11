@@ -44,6 +44,7 @@ timeout = 300
 concurrency = 80
 
 [profiles.dev.env_vars]
+KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
@@ -92,6 +93,7 @@ timeout = 300
 concurrency = 80
 
 [profiles.prod.env_vars]
+KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "production"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
@@ -132,6 +134,7 @@ timeout = 300
 concurrency = 80
 
 [profiles.multi-agent-dev.env_vars]
+KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
@@ -165,6 +168,7 @@ timeout = 300
 concurrency = 80
 
 [profiles.multi-agent-prod.env_vars]
+KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "production"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
@@ -195,6 +199,7 @@ timeout = 300
 concurrency = 80
 
 [profiles.azure-multi-agent-dev.env_vars]
+KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_HOST_AUTOSTART = "true"
@@ -220,6 +225,7 @@ timeout = 300
 concurrency = 80
 
 [profiles.azure-dev.env_vars]
+KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"

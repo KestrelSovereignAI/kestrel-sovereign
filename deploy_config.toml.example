@@ -34,6 +34,9 @@ timeout = 300
 concurrency = 80
 
 [profiles.dev.env_vars]
+# Born-hybrid inception (#2397): domain for new agents' did:web DID
+# documents. Required — inception fails loud without it.
+KESTREL_DID_WEB_DOMAIN = "agents.example.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
@@ -75,6 +78,9 @@ timeout = 300
 concurrency = 80
 
 [profiles.prod.env_vars]
+# Born-hybrid inception (#2397): domain for new agents' did:web DID
+# documents. Required — inception fails loud without it.
+KESTREL_DID_WEB_DOMAIN = "agents.example.com"
 KESTREL_ENV = "production"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"

@@ -80,8 +80,13 @@ class ScriptSigner:
         parts = self.agent_did.split(":")
         if len(parts) >= 3 and parts[-1].startswith("0x"):
             return f"kestrel_{parts[-1]}"
-        
+
         return None
+
+    def _is_born_hybrid_did(self) -> bool:
+        """did:web agents (#2397) have no legacy key id — their keys are
+        discovered from the <slug>_did.json document on disk."""
+        return bool(self.agent_did) and self.agent_did.startswith("did:web:")
     
     async def _load_keys(self) -> bool:
         """
@@ -94,8 +99,11 @@ class ScriptSigner:
             return True
         
         try:
-            key_id = self._extract_key_id()
-            if not key_id:
+            # did:web is checked FIRST: _extract_key_id's address-suffix
+            # heuristic would misroute a did:web slug like "0xcafe" to a
+            # nonexistent legacy key path and strand the hybrid keys.
+            key_id = None if self._is_born_hybrid_did() else self._extract_key_id()
+            if not key_id and not self._is_born_hybrid_did():
                 logger.warning(f"Cannot extract key_id from DID: {self.agent_did}")
                 return False
             
@@ -125,9 +133,30 @@ class ScriptSigner:
             )
             try:
                 self._agent_identity = load_agent_identity(key_id, storage_dir=db_dir)
-                self._private_key = self._agent_identity.legacy_keypair.private_key
-                self._public_key = self._agent_identity.legacy_keypair.public_key
-                if self._agent_identity.is_hybrid:
+                # Bind the loaded born-hybrid identity to THIS agent's
+                # DID — the slug-based loader returns whatever identity
+                # is in the dir (same principle as
+                # signing._load_local_identity_for_did).
+                if key_id is None and self._agent_identity.new_did != self.agent_did:
+                    logger.warning(
+                        f"Identity on disk is {self._agent_identity.new_did!r} "
+                        f"but this signer's agent DID is {self.agent_did!r} — "
+                        f"refusing the mis-bound identity."
+                    )
+                    self._agent_identity = None
+                    return False
+                # Born-hybrid agents (#2397) carry no legacy keypair at
+                # all; hybrid signing below covers them. Only populate
+                # the legacy ECDSA slots when legacy material exists.
+                if self._agent_identity.legacy_keypair is not None:
+                    self._private_key = self._agent_identity.legacy_keypair.private_key
+                    self._public_key = self._agent_identity.legacy_keypair.public_key
+                if self._agent_identity.is_born_hybrid:
+                    logger.info(
+                        f"Loaded BORN-HYBRID signing keys: "
+                        f"{self._agent_identity.new_did}"
+                    )
+                elif self._agent_identity.is_hybrid:
                     logger.info(
                         f"Loaded HYBRID signing keys for {key_id}: "
                         f"legacy={self._agent_identity.legacy_did} -> "
@@ -137,6 +166,14 @@ class ScriptSigner:
                     logger.info(f"Loaded signing keys for {key_id} (legacy-only)")
                 return True
             except FileNotFoundError as e:
+                if key_id is None:
+                    # Born-hybrid DID with no identity material on disk:
+                    # there is no legacy key file to fall through to.
+                    logger.warning(
+                        f"No born-hybrid identity on disk for "
+                        f"{self.agent_did}: {e}"
+                    )
+                    return False
                 logger.debug(
                     f"No identity on disk for {key_id}; falling through to "
                     f"legacy load: {e}"
