@@ -18,6 +18,7 @@ If the second attempt also fails, the resulting exception is augmented
 with retry context and keeps the transport classification + ``exceeds_cap``
 attribute so the streaming.py harness-owned check (#1429) still kicks in.
 """
+import asyncio
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
@@ -72,6 +73,40 @@ async def _collect(agen) -> List[dict]:
     return out
 
 
+class _RuntimeFakeApp:
+    """Small app-server double for behavioral ``_run_turn`` tests."""
+
+    def __init__(self):
+        self.requests = []
+        self.closed = []
+
+    async def ensure_started(self):
+        return None
+
+    async def request(self, method, params=None, *, timeout=120):
+        self.requests.append((method, params))
+        return {}
+
+    def open_turn_sink(self, thread_id):
+        return thread_id
+
+    def close_turn_sink(self, thread_id):
+        self.closed.append(thread_id)
+
+
+def _runtime_adapter() -> tuple[CodexAdapter, _RuntimeFakeApp]:
+    """Build the minimum real-turn harness without starting Codex."""
+    adapter = _stub_adapter()
+    adapter._thread_locks = {}
+    adapter.contribute_system_prompt = lambda model, instructions: instructions
+    adapter._effective_model_param = lambda model: None
+    adapter._resolve_thread_cwd = lambda: "/tmp"
+    adapter._ensure_codex_approval_bridge = lambda app: None
+    app = _RuntimeFakeApp()
+    adapter._app_server = lambda: app
+    return adapter, app
+
+
 # ---------------------------------------------------------------------------
 # Retry fires
 # ---------------------------------------------------------------------------
@@ -86,7 +121,10 @@ async def test_retry_succeeds_after_first_idle_timeout_under_cap():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
+    async def fake_run_turn(
+        model, messages, tools, session_id, tool_executor,
+        cancel_token=None, keep_trailing_system=False,
+    ):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise _transport_error()
@@ -106,7 +144,7 @@ async def test_retry_succeeds_after_first_idle_timeout_under_cap():
 
 
 @pytest.mark.asyncio
-async def test_retry_waits_via_seam_before_second_attempt():
+async def test_retry_waits_via_seam_before_second_attempt(monkeypatch):
     """The configured wait fires between attempts; tests don't burn
     real wall-clock seconds because the autouse fixture replaces the
     wait with 0s.
@@ -118,26 +156,22 @@ async def test_retry_waits_via_seam_before_second_attempt():
         waits.append("called")
         return 0.0
 
-    # Override the module fixture for this test to count invocations.
-    import kestrel_sovereign.llm.codex_adapter as m
-    real = m._codex_retry_wait_seconds
-    m._codex_retry_wait_seconds = fake_wait
-    try:
-        call_count = {"n": 0}
+    monkeypatch.setattr(
+        codex_adapter_module, "_codex_retry_wait_seconds", fake_wait
+    )
+    call_count = {"n": 0}
 
-        async def fake_run_turn(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise _transport_error()
-            yield {"final": ("ok", None, {})}
+    async def fake_run_turn(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise _transport_error()
+        yield {"final": ("ok", None, {})}
 
-        adapter._run_turn = fake_run_turn
-        await _collect(adapter._run_turn_with_retry("m", [], None, None, None))
-        assert waits == ["called"], (
-            "wait seam must be invoked exactly once before the retry"
-        )
-    finally:
-        m._codex_retry_wait_seconds = real
+    adapter._run_turn = fake_run_turn
+    await _collect(adapter._run_turn_with_retry("m", [], None, None, None))
+    assert waits == ["called"], (
+        "wait seam must be invoked exactly once before the retry"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,106 +206,58 @@ async def test_no_retry_when_events_already_yielded():
 
 
 @pytest.mark.asyncio
-async def test_no_retry_when_exceeds_cap():
-    """Over-cap stalls are caused by ChatGPT-Plus's per-turn payload
-    limit; retrying without compaction can't help. Surface the error
-    immediately so the operator sees the cap-exceeded hint.
-    """
+@pytest.mark.parametrize(
+    ("error_factory", "expected_type"),
+    [
+        pytest.param(
+            lambda: _transport_error(
+                "codex turn idle for 300s with no completion — EXCEEDS cap",
+                exceeds_cap=True,
+            ),
+            CodexAppServerTransportError,
+            id="payload-exceeds-cap",
+        ),
+        pytest.param(
+            lambda: CodexAppServerTransportError(
+                "codex turn idle for 300s with no completion"
+            ),
+            CodexAppServerTransportError,
+            id="cap-classification-missing",
+        ),
+        pytest.param(
+            lambda: _transport_error(
+                "turn/start timed out after 60s", exceeds_cap=False
+            ),
+            CodexAppServerTransportError,
+            id="not-an-idle-timeout",
+        ),
+        pytest.param(
+            lambda: CodexAppServerConnectionClosed(
+                "codex app-server closed mid-turn"
+            ),
+            CodexAppServerConnectionClosed,
+            id="connection-closed",
+        ),
+    ],
+)
+async def test_ineligible_failure_is_not_retried(error_factory, expected_type):
+    """Failures outside the narrow replay envelope surface immediately."""
     adapter = _stub_adapter()
-    call_count = {"n": 0}
+    call_count = 0
 
     async def fake_run_turn(*args, **kwargs):
-        call_count["n"] += 1
-        raise _transport_error(
-            "codex turn idle for 300s with no completion — EXCEEDS cap",
-            exceeds_cap=True,
-        )
-        yield  # pragma: no cover (make this an async generator, not a coroutine)
+        nonlocal call_count
+        call_count += 1
+        raise error_factory()
+        yield  # pragma: no cover - preserves async-generator shape
 
     adapter._run_turn = fake_run_turn
 
-    with pytest.raises(CodexAppServerTransportError):
+    with pytest.raises(expected_type):
         await _collect(adapter._run_turn_with_retry(
             "m", [], None, None, None,
         ))
-    assert call_count["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_no_retry_when_exceeds_cap_attribute_missing():
-    """Safety default: an exception without an ``exceeds_cap`` attribute
-    skips retry. The attribute is only set by ``_iter_with_overflow_hint``
-    when it determined cap-vs-payload; absence means "we don't know,"
-    and retrying an unknown stall is worse than surfacing it.
-    """
-    adapter = _stub_adapter()
-    call_count = {"n": 0}
-
-    async def fake_run_turn(*args, **kwargs):
-        call_count["n"] += 1
-        # Construct directly without going through the hint rewrite,
-        # so no exceeds_cap attribute is set.
-        raise CodexAppServerTransportError(
-            "codex turn idle for 300s with no completion"
-        )
-        yield  # pragma: no cover
-
-    adapter._run_turn = fake_run_turn
-
-    with pytest.raises(CodexAppServerTransportError):
-        await _collect(adapter._run_turn_with_retry(
-            "m", [], None, None, None,
-        ))
-    assert call_count["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_no_retry_when_error_is_not_idle_timeout():
-    """A different transport error — RPC timeout from ``_request_unguarded``,
-    say — is not an idle stall and won't be helped by waiting 5s. Pass
-    through unchanged.
-    """
-    adapter = _stub_adapter()
-    call_count = {"n": 0}
-
-    async def fake_run_turn(*args, **kwargs):
-        call_count["n"] += 1
-        # Has exceeds_cap=False but the message doesn't carry the
-        # idle-timeout markers — different transport failure class.
-        raise _transport_error(
-            "turn/start timed out after 60s", exceeds_cap=False,
-        )
-        yield  # pragma: no cover
-
-    adapter._run_turn = fake_run_turn
-
-    with pytest.raises(CodexAppServerTransportError):
-        await _collect(adapter._run_turn_with_retry(
-            "m", [], None, None, None,
-        ))
-    assert call_count["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_no_retry_on_connection_closed():
-    """Connection-closed is the app-server process going away. Retrying
-    doesn't bring it back; we'd just get the same closure again.
-    """
-    adapter = _stub_adapter()
-    call_count = {"n": 0}
-
-    async def fake_run_turn(*args, **kwargs):
-        call_count["n"] += 1
-        raise CodexAppServerConnectionClosed("codex app-server closed mid-turn")
-        yield  # pragma: no cover
-
-    adapter._run_turn = fake_run_turn
-
-    with pytest.raises(CodexAppServerConnectionClosed):
-        await _collect(adapter._run_turn_with_retry(
-            "m", [], None, None, None,
-        ))
-    assert call_count["n"] == 1
+    assert call_count == 1
 
 
 @pytest.mark.asyncio
@@ -285,7 +271,10 @@ async def test_no_retry_when_tools_are_present():
     received_tools = []
     received_tool_executor = []
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
+    async def fake_run_turn(
+        model, messages, tools, session_id, tool_executor,
+        cancel_token=None, keep_trailing_system=False,
+    ):
         call_count["n"] += 1
         received_tools.append(tools)
         received_tool_executor.append(tool_executor)
@@ -325,7 +314,10 @@ async def test_retry_invalidates_cached_thread_for_session():
     call_count = {"n": 0}
     cache_at_start_of_attempt: List[dict] = []
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
+    async def fake_run_turn(
+        model, messages, tools, session_id, tool_executor,
+        cancel_token=None, keep_trailing_system=False,
+    ):
         call_count["n"] += 1
         # Snapshot the cache as seen at the start of each attempt — the
         # wrapper's invariant is "cache popped between attempts."
@@ -346,86 +338,66 @@ async def test_retry_invalidates_cached_thread_for_session():
     assert cache_at_start_of_attempt[1] == {}
 
 
-def test_run_turn_rechecks_session_cache_after_acquiring_thread_lock():
-    """Codex review round 3: a same-session call queued on
-    ``_thread_locks[thread_id]`` already has the now-poisoned
-    ``thread_id`` in a local variable. Popping ``_session_threads``
-    from another concurrent failure doesn't help that queued call —
-    it would still call ``turn/start`` on the hung thread when it
-    unblocks. The fix: re-check ``_session_threads`` after acquiring
-    the thread lock; if the cache no longer points at our
-    ``thread_id``, re-resolve via ``_ensure_thread`` to get a fresh
-    thread.
+@pytest.mark.asyncio
+async def test_queued_same_session_turn_re_resolves_after_idle_timeout():
+    """A queued turn must not reuse the thread invalidated by its predecessor.
 
-    Pinned source-level (behavioral test would require choreographing
-    two concurrent ``_run_turn`` invocations through real asyncio with
-    a poisoned-thread injection — feasible but heavy for what's
-    effectively a "did the author add the re-check" assertion).
+    This drives the actual lock/cache race: both calls resolve the same cached
+    thread, the first idle-times out while holding its lock, and the second must
+    observe the invalidation after it acquires that lock and start a fresh
+    thread. It replaces source-string assertions that could not prove ordering.
     """
-    from kestrel_sovereign.llm import codex_adapter as m
-    import inspect
+    adapter, _app = _runtime_adapter()
+    adapter._session_threads = {"sess-X": ("thread-old", "fingerprint")}
+    adapter._forget_thread_usage = lambda session_id: None
+    ensure_results = []
 
-    src = inspect.getsource(m.CodexAdapter._run_turn)
-    # The re-check must come after the initial lock acquire.
-    # With cancellation support, lock.acquire() is wrapped in await_or_cancelled.
-    initial_acquire_idx = src.find("lock.acquire()")
-    assert initial_acquire_idx > 0
-    # The re-check loop pattern.
-    recheck_idx = src.find("self._session_threads.get(session_id)")
-    assert recheck_idx > initial_acquire_idx, (
-        "session-cache re-check must appear AFTER the initial thread "
-        "lock acquire so the cache state at lock-acquisition-time is "
-        "what gates the re-resolve."
-    )
-    # The re-resolve path must release the stale lock and re-call
-    # ``_ensure_thread`` rather than just looping with the same lock
-    # and thread_id (which would re-resolve to itself if the cache
-    # was racy-popped after our lookup).
-    assert "lock.release()" in src[recheck_idx:src.find("\n        try:")], (
-        "the re-check arm must release the stale lock before "
-        "re-resolving via _ensure_thread"
-    )
-    assert "_ensure_thread" in src[recheck_idx:src.find("\n        try:")]
+    async def ensure_thread(app, session_id, model, instructions, tools):
+        cached = adapter._session_threads.get(session_id)
+        if cached:
+            result = (cached[0], False)
+        else:
+            result = ("thread-new", True)
+            adapter._session_threads[session_id] = (
+                result[0], "new-fingerprint"
+            )
+        ensure_results.append(result[0])
+        return result
 
+    adapter._ensure_thread = ensure_thread
+    old_turn_started = asyncio.Event()
+    release_old_turn = asyncio.Event()
+    iterated_threads = []
 
-def test_run_turn_invalidates_session_cache_before_lock_release():
-    """Codex review round 2: the cache invalidation must happen BEFORE
-    ``_run_turn``'s ``finally`` releases the per-thread lock, otherwise
-    a same-session call queued on ``_session_locks`` can unblock and
-    grab the still-hung thread before the retry wrapper pops the
-    cache. Pin the source-level intent: ``_run_turn`` itself must
-    catch ``CodexAppServerTransportError`` and pop the cache for
-    idle-timeout cases.
+    async def iter_events(
+        app, sink, est_payload_tokens, *, thread_id=None, cancel_token=None
+    ):
+        iterated_threads.append(thread_id)
+        if thread_id == "thread-old":
+            old_turn_started.set()
+            await release_old_turn.wait()
+            raise _transport_error()
+        yield {
+            "method": "turn/completed",
+            "params": {"turn": {"status": "completed"}},
+        }
 
-    Source-level rather than behavioral because reproducing the
-    inter-task timing window in a unit test requires substantial
-    asyncio orchestration; the source pin catches the regression
-    that matters (someone refactors ``_run_turn`` and accidentally
-    drops the in-method invalidation, leaving only the wrapper's
-    post-lock-release pop).
-    """
-    from kestrel_sovereign.llm import codex_adapter as m
-    import inspect
+    adapter._iter_with_overflow_hint = iter_events
+    args = ("m", [{"role": "user", "content": "hi"}], None, "sess-X", None)
+    first = asyncio.create_task(_collect(adapter._run_turn(*args)))
+    await old_turn_started.wait()
+    second = asyncio.create_task(_collect(adapter._run_turn(*args)))
+    await asyncio.sleep(0)  # let the second call queue on thread-old's lock
+    release_old_turn.set()
 
-    src = inspect.getsource(m.CodexAdapter._run_turn)
-    assert "except CodexAppServerTransportError" in src, (
-        "_run_turn must catch the transport error inside its try-block "
-        "so the cache invalidation runs BEFORE the finally releases "
-        "the thread lock."
-    )
-    assert "_session_threads.pop(session_id" in src, (
-        "_run_turn's transport-error arm must pop _session_threads so "
-        "concurrent same-session callers don't reuse the hung thread."
-    )
-    # The order check: the except arm must appear BEFORE the finally
-    # in source order. (Python's runtime order is also except-then-
-    # finally regardless, but the source order is what readers reason
-    # about.)
-    except_idx = src.find("except CodexAppServerTransportError")
-    finally_idx = src.find("\n        finally:")
-    assert 0 <= except_idx < finally_idx, (
-        "except arm must precede finally in _run_turn's source"
-    )
+    with pytest.raises(CodexAppServerTransportError):
+        await first
+    second_events = await asyncio.wait_for(second, timeout=1)
+
+    assert ensure_results == ["thread-old", "thread-old", "thread-new"]
+    assert iterated_threads == ["thread-old", "thread-new"]
+    assert second_events[-1]["final"] == (None, None, {})
+    assert adapter._session_threads["sess-X"][0] == "thread-new"
 
 
 @pytest.mark.asyncio
@@ -438,7 +410,10 @@ async def test_retry_fires_with_empty_tool_list():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None, keep_trailing_system=False):
+    async def fake_run_turn(
+        model, messages, tools, session_id, tool_executor,
+        cancel_token=None, keep_trailing_system=False,
+    ):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise _transport_error()
@@ -500,25 +475,37 @@ async def test_no_retry_when_exceeds_cap_unset_for_unknown_cap():
     )
 
 
-def test_run_turn_uses_truthy_session_id_guard_for_recheck_loop():
-    """Codex review round 4 P2: the post-acquire re-check loop must
-    use ``while session_id:`` (truthy), not ``while session_id is not None:``.
-    ``_ensure_thread`` treats empty-string session_ids as sessionless
-    via its own truthy check, so the cache is never written for them.
-    With ``is not None``, the re-check loop would spin forever opening
-    fresh threads because ``cached`` stays ``None`` indefinitely.
-    """
-    from kestrel_sovereign.llm import codex_adapter as m
-    import inspect
+@pytest.mark.asyncio
+async def test_empty_session_id_completes_without_thread_re_resolution():
+    """An empty session id is sessionless and must not enter the cache loop."""
+    adapter, _app = _runtime_adapter()
+    ensure_calls = 0
 
-    src = inspect.getsource(m.CodexAdapter._run_turn)
-    assert "while session_id:" in src, (
-        "_run_turn's re-check loop must gate on truthy session_id to "
-        "match _ensure_thread's semantics and avoid infinite-loop on ''"
+    async def ensure_thread(app, session_id, model, instructions, tools):
+        nonlocal ensure_calls
+        ensure_calls += 1
+        return "thread-sessionless", True
+
+    adapter._ensure_thread = ensure_thread
+
+    async def iter_events(
+        app, sink, est_payload_tokens, *, thread_id=None, cancel_token=None
+    ):
+        yield {
+            "method": "turn/completed",
+            "params": {"turn": {"status": "completed"}},
+        }
+
+    adapter._iter_with_overflow_hint = iter_events
+    events = await asyncio.wait_for(
+        _collect(adapter._run_turn(
+            "m", [{"role": "user", "content": "hi"}], None, "", None
+        )),
+        timeout=1,
     )
-    assert "while session_id is not None:" not in src, (
-        "stale guard would spin forever on empty-string session ids"
-    )
+
+    assert ensure_calls == 1
+    assert events[-1]["final"] == (None, None, {})
 
 
 @pytest.mark.asyncio
@@ -582,46 +569,62 @@ async def test_retry_exhaustion_preserves_transport_and_exceeds_cap():
 
 
 # ---------------------------------------------------------------------------
-# Entry-point routing: get_response + get_streaming_response use the
-# wrapper; get_streaming_response_with_tools does NOT.
+# Entry-point routing: text-only public APIs retry; tool streaming does not.
 # ---------------------------------------------------------------------------
 
 
-def test_get_response_calls_run_turn_with_retry():
-    """Source-level guarantee — both code paths must funnel through the
-    retry wrapper rather than calling ``_run_turn`` directly.
-    """
-    from kestrel_sovereign.llm import codex_adapter as m
-    import inspect
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_point", ["get_response", "get_streaming_response"])
+async def test_text_only_public_entry_point_retries_idle_timeout(entry_point):
+    """The public text APIs expose the wrapper's observable retry behavior."""
+    adapter = _stub_adapter()
+    call_count = 0
 
-    src = inspect.getsource(m.CodexAdapter.get_response)
-    assert "_run_turn_with_retry" in src
-    assert "self._run_turn(" not in src
+    async def fake_run_turn(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise _transport_error()
+        yield {"text": "ok"}
+        yield {"final": ("ok", None, {})}
+
+    adapter._run_turn = fake_run_turn
+    method = getattr(adapter, entry_point)
+    call = method(
+        client=None,
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    if entry_point == "get_response":
+        response = await call
+        assert response.content == "ok"
+    else:
+        assert await _collect(call) == ["ok"]
+    assert call_count == 2
 
 
-def test_get_streaming_response_calls_run_turn_with_retry():
-    from kestrel_sovereign.llm import codex_adapter as m
-    import inspect
+@pytest.mark.asyncio
+async def test_tool_streaming_public_entry_point_does_not_retry():
+    """A tool-bearing public stream surfaces its first transport failure."""
+    adapter = _stub_adapter()
+    call_count = 0
 
-    src = inspect.getsource(m.CodexAdapter.get_streaming_response)
-    assert "_run_turn_with_retry" in src
-    assert "self._run_turn(" not in src
+    async def fake_run_turn(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise _transport_error()
+        yield  # pragma: no cover - preserves async-generator shape
 
-
-def test_get_streaming_response_with_tools_does_not_use_retry():
-    """The tool-bearing streaming path must NOT use the retry wrapper.
-    Inline tool execution + replay is the deferred-design case the
-    ticket explicitly carves out. If a future change accidentally
-    points this entry point at the wrapper, the wrapper would still
-    delegate straight through (it has a ``tools is not None`` guard),
-    but pinning the source-level intent is cheap insurance.
-    """
-    from kestrel_sovereign.llm import codex_adapter as m
-    import inspect
-
-    src = inspect.getsource(m.CodexAdapter.get_streaming_response_with_tools)
-    assert "_run_turn_with_retry" not in src
-    assert "self._run_turn(" in src
+    adapter._run_turn = fake_run_turn
+    with pytest.raises(CodexAppServerTransportError):
+        await _collect(adapter.get_streaming_response_with_tools(
+            client=None,
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "noop"}}],
+            tool_executor=MagicMock(),
+        ))
+    assert call_count == 1
 
 
 # ---------------------------------------------------------------------------

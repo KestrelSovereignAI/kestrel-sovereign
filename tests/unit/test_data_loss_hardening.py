@@ -135,15 +135,6 @@ class TestInceptionForce:
 
 
 # ---------------------------------------------------------------------------
-# Retirement: archive only THIS agent's keys (not co-located peers')
-# ---------------------------------------------------------------------------
-class TestRetirementScoping:
-    @pytest.mark.asyncio
-    async def test_placeholder(self):  # keep class import-time stable
-        assert True
-
-
-# ---------------------------------------------------------------------------
 # Sovereign import: restore the ORIGINAL timestamp, not import-time "now"
 # ---------------------------------------------------------------------------
 class TestImportTimestampPreservation:
