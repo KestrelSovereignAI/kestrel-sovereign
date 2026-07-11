@@ -17,6 +17,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.setup.context import Flow, SetupContext
 from kestrel_sovereign.setup.env_file import read_env, write_env
 from kestrel_sovereign.setup.toml_file import read_toml, write_toml
@@ -159,9 +160,9 @@ _OPENROUTER = _Vendor(
                     "api": {
                         "adapter": "OpenRouterAdapter",
                         "api_key_env": "OPENROUTER_API_KEY",
-                        # Management-key-only setups are valid: the registry
-                        # (#2243) registers OpenRouter + mints keys from this
-                        # alone, and doctor treats it as an accepted credential.
+                        # Declare the management-key env so the runtime,
+                        # setup --check, and doctor all recognize a
+                        # management-key-only credential (#2245).
                         "management_api_key_env": "OPENROUTER_MANAGEMENT_API_KEY",
                         "model": "auto",
                         "selection_hints": ["sonnet", "gpt", "gemini"],
@@ -194,30 +195,15 @@ def run(ctx: SetupContext) -> None:
             route = (
                 (existing_vendors.get(vendor_key) or {}).get("routes") or {}
             ).get(route_key) or {}
-            api_key_env = route.get("api_key_env")
-            if api_key_env and not existing_keys.get(api_key_env):
-                # An alternative credential can still satisfy the route.
-                # For OpenRouter, an OPENROUTER_MANAGEMENT_API_KEY (the
-                # route's ``management_api_key_env`` or the default) lets the
-                # registry mint a bootstrap child key (#2243), so a management
-                # key alone is a valid config — don't report it as missing.
-                # CHECK mode validates on-disk state only: a key exported in
-                # the operator's shell but absent from .env would not survive a
-                # managed restart or a different shell, so only ``existing_keys``
-                # (.env) counts here — matching the primary key path above.
-                vendor = _VENDORS_BY_KEY.get(vendor_key)
-                alt_envs = [
-                    e
-                    for e in (
-                        route.get("management_api_key_env"),
-                        vendor.alt_api_key_env if vendor else None,
-                    )
-                    if e
-                ]
-                if any(existing_keys.get(e) for e in alt_envs):
-                    continue
+            # CHECK mode validates on-disk state only: a key exported in
+            # the operator's shell but absent from .env would not survive a
+            # managed restart or a different shell, so only ``existing_keys``
+            # (.env) counts here.
+            accepted = accepted_credential_envs(route_id, route)
+            if accepted and not any(existing_keys.get(name) for name in accepted):
                 ctx.block(
-                    f"{api_key_env} not set in .env (required for {route_id})"
+                    f"{' or '.join(accepted)} not set in .env "
+                    f"(required for {route_id})"
                 )
         return
 
@@ -296,21 +282,13 @@ def _detect_available_vendors(existing_keys: dict[str, str]) -> list[_Vendor]:
     # treat the vendor as available.
     cloud_priority = (_OPENROUTER, _ANTHROPIC, _OPENAI, _GOOGLE)
     for vendor in cloud_priority:
-        env_var = vendor.api_key_env
-        if not env_var:
+        # A vendor is available if any of its accepted credential env vars
+        # (primary or alternate, e.g. OpenRouter's management key) is set
+        # in either the parent shell or the .env file.
+        env_vars = [e for e in (vendor.api_key_env, vendor.alt_api_key_env) if e]
+        if not env_vars:
             continue
-        candidates = [env_var]
-        if vendor.alt_api_key_env:
-            candidates.append(vendor.alt_api_key_env)
-        value = next(
-            (
-                os.environ.get(e) or existing_keys.get(e)
-                for e in candidates
-                if os.environ.get(e) or existing_keys.get(e)
-            ),
-            None,
-        )
-        if value:
+        if any(os.environ.get(e) or existing_keys.get(e) for e in env_vars):
             detected.append(vendor)
 
     if _is_ollama_reachable():
@@ -427,12 +405,10 @@ def _gather_api_keys(
     for vendor in selected:
         if not vendor.api_key_env:
             continue
-        # A vendor may accept more than one env var (OpenRouter also takes
-        # a management key). If any acceptable key is already in .env, leave
-        # it alone.
-        key_envs = [vendor.api_key_env]
-        if vendor.alt_api_key_env:
-            key_envs.append(vendor.alt_api_key_env)
+        # A vendor's credential requirement is satisfied by any of its
+        # accepted env vars (primary or alternate). If .env already has
+        # one, there's nothing to gather.
+        key_envs = [e for e in (vendor.api_key_env, vendor.alt_api_key_env) if e]
         if any(existing_keys.get(e) for e in key_envs):
             continue
         # Promote a shell-exported key into .env (quickstart only) so

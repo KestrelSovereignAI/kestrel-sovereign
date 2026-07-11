@@ -418,6 +418,31 @@ def test_llm_check_mode_reports_missing_key_for_existing_cloud_route(tmp_path):
     assert any("OPENAI_API_KEY" in b for b in ctx.blockers)
 
 
+def test_llm_check_mode_accepts_openrouter_management_key_only(tmp_path, monkeypatch):
+    """--check accepts a management-key-only OpenRouter setup even when the
+    route TOML omits ``management_api_key_env`` (via the vendor alt-key
+    fallback). doctor must agree — see the doctor regression test (#2245)."""
+    for var in ("OPENROUTER_API_KEY", "OPENROUTER_MANAGEMENT_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    write_toml(
+        tmp_path / "kestrel.toml",
+        {
+            "llm": {
+                "route_priority": ["openrouter:api"],
+                "vendors": {
+                    "openrouter": {
+                        "routes": {"api": {"api_key_env": "OPENROUTER_API_KEY"}}
+                    }
+                },
+            }
+        },
+    )
+    write_env(tmp_path / ".env", {"OPENROUTER_MANAGEMENT_API_KEY": "sk-mgmt-x"})
+    ctx = _make_ctx(tmp_path, Flow.CHECK)
+    llm.run(ctx)
+    assert not ctx.blockers, f"blockers={ctx.blockers}"
+
+
 def test_llm_existing_unmanaged_routes_preserved(tmp_path):
     """A user-authored vendor we don't manage in v1 must survive a wizard run."""
     write_toml(
