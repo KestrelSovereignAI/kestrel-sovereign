@@ -54,7 +54,10 @@ window.toggleEncryptionView = async function() {
     await loadConversationHistory();
 
     if (state.currentSessionId) {
-        await window.loadConversation(state.currentSessionId);
+        // force: this IS a same-session reload — the canonical loader's
+        // same-session no-op (#2380) must not skip the re-render that swaps
+        // between decrypted and raw-ciphertext views.
+        await window.loadConversation(state.currentSessionId, { force: true });
     }
 
     Toast.info(state.showDecrypted ? '\u{1F513} Now viewing decrypted content' : '\u{1F510} Now viewing raw encrypted data');

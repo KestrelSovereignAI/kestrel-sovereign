@@ -1626,21 +1626,40 @@ window.loadConversation = async function(sessionId, options = {}) {
         return;
     }
 
+    // Snapshot the selection state BEFORE committing the new one, so a failed
+    // load can roll the highlight back instead of leaving it pointing at a
+    // conversation that never rendered (#2380 codex round 2).
+    const host = API.getHostAgent();
+    const prevActiveId = activeConversationId;
+    const prevMappedId = activeConversationIdsByAgent.get(host);
+
+    const applyHighlight = (sid) => {
+        // #2222: keep the shared pane's highlight unified with our active-id.
+        // The component owns the highlight now (setActiveSessionId re-renders
+        // with the active row marked); the manual class toggle stays as a
+        // cheap fallback for the pre-mount / no-handle case.
+        if (conversationsHandle) conversationsHandle.setActiveSessionId(sid);
+        // The mounted list re-renders per agent (retarget is the only refresh
+        // path on a switch, #2199), so every visible row already belongs to
+        // the current host — a session_id match is sufficient.
+        document.querySelectorAll('.conversation-item').forEach(item => {
+            item.classList.toggle('active', item.dataset.sessionId === sid);
+        });
+    };
+
     activeConversationId = sessionId;
-    activeConversationIdsByAgent.set(API.getHostAgent(), sessionId);
+    activeConversationIdsByAgent.set(host, sessionId);
+    applyHighlight(sessionId);
 
-    // #2222: keep the shared pane's highlight unified with our active-id. The
-    // component owns the highlight now (setActiveSessionId re-renders with the
-    // active row marked); the manual class toggle below stays as a cheap
-    // fallback for the pre-mount / no-handle case.
-    if (conversationsHandle) conversationsHandle.setActiveSessionId(sessionId);
-
-    // Update selection UI. The mounted list re-renders per agent (retarget is
-    // the only refresh path on a switch, #2199), so every visible row already
-    // belongs to the current host — a session_id match is sufficient.
-    document.querySelectorAll('.conversation-item').forEach(item => {
-        item.classList.toggle('active', item.dataset.sessionId === sessionId);
-    });
+    // Same-session no-op (#2380 codex round 2, carried from the legacy
+    // loader): re-clicking the already-active conversation must not wipe the
+    // pane — an in-flight stream would be generation-gated out and its chunks
+    // dropped. The highlight commit above is idempotent for this case. Callers
+    // that NEED a same-session re-render (the encryption-view toggle) pass
+    // ``{ force: true }``.
+    if (!options.force && sessionId === state.currentSessionId) {
+        return;
+    }
 
     // Load conversation messages into chat panel
     try {
@@ -1935,6 +1954,18 @@ window.loadConversation = async function(sessionId, options = {}) {
         updateContextStatus();
     } catch (e) {
         console.error('Failed to load conversation:', e);
+        // Roll the selection back to what was actually loaded — the clicked
+        // row never rendered, so leaving it highlighted would let subsequent
+        // sends continue in the OLD session under the WRONG highlight (#2380
+        // codex round 2). Only roll back if no later click has already moved
+        // the selection on.
+        if (activeConversationId === sessionId) {
+            activeConversationId = prevActiveId;
+            if (prevMappedId === undefined) activeConversationIdsByAgent.delete(host);
+            else activeConversationIdsByAgent.set(host, prevMappedId);
+            applyHighlight(prevActiveId);
+        }
+        Toast.error(`Failed to load conversation: ${e.message}`);
     }
 };
 
