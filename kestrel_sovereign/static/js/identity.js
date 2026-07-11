@@ -1706,8 +1706,11 @@ window.loadConversation = async function(sessionId, options = {}) {
         // wipe + render A's history into B's pane after the user
         // switched.  The pre-await guard above catches the case where
         // the switch happened BEFORE the fetch; this one catches a
-        // switch DURING.  Codex round-3 catch on #1358.
+        // switch DURING.  Codex round-3 catch on #1358. Roll the pending
+        // selection back so the captured agent's map entry doesn't point at a
+        // session that never rendered (#2380 codex round 7).
         if (hasExpectedAgent(options) && !currentAgentMatches(options.expectedAgent)) {
+            rollbackToRendered();
             return;
         }
 
@@ -1741,7 +1744,10 @@ window.loadConversation = async function(sessionId, options = {}) {
         // captured host's pane while assigning state.currentSessionId through
         // the NEWLY-visible agent's pane. (Covers the no-expectedAgent callers
         // too; the expectedAgent guards above only ran for pinned loads.)
+        // Roll the pending selection back so the captured agent's map entry
+        // doesn't point at a session that never rendered (#2380 codex round 7).
         if (API.getHostAgent() !== host) {
+            rollbackToRendered();
             return;
         }
 
