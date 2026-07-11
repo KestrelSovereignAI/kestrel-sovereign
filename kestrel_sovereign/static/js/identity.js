@@ -6,7 +6,7 @@
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts, renderSignalWakeChip } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
 // consumer — one list orchestrator (fetch / refresh / seq-guard / views /
@@ -1481,6 +1481,64 @@ function renderAssistantMessageWithParts(msg, container) {
     }
 }
 
+// Parse a stored timestamp into an epoch-ms sort key for interleaving the
+// conversation timeline (#1816). DB timestamps are UTC, but conversation rows
+// serialize naive (no tz suffix) while restart_status_events carry an explicit
+// +00:00. Date.parse() reads a naive string as LOCAL time, so pin tz-less
+// strings to UTC ('Z') before parsing — otherwise the two streams drift apart
+// by the viewer's local offset and interleave wrong. Ported from history.js
+// alongside the restart-trail repaint when the duplicate loader was removed
+// (#2380).
+function timelineTs(value) {
+    const s = String(value || '');
+    if (!s) return 0;
+    const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s);
+    const t = Date.parse(hasTz ? s : `${s}Z`);
+    return Number.isNaN(t) ? 0 : t;
+}
+
+// #1659: tool cards on reload come from the structured, position-stamped
+// ``tool_events`` metadata; new rows persist clean prose. Rows persisted BEFORE
+// the cutover instead carry emoji marker tokens inline (and their tool_events,
+// if any, lack ``pos``). For those we parse the markers back into structured
+// events WITH positions, so the cards render where the tools actually occurred
+// — not bunched at the top. Ported from history.js alongside the tool-card
+// reload path when the duplicate loader was removed (#2380).
+//
+// Self-terminating marker TOKENS (not line-anchored): the old stream could glue
+// a marker onto adjacent prose without a newline ("I'll check🔧 Calling
+// lookup..."). Mirrors the deleted chat.js TOOL_MARKER_TOKEN.
+const LEGACY_TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?\s+(?:complete|done)\b(?:\s+\([^\n)]*\))?|❌\s+\S[^\n]*?\s+failed\b(?::[^\n\u{1F527}✓❌]*)?/gu;
+// Gate legacy handling on a 🔧 Calling START being present — exactly the old
+// TOOL_START_PRESENCE rule. Without it, ordinary replies like "✓ Migration
+// complete" would be mistaken for tool markers.
+const LEGACY_TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
+
+function legacyToolEventsFromText(content) {
+    const src = String(content || '');
+    const re = new RegExp(LEGACY_TOOL_MARKER_TOKEN.source, 'gu');
+    const events = [];
+    let clean = '';
+    let last = 0;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+        clean += src.slice(last, m.index);
+        const marker = m[0];
+        const pos = clean.length;
+        let mm;
+        if ((mm = marker.match(/^\u{1F527}\s+Calling\s+(\S[^\n]*?)(?::[^\n]*)?\.\.\.$/u))) {
+            events.push({ phase: 'start', name: mm[1].trim(), pos });
+        } else if ((mm = marker.match(/^✓\s+(\S[^\n]*?)\s+(?:complete|done)\b/u))) {
+            events.push({ phase: 'done', name: mm[1].trim(), pos });
+        } else if ((mm = marker.match(/^❌\s+(\S[^\n]*?)\s+failed\b/u))) {
+            events.push({ phase: 'error', name: mm[1].trim(), pos });
+        }
+        last = re.lastIndex;
+    }
+    clean += src.slice(last);
+    return { clean, events };
+}
+
 window.loadConversation = async function(sessionId, options = {}) {
     // Stale-load guard: when a row load was queued for one agent and the
     // operator has since selectAgent'd to a different host, the queued
@@ -1509,8 +1567,11 @@ window.loadConversation = async function(sessionId, options = {}) {
 
     // Load conversation messages into chat panel
     try {
-        const data = await API.getConversation(sessionId);
+        const data = await API.getConversation(sessionId, state.showDecrypted);
         const messages = data.messages || [];
+        if (data.encrypted_at_rest !== undefined) {
+            state.encryptedAtRest = data.encrypted_at_rest;
+        }
 
         // Post-await stale-agent re-check: the operator may have
         // switched host agents while ``getConversation`` was in flight.
@@ -1559,14 +1620,94 @@ window.loadConversation = async function(sessionId, options = {}) {
         const pane = state.chatPanes.get(currentAgent);
         const chatContainer = pane ? pane.element : document.getElementById('chat-container');
 
-        const renderMd = window.SharedMarkdown?.renderMarkdown;
+        // Encrypted-at-rest banner (ported from the legacy history.js loader,
+        // #2380): when the operator is viewing raw encrypted data, surface a
+        // banner with a Decrypt toggle. state.encryptedAtRest was set from the
+        // response above.
+        if (!state.showDecrypted && state.encryptedAtRest) {
+            const banner = document.createElement('div');
+            banner.style.cssText = `
+                background: linear-gradient(135deg, #22c55e, #16a34a);
+                color: white;
+                padding: 0.75rem 1rem;
+                margin: 0.5rem;
+                border-radius: 8px;
+                font-size: 0.85rem;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            `;
+            banner.innerHTML = `
+                \u{1F510} <strong>Viewing raw encrypted data</strong> - This is how your messages are stored at rest.
+                <button onclick="toggleEncryptionView()" style="
+                    margin-left: auto;
+                    background: rgba(255,255,255,0.2);
+                    border: none;
+                    color: white;
+                    padding: 0.25rem 0.75rem;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 0.75rem;
+                ">Decrypt</button>
+            `;
+            chatContainer.appendChild(banner);
+        }
 
+        // Repaint the restart status-bubble trail (requesting → executing →
+        // completed) on reload (#1816). These bubbles render live via the
+        // ``restart_status`` SSE side-channel but vanish on reload because they
+        // are never persisted as conversation rows — their durable home is the
+        // ``restart_status_events`` audit table (#1562), scoped server-side to
+        // requests filed from THIS session (#1812). Tolerate the endpoint being
+        // absent (restart feature not loaded) — there's just no trail then.
+        // Ported from the legacy history.js loader (#2380).
+        let restartEvents = [];
+        try {
+            const res = await API.getRestartStatusEvents(sessionId);
+            restartEvents = Array.isArray(res?.events) ? res.events : [];
+        } catch (e) {
+            restartEvents = [];
+        }
+
+        // Interleave messages and restart status bubbles in timestamp order so
+        // the trail lands chronologically among the conversation turns, matching
+        // the live render order. DB timestamps are UTC; conversation rows
+        // serialize naive (no tz) while restart events carry +00:00, so pin naive
+        // strings to UTC before comparing (see timelineTs).
+        const timeline = [];
         for (const msg of messages) {
+            timeline.push({ ts: timelineTs(msg.created_at), kind: 'message', item: msg });
+        }
+        restartEvents.forEach((ev) => {
+            timeline.push({ ts: timelineTs(ev.created_at), kind: 'restart', item: ev });
+        });
+        timeline.sort((a, b) => a.ts - b.ts);
+
+        for (const entry of timeline) {
+            if (entry.kind === 'restart') {
+                // Reuse the live bubble renderer; the stored event payload IS the
+                // SSE payload shape it expects. Pin the target to this
+                // conversation's pane so interleaving holds.
+                handleRestartStatus(entry.item.payload, chatContainer);
+                continue;
+            }
+            const msg = entry.item;
+            // When the operator is viewing raw encrypted data (Decrypt toggle
+            // off) an encrypted row's ``content`` is ciphertext, not prose or
+            // component data. Gate every rich renderer (typed parts, tool cards,
+            // markdown, attachments) on this so ciphertext is presented as raw
+            // text under the encrypted styling — never parsed as markdown or
+            // mounted as component bubbles. Ported from the legacy history.js
+            // loader (#2380).
+            const isEncrypted = msg.encrypted && !state.showDecrypted;
+
             // #2081/#1914: an assistant turn carrying typed component parts
             // re-renders as interleaved prose + component bubbles so a persisted
             // card (e.g. the WhatsApp channel_link QR) survives this load path.
+            // Skipped for encrypted rows — the parts payload is ciphertext.
             const parts = msg.metadata?.parts;
-            if (msg.role === 'assistant' && Array.isArray(parts) && parts.length) {
+            if (msg.role === 'assistant' && !isEncrypted
+                && Array.isArray(parts) && parts.length) {
                 renderAssistantMessageWithParts(msg, chatContainer);
                 continue;
             }
@@ -1605,16 +1746,90 @@ window.loadConversation = async function(sessionId, options = {}) {
                 messageDiv.appendChild(deleteBtn);
             }
 
+            if (isEncrypted) {
+                // Raw ciphertext view: present the stored bytes verbatim in a
+                // monospace, break-all bubble. No markdown, no tool cards, no
+                // attachments. Inline styling ported verbatim from the legacy
+                // history.js loader (#2380) — there is no CSS class for it.
+                messageDiv.style.cssText = `
+                    padding: 1rem;
+                    margin-bottom: 0.75rem;
+                    border-radius: 12px;
+                    max-width: 85%;
+                    background: linear-gradient(135deg, #1a1a2e, #16213e);
+                    border: 1px solid #22c55e;
+                    margin-${msg.role === 'user' ? 'left' : 'right'}: auto;
+                    font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+                    font-size: 0.75rem;
+                    word-break: break-all;
+                    color: #22c55e;
+                `;
+                const header = document.createElement('div');
+                header.style.cssText = `
+                    font-size: 0.65rem;
+                    opacity: 0.7;
+                    margin-bottom: 0.5rem;
+                    color: #4ade80;
+                `;
+                header.textContent = `\u{1F510} ${String(msg.role).toUpperCase()} (encrypted)`;
+                messageDiv.appendChild(header);
+                const contentSpan = document.createElement('span');
+                contentSpan.textContent = msg.content;
+                messageDiv.appendChild(contentSpan);
+                chatContainer.appendChild(messageDiv);
+                continue;
+            }
+
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
 
-            if (msg.role === 'assistant' && renderMd) {
-                contentDiv.innerHTML = renderMd(msg.content);
+            if (msg.role === 'assistant') {
+                // #1659: reload the assistant turn's tool-activity cards from
+                // the persisted ``tool_events`` metadata so they render in
+                // document order alongside the prose, matching the live bubble.
+                const toolEvents = msg.metadata?.tool_events;
+                const hasPos = !!toolEvents
+                    && toolEvents.some((e) => typeof e.pos === 'number');
+                let bodyHtml = null;
+                if (hasPos) {
+                    // Post-cutover row: position-stamped events are authoritative
+                    // and the prose is already clean.
+                    bodyHtml = renderAgentContentHtml(msg.content, { toolEvents });
+                } else if (LEGACY_TOOL_START_PRESENCE.test(msg.content)) {
+                    // Pre-cutover row: derive cards AND positions from the inline
+                    // emoji markers so they land where the tools ran.
+                    const legacy = legacyToolEventsFromText(msg.content);
+                    bodyHtml = renderAgentContentHtml(
+                        legacy.clean, { toolEvents: legacy.events },
+                    );
+                } else if (toolEvents && toolEvents.length) {
+                    // Old metadata with neither pos nor inline markers — no
+                    // placement survives; render the cards rather than drop them.
+                    bodyHtml = renderAgentContentHtml(msg.content, { toolEvents });
+                } else {
+                    // Plain assistant turn: shared renderer collapses to markdown.
+                    bodyHtml = renderAgentContentHtml(msg.content, {});
+                }
+                contentDiv.innerHTML = bodyHtml;
+                messageDiv.appendChild(contentDiv);
+                // Reloaded tool cards may carry feature-renderer wrappers; mount
+                // their imperative hooks now that the markup is live.
+                mountToolRenderers(contentDiv);
             } else {
                 contentDiv.textContent = msg.content;
+                messageDiv.appendChild(contentDiv);
             }
 
-            messageDiv.appendChild(contentDiv);
+            // #1662: re-render the user turn's attachment thumbnails from the
+            // persisted metadata refs so they survive a reload.
+            if (msg.role === 'user') {
+                const attachments = msg.metadata?.attachments;
+                if (attachments && attachments.length) {
+                    const stripHtml = messageAttachmentsHtml(attachments);
+                    if (stripHtml) messageDiv.insertAdjacentHTML('beforeend', stripHtml);
+                }
+            }
+
             if (msg.role === 'assistant') {
                 const footer = renderModelFooterHtml({
                     model: msg.model,
@@ -1638,6 +1853,12 @@ window.loadConversation = async function(sessionId, options = {}) {
 
         // Switch to chat panel
         document.querySelector('[data-panel="chat"]')?.click();
+
+        // Refresh the context/utilization footer for the newly-loaded session.
+        // The old history.js loader did this after every row click; without it,
+        // switching conversations leaves the footer showing the previous
+        // session's utilization until an unrelated refresh fires (#2380).
+        updateContextStatus();
     } catch (e) {
         console.error('Failed to load conversation:', e);
     }
