@@ -65,65 +65,6 @@ class TestBudgetOverflow:
         assert budget.allocations["rag"].remaining > 0
 
 
-class TestReallocateUnused:
-    """Tests for token reallocation from unused sources."""
-
-    def test_reallocate_unused_boosts_history_and_episodes(self):
-        """Test that unused tokens get redistributed to history and episodes."""
-        budget = TokenBudget("gpt-4")
-
-        # Use up system, leave memories and rag unused
-        budget.use("system", budget.allocations["system"].budget)
-
-        # Track initial allocations
-        initial_history = budget.allocations["history"].budget
-        initial_episodes = budget.allocations["episodes"].budget
-
-        # Get unused from memories and rag
-        unused_memories = budget.allocations["memories"].remaining
-        unused_rag = budget.allocations["rag"].remaining
-        total_unused = unused_memories + unused_rag
-
-        # Reallocate
-        budget.reallocate_unused()
-
-        # If there was enough unused, should see boost
-        if total_unused > 100:
-            # History gets 70%, episodes gets 30%
-            expected_history_boost = int(total_unused * 0.7)
-            expected_episodes_boost = int(total_unused * 0.3)
-
-            assert budget.allocations["history"].budget >= initial_history + expected_history_boost - 1
-            assert budget.allocations["episodes"].budget >= initial_episodes + expected_episodes_boost - 1
-
-    def test_reallocate_unused_ignores_small_amounts(self):
-        """Test that reallocation skips if unused < 100 tokens."""
-        budget = TokenBudget("gpt-4")
-
-        # Use almost everything
-        budget.use("memories", budget.allocations["memories"].budget - 50)
-        budget.use("rag", budget.allocations["rag"].budget - 50)
-
-        initial_history = budget.allocations["history"].budget
-
-        budget.reallocate_unused()
-
-        # With only 100 tokens unused (< threshold), history should be unchanged
-        assert budget.allocations["history"].budget == initial_history
-
-    def test_reallocate_unused_only_takes_from_memories_and_rag(self):
-        """Test that reallocation only pulls from memories and rag, not system."""
-        budget = TokenBudget("gpt-4")
-
-        # Leave system unused (should not be taken)
-        system_remaining = budget.allocations["system"].remaining
-
-        budget.reallocate_unused()
-
-        # System should still have its full remaining (not taken from)
-        assert budget.allocations["system"].remaining == system_remaining
-
-
 class TestCrossModelBudgets:
     """Tests for budget differences across model context limits."""
 

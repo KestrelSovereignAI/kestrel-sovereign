@@ -238,32 +238,6 @@ class TokenBudget:
             return 0
         return self.allocations[source].remaining
 
-    def reallocate_unused(self):
-        """
-        Reallocate unused tokens from one source to others.
-
-        Called after initial allocation to redistribute surplus.
-        Prioritizes history and episodes.
-        """
-        # Collect unused tokens
-        unused = sum(
-            a.remaining for a in self.allocations.values()
-            if a.name in ("memories", "rag")  # Take from less critical
-        )
-
-        if unused > 100:  # Only reallocate if meaningful
-            # Give 70% to history, 30% to episodes
-            history_boost = int(unused * 0.7)
-            episodes_boost = int(unused * 0.3)
-
-            self.allocations["history"].budget += history_boost
-            self.allocations["episodes"].budget += episodes_boost
-
-            logger.debug(
-                f"Reallocated {unused} tokens: "
-                f"+{history_boost} history, +{episodes_boost} episodes"
-            )
-
     def get_summary(self) -> dict:
         """
         Get summary of all allocations.
