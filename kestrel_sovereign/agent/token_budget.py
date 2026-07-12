@@ -192,7 +192,17 @@ class TokenBudget:
 
         Returns:
             True if usage was within budget, False if exceeded
+
+        Raises:
+            ValueError: If ``tokens`` or ``items`` is negative. Negative
+                input is a caller bug, not a budget outcome — ``False`` is
+                reserved to mean strictly "did not fit". Zero is accepted.
         """
+        if tokens < 0 or items < 0:
+            raise ValueError(
+                f"tokens and items must be non-negative "
+                f"(got tokens={tokens}, items={items})"
+            )
         if source not in self.allocations:
             logger.warning(f"Unknown source: {source}")
             return False
@@ -219,7 +229,13 @@ class TokenBudget:
 
         Returns:
             True if tokens fit within remaining budget
+
+        Raises:
+            ValueError: If ``tokens`` is negative. A negative request is a
+                caller bug, not a "did not fit" outcome. Zero is accepted.
         """
+        if tokens < 0:
+            raise ValueError(f"tokens must be non-negative (got {tokens})")
         if source not in self.allocations:
             return False
         return tokens <= self.allocations[source].remaining
@@ -463,7 +479,13 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
         The system slice never borrows below the mandatory floor: any
         ``use("system", …)`` past ``mandatory_system_tokens`` will be
         treated as borrowable but the floor itself stays protected.
+
+        Raises:
+            ValueError: If ``tokens`` is negative (caller bug, not a
+                "did not fit" outcome). Zero is accepted.
         """
+        if tokens < 0:
+            raise ValueError(f"tokens must be non-negative (got {tokens})")
         if source not in self.allocations:
             return False
         local = self.allocations[source].remaining
@@ -489,7 +511,18 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
         cover the request — that's the signal to caller code that the
         section must be skipped (matches the legacy ``TokenBudget.use``
         return semantics).
+
+        Raises:
+            ValueError: If ``tokens`` or ``items`` is negative. Negative
+                input is a caller bug — ``False`` is reserved to mean
+                strictly "did not fit". Zero is accepted, and the elastic
+                pool is never mutated on rejection.
         """
+        if tokens < 0 or items < 0:
+            raise ValueError(
+                f"tokens and items must be non-negative "
+                f"(got tokens={tokens}, items={items})"
+            )
         if source not in self.allocations:
             logger.warning(f"Unknown source: {source}")
             return False

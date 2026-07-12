@@ -266,6 +266,49 @@ class TestEffectiveBudget:
         assert elastic.effective_budget("not-a-section") == 0
 
 
+class TestNegativeInputRejection:
+    """Negative tokens/items are a caller bug — reject loudly and leave
+    accounting (used, items, elastic pool) untouched. Zero is a valid
+    no-op success. Mirrors the base ``TokenBudget`` contract."""
+
+    def test_zero_tokens_and_items_are_accepted_no_ops(self):
+        elastic = create_budget("gpt-4", elastic=True)
+        assert elastic.can_fit("history", 0)
+        assert elastic.use("history", 0, items=0) is True
+        assert elastic.allocations["history"].used == 0
+        assert elastic.allocations["history"].items == 0
+
+    def test_use_negative_tokens_raises_and_preserves_state(self):
+        elastic = create_budget("gpt-4", elastic=True)
+        assert elastic.use("history", 100, items=2)
+        before_used = elastic.allocations["history"].used
+        before_items = elastic.allocations["history"].items
+        before_pool = elastic.elastic_pool
+
+        for tokens, items in ((-1, 1), (100, -1), (-100, -1)):
+            with pytest.raises(ValueError):
+                elastic.use("history", tokens, items=items)
+
+        assert elastic.allocations["history"].used == before_used
+        assert elastic.allocations["history"].items == before_items
+        assert elastic.elastic_pool == before_pool
+
+    def test_use_negative_does_not_drain_elastic_pool(self):
+        elastic = create_budget("gpt-4", elastic=True)
+        elastic.mark_section_finalized("memories")
+        elastic.mark_section_finalized("rag")
+        pool = elastic.elastic_pool
+        assert pool > 0
+        with pytest.raises(ValueError):
+            elastic.use("history", -1)
+        assert elastic.elastic_pool == pool
+
+    def test_can_fit_negative_tokens_raises(self):
+        elastic = create_budget("gpt-4", elastic=True)
+        with pytest.raises(ValueError):
+            elastic.can_fit("history", -1)
+
+
 class TestSummarySurfacing:
     def test_summary_exposes_elastic_fields(self):
         elastic = create_budget(
