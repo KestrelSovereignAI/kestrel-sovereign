@@ -402,6 +402,12 @@ def backup_or_refuse_existing_identity(output_dir: Path, slug: str, force: bool)
         "*_mldsa65.bytes.enc",
         "*_archival_slhdsa.bytes.enc",
         "*_archival_slhdsa_pub.bytes.enc",
+        # Hybrid-KEM receive keys (#2398): private material that must be
+        # backed up too, and whose staleness would let detect_agent_kem_slug
+        # pick up a prior agent's recipient keys.
+        "*_x25519.key.enc",
+        "*_mlkem768.bytes.enc",
+        "*_mlkem768_pub.bytes.enc",
         # Classical identity material too: force re-minting a legacy
         # did:pkh agent's dir must not leave its secp256k1 private key
         # live and un-backed-up beside the new identity.

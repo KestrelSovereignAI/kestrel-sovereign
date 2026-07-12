@@ -37,6 +37,21 @@ from .importer import (
     import_identity,
 )
 
+from .sealed_export import (
+    RecipientKEMKeys,
+    SealedExportError,
+    agent_kem_public_multibases,
+    generate_agent_kem_keypair,
+    has_agent_kem_keypair,
+    is_sealed_identity_export,
+    load_agent_kem_keypair,
+    open_identity_export,
+    recipient_keys_from_did_document,
+    recipient_keys_from_multibase,
+    seal_identity_package,
+    unseal_identity_package,
+)
+
 from .signing import (
     sign_package,
     verify_package_signature,
@@ -103,6 +118,19 @@ __all__ = [
     "IdentityImporter",
     "ImportResult",
     "import_identity",
+    # Sealed exports (#2398)
+    "RecipientKEMKeys",
+    "SealedExportError",
+    "agent_kem_public_multibases",
+    "generate_agent_kem_keypair",
+    "has_agent_kem_keypair",
+    "is_sealed_identity_export",
+    "load_agent_kem_keypair",
+    "open_identity_export",
+    "recipient_keys_from_did_document",
+    "recipient_keys_from_multibase",
+    "seal_identity_package",
+    "unseal_identity_package",
     # Signing
     "sign_package",
     "verify_package_signature",

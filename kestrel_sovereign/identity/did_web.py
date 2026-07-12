@@ -310,9 +310,23 @@ def parse_did_document(doc: dict) -> List[Tuple[str, CryptoSuite, Any]]:
         try:
             suite, pub = multibase_to_public_key(multibase)
         except CryptoSuiteError as e:
-            raise DidWebError(
-                f"verificationMethod[{i}] (id={kid!r}): {e}"
-            ) from e
+            # A key-agreement (KEM) Multikey legitimately lives in the
+            # verificationMethod array (x25519 / ml-kem-768, published
+            # for #2398 sealed-capsule recipients). It's not a signing
+            # key, so skip it rather than break signing-identity loads.
+            # A codec that's neither a signing NOR a KEM suite is a real
+            # interop break and still raises.
+            from kestrel_sovereign.security.multikey import (
+                multibase_to_kem_public_key,
+            )
+            from kestrel_sovereign.security.kem_suite import KEMSuiteError
+            try:
+                multibase_to_kem_public_key(multibase)
+            except (KEMSuiteError, ValueError):
+                raise DidWebError(
+                    f"verificationMethod[{i}] (id={kid!r}): {e}"
+                ) from e
+            continue
         out.append((kid, suite, pub))
     return out
 

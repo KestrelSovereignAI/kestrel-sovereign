@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.identity.sealed_export import SealedExportError
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -72,6 +73,25 @@ class IdentityFeature(Feature):
     async def initialize(self):
         """Initialize the identity feature."""
         logger.info("Initializing IdentityFeature")
+
+    def _load_import_package(self, package_json: str):
+        """Parse a loaded export into an AgentIdentityPackage.
+
+        ALWAYS routes through ``open_identity_export`` — it parses a
+        plaintext package, unseals a hybrid-KEM capsule with THIS
+        agent's local KEM keypair (recipient custody), AND fails closed
+        on a tampered/format-stripped capsule. Calling ``from_json``
+        directly for the "not exactly a capsule" case would skip that
+        tamper check (codex #2398 round 10).
+        """
+        from kestrel_sovereign.identity.sealed_export import open_identity_export
+
+        # Let open_identity_export discover the KEM slug from the local
+        # key files (robust to multi-segment did:web and did:pkh agents)
+        # — the DID tail is not a reliable slug.
+        storage_path = getattr(self.agent, "storage_path", None)
+        storage_dir = Path(storage_path).parent if storage_path else None
+        return open_identity_export(package_json, storage_dir=storage_dir)
 
     @tool(
         name="export_identity",
@@ -467,8 +487,13 @@ class IdentityFeature(Feature):
                     data={"source": source},
                 )
 
-            # Parse package
-            package = AgentIdentityPackage.from_json(package_json)
+            # Parse package (unseal first if it's a hybrid-KEM capsule)
+            try:
+                package = self._load_import_package(package_json)
+            except SealedExportError as e:
+                return ToolResult.failed(
+                    f"Import failed: {e}", data={"source": source},
+                )
             summary = package.get_summary()
 
             # Verify integrity
@@ -598,8 +623,13 @@ class IdentityFeature(Feature):
                     data={"source": source},
                 )
 
-            # Parse package
-            package = AgentIdentityPackage.from_json(package_json)
+            # Parse package (unseal first if it's a hybrid-KEM capsule)
+            try:
+                package = self._load_import_package(package_json)
+            except SealedExportError as e:
+                return ToolResult.failed(
+                    f"Preview failed: {e}", data={"source": source},
+                )
             summary = package.get_summary()
 
             # Verify constitution
