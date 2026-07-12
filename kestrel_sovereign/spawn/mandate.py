@@ -178,7 +178,10 @@ def verify_mandate(
 
     - Otherwise (bare hex) → classic secp256k1 ECDSA verify against
       ``parent_public_key``. Pre-ceremony mandates follow this path
-      unchanged.
+      unchanged — UNLESS the trusted ``parent_identity`` is hybrid, in
+      which case a classical-only signature is a downgrade and is
+      rejected outright (#2400) rather than routed to ECDSA, mirroring
+      ``verify_policy``'s post-cutoff classical-downgrade semantics.
     """
     if not mandate.parent_signature:
         logger.warning("Mandate has no signature to verify")
@@ -216,6 +219,24 @@ def verify_mandate(
             mandate, payload,
             parent_identity.new_verification_methods,
         )
+
+    # Policy-first downgrade check (#2400): a bare-hex (classical
+    # secp256k1) signature must NOT be accepted for a hybrid parent.
+    # Sniffing the verification path from the wire format alone let an
+    # attacker present a classical-only mandate for a hybrid parent
+    # (HYBRID_REQUIRED enforced only *inside* the hybrid envelope).
+    # Mirror ``evaluate_signatures``' post-cutoff classical-downgrade
+    # rejection: once the trusted parent identity is hybrid, a
+    # non-hybrid signature is a downgrade and is refused outright.
+    if parent_identity is not None and getattr(
+        parent_identity, "is_hybrid", False
+    ):
+        logger.warning(
+            "Mandate for hybrid parent %r carries a classical (non-hybrid) "
+            "signature; refusing classical downgrade (HYBRID_REQUIRED)",
+            mandate.parent_did,
+        )
+        return False
 
     from kestrel_sovereign.security.crypto_suite import (
         ALG_ECDSA_SECP256K1_SHA256, get_suite,
