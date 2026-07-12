@@ -22,7 +22,13 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, UTC
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier, StorageResult
+# NOTE: import StorageTier/StorageResult from the provider base module, NOT
+# from filecoin_adapter. filecoin_adapter imports
+# `kestrel_sovereign.storage.providers.base`, which runs this package's
+# __init__ (which imports this module) before filecoin_adapter finishes — so
+# importing FilecoinAdapter eagerly here forms a package-initialization cycle
+# (#2384). FilecoinAdapter is imported lazily inside __init__ instead.
+from kestrel_sovereign.storage.providers.base import StorageTier, StorageResult
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 
@@ -31,6 +37,7 @@ from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 # that chain imports back into storage. Type-only references can use
 # the TYPE_CHECKING guard without triggering the circular load.
 if TYPE_CHECKING:
+    from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
     from kestrel_sovereign.identity.access_grant import DataAccessGrant
 
 # Constants
@@ -322,11 +329,14 @@ class SovereignStorageAdapter:
     V2 Adapter for Sharded, Deduplicated, Encrypted Storage.
     """
 
-    def __init__(self, db: AsyncDatabase, user_secret: str, filecoin_adapter: Optional[FilecoinAdapter] = None, agent_id: str = ""):
+    def __init__(self, db: AsyncDatabase, user_secret: str, filecoin_adapter: Optional["FilecoinAdapter"] = None, agent_id: str = ""):
         self.db = db
         self.agent_id = agent_id
         self.encryptor = ConvergentEncryptor(user_secret)
-        self.adapter = filecoin_adapter or FilecoinAdapter()
+        if filecoin_adapter is None:
+            from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
+            filecoin_adapter = FilecoinAdapter()
+        self.adapter = filecoin_adapter
         self.logger = logging.getLogger(__name__)
 
     def _now_sql(self) -> str:
