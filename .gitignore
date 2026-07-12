@@ -18,6 +18,7 @@ credentials/
 !package-lock.json
 !docs/generated/RENDER_MANIFEST.json
 !docs/audit/issues/*-prd.json
+!tests/warning_baseline.json
 *.pem
 *.key
 

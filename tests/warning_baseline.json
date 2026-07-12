@@ -1,0 +1,7 @@
+{
+  "_comment": "Baseline warning counts for the #2391 warning gate. scripts/warning_gate.py fails CI when RuntimeWarning/ResourceWarning rise above baseline + tolerance (see the script for the margin). Only the gated categories below are enforced; DeprecationWarning et al. are reported in the artifact but not gated. Re-baseline intentionally with: python scripts/warning_gate.py --report-dir .warning-report --update-baseline.",
+  "by_category": {
+    "RuntimeWarning": 4,
+    "ResourceWarning": 0
+  }
+}

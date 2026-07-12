@@ -23,6 +23,7 @@ Schema::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -89,7 +90,7 @@ class AuditLog:
             return
         try:
             payload = asdict(record)
-            if asyncio.iscoroutinefunction(hook):
+            if inspect.iscoroutinefunction(hook):
                 await hook("computer_use", record.tool, payload)
             else:
                 await asyncio.to_thread(hook, "computer_use", record.tool, payload)

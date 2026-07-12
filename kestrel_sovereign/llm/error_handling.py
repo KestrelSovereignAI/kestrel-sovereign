@@ -7,6 +7,7 @@ broad exception catches throughout the LLM service code.
 import logging
 import time
 import asyncio
+import inspect
 from typing import Any, Callable, Optional, Type, Union, Dict
 from functools import wraps
 
@@ -222,7 +223,7 @@ def handle_llm_errors(
                 raise error
 
         # Return appropriate wrapper based on function type
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             return async_wrapper
         else:
             return sync_wrapper
@@ -269,7 +270,7 @@ def handle_observability_errors(func: Callable) -> Callable:
             return None
 
     # Return appropriate wrapper based on function type
-    if asyncio.iscoroutinefunction(func):
+    if inspect.iscoroutinefunction(func):
         return async_wrapper
     else:
         return sync_wrapper
@@ -319,7 +320,7 @@ def handle_storage_errors(operation_name: str = "storage operation"):
                 logger.error(f"Storage error in {operation_name} ({func.__name__}): {e}", exc_info=True)
                 return None
 
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             return async_wrapper
         else:
             return sync_wrapper
@@ -368,7 +369,7 @@ def handle_crypto_errors(func: Callable) -> Callable:
             logger.error(f"Cryptographic operation failed in {func.__name__}: {e}", exc_info=True)
             raise
 
-    if asyncio.iscoroutinefunction(func):
+    if inspect.iscoroutinefunction(func):
         return async_wrapper
     else:
         return sync_wrapper
@@ -442,7 +443,7 @@ def with_retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
 
             raise last_error
 
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             return async_wrapper
         else:
             return sync_wrapper
@@ -518,7 +519,7 @@ def handle_provider_fallback(providers: list):
 
             raise LLMAllProvidersFailedError(errors)
 
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             return async_wrapper
         else:
             return sync_wrapper

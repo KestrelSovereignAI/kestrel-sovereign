@@ -57,6 +57,52 @@ def pytest_collection_modifyitems(config, items):
     _cleanup_collection_modifyitems(config, items)
 
 
+# =============================================================================
+# Warning-count reporting (#2391)
+#
+# When ``KESTREL_WARNING_REPORT_DIR`` is set, every warning pytest records is
+# tallied by category and, at session end, written to a per-worker JSON file in
+# that directory. ``scripts/warning_gate.py`` aggregates those files into a
+# single warning-count artifact and fails CI when runtime/resource warnings
+# rise above the committed baseline — without blanket-suppressing the existing
+# baseline. Absent the env var this is inert, so local runs are unaffected.
+# =============================================================================
+
+_WARNING_COUNTS: "dict[str, int]" = {}
+
+
+def pytest_warning_recorded(warning_message, when, nodeid, location):
+    """Tally each recorded warning by its category name."""
+    if not os.environ.get("KESTREL_WARNING_REPORT_DIR"):
+        return
+    category = getattr(warning_message, "category", None)
+    name = category.__name__ if category is not None else "UnknownWarning"
+    _WARNING_COUNTS[name] = _WARNING_COUNTS.get(name, 0) + 1
+
+
+def _write_warning_report() -> None:
+    """Write this worker's warning tally to the report directory (if enabled)."""
+    report_dir = os.environ.get("KESTREL_WARNING_REPORT_DIR")
+    if not report_dir:
+        return
+    import json as _json
+
+    dest = Path(report_dir)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+        payload = {
+            "worker": worker,
+            "total": sum(_WARNING_COUNTS.values()),
+            "by_category": dict(sorted(_WARNING_COUNTS.items())),
+        }
+        (dest / f"warnings-{worker}.json").write_text(
+            _json.dumps(payload, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
 def pytest_configure(config):
     """Configure pytest with all plugins and load .env for skipif conditions."""
     # Load .env EARLY so that skipif decorators (evaluated at collection time)
@@ -97,6 +143,9 @@ def pytest_sessionfinish(session, exitstatus):
     import sys
     import os as _os
     from tests.shared.cost_tracker import cost_tracker
+
+    # 0. Persist this worker's warning tally (no-op unless enabled).
+    _write_warning_report()
 
     # 1. Clean up any tracked resources first
     registry.cleanup_all()

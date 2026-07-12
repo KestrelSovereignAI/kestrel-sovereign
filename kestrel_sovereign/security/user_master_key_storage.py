@@ -38,7 +38,10 @@ from kestrel_sovereign.security.legacy_decrypt import (
 from kestrel_sovereign.security.exceptions import (
     KeyNotConfiguredError,
 )
-from kestrel_sovereign.security.service_key_storage import KNOWN_PROVIDERS
+from kestrel_sovereign.security.service_key_storage import (
+    KNOWN_PROVIDERS,
+    _as_datetime,
+)
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -183,7 +186,7 @@ class UserMasterKeyStorage:
                 master_did=row[1],
                 provider_id=row[2],
                 is_active=bool(row[3]),
-                created_at=datetime.fromisoformat(row[4]) if row[4] else datetime.utcnow(),
+                created_at=_as_datetime(row[4]),
             )
             for row in rows
         ]

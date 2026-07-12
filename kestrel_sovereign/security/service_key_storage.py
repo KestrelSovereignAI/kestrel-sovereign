@@ -12,7 +12,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from kestrel_sovereign.security.agent_encryption import encrypt
@@ -55,7 +55,7 @@ def _as_datetime(value: Any) -> datetime:
     ``TypeError: fromisoformat: argument must be str`` on Postgres.
     """
     if value is None:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc).replace(tzinfo=None)
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(value)
@@ -512,7 +512,7 @@ class ServiceKeyStorage:
         # (``function datetime(unknown, unknown) does not exist``). A datetime
         # parameter compares correctly against TIMESTAMP (PG) and the ISO-string
         # ``recorded_at`` written via CURRENT_TIMESTAMP (SQLite).
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
         rows = await self._db.fetchall(
             """
             SELECT id, key_id, provider_id, operation, units_consumed,
