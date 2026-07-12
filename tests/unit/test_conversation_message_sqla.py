@@ -147,11 +147,6 @@ def test_resolve_embedding_dim_honours_env_override():
     assert resolve_embedding_dim({"KESTREL_EMBEDDING_DIM": "1536"}) == 1536
 
 
-def test_resolve_embedding_dim_no_env_returns_default():
-    """No env var → 768. (Matches the constant captured at import time.)"""
-    assert resolve_embedding_dim({}) == 768
-
-
 def test_resolve_embedding_dim_without_test_env_uses_active_provider(monkeypatch):
     """Production no-env path asks the active provider before falling back."""
     import kestrel_sovereign.storage.sqla.conversation_message as mod

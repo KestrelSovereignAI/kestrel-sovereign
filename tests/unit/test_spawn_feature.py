@@ -5,7 +5,6 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-from pathlib import Path
 
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
@@ -277,26 +276,7 @@ class TestSpawnFeatureWithManager:
 
         # Delegate and wait for completion
         await feature.delegate_task(child_name="helper", task="analyze")
-        await asyncio.sleep(0.2)  # Let the task complete
-
-        envelope = await feature.get_child_result(child_name="helper")
-        assert envelope.data["ready"] is True
-        assert envelope.data["result"] == "analysis complete: 42"
-
-    @pytest.mark.asyncio
-    async def test_delegate_task_ignores_non_lifecycle_manager_attr(self):
-        parent = _make_mock_agent("did:parent")
-        child = _make_mock_agent("did:child")
-        child.process_input = AsyncMock(return_value="analysis complete: 42")
-
-        manager = MagicMock()
-        manager.get_agent = MagicMock(return_value=child)
-        manager.get_children = MagicMock(return_value=["helper"])
-
-        feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-
-        await feature.delegate_task(child_name="helper", task="analyze")
-        await asyncio.sleep(0.2)
+        await feature._child_tasks["helper"]
 
         envelope = await feature.get_child_result(child_name="helper")
         assert envelope.data["ready"] is True

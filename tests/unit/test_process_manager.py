@@ -10,7 +10,6 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
-import toml
 
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
@@ -111,6 +110,7 @@ class TestStaticHelpers:
 
         # Write and read
         ProcessManager.write_pid(pid_file, 42)
+        assert pid_file.exists()
         assert ProcessManager.read_pid(pid_file) == 42
 
         # Clear
@@ -788,7 +788,6 @@ class TestSpawnDetached:
         before it consumes the line. With detached fd redirection,
         the child writes the line directly — no thread needed,
         nothing to race."""
-        import subprocess
         import sys
         import time
 

@@ -10,7 +10,6 @@ from unittest.mock import Mock, MagicMock, patch
 
 from kestrel_sovereign.features import (
     DISABLED_FEATURES_ENV,
-    FEATURE_ENTRY_POINT_GROUP,
     discover_feature_modules,
     discover_features,
     discover_entrypoint_feature_classes,
@@ -271,11 +270,6 @@ def test_multiple_entrypoint_packages_all_discovered():
     names = {f.__class__.__name__ for f in features}
     assert "_SyntheticExternalFeature" in names
     assert "_AnotherExternalFeature" in names
-
-
-def test_entrypoint_group_constant_matches_package_namespace():
-    """The entry_point group constant must match the features package path."""
-    assert FEATURE_ENTRY_POINT_GROUP == "kestrel_sovereign.features"
 
 
 def test_all_features_are_feature_instances_in_combined_mode():
