@@ -128,6 +128,9 @@ function _getInstance(slot, anchor) {
 // Mount, re-render, or unmount a single contribution within one instance,
 // honoring its gate. Teardown fires before every re-render and before unmount.
 function _applyContribution(slot, inst, contribution) {
+    // Item-provider contributions (menu slots) have no DOM to mount; they are
+    // pulled on demand by `collectItems`, never mounted into a zone anchor.
+    if (typeof contribution.render !== 'function') return;
     const ctx = inst.ctx || {};
     const rec = inst.mounted.get(contribution);
     const gated = contribution.gate ? !!_safe(contribution.gate, ctx) : true;
@@ -222,8 +225,13 @@ export const UI = {
             console.error('[ui-ext registry] register: contribution needs a string `slot`');
             return;
         }
-        if (typeof contribution.render !== 'function') {
-            console.error('[ui-ext registry] register: contribution needs a `render` function');
+        // A contribution is either DOM-shaped (`render`) or item-provider-shaped
+        // (`items`, for menu slots like `chat-message-actions`). Exactly one is
+        // required; item-provider contributions are never mounted by renderSlot,
+        // they are pulled by `collectItems`.
+        if (typeof contribution.render !== 'function'
+            && typeof contribution.items !== 'function') {
+            console.error('[ui-ext registry] register: contribution needs a `render` or `items` function');
             return;
         }
         const list = _contribs.get(contribution.slot) || [];
@@ -373,6 +381,31 @@ export const UI = {
      */
     contributions(slot) {
         return [...(_contribs.get(slot) || [])];
+    },
+
+    /**
+     * Collect menu items from an item-provider slot (e.g. `chat-message-actions`).
+     * Unlike `render`-based zones, these contributions supply menu ITEMS, not DOM:
+     * each is `{ slot, order?, gate?, items: (ctx) => [{label, danger?, ...}] }`.
+     * Contributions are gated by `gate(ctx)`, ordered by `order`, and each item
+     * provider is error-isolated — a throwing provider yields no items instead of
+     * killing the caller's base items. Returns a flat, ordered array.
+     *
+     * @param {string} slot
+     * @param {object} ctx
+     * @returns {Array<object>}
+     */
+    collectItems(slot, ctx) {
+        const out = [];
+        for (const c of _sorted(slot)) {
+            if (typeof c.items !== 'function') continue;
+            if (c.gate && !_safe(c.gate, ctx)) continue;
+            const items = _safe(c.items, ctx);
+            if (Array.isArray(items)) {
+                for (const it of items) if (it) out.push(it);
+            }
+        }
+        return out;
     },
 
     /** Test/teardown affordance: forget all contributions, instances, and bus wiring. */

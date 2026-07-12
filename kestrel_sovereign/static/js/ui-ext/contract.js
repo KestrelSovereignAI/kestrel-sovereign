@@ -27,12 +27,20 @@
  * (`registerPartRenderer` lineage + panel contributions), not the positional
  * inline-widget contract below. They are named here so the id space is closed.
  *
+ * `chat-message-actions` is item-provider-shaped (see {@link MessageActionsItem}
+ * and {@link ChatMessageActionsContext}), NOT the positional inline-widget
+ * contract: contributions supply menu ITEMS pulled by `UI.collectItems`, not
+ * DOM mounted by `renderSlot`. It is the single sanctioned surface for
+ * per-message actions — features never plant their own overlay buttons on
+ * bubbles.
+ *
  * @typedef {(
  *   | 'chat-input-actions'
  *   | 'agent-card-actions'
  *   | 'input-footer-status'
  *   | 'modal-root'
  *   | 'panel-section'
+ *   | 'chat-message-actions'
  *   | 'chat-message-renderers'
  *   | 'nav-tabs'
  *   | 'panel-root'
@@ -135,6 +143,48 @@
  * @property {SlotApi}  api
  * @property {HTMLElement} [element]
  * @property {string}   panelId     - id of the host panel the section mounts into.
+ */
+
+/**
+ * Context for `chat-message-actions`. Passed to a contribution's `items(ctx)`
+ * provider each time a message's kebab menu opens (lazy — so items reflect
+ * current state and features registered after page load still appear). Scoped
+ * to one message bubble.
+ *
+ * @typedef {Object} ChatMessageActionsContext
+ * @property {string}   messageId  - the message's persisted id.
+ * @property {string}  [role]      - `'user'` | `'assistant'` (message role).
+ * @property {object}  [metadata]  - the message's metadata payload, if any.
+ * @property {string}  [agent]     - the owning agent name (bubble's pane), if resolvable.
+ */
+
+/**
+ * A single menu item a `chat-message-actions` contribution returns. Matches the
+ * kebab menu item shape (see `kebab_menu.js`). Feature items render ABOVE the
+ * base "Delete permanently" destructive separator, gated + ordered by the
+ * contribution's `gate`/`order`.
+ *
+ * @typedef {Object} MessageActionsItem
+ * @property {string}   label            - visible menu label.
+ * @property {boolean} [danger]          - render with destructive styling.
+ * @property {boolean} [separatorBefore] - draw a separator above this item.
+ * @property {(e?: Event) => void} onSelect - invoked when the item is chosen.
+ */
+
+/**
+ * A `chat-message-actions` contribution. Unlike `render`-based
+ * {@link UIContribution}s, this slot is item-provider-shaped: it supplies menu
+ * items, not DOM. `UI.collectItems('chat-message-actions', ctx)` gathers items
+ * across contributions (gated, ordered, error-isolated).
+ *
+ * @typedef {Object} MessageActionsContribution
+ * @property {'chat-message-actions'} slot
+ * @property {number}  [order=100] - ascending sort within the slot.
+ * @property {string}  [id]        - stable id for update/removal & dedupe.
+ * @property {(ctx: ChatMessageActionsContext) => boolean} [gate]
+ *           - items included only when truthy. Defaults to always-shown.
+ * @property {(ctx: ChatMessageActionsContext) => MessageActionsItem[]} items
+ *           - returns the menu items to merge in. Evaluated on every menu open.
  */
 
 /**

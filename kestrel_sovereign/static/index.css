@@ -1270,63 +1270,23 @@ nav {
     position: relative;
 }
 
-.message .msg-delete-btn {
-    display: none;
+/* Per-message overflow ("⋯") menu on chat bubbles (#2410). Replaces the twin
+   red delete/purge circles with one hover/focus-revealed kebab, reusing the
+   conversation-card pattern (`.conversation-item .kebab-btn`). `.message` is
+   position: relative, so the absolute kebab pins to the bubble's top-right.
+   Base `.kebab-btn` (js/kebab_menu.js output) supplies size/shape/hover; these
+   rules only position it and drive the hover/focus reveal. */
+.message .msg-kebab-btn {
     position: absolute;
     top: 0.25rem;
     right: 0.25rem;
-    background: rgba(239, 68, 68, 0.85);
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 1.25rem;
-    height: 1.25rem;
-    font-size: 0.65rem;
-    cursor: pointer;
-    line-height: 1;
-    padding: 0;
     z-index: 1;
 }
 
-.message:hover .msg-delete-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.message .msg-delete-btn:hover {
-    background: #dc2626;
-}
-
-/* Permanent-delete affordance on chat bubbles (#765). Sits to
-   the left of the soft ✕ so the user has to slow down to hit
-   it. Same hover-reveal lifecycle. */
-.message .msg-purge-btn {
-    display: none;
-    position: absolute;
-    top: 0.25rem;
-    right: 1.65rem;
-    background: rgba(220, 38, 38, 0.85);
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 1.25rem;
-    height: 1.25rem;
-    font-size: 0.6rem;
-    cursor: pointer;
-    line-height: 1;
-    padding: 0;
-    z-index: 1;
-}
-
-.message:hover .msg-purge-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.message .msg-purge-btn:hover {
-    background: #b91c1c;
+.message:hover .msg-kebab-btn,
+.message .msg-kebab-btn:focus,
+.message .msg-kebab-btn:focus-visible {
+    opacity: 1;
 }
 
 .user-message {
