@@ -31,7 +31,6 @@ import pytest
 from kestrel_sdk.signals import Status
 from kestrel_sdk.tools import Outcome, WaitStatus
 
-from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.waits.engine import WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
     MAX_DELIVERY_ATTEMPTS,
@@ -121,17 +120,22 @@ class _FakeProvider:
         return WaitStatus(outcome, summary, data=dict(data))
 
 
-async def _make_agent(tmp_path, provider, dispatcher):
-    db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
-    registry = WaitRegistry()
-    registry.register(provider)
-    return SimpleNamespace(
-        did="did:test:agent",
-        agent_id="did:test:agent",
-        _raw_storage=SimpleNamespace(db=db),
-        wait_registry=registry,
-        dispatcher=dispatcher,
-    )
+@pytest.fixture
+def make_agent(tmp_path, sqlite_database_factory):
+    async def create(provider, dispatcher):
+        db = await sqlite_database_factory(tmp_path / "agent.db")
+        registry = WaitRegistry()
+        if provider is not None:
+            registry.register(provider)
+        return SimpleNamespace(
+            did="did:test:agent",
+            agent_id="did:test:agent",
+            _raw_storage=SimpleNamespace(db=db),
+            wait_registry=registry,
+            dispatcher=dispatcher,
+        )
+
+    return create
 
 
 # ---------------------------------------------------------------------------
@@ -140,11 +144,11 @@ async def _make_agent(tmp_path, provider, dispatcher):
 
 
 @pytest.mark.asyncio
-async def test_emits_one_signal_per_transition(tmp_path):
+async def test_emits_one_signal_per_transition(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE, summary="all good", data={"x": 1})
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     # Tick 1 enqueues, tick 2 harvests the (already-complete) task.
@@ -173,11 +177,11 @@ async def test_emits_one_signal_per_transition(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_no_signal_for_pending_handles(tmp_path):
+async def test_no_signal_for_pending_handles(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.PENDING, summary="working")
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     t = await rec.reconcile()
@@ -187,11 +191,11 @@ async def test_no_signal_for_pending_handles(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_records_ok_as_delivered_and_locks_outcome(tmp_path):
+async def test_records_ok_as_delivered_and_locks_outcome(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     t1 = await rec.reconcile()
@@ -212,11 +216,11 @@ async def test_records_ok_as_delivered_and_locks_outcome(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_coalesced_counts_as_delivered(tmp_path):
+async def test_coalesced_counts_as_delivered(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher(status_override=Status.COALESCED)
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     await rec.reconcile()
@@ -228,7 +232,7 @@ async def test_coalesced_counts_as_delivered(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_corrected_native_status_resignals_within_same_outcome(tmp_path):
+async def test_corrected_native_status_resignals_within_same_outcome(make_agent):
     """Regression (codex Wave 2 P2): when a provider's native status changes
     but maps to the SAME generic Outcome (talon finished_unknown -> failed,
     both FAILED), the corrected transition must re-signal — dedup is on the
@@ -237,7 +241,7 @@ async def test_corrected_native_status_resignals_within_same_outcome(tmp_path):
     provider.set("h1", Outcome.FAILED, summary="finished, no exit code",
                  data={"status": "finished_unknown"})
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     # First terminal state: enqueue + harvest delivered.
@@ -264,14 +268,14 @@ async def test_corrected_native_status_resignals_within_same_outcome(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(tmp_path):
+async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     quiet = _CapturingDispatcher(
         status_override=Status.DROPPED_QUIET_HOURS,
         error_override="inside quiet window",
     )
-    agent = await _make_agent(tmp_path, provider, quiet)
+    agent = await make_agent(provider, quiet)
     rec = WaitReconciler(agent)
 
     # Tick 1 enqueues (attempt 1). Tick 2 harvests the soft fail AND
@@ -302,14 +306,14 @@ async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_hard_fail_locks_signaled(tmp_path):
+async def test_hard_fail_locks_signaled(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     bad = _CapturingDispatcher(
         status_override=Status.DROPPED_VALIDATION,
         error_override="schema mismatch",
     )
-    agent = await _make_agent(tmp_path, provider, bad)
+    agent = await make_agent(provider, bad)
     rec = WaitReconciler(agent)
 
     await rec.reconcile()
@@ -327,7 +331,7 @@ async def test_hard_fail_locks_signaled(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_raises_records_soft_failure(tmp_path):
+async def test_dispatcher_raises_records_soft_failure(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
 
@@ -335,7 +339,7 @@ async def test_dispatcher_raises_records_soft_failure(tmp_path):
         async def enqueue_signal(self, signal):
             raise RuntimeError("boom")
 
-    agent = await _make_agent(tmp_path, provider, _BrokenDispatcher())
+    agent = await make_agent(provider, _BrokenDispatcher())
     rec = WaitReconciler(agent)
 
     # enqueue raises synchronously → soft-fail recorded in the same tick.
@@ -354,13 +358,13 @@ async def test_dispatcher_raises_records_soft_failure(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_retry_cap_locks_after_max_attempts(tmp_path):
+async def test_retry_cap_locks_after_max_attempts(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     broken = _CapturingDispatcher(
         status_override=Status.FAILED, error_override="upstream dead",
     )
-    agent = await _make_agent(tmp_path, provider, broken)
+    agent = await make_agent(provider, broken)
     rec = WaitReconciler(agent)
 
     # Each enqueue/harvest pair burns one attempt. Run enough pairs to
@@ -382,14 +386,14 @@ async def test_retry_cap_locks_after_max_attempts(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pending_lost_at_restart_re_detects(tmp_path):
+async def test_pending_lost_at_restart_re_detects(make_agent):
     """A durable pending row with no in-memory handle (Kestrel restarted
     mid-flight) must be swept as lost_at_restart (NOT locked) so the same
     tick re-detects the still-terminal handle and re-enqueues."""
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     # Seed a durable pending row directly (simulating a pre-restart enqueue)
@@ -417,10 +421,10 @@ async def test_pending_lost_at_restart_re_detects(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_no_dispatcher_does_not_mark_signaled(tmp_path):
+async def test_no_dispatcher_does_not_mark_signaled(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
-    agent = await _make_agent(tmp_path, provider, dispatcher=None)
+    agent = await make_agent(provider, dispatcher=None)
     rec = WaitReconciler(agent)
 
     t1 = await rec.reconcile()
@@ -442,11 +446,11 @@ async def test_no_dispatcher_does_not_mark_signaled(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_does_not_re_enqueue_while_pending(tmp_path):
+async def test_does_not_re_enqueue_while_pending(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     pending = _CapturingDispatcher(pending=True)
-    agent = await _make_agent(tmp_path, provider, pending)
+    agent = await make_agent(provider, pending)
     rec = WaitReconciler(agent)
 
     t1 = await rec.reconcile()
@@ -465,11 +469,11 @@ async def test_does_not_re_enqueue_while_pending(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_provider_signal_name_routes_source(tmp_path):
+async def test_provider_signal_name_routes_source(make_agent):
     provider = _FakeProvider(signal="talon.job_complete")
     provider.set("job-7", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     await rec.reconcile()
@@ -477,7 +481,7 @@ async def test_provider_signal_name_routes_source(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_poll_only_provider_is_skipped(tmp_path):
+async def test_poll_only_provider_is_skipped(make_agent):
     """A provider that is NOT a MonitorableWaitable (no active_handles) must
     be skipped by enumeration — it stays valid as a blocking-wait provider."""
 
@@ -488,17 +492,8 @@ async def test_poll_only_provider_is_skipped(tmp_path):
         async def poll(self, handle):
             return WaitStatus(Outcome.DONE, "x", data={})
 
-    db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
-    registry = WaitRegistry()
-    registry.register(_PollOnly())
     dispatcher = _CapturingDispatcher()
-    agent = SimpleNamespace(
-        did="did:test:agent",
-        agent_id="did:test:agent",
-        _raw_storage=SimpleNamespace(db=db),
-        wait_registry=registry,
-        dispatcher=dispatcher,
-    )
+    agent = await make_agent(_PollOnly(), dispatcher)
     rec = WaitReconciler(agent)
     t = await rec.reconcile()
     assert t.data["scanned"] == 0
@@ -532,28 +527,14 @@ class _PollOnlyProvider:
         return WaitStatus(outcome, summary, data=dict(data))
 
 
-async def _make_agent_with_provider(tmp_path, provider, dispatcher):
-    db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
-    registry = WaitRegistry()
-    registry.register(provider)
-    agent = SimpleNamespace(
-        did="did:test:agent",
-        agent_id="did:test:agent",
-        _raw_storage=SimpleNamespace(db=db),
-        wait_registry=registry,
-        dispatcher=dispatcher,
-    )
-    return agent
-
-
 @pytest.mark.asyncio
-async def test_watched_poll_only_provider_emits_on_terminal(tmp_path):
+async def test_watched_poll_only_provider_emits_on_terminal(make_agent):
     """A watched poll-only provider (no active_handles) gets a wait.complete
     signal when its handle reaches a terminal outcome."""
     provider = _PollOnlyProvider(kind="task")
     provider.set("t1", Outcome.DONE, summary="task done", data={"y": 2})
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent_with_provider(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
 
     # Register the explicit watch (what wait(target, mode="signal") does).
@@ -574,11 +555,11 @@ async def test_watched_poll_only_provider_emits_on_terminal(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_watched_non_terminal_stays_watched_and_emits_nothing(tmp_path):
+async def test_watched_non_terminal_stays_watched_and_emits_nothing(make_agent):
     provider = _PollOnlyProvider(kind="task")
     provider.set("t1", Outcome.PENDING, summary="still working")
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent_with_provider(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
     await rec._store.start_watch("task", "t1")
 
@@ -592,11 +573,11 @@ async def test_watched_non_terminal_stays_watched_and_emits_nothing(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_watch_stops_emitting_after_delivery(tmp_path):
+async def test_watch_stops_emitting_after_delivery(make_agent):
     provider = _PollOnlyProvider(kind="task")
     provider.set("t1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent_with_provider(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
     await rec._store.start_watch("task", "t1")
 
@@ -613,14 +594,14 @@ async def test_watch_stops_emitting_after_delivery(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_handle_both_active_and_watched_processed_once(tmp_path):
+async def test_handle_both_active_and_watched_processed_once(make_agent):
     """A MonitorableWaitable handle that is ALSO explicitly watched must be
     polled/emitted exactly once per tick (the active_handles loop wins; the
     watched loop skips the already-processed key)."""
     provider = _FakeProvider()  # monitorable: active_handles == states keys
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
     rec = WaitReconciler(agent)
     # Watch the SAME handle the active_handles loop will also surface.
     await rec._store.start_watch("fake", "h1")
@@ -638,19 +619,11 @@ async def test_handle_both_active_and_watched_processed_once(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_watched_unregistered_provider_is_skipped(tmp_path):
+async def test_watched_unregistered_provider_is_skipped(make_agent):
     """A watch whose provider kind isn't registered (feature unloaded) is
     skipped — no crash, the row stays for when the provider returns."""
-    db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
-    registry = WaitRegistry()  # empty — no providers
     dispatcher = _CapturingDispatcher()
-    agent = SimpleNamespace(
-        did="did:test:agent",
-        agent_id="did:test:agent",
-        _raw_storage=SimpleNamespace(db=db),
-        wait_registry=registry,
-        dispatcher=dispatcher,
-    )
+    agent = await make_agent(None, dispatcher)
     rec = WaitReconciler(agent)
     await rec._store.start_watch("ghost", "g1")
 
@@ -669,11 +642,11 @@ async def test_watched_unregistered_provider_is_skipped(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_wait_reconcile_caches_singleton(tmp_path):
+async def test_run_wait_reconcile_caches_singleton(make_agent):
     provider = _FakeProvider()
     provider.set("h1", Outcome.DONE)
     dispatcher = _CapturingDispatcher()
-    agent = await _make_agent(tmp_path, provider, dispatcher)
+    agent = await make_agent(provider, dispatcher)
 
     await run_wait_reconcile(agent)
     rec1 = agent._wait_reconciler

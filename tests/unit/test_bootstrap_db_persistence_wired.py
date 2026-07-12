@@ -19,14 +19,10 @@ These tests exercise the real wiring:
 import pytest
 
 from kestrel_sovereign.agent.context_builder import ContextBuilder
-from kestrel_sovereign.storage.async_database import AsyncDatabase
-
-
 @pytest.fixture
-async def real_db(tmp_path):
+async def real_db(tmp_path, sqlite_database_factory):
     """A real SQLite AsyncDatabase with the bootstrap_config table created."""
-    db = await AsyncDatabase.sqlite(str(tmp_path / "bootstrap-wired.db"))
-    yield db
+    return await sqlite_database_factory(tmp_path / "bootstrap-wired.db")
 
 
 @pytest.fixture

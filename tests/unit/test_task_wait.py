@@ -16,7 +16,6 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.features.wait.feature import WaitFeature
-from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.waits import WaitRegistry
 
 
@@ -32,10 +31,11 @@ def _wait_feature(agent=None):
     return f
 
 
-async def _make_db_agent(tmp_path):
+@pytest.fixture
+async def db_agent(tmp_path, sqlite_database_factory):
     """A stub agent with a real sqlite DB so register_wait_watch can persist
     a watch row (the signal-mode path writes to WaitSignalStore)."""
-    db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
+    db = await sqlite_database_factory(tmp_path / "agent.db")
     return SimpleNamespace(
         did="did:test:agent",
         agent_id="did:test:agent",
@@ -148,23 +148,25 @@ class TestWaitModeSignal:
     that also works for poll-only providers like TaskWaitable."""
 
     @pytest.mark.asyncio
-    async def test_signal_mode_registers_watch_and_returns_immediately(self, tmp_path):
-        agent = await _make_db_agent(tmp_path)
-        await _register_task_provider(agent)
-        result = await _wait_feature(agent).wait(target="task:abc123", mode="signal")
+    async def test_signal_mode_registers_watch_and_returns_immediately(self, db_agent):
+        await _register_task_provider(db_agent)
+        result = await _wait_feature(db_agent).wait(
+            target="task:abc123", mode="signal"
+        )
         assert result.status is ToolResultStatus.OK
         assert result.data["mode"] == "signal"
         assert result.data["watching"] is True
         assert result.data["ref"] == "task:abc123"
 
-        store = agent._wait_reconciler._store
+        store = db_agent._wait_reconciler._store
         keys = {(w.kind, w.handle) for w in await store.list_watched()}
         assert ("task", "abc123") in keys
 
     @pytest.mark.asyncio
-    async def test_signal_mode_unknown_kind_errors(self, tmp_path):
-        agent = await _make_db_agent(tmp_path)
-        result = await _wait_feature(agent).wait(target="bogus:xyz", mode="signal")
+    async def test_signal_mode_unknown_kind_errors(self, db_agent):
+        result = await _wait_feature(db_agent).wait(
+            target="bogus:xyz", mode="signal"
+        )
         assert result.status is ToolResultStatus.ERROR
         assert "no wait provider for kind 'bogus'" in result.error
 
@@ -187,11 +189,12 @@ class TestWaitModeSignal:
         assert "mode must be 'block' or 'signal'" in result.error
 
     @pytest.mark.asyncio
-    async def test_block_mode_is_default(self, tmp_path):
+    async def test_block_mode_is_default(self, db_agent):
         """Default mode stays blocking — no watch row is created."""
-        agent = await _make_db_agent(tmp_path)
-        await _register_task_provider(agent)
-        result = await _wait_feature(agent).wait(target="task:abc123", timeout_seconds=5)
+        await _register_task_provider(db_agent)
+        result = await _wait_feature(db_agent).wait(
+            target="task:abc123", timeout_seconds=5
+        )
         assert result.status is ToolResultStatus.OK
         # Blocking path doesn't lazily build a reconciler/watch row.
-        assert getattr(agent, "_wait_reconciler", None) is None
+        assert getattr(db_agent, "_wait_reconciler", None) is None

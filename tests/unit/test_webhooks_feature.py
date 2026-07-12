@@ -17,11 +17,9 @@ Tests:
 
 import hashlib
 import hmac as hmac_mod
-import json
-import time
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sovereign.features.webhooks.models import (
     WebhookAuthType,
@@ -1224,13 +1222,14 @@ class TestWebhookLiveRouterIntegration:
     webhook_log row is persisted that survives a simulated restart."""
 
     @pytest.mark.asyncio
-    async def test_post_reaches_handler_persists_and_survives_restart(self, tmp_path):
+    async def test_post_reaches_handler_persists_and_survives_restart(
+        self, tmp_path, sqlite_database_factory
+    ):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
 
         db_path = str(tmp_path / "webhooks.db")
-        db = await AsyncDatabase.sqlite(db_path)
+        db = await sqlite_database_factory(db_path)
         agent = _make_agent(db=db)
         feat = WebhookFeature(agent)
         await feat.initialize()
@@ -1265,7 +1264,7 @@ class TestWebhookLiveRouterIntegration:
         assert rows[0][2] == 200
 
         # --- Simulated restart: fresh feature instance over the same DB file. ---
-        db2 = await AsyncDatabase.sqlite(db_path)
+        db2 = await sqlite_database_factory(db_path)
         agent2 = _make_agent(db=db2)
         feat2 = WebhookFeature(agent2)
         await feat2.initialize()
@@ -1289,23 +1288,24 @@ class TestWebhookMultiAgentDispatch:
     """
 
     @pytest.mark.asyncio
-    async def test_two_agents_distinct_webhooks_both_reachable(self, tmp_path):
+    async def test_two_agents_distinct_webhooks_both_reachable(
+        self, tmp_path, sqlite_database_factory
+    ):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.features.webhooks.receiver import (
             build_webhook_dispatch_router,
         )
 
         # Agent A owns "alpha"; agent B owns "beta" — each in its own DB.
-        db_a = await AsyncDatabase.sqlite(str(tmp_path / "a.db"))
+        db_a = await sqlite_database_factory(tmp_path / "a.db")
         feat_a = WebhookFeature(_make_agent(db=db_a, agent_id="did:test:agent-a"))
         await feat_a.initialize()
         await feat_a.webhooks_register(
             name="alpha", auth_type="none", allow_unauthenticated=True
         )
 
-        db_b = await AsyncDatabase.sqlite(str(tmp_path / "b.db"))
+        db_b = await sqlite_database_factory(tmp_path / "b.db")
         feat_b = WebhookFeature(_make_agent(db=db_b, agent_id="did:test:agent-b"))
         await feat_b.initialize()
         await feat_b.webhooks_register(
@@ -1336,15 +1336,16 @@ class TestWebhookMultiAgentDispatch:
         assert [r[0] for r in rows_b] == ["beta"]
 
     @pytest.mark.asyncio
-    async def test_unknown_name_audited_on_first_receiver(self, tmp_path):
+    async def test_unknown_name_audited_on_first_receiver(
+        self, tmp_path, sqlite_database_factory
+    ):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.features.webhooks.receiver import (
             build_webhook_dispatch_router,
         )
 
-        db_a = await AsyncDatabase.sqlite(str(tmp_path / "a.db"))
+        db_a = await sqlite_database_factory(tmp_path / "a.db")
         feat_a = WebhookFeature(_make_agent(db=db_a, agent_id="did:test:agent-a"))
         await feat_a.initialize()
 

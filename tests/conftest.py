@@ -13,17 +13,17 @@ import shutil
 import os
 import threading
 import asyncio
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Generator
 
 # Import shared test infrastructure for resource cleanup
 from tests.shared.pytest_cleanup_plugin import (
     pytest_configure as _cleanup_configure,
-    pytest_sessionstart as _cleanup_sessionstart,
-    pytest_keyboard_interrupt,
+    pytest_keyboard_interrupt,  # noqa: F401 - exposed as a pytest hook
     pytest_collection_modifyitems as _cleanup_collection_modifyitems,
-    resource_tracker,
-    cost_tracking,
+    resource_tracker,  # noqa: F401 - exposed as a pytest fixture
+    cost_tracking,  # noqa: F401 - exposed as a pytest fixture
 )
 from tests.shared.resource_registry import registry
 
@@ -215,6 +215,21 @@ def project_root() -> Path:
     return Path(__file__).parent.parent
 
 
+@pytest.fixture
+async def sqlite_database_factory():
+    """Create real SQLite databases and close every connection after the test."""
+    async with AsyncExitStack() as database_stack:
+
+        async def create(db_path):
+            from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+            database = await AsyncDatabase.sqlite(str(db_path))
+            database_stack.push_async_callback(database.close)
+            return database
+
+        yield create
+
+
 @pytest.fixture(scope="session")
 def post_ceremony_template(tmp_path_factory):
     """Build the real archival ceremony once per pytest worker."""
@@ -345,7 +360,7 @@ def mock_agent_env(agent_data_dir: Path, monkeypatch) -> Generator[Path, None, N
             from kestrel_sovereign.storage import get_default_agent_data_dir
             assert get_default_agent_data_dir() == str(mock_agent_env)
     """
-    import kestrel_sovereign.storage
+    import kestrel_sovereign.storage as storage
     monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: str(agent_data_dir))
     
     yield agent_data_dir

@@ -1725,7 +1725,7 @@ Repo entry points and standard project files.
 - **tests/README.md** — Kestrel Test Suite — Commands to run the various test categories for the Kestrel Sovereign AI Agent framework.
 - **tests/__init__.py** — —
 - **tests/conftest.py** — Pytest configuration and shared fixtures for Kestrel tests.
-  - `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_configure(config)`; `def pytest_sessionfinish(session, exitstatus)`; `def setup_test_config()`; `def project_root()`; `def post_ceremony_template(tmp_path_factory)`; `def post_ceremony_material(tmp_path, monkeypatch, post_ceremony_template)`; `…`
+  - `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_configure(config)`; `def pytest_sessionfinish(session, exitstatus)`; `def setup_test_config()`; `def project_root()`; `async def sqlite_database_factory()`; `def post_ceremony_template(tmp_path_factory)`; `…`
 - **tests/e2e/playwright.config.cjs** — —
 - **tests/e2e/spawn/spawn-console.spec.cjs** — —
 - **tests/e2e/spawn/spawn-lifecycle.spec.cjs** — —
@@ -2146,7 +2146,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_backup_retention.py** — —
   - `def test_working_memory_keeps_all_under_14_days_then_one_per_iso_week()`; `def test_identity_keeps_all_under_30_days_and_survives_longer_than_working()`; `def test_identity_uses_weekly_until_12_months_then_monthly_forever()`; `def test_newest_item_per_class_is_never_pruned()`; `def test_config_override_changes_working_memory_keep_all_window()`; `def test_classify_known_identity_and_working_names()`; `class PruneFailingTarget`; `async def test_prune_failure_does_not_fail_backup_cycle(tmp_path)`; `…`
 - **tests/unit/test_bootstrap_db_persistence_wired.py** — Regression tests for #2135 (F099): bootstrap_config DB persistence must be wired end-to-end through the ContextBuilder.
-  - `async def real_db(tmp_path)`; `def agent_dir(tmp_path)`; `class TestContextBuilderWiring`; `class TestPersistenceRoundTrip`; `class TestFirstPromptOrdering`
+  - `async def real_db(tmp_path, sqlite_database_factory)`; `def agent_dir(tmp_path)`; `class TestContextBuilderWiring`; `class TestPersistenceRoundTrip`; `class TestFirstPromptOrdering`
 - **tests/unit/test_bootstrap_discovery_fallthrough.py** — Regression: ``_handle_bootstrap`` falls through on discovery LLM error.
   - `async def test_handle_bootstrap_falls_through_when_discovery_llm_fails()`; `async def test_handle_bootstrap_pending_persists_user_message_and_greeting()`; `async def test_handle_bootstrap_pending_does_not_persist_user_when_greeting_fails()`; `async def test_handle_bootstrap_swallows_skip_discovery_failure()`
 - **tests/unit/test_bootstrap_feature.py** — Unit tests for the Bootstrap Feature (#153).
@@ -3098,7 +3098,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_talon_verification.py** — Tests for the Talon test-evidence verification layer (#1542).
   - `class TestAllowlist`; `class TestClassifyExecution`; `class TestClassifyDenial`; `class TestVerifierFlow`; `class TestEvidenceAggregation`; `class TestRealApprovalQueueProvenance`
 - **tests/unit/test_task_wait.py** — Tests for the single generic ``wait`` tool (WaitFeature) and its dispatch to feature-registered Waitable providers (e.g.
-  - `class TestGenericWaitSleep`; `class TestUnifiedWaitTarget`; `class TestWaitModeSignal`
+  - `async def db_agent(tmp_path, sqlite_database_factory)`; `class TestGenericWaitSleep`; `class TestUnifiedWaitTarget`; `class TestWaitModeSignal`
 - **tests/unit/test_tasks_subscribe_endpoint.py** — ``GET /api/agent/api/agent/tasks/{task_id}/subscribe`` — sender-side push ingress for the async ``send_a2a_question`` resumption design (#1444).
   - `def app_with_subscribe(monkeypatch)`; `def test_subscribe_returns_404_when_task_manager_missing(app_with_subscribe)`; `def test_subscribe_returns_404_for_unknown_task(app_with_subscribe)`; `def test_subscribe_streams_snapshot_then_terminal(app_with_subscribe)`; `def test_subscribe_forwards_keepalive_frames(app_with_subscribe)`; `def test_subscribe_response_headers_match_sse_contract(app_with_subscribe)`
 - **tests/unit/test_telemetry.py** — Tests for kestrel_sovereign.telemetry module.
@@ -3154,9 +3154,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_verify_policy.py** — verify_policy tests — Wave 1 sub-PR 4 (#916).
   - `def test_archival_import_defaults_to_legacy_allowed()`; `def test_live_identity_defaults_to_legacy_allowed_pre_wave_2()`; `def test_new_identity_issuance_defaults_to_hybrid_required()`; `def test_constitution_checkpoint_defaults_to_pq_required()`; `def test_every_context_has_a_default()`; `def test_legacy_allowed_accepts_classical_only()`; `def test_legacy_allowed_accepts_pq_only()`; `def test_legacy_allowed_accepts_hybrid()`; `…`
 - **tests/unit/test_wait_reconciler.py** — Tests for the generic wait reconciler (Wave 2 of #1860).
-  - `async def test_emits_one_signal_per_transition(tmp_path)`; `async def test_no_signal_for_pending_handles(tmp_path)`; `async def test_records_ok_as_delivered_and_locks_outcome(tmp_path)`; `async def test_coalesced_counts_as_delivered(tmp_path)`; `async def test_corrected_native_status_resignals_within_same_outcome(tmp_path)`; `async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(tmp_path)`; `async def test_hard_fail_locks_signaled(tmp_path)`; `async def test_dispatcher_raises_records_soft_failure(tmp_path)`; `…`
+  - `def make_agent(tmp_path, sqlite_database_factory)`; `async def test_emits_one_signal_per_transition(make_agent)`; `async def test_no_signal_for_pending_handles(make_agent)`; `async def test_records_ok_as_delivered_and_locks_outcome(make_agent)`; `async def test_coalesced_counts_as_delivered(make_agent)`; `async def test_corrected_native_status_resignals_within_same_outcome(make_agent)`; `async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(make_agent)`; `async def test_hard_fail_locks_signaled(make_agent)`; `…`
 - **tests/unit/test_wait_signal_store.py** — CRUD tests for ``WaitSignalStore`` (Wave 2 of #1860).
-  - `async def test_get_missing_returns_none(tmp_path)`; `async def test_record_pending_then_get(tmp_path)`; `async def test_record_pending_preserves_signaled_outcome(tmp_path)`; `async def test_record_delivery_locks_outcome_and_clears_pending(tmp_path)`; `async def test_record_delivery_soft_fail_does_not_lock_outcome(tmp_path)`; `async def test_list_pending_filters_to_unharvested(tmp_path)`; `async def test_clear_pending_nulls_only_pending_fields(tmp_path)`; `async def test_start_watch_creates_row(tmp_path)`; `…`
+  - `def make_store(tmp_path, sqlite_database_factory)`; `async def test_get_missing_returns_none(make_store)`; `async def test_record_pending_then_get(make_store)`; `async def test_record_pending_preserves_signaled_outcome(make_store)`; `async def test_record_delivery_locks_outcome_and_clears_pending(make_store)`; `async def test_record_delivery_soft_fail_does_not_lock_outcome(make_store)`; `async def test_list_pending_filters_to_unharvested(make_store)`; `async def test_clear_pending_nulls_only_pending_fields(make_store)`; `…`
 - **tests/unit/test_web_search_feature.py** — Unit tests for WebSearchFeature and WebSearchTool.
   - `class TestWebSearchTool`; `class TestWebSearchFeature`; `class TestWebSearchConfigHints`; `class TestWebSearchIntegration`
 - **tests/unit/test_webhooks_feature.py** — Unit tests for the generic Webhook Receiver feature (#156).
