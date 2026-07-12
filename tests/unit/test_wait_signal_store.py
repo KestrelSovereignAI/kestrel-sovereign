@@ -13,27 +13,29 @@ from datetime import datetime, timezone
 
 import pytest
 
-from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_wait_signal_store import (
     WaitSignalStore,
 )
 
 
-async def _make_store(tmp_path, agent_id="did:test:agent"):
-    db_path = str(tmp_path / "wait_store.db")
-    db = await AsyncDatabase.sqlite(db_path)
-    return WaitSignalStore(db, agent_id=agent_id)
+@pytest.fixture
+def make_store(tmp_path, sqlite_database_factory):
+    async def create(agent_id="did:test:agent"):
+        db = await sqlite_database_factory(tmp_path / "wait_store.db")
+        return WaitSignalStore(db, agent_id=agent_id)
+
+    return create
 
 
 @pytest.mark.asyncio
-async def test_get_missing_returns_none(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_get_missing_returns_none(make_store):
+    store = await make_store()
     assert await store.get("talon", "job-1") is None
 
 
 @pytest.mark.asyncio
-async def test_record_pending_then_get(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_record_pending_then_get(make_store):
+    store = await make_store()
     now = datetime.now(timezone.utc)
     await store.record_pending(
         "talon", "job-1",
@@ -51,11 +53,11 @@ async def test_record_pending_then_get(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_record_pending_preserves_signaled_outcome(tmp_path):
+async def test_record_pending_preserves_signaled_outcome(make_store):
     """An upsert from record_pending must NOT clobber a previously-locked
     last_signaled_outcome (the row may carry a confirmed delivery for an
     earlier transition)."""
-    store = await _make_store(tmp_path)
+    store = await make_store()
     # First confirm a delivery (locks last_signaled_outcome).
     await store.record_pending(
         "talon", "job-1", signal_id="s1", target="failed", attempts=1,
@@ -77,8 +79,8 @@ async def test_record_pending_preserves_signaled_outcome(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_record_delivery_locks_outcome_and_clears_pending(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_record_delivery_locks_outcome_and_clears_pending(make_store):
+    store = await make_store()
     await store.record_pending(
         "talon", "job-1", signal_id="s1", target="done", attempts=1,
     )
@@ -96,10 +98,10 @@ async def test_record_delivery_locks_outcome_and_clears_pending(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_record_delivery_soft_fail_does_not_lock_outcome(tmp_path):
+async def test_record_delivery_soft_fail_does_not_lock_outcome(make_store):
     """Soft-fail: omit signaled_outcome so the next tick re-detects +
     retries. Pending is still cleared (the harvest is done)."""
-    store = await _make_store(tmp_path)
+    store = await make_store()
     await store.record_pending(
         "talon", "job-1", signal_id="s1", target="done", attempts=1,
     )
@@ -116,8 +118,8 @@ async def test_record_delivery_soft_fail_does_not_lock_outcome(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_list_pending_filters_to_unharvested(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_list_pending_filters_to_unharvested(make_store):
+    store = await make_store()
     await store.record_pending(
         "talon", "job-1", signal_id="s1", target="done", attempts=1,
     )
@@ -134,8 +136,8 @@ async def test_list_pending_filters_to_unharvested(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_clear_pending_nulls_only_pending_fields(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_clear_pending_nulls_only_pending_fields(make_store):
+    store = await make_store()
     await store.record_pending(
         "talon", "job-1", signal_id="s1", target="done", attempts=3,
     )
@@ -151,8 +153,8 @@ async def test_clear_pending_nulls_only_pending_fields(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_watch_creates_row(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_start_watch_creates_row(make_store):
+    store = await make_store()
     await store.start_watch("task", "task-1")
     row = await store.get("task", "task-1")
     assert row is not None
@@ -164,10 +166,10 @@ async def test_start_watch_creates_row(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_watch_preserves_existing_fields(tmp_path):
+async def test_start_watch_preserves_existing_fields(make_store):
     """A watch on an existing row must NOT clobber its delivery/pending
     state — start_watch only flips watching=1."""
-    store = await _make_store(tmp_path)
+    store = await make_store()
     await store.record_pending(
         "task", "task-1", signal_id="s1", target="done", attempts=2,
     )
@@ -180,8 +182,8 @@ async def test_start_watch_preserves_existing_fields(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stop_watch_clears_flag(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_stop_watch_clears_flag(make_store):
+    store = await make_store()
     await store.start_watch("task", "task-1")
     await store.stop_watch("task", "task-1")
     row = await store.get("task", "task-1")
@@ -189,8 +191,8 @@ async def test_stop_watch_clears_flag(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_list_watched_only_active_unsignaled(tmp_path):
-    store = await _make_store(tmp_path)
+async def test_list_watched_only_active_unsignaled(make_store):
+    store = await make_store()
     await store.start_watch("task", "active-1")
     await store.start_watch("talon", "active-2")
     # A stopped watch.
@@ -208,9 +210,9 @@ async def test_list_watched_only_active_unsignaled(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_watching_column_round_trip(tmp_path):
+async def test_watching_column_round_trip(make_store):
     """The watching column survives a write→read round trip on the dataclass."""
-    store = await _make_store(tmp_path)
+    store = await make_store()
     await store.start_watch("task", "task-1")
     row = await store.get("task", "task-1")
     assert isinstance(row.watching, int)
@@ -220,8 +222,8 @@ async def test_watching_column_round_trip(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_watch_isolation_between_agents(tmp_path):
-    db = await AsyncDatabase.sqlite(str(tmp_path / "shared.db"))
+async def test_watch_isolation_between_agents(tmp_path, sqlite_database_factory):
+    db = await sqlite_database_factory(tmp_path / "shared.db")
     store_a = WaitSignalStore(db, agent_id="did:agent:A")
     store_b = WaitSignalStore(db, agent_id="did:agent:B")
     await store_a.start_watch("task", "task-1")
@@ -230,10 +232,10 @@ async def test_watch_isolation_between_agents(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_seed_signaled_is_insert_or_ignore(tmp_path):
+async def test_seed_signaled_is_insert_or_ignore(make_store):
     """seed_signaled inserts a confirmed-signaled row only if absent, and
     never clobbers an existing reconciler-managed row (codex Wave 2 P2)."""
-    store = await _make_store(tmp_path)
+    store = await make_store()
     assert await store.seed_signaled("talon", "job-1", "done") is True
     assert (await store.get("talon", "job-1")).last_signaled_outcome == "done"
     # Re-seeding the same handle is a no-op (returns False, value unchanged).
@@ -242,10 +244,10 @@ async def test_seed_signaled_is_insert_or_ignore(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_seed_does_not_clobber_managed_row(tmp_path):
+async def test_seed_does_not_clobber_managed_row(make_store):
     """A later legacy seed must not overwrite a row the reconciler already
     manages (e.g. an in-flight pending row)."""
-    store = await _make_store(tmp_path)
+    store = await make_store()
     await store.record_pending(
         "talon", "job-1", signal_id="s1", target="done", attempts=1,
     )
@@ -256,10 +258,10 @@ async def test_seed_does_not_clobber_managed_row(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_agent_id_isolation(tmp_path):
+async def test_agent_id_isolation(tmp_path, sqlite_database_factory):
     """A shared backend must not leak rows between agents (the codex P1
     isolation contract carried over from PendingA2AQuestionStore)."""
-    db = await AsyncDatabase.sqlite(str(tmp_path / "shared.db"))
+    db = await sqlite_database_factory(tmp_path / "shared.db")
     store_a = WaitSignalStore(db, agent_id="did:agent:A")
     store_b = WaitSignalStore(db, agent_id="did:agent:B")
     await store_a.record_pending(
