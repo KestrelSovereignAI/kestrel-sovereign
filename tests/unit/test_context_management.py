@@ -3,24 +3,19 @@ Tests for the Context Management System.
 
 Tests cover:
 - Token counting (tiktoken + fallback)
-- Token budget allocation (fixed + adaptive)
 - BM25 indexing
 - Episode creation triggers
 - ContextManager orchestration
 """
 
 import pytest
-from datetime import datetime, timezone, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 # Import components to test
 from kestrel_sovereign.agent.token_counter import (
-    TokenCounter, get_token_counter, TIKTOKEN_AVAILABLE,
-    CHARS_PER_TOKEN_ESTIMATE
-)
-from kestrel_sovereign.agent.token_budget import (
-    TokenBudget, AdaptiveTokenBudget, TokenAllocation,
-    create_budget, DEFAULT_ALLOCATION, RESPONSE_RESERVE
+    TokenCounter,
+    get_token_counter,
+    TIKTOKEN_AVAILABLE,
 )
 from kestrel_sovereign.endpoints.agent import _latest_assistant_model_identity
 from kestrel_sovereign.storage.bm25_index import BM25Index, BM25_AVAILABLE
@@ -163,103 +158,6 @@ class TestContextStatusModelIdentity:
         assert identity["model_source"] == "legacy_assistant_turn"
 
 
-class TestTokenBudget:
-    """Tests for TokenBudget class."""
-
-    def test_budget_initialization(self):
-        """Test that TokenBudget initializes with correct allocations."""
-        budget = TokenBudget("gpt-4")
-        assert budget.model == "gpt-4"
-        assert budget.context_limit == 8192  # From model_catalog.toml
-        assert budget.response_reserve == RESPONSE_RESERVE
-
-    def test_budget_allocations(self):
-        """Test that all allocations are created."""
-        budget = TokenBudget("gpt-4")
-        for name in DEFAULT_ALLOCATION.keys():
-            assert name in budget.allocations
-            assert budget.allocations[name].budget > 0
-
-    def test_budget_use(self):
-        """Test recording token usage."""
-        budget = TokenBudget("gpt-4")
-        initial_remaining = budget.get_remaining("history")
-
-        success = budget.use("history", 100)
-        assert success is True
-        assert budget.get_remaining("history") == initial_remaining - 100
-
-    def test_budget_can_fit(self):
-        """Test checking if tokens fit."""
-        budget = TokenBudget("gpt-4")
-        remaining = budget.get_remaining("history")
-
-        assert budget.can_fit("history", remaining - 1)
-        assert budget.can_fit("history", remaining)
-        assert not budget.can_fit("history", remaining + 1)
-
-    def test_budget_total_used(self):
-        """Test total used calculation."""
-        budget = TokenBudget("gpt-4")
-        budget.use("system", 100)
-        budget.use("history", 200)
-        assert budget.total_used == 300
-
-    def test_budget_summary(self):
-        """Test getting budget summary."""
-        budget = TokenBudget("gpt-4")
-        budget.use("history", 100, items=5)
-        summary = budget.get_summary()
-
-        assert "model" in summary
-        assert "allocations" in summary
-        assert summary["allocations"]["history"]["used"] == 100
-        assert summary["allocations"]["history"]["items"] == 5
-
-
-class TestAdaptiveTokenBudget:
-    """Tests for AdaptiveTokenBudget class."""
-
-    def test_short_conversation_allocation(self):
-        """Test allocation for short conversations (<10 messages)."""
-        budget = AdaptiveTokenBudget("gpt-4", message_count=5)
-        # Short conversations should have more history budget
-        assert budget.allocations["history"].budget > budget.allocations["episodes"].budget
-
-    def test_medium_conversation_allocation(self):
-        """Test allocation for medium conversations (10-30 messages)."""
-        budget = AdaptiveTokenBudget("gpt-4", message_count=20)
-        # Should use default allocation
-        # History is 40%, Episodes is 20%
-        total = budget.total_budget
-        expected_history = int(total * 0.40)
-        expected_episodes = int(total * 0.20)
-        assert budget.allocations["history"].budget == expected_history
-        assert budget.allocations["episodes"].budget == expected_episodes
-
-    def test_long_conversation_allocation(self):
-        """Test allocation for long conversations (>30 messages)."""
-        budget = AdaptiveTokenBudget("gpt-4", message_count=50)
-        # Long conversations should have more episodes, less history
-        # Episodes: 35%, History: 25%
-        total = budget.total_budget
-        expected_history = int(total * 0.25)
-        expected_episodes = int(total * 0.35)
-        assert budget.allocations["history"].budget == expected_history
-        assert budget.allocations["episodes"].budget == expected_episodes
-
-    def test_create_budget_factory(self):
-        """Test create_budget factory function."""
-        # Non-adaptive
-        budget = create_budget("gpt-4", message_count=50, adaptive=False)
-        assert isinstance(budget, TokenBudget)
-        assert not isinstance(budget, AdaptiveTokenBudget)
-
-        # Adaptive
-        budget = create_budget("gpt-4", message_count=50, adaptive=True)
-        assert isinstance(budget, AdaptiveTokenBudget)
-
-
 class TestBM25Index:
     """Tests for BM25 indexing."""
 
@@ -321,30 +219,6 @@ class TestBM25Index:
         assert len(results) > 0
         # doc3 should be first as it matches the query best
         assert results[0].doc_id == "doc3"
-
-
-class TestTokenAllocation:
-    """Tests for TokenAllocation dataclass."""
-
-    def test_remaining_property(self):
-        """Test remaining tokens calculation."""
-        alloc = TokenAllocation(name="test", budget=1000, used=300)
-        assert alloc.remaining == 700
-
-    def test_remaining_never_negative(self):
-        """Test remaining is never negative."""
-        alloc = TokenAllocation(name="test", budget=100, used=200)
-        assert alloc.remaining == 0
-
-    def test_utilization(self):
-        """Test utilization percentage."""
-        alloc = TokenAllocation(name="test", budget=1000, used=500)
-        assert alloc.utilization == 0.5
-
-    def test_utilization_zero_budget(self):
-        """Test utilization with zero budget."""
-        alloc = TokenAllocation(name="test", budget=0, used=0)
-        assert alloc.utilization == 0.0
 
 
 # Integration tests that need async
@@ -1338,8 +1212,6 @@ class TestStashOperations:
     async def test_get_full_history_excludes_stashed(self, mock_storage_with_conv):
         """Test that stashed messages are excluded from full history by default."""
         # This tests the storage layer filtering
-        from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
-
         # We'll test the filtering logic directly
         # The actual implementation filters in get_full_history_with_ids
         # For now, verify the parameter is accepted

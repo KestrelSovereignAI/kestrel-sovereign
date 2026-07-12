@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-07-12
-**Scope:** 2007 tracked files (1310 `.py`, 328 `.md`, 369 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 2008 tracked files (1310 `.py`, 328 `.md`, 370 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1734,6 +1734,7 @@ Repo entry points and standard project files.
 - **tests/e2e/test_chat_and_models.spec.cjs** — —
 - **tests/e2e/test_clarification_workflow.py** — End-to-end tests for GitHub clarification workflow using Playwright.
   - `def run_gh_command(args)`; `def create_test_issue(title, body, labels)`; `def close_test_issue(issue_number)`; `def get_issue_comments(issue_number)`; `def get_issue_labels(issue_number)`; `def run_agent_on_issue(issue_number)`; `class TestClarificationWorkflow`; `class TestClarificationUI`; `…`
+- **tests/e2e/test_conversation_highlight.spec.cjs** — —
 - **tests/e2e/test_core_only.spec.cjs** — —
 - **tests/e2e/test_flux_lora_training.spec.cjs** — —
 - **tests/e2e/test_heartbeat_and_bootstrap.spec.cjs** — —
@@ -2327,7 +2328,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_context_feature_store_accessor.py** — Regression tests for F152 — the context/save tool paths that call ``context_manager._get_conversation_store()``.
   - `def test_context_manager_get_conversation_store_returns_real_store()`; `async def test_restore_excluded_recent_resolves_real_store()`; `async def test_save_feature_resolves_real_store()`
 - **tests/unit/test_context_management.py** — Tests for the Context Management System.
-  - `class TestTokenCounter`; `class TestContextStatusModelIdentity`; `class TestTokenBudget`; `class TestAdaptiveTokenBudget`; `class TestBM25Index`; `class TestTokenAllocation`; `class TestContextManagerIntegration`; `class TestSessionCompaction`; `…`
+  - `class TestTokenCounter`; `class TestContextStatusModelIdentity`; `class TestBM25Index`; `class TestContextManagerIntegration`; `class TestSessionCompaction`; `class TestAgentContextControl`; `class TestMemoryMetadataContextFields`; `class TestStashOperations`; `…`
 - **tests/unit/test_context_manager_bootstrap_injection.py** — Regression test: system prompts sent via ContextManager actually contain the agent's bootstrap identity (SOUL.md).
   - `def test_context_manager_uses_injected_context_builder()`; `def test_context_manager_falls_back_when_no_injection()`; `async def test_system_prompt_contains_soul_content_when_injected()`; `def test_kestrel_agent_injects_its_own_context_builder()`
 - **tests/unit/test_continuation_store.py** — Unit tests for the continuation cursor store (#808 / #806).
@@ -3110,8 +3111,8 @@ Repo entry points and standard project files.
   - `def test_timeout_seconds_from_float()`; `def test_timeout_seconds_from_httpx_timeout_uses_largest_phase()`; `def test_timeout_seconds_none()`; `def test_effective_timeout_scoped_to_candidates_ignores_unrelated_local()`; `def test_effective_timeout_picks_local_route()`; `def test_effective_timeout_ignores_cloud_providers()`; `def test_effective_timeout_none_for_mixed_set_to_protect_cloud_hang_detection()`; `def test_effective_timeout_lifts_only_when_all_candidates_local()`; `…`
 - **tests/unit/test_todo_feature.py** — —
   - `async def test_tools_are_discoverable()`; `async def test_todo_add_persists_session_scoped_todo_with_terminal_condition()`; `async def test_todo_add_accepts_priority_medium_synonym()`; `async def test_todo_add_normalizes_priority_and_status_synonyms()`; `async def test_todo_add_still_rejects_genuinely_invalid_priority()`; `async def test_todo_update_normalizes_priority_synonym()`; `async def test_todo_add_rejects_done_status()`; `async def test_todo_update_preserves_terminal_condition_and_status_transition()`; `…`
-- **tests/unit/test_token_budget_edge_cases.py** — Tests for token budget edge cases.
-  - `class TestBudgetOverflow`; `class TestReallocateUnused`; `class TestCrossModelBudgets`; `class TestModelSwitching`; `class TestConcurrentBudgetAllocation`; `class TestBudgetSummary`; `class TestAdaptiveBudgetEdgeCases`; `class TestTokenAllocationProperties`
+- **tests/unit/test_token_budget.py** — Canonical contracts for the legacy static and adaptive token budgets.
+  - `def test_token_allocation_remaining_and_utilization_matrix()`; `def test_static_budget_allocates_available_context_by_default_percentages()`; `def test_use_tracks_usage_items_and_exact_fit_boundary()`; `def test_sources_account_independently()`; `def test_unknown_source_fails_without_changing_usage()`; `def test_summary_reports_budget_and_allocation_state()`; `def test_adaptive_budget_thresholds(message_count, history_share, episode_share)`
 - **tests/unit/test_tool_concurrency.py** — Tests for tool concurrency batching (#562 v2).
   - `class FakeToolCall`; `class FakeToolSchema`; `class FakeTool`; `class FakeFeature`; `class TestPartitionToolCalls`; `class TestIsConcurrencySafe`; `class TestMaxConcurrency`
 - **tests/unit/test_tool_description_promotions.py** — Doc-visibility assertions for #1946.
