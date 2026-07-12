@@ -18,7 +18,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -46,60 +46,13 @@ def kestrel_data_key(monkeypatch):
 
 
 @pytest.fixture
-def post_ceremony_dir(tmp_path, kestrel_data_key, monkeypatch):
-    """Set up a complete post-ceremony agent dir with legacy + hybrid
-    + succession material on disk. Returns the dir + slug."""
-    storage = SecureKeyStorage(storage_dir=tmp_path)
-    secp = Secp256k1Suite()
-    legacy_kp = secp.generate_keypair()
-    address = public_key_to_ethereum_address(legacy_kp.public_key)
-    legacy_did = f"did:pkh:eip155:1:{address}"
-    key_id = f"kestrel_{address}"
-    storage.save_private_key(legacy_kp.private_key, key_id)
-
-    from cryptography.hazmat.primitives.serialization import (
-        Encoding, PublicFormat,
+def post_ceremony_dir(post_ceremony_material):
+    """Return an isolated copy of the canonical post-ceremony directory."""
+    return (
+        post_ceremony_material.storage_dir,
+        post_ceremony_material.legacy_key_id,
+        post_ceremony_material.slug,
     )
-    pub_hex = legacy_kp.public_key.public_bytes(
-        encoding=Encoding.X962, format=PublicFormat.UncompressedPoint,
-    ).hex()
-    (tmp_path / f"{key_id}.json").write_text(json.dumps({
-        "@context": "https://w3id.org/did/v1",
-        "id": legacy_did,
-        "publicKey": [{
-            "id": f"{legacy_did}#keys-1",
-            "type": "EcdsaSecp256k1VerificationKey2019",
-            "controller": legacy_did,
-            "publicKeyHex": pub_hex,
-        }],
-    }))
-
-    legacy_vms = build_verification_methods(legacy_did, [(secp, legacy_kp.public_key)])
-    archival_kp = SLHDSASHA2128sSuite().generate_keypair()
-    # Set effective_from to 30 days ago so the rollback window has passed
-    eff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    result = run_rotation_ceremony(
-        predecessor_did=legacy_did,
-        predecessor_keypair=legacy_kp,
-        predecessor_kid=legacy_vms[0]["id"].rsplit("#", 1)[-1],
-        predecessor_verification_methods=legacy_vms,
-        new_did_domain="agents.test.example",
-        new_did_slug="testbot",
-        reason="destroy legacy test",
-        effective_from=eff,
-        archival_keypair=archival_kp,
-    )
-    new_kp = result.new_identity.keypair
-    storage.save_private_key(new_kp.classical.private_key, "testbot_ed25519")
-    storage.save_secret_bytes(new_kp.pq.private_key, "testbot_mldsa65")
-    storage.save_secret_bytes(archival_kp.private_key, "testbot_archival_slhdsa")
-    storage.save_secret_bytes(archival_kp.public_key, "testbot_archival_slhdsa_pub")
-    successions_dir = tmp_path / "successions"
-    successions_dir.mkdir()
-    (successions_dir / "testbot.json").write_text(
-        json.dumps(result.succession_statement.to_dict(), indent=2)
-    )
-    return tmp_path, key_id, "testbot"
 
 
 def _run(args: list[str], env_extra: dict | None = None):
@@ -291,7 +244,6 @@ def test_hybrid_keys_from_wrong_agent_blocks_destruction(
     other_address = public_key_to_ethereum_address(other_legacy.public_key)
     other_did = f"did:pkh:eip155:1:{other_address}"
     other_storage.save_private_key(other_legacy.private_key, f"kestrel_{other_address}")
-    from kestrel_sovereign.identity.did_web import build_verification_methods
     from cryptography.hazmat.primitives.serialization import (
         Encoding, PublicFormat,
     )

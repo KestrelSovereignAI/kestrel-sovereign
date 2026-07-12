@@ -40,8 +40,6 @@ from kestrel_sovereign.security.crypto_suite import (
 )
 from kestrel_sovereign.security.multikey import public_key_to_multibase
 from kestrel_sovereign.security.release_manifest import (
-    MANIFEST_FORMAT_ID,
-    MANIFEST_FORMAT_VERSION,
     ReleaseManifest,
     ReleaseManifestError,
     add_artifact_entry,
@@ -84,13 +82,24 @@ def base_manifest():
     )
 
 
-@pytest.fixture
-def signed_manifest(base_manifest, slh_kp):
-    """A representative signed-and-finalized manifest with two artifacts."""
-    m = add_artifact_entry(base_manifest, "wheel.whl", b"wheel-bytes")
+@pytest.fixture(scope="module")
+def signed_manifest_json(slh_kp):
+    """Serialize one real signature for the module's verify-only cases."""
+    manifest = new_manifest(
+        release_tag="v1.2.3",
+        released_at="2026-05-04T20:00:00+00:00",
+        signer_did="did:web:kestrel-sovereign.example",
+    )
+    m = add_artifact_entry(manifest, "wheel.whl", b"wheel-bytes")
     m = add_artifact_entry(m, "src.tar.gz", b"tarball-bytes")
     m = sign_manifest(m, slh_kp, kid="release-key-1")
-    return finalize(m)
+    return json.dumps(finalize(m).to_dict())
+
+
+@pytest.fixture
+def signed_manifest(signed_manifest_json):
+    """Rehydrate a fresh manifest so mutations cannot leak between tests."""
+    return ReleaseManifest.from_dict(json.loads(signed_manifest_json))
 
 
 # ---------------------------------------------------------------------------

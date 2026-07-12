@@ -18,26 +18,20 @@ from __future__ import annotations
 import json
 import pytest
 
-from kestrel_sovereign.identity.did_web import build_verification_methods
-from kestrel_sovereign.identity.rotation_ceremony import run_rotation_ceremony
 from kestrel_sovereign.identity.runtime_identity import (
     AgentIdentity,
     RuntimeIdentityError,
     load_agent_identity,
 )
-from kestrel_sovereign.identity.succession import SuccessionStatement
 from kestrel_sovereign.inception_service import (
     public_key_to_ethereum_address,
-    create_did_document,
 )
 from kestrel_sovereign.security.crypto_suite import (
     ALG_ECDSA_SECP256K1_SHA256,
     ALG_ED25519,
     ALG_ML_DSA_65,
     ALG_SLH_DSA_SHA2_128S,
-    Keypair,
     Secp256k1Suite,
-    SLHDSASHA2128sSuite,
 )
 from kestrel_sovereign.security.key_storage import SecureKeyStorage
 
@@ -93,43 +87,15 @@ def legacy_agent_on_disk(tmp_path, kestrel_data_key):
 
 
 @pytest.fixture
-def post_ceremony_agent_on_disk(legacy_agent_on_disk, kestrel_data_key):
-    """Run the rotation ceremony against the legacy agent and persist
-    everything in the canonical layout. Returns the same tuple plus
-    the ceremony result."""
-    storage_dir, legacy_key_id, legacy_did, legacy_kp = legacy_agent_on_disk
-    storage = SecureKeyStorage(storage_dir=storage_dir)
-
-    secp = Secp256k1Suite()
-    legacy_vms = build_verification_methods(legacy_did, [(secp, legacy_kp.public_key)])
-    legacy_kid = legacy_vms[0]["id"].rsplit("#", 1)[-1]
-
-    archival_kp = SLHDSASHA2128sSuite().generate_keypair()
-    result = run_rotation_ceremony(
-        predecessor_did=legacy_did,
-        predecessor_keypair=legacy_kp,
-        predecessor_kid=legacy_kid,
-        predecessor_verification_methods=legacy_vms,
-        new_did_domain="agents.test.example",
-        new_did_slug="testbot",
-        reason="runtime loader test",
-        archival_keypair=archival_kp,
+def post_ceremony_agent_on_disk(post_ceremony_material):
+    """Return isolated persisted material and freshly loaded legacy keys."""
+    return (
+        post_ceremony_material.storage_dir,
+        post_ceremony_material.legacy_key_id,
+        post_ceremony_material.legacy_did,
+        post_ceremony_material.load_legacy_keypair(),
+        post_ceremony_material.new_did,
     )
-
-    # Persist exactly like quantum_kestrel_1_ceremony.py does
-    new_kp = result.new_identity.keypair
-    storage.save_private_key(new_kp.classical.private_key, "testbot_ed25519")
-    storage.save_secret_bytes(new_kp.pq.private_key, "testbot_mldsa65")
-    storage.save_secret_bytes(archival_kp.private_key, "testbot_archival_slhdsa")
-    storage.save_secret_bytes(archival_kp.public_key, "testbot_archival_slhdsa_pub")
-
-    successions_dir = storage_dir / "successions"
-    successions_dir.mkdir()
-    (successions_dir / "testbot.json").write_text(
-        json.dumps(result.succession_statement.to_dict(), indent=2)
-    )
-
-    return storage_dir, legacy_key_id, legacy_did, legacy_kp, result
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +137,11 @@ def test_legacy_agent_missing_did_doc_raises(tmp_path, kestrel_data_key):
 # ---------------------------------------------------------------------------
 
 def test_load_hybrid_agent(post_ceremony_agent_on_disk):
-    storage_dir, key_id, legacy_did, legacy_kp, result = post_ceremony_agent_on_disk
+    storage_dir, key_id, legacy_did, legacy_kp, new_did = post_ceremony_agent_on_disk
     identity = load_agent_identity(key_id, storage_dir)
     assert identity.is_hybrid is True
-    assert identity.signing_did == result.new_identity.did
-    assert identity.new_did == result.new_identity.did
+    assert identity.signing_did == new_did
+    assert identity.new_did == new_did
     assert identity.legacy_did == legacy_did
     # Hybrid keypair carries both halves
     assert identity.hybrid_keypair.classical.suite_id == ALG_ED25519
@@ -186,14 +152,14 @@ def test_load_hybrid_agent(post_ceremony_agent_on_disk):
     assert len(identity.succession_chain) == 1
     # Succession statement readable
     assert identity.succession_statement.predecessor_did == legacy_did
-    assert identity.succession_statement.successor_did == result.new_identity.did
+    assert identity.succession_statement.successor_did == new_did
     # Verification methods exposed (not a full DID doc — that would
     # drift from the published did.json which carries alsoKnownAs etc).
     vms = identity.new_verification_methods
     assert len(vms) == 2
     assert all("publicKeyMultibase" in vm for vm in vms)
     assert all("controller" in vm for vm in vms)
-    assert all(vm["controller"] == result.new_identity.did for vm in vms)
+    assert all(vm["controller"] == new_did for vm in vms)
 
 
 def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk):

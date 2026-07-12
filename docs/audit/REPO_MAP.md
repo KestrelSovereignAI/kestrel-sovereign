@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-07-12
-**Scope:** 2006 tracked files (1309 `.py`, 328 `.md`, 369 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 2007 tracked files (1310 `.py`, 328 `.md`, 369 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1725,7 +1725,7 @@ Repo entry points and standard project files.
 - **tests/README.md** — Kestrel Test Suite — Commands to run the various test categories for the Kestrel Sovereign AI Agent framework.
 - **tests/__init__.py** — —
 - **tests/conftest.py** — Pytest configuration and shared fixtures for Kestrel tests.
-  - `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_configure(config)`; `def pytest_sessionfinish(session, exitstatus)`; `def setup_test_config()`; `def project_root()`; `def temp_dir()`; `def temp_file()`; `…`
+  - `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_configure(config)`; `def pytest_sessionfinish(session, exitstatus)`; `def setup_test_config()`; `def project_root()`; `def post_ceremony_template(tmp_path_factory)`; `def post_ceremony_material(tmp_path, monkeypatch, post_ceremony_template)`; `…`
 - **tests/e2e/playwright.config.cjs** — —
 - **tests/e2e/spawn/spawn-console.spec.cjs** — —
 - **tests/e2e/spawn/spawn-lifecycle.spec.cjs** — —
@@ -2046,6 +2046,8 @@ Repo entry points and standard project files.
   - `def pytest_configure(config)`; `def pytest_sessionstart(session)`; `def pytest_sessionfinish(session, exitstatus)`; `def pytest_keyboard_interrupt(excinfo)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_runtest_setup(item)`; `def pytest_runtest_teardown(item)`; `def pytest_exception_interact(node, call, report)`; `…`
 - **tests/shared/resource_registry.py** — Global resource registry for test cleanup.
   - `class TrackedResource`; `class ResourceRegistry`; `def track_runpod(pod_id, name, cost_per_hr)`; `def track_docker(container_id, image)`; `def track_subprocess(process, name)`; `def track_tempdir(path)`; `def untrack(key)`
+- **tests/shared/rotation_ceremony.py** — Reusable, isolated post-ceremony test material.
+  - `class PostCeremonyMaterial`; `class PostCeremonyTemplate`; `def build_post_ceremony_template(storage_dir)`
 - **tests/test_logging_config.py** — Tests for kestrel_sovereign.logging_config — structured JSON logging.
   - `class TestJSONFormatter`; `class TestCorrelationId`; `class TestSetupLogging`
 - **tests/test_model_discovery.py** — Tests for LLM model discovery functionality.
@@ -2391,7 +2393,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_deploy_secrets.py** — Tests for ``kestrel_sovereign.features.deploy.secrets``.
   - `def deploy_config_two_profiles()`; `def deploy_config_with_azure_substitutions()`; `def mock_secret_client()`; `def test_derive_secret_mapping_single_profile(deploy_config_two_profiles)`; `def test_derive_secret_mapping_all_profiles_dedupes(deploy_config_two_profiles)`; `def test_derive_secret_mapping_skips_dollar_substitutions(deploy_config_with_azure_substitutions)`; `def test_derive_secret_mapping_accepts_unusual_secret_names()`; `def test_derive_secret_mapping_skips_non_cloudrun_profiles()`; `…`
 - **tests/unit/test_destroy_legacy_key.py** — Tests for ``scripts/quantum_destroy_legacy_key.py``.
-  - `def kestrel_data_key(monkeypatch)`; `def post_ceremony_dir(tmp_path, kestrel_data_key, monkeypatch)`; `def test_dry_run_preserves_legacy_key(post_ceremony_dir)`; `def test_confirm_without_env_var_rejects(post_ceremony_dir)`; `def test_confirm_with_env_var_deletes_legacy_only(post_ceremony_dir)`; `def test_rollback_window_blocks_fresh_succession(post_ceremony_dir)`; `def test_missing_hybrid_keys_blocks_destruction(post_ceremony_dir)`; `def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path)`; `…`
+  - `def kestrel_data_key(monkeypatch)`; `def post_ceremony_dir(post_ceremony_material)`; `def test_dry_run_preserves_legacy_key(post_ceremony_dir)`; `def test_confirm_without_env_var_rejects(post_ceremony_dir)`; `def test_confirm_with_env_var_deletes_legacy_only(post_ceremony_dir)`; `def test_rollback_window_blocks_fresh_succession(post_ceremony_dir)`; `def test_missing_hybrid_keys_blocks_destruction(post_ceremony_dir)`; `def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path)`; `…`
 - **tests/unit/test_did_web.py** — did:web producer + resolver — Wave 2 sub-PR 3 (#917).
   - `def test_build_did_host_only()`; `def test_build_did_with_path()`; `def test_build_did_with_port_encoded_as_percent_3a()`; `def test_build_did_rejects_bare_colon_in_domain()`; `def test_build_did_rejects_scheme_in_domain()`; `def test_build_did_rejects_slash_in_domain()`; `def test_build_did_rejects_colon_in_segment()`; `def test_build_did_rejects_empty_segment()`; `…`
 - **tests/unit/test_diminishing_returns.py** — Tests for diminishing returns detection in orchestrator loops.
@@ -2815,7 +2817,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_reanchor_constitution.py** — Unit tests for !reanchor-constitution command.
   - `async def test_reanchor_rejects_missing_signed_artifact()`; `async def test_reanchor_rejects_short_hash(tmp_path)`; `async def test_reanchor_rejects_wrong_hash(tmp_path)`; `async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path)`; `async def test_reanchor_accepts_controller_resolved_sovereign_root(tmp_path)`; `async def test_reanchor_rejects_wrongly_signed_artifact(tmp_path)`; `async def test_reanchor_rejects_agent_owned_signature(tmp_path)`; `async def test_reanchor_rejects_self_identity_as_trust_anchor(tmp_path)`; `…`
 - **tests/unit/test_release_manifest.py** — Release manifest tests — Wave 5 sub-PR 1 (#920).
-  - `def slh_kp()`; `def slh_pub_multibase(slh_kp)`; `def ed_kp()`; `def base_manifest()`; `def signed_manifest(base_manifest, slh_kp)`; `def test_new_manifest_requires_release_tag()`; `def test_new_manifest_default_released_at_is_utc()`; `def test_naive_released_at_rejected()`; `…`
+  - `def slh_kp()`; `def slh_pub_multibase(slh_kp)`; `def ed_kp()`; `def base_manifest()`; `def signed_manifest_json(slh_kp)`; `def signed_manifest(signed_manifest_json)`; `def test_new_manifest_requires_release_tag()`; `def test_new_manifest_default_released_at_is_utc()`; `…`
 - **tests/unit/test_release_signing_key_loader.py** — Tests for ``scripts/release/load_signing_key_from_env.py`` — Wave 5 sub-PR 3 (#920).
   - `def test_loader_happy_path(tmp_path, monkeypatch)`; `def test_loader_rejects_wrong_length_secret(tmp_path)`; `def test_loader_rejects_wrong_length_public(tmp_path)`; `def test_loader_rejects_mismatched_pair(tmp_path)`; `def test_loader_rejects_empty_secret_env(tmp_path)`; `def test_loader_rejects_malformed_base64(tmp_path)`
 - **tests/unit/test_relevance_gate.py** — Relevance gate on memory + RAG retrieval (#1404).
@@ -2853,7 +2855,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_run_script_approval_failclosed.py** — F126: run_script approval gate must fail CLOSED when no queue is reachable.
   - `def temp_db()`; `def signer_with_ecdsa_keys(temp_db)`; `async def test_missing_security_feature_fails_closed(temp_db, signer_with_ecdsa_keys)`; `async def test_missing_approval_queue_fails_closed(temp_db, signer_with_ecdsa_keys)`
 - **tests/unit/test_runtime_identity.py** — Tests for :mod:`kestrel_sovereign.identity.runtime_identity`.
-  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_on_disk(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_on_disk(legacy_agent_on_disk, kestrel_data_key)`; `def test_load_legacy_only_agent(legacy_agent_on_disk)`; `def test_legacy_agent_missing_did_doc_raises(tmp_path, kestrel_data_key)`; `def test_load_hybrid_agent(post_ceremony_agent_on_disk)`; `def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk)`; `def test_succession_present_but_hybrid_keys_missing_raises(post_ceremony_agent_on_disk)`; `…`
+  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_on_disk(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_on_disk(post_ceremony_material)`; `def test_load_legacy_only_agent(legacy_agent_on_disk)`; `def test_legacy_agent_missing_did_doc_raises(tmp_path, kestrel_data_key)`; `def test_load_hybrid_agent(post_ceremony_agent_on_disk)`; `def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk)`; `def test_succession_present_but_hybrid_keys_missing_raises(post_ceremony_agent_on_disk)`; `…`
 - **tests/unit/test_save_feature.py** — ToolResult contract tests for SaveFeature (#1061 wave 7).
   - `async def test_save_stash_with_embedding_returns_ok()`; `async def test_save_stash_without_embedding_returns_partial()`; `async def test_save_stash_no_stashes_returns_error()`; `async def test_save_stash_empty_specific_stash_returns_error()`; `async def test_save_excerpt_last_n_full_returns_ok()`; `async def test_save_excerpt_last_n_shortfall_returns_partial()`; `async def test_save_excerpt_invalid_target_returns_error()`; `async def test_save_excerpt_no_embedding_returns_partial()`; `…`
 - **tests/unit/test_saved_items.py** — Tests for the Saved Items system.
@@ -2875,7 +2877,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_script_signer_fail_closed.py** — Fail-closed tests for ScriptSigner — Wave 0B (#914).
   - `def temp_db()`; `def script()`; `async def test_sign_without_keys_raises(temp_db, script)`; `async def test_sign_without_did_raises(temp_db, script)`; `async def test_sign_propagates_signing_failure(temp_db, script)`; `async def test_verify_rejects_hmac_prefix_even_when_math_verifies(temp_db, script)`; `async def test_verify_rejects_hmac_with_unsigned_default(temp_db, script)`; `async def test_verify_genuine_ecdsa_signature(temp_db, script)`; `…`
 - **tests/unit/test_script_signer_hybrid.py** — ScriptSigner hybrid-format tests — Quantum Hardening epic, signing-path follow-up to PR #999.
-  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key)`; `async def test_legacy_agent_signs_ecdsa(legacy_agent_dir)`; `async def test_hybrid_agent_signs_hybrid_format(post_ceremony_agent_dir)`; `async def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `async def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `async def test_hybrid_payload_tamper_detected(post_ceremony_agent_dir)`; `…`
+  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(post_ceremony_material)`; `async def test_legacy_agent_signs_ecdsa(legacy_agent_dir)`; `async def test_hybrid_agent_signs_hybrid_format(post_ceremony_agent_dir)`; `async def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `async def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `async def test_hybrid_payload_tamper_detected(post_ceremony_agent_dir)`; `…`
 - **tests/unit/test_sdk_extension_ownership.py** — Sovereign consumes and compatibility-exports SDK extension contracts.
   - `def test_ui_contributions_is_the_sdk_type()`; `def test_app_extension_compatibility_path_is_the_sdk_type()`
 - **tests/unit/test_sealed_capsule.py** — Sealed capsule tests — Wave 4 sub-PR 3 (#919).
@@ -2939,7 +2941,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_shell_exit_tokens.py** — Shell exit tokens — #658.
   - `class TestExitTokenSet`
 - **tests/unit/test_sign_package_hybrid.py** — sign_package / verify_package_signature hybrid-format tests.
-  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key)`; `def test_legacy_agent_signs_v1_only(legacy_agent_dir)`; `def test_legacy_tamper_detected(legacy_agent_dir)`; `def test_hybrid_agent_emits_v2_only(post_ceremony_agent_dir)`; `def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `…`
+  - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(post_ceremony_material)`; `def test_legacy_agent_signs_v1_only(legacy_agent_dir)`; `def test_legacy_tamper_detected(legacy_agent_dir)`; `def test_hybrid_agent_emits_v2_only(post_ceremony_agent_dir)`; `def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `…`
 - **tests/unit/test_signal_prompt_templates_packaged.py** — Every signal source's prompt_template must ship inside the package (#1415).
   - `def package_root()`; `class TestPromptTemplateShipsWithWheel`; `class TestPackagedTemplateInventory`
 - **tests/unit/test_signals_a2a_source.py** — Phase 5 of #889: a2a.task_complete source registration + causation chain propagation + the cycle detection mechanism's first real-world exercise.
@@ -3013,7 +3015,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_spawn_mandate.py** — Tests for SpawnMandate data structure and DID delegation chains.
   - `def parent_keys()`; `def child_keys()`; `def sample_mandate()`; `class TestSpawnMandate`; `class TestMandateSigning`; `class TestChildDIDDocument`
 - **tests/unit/test_spawn_mandate_hybrid.py** — sign_mandate / verify_mandate hybrid-format tests.
-  - `def kestrel_data_key(monkeypatch)`; `def hybrid_parent(tmp_path, kestrel_data_key)`; `def test_legacy_mandate_signs_bare_hex()`; `def test_legacy_tamper_detected()`; `def test_hybrid_mandate_uses_prefix(hybrid_parent)`; `def test_hybrid_mandate_round_trip_verifies(hybrid_parent)`; `def test_hybrid_mandate_tamper_detected(hybrid_parent)`; `def test_hybrid_mandate_strip_pq_half_rejected(hybrid_parent)`; `…`
+  - `def kestrel_data_key(monkeypatch)`; `def hybrid_parent(post_ceremony_material)`; `def test_legacy_mandate_signs_bare_hex()`; `def test_legacy_tamper_detected()`; `def test_hybrid_mandate_uses_prefix(hybrid_parent)`; `def test_hybrid_mandate_round_trip_verifies(hybrid_parent)`; `def test_hybrid_mandate_tamper_detected(hybrid_parent)`; `def test_hybrid_mandate_strip_pq_half_rejected(hybrid_parent)`; `…`
 - **tests/unit/test_spawn_mandate_subset_enforcement.py** — F277: a SpawnMandate must only RESTRICT the child relative to the parent.
   - `def test_subset_ok_when_features_are_a_subset()`; `def test_spawn_tool_max_tokens_constraint_validates()`; `def test_refuses_features_not_available_to_parent()`; `def test_refuses_capability_granting_constraint()`; `async def test_create_agent_forwards_mandate_to_inception(monkeypatch, tmp_path)`; `async def test_omitted_allowlist_inherits_parent_ceiling_not_all(monkeypatch, tmp_path)`
 - **tests/unit/test_sql_utils.py** — Tests for kestrel_sovereign.sql_utils — SQL identifier validation.
