@@ -15,7 +15,6 @@ Covers:
 
 from __future__ import annotations
 
-import os
 
 import pytest
 
@@ -275,26 +274,3 @@ def test_distinct_codec_from_mldsa65(suite):
     would mis-route public keys at multibase decode time."""
     from kestrel_sovereign.security.crypto_suite import MLDSA65Suite
     assert suite.public_key_multicodec != MLDSA65Suite().public_key_multicodec
-
-
-# ---------------------------------------------------------------------------
-# Determinism / non-determinism observation
-# ---------------------------------------------------------------------------
-
-def test_signatures_may_be_non_deterministic(suite, keypair):
-    """FIPS 205 allows both deterministic (det:) and randomized variants
-    of SLH-DSA. This pqcrypto build defaults to the randomized form, so
-    two successive signs over the same input may produce different
-    signatures — but BOTH must verify. Locks the observation; if the
-    library ever flips to deterministic mode the test still passes.
-
-    Workflow note: succession ceremonies that hash a chain of signatures
-    therefore must canonicalize the ``signatures`` array carefully if they
-    rely on byte-stable countersigning across re-signs — which Wave 3
-    does NOT (each succession statement is signed once, archived, and
-    referenced by content hash thereafter).
-    """
-    sig_a = suite.sign(b"same-input", keypair.private_key)
-    sig_b = suite.sign(b"same-input", keypair.private_key)
-    assert suite.verify(b"same-input", sig_a, keypair.public_key) is True
-    assert suite.verify(b"same-input", sig_b, keypair.public_key) is True

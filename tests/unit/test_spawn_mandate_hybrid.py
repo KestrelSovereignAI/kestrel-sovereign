@@ -38,60 +38,17 @@ def kestrel_data_key(monkeypatch):
 
 
 @pytest.fixture
-def hybrid_parent(tmp_path, kestrel_data_key):
-    """Mint a hybrid parent agent: legacy ECDSA + post-ceremony hybrid
-    keypair on disk + succession statement. Returns the AgentIdentity
-    bundle ready to pass to sign_mandate."""
-    storage = SecureKeyStorage(storage_dir=tmp_path)
-    secp = Secp256k1Suite()
-    legacy_kp = secp.generate_keypair()
-    address = public_key_to_ethereum_address(legacy_kp.public_key)
-    legacy_did = f"did:pkh:eip155:1:{address}"
-    key_id = f"kestrel_{address}"
-    storage.save_private_key(legacy_kp.private_key, key_id)
-
-    from cryptography.hazmat.primitives.serialization import (
-        Encoding, PublicFormat,
+def hybrid_parent(post_ceremony_material):
+    """Load a fresh parent identity from isolated canonical material."""
+    identity = load_agent_identity(
+        post_ceremony_material.legacy_key_id,
+        storage_dir=post_ceremony_material.storage_dir,
     )
-    pub_hex = legacy_kp.public_key.public_bytes(
-        encoding=Encoding.X962, format=PublicFormat.UncompressedPoint,
-    ).hex()
-    (tmp_path / f"{key_id}.json").write_text(json.dumps({
-        "@context": "https://w3id.org/did/v1",
-        "id": legacy_did,
-        "publicKey": [{
-            "id": f"{legacy_did}#keys-1",
-            "type": "EcdsaSecp256k1VerificationKey2019",
-            "controller": legacy_did,
-            "publicKeyHex": pub_hex,
-        }],
-    }))
-
-    legacy_vms = build_verification_methods(legacy_did, [(secp, legacy_kp.public_key)])
-    archival_kp = SLHDSASHA2128sSuite().generate_keypair()
-    result = run_rotation_ceremony(
-        predecessor_did=legacy_did,
-        predecessor_keypair=legacy_kp,
-        predecessor_kid=legacy_vms[0]["id"].rsplit("#", 1)[-1],
-        predecessor_verification_methods=legacy_vms,
-        new_did_domain="agents.test.example",
-        new_did_slug="parent",
-        reason="mandate hybrid test",
-        archival_keypair=archival_kp,
+    return (
+        identity,
+        post_ceremony_material.load_legacy_keypair(),
+        post_ceremony_material.new_did,
     )
-    new_kp = result.new_identity.keypair
-    storage.save_private_key(new_kp.classical.private_key, "parent_ed25519")
-    storage.save_secret_bytes(new_kp.pq.private_key, "parent_mldsa65")
-    storage.save_secret_bytes(archival_kp.private_key, "parent_archival_slhdsa")
-    storage.save_secret_bytes(archival_kp.public_key, "parent_archival_slhdsa_pub")
-    successions_dir = tmp_path / "successions"
-    successions_dir.mkdir()
-    (successions_dir / "parent.json").write_text(
-        json.dumps(result.succession_statement.to_dict(), indent=2)
-    )
-
-    identity = load_agent_identity(key_id, storage_dir=tmp_path)
-    return identity, legacy_kp, result
 
 
 def _make_mandate(parent_did: str = "did:pkh:eip155:1:0xPARENTPLACEHOLDER") -> SpawnMandate:

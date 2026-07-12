@@ -215,6 +215,35 @@ def project_root() -> Path:
     return Path(__file__).parent.parent
 
 
+@pytest.fixture(scope="session")
+def post_ceremony_template(tmp_path_factory):
+    """Build the real archival ceremony once per pytest worker."""
+    from tests.shared.rotation_ceremony import (
+        TEST_DATA_KEY,
+        build_post_ceremony_template,
+    )
+
+    template_dir = tmp_path_factory.mktemp("post_ceremony_template")
+    previous_data_key = os.environ.get("KESTREL_DATA_KEY")
+    os.environ["KESTREL_DATA_KEY"] = TEST_DATA_KEY
+    try:
+        return build_post_ceremony_template(template_dir)
+    finally:
+        if previous_data_key is None:
+            os.environ.pop("KESTREL_DATA_KEY", None)
+        else:
+            os.environ["KESTREL_DATA_KEY"] = previous_data_key
+
+
+@pytest.fixture
+def post_ceremony_material(tmp_path, monkeypatch, post_ceremony_template):
+    """Copy canonical ceremony files into an isolated per-test directory."""
+    from tests.shared.rotation_ceremony import TEST_DATA_KEY
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", TEST_DATA_KEY)
+    return post_ceremony_template.clone_into(tmp_path)
+
+
 # =============================================================================
 # Temporary directory fixtures with automatic cleanup
 # =============================================================================
@@ -579,5 +608,3 @@ async def sqlite_backend(tmp_path):
     await backend.connect()
     yield backend
     await backend.close()
-
-

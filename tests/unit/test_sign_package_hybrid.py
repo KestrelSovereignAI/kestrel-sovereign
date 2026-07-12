@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import pytest
-from pathlib import Path
 
 from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
 from kestrel_sovereign.identity.did_web import build_verification_methods
@@ -69,34 +68,14 @@ def legacy_agent_dir(tmp_path, kestrel_data_key):
 
 
 @pytest.fixture
-def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key):
-    storage_dir, legacy_key_id, legacy_did, legacy_kp = legacy_agent_dir
-    storage = SecureKeyStorage(storage_dir=storage_dir)
-    secp = Secp256k1Suite()
-    legacy_vms = build_verification_methods(legacy_did, [(secp, legacy_kp.public_key)])
-    legacy_kid = legacy_vms[0]["id"].rsplit("#", 1)[-1]
-    archival_kp = SLHDSASHA2128sSuite().generate_keypair()
-    result = run_rotation_ceremony(
-        predecessor_did=legacy_did,
-        predecessor_keypair=legacy_kp,
-        predecessor_kid=legacy_kid,
-        predecessor_verification_methods=legacy_vms,
-        new_did_domain="agents.test.example",
-        new_did_slug="testbot",
-        reason="sign_package hybrid test",
-        archival_keypair=archival_kp,
+def post_ceremony_agent_dir(post_ceremony_material):
+    return (
+        post_ceremony_material.storage_dir,
+        post_ceremony_material.legacy_key_id,
+        post_ceremony_material.legacy_did,
+        post_ceremony_material.load_legacy_keypair(),
+        post_ceremony_material.new_did,
     )
-    new_kp = result.new_identity.keypair
-    storage.save_private_key(new_kp.classical.private_key, "testbot_ed25519")
-    storage.save_secret_bytes(new_kp.pq.private_key, "testbot_mldsa65")
-    storage.save_secret_bytes(archival_kp.private_key, "testbot_archival_slhdsa")
-    storage.save_secret_bytes(archival_kp.public_key, "testbot_archival_slhdsa_pub")
-    successions_dir = storage_dir / "successions"
-    successions_dir.mkdir()
-    (successions_dir / "testbot.json").write_text(
-        json.dumps(result.succession_statement.to_dict(), indent=2)
-    )
-    return storage_dir, legacy_key_id, legacy_did, legacy_kp, result
 
 
 def _make_package(did: str) -> AgentIdentityPackage:
@@ -269,8 +248,6 @@ def test_attacker_cannot_self_validate_with_own_keys(
     storage_dir, _, victim_did, _, _ = post_ceremony_agent_dir
 
     # Attacker mints their own legacy + hybrid identity
-    from kestrel_sovereign.identity.did_web import build_verification_methods
-    from kestrel_sovereign.identity.rotation_ceremony import run_rotation_ceremony
     from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
 
     attacker_dir = tmp_path / "attacker"
