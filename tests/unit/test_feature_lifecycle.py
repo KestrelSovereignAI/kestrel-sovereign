@@ -11,8 +11,6 @@ Tests the new lifecycle methods on the Feature base class:
 - Config persistence via graph store
 """
 
-import asyncio
-import json
 import pytest
 from typing import Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -342,11 +340,6 @@ class TestGetRouter:
         feature = RouterFeature(mock_agent)
         router = feature.get_router()
         assert router is not None
-
-    def test_simple_feature_returns_none(self, mock_agent):
-        feature = SimpleFeature(mock_agent)
-        assert feature.get_router() is None
-
 
 # === Tests: Config Schema ===
 

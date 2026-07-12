@@ -2201,7 +2201,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_cleanup_models_dryrun.py** — Unit tests for cleanup_models dry-run safety (#1946).
   - `class TestCleanupModelsDryRunDefault`; `class TestCleanupModelsDocs`
 - **tests/unit/test_cli.py** — Unit tests for the unified kestrel CLI.
-  - `class TestAgentHttpTimeout`; `class TestArgumentParsing`; `class TestCommandDispatch`; `class TestProcessHelpers`; `def multi_agent_env(tmp_path)`; `class TestCmdList`; `class TestCmdStatus`; `class TestCmdStorage`; `…`
+  - `class TestAgentHttpTimeout`; `class TestArgumentParsing`; `class TestCommandDispatch`; `def multi_agent_env(tmp_path)`; `class TestCmdList`; `class TestCmdStatus`; `class TestCmdStorage`; `class TestCmdStop`; `…`
 - **tests/unit/test_cli_adapter_feature.py** — Tests for feature-owned CLI adapter support.
   - `class FakeTerminal`; `class FakeApprovalQueue`; `def git_repo(tmp_path)`; `async def test_terminal_execution_blocks_non_read_only_without_approval_callback()`; `async def test_terminal_execution_blocks_non_read_only_when_approval_denies()`; `async def test_terminal_execution_runs_non_read_only_after_approval()`; `async def test_cli_feature_approval_callback_uses_security_queue()`; `async def test_cli_feature_approval_callback_fails_closed_without_security_queue()`; `…`
 - **tests/unit/test_cli_agent_docker.py** — ``kestrel agent docker`` CLI tests — sub-PR 3.2 of epic #1050 (bash-to-Python port of ``scripts/sovereign-agent.sh``).

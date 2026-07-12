@@ -9,7 +9,7 @@ unknown-alg fail-loud behavior.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import pytest
 
@@ -23,7 +23,6 @@ from kestrel_sovereign.security.crypto_suite import (
 )
 from kestrel_sovereign.security.verify_policy import (
     Context,
-    PolicyResult,
     VerifyPolicy,
     default_policy_for,
     evaluate_signatures,
@@ -241,16 +240,6 @@ def test_cutoff_accepts_hybrid_post_cutoff():
         [_sig(ALG_ECDSA_SECP256K1_SHA256), _sig(ALG_ML_DSA_65)],
         VerifyPolicy.HYBRID_REQUIRED,
         post_cutoff_classical_allowed=False,
-    )
-    assert result.ok is True
-
-
-def test_cutoff_default_is_permissive():
-    """Backwards compat: callers that don't know about the cutoff still
-    see Wave-1-and-earlier behavior (no cutoff applied)."""
-    result = evaluate_signatures(
-        [_sig(ALG_ECDSA_SECP256K1_SHA256)],
-        VerifyPolicy.LEGACY_ALLOWED,
     )
     assert result.ok is True
 

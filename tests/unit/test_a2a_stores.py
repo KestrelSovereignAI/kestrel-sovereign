@@ -10,10 +10,8 @@ Tests all 6 core datastores with SQLite implementations:
 6. FeedbackStore - Agent self-diagnosis
 """
 
-import asyncio
 import os
 import tempfile
-from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -34,16 +32,11 @@ from kestrel_sovereign.a2a.stores import (
     OrchestrationStore,
     FeedbackStore,
     # Data models
-    SessionState,
-    MemoryEntry,
-    ObservabilityEvent,
     OrchestrationStatus,
-    OrchestrationTask,
     FeedbackCategory,
     FeedbackSeverity,
     FeedbackStatus,
     FeedbackSource,
-    FeedbackEntry,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 
@@ -106,13 +99,53 @@ class TestTaskStore:
     """Tests for TaskStore with SQLite backend."""
 
     @pytest.mark.asyncio
-    async def test_initialize(self, db_path):
-        """Test store initialization creates tables."""
+    async def test_initialize_migrates_legacy_user_id_and_preserves_rows(
+        self, db_path
+    ):
+        """Legacy task databases gain user_id without losing existing rows."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
+        await backend.execute_script("""
+            CREATE TABLE a2a_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                task_type TEXT NOT NULL,
+                status TEXT DEFAULT 'submitted',
+                message TEXT,
+                artifacts TEXT DEFAULT '[]',
+                history TEXT DEFAULT '[]',
+                metadata TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO a2a_tasks (id, task_type, status)
+            VALUES ('legacy-task', 'generic', 'submitted');
+        """)
         store = track_store(TaskStore(backend))
         await store.initialize()
-        # No exception means success
+        await store.initialize()
+
+        columns = {
+            row[1]
+            for row in await backend.fetch_all("PRAGMA table_info('a2a_tasks')")
+        }
+        assert "user_id" in columns
+        legacy_row = await backend.fetch_one(
+            "SELECT id FROM a2a_tasks WHERE id = ?", ("legacy-task",)
+        )
+        assert legacy_row[0] == "legacy-task"
+
+        await store.save(
+            Task(
+                id="new-task",
+                status=TaskStatus(state=TaskState.SUBMITTED),
+                metadata={"user_id": "user-123"},
+            )
+        )
+        row = await backend.fetch_one(
+            "SELECT user_id FROM a2a_tasks WHERE id = ?", ("new-task",)
+        )
+        assert row[0] == "user-123"
 
     @pytest.mark.asyncio
     async def test_save_and_get(self, db_path):
@@ -323,14 +356,6 @@ class TestSessionService:
     """Tests for SQLiteSessionService."""
 
     @pytest.mark.asyncio
-    async def test_initialize(self, db_path):
-        """Test service initialization."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        service = track_store(SessionService(backend))
-        await service.initialize()
-
-    @pytest.mark.asyncio
     async def test_create_and_get_session(self, db_path):
         """Test creating and retrieving a session."""
         backend = SQLiteBackend(db_path)
@@ -440,14 +465,6 @@ class TestMemoryService:
     """Tests for SQLiteMemoryService."""
 
     @pytest.mark.asyncio
-    async def test_initialize(self, db_path):
-        """Test service initialization with FTS5."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        service = track_store(MemoryService(backend))
-        await service.initialize()
-
-    @pytest.mark.asyncio
     async def test_add_and_get_memory(self, db_path):
         """Test adding and retrieving memory."""
         backend = SQLiteBackend(db_path)
@@ -546,12 +563,61 @@ class TestObservabilityStore:
     """Tests for SQLiteObservabilityStore."""
 
     @pytest.mark.asyncio
-    async def test_initialize(self, db_path):
-        """Test store initialization."""
+    async def test_initialize_migrates_legacy_agent_did_and_preserves_rows(
+        self, db_path
+    ):
+        """Legacy LLM-call rows survive the additive agent_did migration."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
+        await backend.execute_script("""
+            CREATE TABLE a2a_llm_calls (
+                id TEXT PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                session_id TEXT,
+                companion_id TEXT,
+                user_id TEXT,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                system_prompt_preview TEXT,
+                user_prompt_preview TEXT,
+                response_preview TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                duration_ms INTEGER NOT NULL,
+                success INTEGER DEFAULT 1,
+                error_message TEXT,
+                tool_calls TEXT,
+                metadata TEXT DEFAULT '{}'
+            );
+            INSERT INTO a2a_llm_calls
+                (id, provider, model, duration_ms)
+            VALUES ('legacy-call', 'legacy-provider', 'legacy-model', 7);
+        """)
         store = track_store(ObservabilityStore(backend))
         await store.initialize()
+        await store.initialize()
+
+        columns = {
+            row[1]
+            for row in await backend.fetch_all(
+                "PRAGMA table_info('a2a_llm_calls')"
+            )
+        }
+        assert "agent_did" in columns
+        legacy_row = await backend.fetch_one(
+            "SELECT id FROM a2a_llm_calls WHERE id = ?", ("legacy-call",)
+        )
+        assert legacy_row[0] == "legacy-call"
+
+        await store.log_llm_call(
+            provider="test-provider",
+            model="test-model",
+            duration_ms=10,
+            agent_did="did:test:new-agent",
+        )
+        calls = await store.query_llm_calls(agent_did="did:test:new-agent")
+        assert len(calls) == 1
+        assert calls[0].agent_did == "did:test:new-agent"
 
     @pytest.mark.asyncio
     async def test_log_tool_call_and_response(self, db_path):
@@ -648,20 +714,28 @@ class TestObservabilityStore:
 
     @pytest.mark.asyncio
     async def test_prune_old_events(self, db_path):
-        """Test pruning old events."""
+        """Pruning deletes only events older than the requested cutoff."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
         store = track_store(ObservabilityStore(backend))
         await store.initialize()
 
-        # Add some events
-        for _ in range(5):
-            await store.log_tool_call(agent_name="test", tool_name="test")
+        old_event = await store.log_tool_call(
+            agent_name="test", tool_name="old-tool"
+        )
+        fresh_event = await store.log_tool_call(
+            agent_name="test", tool_name="fresh-tool"
+        )
+        await backend.execute(
+            "UPDATE a2a_observability SET timestamp = ? WHERE id = ?",
+            ("2000-01-01T00:00:00", old_event),
+        )
 
-        # Prune (won't actually delete since events are new)
-        deleted = await store.prune_old_events(older_than_days=0)
-        # Since events are brand new, may or may not delete depending on timing
-        assert deleted >= 0
+        deleted = await store.prune_old_events(older_than_days=30)
+
+        assert deleted == 1
+        assert await store.get_event(old_event) is None
+        assert await store.get_event(fresh_event) is not None
 
 
 # =============================================================================
@@ -670,14 +744,6 @@ class TestObservabilityStore:
 
 class TestOrchestrationStore:
     """Tests for SQLiteOrchestrationStore."""
-
-    @pytest.mark.asyncio
-    async def test_initialize(self, db_path):
-        """Test store initialization."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(OrchestrationStore(backend))
-        await store.initialize()
 
     @pytest.mark.asyncio
     async def test_create_workflow_and_add_tasks(self, db_path):
@@ -872,14 +938,6 @@ class TestOrchestrationStore:
 
 class TestFeedbackStore:
     """Tests for SQLiteFeedbackStore."""
-
-    @pytest.mark.asyncio
-    async def test_initialize(self, db_path):
-        """Test store initialization."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(FeedbackStore(backend))
-        await store.initialize()
 
     @pytest.mark.asyncio
     async def test_submit_and_get_feedback(self, db_path):
