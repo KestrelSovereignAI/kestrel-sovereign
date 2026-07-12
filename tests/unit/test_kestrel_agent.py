@@ -7,6 +7,7 @@ NO mock-returns-mock tests - each test verifies real logic.
 
 import pytest
 import asyncio
+import contextlib
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
@@ -953,6 +954,430 @@ class TestLifecycle:
         agent.memory_system.shutdown.assert_called_once()
         mock_storage.close.assert_called_once()
         assert call_order == ["memory", "storage"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_all_feature_owned_workers(self, tmp_path):
+        """Whole-agent shutdown stops feature-owned background workers (#2409)."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        class _WorkerFeature:
+            """Representative feature that owns a background worker task."""
+
+            def __init__(self, name):
+                self.name = name
+                self.worker = None
+                self._started = asyncio.Event()
+
+            async def start(self):
+                async def _run():
+                    self._started.set()
+                    await asyncio.Event().wait()
+
+                self.worker = asyncio.create_task(_run())
+                await self._started.wait()
+
+            async def shutdown(self):
+                if self.worker and not self.worker.done():
+                    self.worker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.worker
+
+        health = _WorkerFeature("HealthFeature")
+        delivery = _WorkerFeature("DeliveryFeature")
+        scheduler = _WorkerFeature("SchedulerFeature")
+        await health.start()
+        await delivery.start()
+        await scheduler.start()
+
+        agent.features = {
+            "HealthFeature": health,
+            "DeliveryFeature": delivery,
+            "SchedulerFeature": scheduler,
+        }
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+
+        # No feature worker survives normal whole-agent shutdown.
+        assert health.worker.done()
+        assert delivery.worker.done()
+        assert scheduler.worker.done()
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_real_health_feature_background_task(self, tmp_path):
+        """A real HealthFeature's owned background task does not survive (#2409).
+
+        The fake-worker tests prove the sweep calls shutdown(); this proves
+        the contract against a real in-tree feature that owns an
+        ``asyncio.create_task`` background loop, so the actual
+        ``HealthFeature.shutdown`` cancellation path is exercised end to end.
+        """
+        from kestrel_sovereign.features.health.feature import HealthFeature
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        # Drive the real feature's background loop without touching the DB:
+        # a large interval means the loop parks in its first sleep and is
+        # torn down purely by HealthFeature.shutdown()'s cancel path.
+        health = HealthFeature(agent)
+        health._interval_seconds = 3600
+        health._running = False
+        health._background_task = None
+        health._start_background_loop()
+        assert health._background_task is not None
+        assert not health._background_task.done()
+
+        agent.features = {"HealthFeature": health}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+
+        # The real feature's owned task is cancelled and cleared.
+        assert health._background_task is None
+        assert health._running is False
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_double_stop_security_feature(self, tmp_path):
+        """SecurityFeature is shut down exactly once, not by the feature sweep (#2409)."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        mock_security = AsyncMock()
+        mock_security.shutdown = AsyncMock()
+        other = AsyncMock()
+        other.shutdown = AsyncMock()
+
+        agent.features = {"SecurityFeature": mock_security, "OtherFeature": other}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+
+        mock_security.shutdown.assert_called_once()
+        other.shutdown.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_feature_sweep_runs_before_storage_close(self, tmp_path):
+        """Feature-owned workers stop before storage teardown, never racing it (#2409)."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        call_order = []
+
+        feature = MagicMock()
+
+        async def shutdown_feature():
+            call_order.append("feature")
+
+        feature.shutdown = AsyncMock(side_effect=shutdown_feature)
+
+        async def close_storage():
+            call_order.append("storage")
+
+        agent.features = {"WorkerFeature": feature}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock(side_effect=close_storage)
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+
+        assert call_order == ["feature", "storage"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_twice_is_safe_with_stateful_feature(self, tmp_path):
+        """A second whole-agent shutdown is safe against real feature state (#2409).
+
+        A bare AsyncMock called twice proves nothing about idempotency — it
+        cannot fail. This uses a stateful feature whose shutdown() operates
+        on a real worker task: the first shutdown cancels+awaits it, and the
+        second must observe the already-stopped state and return cleanly
+        (no double-cancel error, no await on a consumed task).
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        class _StatefulFeature:
+            """Owns a real worker; shutdown() must be safe to call twice."""
+
+            def __init__(self):
+                self.worker = None
+                self.shutdown_calls = 0
+                self._started = asyncio.Event()
+
+            async def start(self):
+                async def _run():
+                    self._started.set()
+                    await asyncio.Event().wait()
+
+                self.worker = asyncio.create_task(_run())
+                await self._started.wait()
+
+            async def shutdown(self):
+                self.shutdown_calls += 1
+                # Guard on real state: only cancel/await a live worker.
+                # A naive impl that unconditionally `await self.worker`
+                # would raise on the second call (task already consumed).
+                if self.worker is not None and not self.worker.done():
+                    self.worker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.worker
+                self.worker = None
+
+        feature = _StatefulFeature()
+        await feature.start()
+
+        agent.features = {"WorkerFeature": feature}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+        # A second whole-agent shutdown must not raise despite the worker
+        # already being stopped, and must not double-cancel a consumed task.
+        await agent.shutdown()
+
+        assert feature.shutdown_calls == 2
+        assert feature.worker is None
+
+    @pytest.mark.asyncio
+    async def test_shutdown_continues_when_one_feature_shutdown_fails(self, tmp_path):
+        """A failing feature shutdown does not block the rest or storage close (#2409)."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        failing = AsyncMock()
+        failing.shutdown = AsyncMock(side_effect=RuntimeError("worker boom"))
+        healthy = AsyncMock()
+        healthy.shutdown = AsyncMock()
+
+        agent.features = {"FailingFeature": failing, "HealthyFeature": healthy}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        await agent.shutdown()
+
+        failing.shutdown.assert_called_once()
+        healthy.shutdown.assert_called_once()
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_runs_durable_tail_then_propagates_cancellation(
+        self, tmp_path
+    ):
+        """Cancellation runs the durable tail, then propagates (#2409).
+
+        agent.shutdown() is wrapped in asyncio.wait_for() by the CLI/server
+        shutdown paths. If a feature shutdown is cancelled by the outer
+        timeout, the sweep must NOT report a successful shutdown — but it
+        must also NOT skip the safety-critical durable cleanup tail
+        (background-task cleanup, memory shutdown, final sync snapshot,
+        storage close). So storage MUST still close, and CancelledError
+        MUST still propagate so wait_for surfaces the timeout.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        cancelled = AsyncMock()
+        cancelled.shutdown = AsyncMock(side_effect=asyncio.CancelledError())
+
+        agent.features = {"SlowFeature": cancelled}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.shutdown()
+
+        cancelled.shutdown.assert_called_once()
+        # Durable cleanup MUST run despite cancellation — data safety wins.
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_prefix_cancellation_still_runs_durable_tail(
+        self, tmp_path
+    ):
+        """Cancellation in the fallible PREFIX cannot bypass the durable tail (#2409).
+
+        The heartbeat runner, resume monitor, salvage worker, and
+        SecurityFeature run *before* the feature sweep. Before this fix they
+        sat outside the try/finally, so a cancellation there (the outer
+        wait_for timeout firing early) propagated straight out and skipped the
+        durable cleanup tail entirely — leaking data/storage. They now live
+        inside the protected region: cancellation anywhere in the prefix still
+        runs the durable tail, then re-raises.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        # Cancellation strikes while stopping the heartbeat — the very first
+        # prefix step, well before any feature sweep.
+        heartbeat = MagicMock()
+        heartbeat.stop = AsyncMock(side_effect=asyncio.CancelledError())
+        agent.heartbeat_runner = heartbeat
+
+        later_feature = AsyncMock()
+        later_feature.shutdown = AsyncMock()
+        agent.features = {"LaterFeature": later_feature}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.shutdown()
+
+        heartbeat.stop.assert_called_once()
+        # The durable tail MUST still run even though cancellation hit the
+        # prefix before the feature sweep.
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_bounds_a_hung_feature(self, tmp_path):
+        """A feature that never returns from shutdown() is bounded (#2409).
+
+        A single hung feature must not stall the sweep or starve the durable
+        cleanup tail — it is abandoned after the per-feature timeout and the
+        rest of shutdown (including storage close) still completes.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        hung_started = asyncio.Event()
+
+        async def _never_returns():
+            hung_started.set()
+            await asyncio.Event().wait()
+
+        hung = MagicMock()
+        hung.shutdown = _never_returns
+        healthy = AsyncMock()
+        healthy.shutdown = AsyncMock()
+
+        agent.features = {"HungFeature": hung, "HealthyFeature": healthy}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        with patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S",
+            0.05,
+        ):
+            await agent.shutdown()
+
+        assert hung_started.is_set()
+        # The hung feature was abandoned but the sweep and teardown finished.
+        healthy.shutdown.assert_called_once()
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_hung_early_feature_does_not_starve_later_feature_or_storage(
+        self, tmp_path
+    ):
+        """Coherent deadline composition under the production outer wait_for (#2409).
+
+        The CLI/server/AgentManager paths all wrap agent.shutdown() in
+        ``asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)``. If a
+        single early feature hangs forever, the per-feature bound must be
+        composed against that outer deadline (not a larger fixed per-feature
+        timeout) so the hung feature consumes only its fair slice and a LATER
+        feature — plus the durable storage close — still run *inside* the
+        outer deadline. This is the regression the review asked for: it drives
+        shutdown through the real production-style outer wait_for rather than
+        awaiting shutdown() directly.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        hung_started = asyncio.Event()
+        late_started = asyncio.Event()
+
+        async def _never_returns():
+            hung_started.set()
+            await asyncio.Event().wait()
+
+        async def _late_shutdown():
+            late_started.set()
+
+        hung = MagicMock()
+        hung.shutdown = _never_returns
+        late = MagicMock()
+        late.shutdown = _late_shutdown
+
+        # Order matters: the hung feature is FIRST so a naive sweep would
+        # never reach the late feature within the outer deadline.
+        agent.features = {"HungFeature": hung, "LateFeature": late}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        # Shrink the internal budget so the test is fast, but keep the shape
+        # identical to production: the internal budget is composed BELOW the
+        # outer wait_for deadline, and each feature fair-divides it.
+        outer_deadline = 2.0
+        with patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+            0.6,
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+            0.2,
+        ):
+            # Production-style outer wait_for. It must NOT be what saves us —
+            # shutdown() must complete on its own well within the deadline.
+            await asyncio.wait_for(agent.shutdown(), timeout=outer_deadline)
+
+        assert hung_started.is_set()
+        # The hung early feature did not starve the later feature...
+        assert late_started.is_set()
+        # ...nor the durable storage close.
+        mock_storage.close.assert_called_once()
 
 
 # =============================================================================
