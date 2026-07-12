@@ -80,6 +80,35 @@ def test_unknown_source_fails_without_changing_usage():
     assert budget.total_used == 0
 
 
+def test_zero_tokens_and_items_are_accepted_no_ops():
+    budget = TokenBudget("gpt-4")
+
+    assert budget.can_fit("history", 0)
+    assert budget.use("history", 0, items=0)
+    assert budget.get_remaining("history") == budget.history
+    assert budget.allocations["history"].used == 0
+    assert budget.allocations["history"].items == 0
+    assert budget.total_used == 0
+
+
+def test_negative_tokens_or_items_raise_and_leave_state_unchanged():
+    budget = TokenBudget("gpt-4")
+    assert budget.use("history", 100, items=2)
+    before_used = budget.allocations["history"].used
+    before_items = budget.allocations["history"].items
+
+    for tokens, items in ((-1, 1), (100, -1), (-100, -1)):
+        with pytest.raises(ValueError):
+            budget.use("history", tokens, items=items)
+
+    with pytest.raises(ValueError):
+        budget.can_fit("history", -1)
+
+    assert budget.allocations["history"].used == before_used
+    assert budget.allocations["history"].items == before_items
+    assert budget.total_used == before_used
+
+
 def test_summary_reports_budget_and_allocation_state():
     budget = TokenBudget("gpt-4")
     assert budget.use("history", 100, items=5)
