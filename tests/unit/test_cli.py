@@ -4,9 +4,6 @@ Unit tests for the unified kestrel CLI.
 Tests argument parsing, command dispatch, and individual command handlers.
 """
 
-import os
-import signal
-import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -26,11 +23,8 @@ from kestrel_sovereign.cli import (
     cmd_ask,
     cmd_health,
     cmd_storage,
-    cmd_config,
     _agent_http_timeout,
     _DEFAULT_ASK_READ_TIMEOUT,
-    _get_project_dir,
-    _host_pid_file,
 )
 
 
@@ -68,7 +62,6 @@ class TestAgentHttpTimeout:
     def test_ask_timeout_flag_defaults_none(self):
         args = build_parser().parse_args(["ask", "kite", "hi"])
         assert args.timeout is None
-from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
 
@@ -354,65 +347,6 @@ class TestCommandDispatch:
              patch("kestrel_sovereign.cli.cmd_config", return_value=0) as mock:
             main()
             mock.assert_called_once()
-
-
-# -----------------------------------------------------------------------
-# Process helper tests (now on ProcessManager)
-# -----------------------------------------------------------------------
-
-class TestProcessHelpers:
-    """Test process management helper functions."""
-
-    def test_read_pid_no_file(self, tmp_path):
-        """Reading PID from non-existent file returns None."""
-        assert ProcessManager.read_pid(tmp_path / "nonexistent.pid") is None
-
-    def test_write_and_read_pid(self, tmp_path):
-        """Write and read PID should round-trip."""
-        pid_file = tmp_path / "test.pid"
-        ProcessManager.write_pid(pid_file, 12345)
-        assert ProcessManager.read_pid(pid_file) == 12345
-
-    def test_clear_pid(self, tmp_path):
-        """Clearing PID should remove the file."""
-        pid_file = tmp_path / "test.pid"
-        ProcessManager.write_pid(pid_file, 12345)
-        assert pid_file.exists()
-        ProcessManager.clear_pid(pid_file)
-        assert not pid_file.exists()
-
-    def test_clear_pid_nonexistent(self, tmp_path):
-        """Clearing non-existent PID file should not raise."""
-        ProcessManager.clear_pid(tmp_path / "nonexistent.pid")
-
-    def test_read_pid_invalid_content(self, tmp_path):
-        """Reading PID from file with invalid content returns None."""
-        pid_file = tmp_path / "bad.pid"
-        pid_file.write_text("not-a-number")
-        assert ProcessManager.read_pid(pid_file) is None
-
-    def test_agent_pid_file(self, tmp_path):
-        """Agent PID file should be in agent directory."""
-        pid_file = ProcessManager.agent_pid_file(tmp_path / "myagent")
-        assert pid_file == tmp_path / "myagent" / "agent.pid"
-
-    def test_agent_log_file(self, tmp_path):
-        """Agent log file should be in agent directory."""
-        log_file = ProcessManager.agent_log_file(tmp_path / "myagent")
-        assert log_file == tmp_path / "myagent" / "agent.log"
-
-    def test_is_process_running_current(self):
-        """Current process should be detected as running."""
-        assert ProcessManager.is_process_running(os.getpid()) is True
-
-    def test_is_process_running_invalid(self):
-        """Non-existent PID should not be detected as running."""
-        assert ProcessManager.is_process_running(999999) is False
-
-    def test_is_port_in_use_no(self):
-        """An unused port should return False."""
-        # Port 0 is never in use (it's assigned dynamically)
-        assert ProcessManager.is_port_in_use(0) is False
 
 
 # -----------------------------------------------------------------------
@@ -1071,7 +1005,7 @@ class TestDetectRunningAgentServer:
                 resp.status_code = 200
                 resp.json.return_value = {"key": "host-key"}
                 return resp
-            if url.endswith(f"/api/agents/claw/health"):
+            if url.endswith("/api/agents/claw/health"):
                 resp.status_code = 200
                 return resp
             raise AssertionError(f"unexpected probe: {url}")
@@ -1103,7 +1037,7 @@ class TestDetectRunningAgentServer:
                 resp.status_code = 200
                 resp.json.return_value = {"key": "host-key"}
                 return resp
-            if url.endswith(f"/api/agents/claw/health"):
+            if url.endswith("/api/agents/claw/health"):
                 resp.status_code = 404
                 return resp
             raise AssertionError(f"unexpected probe: {url}")

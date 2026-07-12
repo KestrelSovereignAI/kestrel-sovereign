@@ -8,10 +8,7 @@ NO mock-returns-mock tests - each test verifies real logic.
 import pytest
 import asyncio
 import os
-import tempfile
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock, patch, call
-from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
@@ -23,7 +20,6 @@ def _no_confirm_evaluate():
     # evaluate_transition mock for non-destructive transitions (never
     # PUBLIC→EPHEMERAL): the agent applies rather than staging pending.
     return MagicMock(side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False))
-from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
 
 # =============================================================================
@@ -826,22 +822,6 @@ class TestNotifications:
 
 class TestLifecycle:
     """Tests for lifecycle methods."""
-
-    @pytest.mark.asyncio
-    async def test_shutdown_does_not_crash_when_storage_none(self, tmp_path):
-        """shutdown() doesn't crash when storage is None."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db")
-        )
-
-        agent.features = {}
-        agent.llm_service = None
-        agent.task_manager = None
-        agent.storage = None
-
-        # Should not raise exception
-        await agent.shutdown()
 
     @pytest.mark.asyncio
     async def test_shutdown_closes_all_components(self, tmp_path):

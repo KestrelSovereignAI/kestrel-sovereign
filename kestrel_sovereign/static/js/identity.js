@@ -6,7 +6,7 @@
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, splitContentByParts, renderSignalWakeChip } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
 // consumer — one list orchestrator (fetch / refresh / seq-guard / views /
@@ -1176,6 +1176,10 @@ window.selectAgent = async function(agentName) {
 
 let activeConversationId = null;
 const activeConversationIdsByAgent = new Map();
+// Monotonic load-request counter for window.loadConversation (#2380): the
+// latest call holds the token; earlier in-flight loads detect supersession by
+// comparing their captured token against it.
+let conversationLoadSeq = 0;
 
 // #2199: the ONE mount handle for the standalone conversations pane. All list
 // fetch / refresh / request-sequencing / view filtering lives inside the shared
@@ -1435,9 +1439,70 @@ export function _pickMostRecentConversation(conversations) {
 // Mirrors ``history.js::renderAssistantWithParts`` at this loader's simpler
 // altitude (no tool-card interleaving): the first rendered bubble anchors the
 // message id + delete control + model footer so they aren't duplicated.
+// Message-level controls shared by every bubble this loader paints: soft
+// delete (✕, #763) and permanent purge (⊘, #765) — both handlers live in
+// history.js and are shared across loaders. Ported from the legacy loader's
+// affordance set (#2380 codex P2: purge was loader-only and got dropped).
+function buildMessageDeleteBtn(messageId, node) {
+    const btn = document.createElement('button');
+    btn.className = 'msg-delete-btn';
+    btn.title = 'Delete message';
+    btn.textContent = '✕';
+    btn.onclick = (e) => {
+        e.stopPropagation();
+        if (typeof window.deleteMessage === 'function') {
+            window.deleteMessage(messageId, node);
+        }
+    };
+    return btn;
+}
+
+function buildMessagePurgeBtn(messageId, node) {
+    const btn = document.createElement('button');
+    btn.className = 'msg-purge-btn';
+    btn.title = 'Delete permanently (cannot be restored)';
+    btn.textContent = '⊘';
+    btn.onclick = (e) => {
+        e.stopPropagation();
+        if (typeof window.purgeMessage === 'function') {
+            window.purgeMessage(messageId, node);
+        }
+    };
+    return btn;
+}
+
+// KaTeX post-pass for reloaded assistant markup: renderAgentContentHtml
+// returns sanitized markdown HTML only — math delimiters render via the
+// shared pass once the element is live (#2380 codex P2).
+function renderMathIn(el) {
+    const SM = window.SharedMarkdown;
+    if (el && SM && typeof SM.renderMath === 'function') SM.renderMath(el);
+}
+
 function renderAssistantMessageWithParts(msg, container) {
-    const renderMd = window.SharedMarkdown?.renderMarkdown;
-    const segments = splitContentByParts(msg.content, msg.metadata?.parts);
+    const text = String(msg.content || '');
+    const len = text.length;
+    const clampPos = (p) => Math.max(0, Math.min(len, typeof p === 'number' ? p : len));
+    // Merge position-stamped tool events and typed parts into ONE wire-ordered
+    // timeline — primary key ``pos`` (text offset), tie-broken by ``seq`` (the
+    // shared wire-order counter persisted by the server) — so a reload
+    // interleaves tool cards and component bubbles exactly as they streamed
+    // (#1914). An assistant row carrying BOTH parts and tool_events must not
+    // lose its tool cards (#2380 codex P2).
+    const toolEventsRaw = msg.metadata?.tool_events;
+    const tools = Array.isArray(toolEventsRaw)
+        ? toolEventsRaw.filter((e) => typeof e.pos === 'number')
+        : [];
+    const validParts = (Array.isArray(msg.metadata?.parts) ? msg.metadata.parts : [])
+        .filter((p) => p && typeof p.type === 'string');
+    const entries = [
+        ...tools.map((t) => ({ kind: 'tool', pos: clampPos(t.pos), seq: t.seq || 0, item: t })),
+        ...validParts.map((p) => ({ kind: 'part', pos: clampPos(p.pos), seq: p.seq || 0, item: p })),
+    ].sort((a, b) => (a.pos - b.pos) || (a.seq - b.seq));
+
+    // Every bubble carries the message id (a delete removes ALL of them); only
+    // the FIRST rendered bubble anchors the delete/purge controls + model
+    // footer so they aren't duplicated.
     let anchored = false;
     const anchor = (node) => {
         if (!node) return;
@@ -1445,40 +1510,114 @@ function renderAssistantMessageWithParts(msg, container) {
         if (anchored) return;
         anchored = true;
         if (msg.id) {
-            const deleteBtn = document.createElement('button');
-            deleteBtn.className = 'msg-delete-btn';
-            deleteBtn.title = 'Delete message';
-            deleteBtn.textContent = '✕';
-            deleteBtn.onclick = (e) => {
-                e.stopPropagation();
-                if (typeof window.deleteMessage === 'function') {
-                    window.deleteMessage(msg.id, node);
-                }
-            };
-            node.appendChild(deleteBtn);
+            node.appendChild(buildMessageDeleteBtn(msg.id, node));
+            node.appendChild(buildMessagePurgeBtn(msg.id, node));
         }
         const footer = renderModelFooterHtml({ model: msg.model, provider: msg.provider });
         if (footer) node.insertAdjacentHTML('beforeend', footer);
     };
-    for (const seg of segments) {
-        if (seg.kind === 'part') {
-            const pnode = appendMessagePart(seg.part.type, seg.part.data, container);
-            anchor(pnode);
-            continue;
-        }
-        // Skip an empty prose run (e.g. the gap between two adjacent parts, or a
-        // part-only message) so no blank bubble appears.
-        if (!String(seg.text || '').trim()) continue;
+
+    const renderProseBubble = (segText, segTools) => {
+        // Skip an empty run (the gap between two adjacent parts) unless it
+        // carries tool cards to place.
+        if (!String(segText || '').trim() && !(segTools && segTools.length)) return;
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message agent-message';
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
-        if (renderMd) contentDiv.innerHTML = renderMd(seg.text);
-        else contentDiv.textContent = seg.text;
+        contentDiv.innerHTML = renderAgentContentHtml(segText, {
+            toolEvents: segTools && segTools.length ? segTools : null,
+        });
         messageDiv.appendChild(contentDiv);
         container.appendChild(messageDiv);
+        mountToolRenderers(contentDiv);
+        renderMathIn(contentDiv);
         anchor(messageDiv);
+    };
+
+    let cursor = 0;       // text offset where the current prose run starts
+    let segTools = [];    // tool events accumulated for the current prose run
+    let firstPartNode = null;
+    for (const ev of entries) {
+        if (ev.kind === 'tool') {
+            // Tool cards render by position within their prose bubble; rebase.
+            segTools.push({ ...ev.item, pos: Math.max(0, ev.pos - cursor) });
+            continue;
+        }
+        // A part closes the current prose run (text + its tool cards) into a
+        // bubble, then renders the component as its own bubble.
+        renderProseBubble(text.slice(cursor, ev.pos), segTools);
+        cursor = ev.pos;
+        segTools = [];
+        const pnode = appendMessagePart(ev.item.type, ev.item.data, container);
+        if (pnode && msg.id) pnode.dataset.messageId = msg.id;
+        if (!firstPartNode) firstPartNode = pnode;
     }
+    // Trailing prose + any tool cards after the last part.
+    renderProseBubble(text.slice(cursor), segTools);
+
+    // A part-only message (empty content) produced no prose anchor — attach
+    // the controls + footer to the first part bubble so the row stays
+    // manageable like every other row.
+    if (!anchored && firstPartNode) anchor(firstPartNode);
+}
+
+// Parse a stored timestamp into an epoch-ms sort key for interleaving the
+// conversation timeline (#1816). DB timestamps are UTC, but conversation rows
+// serialize naive (no tz suffix) while restart_status_events carry an explicit
+// +00:00. Date.parse() reads a naive string as LOCAL time, so pin tz-less
+// strings to UTC ('Z') before parsing — otherwise the two streams drift apart
+// by the viewer's local offset and interleave wrong. Ported from history.js
+// alongside the restart-trail repaint when the duplicate loader was removed
+// (#2380).
+function timelineTs(value) {
+    const s = String(value || '');
+    if (!s) return 0;
+    const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s);
+    const t = Date.parse(hasTz ? s : `${s}Z`);
+    return Number.isNaN(t) ? 0 : t;
+}
+
+// #1659: tool cards on reload come from the structured, position-stamped
+// ``tool_events`` metadata; new rows persist clean prose. Rows persisted BEFORE
+// the cutover instead carry emoji marker tokens inline (and their tool_events,
+// if any, lack ``pos``). For those we parse the markers back into structured
+// events WITH positions, so the cards render where the tools actually occurred
+// — not bunched at the top. Ported from history.js alongside the tool-card
+// reload path when the duplicate loader was removed (#2380).
+//
+// Self-terminating marker TOKENS (not line-anchored): the old stream could glue
+// a marker onto adjacent prose without a newline ("I'll check🔧 Calling
+// lookup..."). Mirrors the deleted chat.js TOOL_MARKER_TOKEN.
+const LEGACY_TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?\s+(?:complete|done)\b(?:\s+\([^\n)]*\))?|❌\s+\S[^\n]*?\s+failed\b(?::[^\n\u{1F527}✓❌]*)?/gu;
+// Gate legacy handling on a 🔧 Calling START being present — exactly the old
+// TOOL_START_PRESENCE rule. Without it, ordinary replies like "✓ Migration
+// complete" would be mistaken for tool markers.
+const LEGACY_TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
+
+function legacyToolEventsFromText(content) {
+    const src = String(content || '');
+    const re = new RegExp(LEGACY_TOOL_MARKER_TOKEN.source, 'gu');
+    const events = [];
+    let clean = '';
+    let last = 0;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+        clean += src.slice(last, m.index);
+        const marker = m[0];
+        const pos = clean.length;
+        let mm;
+        if ((mm = marker.match(/^\u{1F527}\s+Calling\s+(\S[^\n]*?)(?::[^\n]*)?\.\.\.$/u))) {
+            events.push({ phase: 'start', name: mm[1].trim(), pos });
+        } else if ((mm = marker.match(/^✓\s+(\S[^\n]*?)\s+(?:complete|done)\b/u))) {
+            events.push({ phase: 'done', name: mm[1].trim(), pos });
+        } else if ((mm = marker.match(/^❌\s+(\S[^\n]*?)\s+failed\b/u))) {
+            events.push({ phase: 'error', name: mm[1].trim(), pos });
+        }
+        last = re.lastIndex;
+    }
+    clean += src.slice(last);
+    return { clean, events };
 }
 
 window.loadConversation = async function(sessionId, options = {}) {
@@ -1491,26 +1630,88 @@ window.loadConversation = async function(sessionId, options = {}) {
         return;
     }
 
-    activeConversationId = sessionId;
-    activeConversationIdsByAgent.set(API.getHostAgent(), sessionId);
+    // Load-request token (#2380 codex round 4): each call claims the token;
+    // any later call supersedes every earlier in-flight one. This is the
+    // ownership primitive for both the superseded-load drop and the rollback
+    // guards below — deliberately NOT ``activeConversationId``, which other
+    // listeners (e.g. the debounced ``kestrel:conversations-stale`` handler)
+    // legitimately mutate while a load is in flight.
+    const host = API.getHostAgent();
+    const loadToken = ++conversationLoadSeq;
 
-    // #2222: keep the shared pane's highlight unified with our active-id. The
-    // component owns the highlight now (setActiveSessionId re-renders with the
-    // active row marked); the manual class toggle below stays as a cheap
-    // fallback for the pre-mount / no-handle case.
-    if (conversationsHandle) conversationsHandle.setActiveSessionId(sessionId);
+    // Pane-activity snapshot at click time (#2380 codex round 6): an explicit
+    // click overrides a stream that was ALREADY running, but never a turn the
+    // user starts DURING this load's awaits — that turn owns the pane.
+    const paneAtClick = state.chatPanes.get(host);
+    const busyAtClick = state.waitingAgents.has(host)
+        || !!(paneAtClick && paneAtClick.streamingMsgDiv);
+    // Monotonic activity marker (#2380 codex round 9): a turn that starts AND
+    // completes entirely inside this load's awaits leaves both busy flags
+    // false at the commit check — but it appended a user bubble. Count USER
+    // turns specifically (not all children — live restart bubbles, cognition
+    // wakes and other notifications also append, and must not cancel an
+    // explicit click; codex round 10).
+    const userTurnCount = (pane) => (pane
+        ? pane.element.querySelectorAll('.message.user-message').length
+        : 0);
+    const userTurnsAtClick = userTurnCount(paneAtClick);
 
-    // Update selection UI. The mounted list re-renders per agent (retarget is
-    // the only refresh path on a switch, #2199), so every visible row already
-    // belongs to the current host — a session_id match is sufficient.
-    document.querySelectorAll('.conversation-item').forEach(item => {
-        item.classList.toggle('active', item.dataset.sessionId === sessionId);
-    });
+    // Roll the selection back to the session the CAPTURED host's pane actually
+    // renders (not the previously *pending* selection — that one may itself
+    // have never rendered, and not the global currentSessionId — the operator
+    // may have switched to another agent mid-load, #2380 codex round 5).
+    // No-ops when a newer load owns the UI; only repaints the visible
+    // selection when the captured host still owns the visible pane.
+    const rollbackToRendered = () => {
+        if (loadToken !== conversationLoadSeq) return;
+        const pane = state.chatPanes.get(host);
+        const rendered = (pane && pane.sessionId) || null;
+        if (rendered == null) activeConversationIdsByAgent.delete(host);
+        else activeConversationIdsByAgent.set(host, rendered);
+        if (API.getHostAgent() === host) {
+            activeConversationId = rendered;
+            applyHighlight(rendered);
+        }
+    };
+
+    const applyHighlight = (sid) => {
+        // #2222: keep the shared pane's highlight unified with our active-id.
+        // The component owns the highlight now (setActiveSessionId re-renders
+        // with the active row marked); the manual class toggle stays as a
+        // cheap fallback for the pre-mount / no-handle case.
+        if (conversationsHandle) conversationsHandle.setActiveSessionId(sid);
+        // The mounted list re-renders per agent (retarget is the only refresh
+        // path on a switch, #2199), so every visible row already belongs to
+        // the current host — a session_id match is sufficient.
+        document.querySelectorAll('.conversation-item').forEach(item => {
+            item.classList.toggle('active', item.dataset.sessionId === sid);
+        });
+    };
+
+    // NB: the selection/highlight is deliberately NOT committed here (#2380
+    // codex round 8 P1): between the click and the pane commit below, the
+    // composer stays usable against the PREVIOUS session — highlighting the
+    // clicked row during that window would show B selected while a quick send
+    // persists to A. The commit happens atomically with the pane switch, after
+    // every guard has passed.
+
+    // Same-session no-op (#2380 codex round 2, carried from the legacy
+    // loader): re-clicking the already-active conversation must not wipe the
+    // pane — an in-flight stream would be generation-gated out and its chunks
+    // dropped. The highlight is already correct for this case. Callers that
+    // NEED a same-session re-render (the encryption-view toggle) pass
+    // ``{ force: true }``.
+    if (!options.force && sessionId === state.currentSessionId) {
+        return;
+    }
 
     // Load conversation messages into chat panel
     try {
-        const data = await API.getConversation(sessionId);
+        const data = await API.getConversation(sessionId, state.showDecrypted);
         const messages = data.messages || [];
+        if (data.encrypted_at_rest !== undefined) {
+            state.encryptedAtRest = data.encrypted_at_rest;
+        }
 
         // Post-await stale-agent re-check: the operator may have
         // switched host agents while ``getConversation`` was in flight.
@@ -1518,12 +1719,65 @@ window.loadConversation = async function(sessionId, options = {}) {
         // wipe + render A's history into B's pane after the user
         // switched.  The pre-await guard above catches the case where
         // the switch happened BEFORE the fetch; this one catches a
-        // switch DURING.  Codex round-3 catch on #1358.
+        // switch DURING.  Codex round-3 catch on #1358. Nothing to roll back:
+        // the selection commit is deferred to the pane commit below (#2380
+        // codex round 8).
         if (hasExpectedAgent(options) && !currentAgentMatches(options.expectedAgent)) {
             return;
         }
 
         const currentAgent = API.getHostAgent();
+
+        // Fetch the restart status-bubble trail (#1816) BEFORE committing the
+        // pane switch, so there are NO awaits between the wipe and the
+        // synchronous render below — a load superseded mid-await could
+        // otherwise append its historical timeline into whatever conversation
+        // now owns the pane (#2380 codex round 3 P1). Tolerate the endpoint
+        // being absent (restart feature not loaded) — there's just no trail.
+        let restartEvents = [];
+        try {
+            const res = await API.getRestartStatusEvents(sessionId);
+            restartEvents = Array.isArray(res?.events) ? res.events : [];
+        } catch (e) {
+            restartEvents = [];
+        }
+
+        // Superseded-load check: if the operator selected ANOTHER conversation
+        // while this one's fetches were in flight, the later call holds the
+        // token — drop this load entirely (its render would clobber the newer
+        // conversation's pane).
+        if (loadToken !== conversationLoadSeq) {
+            return;
+        }
+
+        // Host recheck after the SECOND await (#2380 codex round 5 P1): an
+        // agent switch doesn't necessarily start another conversation load, so
+        // the token check alone can't catch it — and proceeding would wipe the
+        // captured host's pane while assigning state.currentSessionId through
+        // the NEWLY-visible agent's pane. (Covers the no-expectedAgent callers
+        // too; the expectedAgent guards above only ran for pinned loads.)
+        if (API.getHostAgent() !== host) {
+            return;
+        }
+
+        // A turn STARTED during this load's awaits owns the pane (#2380 codex
+        // round 6 P1): the composer stayed usable against the previous session
+        // while getConversation/getRestartStatusEvents were in flight, so
+        // wiping now would generation-gate the user's in-flight response and
+        // visually discard their turn. Drop the load — the selection was never
+        // committed, so the highlight still points at the session the turn
+        // went to. (A stream already running at click time doesn't trip this —
+        // explicit clicks override pre-existing streams, as before.)
+        const paneNow = state.chatPanes.get(host);
+        const busyNow = state.waitingAgents.has(host)
+            || !!(paneNow && paneNow.streamingMsgDiv);
+        // User-turn growth catches a turn that ran to completion entirely
+        // within the awaits (both busy flags false again) — and a replacement
+        // turn masked by busyAtClick (#2380 codex round 9 P1) — without
+        // tripping on non-turn appends like restart bubbles (round 10 P2).
+        if ((!busyAtClick && busyNow) || userTurnCount(paneNow) > userTurnsAtClick) {
+            return;
+        }
 
         // Auto-load defense-in-depth: the maybeAutoLoadMostRecent() caller
         // already checked the pane was cold synchronously, but the
@@ -1541,12 +1795,21 @@ window.loadConversation = async function(sessionId, options = {}) {
             const userBusy = state.waitingAgents.has(currentAgent);
             const sessionAlreadySet = !!state.currentSessionId;
             if (!paneIsCold || userBusy || sessionAlreadySet) {
-                // User started a turn while auto-load was in flight.
-                // Drop the auto-load silently — the in-flight stream is
-                // what the user actually wants to see.
+                // User started a turn while auto-load was in flight. Drop the
+                // auto-load — the in-flight stream is what the user actually
+                // wants to see. Nothing to roll back: the selection commit is
+                // deferred to the pane commit below (#2380 codex round 8).
                 return;
             }
         }
+
+        // COMMIT POINT: every guard has passed and the render below is fully
+        // synchronous, so the selection, the highlight (#2222), and the pane
+        // switch land atomically — the sidebar can never show a session the
+        // composer isn't anchored to (#2380 codex round 8 P1).
+        activeConversationId = sessionId;
+        activeConversationIdsByAgent.set(host, sessionId);
+        applyHighlight(sessionId);
 
         // Wipe ONLY the visible agent's pane and bump that agent's
         // pane-local generation. A stream still running against the
@@ -1559,14 +1822,83 @@ window.loadConversation = async function(sessionId, options = {}) {
         const pane = state.chatPanes.get(currentAgent);
         const chatContainer = pane ? pane.element : document.getElementById('chat-container');
 
-        const renderMd = window.SharedMarkdown?.renderMarkdown;
+        // Encrypted-at-rest banner (ported from the legacy history.js loader,
+        // #2380): when the operator is viewing raw encrypted data, surface a
+        // banner with a Decrypt toggle. state.encryptedAtRest was set from the
+        // response above.
+        if (!state.showDecrypted && state.encryptedAtRest) {
+            const banner = document.createElement('div');
+            banner.style.cssText = `
+                background: linear-gradient(135deg, #22c55e, #16a34a);
+                color: white;
+                padding: 0.75rem 1rem;
+                margin: 0.5rem;
+                border-radius: 8px;
+                font-size: 0.85rem;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            `;
+            banner.innerHTML = `
+                \u{1F510} <strong>Viewing raw encrypted data</strong> - This is how your messages are stored at rest.
+                <button onclick="toggleEncryptionView()" style="
+                    margin-left: auto;
+                    background: rgba(255,255,255,0.2);
+                    border: none;
+                    color: white;
+                    padding: 0.25rem 0.75rem;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 0.75rem;
+                ">Decrypt</button>
+            `;
+            chatContainer.appendChild(banner);
+        }
 
+        // Interleave messages and restart status bubbles (#1816, fetched
+        // above, pre-commit) in timestamp order so
+        // the trail lands chronologically among the conversation turns, matching
+        // the live render order. DB timestamps are UTC; conversation rows
+        // serialize naive (no tz) while restart events carry +00:00, so pin naive
+        // strings to UTC before comparing (see timelineTs).
+        const timeline = [];
         for (const msg of messages) {
+            // System rows (context summaries, compaction markers, audits) are
+            // internal bookkeeping — never render them into the visible chat
+            // (#2380 codex P2, behavior carried from the legacy loader).
+            if (msg.role === 'system') continue;
+            timeline.push({ ts: timelineTs(msg.created_at), kind: 'message', item: msg });
+        }
+        restartEvents.forEach((ev) => {
+            timeline.push({ ts: timelineTs(ev.created_at), kind: 'restart', item: ev });
+        });
+        timeline.sort((a, b) => a.ts - b.ts);
+
+        for (const entry of timeline) {
+            if (entry.kind === 'restart') {
+                // Reuse the live bubble renderer; the stored event payload IS the
+                // SSE payload shape it expects. Pin the target to this
+                // conversation's pane so interleaving holds.
+                handleRestartStatus(entry.item.payload, chatContainer);
+                continue;
+            }
+            const msg = entry.item;
+            // When the operator is viewing raw encrypted data (Decrypt toggle
+            // off) an encrypted row's ``content`` is ciphertext, not prose or
+            // component data. Gate every rich renderer (typed parts, tool cards,
+            // markdown, attachments) on this so ciphertext is presented as raw
+            // text under the encrypted styling — never parsed as markdown or
+            // mounted as component bubbles. Ported from the legacy history.js
+            // loader (#2380).
+            const isEncrypted = msg.encrypted && !state.showDecrypted;
+
             // #2081/#1914: an assistant turn carrying typed component parts
             // re-renders as interleaved prose + component bubbles so a persisted
             // card (e.g. the WhatsApp channel_link QR) survives this load path.
+            // Skipped for encrypted rows — the parts payload is ciphertext.
             const parts = msg.metadata?.parts;
-            if (msg.role === 'assistant' && Array.isArray(parts) && parts.length) {
+            if (msg.role === 'assistant' && !isEncrypted
+                && Array.isArray(parts) && parts.length) {
                 renderAssistantMessageWithParts(msg, chatContainer);
                 continue;
             }
@@ -1592,29 +1924,96 @@ window.loadConversation = async function(sessionId, options = {}) {
             // to delete anything.
             if (msg.id) {
                 messageDiv.dataset.messageId = msg.id;
-                const deleteBtn = document.createElement('button');
-                deleteBtn.className = 'msg-delete-btn';
-                deleteBtn.title = 'Delete message';
-                deleteBtn.textContent = '✕';
-                deleteBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    if (typeof window.deleteMessage === 'function') {
-                        window.deleteMessage(msg.id, messageDiv);
-                    }
-                };
-                messageDiv.appendChild(deleteBtn);
+                messageDiv.appendChild(buildMessageDeleteBtn(msg.id, messageDiv));
+                messageDiv.appendChild(buildMessagePurgeBtn(msg.id, messageDiv));
+            }
+
+            if (isEncrypted) {
+                // Raw ciphertext view: present the stored bytes verbatim in a
+                // monospace, break-all bubble. No markdown, no tool cards, no
+                // attachments. Inline styling ported verbatim from the legacy
+                // history.js loader (#2380) — there is no CSS class for it.
+                messageDiv.style.cssText = `
+                    padding: 1rem;
+                    margin-bottom: 0.75rem;
+                    border-radius: 12px;
+                    max-width: 85%;
+                    background: linear-gradient(135deg, #1a1a2e, #16213e);
+                    border: 1px solid #22c55e;
+                    margin-${msg.role === 'user' ? 'left' : 'right'}: auto;
+                    font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+                    font-size: 0.75rem;
+                    word-break: break-all;
+                    color: #22c55e;
+                `;
+                const header = document.createElement('div');
+                header.style.cssText = `
+                    font-size: 0.65rem;
+                    opacity: 0.7;
+                    margin-bottom: 0.5rem;
+                    color: #4ade80;
+                `;
+                header.textContent = `\u{1F510} ${String(msg.role).toUpperCase()} (encrypted)`;
+                messageDiv.appendChild(header);
+                const contentSpan = document.createElement('span');
+                contentSpan.textContent = msg.content;
+                messageDiv.appendChild(contentSpan);
+                chatContainer.appendChild(messageDiv);
+                continue;
             }
 
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
 
-            if (msg.role === 'assistant' && renderMd) {
-                contentDiv.innerHTML = renderMd(msg.content);
+            if (msg.role === 'assistant') {
+                // #1659: reload the assistant turn's tool-activity cards from
+                // the persisted ``tool_events`` metadata so they render in
+                // document order alongside the prose, matching the live bubble.
+                const toolEvents = msg.metadata?.tool_events;
+                const hasPos = !!toolEvents
+                    && toolEvents.some((e) => typeof e.pos === 'number');
+                let bodyHtml = null;
+                if (hasPos) {
+                    // Post-cutover row: position-stamped events are authoritative
+                    // and the prose is already clean.
+                    bodyHtml = renderAgentContentHtml(msg.content, { toolEvents });
+                } else if (LEGACY_TOOL_START_PRESENCE.test(msg.content)) {
+                    // Pre-cutover row: derive cards AND positions from the inline
+                    // emoji markers so they land where the tools ran.
+                    const legacy = legacyToolEventsFromText(msg.content);
+                    bodyHtml = renderAgentContentHtml(
+                        legacy.clean, { toolEvents: legacy.events },
+                    );
+                } else if (toolEvents && toolEvents.length) {
+                    // Old metadata with neither pos nor inline markers — no
+                    // placement survives; render the cards rather than drop them.
+                    bodyHtml = renderAgentContentHtml(msg.content, { toolEvents });
+                } else {
+                    // Plain assistant turn: shared renderer collapses to markdown.
+                    bodyHtml = renderAgentContentHtml(msg.content, {});
+                }
+                contentDiv.innerHTML = bodyHtml;
+                messageDiv.appendChild(contentDiv);
+                // Reloaded tool cards may carry feature-renderer wrappers; mount
+                // their imperative hooks now that the markup is live, then run
+                // the shared math pass (KaTeX) over the inserted markdown.
+                mountToolRenderers(contentDiv);
+                renderMathIn(contentDiv);
             } else {
                 contentDiv.textContent = msg.content;
+                messageDiv.appendChild(contentDiv);
             }
 
-            messageDiv.appendChild(contentDiv);
+            // #1662: re-render the user turn's attachment thumbnails from the
+            // persisted metadata refs so they survive a reload.
+            if (msg.role === 'user') {
+                const attachments = msg.metadata?.attachments;
+                if (attachments && attachments.length) {
+                    const stripHtml = messageAttachmentsHtml(attachments);
+                    if (stripHtml) messageDiv.insertAdjacentHTML('beforeend', stripHtml);
+                }
+            }
+
             if (msg.role === 'assistant') {
                 const footer = renderModelFooterHtml({
                     model: msg.model,
@@ -1638,8 +2037,20 @@ window.loadConversation = async function(sessionId, options = {}) {
 
         // Switch to chat panel
         document.querySelector('[data-panel="chat"]')?.click();
+
+        // Refresh the context/utilization footer for the newly-loaded session.
+        // The old history.js loader did this after every row click; without it,
+        // switching conversations leaves the footer showing the previous
+        // session's utilization until an unrelated refresh fires (#2380).
+        updateContextStatus();
     } catch (e) {
         console.error('Failed to load conversation:', e);
+        // Roll the selection back to the session the pane actually renders —
+        // the clicked row never loaded, so leaving it highlighted would let
+        // subsequent sends continue in the OLD session under the WRONG
+        // highlight (#2380 codex round 2). No-ops if a later load owns the UI.
+        rollbackToRendered();
+        Toast.error(`Failed to load conversation: ${e.message}`);
     }
 };
 
@@ -1752,11 +2163,20 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
         // below stays correct in both modes.
         if (detail && detail.sessionId) {
             const agentKey = detail.agent !== undefined ? detail.agent : null;
-            activeConversationIdsByAgent.set(agentKey, detail.sessionId);
-            if (currentAgentMatches(agentKey)) {
-                activeConversationId = detail.sessionId;
-                if (conversationsHandle) {
-                    conversationsHandle.setActiveSessionId(activeConversationId);
+            // Only adopt the event's session while the agent's pane still
+            // holds it (or holds nothing yet — the first-turn session-derive
+            // case). A turn that completes AFTER the user switched to another
+            // conversation must not yank the highlight back to the old
+            // session (#2380 codex round 8 P2); the list refresh below still
+            // updates its tile counts.
+            const paneSession = state.chatPanes.get(agentKey)?.sessionId || null;
+            if (paneSession === null || paneSession === detail.sessionId) {
+                activeConversationIdsByAgent.set(agentKey, detail.sessionId);
+                if (currentAgentMatches(agentKey)) {
+                    activeConversationId = detail.sessionId;
+                    if (conversationsHandle) {
+                        conversationsHandle.setActiveSessionId(activeConversationId);
+                    }
                 }
             }
         }
