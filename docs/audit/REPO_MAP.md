@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-11
-**Scope:** 2003 tracked files (1306 `.py`, 328 `.md`, 369 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-12
+**Scope:** 2006 tracked files (1309 `.py`, 328 `.md`, 369 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -650,6 +650,8 @@ Repo entry points and standard project files.
   - `class RotationCeremonyResult`; `def run_rotation_ceremony()`
 - **kestrel_sovereign/identity/runtime_identity.py** — Runtime identity loader — Wave 3 follow-up of Quantum Hardening (#921).
   - `class RuntimeIdentityError`; `class AgentIdentity`; `def load_agent_identity(legacy_key_id, storage_dir)`
+- **kestrel_sovereign/identity/sealed_export.py** — Sealed identity exports — wiring hybrid-KEM sealed capsules into the identity export/import flow (#2398, real completion of #919 / epic #921).
+  - `class SealedExportError`; `class RecipientKEMKeys`; `def recipient_keys_from_multibase(classical_multibase, pq_multibase)`; `def recipient_keys_from_did_document(did_document)`; `def detect_agent_kem_slug(storage_dir)`; `def has_agent_kem_keypair(slug, storage_dir)`; `def generate_agent_kem_keypair(slug, storage_dir)`; `def load_agent_kem_keypair(slug, storage_dir)`; `…`
 - **kestrel_sovereign/identity/signing.py** — Identity Signing: DID-based cryptographic signing for identity packages.
   - `class SigningError`; `class VerificationError`; `def extract_address_from_did(did)`; `def get_key_id(did)`; `def sign_package(package, storage_dir)`; `def verify_package_signature(package, storage_dir)`; `async def sign_and_export(package, storage_dir, output_path)`; `def verify_and_load(json_str, storage_dir, require_valid_signature, allow_unsigned)`; `…`
 - **kestrel_sovereign/identity/substrate_adapter.py** — Substrate Adapter: Adapt agent identity to different LLM substrates.
@@ -1884,7 +1886,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_constitution_adversarial.py** — Adversarial tests for Kestrel Constitutional protections.
   - `class TestDataSanctityBypass`; `class TestVerifiableHistoryBypass`; `class TestExecutorFidelityViolation`; `class TestAmendmentProcessViolation`; `class TestCrossUserIsolation`; `class TestPrivacyModeEnforcement`
 - **tests/integration/test_constitution_embedding.py** — Comprehensive tests for Kestrel Constitution Embedding and Genesis Process.
-  - `async def test_constitution_anchored(tmp_path)`; `async def test_constitution_retrievable(tmp_path)`; `async def test_constitution_stored_first(tmp_path)`; `async def test_did_format_validation(tmp_path)`; `async def test_constitution_content_hash_deterministic(tmp_path)`; `async def test_agent_can_access_constitution_via_kestrel_agent(tmp_path)`; `async def test_genesis_audit_bypassed_temporarily(tmp_path)`; `async def test_constitution_encryption_if_key_set(tmp_path, monkeypatch)`; `…`
+  - `async def test_constitution_anchored(tmp_path)`; `async def test_constitution_retrievable(tmp_path)`; `async def test_constitution_stored_first(tmp_path)`; `async def test_did_format_validation(tmp_path, monkeypatch)`; `async def test_constitution_content_hash_deterministic(tmp_path)`; `async def test_agent_can_access_constitution_via_kestrel_agent(tmp_path)`; `async def test_genesis_audit_bypassed_temporarily(tmp_path)`; `async def test_constitution_encryption_if_key_set(tmp_path, monkeypatch)`; `…`
 - **tests/integration/test_constitution_real_llm.py** — Integration tests for Constitutional protections with REAL LLM calls.
   - `def api_key()`; `async def client(monkeypatch)`; `def anyio_backend()`; `async def test_agent_identifies_as_kestrel(client, api_key)`; `async def test_agent_refuses_harmful_request(client, api_key)`; `async def test_agent_acknowledges_constitution(client, api_key)`; `async def test_agent_maintains_sovereignty(client, api_key)`
 - **tests/integration/test_constitution_reanchor_e2e.py** — End-to-end test for ``kestrel constitution reanchor``.
@@ -2154,6 +2156,8 @@ Repo entry points and standard project files.
   - `def test_demo_kestrel_toml_uses_auto_selection_with_hints()`; `def test_run_docker_remote_does_not_inject_hidden_default_model()`
 - **tests/unit/test_bootstrap_service.py** — Unit tests for the Bootstrap Service.
   - `class MockDB`; `class FailingHistoryClearDB`; `class MockLLMService`; `def mock_db()`; `def mock_llm()`; `def temp_agent_dir(tmp_path)`; `def bootstrap_service(mock_db, mock_llm, temp_agent_dir)`; `class TestBootstrapState`; `…`
+- **tests/unit/test_born_hybrid_inception.py** — Born-hybrid inception (#2397): new agents mint a hybrid did:web identity (Ed25519 + ML-DSA-65) by default — no classical secp256k1 key ever exists.
+  - `def hybrid_env(monkeypatch)`; `def test_default_method_is_did_web(monkeypatch)`; `def test_unknown_method_rejected()`; `def test_slugify_agent_name(name, expected)`; `def test_slugify_rejects_empty()`; `async def test_explicit_slug_validated_before_any_disk_writes(tmp_path, hybrid_env, bad_slug)`; `async def test_invalid_identity_method_leaves_no_db(tmp_path, hybrid_env)`; `async def test_inception_defaults_to_born_hybrid(tmp_path, hybrid_env)`; `…`
 - **tests/unit/test_brain_router.py** — Tests for LLMService GPU backend routing functionality.
   - `class FakeRemoteClient`; `async def test_switch_backend_to_remote_gpu(monkeypatch)`; `async def test_generate_uses_remote_backend(monkeypatch)`; `async def test_remote_failure_falls_back_to_cloud(monkeypatch)`
 - **tests/unit/test_bridge_feature.py** — Unit Tests for the KestrelClaw Bridge Feature (#157).
@@ -2876,6 +2880,8 @@ Repo entry points and standard project files.
   - `def test_ui_contributions_is_the_sdk_type()`; `def test_app_extension_compatibility_path_is_the_sdk_type()`
 - **tests/unit/test_sealed_capsule.py** — Sealed capsule tests — Wave 4 sub-PR 3 (#919).
   - `def hybrid_kp()`; `def test_round_trip_basic(hybrid_kp)`; `def test_open_capsule_two_calling_conventions(hybrid_kp)`; `def test_round_trip_empty_payload(hybrid_kp)`; `def test_round_trip_large_payload(hybrid_kp)`; `def test_distinct_seals_produce_distinct_envelopes(hybrid_kp)`; `def test_envelope_has_expected_structure(hybrid_kp)`; `def test_wrong_recipient_aead_authentication_fails(hybrid_kp)`; `…`
+- **tests/unit/test_sealed_identity_export.py** — Sealed identity-export tests (#2398 — wiring sealed capsules into the identity export/import paths; real completion of #919 / epic #921).
+  - `def recipient_kp()`; `def recipient(recipient_kp)`; `def test_seal_unseal_round_trip(recipient_kp, recipient)`; `def test_open_identity_export_routes_sealed(recipient_kp, recipient)`; `def test_plaintext_export_path_unchanged(recipient_kp)`; `def test_wrong_recipient_rejected(recipient)`; `def test_tampered_capsule_rejected(recipient_kp, recipient)`; `def test_sealed_input_without_keys_fails_loud(recipient)`; `…`
 - **tests/unit/test_search_history_tokenized_fallback.py** — Regression: broad natural-language queries must find relevant memories.
   - `class TestTokenizeForSearch`; `class TestNegationGate`; `class TestTechnicalTermsUnregressed`; `class TestTokenMatchScore`; `async def test_broad_query_finds_relevant_row_via_token_fallback()`; `async def test_exact_substring_still_works()`; `async def test_token_fallback_does_not_match_low_overlap()`; `async def test_exact_matches_ranked_before_token_fallback()`; `…`
 - **tests/unit/test_secondary_endpoint_contracts.py** — Focused contract tests for remaining database/files/observability/saved-items routes.
