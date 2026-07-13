@@ -245,6 +245,57 @@ async def test_reindex_dead_service_is_error_not_false_success(seeded_db):
     assert sum((await remaining.count_all_stale(agent_id="a1")).values()) == 6
 
 
+def _finalized(**totals):
+    """Run ``_finalize_reindex_status`` over a minimal job dict and return it."""
+    job = {
+        "total_reembedded": totals.get("reembedded", 0),
+        "total_failed": totals.get("failed", 0),
+        "total_skipped_empty": totals.get("skipped_empty", 0),
+        "total_skipped_dim_mismatch": totals.get("dim_mismatch", 0),
+        "total_stale": totals.get("stale", 0),
+        "status": "running",
+        "error": None,
+    }
+    model_endpoints._finalize_reindex_status(job)
+    return job
+
+
+def test_finalize_all_skipped_empty_is_done_not_error():
+    # #2426: a corpus whose only stale rows are skipped_empty (no recoverable
+    # text — genuinely empty or undecryptable) proves there is nothing
+    # embeddable. failed == 0 and skipped_empty == total_stale => done, with
+    # unembeddable_rows surfaced for the UI — NOT a permanent "error".
+    job = _finalized(stale=5, reembedded=0, skipped_empty=5, failed=0)
+    assert job["status"] == "done", job
+    assert job["error"] is None, job
+    assert job["unembeddable_rows"] == 5, job
+
+
+def test_finalize_mixed_reembed_and_skipped_empty_is_done():
+    # Some rows embed, the rest are genuinely unembeddable: still done.
+    job = _finalized(stale=10, reembedded=6, skipped_empty=4, failed=0)
+    assert job["status"] == "done", job
+    assert job["error"] is None, job
+    assert job["unembeddable_rows"] == 4, job
+
+
+def test_finalize_zero_reembed_with_unexplained_shortfall_is_error():
+    # A dead/mis-resolved service leaves rows with text unaccounted for
+    # (failed) — still the #2360 error, now naming the unembeddable split.
+    job = _finalized(stale=6, reembedded=0, skipped_empty=1, failed=5)
+    assert job["status"] == "error", job
+    assert job["error"], job
+    assert job["unembeddable_rows"] == 1, job
+
+
+def test_finalize_partial_when_some_fail_alongside_skipped_empty():
+    # Some rows embed, some fail, some are unembeddable => partial, not done.
+    job = _finalized(stale=10, reembedded=6, skipped_empty=2, failed=2)
+    assert job["status"] == "partial", job
+    assert job["error"], job
+    assert job["unembeddable_rows"] == 2, job
+
+
 @pytest.mark.asyncio
 async def test_reindex_execute_empty_corpus_reports_done_inline(seeded_db):
     # First re-embed everything, then a second execute has nothing to do and
@@ -262,6 +313,109 @@ async def test_reindex_execute_empty_corpus_reports_done_inline(seeded_db):
     assert result["status"] == "done"
     assert result["total_stale"] == 0
     assert "job_id" not in result
+
+
+async def _seed_unembeddable_chunk(db) -> None:
+    """Add one stale document_chunk whose content is whitespace-only.
+
+    It matches the stale SQL predicate (no target profile) but has no
+    recoverable source text, so a reindex run counts it ``skipped_empty``
+    and it stays stale forever — an *unembeddable* row (#2426).
+    """
+    await db.execute_commit(
+        "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
+        "VALUES (?, ?, ?)",
+        ("blankchunk", "   ", None),
+    )
+
+
+@pytest.mark.asyncio
+async def test_classify_all_stale_splits_actionable_from_unembeddable(seeded_db):
+    # #2426: the classifier reuses the reindexer's source-text extraction, so a
+    # whitespace-only stale row lands in ``unembeddable`` while the 6 seeded rows
+    # with real text remain ``actionable``.
+    await _seed_unembeddable_chunk(seeded_db)
+    svc = FakeEmbeddingService()
+    reindexer = EmbeddingReindexer(seeded_db, svc, TARGET, column_dim=DIM)
+
+    breakdown = await reindexer.classify_all_stale(agent_id="a1")
+
+    assert breakdown["stale"] == 7, breakdown
+    assert breakdown["actionable"] == 6, breakdown
+    assert breakdown["unembeddable"] == 1, breakdown
+    # A pure count still sees all 7 — the button lie the split prevents.
+    assert sum((await reindexer.count_all_stale(agent_id="a1")).values()) == 7
+
+
+@pytest.mark.asyncio
+async def test_apply_stale_counts_excludes_unembeddable_from_button(seeded_db):
+    # #2426: settings surface only actionable rows as ``stale_rows`` (the button
+    # count) and the unembeddable rows separately, so the button doesn't keep
+    # advertising an action that can never clear them.
+    await _seed_unembeddable_chunk(seeded_db)
+    svc = FakeEmbeddingService()
+    settings: dict = {}
+
+    await model_endpoints._apply_stale_embedding_counts(
+        settings, _agent(seeded_db, svc)
+    )
+
+    assert settings["stale_rows"] == 6, settings
+    assert settings["unembeddable_rows"] == 1, settings
+
+
+@pytest.mark.asyncio
+async def test_dry_run_surfaces_actionable_and_unembeddable_split(seeded_db):
+    # #2426: dry-run keeps ``total_stale`` as the full count (the executed job's
+    # finalizer classifies against it) but adds the actionable/unembeddable split
+    # so the confirm dialog counts only rows a re-embed can clear.
+    await _seed_unembeddable_chunk(seeded_db)
+    svc = FakeEmbeddingService()
+    request = _FakeRequest(_agent(seeded_db, svc), {"dry_run": True})
+
+    result = await model_endpoints.reindex_embeddings(request)
+
+    assert result["total_stale"] == 7, result
+    assert result["actionable_stale"] == 6, result
+    assert result["unembeddable_rows"] == 1, result
+
+
+@pytest.mark.asyncio
+async def test_all_stale_unembeddable_hides_button_but_run_is_done(seeded_db):
+    # #2426 end-to-end: a corpus whose ONLY stale rows are unembeddable reports
+    # zero actionable rows (button hidden) and, when executed, finishes ``done``
+    # with an ``unembeddable_rows`` explanation — never the #2360 error.
+    # Start from a clean corpus, then add only an unembeddable row.
+    svc = FakeEmbeddingService()
+    reindexer = EmbeddingReindexer(seeded_db, svc, TARGET, column_dim=DIM)
+    from kestrel_sovereign.storage.embedding_reindex import REINDEX_TABLES
+
+    for table in REINDEX_TABLES:
+        await reindexer.reindex_table(table, agent_id="a1")
+    await _seed_unembeddable_chunk(seeded_db)
+
+    settings: dict = {}
+    await model_endpoints._apply_stale_embedding_counts(
+        settings, _agent(seeded_db, svc)
+    )
+    assert settings["stale_rows"] == 0, settings
+    assert settings["unembeddable_rows"] == 1, settings
+
+    request = _FakeRequest(_agent(seeded_db, svc), {"dry_run": False})
+    started = await model_endpoints.reindex_embeddings(request)
+    # One stale row still exists, so a job runs (not the inline empty-corpus path).
+    assert started["total_stale"] == 1, started
+    job_id = started["job_id"]
+    job = None
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        job = await model_endpoints.get_reindex_job(job_id, request)
+        if job["status"] in ("done", "error", "partial"):
+            break
+    assert job is not None and job["status"] == "done", job
+    assert job["total_reembedded"] == 0, job
+    assert job["unembeddable_rows"] == 1, job
+    assert job["error"] is None, job
 
 
 @pytest.mark.asyncio

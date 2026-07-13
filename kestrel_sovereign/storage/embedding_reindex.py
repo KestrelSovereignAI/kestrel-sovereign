@@ -295,6 +295,73 @@ class EmbeddingReindexer:
                 out[table] = 0
         return out
 
+    async def classify_table_stale(
+        self, table: str, agent_id: Optional[str] = None
+    ) -> Dict[str, int]:
+        """Split a table's stale rows into actionable vs unembeddable (#2426).
+
+        A stale row is *unembeddable* when it has no recoverable source
+        text — genuinely empty, or undecryptable with the current keys —
+        exactly the rows :meth:`reindex_table` would count as
+        ``skipped_empty`` and never rewrite. Those rows stay stale by the
+        SQL predicate forever, so surfacing them as "re-embed N memories"
+        is a lie: the action can never clear them.
+
+        Uses the same keyset scan + :meth:`_extract_text` as the reindexer
+        (so the classification matches the run outcome exactly) but embeds
+        nothing. Returns ``{"stale", "actionable", "unembeddable"}``.
+        """
+        spec = _TABLE_SPECS[table]
+        after: Optional[Any] = None
+        select_cols = ", ".join((spec.id_col, *spec.text_cols))
+        actionable = 0
+        unembeddable = 0
+        while True:
+            where, params = self._stale_where(spec, agent_id)
+            page_params = list(params)
+            if after is not None:
+                where += f" AND {spec.id_col} > ?"
+                page_params.append(after)
+            sql = (
+                f"SELECT {select_cols} FROM {spec.name} WHERE {where} "
+                f"ORDER BY {spec.id_col} LIMIT ?"
+            )
+            page_params.append(self.batch_size)
+            rows = await self.db.fetchall(sql, tuple(page_params))
+            if not rows:
+                break
+            after = rows[-1][0]
+            for row in rows:
+                text = self._extract_text(spec, tuple(row[1:]))
+                if not text or not text.strip():
+                    unembeddable += 1
+                else:
+                    actionable += 1
+        return {
+            "stale": actionable + unembeddable,
+            "actionable": actionable,
+            "unembeddable": unembeddable,
+        }
+
+    async def classify_all_stale(
+        self, agent_id: Optional[str] = None, tables: Optional[Sequence[str]] = None
+    ) -> Dict[str, int]:
+        """Aggregate :meth:`classify_table_stale` across tables (#2426).
+
+        Returns totals ``{"stale", "actionable", "unembeddable"}`` summed
+        over every table. Missing tables/columns are skipped defensively.
+        """
+        total = {"stale": 0, "actionable": 0, "unembeddable": 0}
+        for table in tables or REINDEX_TABLES:
+            try:
+                part = await self.classify_table_stale(table, agent_id)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("classify_table_stale(%s) failed: %s", table, exc)
+                continue
+            for key in total:
+                total[key] += part[key]
+        return total
+
     # --------------------------------------------------------------- decryption
 
     def _fernet_for(self, agent_id: Optional[str]) -> Any:

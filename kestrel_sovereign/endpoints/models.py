@@ -1607,8 +1607,10 @@ async def get_embedding_settings(request: Request):
         # #2289 — surface how many stored rows are on a different (or no)
         # embedding profile than the one currently resolved, so the UI can
         # render "Re-embed N memories". ``None`` when no profile resolves
-        # (keyword-search fallback) or storage is unavailable.
-        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
+        # (keyword-search fallback) or storage is unavailable. Only actionable
+        # rows count toward the button; permanently-unembeddable rows are
+        # surfaced separately as ``unembeddable_rows`` (#2426).
+        await _apply_stale_embedding_counts(settings, agent)
         return settings
     except HTTPException:
         raise
@@ -1634,13 +1636,23 @@ def _agent_raw_db(agent):
     return db
 
 
-async def _count_stale_embedding_rows(agent, service=None) -> Optional[int]:
-    """Count stored rows whose embedding profile != the resolved profile (#2289).
+async def _classify_stale_embedding_rows(agent, service=None) -> Optional[Dict[str, int]]:
+    """Classify stored stale rows into actionable vs unembeddable (#2289/#2426).
 
     Scoped to the agent for the per-agent tables (conversation_history,
     saved_items); document_chunks is global. Returns ``None`` when no
     embedding profile resolves or storage isn't available — the caller
     treats that as "re-embed action not applicable".
+
+    A stale row is *unembeddable* when it has no recoverable source text
+    (genuinely empty or undecryptable with the current keys) — the same rows
+    a reindex run counts as ``skipped_empty`` and never rewrites. Those rows
+    stay stale by the SQL predicate forever, so counting them toward the
+    "Re-embed N memories" button keeps the UI advertising an action that can
+    never clear them (#2426). The classifier reuses the reindexer's
+    source-text extraction so the split matches the run outcome exactly.
+
+    Returns ``{"stale", "actionable", "unembeddable"}``.
 
     ``service`` pins the count to a SPECIFIC route's embedding profile (#2372):
     the route-model echo passes the just-configured route's service so the
@@ -1661,13 +1673,29 @@ async def _count_stale_embedding_rows(agent, service=None) -> Optional[int]:
         from kestrel_sovereign.storage.embedding_reindex import EmbeddingReindexer
 
         reindexer = EmbeddingReindexer(db, service, target)
-        counts = await reindexer.count_all_stale(
+        return await reindexer.classify_all_stale(
             agent_id=getattr(agent, "agent_id", None)
         )
-        return sum(counts.values())
     except Exception as e:  # pragma: no cover - defensive; never crash the GET
         logger.debug("stale_rows count failed: %s", e)
         return None
+
+
+async def _apply_stale_embedding_counts(settings: Dict, agent, service=None) -> None:
+    """Populate ``stale_rows`` (actionable) + ``unembeddable_rows`` on *settings*.
+
+    Shared by the GET/POST settings and route-model echo paths so the button
+    count everywhere reflects only rows a re-embed can actually clear, with the
+    permanently-unembeddable rows surfaced separately (#2426). ``stale_rows`` is
+    ``None`` (button hidden) when no profile resolves or storage is unavailable.
+    """
+    breakdown = await _classify_stale_embedding_rows(agent, service=service)
+    if breakdown is None:
+        settings["stale_rows"] = None
+        settings["unembeddable_rows"] = 0
+        return
+    settings["stale_rows"] = breakdown["actionable"]
+    settings["unembeddable_rows"] = breakdown["unembeddable"]
 
 
 @router.api_route("/api/embedding/settings", methods=["POST", "PUT"])
@@ -1743,7 +1771,7 @@ async def set_embedding_settings(request: Request):
         # ``_renderReindex`` hides the "Re-embed N memories" button whenever
         # ``stale_rows`` is absent. Mirror the GET endpoint so the button state
         # is correct immediately after a route change without a second reload.
-        settings["stale_rows"] = await _count_stale_embedding_rows(agent)
+        await _apply_stale_embedding_counts(settings, agent)
         return {"success": True, **settings}
     except HTTPException:
         raise
@@ -1865,9 +1893,7 @@ async def set_route_embedding_model(request: Request):
                 route_service = getter(route)
             except Exception as e:  # pragma: no cover - defensive; fall back to active
                 logger.debug(f"route embedding service build failed for {route}: {e}")
-        settings["stale_rows"] = await _count_stale_embedding_rows(
-            agent, service=route_service
-        )
+        await _apply_stale_embedding_counts(settings, agent, service=route_service)
         return {"success": True, **settings}
     except HTTPException:
         raise
@@ -1906,6 +1932,10 @@ def _reindex_job_public(job: Dict) -> Dict:
         "total_failed": job.get("total_failed", 0),
         "total_skipped_empty": job.get("total_skipped_empty", 0),
         "total_skipped_dim_mismatch": job.get("total_skipped_dim_mismatch", 0),
+        # Rows that can never be embedded (no recoverable text). Lets the UI say
+        # "N rows have no embeddable text" instead of surfacing a false error
+        # for a corpus whose only stale rows are unembeddable (#2426).
+        "unembeddable_rows": job.get("unembeddable_rows", 0),
         "error": job["error"],
         "updated_at": job["updated_at"],
     }
@@ -1919,34 +1949,62 @@ def _finalize_reindex_status(job: Dict) -> None:
     returns empty vectors for every row with no exception, which the old code
     reported as ``status: done, error: null``. Classify honestly:
 
-    - ``error``   — stale rows existed but nothing was re-embedded (total wipe-
-      out; almost always a dead embedding service), or every attempt failed.
+    - ``error``   — stale rows existed but nothing was re-embedded for a reason
+      the stats can't explain (total wipe-out; almost always a dead embedding
+      service), or every attempt failed.
     - ``partial`` — some rows re-embedded but some failed / were skipped for a
-      dimension mismatch (empty source text is expected and not counted here).
-    - ``done``    — all stale rows re-embedded, no failures.
+      dimension mismatch.
+    - ``done``    — every stale row is accounted for: re-embedded, or genuinely
+      unembeddable (``skipped_empty`` — no recoverable text), with no failures.
+
+    A corpus whose only stale rows are ``skipped_empty`` (no recoverable
+    text — genuinely empty or undecryptable with the current keys) is ``done``,
+    not ``error``: the stats themselves prove there is nothing embeddable
+    (``failed == 0`` and every non-reembedded stale row is skipped_empty). Those
+    rows are surfaced as ``unembeddable_rows`` so the UI can render an
+    explanation instead of a scary error (#2426).
     """
     total_reembedded = job["total_reembedded"]
     total_failed = job.get("total_failed", 0)
     total_dim_mismatch = job.get("total_skipped_dim_mismatch", 0)
+    total_skipped_empty = job.get("total_skipped_empty", 0)
     total_stale = job.get("total_stale", 0)
 
-    if total_stale > 0 and total_reembedded == 0:
+    # Rows with no recoverable text will never be embeddable — a permanent,
+    # non-actionable condition, not a run failure. Surface the count so the UI
+    # can explain them rather than reading them as an error (#2426).
+    job["unembeddable_rows"] = total_skipped_empty
+
+    # The part of the stale set left unexplained once re-embedded rows and the
+    # permanently-unembeddable rows are set aside. A dead/mis-resolved embedding
+    # service leaves this positive (rows had text but produced no usable vector).
+    unexplained = total_stale - total_reembedded - total_skipped_empty
+
+    if total_failed == 0 and total_dim_mismatch == 0 and unexplained <= 0:
+        # Nothing failed and every stale row is accounted for. This covers the
+        # all-skipped_empty case (total_reembedded == 0 but every stale row is
+        # genuinely unembeddable) — success, not the #2360 silent-failure
+        # signature.
+        job["status"] = "done"
+        job["error"] = None
+        return
+
+    if total_stale > 0 and total_reembedded == 0 and unexplained > 0:
         job["status"] = "error"
         job["error"] = (
             f"re-embedded 0 of {total_stale} stale row(s) "
-            f"({total_failed} failed, {total_dim_mismatch} dim-mismatch). "
+            f"({total_failed} failed, {total_dim_mismatch} dim-mismatch, "
+            f"{total_skipped_empty} unembeddable). "
             "The resolved embedding service returned no usable vectors — it is "
             "likely dead or mis-configured; check the active embedding route."
         )
         return
-    if total_failed or total_dim_mismatch:
-        job["status"] = "partial"
-        job["error"] = (
-            f"re-embedded {total_reembedded} row(s) but {total_failed} failed "
-            f"and {total_dim_mismatch} were skipped for a dimension mismatch."
-        )
-        return
-    job["status"] = "done"
+
+    job["status"] = "partial"
+    job["error"] = (
+        f"re-embedded {total_reembedded} row(s) but {total_failed} failed "
+        f"and {total_dim_mismatch} were skipped for a dimension mismatch."
+    )
 
 
 def _accumulate_reindex_stats(job: Dict) -> None:
@@ -2267,12 +2325,21 @@ async def reindex_embeddings(request: Request):
         total_stale = sum(counts.values())
 
         if dry_run:
+            # Split the stale set so the confirm dialog counts only rows a
+            # re-embed can actually clear (#2426). ``total_stale`` stays the full
+            # count — the executed job's finalizer classifies against it — but the
+            # UI advertises ``actionable_stale`` to match the settings button.
+            breakdown = await reindexer.classify_all_stale(
+                agent_id=agent_id, tables=tables
+            )
             return {
                 "dry_run": True,
                 "target_profile": target,
                 "embedding_dim": target_dim,
                 "stale_rows": counts,
                 "total_stale": total_stale,
+                "actionable_stale": breakdown["actionable"],
+                "unembeddable_rows": breakdown["unembeddable"],
             }
 
         # Execute. Nothing stale → report done inline (no job needed).
@@ -2312,6 +2379,7 @@ async def reindex_embeddings(request: Request):
             "total_failed": 0,
             "total_skipped_empty": 0,
             "total_skipped_dim_mismatch": 0,
+            "unembeddable_rows": 0,
             "error": None,
             "updated_at": time.time(),
         }
