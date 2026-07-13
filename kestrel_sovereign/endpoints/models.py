@@ -1831,6 +1831,8 @@ async def set_route_embedding_model(request: Request):
                 detail="'force' must be a JSON boolean (true/false).",
             )
 
+        from kestrel_sovereign.llm.service import EmbeddingSpaceConflictError
+
         agent = get_agent(request)
         if not hasattr(agent, "llm_service") or not agent.llm_service:
             raise HTTPException(status_code=503, detail="LLM service not available.")
@@ -1857,6 +1859,11 @@ async def set_route_embedding_model(request: Request):
             await agent.llm_service.aset_route_embedding_model(
                 route, model, dim, force=force
             )
+        except EmbeddingSpaceConflictError as ce:
+            # Pinning a model/dim that fragments a VERIFIED shared space is a
+            # conflict, not a malformed request (#2440) — refuse at set time
+            # instead of storing a phantom pin the space silently overrides.
+            raise HTTPException(status_code=409, detail=str(ce))
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 

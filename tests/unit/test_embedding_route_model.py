@@ -554,3 +554,147 @@ async def test_override_map_is_persisted():
     assert persisted["value"] == {
         "openrouter:api": {"model": "qwen/qwen3-embedding-8b", "dim": 768}
     }
+
+
+# --- verified-shared-space coherence gate (#2440) ----------------------------
+
+def _verified_space_service():
+    """A service with a VERIFIED ``qwen3`` shared space over ollama+openrouter."""
+    from kestrel_sovereign.llm.embedding_space import EmbeddingSpacePin, ParityResult
+
+    ollama = _route(
+        "ollama:local", "ollama", is_local=True,
+        capabilities={"supports_embeddings": True,
+                      "embedding_model": "qwen3-embedding:8b", "embedding_dim": 768},
+    )
+    openrouter = _route(
+        "openrouter:api", "openrouter",
+        capabilities={"supports_embeddings": True,
+                      "embedding_model": "qwen/qwen3-embedding-8b", "embedding_dim": 768},
+    )
+    standalone = _route(
+        "openai:api", "openai",
+        capabilities={"supports_embeddings": True,
+                      "embedding_model": "text-embedding-3-small", "embedding_dim": 1536},
+    )
+    service = _service([ollama, openrouter, standalone])
+    pin = EmbeddingSpacePin(
+        name="qwen3",
+        model="qwen/qwen3-embedding-8b",
+        dim=768,
+        members=("ollama:local", "openrouter:api"),
+    )
+    service._embedding_space_pins = [pin]
+    service._verified_space_pins = {
+        "qwen3": ParityResult(passed=True, threshold=0.98, min_cosine=0.9804,
+                              mean_cosine=0.99, n=4),
+    }
+    return service, pin
+
+
+def test_conflicting_pin_on_verified_space_member_is_refused():
+    """#2440: pinning a DIFFERENT model on a verified-space member refuses —
+    a phantom pin the space silently overrides must not be accepted."""
+    from kestrel_sovereign.llm.service import EmbeddingSpaceConflictError
+
+    service, _ = _verified_space_service()
+    with pytest.raises(EmbeddingSpaceConflictError) as exc:
+        service._check_route_pin_space_coherent("ollama:local", "nomic-embed-text", 768)
+    msg = str(exc.value)
+    assert "qwen3" in msg
+    assert "nomic-embed-text" in msg
+    assert "fragment" in msg
+
+
+def test_conflicting_dim_on_verified_space_member_is_refused():
+    """#2440: the space's OWN model at a different dim also fragments it."""
+    from kestrel_sovereign.llm.service import EmbeddingSpaceConflictError
+
+    service, _ = _verified_space_service()
+    with pytest.raises(EmbeddingSpaceConflictError):
+        service._check_route_pin_space_coherent(
+            "openrouter:api", "qwen/qwen3-embedding-8b", 1024
+        )
+
+
+def test_pinning_the_spaces_own_model_is_allowed():
+    """#2440: re-pinning the space's own model/dim is coherent — no refusal."""
+    service, _ = _verified_space_service()
+    # Same model, same dim → no conflict raised.
+    service._check_route_pin_space_coherent(
+        "ollama:local", "qwen/qwen3-embedding-8b", 768
+    )
+    # Same model, dim omitted → no conflict raised.
+    service._check_route_pin_space_coherent(
+        "openrouter:api", "qwen/qwen3-embedding-8b", None
+    )
+
+
+def test_route_native_alias_of_spaces_model_is_allowed():
+    """#2440 P2: a member may re-pin the space's model under its OWN route-native
+    slug. Ollama serves ``qwen3-embedding:8b`` for the same weights the pin names
+    ``qwen/qwen3-embedding-8b``; normalized identity makes them equal, so this
+    no-op re-pin / rollback must NOT falsely 409."""
+    service, _ = _verified_space_service()
+    # Ollama's tagged alias for the space's model — same weights, no fragmentation.
+    service._check_route_pin_space_coherent(
+        "ollama:local", "qwen3-embedding:8b", 768
+    )
+    # And with the dim omitted.
+    service._check_route_pin_space_coherent(
+        "ollama:local", "qwen3-embedding:8b", None
+    )
+
+
+def test_sync_setter_refuses_conflicting_pin_on_verified_space_member():
+    """#2440 P1: the SYNCHRONOUS setter (the boot/settings/reindex hydration path)
+    must also reject a pre-existing conflicting stored pin, not silently re-apply
+    it after deploy. Refusal happens before capabilities/overrides mutate."""
+    from kestrel_sovereign.llm.service import EmbeddingSpaceConflictError
+
+    service, _ = _verified_space_service()
+    ollama = next(p for p in service.providers if p["name"] == "ollama:local")
+    with pytest.raises(EmbeddingSpaceConflictError):
+        service.set_route_embedding_model("ollama:local", "nomic-embed-text", 768)
+    # No phantom pin stored, and the member's capability model is untouched.
+    assert service.get_route_embedding_model_overrides() == {}
+    assert ollama["capabilities"]["embedding_model"] == "qwen3-embedding:8b"
+
+
+def test_sync_setter_allows_route_native_alias_of_spaces_model():
+    """#2440 P1+P2: the sync hydration path accepts the space's model under the
+    member's route-native alias (normalized identity), so a legitimate persisted
+    pin re-applies cleanly on boot."""
+    service, _ = _verified_space_service()
+    # Ollama's tagged alias normalizes to the pin's model → coherent, stored.
+    service.set_route_embedding_model("ollama:local", "qwen3-embedding:8b", 768)
+    assert service.get_route_embedding_model_overrides() == {
+        "ollama:local": {"model": "qwen3-embedding:8b", "dim": 768}
+    }
+
+
+def test_non_member_route_is_unaffected_by_verified_space():
+    """#2440: a route that is NOT a member of the space may be pinned freely."""
+    service, _ = _verified_space_service()
+    # openai:api is not a member — any model is fine.
+    service._check_route_pin_space_coherent("openai:api", "text-embedding-3-large", 3072)
+
+
+def test_unverified_space_does_not_constrain_member_pin():
+    """#2440: only a VERIFIED space wins. An unverified pin does not lock members."""
+    service, _ = _verified_space_service()
+    # Drop the verified parity so the space is declared but not verified.
+    service._verified_space_pins = {}
+    service._check_route_pin_space_coherent("ollama:local", "nomic-embed-text", 768)
+
+
+async def test_aset_refuses_conflicting_pin_on_verified_space_member():
+    """#2440: the async setter surfaces the conflict BEFORE storing anything —
+    the override map stays empty so no phantom pin is persisted."""
+    from kestrel_sovereign.llm.service import EmbeddingSpaceConflictError
+
+    service, _ = _verified_space_service()
+    with pytest.raises(EmbeddingSpaceConflictError):
+        await service.aset_route_embedding_model("ollama:local", "nomic-embed-text", 768)
+    # Nothing was stored — the refusal is at set time, not after.
+    assert service.get_route_embedding_model_overrides() == {}
