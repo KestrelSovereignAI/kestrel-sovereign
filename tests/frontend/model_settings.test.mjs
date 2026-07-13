@@ -461,6 +461,157 @@ test('re-embed button dry-runs, confirms, executes, and refreshes (#2336)', asyn
     assert.equal(reindexButton.style.display, 'none');
 });
 
+test('re-embed surfaces the server\'s refusal detail inline (#2420)', async () => {
+    // The backend 409/400 refusals carry a human ``detail`` written for exactly
+    // this moment; the popover must render it where the operator clicked instead
+    // of silently swallowing it.
+    const detail = "resolved provider can't write 1536→768; re-embed refused";
+    const settings = {
+        embedding_route: 'openai:api', resolved_route: 'openai:api',
+        embedding_model: 'text-embedding-3-small', embedding_dim: 1536,
+        kestrel_embedding_dim: 768, stale_rows: 1721,
+    };
+    const { embeddings, reindexStatus } = loadEmbeddings({
+        settings,
+        routes: [{ vendor: 'openai', route: 'api' }],
+        fetchImpl: async (url, opts) => {
+            const method = (opts && opts.method) || 'GET';
+            if (url === '/api/embedding/reindex' && method === 'POST') {
+                return { ok: false, status: 409, json: async () => ({ detail }) };
+            }
+            return { ok: true, json: async () => settings };
+        },
+    });
+    await embeddings.init();
+    await embeddings._handleReindexClick();
+    assert.ok(reindexStatus.textContent.includes(detail),
+        `expected the 409 detail inline, got: "${reindexStatus.textContent}"`);
+});
+
+test('re-embed button is disabled with the write-blocked reason (#2420)', async () => {
+    // When the resolved provider can't write to the column — the same state that
+    // makes the endpoint 409 — the button must be disabled and state why. An
+    // enabled button that can only ever 409 is a lie.
+    const { embeddings, reindexButton } = loadEmbeddings({
+        settings: {
+            embedding_route: 'openai:api', resolved_route: 'openai:api',
+            embedding_model: 'text-embedding-3-small', embedding_dim: 1536,
+            kestrel_embedding_dim: 768, stale_rows: 1721,
+            dim_write_blocked: true,
+            dim_write_status: 'Selected provider cannot write — memory vectors paused (resolves 1536-dim, columns are 768-dim).',
+        },
+        routes: [{ vendor: 'openai', route: 'api' }],
+    });
+    await embeddings.init();
+    assert.equal(reindexButton.style.display, '');
+    assert.equal(reindexButton.disabled, true);
+    assert.ok(/paused|can.t write|cannot write/i.test(reindexButton.title),
+        `expected a write-blocked reason in the title, got: "${reindexButton.title}"`);
+});
+
+test('re-embed shows a busy state immediately on click (#2420)', async () => {
+    let releaseDry;
+    const dryGate = new Promise(r => { releaseDry = r; });
+    const settings = {
+        embedding_route: 'openai:api', resolved_route: 'openai:api',
+        embedding_model: 'text-embedding-3-small', embedding_dim: 768,
+        kestrel_embedding_dim: 768, stale_rows: 3,
+    };
+    const { embeddings, reindexButton, reindexStatus } = loadEmbeddings({
+        settings,
+        routes: [{ vendor: 'openai', route: 'api' }],
+        fetchImpl: async (url, opts) => {
+            const method = (opts && opts.method) || 'GET';
+            if (url === '/api/embedding/reindex' && method === 'POST') {
+                await dryGate;
+                return { ok: true, json: async () => ({ dry_run: true, total_stale: 0 }) };
+            }
+            return { ok: true, json: async () => settings };
+        },
+    });
+    await embeddings.init();
+    assert.equal(reindexButton.disabled, false);
+
+    const pending = embeddings._handleReindexClick();
+    // Synchronously after the click — before the dry-run probe resolves — the
+    // button is disabled and a busy line is shown (no zero-feedback click).
+    assert.equal(reindexButton.disabled, true);
+    assert.equal(reindexStatus.textContent, 'Checking…');
+
+    releaseDry();
+    await pending;
+});
+
+test('rebinding on agent switch does not stack handlers — one click, one POST (#2420)', async () => {
+    // chat.js rebuilds a fresh EmbeddingSelector on every agent switch against
+    // the SAME persistent popover DOM. Without idempotent binding, both
+    // instances' handlers fire — doubling POSTs AND hitting both agents.
+    function liveButton() {
+        const live = new Map();
+        return {
+            textContent: '', title: '', disabled: false, style: {},
+            addEventListener(t, fn) { (live.get(t) || live.set(t, new Set()).get(t)).add(fn); },
+            removeEventListener(t, fn) { const s = live.get(t); if (s) s.delete(fn); },
+            _fire(t) { for (const fn of (live.get(t) || [])) fn(); },
+            _count(t) { return (live.get(t) || new Set()).size; },
+        };
+    }
+    const reindexButton = liveButton();
+    const reindexStatus = { textContent: '', style: {} };
+    const settings = {
+        embedding_route: 'openai:api', resolved_route: 'openai:api',
+        embedding_model: 'text-embedding-3-small', embedding_dim: 768,
+        kestrel_embedding_dim: 768, stale_rows: 3,
+    };
+    const posts = [];
+    const sharedDocument = {
+        getElementById(id) {
+            if (id === 'embedding-reindex-button') return reindexButton;
+            if (id === 'embedding-reindex-status') return reindexStatus;
+            return null;
+        },
+    };
+    const makeInstance = (endpoint) => {
+        const context = {
+            console: { warn() {}, error() {}, log() {} },
+            window: {},
+            document: sharedDocument,
+            fetch: async (url, opts) => {
+                const method = (opts && opts.method) || 'GET';
+                if (method === 'POST' && url === endpoint) {
+                    posts.push(url);
+                    return { ok: true, json: async () => ({ dry_run: true, total_stale: 0 }) };
+                }
+                return { ok: true, json: async () => settings };
+            },
+            setTimeout, clearTimeout,
+        };
+        vm.runInNewContext(embeddingsSource, context, { filename: 'model-selector/embeddings.js' });
+        return new context.window.EmbeddingSelector({
+            reindexButtonId: 'embedding-reindex-button',
+            reindexStatusId: 'embedding-reindex-status',
+            reindexEndpoint: endpoint,
+            confirm: () => true,
+            getEmbeddingRoutes: () => [],
+        });
+    };
+
+    const emma = makeInstance('/api/agents/Emma/api/embedding/reindex');
+    await emma.init();
+    // Switch to Nellie: a new instance rebinds against the SAME button.
+    const nellie = makeInstance('/api/agents/Nellie/api/embedding/reindex');
+    await nellie.init();
+
+    // Exactly one live click handler — the stale Emma handler was displaced.
+    assert.equal(reindexButton._count('click'), 1);
+
+    reindexButton._fire('click');
+    for (let i = 0; i < 12; i++) await new Promise(r => setTimeout(r, 0));
+
+    // Only the current agent got the POST; the click did not fan out to both.
+    assert.deepEqual(posts, ['/api/agents/Nellie/api/embedding/reindex']);
+});
+
 test('embeddings explicit selection round-trips to the API', async () => {
     const { embeddings, modeSelect, routeSelect, posts } = loadEmbeddings({
         settings: {

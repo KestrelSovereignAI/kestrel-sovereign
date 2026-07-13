@@ -112,21 +112,35 @@ class EmbeddingSelector {
     }
 
     _bindEvents() {
-        if (this.modeSelect) {
-            this.modeSelect.addEventListener('change', () => this._handleModeChange());
+        // The popover DOM (mode/route selects, re-embed button, …) persists,
+        // but chat.js rebuilds a fresh EmbeddingSelector on every agent switch
+        // (loadModels()). Naively re-adding listeners each time stacks handlers
+        // on the same element, so ONE click fires N POSTs — and because each
+        // stale instance still targets ITS agent's endpoints, the same click
+        // hits multiple agents (the Emma+Nellie double-fire in #2420). Bind
+        // through _bindListener, which displaces any handler a prior instance
+        // registered on the same element before adding our own.
+        this._bindListener(this.modeSelect, 'change', () => this._handleModeChange());
+        this._bindListener(this.routeSelect, 'change', () => this._handleRouteChange());
+        this._bindListener(this.reindexButton, 'click', () => this._handleReindexClick());
+        this._bindListener(this.universalEl, 'click', () => this._handleUniversalClick());
+        this._bindListener(this.modelSelect, 'change', () => this._handleModelChange());
+    }
+
+    /**
+     * Add a listener idempotently across EmbeddingSelector rebuilds (#2420).
+     * The element outlives the instance, so before binding we remove whatever
+     * handler a previous instance stashed on the element for this event type.
+     */
+    _bindListener(element, type, handler) {
+        if (!element || typeof element.addEventListener !== 'function') return;
+        const key = `_kestrelEmbedHandler_${type}`;
+        const prior = element[key];
+        if (prior && typeof element.removeEventListener === 'function') {
+            element.removeEventListener(type, prior);
         }
-        if (this.routeSelect) {
-            this.routeSelect.addEventListener('change', () => this._handleRouteChange());
-        }
-        if (this.reindexButton) {
-            this.reindexButton.addEventListener('click', () => this._handleReindexClick());
-        }
-        if (this.universalEl && this.universalEl.addEventListener) {
-            this.universalEl.addEventListener('click', () => this._handleUniversalClick());
-        }
-        if (this.modelSelect && this.modelSelect.addEventListener) {
-            this.modelSelect.addEventListener('change', () => this._handleModelChange());
-        }
+        element.addEventListener(type, handler);
+        element[key] = handler;
     }
 
     /** Fetch the current settings and render. */
@@ -197,7 +211,13 @@ class EmbeddingSelector {
         const s = this.settings || {};
         const stale = s.stale_rows;
         const hasStale = typeof stale === 'number' && stale > 0;
-        const resolvable = this.mode !== 'off' && s.embedding_dim != null;
+        // #2420 — a provider whose resolved dim can't write into the column is
+        // exactly the state the reindex endpoint 409s on. An enabled button that
+        // can only ever 409 is a lie: fold ``dim_write_blocked`` into resolvable
+        // so the button's enablement mirrors the server's writability, and show
+        // the same reason the endpoint would return.
+        const writeBlocked = s.dim_write_blocked === true;
+        const resolvable = this.mode !== 'off' && s.embedding_dim != null && !writeBlocked;
 
         if (!hasStale) {
             this.reindexButton.style.display = 'none';
@@ -212,11 +232,21 @@ class EmbeddingSelector {
         this.reindexButton.style.display = '';
         const noun = stale === 1 ? 'memory' : 'memories';
         this.reindexButton.textContent = `Re-embed ${stale} ${noun}`;
-        // Disable while unresolvable (off/no provider) or a job is in flight.
+        // Disable while unresolvable (off / no provider / write-blocked) or a job
+        // is in flight.
         this.reindexButton.disabled = !resolvable || this._reindexing;
-        this.reindexButton.title = resolvable
-            ? `Re-embed ${stale} stale ${noun} into the current embedding provider.`
-            : 'No embedding provider resolves — nothing to re-embed to.';
+        if (resolvable) {
+            this.reindexButton.title =
+                `Re-embed ${stale} stale ${noun} into the current embedding provider.`;
+        } else if (writeBlocked) {
+            const dim = s.embedding_dim;
+            const columnDim = s.kestrel_embedding_dim;
+            this.reindexButton.title = s.dim_write_status ||
+                `Selected provider can't write (resolves ${dim}-dim, columns are ` +
+                `${columnDim}-dim) — re-embedding would be refused.`;
+        } else {
+            this.reindexButton.title = 'No embedding provider resolves — nothing to re-embed to.';
+        }
     }
 
     _setReindexStatus(text) {
@@ -233,33 +263,46 @@ class EmbeddingSelector {
      */
     async _handleReindexClick() {
         if (this._reindexing) return;
-        const dry = await this._postReindex({ dry_run: true });
-        if (!dry) {
-            this._setReindexStatus('Re-embed failed — could not read counts.');
-            return;
-        }
-        const n = dry.total_stale || 0;
-        if (!n) {
-            await this.load();
-            return;
-        }
-        const noun = n === 1 ? 'memory' : 'memories';
-        if (!this.confirm(`Re-embed ${n} ${noun} into the current embedding provider? Stored vectors will be rewritten.`)) {
-            return;
-        }
-
+        // #2420 — mark busy immediately so the click has feedback while the
+        // dry-run probe runs (this also disables the button via _renderReindex),
+        // and reload authoritative settings on every exit path.
         this._reindexing = true;
         this._renderReindex();
-        this._setReindexStatus(`Re-embedding ${n} ${noun}…`);
+        this._setReindexStatus('Checking…');
         try {
-            const started = await this._postReindex({ dry_run: false });
-            if (!started) {
-                this._setReindexStatus('Re-embed failed to start.');
+            const dry = await this._postReindex({ dry_run: true });
+            if (!dry.ok) {
+                // #2420 — the backend refusal (400 dim/probe guard, 409 provider
+                // can't write) carries a human ``detail`` written for exactly this
+                // moment. Render it inline where the operator clicked instead of
+                // silently swallowing it.
+                this._setReindexStatus(dry.detail
+                    ? `Re-embed unavailable: ${dry.detail}`
+                    : 'Re-embed failed — could not read counts.');
                 return;
             }
-            let job = started;
-            if (started.job_id && started.status === 'running') {
-                job = await this._pollReindex(started.job_id);
+            const n = (dry.data && dry.data.total_stale) || 0;
+            if (!n) {
+                this._setReindexStatus('');
+                return;
+            }
+            const noun = n === 1 ? 'memory' : 'memories';
+            if (!this.confirm(`Re-embed ${n} ${noun} into the current embedding provider? Stored vectors will be rewritten.`)) {
+                this._setReindexStatus('');
+                return;
+            }
+
+            this._setReindexStatus(`Re-embedding ${n} ${noun}…`);
+            const started = await this._postReindex({ dry_run: false });
+            if (!started.ok) {
+                this._setReindexStatus(started.detail
+                    ? `Re-embed refused: ${started.detail}`
+                    : 'Re-embed failed to start.');
+                return;
+            }
+            let job = started.data;
+            if (job && job.job_id && job.status === 'running') {
+                job = await this._pollReindex(job.job_id);
             }
             if (!job) {
                 // Poll timed out / dropped before a terminal state — don't
@@ -287,7 +330,12 @@ class EmbeddingSelector {
         }
     }
 
-    /** POST the reindex body and return the parsed JSON, or null on failure. */
+    /**
+     * POST the reindex body and return ``{ok, data, detail}`` (#2420). ``detail``
+     * carries the server's rejection message on a non-2xx (a 400 dim/probe guard
+     * or a 409 "provider can't write") so the caller can render it inline instead
+     * of swallowing it — the bodies were written for the user.
+     */
     async _postReindex(body) {
         try {
             const headers = {
@@ -299,10 +347,14 @@ class EmbeddingSelector {
                 headers,
                 body: JSON.stringify(body),
             });
-            if (!response.ok) return null;
-            return await response.json();
+            let data = null;
+            try { data = await response.json(); } catch (e) { /* no/invalid body */ }
+            if (!response.ok) {
+                return { ok: false, data, detail: data && data.detail };
+            }
+            return { ok: true, data };
         } catch (e) {
-            return null;
+            return { ok: false, detail: String(e) };
         }
     }
 
