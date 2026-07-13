@@ -1,115 +1,21 @@
-/**
- * Node-run unit tests for Realtime long-running tool progress hints.
- *
- *   node --test tests/js/test_voice_realtime_tool_progress.mjs
- */
+/** Provider-neutral Realtime utility tests. */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS,
+  applyTranscriptUpdate,
+  base64ToBytes,
   buildRealtimeToolsSessionUpdate,
-  buildToolProgressHintMessages,
-  createToolProgressHintScheduler,
-  resolveToolProgressHintDelay,
+  bytesToBase64,
+  normalizeToolBatchResults,
+  responseAllowsToolDispatch,
+  resolveRealtimeSDPEndpoint,
+  waitForPlaybackIdle,
 } from '../../kestrel_sovereign/static/js/voice/realtime.js';
 
-function makeTimerHarness() {
-  const timers = [];
-  const cleared = new Set();
-  return {
-    timers,
-    cleared,
-    setTimeoutFn(fn, ms) {
-      const id = timers.length;
-      timers.push({ fn, ms });
-      return id;
-    },
-    clearTimeoutFn(id) {
-      cleared.add(id);
-    },
-    fire(id = 0) {
-      if (!cleared.has(id)) timers[id].fn();
-    },
-  };
-}
-
-test('tool progress delay defaults to three seconds and accepts config override', () => {
-  assert.equal(DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS, 3000);
-  assert.equal(resolveToolProgressHintDelay({ tool_progress_hint_delay_ms: 1250 }), 1250);
-  assert.equal(resolveToolProgressHintDelay({ toolBridgeDelayMs: 10 }), 10);
-  assert.equal(resolveToolProgressHintDelay({ tool_progress_hint_delay_ms: 'bad' }), 3000);
-});
-
-test('fast tool call cancels progress hint before it fires', () => {
-  const harness = makeTimerHarness();
-  const sent = [];
-  const scheduler = createToolProgressHintScheduler({
-    delayMs: 3000,
-    sendHint: (payload) => sent.push(payload),
-    setTimeoutFn: harness.setTimeoutFn.bind(harness),
-    clearTimeoutFn: harness.clearTimeoutFn.bind(harness),
-  });
-
-  const pending = scheduler.start({ callId: 'call_fast', toolName: 'quick_lookup' });
-  assert.equal(harness.timers[0].ms, 3000);
-  pending.finish();
-  harness.fire(0);
-
-  assert.deepEqual(sent, []);
-  assert.ok(harness.cleared.has(0));
-});
-
-test('slow tool call emits one working hint after threshold', () => {
-  const harness = makeTimerHarness();
-  const sent = [];
-  const scheduler = createToolProgressHintScheduler({
-    delayMs: 3000,
-    sendHint: (payload) => sent.push(payload),
-    setTimeoutFn: harness.setTimeoutFn.bind(harness),
-    clearTimeoutFn: harness.clearTimeoutFn.bind(harness),
-  });
-
-  const pending = scheduler.start({ callId: 'call_slow', toolName: 'web_research' });
-  harness.fire(0);
-  harness.fire(0);
-  pending.finish();
-
-  assert.deepEqual(sent, [{
-    phase: 'working',
-    callId: 'call_slow',
-    toolName: 'web_research',
-  }]);
-  assert.equal(harness.cleared.size, 0);
-});
-
-test('tool progress hint uses conversation item plus response create', () => {
-  const messages = buildToolProgressHintMessages({
-    callId: 'call_123',
-    toolName: 'subagent_dispatch',
-  });
-
-  assert.equal(messages.length, 2);
-  assert.equal(messages[0].type, 'conversation.item.create');
-  assert.equal(messages[0].item.type, 'message');
-  assert.equal(messages[0].item.role, 'user');
-  assert.match(messages[0].item.content[0].text, /tool status: working/);
-  assert.match(messages[0].item.content[0].text, /subagent_dispatch/);
-  assert.equal(messages[1].type, 'response.create');
-  assert.match(messages[1].response.instructions, /one short bridge phrase/);
-});
-
 test('realtime tool disclosure update uses session.update tools payload', () => {
-  const tools = [{
-    type: 'function',
-    function: {
-      name: 'memory_feature',
-      description: 'Dispatch to memory',
-      parameters: { type: 'object' },
-    },
-  }];
-
+  const tools = [{ type: 'function', name: 'memory_feature', parameters: { type: 'object' } }];
   assert.deepEqual(buildRealtimeToolsSessionUpdate(tools), {
     type: 'session.update',
     session: { tools },
@@ -118,4 +24,53 @@ test('realtime tool disclosure update uses session.update tools payload', () => 
     type: 'session.update',
     session: { tools: [] },
   });
+});
+
+test('PCM chunks round trip through provider WebSocket base64 encoding', () => {
+  const input = new Uint8Array([0, 1, 127, 128, 254, 255]);
+  assert.deepEqual(base64ToBytes(bytesToBase64(input)), input);
+});
+
+test('incremental and cumulative provider transcripts share one UI contract', () => {
+  assert.equal(applyTranscriptUpdate('hello', ' world', false), 'hello world');
+  assert.equal(applyTranscriptUpdate('hello wurld', 'hello world', true), 'hello world');
+});
+
+test('partial batch responses still produce one result per requested tool', () => {
+  const calls = [
+    { call_id: 'one', name: 'first' },
+    { call_id: 'two', name: 'second' },
+  ];
+  assert.deepEqual(normalizeToolBatchResults(calls, [
+    { call_id: 'one', result: { ok: true } },
+  ]), [
+    { call_id: 'one', result: { ok: true } },
+    { call_id: 'two', result: { error: 'tool dispatch returned no result' } },
+  ]);
+  assert.equal(normalizeToolBatchResults(calls, null).length, 2);
+});
+
+test('WebRTC fallback keeps the discovered model query', () => {
+  assert.equal(
+    resolveRealtimeSDPEndpoint({ model: 'runtime model' }),
+    'https://api.openai.com/v1/realtime/calls?model=runtime%20model',
+  );
+  assert.equal(
+    resolveRealtimeSDPEndpoint({ endpoint: 'https://provider.example/calls', model: 'ignored' }),
+    'https://provider.example/calls',
+  );
+});
+
+test('playback idle wait has a bounded continuation timeout', async () => {
+  const started = Date.now();
+  await waitForPlaybackIdle({ whenIdle: () => new Promise(() => {}) }, 5);
+  assert.ok(Date.now() - started < 250);
+});
+
+test('cancelled and failed responses never dispatch collected tools', () => {
+  assert.equal(responseAllowsToolDispatch({ response: { status: 'completed' } }), true);
+  assert.equal(responseAllowsToolDispatch({}), true); // xAI-compatible absent status
+  assert.equal(responseAllowsToolDispatch({ response: { status: 'cancelled' } }), false);
+  assert.equal(responseAllowsToolDispatch({ response: { status: 'failed' } }), false);
+  assert.equal(responseAllowsToolDispatch({ response: { status: 'incomplete' } }), false);
 });

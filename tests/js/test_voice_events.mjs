@@ -21,7 +21,7 @@ test('Events constants include all documented kinds', () => {
     'THINKING_STARTED', 'SPEAKING_STARTED', 'SPEAKING_STOPPED',
     'USER_TRANSCRIPT_DELTA', 'USER_TRANSCRIPT_FINAL',
     'AGENT_TEXT_DELTA', 'AGENT_TEXT_FINAL',
-    'RESPONSE_DONE', 'TOOL_CALL_REQUESTED',
+    'RESPONSE_DONE', 'TOOL_CALL_REQUESTED', 'TOOL_CALL_BATCH_REQUESTED',
     'ERROR',
   ];
   for (const name of required) {

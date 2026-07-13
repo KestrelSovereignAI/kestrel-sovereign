@@ -70,6 +70,7 @@ export function nextStateForEvent(currentState, eventKind, eventPayload = {}) {
     case Events.AGENT_TEXT_DELTA:
     case Events.AGENT_TEXT_FINAL:
     case Events.TOOL_CALL_REQUESTED:
+    case Events.TOOL_CALL_BATCH_REQUESTED:
       // Pure-content events don't change the visible state — they're
       // rendered into the transcript by ui.js, but the mic-button state
       // stays where it is.

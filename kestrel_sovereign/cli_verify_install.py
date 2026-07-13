@@ -407,7 +407,8 @@ def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
 
     **Filtered to ``kestrel-feature-*`` packages only.** The registry
     also lists provider plugins (``kestrel-voice-elevenlabs``,
-    ``kestrel-voice-deepgram``, ``kestrel-voice-openai``) under
+    ``kestrel-voice-deepgram``, ``kestrel-voice-openai``,
+    ``kestrel-voice-xai``) under
     ``core = false``, but those register under a different entry-point
     group (``kestrel_sovereign.voice_providers``) and implement
     provider interfaces, not ``kestrel_sdk.features.base.Feature``.

@@ -74,6 +74,7 @@ test('content-only events return null (no state transition)', () => {
     Events.AGENT_TEXT_DELTA,
     Events.AGENT_TEXT_FINAL,
     Events.TOOL_CALL_REQUESTED,
+    Events.TOOL_CALL_BATCH_REQUESTED,
   ]) {
     assert.equal(nextStateForEvent(State.LISTENING, ek), null);
   }

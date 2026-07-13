@@ -96,6 +96,7 @@ isolated feature venvs (see `docs/design/ISOLATED_FEATURE_RUNTIME.md`).
 | Repository | What it is |
 |---|---|
 | [kestrel-voice-openai](https://github.com/KestrelSovereignAI/kestrel-voice-openai) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-voice-openai/blob/main/AGENTS.md)) | OpenAI TTS + STT (including realtime). |
+| [kestrel-voice-xai](https://github.com/KestrelSovereignAI/kestrel-voice-xai) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-voice-xai/blob/main/AGENTS.md)) | xAI Voice Agent realtime + TTS + STT, including built-in and custom voices. |
 | [kestrel-voice-elevenlabs](https://github.com/KestrelSovereignAI/kestrel-voice-elevenlabs) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-voice-elevenlabs/blob/main/AGENTS.md)) | ElevenLabs TTS. |
 | [kestrel-voice-deepgram](https://github.com/KestrelSovereignAI/kestrel-voice-deepgram) (private, [AGENTS.md](https://github.com/KestrelSovereignAI/kestrel-voice-deepgram/blob/main/AGENTS.md)) | Deepgram STT. |
 

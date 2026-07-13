@@ -264,6 +264,15 @@ tags = ["communication", "voice", "tts", "stt", "cloud", "openai"]
 icon = "microphone"
 core = false
 
+[voice_xai]
+package = "kestrel-voice-xai"
+git = "https://github.com/KestrelSovereignAI/kestrel-voice-xai.git"
+features = ["XAITTSProvider", "XAISTTProvider", "XAIRealtimeConversationProvider"]
+description = "xAI cloud realtime voice agent + TTS + STT providers"
+tags = ["communication", "voice", "tts", "stt", "realtime", "cloud", "xai"]
+icon = "microphone"
+core = false
+
 [mcp]
 package = "kestrel-feature-mcp"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-mcp.git"

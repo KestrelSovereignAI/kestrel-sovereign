@@ -35,6 +35,7 @@ export const Events = Object.freeze({
 
   // Tool calls — realtime only; pipeline doesn't surface these
   TOOL_CALL_REQUESTED: 'tool_call_requested', // { call_id, name, arguments }
+  TOOL_CALL_BATCH_REQUESTED: 'tool_call_batch_requested', // { batch_id, calls }
 
   // Errors. `fatal` signals the session is finished; UI should reset.
   ERROR: 'error',                        // { message, code?, fatal }
