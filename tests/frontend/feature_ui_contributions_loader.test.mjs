@@ -126,8 +126,8 @@ test('multi-agent host mode pins feature-static URLs to the selected agent; leav
     // assets to the selected agent so the /api/agents/{id} proxy reaches the agent
     // that declared them; /js/ assets are host-served and must stay un-prefixed.
     const buildCalls = [];
-    const originalBuild = API.buildAgentUrl;
-    API.buildAgentUrl = (url) => {
+    const originalBuild = API.buildAgentUrlFor;
+    API.buildAgentUrlFor = (url) => {
         buildCalls.push(url);
         return `/api/agents/agentB${url}`;
     };
@@ -173,7 +173,7 @@ test('multi-agent host mode pins feature-static URLs to the selected agent; leav
             '/api/agents/agentB/features/spawnfeature/static/spawn.css',
         );
     } finally {
-        API.buildAgentUrl = originalBuild;
+        API.buildAgentUrlFor = originalBuild;
     }
 });
 
@@ -203,6 +203,28 @@ test('concurrent invocations are coalesced onto a single fetch', async () => {
 
     await Promise.all([loadFeatureUIContributions(), loadFeatureUIContributions()]);
     assert.equal(fetches, 1, 'overlapping loads must share one in-flight manifest fetch');
+});
+
+test('concurrent loads for different agents are pinned and not coalesced together', async () => {
+    const pending = new Map();
+    const originalRequestForAgent = API.requestForAgent;
+    API.requestForAgent = (path, _options, agent) => {
+        assert.equal(path, '/api/ui/contributions');
+        return new Promise((resolve) => pending.set(agent, resolve));
+    };
+    API.setHostAgent('Tern');
+    try {
+        const kite = loadFeatureUIContributions('Kite');
+        const tern = loadFeatureUIContributions('Tern');
+        assert.deepEqual([...pending.keys()], ['Kite', 'Tern']);
+
+        pending.get('Tern')({ contributions: [] });
+        pending.get('Kite')({ contributions: [] });
+        await Promise.all([kite, tern]);
+    } finally {
+        API.requestForAgent = originalRequestForAgent;
+        API.setHostAgent(null);
+    }
 });
 
 // --- host-scoped UI loader (#2293) ---
@@ -274,8 +296,8 @@ test('selectAgent re-runs the loader after refreshCapabilities (multi-agent path
     const selectIdx = identitySrc.indexOf('window.selectAgent = async function');
     assert.notEqual(selectIdx, -1, 'selectAgent must exist');
     const tail = identitySrc.slice(selectIdx);
-    const refreshIdx = tail.indexOf('await API.refreshCapabilities();');
-    const loadIdx = tail.indexOf('await loadFeatureUIContributions();');
+    const refreshIdx = tail.indexOf('await API.refreshCapabilities({ expectedAgent: agentName });');
+    const loadIdx = tail.indexOf('await loadFeatureUIContributions(agentName);');
     assert.ok(refreshIdx !== -1, 'selectAgent must refresh capabilities');
     assert.ok(loadIdx !== -1, 'selectAgent must re-run the feature loader');
     assert.ok(

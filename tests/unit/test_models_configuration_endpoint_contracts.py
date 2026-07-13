@@ -391,6 +391,48 @@ def test_models_endpoint_groups_results_and_rejects_invalid_category():
         _restore_app(app, original)
 
 
+def test_stale_models_endpoint_preserves_cached_discovery_only_embedding_route():
+    """A stale fast response must not temporarily hide a discovered route."""
+    from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+
+    chat_model = MagicMock()
+    chat_model.provider = "openrouter"
+    chat_model.is_featured = True
+    chat_model.to_dict.return_value = {"id": "chat-model", "provider": "openrouter"}
+
+    llm_service = MagicMock()
+    llm_service.discover_all_models = AsyncMock(return_value=[chat_model])
+    llm_service.discover_embedding_models = AsyncMock(return_value=[])
+    llm_service.get_active_model_id = MagicMock(return_value="openrouter/chat-model")
+    llm_service.providers = [{
+        "name": "openrouter:api",
+        "vendor": "openrouter",
+        "route": "api",
+        "model": "chat-model",
+        "capabilities": {"supports_embeddings": False},
+    }]
+    llm_service._embedding_discovery_cache = [
+        SimpleNamespace(route="openrouter:api")
+    ]
+    agent = MagicMock(llm_service=llm_service)
+
+    cache = get_shared_model_cache()
+    cache.clear()
+    cache.set_stale([chat_model])
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/models", headers=_api_headers())
+        assert response.status_code == 200
+        route = response.json()["routes"][0]
+        assert route["supports_embeddings"] is True
+        llm_service.discover_embedding_models.assert_not_awaited()
+    finally:
+        cache.clear()
+        _restore_app(app, original)
+
+
 def test_models_endpoint_scopes_list_to_vendor_route():
     """``/api/models?vendor=openai&route=plan`` must draw the list from the
     route-scoped discovery, not the flattened vendor discovery (#2262)."""

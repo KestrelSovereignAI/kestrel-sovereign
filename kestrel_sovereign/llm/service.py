@@ -461,6 +461,25 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # are provider route names (matches provider["name"]).
         self._disabled_routes: dict[str, str] = {}
 
+        # Schema modules are imported while FastAPI builds its routes, before a
+        # real agent-scoped LLM service exists. Freeze the conversation vector
+        # width now, from this already-initialized service, instead of making
+        # the schema import construct and discard a second LLMService. This
+        # preserves provider-derived dimensions for existing non-768 deployments
+        # while removing provider setup from the server import critical path.
+        try:
+            from kestrel_sovereign.storage.sqla.conversation_message import (
+                configure_embedding_dim_from_service,
+            )
+
+            configure_embedding_dim_from_service(self)
+        except Exception:
+            logger.warning(
+                "Could not configure conversation embedding schema width from "
+                "the initialized provider; using the deployment default.",
+                exc_info=True,
+            )
+
     def _stamp_response_identity(
         self,
         response: Any,

@@ -37,6 +37,7 @@ multi-tenant scoping happens above this layer in frinz.
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime
 from typing import Any, Optional
 
@@ -48,45 +49,16 @@ from .base import SovereignBase
 from .types import PortableVector
 
 
-def _active_provider_embedding_dim() -> Optional[int]:
-    """Best-effort dim probe from the global default embedding provider.
-
-    This intentionally uses ``get_provider_embedding_service()`` with
-    no agent-scoped ``llm_service`` argument — the migration runs at
-    process startup, before any agent-scoped routing decisions exist.
-    The expectation is that a sovereign process serves agents that
-    share an embedding provider (the typical single-tenant
-    deployment).
-
-    Multi-provider deployments (per-agent OpenAI vs Vertex etc.) MUST
-    set ``KESTREL_EMBEDDING_DIM`` explicitly so the column matches
-    every writer. The dim-mismatch fallback in
-    ``AsyncConversationStore._maybe_embed`` is defense-in-depth —
-    it'll log a clear operator-actionable error and persist the row
-    without ``embedding_vec`` rather than silently corrupting data —
-    but vector recall is disabled for that agent until the column is
-    re-migrated.
-    """
-    try:
-        from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service
-
-        service = get_provider_embedding_service()
-        dim = getattr(service, "embedding_dim", None) if service else None
-        return int(dim) if dim else None
-    except Exception:
-        return None
-
-
 def resolve_embedding_dim(env: Optional[dict] = None) -> int:
     """Pick the embedding dimension for fresh ``conversation_history`` DBs.
 
     Unlike ``saved_items`` / ``document_chunks`` the table has no
     legacy embedding column to sniff from, so the migration MUST pick
-    a dim up front. ``KESTREL_EMBEDDING_DIM`` still wins as an explicit
-    operator override. Without it, Kestrel asks the active chat provider's
-    embedding capability for a dimension (OpenAI 1536, Gemini/Vertex 768,
-    Ollama 768, etc.) and only falls back to 768 if no provider embedding
-    service is available.
+    a dim up front. ``KESTREL_EMBEDDING_DIM`` is the deployment-level
+    operator setting; without it the schema default is 768. The database
+    column width cannot safely follow a mutable per-agent chat route, and
+    resolving a provider here would construct a full ``LLMService`` while
+    importing the server — before any real agent exists.
 
     Bad values (non-integer, non-positive) fall back to 768 with a
     warning. Mismatch between the column width and a future writer's
@@ -103,9 +75,7 @@ def resolve_embedding_dim(env: Optional[dict] = None) -> int:
     source = env if env is not None else os.environ
     raw = source.get("KESTREL_EMBEDDING_DIM")
     if raw is None:
-        if env is not None:
-            return 768
-        return _active_provider_embedding_dim() or 768
+        return 768
     if raw == "":
         return 768
     try:
@@ -128,6 +98,8 @@ def resolve_embedding_dim(env: Optional[dict] = None) -> int:
 
 
 CONVERSATION_MESSAGE_EMBEDDING_DIM = resolve_embedding_dim()
+_embedding_dim_lock = threading.Lock()
+_embedding_dim_configured_from_service = False
 
 
 class ConversationMessage(SovereignBase):
@@ -191,6 +163,60 @@ class ConversationMessage(SovereignBase):
     embedding_profile_id: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
     )
+
+
+def configure_embedding_dim_from_service(llm_service: Any) -> int:
+    """Freeze the schema width from an already-initialized LLM service.
+
+    Importing this ORM used to construct a throwaway ``LLMService`` merely to
+    ask its embedding provider for a dimension. That delayed every server
+    import. The real service exists before agent storage/migrations begin, so
+    reuse it here and preserve the historical provider-derived width without
+    doing provider work at module import time.
+
+    An explicit ``KESTREL_EMBEDDING_DIM`` remains authoritative. The first
+    service with a describable embedding provider wins for the process; fleets
+    that mix dimensions must continue to set the deployment-wide override.
+    """
+    global CONVERSATION_MESSAGE_EMBEDDING_DIM
+    global _embedding_dim_configured_from_service
+
+    if "KESTREL_EMBEDDING_DIM" in os.environ:
+        return CONVERSATION_MESSAGE_EMBEDDING_DIM
+    try:
+        service = llm_service.get_embedding_service()
+        raw_dim = getattr(service, "embedding_dim", None) if service else None
+        dimension = int(raw_dim) if raw_dim else None
+    except Exception:
+        dimension = None
+    if not dimension or dimension <= 0:
+        return CONVERSATION_MESSAGE_EMBEDDING_DIM
+
+    with _embedding_dim_lock:
+        if _embedding_dim_configured_from_service:
+            if dimension != CONVERSATION_MESSAGE_EMBEDDING_DIM:
+                import logging
+
+                logging.getLogger(__name__).error(
+                    "Co-hosted embedding providers disagree on schema width "
+                    "(%d vs frozen %d); set KESTREL_EMBEDDING_DIM explicitly.",
+                    dimension,
+                    CONVERSATION_MESSAGE_EMBEDDING_DIM,
+                )
+            return CONVERSATION_MESSAGE_EMBEDDING_DIM
+
+        CONVERSATION_MESSAGE_EMBEDDING_DIM = dimension
+        ConversationMessage.__table__.columns["embedding_vec"].type.dimension = dimension
+        _embedding_dim_configured_from_service = True
+
+        # ``storage.sqla`` re-exports the value. Keep that convenience surface
+        # coherent for callers importing it after service initialization.
+        import sys
+
+        package_module = sys.modules.get(__package__)
+        if package_module is not None:
+            package_module.CONVERSATION_MESSAGE_EMBEDDING_DIM = dimension
+        return dimension
 
 
 def build_conversation_message_spec(dimension: int) -> VectorTableSpec:

@@ -77,6 +77,11 @@ class AgentManager:
         # Hard cap on dynamically-spawned agents so a runaway spawn loop can't
         # exhaust ports / resources (#1729).
         self._max_spawned_agents = int(os.environ.get("KESTREL_MAX_SPAWNED_AGENTS", "64"))
+        # Bound cold-start parallelism so larger fleets gain overlap without
+        # stampeding provider SDK initialization or exhausting DB descriptors.
+        self._init_concurrency = max(
+            1, int(os.environ.get("KESTREL_AGENT_INIT_CONCURRENCY", "4"))
+        )
         # In-flight spawns whose mandate isn't registered yet (counts toward the
         # cap under the lock so concurrent spawns can't race past it).
         self._pending_spawns = 0
@@ -88,8 +93,15 @@ class AgentManager:
         # consumed by the create-agent endpoint to persist registrations.
         self._created_configs: dict[str, "LocalAgentConfig"] = {}
 
-    async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
-        """Create and initialize a KestrelAgent from a multi_agent config entry.
+    async def _initialize_agent(
+        self, name: str, config: LocalAgentConfig
+    ) -> KestrelAgent:
+        """Construct and initialize an agent without publishing it to the fleet.
+
+        Keeping initialization separate from registration lets startup initialize
+        independent configured agents concurrently, then publish successes in
+        deterministic config order. Dynamic ``load_agent`` still uses the same
+        path and registration point.
 
         Args:
             name: Agent name (used as routing key).
@@ -123,29 +135,68 @@ class AgentManager:
         # Build allowed_features set from config (None = load all)
         allowed_features = set(config.features) if config.features is not None else None
 
-        if db_backend.lower() == "postgres" and database_url:
-            agent = KestrelAgent(
-                did=agent_did,
-                storage_path=db_path,
-                llm_service=llm_service,
-                database_url=database_url,
-                db_backend="postgres",
-                allowed_features=allowed_features,
-            )
-        else:
-            agent = KestrelAgent(
-                did=agent_did,
-                storage_path=db_path,
-                llm_service=llm_service,
-                allowed_features=allowed_features,
-            )
+        agent: Optional[KestrelAgent] = None
+        try:
+            if db_backend.lower() == "postgres" and database_url:
+                agent = KestrelAgent(
+                    did=agent_did,
+                    storage_path=db_path,
+                    llm_service=llm_service,
+                    database_url=database_url,
+                    db_backend="postgres",
+                    allowed_features=allowed_features,
+                )
+            else:
+                agent = KestrelAgent(
+                    did=agent_did,
+                    storage_path=db_path,
+                    llm_service=llm_service,
+                    allowed_features=allowed_features,
+                )
 
-        await agent.initialize()
+            await agent.initialize()
+        except BaseException:
+            if agent is not None:
+                await self._shutdown_unregistered_agent(name, agent)
+            else:
+                try:
+                    await llm_service.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close LLM service for uninitialized agent %r",
+                        name,
+                        exc_info=True,
+                    )
+            raise
         # Spawn-mandate enforcement (restricted_tools hook + spawn_mandate attach)
         # is reattached inside KestrelAgent.initialize() from the persisted
         # delegation edge (#2137), so it covers every boot path — not just this
         # one — uniformly.
 
+        assert agent is not None
+        return agent
+
+    @staticmethod
+    async def _shutdown_unregistered_agent(name: str, agent: KestrelAgent) -> None:
+        """Release a fully or partially initialized agent never published.
+
+        Concurrent fleet startup can be cancelled after one initializer has
+        completed but before deterministic registration begins. Such agents
+        are invisible to ``shutdown_all()``, so the startup path owns their
+        cleanup explicitly.
+        """
+        try:
+            await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.warning(
+                "Failed to clean up unregistered agent %r: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
+
+    def _register_agent(self, name: str, agent: KestrelAgent) -> None:
+        """Publish one fully initialized agent to the co-hosted fleet."""
         self._agents[name] = agent
         self._agent_names[agent.agent_id] = name
         # Fleet-idleness (#F235): give EVERY agent — including ones created or
@@ -155,7 +206,17 @@ class AgentManager:
         # dynamically-added agent can never bypass the gate. Resolves live, so
         # each agent sees agents registered after it.
         agent._cohosted_agents_provider = lambda: list(self._agents.values())
-        logger.info(f"Loaded agent '{name}' (DID: {agent_did[:30]}...)")
+        logger.info(f"Loaded agent '{name}' (DID: {agent.agent_id[:30]}...)")
+
+    async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
+        """Create, initialize, and register one agent.
+
+        This is the dynamic/single-agent loading path. Fleet startup uses the
+        same initializer and registrar but batches the independent initialization
+        awaits in :meth:`load_from_config`.
+        """
+        agent = await self._initialize_agent(name, config)
+        self._register_agent(name, agent)
         return agent
 
     async def load_from_config(self, config: MultiAgentConfig) -> int:
@@ -183,6 +244,7 @@ class AgentManager:
         for agent_cfg in config.agents.values():
             if isinstance(agent_cfg, LocalAgentConfig):
                 self._reserved_ports.add(agent_cfg.port)
+        pending: list[tuple[str, LocalAgentConfig]] = []
         for name, agent_cfg in config.agents.items():
             if not isinstance(agent_cfg, LocalAgentConfig):
                 logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
@@ -190,12 +252,70 @@ class AgentManager:
             if not agent_cfg.autostart:
                 logger.info(f"Skipping agent '{name}' (autostart=false)")
                 continue
-            try:
-                await self.load_agent(name, agent_cfg)
-                loaded += 1
-            except Exception as e:
-                logger.error(f"Failed to load agent '{name}': {e}", exc_info=True)
+            pending.append((name, agent_cfg))
+
+        # Agent storage, provider construction, and feature initialization are
+        # independent. Run them concurrently, then register successful results
+        # in config order so the UI/fleet order remains stable across boots.
+        init_slots = asyncio.Semaphore(self._init_concurrency)
+
+        async def _bounded_initialize(name, agent_cfg):
+            async with init_slots:
+                return await self._initialize_agent(name, agent_cfg)
+
+        init_tasks = [
+            asyncio.create_task(_bounded_initialize(name, agent_cfg))
+            for name, agent_cfg in pending
+        ]
+        try:
+            results = await asyncio.gather(*init_tasks, return_exceptions=True)
+        except BaseException:
+            # ``gather`` cancellation cancels pending initializers, whose own
+            # cleanup handles partially-built agents. Initializers that already
+            # returned successfully are not registered yet and need explicit
+            # teardown because shutdown_all() cannot see them.
+            settled = await asyncio.gather(*init_tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(
+                    self._shutdown_unregistered_agent(name, result)
+                    for (name, _), result in zip(pending, settled)
+                    if not isinstance(result, BaseException)
+                ),
+                return_exceptions=True,
+            )
+            raise
+
+        fatal = next(
+            (
+                result
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, Exception)
+            ),
+            None,
+        )
+        if fatal is not None:
+            await asyncio.gather(
+                *(
+                    self._shutdown_unregistered_agent(name, result)
+                    for (name, _), result in zip(pending, results)
+                    if not isinstance(result, BaseException)
+                ),
+                return_exceptions=True,
+            )
+            raise fatal
+
+        for (name, _), result in zip(pending, results):
+            if isinstance(result, BaseException):
+                e = result
+                logger.error(
+                    f"Failed to load agent '{name}': {e}",
+                    exc_info=(type(e), e, e.__traceback__),
+                )
                 self._init_failures.append((name, e))
+                continue
+            self._register_agent(name, result)
+            loaded += 1
         return loaded
 
     @property

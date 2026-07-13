@@ -160,6 +160,31 @@ test('client.getCapabilities returns the host-supplied map', () => {
     assert.deepEqual(client.getCapabilities(), caps);
 });
 
+test('late capability response from a prior agent cannot overwrite selection', async () => {
+    const pending = new Map();
+    const fetchFn = (url) => new Promise((resolve) => pending.set(url, resolve));
+    const client = makeClient({ fetchFn });
+
+    client.setHostAgent('Kite');
+    const kiteRefresh = client.refreshCapabilities({ expectedAgent: 'Kite' });
+    client.setHostAgent('Tern');
+    const ternRefresh = client.refreshCapabilities({ expectedAgent: 'Tern' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    pending.get('/api/agents/Tern/api/ui/capabilities')(
+        jsonResponse(200, { capabilities: { chat: false, identity: true } }),
+    );
+    await ternRefresh;
+    assert.equal(client.hasCapability('chat'), false);
+
+    pending.get('/api/agents/Kite/api/ui/capabilities')(
+        jsonResponse(200, { capabilities: { chat: true, identity: false } }),
+    );
+    await kiteRefresh;
+    assert.equal(client.hasCapability('chat'), false, 'Tern capability must remain active');
+    assert.equal(client.hasCapability('identity'), true, 'late Kite response must be dropped');
+});
+
 // --- deep-link defense: per-panel loaders short-circuit ---
 //
 // These verify that when a host disables a panel, the loaders do NOT

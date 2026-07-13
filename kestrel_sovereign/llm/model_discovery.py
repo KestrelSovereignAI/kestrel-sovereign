@@ -66,7 +66,8 @@ class ModelDiscoveryMixin:
         use_cache: bool = True,
         featured_only: bool = False,
         category: Optional[ModelCategory] = None,
-        providers: Optional[List[str]] = None
+        providers: Optional[List[str]] = None,
+        stale_while_revalidate: bool = False,
     ) -> List[ModelInfo]:
         """
         Discover all available models from all configured providers.
@@ -76,6 +77,10 @@ class ModelDiscoveryMixin:
             featured_only: Only return featured models
             category: Filter by category (CHAT, EMBEDDING, etc.)
             providers: Filter by provider names
+            stale_while_revalidate: When the cache is expired but populated,
+                return its last catalog immediately and coalesce one background
+                provider refresh. Intended for latency-sensitive catalog UI;
+                live routing remains server-authoritative.
 
         Returns:
             List of ModelInfo objects, enriched with catalog data
@@ -83,8 +88,7 @@ class ModelDiscoveryMixin:
         # Check shared process-wide cache
         shared_cache = get_shared_model_cache()
         if use_cache:
-            cached = shared_cache.get()
-            if cached is not None:
+            async def _return_cached(cached_models: List[ModelInfo]) -> List[ModelInfo]:
                 logger.debug("Using shared model cache")
                 # Resolve THIS instance's ``model="auto"`` routes against the
                 # cached models before returning. A route registered after the
@@ -94,7 +98,7 @@ class ModelDiscoveryMixin:
                 # ``_resolve_auto_providers`` pass that only runs on a cache
                 # miss — leaving it unresolved even when the cached snapshot
                 # already contains that vendor's models (#2247).
-                self._resolve_auto_providers(cached)
+                self._resolve_auto_providers(cached_models)
                 # Same reason applies to embedding capabilities (#2338): the
                 # early return would otherwise skip the reconcile pass that only
                 # runs on a cache miss, leaving a dynamically-discovered
@@ -102,10 +106,36 @@ class ModelDiscoveryMixin:
                 # instance even though its embedding catalog is discoverable.
                 await self.reconcile_embedding_capabilities(use_cache=True)
                 return self._filter_models(
-                    cached,
+                    cached_models,
                     featured_only=featured_only,
                     category=category,
-                    providers=providers
+                    providers=providers,
+                )
+
+            cached = shared_cache.get()
+            if cached is not None:
+                return await _return_cached(cached)
+
+            if (
+                not stale_while_revalidate
+                and await shared_cache.wait_for_refresh()
+            ):
+                cached = shared_cache.get()
+                if cached is not None:
+                    return await _return_cached(cached)
+
+            stale = shared_cache.get_any() if stale_while_revalidate else None
+            if stale is not None:
+                logger.debug("Serving stale model catalog while refreshing")
+                self._resolve_auto_providers(stale)
+                shared_cache.refresh_in_background(
+                    lambda: self.discover_all_models(use_cache=False)
+                )
+                return self._filter_models(
+                    stale,
+                    featured_only=featured_only,
+                    category=category,
+                    providers=providers,
                 )
 
         logger.info("Discovering models per vendor...")

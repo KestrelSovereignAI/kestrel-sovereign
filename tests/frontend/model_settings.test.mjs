@@ -34,7 +34,11 @@ function createSelect() {
         style: {},
         options: [],
         addEventListener(type, fn) { (handlers[type] = handlers[type] || []).push(fn); },
+        removeEventListener(type, fn) {
+            handlers[type] = (handlers[type] || []).filter(handler => handler !== fn);
+        },
         _fire(type) { (handlers[type] || []).forEach(fn => fn()); },
+        _listenerCount(type) { return (handlers[type] || []).length; },
     };
 }
 
@@ -293,7 +297,7 @@ test('an explicit commit clears the auto flag so the button stops saying "Auto" 
 // Embeddings section
 // ---------------------------------------------------------------------------
 
-function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
+function loadEmbeddings({ settings, routes, fetchImpl, onInvalidate } = {}) {
     const modeSelect = createSelect();
     const routeSelect = createSelect();
     const dimReadout = { textContent: '', style: {} };
@@ -349,6 +353,7 @@ function loadEmbeddings({ settings, routes, fetchImpl } = {}) {
         reindexEndpoint: '/api/embedding/reindex',
         confirm: () => true,
         getEmbeddingRoutes: () => routes || [],
+        invalidateModelCatalog: onInvalidate,
     });
     return { embeddings, modeSelect, routeSelect, dimReadout, warningEl, sharedSpaceEl, reindexButton, reindexStatus, posts };
 }
@@ -370,6 +375,26 @@ test('embeddings defaults to Auto — follow chat provider', async () => {
     assert.equal(modeSelect.value, 'auto');
     // Explicit route select hidden while in auto.
     assert.equal(routeSelect.style.display, 'none');
+});
+
+test('embedding selector destroy removes switch-replaced listeners', async () => {
+    const { embeddings, modeSelect, routeSelect } = loadEmbeddings({
+        settings: {
+            embedding_route: null,
+            resolved_route: 'ollama:local',
+            embedding_model: 'nomic-embed-text',
+            embedding_dim: 768,
+            kestrel_embedding_dim: 768,
+        },
+    });
+
+    await embeddings.init();
+    assert.equal(modeSelect._listenerCount('change'), 1);
+    assert.equal(routeSelect._listenerCount('change'), 1);
+
+    embeddings.destroy();
+    assert.equal(modeSelect._listenerCount('change'), 0);
+    assert.equal(routeSelect._listenerCount('change'), 0);
 });
 
 test('embeddings render a verified shared local/cloud space as one entry (#2290)', async () => {
@@ -710,6 +735,7 @@ test('rebinding on agent switch does not stack handlers — one click, one POST 
 });
 
 test('embeddings explicit selection round-trips to the API', async () => {
+    let invalidations = 0;
     const { embeddings, modeSelect, routeSelect, posts } = loadEmbeddings({
         settings: {
             embedding_route: null,
@@ -719,6 +745,7 @@ test('embeddings explicit selection round-trips to the API', async () => {
             kestrel_embedding_dim: 768,
         },
         routes: [{ vendor: 'openai', route: 'api' }, { vendor: 'ollama', route: 'local' }],
+        onInvalidate: () => { invalidations += 1; },
     });
     await embeddings.init();
 
@@ -732,6 +759,7 @@ test('embeddings explicit selection round-trips to the API', async () => {
     assert.equal(posts.length, 1);
     assert.equal(posts[0].embedding_route, 'openai:api');
     assert.equal(embeddings.mode, 'explicit');
+    assert.equal(invalidations, 1);
 
     // Switching back to Auto clears the pin (embedding_route: null).
     modeSelect.value = 'auto';

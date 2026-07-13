@@ -106,12 +106,17 @@ async def test_streaming_text_real():
 @pytest.mark.asyncio
 async def test_vision_call_gpt55_real():
     """Live multimodal smoke: Chat image_url input reaches Codex as an
-    input_image part and the model can answer from the image."""
+    app-server image input and the model can answer from the image."""
     adapter = CodexAdapter()
     red_png = (
         "data:image/png;base64,"
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4"
-        "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABLUlEQVR4nO3T"
+        "MREAMAwDsST8ObcwtLwIePjzvol0dD0F0HoAVgCsAFgBsAJgBcAKgBUAKwBW"
+        "AKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAK"
+        "gBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgB"
+        "sAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsA"
+        "VgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXA"
+        "CoAVACsAVgCsAFgBsAKM9QHP4QH/xCXf5QAAAABJRU5ErkJggg=="
     )
     try:
         resp = await adapter.get_response(

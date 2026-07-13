@@ -53,6 +53,10 @@ class EmbeddingSelector {
      * @param {Function} [options.getAuthHeader] Returns an auth-header object.
      * @param {Function} [options.onChange] Called after a successful write with
      *        the fresh settings object.
+     * @param {Function} [options.invalidateModelCatalog] Evicts the owning
+     *        agent's descriptive model catalog after a successful mutation.
+     * @param {Function} [options.isCurrent] False when an agent switch has
+     *        superseded this selector instance.
      */
     constructor(options = {}) {
         this.settingsEndpoint = options.settingsEndpoint || '/api/embedding/settings';
@@ -91,6 +95,9 @@ class EmbeddingSelector {
         this.getEmbeddingRoutes = options.getEmbeddingRoutes || (() => []);
         this.getAuthHeader = options.getAuthHeader || (() => ({}));
         this.onChange = options.onChange || (() => {});
+        this.invalidateModelCatalog = options.invalidateModelCatalog || (() => {});
+        this.isCurrent = options.isCurrent || (() => true);
+        this._eventHandlers = null;
         // True while a reindex job is running — guards the button re-entrancy.
         this._reindexing = false;
 
@@ -107,11 +114,13 @@ class EmbeddingSelector {
     }
 
     async init() {
-        this._bindEvents();
         await this.load();
+        if (this.isCurrent()) this._bindEvents();
     }
 
     _bindEvents() {
+        if (this._eventHandlers) return;
+        this._eventHandlers = [];
         // The popover DOM (mode/route selects, re-embed button, …) persists,
         // but chat.js rebuilds a fresh EmbeddingSelector on every agent switch
         // (loadModels()). Naively re-adding listeners each time stacks handlers
@@ -141,6 +150,17 @@ class EmbeddingSelector {
         }
         element.addEventListener(type, handler);
         element[key] = handler;
+        this._eventHandlers.push({ element, type, handler, key });
+    }
+
+    /** Remove handlers before a switch replaces this selector instance. */
+    destroy() {
+        if (!this._eventHandlers) return;
+        for (const { element, type, handler, key } of this._eventHandlers) {
+            element.removeEventListener?.(type, handler);
+            if (element[key] === handler) delete element[key];
+        }
+        this._eventHandlers = null;
     }
 
     /** Fetch the current settings and render. */
@@ -152,7 +172,9 @@ class EmbeddingSelector {
             };
             const response = await fetch(this.settingsEndpoint, { headers });
             if (!response.ok) return;
-            this.settings = await response.json();
+            const settings = await response.json();
+            if (!this.isCurrent()) return;
+            this.settings = settings;
         } catch (e) {
             return;
         }
@@ -160,6 +182,7 @@ class EmbeddingSelector {
         // option and per-route model picker. A failure here degrades to the
         // route-only UI rather than blocking the settings render.
         await this._loadCatalog();
+        if (!this.isCurrent()) return;
         this.mode = embeddingModeForRoute(this.settings && this.settings.embedding_route);
         this._render();
     }
@@ -273,6 +296,7 @@ class EmbeddingSelector {
      * reloads settings so ``stale_rows`` and the warning refresh.
      */
     async _handleReindexClick() {
+        if (!this.isCurrent()) return;
         if (this._reindexing) return;
         // #2420 — mark busy immediately so the click has feedback while the
         // dry-run probe runs (this also disables the button via _renderReindex),
@@ -380,6 +404,7 @@ class EmbeddingSelector {
             if (!response.ok) {
                 return { ok: false, data, detail: data && data.detail };
             }
+            this.invalidateModelCatalog();
             return { ok: true, data };
         } catch (e) {
             return { ok: false, detail: String(e) };
@@ -471,6 +496,7 @@ class EmbeddingSelector {
     }
 
     _handleUniversalClick() {
+        if (!this.isCurrent()) return;
         if (this._settingUp) return;
         const option = this._universalOption();
         if (!option) return;
@@ -692,6 +718,7 @@ class EmbeddingSelector {
 
     /** Commit a per-route model pin from the picker (probe-on-save, #2337). */
     async _handleModelChange() {
+        if (!this.isCurrent()) return;
         if (this.mode !== 'explicit' || !this.routeSelect || !this.modelSelect) return;
         const route = this.routeSelect.value;
         const model = this.modelSelect.value;
@@ -967,6 +994,7 @@ class EmbeddingSelector {
     }
 
     _handleModeChange() {
+        if (!this.isCurrent()) return;
         const next = this.modeSelect.value;
         if (next === 'auto') {
             this.mode = 'auto';
@@ -989,6 +1017,7 @@ class EmbeddingSelector {
     }
 
     _handleRouteChange() {
+        if (!this.isCurrent()) return;
         if (this.mode !== 'explicit') return;
         this._commit(this.routeSelect.value);
     }
@@ -1035,6 +1064,7 @@ class EmbeddingSelector {
             };
             this.mode = embeddingModeForRoute(this.settings.embedding_route);
             this._render();
+            this.invalidateModelCatalog();
             this.onChange(this.settings);
             return true;
         } catch (e) {

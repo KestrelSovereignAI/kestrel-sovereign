@@ -127,8 +127,14 @@ class _OllamaEmbeddingService:
     async def aembed(self, text):
         if not text:
             return None
+        from kestrel_sovereign.llm.embedding_service import (
+            _prepare_retrieval_document,
+        )
         try:
-            r = await self._client.embed(model=self.model, input=text)
+            r = await self._client.embed(
+                model=self.model,
+                input=_prepare_retrieval_document(text, self.model),
+            )
         except Exception:
             return None
         embeddings = r.get("embeddings") or []
@@ -139,11 +145,31 @@ class _OllamaEmbeddingService:
     async def aembed_batch(self, texts):
         if not texts:
             return []
+        from kestrel_sovereign.llm.embedding_service import (
+            _prepare_retrieval_document,
+        )
         try:
-            r = await self._client.embed(model=self.model, input=list(texts))
+            r = await self._client.embed(
+                model=self.model,
+                input=[_prepare_retrieval_document(text, self.model) for text in texts],
+            )
         except Exception:
             return [None] * len(texts)
         return [list(e) for e in (r.get("embeddings") or [None] * len(texts))]
+
+    async def aembed_query(self, text, *, instruction):
+        from kestrel_sovereign.llm.embedding_service import (
+            _prepare_retrieval_query,
+        )
+        try:
+            r = await self._client.embed(
+                model=self.model,
+                input=_prepare_retrieval_query(text, self.model, instruction),
+            )
+        except Exception:
+            return None
+        embeddings = r.get("embeddings") or []
+        return list(embeddings[0]) if embeddings else None
 
     def describe(self):
         from kestrel_sovereign.llm.embedding_service import (

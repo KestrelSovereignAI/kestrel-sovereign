@@ -73,7 +73,7 @@ export let AGENT_COMMANDS = [
  * Called after agent selection (multi_agent) or during standalone init.
  * Uses API module for proper auth and agent routing.
  */
-export async function loadCommands(apiModule) {
+export async function loadCommands(apiModule, expectedAgent = apiModule?.getHostAgent?.()) {
     if (!apiModule) return;
     // #879: slash-commands hydrate the chat input autocomplete — when the
     // host has its own chat surface, no /api/commands fetch.
@@ -82,6 +82,7 @@ export async function loadCommands(apiModule) {
     }
     try {
         const data = await apiModule.request('/api/commands');
+        if (apiModule.getHostAgent?.() !== expectedAgent) return;
         if (data.commands && data.commands.length > 0) {
             AGENT_COMMANDS = data.commands;
             console.log(`Loaded ${data.count} commands from API`);

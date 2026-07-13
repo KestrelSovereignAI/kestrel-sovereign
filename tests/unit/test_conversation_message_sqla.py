@@ -147,14 +147,29 @@ def test_resolve_embedding_dim_honours_env_override():
     assert resolve_embedding_dim({"KESTREL_EMBEDDING_DIM": "1536"}) == 1536
 
 
-def test_resolve_embedding_dim_without_test_env_uses_active_provider(monkeypatch):
-    """Production no-env path asks the active provider before falling back."""
-    import kestrel_sovereign.storage.sqla.conversation_message as mod
+def test_resolve_embedding_dim_without_env_does_not_construct_provider(monkeypatch):
+    """Schema import stays independent of mutable chat-provider routing."""
+    monkeypatch.delenv("KESTREL_EMBEDDING_DIM", raising=False)
+    assert resolve_embedding_dim() == 768
+
+
+def test_initialized_service_freezes_provider_dim_without_import_time_service(monkeypatch):
+    import kestrel_sovereign.storage.sqla as sqla_package
+    import kestrel_sovereign.storage.sqla.conversation_message as module
 
     monkeypatch.delenv("KESTREL_EMBEDDING_DIM", raising=False)
-    monkeypatch.setattr(mod, "_active_provider_embedding_dim", lambda: 1536)
+    monkeypatch.setattr(module, "CONVERSATION_MESSAGE_EMBEDDING_DIM", 768)
+    monkeypatch.setattr(module, "_embedding_dim_configured_from_service", False)
+    vector_type = module.ConversationMessage.__table__.columns["embedding_vec"].type
+    monkeypatch.setattr(vector_type, "dimension", 768)
+    monkeypatch.setattr(sqla_package, "CONVERSATION_MESSAGE_EMBEDDING_DIM", 768)
+    llm_service = MagicMock()
+    llm_service.get_embedding_service.return_value.embedding_dim = 1536
 
-    assert mod.resolve_embedding_dim() == 1536
+    assert module.configure_embedding_dim_from_service(llm_service) == 1536
+    assert module.CONVERSATION_MESSAGE_EMBEDDING_DIM == 1536
+    assert vector_type.dimension == 1536
+    assert sqla_package.CONVERSATION_MESSAGE_EMBEDDING_DIM == 1536
 
 
 def test_conversation_store_lazy_embedding_service_uses_provider_hook(monkeypatch):

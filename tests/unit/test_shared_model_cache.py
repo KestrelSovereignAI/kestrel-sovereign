@@ -1,5 +1,8 @@
 """Tests for SharedModelCache — process-wide model discovery cache."""
 import time
+import asyncio
+from unittest.mock import MagicMock
+
 import pytest
 
 from kestrel_sovereign.llm.model_cache import SharedModelCache, get_shared_model_cache
@@ -81,6 +84,124 @@ class TestSharedModelCache:
         assert result is not None
         assert len(result) == 1
         assert result[0].id == "new"
+
+    @pytest.mark.asyncio
+    async def test_background_refresh_is_coalesced(self):
+        cache = SharedModelCache()
+        release = asyncio.Event()
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            await release.wait()
+
+        assert cache.refresh_in_background(refresh) is True
+        task = cache._refresh_task
+        assert cache.refresh_in_background(refresh) is False
+        await asyncio.sleep(0.06)
+        assert calls == 1
+
+        release.set()
+        await task
+        await asyncio.sleep(0)
+        assert cache.refresh_in_background(refresh) is True
+        await cache._refresh_task
+
+    @pytest.mark.asyncio
+    async def test_foreground_caller_joins_background_refresh(self):
+        cache = SharedModelCache()
+        cache.set_stale([_make_model("old")])
+        release = asyncio.Event()
+
+        async def refresh():
+            await release.wait()
+            cache.set([_make_model("new")])
+
+        assert cache.refresh_in_background(refresh) is True
+        waiter = asyncio.create_task(cache.wait_for_refresh())
+        await asyncio.sleep(0.06)
+        assert not waiter.done()
+
+        release.set()
+        assert await waiter is True
+        assert cache.get()[0].id == "new"
+
+    @pytest.mark.asyncio
+    async def test_clear_cancels_live_loop_refresh_without_resurrecting_catalog(self):
+        cache = SharedModelCache()
+        started = asyncio.Event()
+
+        async def refresh():
+            started.set()
+            await asyncio.Event().wait()
+            cache.set([_make_model("must-not-return")])
+
+        assert cache.refresh_in_background(refresh) is True
+        task = cache._refresh_task
+        await started.wait()
+
+        cache.clear()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        assert cache.get_any() is None
+        assert cache._refresh_task is None
+
+    @pytest.mark.asyncio
+    async def test_waiter_treats_internal_refresh_cancellation_as_cache_miss(self):
+        cache = SharedModelCache()
+        started = asyncio.Event()
+
+        async def refresh():
+            started.set()
+            await asyncio.Event().wait()
+
+        assert cache.refresh_in_background(refresh) is True
+        waiter = asyncio.create_task(cache.wait_for_refresh())
+        await started.wait()
+
+        cache.clear()
+
+        assert await waiter is False
+        assert not waiter.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_closed_loop_refresh_does_not_wedge_replacement_loop(self):
+        cache = SharedModelCache()
+        stale_task = MagicMock()
+        stale_task.done.return_value = False
+        stale_loop = MagicMock()
+        stale_loop.is_closed.return_value = True
+        cache._refresh_task = stale_task
+        cache._refresh_loop = stale_loop
+
+        refreshed = asyncio.Event()
+
+        async def refresh():
+            refreshed.set()
+
+        assert cache.refresh_in_background(refresh) is True
+        replacement_task = cache._refresh_task
+        assert replacement_task is not stale_task
+        await replacement_task
+        assert refreshed.is_set()
+
+    def test_clear_tolerates_refresh_owned_by_closed_loop(self):
+        cache = SharedModelCache()
+        stale_task = MagicMock()
+        stale_task.done.return_value = False
+        stale_loop = MagicMock()
+        stale_loop.is_closed.return_value = True
+        cache._refresh_task = stale_task
+        cache._refresh_loop = stale_loop
+
+        cache.clear()
+
+        assert cache._refresh_task is None
+        assert cache._refresh_loop is None
+        stale_loop.call_soon_threadsafe.assert_not_called()
 
 
 class TestSharedModelCacheSingleton:

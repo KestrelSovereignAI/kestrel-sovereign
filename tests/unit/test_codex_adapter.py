@@ -318,7 +318,7 @@ class TestTurnInputBuilder:
         assert "user: first" in out and "assistant: ok" in out
         assert out.rstrip().endswith("second")
 
-    def test_image_url_parts_convert_to_responses_input_image(self):
+    def test_image_url_parts_convert_to_app_server_image(self):
         out = _content_to_codex_input_parts([
             {"type": "text", "text": "What is shown?"},
             {
@@ -330,10 +330,10 @@ class TestTurnInputBuilder:
             },
         ])
         assert out == [
-            {"type": "input_text", "text": "What is shown?"},
+            {"type": "text", "text": "What is shown?"},
             {
-                "type": "input_image",
-                "image_url": "data:image/png;base64,AAAA",
+                "type": "image",
+                "url": "data:image/png;base64,AAAA",
                 "detail": "low",
             },
         ]
@@ -353,8 +353,8 @@ class TestTurnInputBuilder:
             fresh_thread=False,
         )
         assert out == [
-            {"type": "input_text", "text": "Describe this"},
-            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "text", "text": "Describe this"},
+            {"type": "image", "url": "data:image/png;base64,AAAA"},
         ]
 
     def test_fresh_thread_keeps_transcript_then_multimodal_parts(self):
@@ -376,12 +376,12 @@ class TestTurnInputBuilder:
             fresh_thread=True,
         )
         assert isinstance(out, list)
-        assert out[0]["type"] == "input_text"
+        assert out[0]["type"] == "text"
         assert "Conversation so far" in out[0]["text"]
         assert "user: remember: tortoise" in out[0]["text"]
         assert out[1:] == [
-            {"type": "input_text", "text": "What color is this?"},
-            {"type": "input_image", "image_url": "data:image/png;base64,BBBB"},
+            {"type": "text", "text": "What color is this?"},
+            {"type": "image", "url": "data:image/png;base64,BBBB"},
         ]
 
 
@@ -599,7 +599,7 @@ class TestAdapterTextPath:
         assert cached_id == "thr-1" and cached_fp  # fingerprint set
 
     @pytest.mark.asyncio
-    async def test_multimodal_user_turn_sends_input_image_part(self):
+    async def test_multimodal_user_turn_materializes_app_server_local_image(self):
         a = _adapter_with(_TEXT_TURN)
         await a.get_response(
             client="ignored",
@@ -620,9 +620,72 @@ class TestAdapterTextPath:
             params for method, params in a._client.requests
             if method == "turn/start"
         ][0]
+        assert turn_params["input"][0] == {
+            "type": "text", "text": "Describe this image.",
+        }
+        image_input = turn_params["input"][1]
+        assert image_input["type"] == "localImage"
+        assert image_input["path"].endswith(".png")
+        assert not Path(image_input["path"]).exists()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_inline_image_does_not_abort_text_turn(self):
+        a = _adapter_with(_TEXT_TURN)
+        unsupported = "data:image/heic;base64,AAAA"
+
+        response = await a.get_response(
+            client="ignored",
+            model="auto",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Answer from the text if needed."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": unsupported},
+                    },
+                ],
+            }],
+            session_id="unsupported-vision",
+        )
+
+        assert response.content == "Hello"
+        turn_params = [
+            params for method, params in a._client.requests
+            if method == "turn/start"
+        ][0]
         assert turn_params["input"] == [
-            {"type": "input_text", "text": "Describe this image."},
-            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            {"type": "text", "text": "Answer from the text if needed."},
+            {"type": "image", "url": unsupported},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_corrupt_inline_image_is_dropped_without_aborting_text_turn(self):
+        a = _adapter_with(_TEXT_TURN)
+
+        response = await a.get_response(
+            client="ignored",
+            model="auto",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Keep this text."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,not valid!"},
+                    },
+                ],
+            }],
+            session_id="corrupt-vision",
+        )
+
+        assert response.content == "Hello"
+        turn_params = [
+            params for method, params in a._client.requests
+            if method == "turn/start"
+        ][0]
+        assert turn_params["input"] == [
+            {"type": "text", "text": "Keep this text."},
         ]
 
     @pytest.mark.asyncio

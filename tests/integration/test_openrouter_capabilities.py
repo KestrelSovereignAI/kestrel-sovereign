@@ -140,7 +140,7 @@ class TestOpenRouterToolCalling:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "anthropic/claude-3.5-haiku",
+                    "model": "anthropic/claude-haiku-4.5",
                     "messages": [
                         {"role": "system", "content": "You must use the get_weather tool to answer weather questions."},
                         {"role": "user", "content": "What's the weather in Paris?"}
