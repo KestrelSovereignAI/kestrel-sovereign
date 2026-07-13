@@ -89,11 +89,12 @@ slot registry must satisfy and then supersede:
 
 ## 2. Zone taxonomy
 
-Eight zone ids form a closed id space. Five are **inline positional** zones
-governed by the `UIContribution` contract in §3. Three (`chat-message-renderers`,
-`nav-tabs`, `panel-root`) are listed for completeness and id-space closure but
-are governed by ticket 06's separate registries; their rows note the owning
-contract.
+Nine zone ids form a closed id space. Five are **inline positional** zones
+governed by the `UIContribution` contract in §3. One (`chat-message-actions`,
+§2.6) is **item-provider-shaped** — contributions supply menu items, not DOM.
+Three (`chat-message-renderers`, `nav-tabs`, `panel-root`) are listed for
+completeness and id-space closure but are governed by ticket 06's separate
+registries; their rows note the owning contract.
 
 Each inline zone defines: **stable id · context contract · anchor semantics ·
 retrigger events**.
@@ -175,7 +176,26 @@ retrigger events**.
   when first shown), `capabilities:changed` (a sub-section's gate mirrors
   `resources.js`'s per-sub-capability checks).
 
-### 2.6 Zones owned by ticket 06 (id-space closure only)
+### 2.6 `chat-message-actions` (item-provider slot, #2410)
+
+- **id:** `chat-message-actions`
+- **Cardinality:** one lazy evaluation per message-bubble kebab (⋯) *open* —
+  the builder (`static/js/message_kebab.js`) calls `UI.collectItems` each time a
+  bubble's menu opens, so items reflect current state and features registered
+  after page load still appear.
+- **Context:** `{ messageId, role, metadata, agent }`
+  (`ChatMessageActionsContext`). Scoped to one message bubble.
+- **Shape:** **item-provider**, NOT DOM. A contribution supplies
+  `items: (ctx) => [{ label, danger?, separatorBefore?, onSelect }]`
+  (`MessageActionsContribution` / `MessageActionsItem`). It is never mounted by
+  `renderSlot`; `UI.collectItems('chat-message-actions', ctx)` gathers items
+  across contributions — gated by `gate(ctx)`, ordered by `order`, and each
+  provider **error-isolated** so a throwing contribution never drops the base
+  Move-to-trash / Delete-permanently items. Feature items land **above** the
+  destructive separator. This is the single sanctioned surface for per-message
+  actions: features contribute menu items, never overlay buttons on bubbles.
+
+### 2.7 Zones owned by ticket 06 (id-space closure only)
 
 | id | Owning contract | Note |
 |---|---|---|

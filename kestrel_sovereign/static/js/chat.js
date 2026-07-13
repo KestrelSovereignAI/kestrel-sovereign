@@ -14,6 +14,7 @@ import {
     renderToSafeHtml,
     mountRenderers,
 } from './ui-ext/renderers.js';
+import { buildMessageKebab } from './message_kebab.js';
 
 let _deps = {
     api: null,
@@ -2011,29 +2012,7 @@ export function renderSignalWakeChip(msg, target = null) {
     if (msg.id) div.dataset.messageId = msg.id;
 
     if (msg.id) {
-        const deleteBtn = document.createElement('button');
-        deleteBtn.className = 'msg-delete-btn';
-        deleteBtn.title = 'Move to trash';
-        deleteBtn.textContent = '✕';
-        deleteBtn.onclick = (e) => {
-            e.stopPropagation();
-            if (typeof window.deleteMessage === 'function') {
-                window.deleteMessage(msg.id, div);
-            }
-        };
-        div.appendChild(deleteBtn);
-
-        const purgeBtn = document.createElement('button');
-        purgeBtn.className = 'msg-purge-btn';
-        purgeBtn.title = 'Delete permanently (cannot be restored)';
-        purgeBtn.textContent = '⊘';
-        purgeBtn.onclick = (e) => {
-            e.stopPropagation();
-            if (typeof window.purgeMessage === 'function') {
-                window.purgeMessage(msg.id, div);
-            }
-        };
-        div.appendChild(purgeBtn);
+        div.appendChild(buildMessageKebab(msg, div, deps().api));
     }
 
     const attribution = document.createElement('div');

@@ -15,6 +15,7 @@ import { generateIdenticon } from './identicon.js';
 // the sidebar-specific hooks (agent pinning, #714 auto-load, chat-state
 // coordination on delete) through the component's config.
 import { mountConversationsPane } from './conversations.js';
+import { buildMessageKebab } from './message_kebab.js';
 // #2278: the standalone agents pane is now a `mountAgentList` consumer — one
 // list orchestrator (adapter fetch / render / selection / per-card
 // `agent-card-actions` slot / active highlight) shared with embedding hosts
@@ -1439,37 +1440,11 @@ export function _pickMostRecentConversation(conversations) {
 // Mirrors ``history.js::renderAssistantWithParts`` at this loader's simpler
 // altitude (no tool-card interleaving): the first rendered bubble anchors the
 // message id + delete control + model footer so they aren't duplicated.
-// Message-level controls shared by every bubble this loader paints: soft
-// delete (✕, #763) and permanent purge (⊘, #765) — both handlers live in
-// history.js and are shared across loaders. Ported from the legacy loader's
-// affordance set (#2380 codex P2: purge was loader-only and got dropped).
-function buildMessageDeleteBtn(messageId, node) {
-    const btn = document.createElement('button');
-    btn.className = 'msg-delete-btn';
-    btn.title = 'Delete message';
-    btn.textContent = '✕';
-    btn.onclick = (e) => {
-        e.stopPropagation();
-        if (typeof window.deleteMessage === 'function') {
-            window.deleteMessage(messageId, node);
-        }
-    };
-    return btn;
-}
-
-function buildMessagePurgeBtn(messageId, node) {
-    const btn = document.createElement('button');
-    btn.className = 'msg-purge-btn';
-    btn.title = 'Delete permanently (cannot be restored)';
-    btn.textContent = '⊘';
-    btn.onclick = (e) => {
-        e.stopPropagation();
-        if (typeof window.purgeMessage === 'function') {
-            window.purgeMessage(messageId, node);
-        }
-    };
-    return btn;
-}
+// Message-level controls shared by every bubble this loader paints: a single
+// hover-revealed kebab (⋯) menu carrying soft delete (#763) and permanent purge
+// (#765) — both handlers live in history.js and are shared across loaders. The
+// kebab builder lives in message_kebab.js so chat.js's signal-wake chips and
+// both of this file's loaders share one surface (#2410).
 
 // KaTeX post-pass for reloaded assistant markup: renderAgentContentHtml
 // returns sanitized markdown HTML only — math delimiters render via the
@@ -1510,8 +1485,7 @@ function renderAssistantMessageWithParts(msg, container) {
         if (anchored) return;
         anchored = true;
         if (msg.id) {
-            node.appendChild(buildMessageDeleteBtn(msg.id, node));
-            node.appendChild(buildMessagePurgeBtn(msg.id, node));
+            node.appendChild(buildMessageKebab(msg, node));
         }
         const footer = renderModelFooterHtml({ model: msg.model, provider: msg.provider });
         if (footer) node.insertAdjacentHTML('beforeend', footer);
@@ -1915,17 +1889,16 @@ window.loadConversation = async function(sessionId, options = {}) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${msg.role === 'user' ? 'user-message' : 'agent-message'}`;
 
-            // Hover-reveal delete control.  Shares CSS (.msg-delete-btn)
-            // and the window.deleteMessage handler with history.js — the
-            // intent is that every rendered historical message is
+            // Hover-reveal kebab (⋯) menu.  Shares the builder (message_kebab.js)
+            // and the window.deleteMessage/purgeMessage handlers with history.js
+            // — the intent is that every rendered historical message is
             // deletable, regardless of WHICH loader painted it.  Before
             // issue #715 this was only on the history-panel path, so
             // users loading a conversation from the sidebar saw no way
             // to delete anything.
             if (msg.id) {
                 messageDiv.dataset.messageId = msg.id;
-                messageDiv.appendChild(buildMessageDeleteBtn(msg.id, messageDiv));
-                messageDiv.appendChild(buildMessagePurgeBtn(msg.id, messageDiv));
+                messageDiv.appendChild(buildMessageKebab(msg, messageDiv));
             }
 
             if (isEncrypted) {

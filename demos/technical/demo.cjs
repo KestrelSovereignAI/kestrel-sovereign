@@ -697,7 +697,7 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
         await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-rename-applied');
 
         // Beat 3: Delete a single message from within a conversation.
-        narrator.narrate('Per-message delete: hover a bubble, hit the ✕ — the single message is gone from history. No need to wipe the whole session.');
+        narrator.narrate('Per-message delete: hover a bubble, open the ⋯ kebab, pick "Move to trash" — the single message is gone from history. No need to wipe the whole session.');
         await navigateToPanel(page, 'chat');
         await dismissContextWarning(page);
         await demoPause(page, 1000);
@@ -709,13 +709,20 @@ test.describe.serial('Kestrel Sovereign Technical Demo', () => {
                 await target.scrollIntoViewIfNeeded();
                 await target.hover();
                 await demoPause(page, 700);
-                const msgDelete = target.locator('.msg-delete-btn').first();
-                if (await msgDelete.count() > 0) {
+                const msgKebab = target.locator('.msg-kebab-btn').first();
+                if (await msgKebab.count() > 0) {
                     await demoScreenshot(narrator, page, OUTPUT_DIR, 'memory-message-delete-hover');
-                    await msgDelete.click();
-                    await demoPause(page, 1500);
+                    await msgKebab.click();
+                    await demoPause(page, 700);
+                    const trashItem = page.locator('.kebab-menu-item', { hasText: 'Move to trash' }).first();
+                    if (await trashItem.count() > 0) {
+                        await trashItem.click();
+                        await demoPause(page, 1500);
+                    } else {
+                        narrator.narrate('[narrator] "Move to trash" menu item not visible — skipping beat 3 click.');
+                    }
                 } else {
-                    narrator.narrate('[narrator] Per-message delete button not visible — skipping beat 3 click.');
+                    narrator.narrate('[narrator] Per-message kebab button not visible — skipping beat 3 click.');
                 }
             }
         } catch (e) {
