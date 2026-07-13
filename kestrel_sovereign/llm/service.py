@@ -68,6 +68,16 @@ _LAST_RESPONSE_IDENTITY: ContextVar[Optional[Dict[str, Optional[str]]]] = (
 _MODEL_IGNORING_VENDORS = frozenset({"llama_cpp", "ollama"})
 
 
+class EmbeddingSpaceConflictError(Exception):
+    """A route pin would fragment a VERIFIED shared embedding space (#2440).
+
+    Raised at set time when an operator tries to pin a route to a model/dim that
+    differs from the verified shared space the route is a member of. Kept
+    distinct from ``ValueError`` so the endpoint can map it to a 409 (conflict)
+    rather than the 400 a malformed request gets.
+    """
+
+
 class AuditResult(BaseModel):
     """Structured result of a response-integrity audit.
 
@@ -982,6 +992,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         clearing = model is None or (isinstance(model, str) and not model.strip())
 
+        # Shared-space coherence gate (#2440): refuse a pin that would fragment a
+        # VERIFIED shared space BEFORE mutating capabilities/overrides. The async
+        # setter runs this too (as a pre-check that also skips the live probe),
+        # but production boot/settings/reindex hydration re-applies persisted
+        # pins through THIS synchronous path — so a pre-existing conflicting
+        # stored pin must be rejected here as well, not silently re-applied.
+        if not clearing:
+            self._check_route_pin_space_coherent(route, model.strip(), dim)
+
         if provider is not None:
             caps = provider.get("capabilities")
             if not isinstance(caps, dict):
@@ -1071,6 +1090,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     f"Cannot set embedding_model: no configured route matches "
                     f"'{route.strip()}'. Known routes: {known or '(none)'}."
                 )
+            # Shared-space coherence gate (#2440): a route that is a member of a
+            # VERIFIED shared space (#2290/#2376) cannot be pinned to a
+            # model/dim that differs from the space's — that would fragment the
+            # verified space. The old behaviour accepted+stored such a pin but
+            # silently let the space win, echoing a model that never took
+            # effect. Refuse at set time (matches the #2417 refuse-at-set-time
+            # philosophy) so the operator clears the space or chooses its model
+            # instead of receiving a phantom pin.
+            self._check_route_pin_space_coherent(route.strip(), model.strip(), dim)
             # Dim-compatibility gate (#2417): the pinned model resolves to a
             # known dim (the explicit ``dim`` the UI passes from the catalog's
             # native_dim, else the route's declared capability dim). If it
@@ -2346,6 +2374,47 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             if pin.covers(name, vendor):
                 return pin
         return None
+
+    def _check_route_pin_space_coherent(
+        self, route: str, model: str, dim: Optional[int]
+    ) -> None:
+        """Refuse a route pin that would fragment a VERIFIED shared space (#2440).
+
+        A route that is a member of a shared-space pin whose parity probe has
+        PASSED (#2290/#2376) is locked to the space's model/dim. Pinning a
+        different model — or the same model at a different dim — would fragment
+        that verified space, so it is refused with an
+        :class:`EmbeddingSpaceConflictError` (mapped to a 409 by the endpoint).
+        Unverified pins do NOT constrain a member: only a verified space wins,
+        which is exactly the precedence the resolver already applies.
+        """
+        provider = self._find_route_provider(route)
+        pin = self._pin_for_provider(provider)
+        if pin is None:
+            return
+        parity = self._verified_space_pins.get(pin.name)
+        if not (parity and parity.passed):
+            return
+        # Compare on the vendor-neutral identity (#2440): the shared-space stack
+        # treats a route-native alias and the pin's slug as the SAME model
+        # (``qwen3-embedding:8b`` ⇄ ``qwen/qwen3-embedding-8b``). Universal setup
+        # pins each member's own route slug, so a raw string compare would
+        # falsely 409 a no-op re-pin / rollback against the verified space.
+        from .embedding_discovery import normalize_embedding_model_id
+
+        model_conflict = normalize_embedding_model_id(
+            model
+        ) != normalize_embedding_model_id(pin.model or "")
+        dim_conflict = (
+            dim is not None and pin.dim is not None and int(dim) != int(pin.dim)
+        )
+        if not (model_conflict or dim_conflict):
+            return
+        raise EmbeddingSpaceConflictError(
+            f"route {route!r} is a member of verified shared space "
+            f"{pin.name!r} ({pin.model}@{pin.dim}) — clear the space or choose "
+            f"its model; pinning {model.strip()} would fragment the space."
+        )
 
     def _shared_space_payload(
         self, provider: Optional[Dict[str, Any]]
