@@ -310,6 +310,163 @@ async def test_empty_source_text_is_skipped_not_stamped(db):
     assert stats.skipped_empty == 1
 
 
+# -------------------------------------------------- #2427 halving-retry
+
+
+class FirstCallDropsThenSucceeds:
+    """All-None on the FIRST ``aembed_batch`` call, real vectors after.
+
+    Models a transient Ollama runner recycle (``… EOF``): the whole first
+    batch call comes back empty, but the split retry succeeds. No poison row —
+    every row must be recovered.
+    """
+
+    def __init__(self, *, dim: int = DIM):
+        self.embedding_dim = dim
+        self._dim = dim
+        self.calls = 0
+
+    async def aembed_batch(self, texts):
+        self.calls += 1
+        if self.calls == 1:
+            return [None for _ in texts]
+        return [[float(len(t) % 7) + 1.0 + i for i in range(self._dim)] for t in texts]
+
+    def current_profile_id(self) -> str:
+        return TARGET
+
+    def describe(self):
+        return None
+
+
+class PoisonsWholeBatch:
+    """All-None whenever a specific poison text is in the batch, else real vectors.
+
+    Halving must isolate the poison row down to a size-1 batch that fails
+    alone — every other row re-embeds.
+    """
+
+    def __init__(self, poison: str, *, dim: int = DIM):
+        self.embedding_dim = dim
+        self._dim = dim
+        self._poison = poison
+        self.calls = 0
+
+    async def aembed_batch(self, texts):
+        self.calls += 1
+        if any(t == self._poison for t in texts):
+            return [None for _ in texts]
+        return [[float(len(t) % 7) + 1.0 + i for i in range(self._dim)] for t in texts]
+
+    def current_profile_id(self) -> str:
+        return TARGET
+
+    def describe(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_transient_batch_drop_recovers_via_halved_retry(db, caplog):
+    import logging
+
+    # Four stale document chunks in one batch; the first embed call drops the
+    # whole batch (runner recycle), the split retry succeeds.
+    for i in range(4):
+        await db.execute_commit(
+            "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
+            "VALUES (?, ?, ?)",
+            (f"h{i}", f"chunk text number {i}", OTHER),
+        )
+    svc = FirstCallDropsThenSucceeds()
+    reindexer = EmbeddingReindexer(
+        db, svc, TARGET, column_dim=DIM, batch_size=50, retry_backoff_s=0.0
+    )
+
+    with caplog.at_level(logging.INFO, logger="kestrel_sovereign.storage.embedding_reindex"):
+        stats = await reindexer.reindex_table("document_chunks")
+
+    assert stats.reembedded == 4
+    assert stats.failed == 0
+    assert svc.calls >= 2  # first call dropped, retried split in half
+    assert any("retrying split in half" in r.message for r in caplog.records)
+    # Nothing stale remains — the transient blip cost nothing.
+    assert await reindexer.count_stale("document_chunks") == 0
+
+
+@pytest.mark.asyncio
+async def test_poison_row_isolated_by_halved_retry(db):
+    # One poison chunk among four; the batch fails wholesale whenever the poison
+    # is present. Recursive halving must isolate it: 3 re-embedded, 1 failed.
+    poison = "POISON ROW CONTENT"
+    await db.execute_commit(
+        "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
+        "VALUES (?, ?, ?)",
+        ("poison", poison, OTHER),
+    )
+    for i in range(3):
+        await db.execute_commit(
+            "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
+            "VALUES (?, ?, ?)",
+            (f"ok{i}", f"good chunk {i}", OTHER),
+        )
+    svc = PoisonsWholeBatch(poison)
+    reindexer = EmbeddingReindexer(
+        db, svc, TARGET, column_dim=DIM, batch_size=50, retry_backoff_s=0.0
+    )
+
+    stats = await reindexer.reindex_table("document_chunks")
+
+    assert stats.reembedded == 3
+    assert stats.failed == 1
+    # The poison row alone stays stale; the other three flipped to target.
+    rows = await db.fetchall(
+        "SELECT file_hash, embedding_profile_id FROM document_chunks ORDER BY file_hash",
+        (),
+    )
+    by_hash = {r[0]: r[1] for r in rows}
+    assert by_hash["poison"] == OTHER
+    assert all(by_hash[f"ok{i}"] == TARGET for i in range(3))
+
+
+@pytest.mark.asyncio
+async def test_split_retry_budget_is_bounded(db):
+    # A fully dead service must not recurse forever: with the retry budget
+    # exhausted, every row is still written off as failed and the run ends.
+    for i in range(8):
+        await db.execute_commit(
+            "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
+            "VALUES (?, ?, ?)",
+            (f"d{i}", f"dead chunk {i}", OTHER),
+        )
+
+    class Dead:
+        embedding_dim = DIM
+
+        def __init__(self):
+            self.calls = 0
+
+        async def aembed_batch(self, texts):
+            self.calls += 1
+            return [None for _ in texts]
+
+        def current_profile_id(self):
+            return TARGET
+
+        def describe(self):
+            return None
+
+    svc = Dead()
+    reindexer = EmbeddingReindexer(
+        db, svc, TARGET, column_dim=DIM, batch_size=50,
+        retry_backoff_s=0.0, max_split_retries=3,
+    )
+    stats = await reindexer.reindex_table("document_chunks")
+    assert stats.reembedded == 0
+    assert stats.failed == 8
+    # Retries were capped — not one call per possible split of 8 rows.
+    assert svc.calls <= 1 + 3 * 2
+
+
 # --------------------------------------------------- CLI refusal / dim guard
 
 
