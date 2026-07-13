@@ -1826,6 +1826,21 @@ async def set_route_embedding_model(request: Request):
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
+        # #2418 — drain the persistence write scheduled by the pin/clear BEFORE
+        # returning. Guided Universal setup issues these POSTs in sequence (pin a
+        # member, then on a later failure clear it as rollback); each pin/clear
+        # schedules an async persist of the full override map snapshotted at
+        # schedule time. Without draining, an earlier "partial pin" write can
+        # land AFTER the rollback "cleared" write and resurrect the partial state
+        # on restart. Draining per request serializes the writes so the response
+        # only returns once THIS request's override map is durably persisted.
+        drain = getattr(agent.llm_service, "drain_preference_persistence", None)
+        if callable(drain):
+            try:
+                await drain()
+            except Exception as e:  # pragma: no cover - persistence is best-effort
+                logger.debug(f"preference persistence drain failed: {e}")
+
         # Echo the settings for the PINNED route through the single #2372
         # resolver so the response reflects THIS route's own slug — not whatever
         # the globally-resolved embedding provider (embedding_route/chat) picks

@@ -2140,6 +2140,25 @@ a.todo-link:hover { text-decoration: underline; }
     color: var(--text-secondary, var(--text-primary));
 }
 
+/* #2418 — the guided-setup status line must never wear success styling
+   around a failure. Each state (set by EmbeddingSelector._setSetupStatus as
+   both a class and a data-status attr) reads as one unmistakable outcome:
+   configured (ok), failed (error), degraded (warn), or in-flight (pending). */
+.embedding-setup-status.embed-setup-ok {
+    color: var(--success, #16a34a);
+}
+.embedding-setup-status.embed-setup-error {
+    color: var(--danger, #dc2626);
+    font-weight: 600;
+}
+.embedding-setup-status.embed-setup-warn {
+    color: var(--warning, #d97706);
+}
+.embedding-setup-status.embed-setup-pending {
+    color: var(--text-secondary, var(--text-primary));
+    opacity: 0.85;
+}
+
 /* Model Controls Container */
 .model-controls {
     display: flex;
