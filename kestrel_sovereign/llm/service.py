@@ -114,11 +114,18 @@ def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
         route:      e.g. ``"api"`` — None when the mandate specifies only a vendor.
         model_name: the model ID.
         model:      display form ``"<vendor>/<model_name>"`` or ``"<vendor>:<route>/<model_name>"``.
+        is_auto:    True when no model is pinned in the mandate, so ``model_name``
+                    is an auto-resolved default that can silently change as the
+                    provider lineup shifts (#2419). Callers surface this so an
+                    unchosen model change reads as auto-drift, not a set setting.
     """
     pref = llm_service.get_model_preference() or {}
     model_name = pref.get("model")
     vendor = pref.get("vendor")
     route = pref.get("route")
+    # Auto = the operator never pinned a model; routing picks the default for
+    # whichever route runs. A pinned mandate carries a truthy ``model``.
+    is_auto = not model_name
 
     providers = getattr(llm_service, "providers", None)
     if not model_name and providers:
@@ -141,6 +148,7 @@ def resolve_active_model_selection(llm_service) -> Dict[str, Optional[str]]:
         "vendor": vendor,
         "route": route,
         "model_name": model_name,
+        "is_auto": is_auto,
     }
 
 

@@ -72,6 +72,12 @@ class ModelSelector {
         this.selectedProvider = '';
         this.selectedModel = '';
         this.selectedRoute = '';
+        // Whether the active model is auto-resolved (no pinned mandate) rather
+        // than an explicit operator choice. Seeded from ``/api/model/current``'s
+        // ``is_auto`` flag and cleared on any explicit pick so the header button
+        // can distinguish "Auto — currently <model>" from a chosen model
+        // (#2419). Not persisted — it mirrors server truth, re-read on sync.
+        this._isAuto = false;
         // Meta-provider upstream filter. Sentinel ``'All'`` = no filter. This is
         // pure display state (never sent to the server) so it is kept in memory
         // and restored from localStorage like the other picks. See #2264.
@@ -537,6 +543,8 @@ class ModelSelector {
             return;  // state matches server — no POST
         }
         this._lastSyncedSelection = { vendor, model, route };
+        // An explicit operator pick pins the model — no longer auto (#2419).
+        this._isAuto = false;
         this.onModelChange(vendor, model, this.isInitialLoad, route);
     }
 
@@ -621,6 +629,11 @@ class ModelSelector {
 
             const data = await response.json();
             if (!data.model) return;
+
+            // Auto-resolution flag (#2419): the server tells us whether the
+            // active model is a pinned mandate or an auto default. Capture it
+            // so getSummary() can label auto-drift on the header button.
+            this._isAuto = !!data.is_auto;
 
             // Canonical shape: /api/model/current returns
             //   {vendor, route, model_name, model: "<vendor>[:<route>]/<model_name>"}
@@ -755,6 +768,9 @@ class ModelSelector {
                     model: this.selectedModel,
                     route: this.selectedRoute || null,
                 };
+                // A confirmed model change reflects a concrete selection, not
+                // an auto default (#2419).
+                this._isAuto = false;
                 return true;
             }
         } catch (e) {
@@ -836,6 +852,41 @@ class ModelSelector {
                 ? this.selectedUpstream
                 : null,
         };
+    }
+
+    /**
+     * Build the at-a-glance label for the model-settings header button (#2419).
+     *
+     * Reads the same resolved state the popover drives — vendor / route / model
+     * plus the auto-resolution flag — so the button never disagrees with the
+     * panel. When the preference is auto the label is ``"Auto — currently
+     * <model>"`` so an unchosen model change reads as auto-drift rather than a
+     * setting someone changed. Otherwise it is ``"<model> · <Route>"`` (route
+     * suffix omitted when the vendor has a single/unnamed route).
+     *
+     * Returns ``{ isAuto, vendor, route, model, displayName, label }``; ``label``
+     * is ``''`` when no model has resolved yet (caller falls back to a static
+     * "Model settings").
+     */
+    getSummary() {
+        const vendor = this.selectedProvider || '';
+        const route = this.selectedRoute || '';
+        const model = this.selectedModel || '';
+        if (!model) {
+            return { isAuto: this._isAuto, vendor, route, model: '', displayName: '', label: '' };
+        }
+        // Prefer the human display name from the active catalog; fall back to
+        // the bare model id when discovery hasn't surfaced a friendly name.
+        const found = (this._currentModelList() || []).find(m => m.id === model);
+        const displayName = (found && found.display_name) || model;
+        const routeLabel = route ? route.charAt(0).toUpperCase() + route.slice(1) : '';
+        let label;
+        if (this._isAuto) {
+            label = `Auto — currently ${displayName}`;
+        } else {
+            label = routeLabel ? `${displayName} · ${routeLabel}` : displayName;
+        }
+        return { isAuto: this._isAuto, vendor, route, model, displayName, label };
     }
 
     /**

@@ -193,6 +193,103 @@ test('upstream filter is never committed as a routing change', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Header-button summary label (#2419)
+// ---------------------------------------------------------------------------
+
+test('getSummary labels an explicit pick as "<model> · <Route>"', () => {
+    const { selector, providerSelect } = loadSelector();
+    selector.allModelsData = {
+        by_vendor: {
+            openai: [{ id: 'gpt-5.6-luna', provider: 'openai', display_name: 'GPT-5.6 Luna', is_featured: true }],
+        },
+        routes: [{ vendor: 'openai', route: 'plan' }, { vendor: 'openai', route: 'api' }],
+    };
+    providerSelect.value = 'openai';
+    selector.selectedProvider = 'openai';
+    selector.selectedModel = 'gpt-5.6-luna';
+    selector.selectedRoute = 'plan';
+    selector._isAuto = false;
+
+    const summary = selector.getSummary();
+    assert.equal(summary.isAuto, false);
+    assert.equal(summary.label, 'GPT-5.6 Luna · Plan');
+});
+
+test('getSummary labels an auto preference as "Auto — currently <model>"', () => {
+    const { selector, providerSelect } = loadSelector();
+    selector.allModelsData = {
+        by_vendor: {
+            openai: [{ id: 'gpt-5.6-luna', provider: 'openai', display_name: 'GPT-5.6 Luna', is_featured: true }],
+        },
+        routes: [{ vendor: 'openai', route: 'api' }],
+    };
+    providerSelect.value = 'openai';
+    selector.selectedProvider = 'openai';
+    selector.selectedModel = 'gpt-5.6-luna';
+    selector._isAuto = true;
+
+    const summary = selector.getSummary();
+    assert.equal(summary.isAuto, true);
+    assert.equal(summary.label, 'Auto — currently GPT-5.6 Luna');
+});
+
+test('getSummary returns an empty label before any model resolves', () => {
+    const { selector } = loadSelector();
+    const summary = selector.getSummary();
+    assert.equal(summary.label, '');
+});
+
+test('syncWithServer captures the is_auto flag from /api/model/current (#2419)', async () => {
+    const { selector, providerSelect } = loadSelector({
+        fetchImpl: async () => ({
+            ok: true,
+            json: async () => ({
+                model: 'openai/gpt-5.6-luna',
+                vendor: 'openai',
+                route: null,
+                model_name: 'gpt-5.6-luna',
+                is_auto: true,
+            }),
+        }),
+    });
+    selector.allModelsData = {
+        by_vendor: { openai: [{ id: 'gpt-5.6-luna', provider: 'openai', display_name: 'GPT-5.6 Luna' }] },
+        routes: [{ vendor: 'openai', route: 'api' }],
+    };
+    providerSelect.value = 'openai';
+    await selector.syncWithServer();
+
+    assert.equal(selector._isAuto, true);
+    assert.equal(selector.getSummary().label, 'Auto — currently GPT-5.6 Luna');
+});
+
+test('an explicit commit clears the auto flag so the button stops saying "Auto" (#2419)', () => {
+    const { selector, providerSelect, modelSelect } = loadSelector();
+    selector.allModelsData = {
+        by_vendor: {
+            openai: [
+                { id: 'gpt-5.6-luna', provider: 'openai', display_name: 'GPT-5.6 Luna', is_featured: true },
+                { id: 'gpt-5.5', provider: 'openai', display_name: 'GPT-5.5', is_featured: true },
+            ],
+        },
+        routes: [{ vendor: 'openai', route: 'api' }],
+    };
+    providerSelect.value = 'openai';
+    selector.selectedProvider = 'openai';
+    selector._isAuto = true;
+    selector.isInitialLoad = false;
+    selector._lastSyncedSelection = { vendor: 'openai', model: 'gpt-5.6-luna', route: 'api' };
+    selector._populateModels();
+
+    // Operator explicitly picks a different model.
+    modelSelect.value = 'gpt-5.5';
+    selector._handleModelChange();
+
+    assert.equal(selector._isAuto, false);
+    assert.equal(selector.getSummary().label, 'GPT-5.5');
+});
+
+// ---------------------------------------------------------------------------
 // Embeddings section
 // ---------------------------------------------------------------------------
 
