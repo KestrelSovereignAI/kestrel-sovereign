@@ -398,53 +398,121 @@ class EmbeddingSelector {
     }
 
     /**
-     * Guided Universal setup (#2337): pin the shared model on EVERY member
-     * route (each with its own slug), run the #2290 parity probe, then reload
-     * so the shared-space readout + #2336 re-embed offer refresh. Fails loudly
-     * at any step — a dead/misspelled upstream slug is rejected by the
-     * route-model probe (#2326); a below-threshold parity shows the measured
-     * cosine rather than silently claiming a shared space.
+     * Guided Universal setup (#2337/#2418): ATOMIC — pin the shared model on
+     * EVERY member route (each with its own slug) or NONE. If any member's
+     * probe-on-save fails, every pin already applied in this run is rolled back
+     * so the operator is never left in a half-applied state (some routes pinned,
+     * some not), and the flow ends in ONE unmistakable state: configured (with
+     * the parity result) or failed (naming the member and why). A dead/misspelled
+     * or auth-rejected upstream slug is surfaced by the route-model probe (#2326);
+     * a below-threshold parity shows the measured cosine as a warning rather than
+     * silently claiming a shared space — never success styling around a failure.
      */
     async _setupUniversal(option) {
         if (this._settingUp) return;
         const members = (option && option.members) || [];
         if (members.length < 2) {
-            this._setSetupStatus('Universal setup needs a local and a cloud member route.');
+            this._setSetupStatus('Universal setup needs a local and a cloud member route.', 'error');
             return;
         }
         this._settingUp = true;
         this._renderUniversal();
+        // Snapshot the pre-setup per-route pins so a later failure restores EXACTLY
+        // what was there, not just "cleared" (#2418). A route that already carried a
+        // runtime pin must be put back to that pin on rollback — clearing it would
+        // mutate prior configuration, which "atomic apply" forbids.
+        const priorPins = (this.settings && this.settings.route_embedding_models) || {};
+        // Track the members we've successfully pinned, each with its prior state,
+        // so a later failure can roll them back to that state — the atomicity
+        // guarantee (#2418).
+        const applied = [];
         try {
             for (const member of members) {
-                this._setSetupStatus(`Configuring ${member.route} → ${member.model}…`);
+                this._setSetupStatus(`Configuring ${member.route} → ${member.model}…`, 'pending');
+                // Capture the prior pin BEFORE overwriting it (null when the route
+                // had no runtime override → rollback clears rather than restores).
+                const prior = priorPins[member.route] || null;
                 const res = await this._postRouteModel(member.route, member.model, option.dim);
                 if (!res.ok) {
+                    // Roll back every pin applied so far — pin all members or none.
+                    const rolledBack = await this._rollbackUniversal(applied);
+                    const rollNote = applied.length
+                        ? (rolledBack
+                            ? ' Rolled back the other members — no partial configuration was applied.'
+                            : ' WARNING: could not fully roll back earlier members; re-run setup or clear them manually.')
+                        : '';
                     this._setSetupStatus(
-                        `Setup failed on ${member.route}: ${res.detail || 'the model could not be configured (not served / not pulled).'}`
+                        `Setup failed on ${member.route}: ` +
+                        `${res.detail || 'the model could not be configured (not served / not pulled / credential invalid).'}` +
+                        rollNote,
+                        'error'
                     );
                     return;
                 }
+                applied.push({ route: member.route, prior });
             }
-            this._setSetupStatus('Verifying local ↔ cloud parity…');
+            this._setSetupStatus('Verifying local ↔ cloud parity…', 'pending');
             const verify = await this._postVerify();
-            const parity = this._summarizeParity(verify);
+            if (!verify.ok) {
+                // The parity probe itself failed (auth / 500 / timeout / malformed
+                // body) — we CANNOT claim a shared space, so this is a failure, not
+                // a success. Honest + atomic (#2418): roll every pin back to its
+                // pre-setup state and end in the failed state, never success styling.
+                const rolledBack = await this._rollbackUniversal(applied);
+                const rollNote = rolledBack
+                    ? ' Rolled back all members — no configuration was applied.'
+                    : ' WARNING: could not fully roll back; re-run setup or clear the members manually.';
+                this._setSetupStatus(
+                    'Setup failed: could not verify local ↔ cloud parity ' +
+                    `(${verify.detail || 'the parity probe did not complete'}).` + rollNote,
+                    'error'
+                );
+                return;
+            }
+            const parity = this._summarizeParity(verify.data);
             if (parity && !parity.passed) {
+                // All members pinned, but the space is not truly shared. Honest:
+                // this is a warning, not a success — the pins stand (each route
+                // embeds), but Universal's shared-space promise isn't met.
                 this._setSetupStatus(
                     `Parity below threshold (min cosine ${parity.minCosine}). ` +
-                    'Local and cloud embeddings drift too far to share one space.'
+                    'Local and cloud embeddings drift too far to share one space — ' +
+                    'memories embedded on one will not match the other.',
+                    'warn'
                 );
             } else if (parity) {
                 this._setSetupStatus(
-                    `Universal active — parity verified (min cosine ${parity.minCosine}).`
+                    `Universal active — parity verified (min cosine ${parity.minCosine}).`,
+                    'ok'
                 );
             } else {
-                this._setSetupStatus('Universal configured.');
+                this._setSetupStatus('Universal configured.', 'ok');
             }
         } finally {
             this._settingUp = false;
             // Authoritative reload refreshes shared_space + stale_rows.
             await this.load();
         }
+    }
+
+    /**
+     * Roll back a partially-applied Universal setup (#2418): restore each member
+     * to its PRE-SETUP pin (best-effort). ``applied`` is a list of
+     * ``{route, prior}`` where ``prior`` is the route's runtime pin before this
+     * run (``null`` if it had none). A route with a prior pin is restored to
+     * ``{model, dim}``; a route with no prior pin is cleared. Returns true only
+     * when every rollback POST succeeded, so the caller can tell the operator
+     * whether the state is clean or needs manual attention.
+     */
+    async _rollbackUniversal(applied) {
+        let allRestored = true;
+        for (const { route, prior } of applied) {
+            const res = prior && prior.model
+                ? await this._postRouteModel(route, prior.model, prior.dim)
+                : await this._postRouteModel(route, null);
+            if (!res.ok) allRestored = false;
+        }
+        return allRestored;
     }
 
     /** Collapse a /space/verify response into {passed, minCosine} or null. */
@@ -464,10 +532,33 @@ class EmbeddingSelector {
         return { passed, minCosine: minCosine === null ? 'n/a' : minCosine };
     }
 
-    _setSetupStatus(text) {
+    /**
+     * Set the guided-setup status line with an explicit ``kind`` so the UI can
+     * style success vs. failure distinctly (#2418) — no success styling around a
+     * failure. ``kind`` is one of ``'ok'`` / ``'error'`` / ``'warn'`` /
+     * ``'pending'`` / ``''``. The kind is reflected both as a class and a
+     * ``data-status`` attribute so plain CSS or the host popover can react.
+     */
+    _setSetupStatus(text, kind = '') {
         if (!this.setupStatus) return;
         this.setupStatus.textContent = text || '';
         this.setupStatus.style.display = text ? '' : 'none';
+        const state = text ? kind : '';
+        // Reflect the state for styling; keep any non-status classes intact.
+        const el = this.setupStatus;
+        if (el.classList && typeof el.classList.remove === 'function') {
+            for (const cls of ['embed-setup-ok', 'embed-setup-error', 'embed-setup-warn', 'embed-setup-pending']) {
+                el.classList.remove(cls);
+            }
+            if (state) el.classList.add(`embed-setup-${state}`);
+        }
+        if (typeof el.setAttribute === 'function' && typeof el.removeAttribute === 'function') {
+            if (state) {
+                el.setAttribute('data-status', state);
+            } else {
+                el.removeAttribute('data-status');
+            }
+        }
     }
 
     // --- Per-route embedding-model picker (#2337) ---------------------------
@@ -532,11 +623,12 @@ class EmbeddingSelector {
         // the write succeeds), otherwise its native dim.
         const columnDim = this.settings && this.settings.kestrel_embedding_dim;
         const dim = this._pinDimForModel(chosen, columnDim);
-        this._setSetupStatus(`Pinning ${route} → ${model}…`);
+        this._setSetupStatus(`Pinning ${route} → ${model}…`, 'pending');
         const res = await this._postRouteModel(route, model, dim);
         if (!res.ok) {
             this._setSetupStatus(
-                `Could not pin ${model} on ${route}: ${res.detail || 'the model may not be served upstream.'}`
+                `Could not pin ${model} on ${route}: ${res.detail || 'the model may not be served upstream, or the credential may be invalid.'}`,
+                'error'
             );
             return;
         }
@@ -574,7 +666,12 @@ class EmbeddingSelector {
         }
     }
 
-    /** POST the shared-space parity probe (#2290); returns the parsed result. */
+    /**
+     * POST the shared-space parity probe (#2290). Returns ``{ok, data, detail}``
+     * so guided setup can tell a genuine parity RESULT apart from a probe that
+     * never completed (#2418): a non-2xx response, a fetch exception, or a
+     * malformed/empty body is ``ok: false`` — never silently treated as success.
+     */
     async _postVerify(name) {
         try {
             const headers = {
@@ -586,10 +683,22 @@ class EmbeddingSelector {
                 headers,
                 body: JSON.stringify(name ? { name } : {}),
             });
-            if (!response.ok) return null;
-            return await response.json();
+            let data = null;
+            try { data = await response.json(); } catch (e) { /* no/invalid body */ }
+            if (!response.ok) {
+                return {
+                    ok: false,
+                    data,
+                    detail: (data && data.detail) ||
+                        `parity probe failed (HTTP ${response.status})`,
+                };
+            }
+            if (!data || typeof data !== 'object') {
+                return { ok: false, detail: 'parity probe returned no result body' };
+            }
+            return { ok: true, data };
         } catch (e) {
-            return null;
+            return { ok: false, detail: String(e) };
         }
     }
 
@@ -734,12 +843,20 @@ class EmbeddingSelector {
         if (this.dimReadout) {
             if (dim) {
                 const modelPart = model ? `${model} · ` : '';
-                this.dimReadout.textContent = `${modelPart}${dim} dimensions`;
+                const modePart = this.mode === 'auto' ? 'Auto — ' : '';
+                this.dimReadout.textContent = `${modePart}${modelPart}${dim} dimensions`;
             } else if (this.mode === 'off') {
                 // Deliberate off (#2287) — a choice, not degradation.
                 this.dimReadout.textContent = 'Embeddings off — keyword search only';
+            } else if (this.mode === 'auto') {
+                // #2418 — read as ONE causal story, not a bare fragment: why
+                // there's no embedding (the chat provider can't embed) and what
+                // to do about it (set up Universal or pick a provider).
+                this.dimReadout.textContent =
+                    'Auto — your chat provider can\'t embed → keyword search. ' +
+                    'Set up Universal above, or pick a provider.';
             } else {
-                // No embedding-capable resolution — keyword search only.
+                // Explicit route that resolved nothing — keyword search only.
                 this.dimReadout.textContent = 'No embedding provider — keyword search only';
             }
         }

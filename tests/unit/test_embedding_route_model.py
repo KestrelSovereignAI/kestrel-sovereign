@@ -156,6 +156,100 @@ async def test_probe_on_save_rejects_dead_cloud_slug(monkeypatch):
     assert "embedding_model" not in provider["capabilities"]
 
 
+class _StatusError(RuntimeError):
+    """An exception carrying an HTTP-ish ``status_code``, like an SDK error."""
+
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+async def test_probe_on_save_classifies_auth_failure(monkeypatch):
+    """#2418 — a 401 ``User not found.`` (dead/revoked agent key) must be
+    reported as an AUTH failure pointing at the agent's credential, NOT the
+    404 "model may not be served" hint that misdirected the operator."""
+    provider = _route("openrouter:api", "openrouter", capabilities={})
+    service = _service([provider])
+
+    async def _auth_fail(self, text):
+        raise _StatusError("401 - {'error': {'message': 'User not found.'}}", 401)
+
+    monkeypatch.setattr(
+        embedding_service_mod.ProviderEmbeddingService, "aembed", _auth_fail
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        await service.aset_route_embedding_model(
+            "openrouter:api", "qwen/qwen3-embedding-8b", 768
+        )
+    msg = str(excinfo.value).lower()
+    assert "credential" in msg
+    assert "openrouter" in msg
+    # Must NOT misclassify as model-not-served.
+    assert "may not be currently served" not in msg
+    assert service.get_route_embedding_model_overrides() == {}
+
+
+async def test_probe_on_save_classifies_not_served(monkeypatch):
+    """#2418 — a genuine 404 stays the model-not-served message."""
+    provider = _route("openrouter:api", "openrouter", capabilities={})
+    service = _service([provider])
+
+    async def _not_served(self, text):
+        raise RuntimeError("404 no provider serving qwen/does-not-exist")
+
+    monkeypatch.setattr(
+        embedding_service_mod.ProviderEmbeddingService, "aembed", _not_served
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        await service.aset_route_embedding_model(
+            "openrouter:api", "qwen/does-not-exist", 768
+        )
+    msg = str(excinfo.value).lower()
+    assert "may not be currently served" in msg
+    assert "credential is invalid" not in msg
+
+
+async def test_probe_on_save_classifies_transient(monkeypatch):
+    """#2418 — a timeout is transient, not a bad model or bad key."""
+    provider = _route("openrouter:api", "openrouter", capabilities={})
+    service = _service([provider])
+
+    async def _timeout(self, text):
+        raise TimeoutError("Request timed out after 30s")
+
+    monkeypatch.setattr(
+        embedding_service_mod.ProviderEmbeddingService, "aembed", _timeout
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        await service.aset_route_embedding_model(
+            "openrouter:api", "qwen/qwen3-embedding-8b", 768
+        )
+    msg = str(excinfo.value).lower()
+    assert "transient" in msg
+    assert "retry" in msg
+
+
+def test_classify_embedding_probe_failure_buckets():
+    """Direct unit coverage of the classifier's ordering (#2418): a 401
+    ``User not found.`` contains the substring "not found" yet must bucket as
+    auth, not not_served."""
+    assert LLMService._classify_embedding_probe_failure(
+        _StatusError("User not found.", 401)
+    ) == "auth"
+    assert LLMService._classify_embedding_probe_failure(
+        RuntimeError("model_not_found: nope")
+    ) == "not_served"
+    assert LLMService._classify_embedding_probe_failure(
+        RuntimeError("connection timed out")
+    ) == "transient"
+    assert LLMService._classify_embedding_probe_failure(
+        RuntimeError("something weird")
+    ) == "unknown"
+
+
 async def test_probe_on_save_rejects_empty_vector(monkeypatch):
     provider = _route("openrouter:api", "openrouter", capabilities={})
     service = _service([provider])

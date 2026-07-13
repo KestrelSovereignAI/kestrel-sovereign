@@ -689,10 +689,10 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         try:
             vector = await service.aembed(canary)
         except Exception as exc:
+            hint = self._embedding_probe_hint(route, exc, subject="route")
             raise ValueError(
                 f"Cannot set embedding_route '{route}': live embedding probe "
-                f"failed against the upstream provider ({exc}). The route may "
-                f"list a model that is not currently served."
+                f"failed {hint}"
             ) from exc
         if not vector:
             raise ValueError(
@@ -1119,9 +1119,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             vector = await service.aembed(canary)
         except Exception as exc:
             raise ValueError(
-                f"Cannot pin embedding_model '{model}' on '{route}': live "
-                f"embedding probe failed against the upstream provider ({exc}). "
-                f"The model may not be currently served."
+                self._embedding_probe_failure_message(route, model, exc)
             ) from exc
         if not vector:
             raise ValueError(
@@ -1129,6 +1127,111 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 f"provider returned no embedding for a canary probe. The model may "
                 f"not be currently served."
             )
+
+    @staticmethod
+    def _classify_embedding_probe_failure(exc: Exception) -> str:
+        """Bucket a live embedding-probe exception (#2418).
+
+        The old probe blamed every failure on "the model may not be served" —
+        the 404 hint — even when the real cause was a dead/revoked credential
+        (a 401 ``User not found.`` from an agent-scoped sub-key) or a transient
+        network/timeout blip. Returns one of ``"auth"`` / ``"not_served"`` /
+        ``"transient"`` / ``"unknown"`` so the caller can point the operator at
+        the right remedy (re-mint the key vs. pick another model vs. retry).
+
+        Order matters: auth is checked FIRST because a 401 ``User not found.``
+        literally contains "not found" and would otherwise misclassify as a
+        missing model.
+        """
+        # Auth (401/403 or an auth-worded message) — reuse the single source of
+        # truth used to disable dead routes.
+        if LLMService._is_permanent_auth_error(exc):
+            return "auth"
+
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        msg = str(exc).lower()
+
+        # Model-not-served (404 / "no provider serving" / "does not exist").
+        not_served_patterns = (
+            "not served",
+            "no provider",
+            "no endpoint",
+            "does not exist",
+            "model_not_found",
+            "no such model",
+            "unknown model",
+            "not found",
+            "404",
+        )
+        if status == 404 or any(p in msg for p in not_served_patterns):
+            return "not_served"
+
+        # Transient — timeouts / connectivity / upstream overload.
+        transient_patterns = (
+            "timeout",
+            "timed out",
+            "connection",
+            "unreachable",
+            "temporarily",
+            "try again",
+            "overloaded",
+            "rate limit",
+            "too many requests",
+        )
+        if status in (408, 429, 500, 502, 503, 504) or any(
+            p in msg for p in transient_patterns
+        ):
+            return "transient"
+
+        return "unknown"
+
+    @staticmethod
+    def _embedding_probe_hint(route: str, exc: Exception, *, subject: str) -> str:
+        """Classify a probe failure into an operator-facing hint (#2418).
+
+        ``subject`` names what is missing/served ("model" or "route") so the
+        not-served hint reads naturally for either probe. The auth hint routes
+        the operator at the agent's own credential — the exact miss the issue
+        described (a 401 ``User not found.`` from a dead agent-scoped sub-key,
+        while the host-level key still works).
+        """
+        vendor = route.split(":", 1)[0] if route else "the"
+        category = LLMService._classify_embedding_probe_failure(exc)
+        if category == "auth":
+            return (
+                f"— this agent's {vendor} credential is invalid or revoked "
+                f"({exc}). Check or re-mint the agent's {vendor} key; the "
+                f"host-level key working does not mean this agent's key does."
+            )
+        if category == "transient":
+            return (
+                f"— the {vendor} provider timed out or was unreachable ({exc}). "
+                f"This is likely transient; retry in a moment."
+            )
+        if category == "not_served":
+            return (
+                f"against the upstream provider ({exc}). "
+                f"The {subject} may not be currently served."
+            )
+        return (
+            f"against the upstream provider ({exc}). The {subject} may not be "
+            f"currently served, or the credential may be invalid."
+        )
+
+    @staticmethod
+    def _embedding_probe_failure_message(
+        route: str, model: str, exc: Exception
+    ) -> str:
+        """Build the per-route pin-rejection message, classifying the cause (#2418).
+
+        Always contains "live embedding probe failed" so existing callers/tests
+        keying on that survive; the trailing hint is what changes per category.
+        """
+        hint = LLMService._embedding_probe_hint(route, exc, subject="model")
+        return (
+            f"Cannot pin embedding_model '{model}' on '{route}': live "
+            f"embedding probe failed {hint}"
+        )
 
     def _schedule_route_embedding_model_persistence(
         self,

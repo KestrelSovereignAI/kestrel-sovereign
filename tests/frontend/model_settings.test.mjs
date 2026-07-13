@@ -607,7 +607,21 @@ function loadEmbeddingsUniversal({ settings, routes, catalog, fetchImpl } = {}) 
     const routeSelect = createSelect();
     const modelSelect = createSelect();
     const universalEl = createButton();
-    const setupStatus = { textContent: '', style: {} };
+    const setupStatus = (() => {
+        const attrs = {};
+        const classes = new Set();
+        return {
+            textContent: '', style: {},
+            classList: {
+                add: (c) => classes.add(c),
+                remove: (c) => classes.delete(c),
+                contains: (c) => classes.has(c),
+            },
+            setAttribute: (k, v) => { attrs[k] = v; },
+            getAttribute: (k) => (k in attrs ? attrs[k] : null),
+            removeAttribute: (k) => { delete attrs[k]; },
+        };
+    })();
     const dimReadout = { textContent: '', style: {} };
     const warningEl = { textContent: '', style: {} };
     const sharedSpaceEl = { textContent: '', style: {} };
@@ -786,6 +800,126 @@ test('guided setup fails loudly when a member route probe rejects the slug (#233
     assert.ok(/live embedding probe failed/.test(setupStatus.textContent));
     // Never reached the parity probe.
     assert.ok(!calls.some(c => c.url.includes('/space/verify')));
+});
+
+test('guided setup is atomic — a failed member rolls back the members already pinned (#2418)', async () => {
+    const settings = {
+        embedding_route: null, resolved_route: 'ollama:local',
+        embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768, shared_space: null,
+    };
+    const routeModelCalls = [];
+    const fetchImpl = async (url, opts) => {
+        if (url.includes('/api/embedding/models')) return { ok: true, json: async () => UNIVERSAL_CATALOG };
+        if (url.includes('/route-model')) {
+            const body = JSON.parse(opts.body);
+            routeModelCalls.push(body);
+            // openrouter's slug is dead upstream → auth-classified 400.
+            if (body.route === 'openrouter:api' && body.embedding_model) {
+                return { ok: false, json: async () => ({ detail: "this agent's openrouter credential is invalid or revoked" }) };
+            }
+            return { ok: true, json: async () => ({ success: true, ...settings }) };
+        }
+        if (url.includes('/space/verify')) throw new Error('verify must not run after a failed pin');
+        return { ok: true, json: async () => settings };
+    };
+    const { embeddings, setupStatus } = loadEmbeddingsUniversal({
+        settings,
+        routes: [{ vendor: 'ollama', route: 'local', is_local: true }, { vendor: 'openrouter', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+        fetchImpl,
+    });
+    await embeddings.init();
+    await embeddings._handleUniversalClick();
+
+    // ollama:local was pinned, openrouter:api failed → ollama:local is CLEARED
+    // (rolled back) so no half-applied state remains.
+    const rollback = routeModelCalls.find(
+        b => b.route === 'ollama:local' && (b.embedding_model === null || b.embedding_model === undefined),
+    );
+    assert.ok(rollback, 'the successfully-pinned member should be rolled back');
+    // Single honest end state: failure, styled as an error (not success).
+    assert.ok(/no partial configuration was applied/.test(setupStatus.textContent));
+    assert.equal(setupStatus.getAttribute('data-status'), 'error');
+    // The auth-classified reason surfaced, not a bare "not served" hint.
+    assert.ok(/credential is invalid or revoked/.test(setupStatus.textContent));
+});
+
+test('guided setup rolls back when the parity probe itself fails (#2418)', async () => {
+    // Both members pin fine, but /space/verify 500s. That is NOT a shared space
+    // — it must read as failure (rollback + error), never "Universal configured".
+    const settings = {
+        embedding_route: null, resolved_route: 'ollama:local',
+        embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768,
+        shared_space: null, route_embedding_models: {},
+    };
+    const routeModelCalls = [];
+    const fetchImpl = async (url, opts) => {
+        if (url.includes('/api/embedding/models')) return { ok: true, json: async () => UNIVERSAL_CATALOG };
+        if (url.includes('/route-model')) {
+            routeModelCalls.push(JSON.parse(opts.body));
+            return { ok: true, json: async () => ({ success: true, ...settings }) };
+        }
+        if (url.includes('/space/verify')) {
+            return { ok: false, status: 500, json: async () => ({ detail: 'parity backend exploded' }) };
+        }
+        return { ok: true, json: async () => settings };
+    };
+    const { embeddings, setupStatus } = loadEmbeddingsUniversal({
+        settings,
+        routes: [{ vendor: 'ollama', route: 'local', is_local: true }, { vendor: 'openrouter', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+        fetchImpl,
+    });
+    await embeddings.init();
+    await embeddings._handleUniversalClick();
+
+    // Honest failure, styled as error — no success styling around a failed probe.
+    assert.equal(setupStatus.getAttribute('data-status'), 'error');
+    assert.ok(/could not verify local ↔ cloud parity/.test(setupStatus.textContent));
+    assert.ok(/parity backend exploded/.test(setupStatus.textContent));
+    // Both members were rolled back (cleared — no prior pins existed).
+    const cleared = routeModelCalls.filter(b => b.embedding_model === null || b.embedding_model === undefined);
+    assert.equal(cleared.length, 2, 'both pinned members rolled back after the verify failure');
+});
+
+test('rollback RESTORES a prior runtime pin instead of clearing it (#2418)', async () => {
+    // ollama:local already carries a runtime pin. Universal pins the members,
+    // openrouter fails, and rollback must put ollama:local BACK to its prior pin
+    // — not clear it (that would mutate pre-existing configuration).
+    const settings = {
+        embedding_route: null, resolved_route: 'ollama:local',
+        embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768,
+        shared_space: null,
+        route_embedding_models: { 'ollama:local': { model: 'nomic-embed-text', dim: 768 } },
+    };
+    const routeModelCalls = [];
+    const fetchImpl = async (url, opts) => {
+        if (url.includes('/api/embedding/models')) return { ok: true, json: async () => UNIVERSAL_CATALOG };
+        if (url.includes('/route-model')) {
+            const body = JSON.parse(opts.body);
+            routeModelCalls.push(body);
+            if (body.route === 'openrouter:api' && body.embedding_model) {
+                return { ok: false, json: async () => ({ detail: 'dead slug' }) };
+            }
+            return { ok: true, json: async () => ({ success: true, ...settings }) };
+        }
+        if (url.includes('/space/verify')) throw new Error('verify must not run after a failed pin');
+        return { ok: true, json: async () => settings };
+    };
+    const { embeddings } = loadEmbeddingsUniversal({
+        settings,
+        routes: [{ vendor: 'ollama', route: 'local', is_local: true }, { vendor: 'openrouter', route: 'api', is_local: false }],
+        catalog: UNIVERSAL_CATALOG,
+        fetchImpl,
+    });
+    await embeddings.init();
+    await embeddings._handleUniversalClick();
+
+    // The LAST write to ollama:local restores its prior pin, not a clear.
+    const ollamaWrites = routeModelCalls.filter(b => b.route === 'ollama:local');
+    const restore = ollamaWrites[ollamaWrites.length - 1];
+    assert.equal(restore.embedding_model, 'nomic-embed-text', 'prior pin restored, not cleared');
+    assert.equal(restore.embedding_dim, 768);
 });
 
 test('non-universal cloud route is labeled with its tradeoff (#2337)', async () => {
