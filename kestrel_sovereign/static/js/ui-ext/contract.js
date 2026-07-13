@@ -156,6 +156,8 @@
  * @property {string}  [role]      - `'user'` | `'assistant'` (message role).
  * @property {object}  [metadata]  - the message's metadata payload, if any.
  * @property {string}  [agent]     - the owning agent name (bubble's pane), if resolvable.
+ * @property {object}   api        - the API client, same handle render-based slot
+ *                                   contexts carry (gate on `api.hasCapability(...)`).
  */
 
 /**

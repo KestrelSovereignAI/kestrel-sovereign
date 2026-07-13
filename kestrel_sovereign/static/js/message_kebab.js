@@ -19,6 +19,7 @@
 
 import { createKebabButton, openMenuAt, positionFromEvent } from './kebab_menu.js';
 import { UI } from './ui-ext/registry.js';
+import API from './api.js';
 
 /** Resolve the owning agent name from the bubble node's pane, if available. */
 function resolveAgent(node) {
@@ -51,11 +52,14 @@ export function messageMenuItems(msg, node) {
 
     let extra = [];
     if (UI && typeof UI.collectItems === 'function') {
+        // Same `api` handle every render-based slot ctx carries (chat.js,
+        // agent_list.js) — providers gate on `ctx.api.hasCapability(...)`.
         extra = UI.collectItems('chat-message-actions', {
             messageId: id,
             role: msg && msg.role,
             metadata: msg && msg.metadata,
             agent: resolveAgent(node),
+            api: API,
         }) || [];
     }
 

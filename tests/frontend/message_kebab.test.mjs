@@ -16,6 +16,7 @@ import { JSDOM } from 'jsdom';
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
 globalThis.window = dom.window;
 globalThis.document = dom.window.document;
+globalThis.location = dom.window.location;
 globalThis.Node = dom.window.Node;
 globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.kicon = () => '⋯';
@@ -99,6 +100,21 @@ test('a registered chat-message-actions item appears above the destructive separ
     });
     const labels = messageMenuItems({ id: 'm4', role: 'assistant' }, node).map((i) => i.label);
     assert.deepEqual(labels, ['Move to trash', 'Copy m4', 'Delete permanently']);
+});
+
+test('provider ctx carries the api handle (capability gating works)', () => {
+    reset();
+    const node = bubble({ id: 'm4b', role: 'assistant' });
+    let seenCtx = null;
+    UI.register({
+        slot: 'chat-message-actions',
+        id: 'inspect',
+        gate: (ctx) => typeof ctx.api?.hasCapability === 'function',
+        items: (ctx) => { seenCtx = ctx; return []; },
+    });
+    messageMenuItems({ id: 'm4b', role: 'assistant' }, node);
+    assert.ok(seenCtx, 'gate on ctx.api.hasCapability must pass');
+    assert.equal(typeof seenCtx.api.hasCapability, 'function');
 });
 
 test('gate: () => false hides a contribution', () => {
