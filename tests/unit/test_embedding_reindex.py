@@ -693,6 +693,197 @@ async def test_cli_service_honors_persisted_route_model_pin(db):
     assert target == expected
 
 
+# ---------------------------- endpoint reindex target honours the pin (#2423)
+
+
+class _FakeEmbeddingAdapter:
+    """Adapter that DISCOVERS one default model and can embed at ``dim``.
+
+    Models the live #2423 shape: a route (ollama:local) whose discovery
+    default is ``nomic-embed-text`` — so an un-pinned reindex resolves nomic,
+    exactly the profile the corpus was wrongly stamped with. A per-route pin
+    must override that default.
+    """
+
+    def __init__(self, default_model: str, dim: int):
+        self._default_model = default_model
+        self._dim = dim
+
+    async def list_embedding_models(self, client):
+        from kestrel_sovereign.llm.embedding_discovery import EmbeddingModelInfo
+
+        return [EmbeddingModelInfo(id=self._default_model, provider="ollama", native_dim=self._dim)]
+
+    async def aembed_batch(self, client, texts, model=None, **kwargs):
+        return [[float(len(t) % 5) + i for i in range(self._dim)] for t in texts]
+
+
+@pytest.mark.asyncio
+async def test_reindex_target_honours_persisted_route_model_pin_multi_agent(
+    db, monkeypatch
+):
+    """Endpoint reindex must stamp the PINNED model's profile, not the route default (#2423).
+
+    Multi-agent-shaped: the reindex resolves from a per-agent ``LLMService``
+    instance whose IN-MEMORY pin state is empty (the route-model POST mutated a
+    different per-agent instance). The pin lives only in the DB — the same
+    persisted state the settings GET honours. ``_resolve_reindex_target`` must
+    re-apply it from the DB before resolving, so the target is the pinned
+    ``qwen3-embedding:8b`` profile rather than the route's discovery default
+    (``nomic-embed-text``) — the exact divergence #2423 hit live (settings said
+    qwen3, corpus got stamped nomic).
+    """
+    import json
+
+    from kestrel_sovereign.endpoints.models import _resolve_reindex_target
+    from kestrel_sovereign.llm.embedding_service import derive_embedding_profile
+    from kestrel_sovereign import cli_embeddings
+
+    PIN_DIM = 16
+    PINNED_MODEL = "qwen3-embedding:8b"
+    DEFAULT_MODEL = "nomic-embed-text"
+
+    provider = {
+        "name": "ollama:local",
+        "vendor": "ollama",
+        "route": "local",
+        "adapter": _FakeEmbeddingAdapter(DEFAULT_MODEL, PIN_DIM),
+        "client": object(),
+        "model": "auto",
+        "is_local": True,
+        "is_cloud": False,
+        "capabilities": {},
+    }
+    # Per-agent instance: EMPTY in-memory pin state (the POST landed elsewhere).
+    service = _cli_context_service(provider)
+
+    # Persist the pin (#2337) + embedding_route (#2263) — the DB is the only
+    # place the pin exists for THIS instance.
+    await db.execute_commit(
+        "INSERT OR REPLACE INTO agent_metadata (agent_id, key, value) "
+        "VALUES (?, ?, ?)",
+        (
+            "a1",
+            "embedding_model_overrides",
+            json.dumps({"ollama:local": {"model": PINNED_MODEL, "dim": PIN_DIM}}),
+        ),
+    )
+    await db.execute_commit(
+        "INSERT OR REPLACE INTO agent_metadata (agent_id, key, value) "
+        "VALUES (?, ?, ?)",
+        ("a1", "embedding_route", json.dumps("ollama:local")),
+    )
+    await _seed(db)
+
+    # The vector column matches the pin dim so the dim guard passes.
+    monkeypatch.setattr(cli_embeddings, "_resolve_column_dim", lambda: PIN_DIM)
+
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    agent.llm_service = service
+    agent.agent_id = "a1"
+
+    embedding_service, target, target_dim, column_dim = await _resolve_reindex_target(
+        agent, db=db, agent_id="a1"
+    )
+
+    pinned_profile = derive_embedding_profile(
+        provider="ollama", model=PINNED_MODEL, dim=PIN_DIM
+    ).profile_id
+    default_profile = derive_embedding_profile(
+        provider="ollama", model=DEFAULT_MODEL, dim=PIN_DIM
+    ).profile_id
+
+    # Resolved target is the PINNED model — never the route's discovery default.
+    assert target == pinned_profile
+    assert target != default_profile
+    assert target_dim == PIN_DIM
+    assert embedding_service.current_profile_id() == pinned_profile
+
+    # And an actual reindex through the resolved service stamps every row with
+    # the pinned profile (the corpus and the settings surface now agree).
+    reindexer = EmbeddingReindexer(
+        db, embedding_service, target, column_dim=column_dim, batch_size=50
+    )
+    for table in REINDEX_TABLES:
+        await reindexer.reindex_table(table, agent_id="a1")
+
+    a1_rows = await db.fetchall(
+        "SELECT embedding_profile_id FROM conversation_history WHERE agent_id = ?",
+        ("a1",),
+    )
+    assert a1_rows
+    assert all(r[0] == pinned_profile for r in a1_rows), a1_rows
+
+
+@pytest.mark.asyncio
+async def test_reindex_target_clears_stale_in_memory_pin_when_db_empty(db, monkeypatch):
+    """Reindex must DROP a stale in-memory pin the operator cleared in the DB (#2423).
+
+    The per-agent ``LLMService`` still holds a runtime pin
+    (``qwen3-embedding:8b``) from before the operator cleared it, but the DB
+    override map is now ``{}`` (the authoritative persisted state the settings
+    GET honours). A purely additive re-seed would leave the stale pin active and
+    stamp rows with ``qwen3`` again; ``_resolve_reindex_target`` must sync the
+    runtime overrides to the empty DB state so the target falls back to the
+    route's discovery default (``nomic-embed-text``) — the DB-authoritative
+    cleared model.
+    """
+    from kestrel_sovereign.endpoints.models import _resolve_reindex_target
+    from kestrel_sovereign import cli_embeddings
+
+    PIN_DIM = 16
+    STALE_MODEL = "qwen3-embedding:8b"
+    DEFAULT_MODEL = "nomic-embed-text"
+
+    provider = {
+        "name": "ollama:local",
+        "vendor": "ollama",
+        "route": "local",
+        "adapter": _FakeEmbeddingAdapter(DEFAULT_MODEL, PIN_DIM),
+        "client": object(),
+        "model": "auto",
+        "is_local": True,
+        "is_cloud": False,
+        "capabilities": {},
+    }
+    service = _cli_context_service(provider)
+    # Seed a STALE in-memory pin (as if the route-model POST landed here before
+    # the operator cleared it) — the DB below has NO override for this route.
+    service.set_route_embedding_model("ollama:local", STALE_MODEL, PIN_DIM, persist=False)
+    assert "ollama:local" in service.get_route_embedding_model_overrides()
+
+    # DB has the route persisted but the override map CLEARED (operator cleared
+    # the pin so writes match the corpus).
+    await db.execute_commit(
+        "INSERT OR REPLACE INTO agent_metadata (agent_id, key, value) "
+        "VALUES (?, ?, ?)",
+        ("a1", "embedding_route", '"ollama:local"'),
+    )
+    await _seed(db)
+
+    monkeypatch.setattr(cli_embeddings, "_resolve_column_dim", lambda: PIN_DIM)
+
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    agent.llm_service = service
+    agent.agent_id = "a1"
+
+    embedding_service, target, target_dim, column_dim = await _resolve_reindex_target(
+        agent, db=db, agent_id="a1"
+    )
+
+    # The stale in-memory pin was dropped to match the empty DB state, so the
+    # resolved model is the route's discovery default — NOT the cleared pin.
+    assert service.get_route_embedding_model_overrides() == {}
+    assert embedding_service.model == DEFAULT_MODEL
+    assert embedding_service.model != STALE_MODEL
+
+
 # ------------------------------------- guard-before-side-effects (#2362)
 
 

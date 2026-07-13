@@ -2055,6 +2055,71 @@ async def _resolve_reindex_target(agent, db=None, agent_id=None):
         except Exception:  # pragma: no cover - defensive
             pass
 
+    # (2b) Re-apply the persisted per-route ``embedding_model`` pins (#2337)
+    # BEFORE reconcile/resolve, exactly as the agent boot path
+    # (``ModelPreferenceMixin._load_route_embedding_models``) and the CLI's
+    # ``_apply_persisted_embedding_config`` do. This is the #2423 fix: a
+    # multi-agent host holds a per-agent ``LLMService`` instance, and the
+    # instance the reindex resolves from is not guaranteed to be the one whose
+    # in-memory pin the route-model POST mutated. Without re-seeding the pin from
+    # the DB (the authoritative persisted state the settings GET honours),
+    # step (3)'s cache-invalidated reconcile re-resolves the route to its
+    # discovery/config default (e.g. ``nomic-embed-text``) and the reindex
+    # stamps rows with a profile that DISAGREES with the settings surface's
+    # pinned model (``qwen3-embedding:8b``) — the exact divergence #2423 hit
+    # live. Each pin re-advertises embedding support for its exact route and is
+    # folded in as ``is_pinned`` so it wins the resolver order verbatim.
+    if db is not None and hasattr(llm_service, "set_route_embedding_model"):
+        try:
+            overrides = await cli_embeddings._load_persisted_route_embedding_models(
+                db, agent_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("could not load persisted embedding_model pins: %s", exc)
+            overrides = {}
+        # Sync runtime overrides to the DB state FIRST (#2423): the DB is the
+        # authoritative persisted state the settings GET honours. A pure additive
+        # re-seed would leave a stale in-memory pin active on a per-agent
+        # ``LLMService`` instance after the operator CLEARED the pin (DB now
+        # ``{}``) — the resolver would keep stamping rows with the old pinned
+        # profile instead of the cleared/default model. Drop every in-memory
+        # override no longer present in the DB map before applying the survivors.
+        if hasattr(llm_service, "get_route_embedding_model_overrides"):
+            try:
+                runtime_overrides = llm_service.get_route_embedding_model_overrides()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("could not read runtime embedding_model pins: %s", exc)
+                runtime_overrides = {}
+            for stale_route in runtime_overrides:
+                if stale_route in overrides:
+                    continue
+                try:
+                    llm_service.set_route_embedding_model(
+                        stale_route, None, persist=False
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "could not clear stale embedding_model pin for %s: %s",
+                        stale_route,
+                        exc,
+                    )
+        for pin_route, spec in overrides.items():
+            if not isinstance(spec, dict):
+                continue
+            model = spec.get("model")
+            if not model:
+                continue
+            try:
+                llm_service.set_route_embedding_model(
+                    pin_route, model, spec.get("dim"), persist=False
+                )
+            except Exception as exc:  # pragma: no cover - defensive; skip bad pin
+                logger.debug(
+                    "skipping persisted embedding_model pin for %s: %s",
+                    pin_route,
+                    exc,
+                )
+
     # (3) Re-advertise capability across every discovering route BEFORE applying
     # the persisted route: a cleared per-route pin drops ``supports_embeddings``,
     # and both ``set_embedding_route``'s validator and
