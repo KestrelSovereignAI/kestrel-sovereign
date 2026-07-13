@@ -499,10 +499,19 @@ class EmbeddingSelector {
         const pinned = pins[route] && pins[route].model;
         const resolved = this.settings && this.settings.embedding_model;
         const selected = pinned || resolved;
+        // #2417 — the column dim these vectors must fit. A model whose native
+        // dim differs would break every future write; mark it BEFORE selection.
+        const columnDim = this.settings && this.settings.kestrel_embedding_dim;
         this.modelSelect.innerHTML = models.map(m => {
             const label = m.display_name || m.id;
             const dim = m.native_dim ? ` · ${m.native_dim}d` : '';
-            return `<option value="${m.id}">${label}${dim}</option>`;
+            // #2417 — a model that supports Matryoshka (MRL) ``dim_options``
+            // including the column dim CAN write into it (truncated to fit), so
+            // it's not "needs migration" even when its native dim differs.
+            const migrate = this._modelNeedsMigration(m, columnDim)
+                ? ` — ${m.native_dim}-dim, needs migration`
+                : '';
+            return `<option value="${m.id}">${label}${dim}${migrate}</option>`;
         }).join('');
         if (selected && models.some(m => m.id === selected)) {
             this.modelSelect.value = selected;
@@ -518,7 +527,11 @@ class EmbeddingSelector {
         if (!route || !model) return;
         const models = this._modelsForRoute(route);
         const chosen = models.find(m => m.id === model);
-        const dim = chosen ? chosen.native_dim : null;
+        // #2417 — pin the dim that actually fits the column: an MRL model whose
+        // ``dim_options`` covers the column dim is pinned AT the column dim (so
+        // the write succeeds), otherwise its native dim.
+        const columnDim = this.settings && this.settings.kestrel_embedding_dim;
+        const dim = this._pinDimForModel(chosen, columnDim);
         this._setSetupStatus(`Pinning ${route} → ${model}…`);
         const res = await this._postRouteModel(route, model, dim);
         if (!res.ok) {
@@ -624,6 +637,46 @@ class EmbeddingSelector {
         return '';
     }
 
+    /**
+     * True when ``candidateDim`` can't write to the ``columnDim`` column (#2417):
+     * both are known and differ. A selection in this state silently pauses every
+     * future memory write, so the UI must flag it BEFORE selection. Unknown dims
+     * (pre-init / a route that declares none) are treated as "can't tell" → false.
+     */
+    _dimNeedsMigration(candidateDim, columnDim) {
+        return (
+            candidateDim != null &&
+            columnDim != null &&
+            Number(candidateDim) !== Number(columnDim)
+        );
+    }
+
+    /**
+     * The dim a model would be PINNED at for the current column (#2417). A model
+     * that advertises Matryoshka (MRL) ``dim_options`` including the column dim
+     * can be truncated to fit, so we pin THAT dim — not its native one — and the
+     * write succeeds. Otherwise the native dim is the only option. ``null`` when
+     * nothing is known (a route/model that declares no dims).
+     */
+    _pinDimForModel(model, columnDim) {
+        if (!model) return null;
+        const options = Array.isArray(model.dim_options) ? model.dim_options : [];
+        if (columnDim != null && options.some(d => Number(d) === Number(columnDim))) {
+            return Number(columnDim);
+        }
+        return model.native_dim != null ? model.native_dim : null;
+    }
+
+    /**
+     * True when a MODEL can't write into the column (#2417): its effective pin
+     * dim — native, or an MRL ``dim_options`` match for the column — still
+     * differs from the column dim. An MRL-compatible model is therefore NOT
+     * flagged even when its native dim differs.
+     */
+    _modelNeedsMigration(model, columnDim) {
+        return this._dimNeedsMigration(this._pinDimForModel(model, columnDim), columnDim);
+    }
+
     /** Populate the explicit route <select> from embedding-capable routes. */
     _renderRoutes() {
         if (!this.routeSelect) return;
@@ -632,11 +685,19 @@ class EmbeddingSelector {
             id: `${r.vendor}:${r.route}`,
         }));
         const configured = this.settings && this.settings.embedding_route;
+        // #2417 — the column dim any picked route must write into.
+        const columnDim = this.settings && this.settings.kestrel_embedding_dim;
         this.routeSelect.innerHTML = routes.map(r => {
             const id = r.id;
             const tradeoff = this._routeTradeoff(r);
             const base = r.label || id;
-            const label = tradeoff ? `${base} — ${tradeoff}` : base;
+            let label = tradeoff ? `${base} — ${tradeoff}` : base;
+            // A route whose resolved dim can't write into the column would break
+            // every future memory write — mark it before selection, mirroring
+            // the cloud-only tradeoff labels (#2337).
+            if (this._dimNeedsMigration(r.embedding_dim, columnDim)) {
+                label += ` — ${r.embedding_dim}-dim, needs migration`;
+            }
             return `<option value="${id}">${label}</option>`;
         }).join('');
         if (configured && routes.some(r => `${r.vendor}:${r.route}` === configured)) {
@@ -684,8 +745,20 @@ class EmbeddingSelector {
         }
 
         if (this.warningEl) {
+            // #2417 — an agent already in the broken state (selected provider's
+            // dim ≠ the column dim) has its memory writes silently paused right
+            // now: every write hits the storage dim guard and persists without a
+            // vector. Surface the server's ``dim_write_status`` as a first-class
+            // popover state, stronger than the softer #2264 re-embed hint.
+            const blocked = s.dim_write_blocked === true;
             const mismatch = dim != null && deploymentDim != null && dim !== deploymentDim;
-            if (mismatch) {
+            if (blocked) {
+                this.warningEl.style.display = '';
+                this.warningEl.textContent =
+                    s.dim_write_status ||
+                    `Selected provider cannot write — memory vectors paused ` +
+                    `(resolves ${dim}-dim, columns are ${deploymentDim}-dim).`;
+            } else if (mismatch) {
                 this.warningEl.style.display = '';
                 this.warningEl.textContent =
                     `Embedding dimension ${dim} ≠ stored ${deploymentDim}: ${DIM_MISMATCH_MESSAGE}.`;
@@ -749,6 +822,11 @@ class EmbeddingSelector {
                 embedding_model: data.embedding_model,
                 embedding_dim: data.embedding_dim,
                 kestrel_embedding_dim: data.kestrel_embedding_dim,
+                // #2417 — carry the write-blocked status so the popover can show
+                // "memory vectors paused" immediately after a change, not only
+                // after a full reload.
+                dim_write_blocked: data.dim_write_blocked,
+                dim_write_status: data.dim_write_status,
                 shared_space: data.shared_space,
                 // Changing the route can create stale memories; the POST echoes
                 // the authoritative count so the "Re-embed N memories" button

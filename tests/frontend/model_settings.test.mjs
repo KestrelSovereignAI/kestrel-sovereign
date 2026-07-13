@@ -674,7 +674,7 @@ function loadEmbeddingsUniversal({ settings, routes, catalog, fetchImpl } = {}) 
         confirm: () => true,
         getEmbeddingRoutes: () => routes || [],
     });
-    return { embeddings, modeSelect, routeSelect, modelSelect, universalEl, setupStatus, sharedSpaceEl, calls };
+    return { embeddings, modeSelect, routeSelect, modelSelect, universalEl, setupStatus, sharedSpaceEl, warningEl, dimReadout, calls };
 }
 
 const UNIVERSAL_CATALOG = {
@@ -837,6 +837,64 @@ test('per-route model picker lists discovered models and pins on change (#2337)'
     assert.equal(pins[0].body.route, 'openai:api');
     assert.equal(pins[0].body.embedding_model, 'text-embedding-3-small');
     assert.equal(pins[0].body.embedding_dim, 1536);
+});
+
+test('dim-incompatible route is marked "needs migration" before selection (#2417)', async () => {
+    const { embeddings, routeSelect } = loadEmbeddingsUniversal({
+        settings: {
+            embedding_route: null, resolved_route: 'ollama:local',
+            embedding_model: 'nomic-embed-text', embedding_dim: 768, kestrel_embedding_dim: 768, shared_space: null,
+        },
+        routes: [
+            // openai:api resolves to 1536 but the column is 768 → needs migration.
+            { vendor: 'openai', route: 'api', is_local: false, embedding_dim: 1536 },
+            // ollama:local matches the 768 column → no migration marker.
+            { vendor: 'ollama', route: 'local', is_local: true, embedding_dim: 768 },
+        ],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+
+    assert.ok(/openai:api.*1536-dim, needs migration/.test(routeSelect.innerHTML));
+    assert.ok(!/ollama:local.*needs migration/.test(routeSelect.innerHTML));
+});
+
+test('model picker marks a 1536-dim model on a 768 column as needs migration (#2417)', async () => {
+    const settings = {
+        embedding_route: 'openai:api', resolved_route: 'openai:api',
+        embedding_model: 'text-embedding-3-small', embedding_dim: 768, kestrel_embedding_dim: 768,
+        shared_space: null, route_embedding_models: {},
+    };
+    const { embeddings, routeSelect, modelSelect } = loadEmbeddingsUniversal({
+        settings,
+        routes: [{ vendor: 'openai', route: 'api', is_local: false, embedding_dim: 1536 }],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+
+    embeddings.mode = 'explicit';
+    routeSelect.value = 'openai:api';
+    embeddings._renderModelPicker();
+    // text-embedding-3-small is native 1536 → flagged against the 768 column.
+    assert.ok(/text-embedding-3-small.*1536-dim, needs migration/.test(modelSelect.innerHTML));
+});
+
+test('write-blocked agent surfaces "memory vectors paused" status (#2417)', async () => {
+    const { embeddings, warningEl } = loadEmbeddingsUniversal({
+        settings: {
+            embedding_route: 'openai:api', resolved_route: 'openai:api',
+            embedding_model: 'text-embedding-3-small', embedding_dim: 1536, kestrel_embedding_dim: 768,
+            dim_write_blocked: true,
+            dim_write_status: 'selected provider cannot write — memory vectors paused (resolves 1536-dim, columns are 768-dim)',
+            shared_space: null,
+        },
+        routes: [{ vendor: 'openai', route: 'api', is_local: false, embedding_dim: 1536 }],
+        catalog: UNIVERSAL_CATALOG,
+    });
+    await embeddings.init();
+
+    assert.equal(warningEl.style.display, '');
+    assert.ok(/memory vectors paused/.test(warningEl.textContent));
 });
 
 // ---------------------------------------------------------------------------

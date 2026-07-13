@@ -4277,6 +4277,10 @@ export async function loadModels() {
                         route: r.route,
                         is_local: r.is_local,
                         is_cloud: r.is_cloud,
+                        // #2417 — carry the route's resolved dim so the embeddings
+                        // section can mark a dim-incompatible route ("needs
+                        // migration") before the operator selects it.
+                        embedding_dim: r.embedding_dim,
                     }));
             },
         });

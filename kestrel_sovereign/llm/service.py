@@ -578,7 +578,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             self._schedule_embedding_route_persistence(route)
 
     async def aset_embedding_route(
-        self, route: Optional[str], *, persist: bool = True
+        self, route: Optional[str], *, persist: bool = True, force: bool = False
     ) -> None:
         """Set the embedding_route, adding a live upstream probe (#2326).
 
@@ -614,6 +614,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if normalized is not None and normalized != "none":
             # Static validation first (unknown route / no embedding support).
             self._validate_embedding_route(normalized)
+            # Dim-compatibility gate (#2417): a route whose resolved dim differs
+            # from the column dim would break every future write — refuse it at
+            # set time (before the live probe, so the actionable dim error wins
+            # over an unrelated upstream hiccup), unless the operator forces it.
+            self._check_embedding_dim_writable(
+                self._resolved_route_embedding_dim(normalized),
+                route=normalized,
+                force=force,
+            )
             # Then the live probe for cloud routes (#2326).
             await self._probe_embedding_route_live(normalized)
 
@@ -721,6 +730,139 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 f"Cannot set embedding_route '{route}': that route does not "
                 f"advertise embedding support."
             )
+
+    def _resolved_route_embedding_dim(self, route: str) -> Optional[int]:
+        """The embedding dim the given ``route`` resolves to, or ``None`` (#2417).
+
+        Reads the declared ``embedding_dim`` from the matching embedding-capable
+        provider's capabilities — the same value the UI surfaces as the resolved
+        ``embedding_dim``. ``None`` when no provider resolves or none declares a
+        dim (pre-init / bare harness), which the dim gate treats as "unknown".
+        """
+        providers = getattr(self, "providers", None) or []
+        if not providers:
+            return None
+        matching = self._filter_providers_by_selector(providers, route)
+        for provider in matching:
+            if not self._provider_supports_embeddings(provider):
+                continue
+            dim = (provider.get("capabilities") or {}).get("embedding_dim")
+            if dim:
+                return int(dim)
+        return None
+
+    @staticmethod
+    def _deployment_embedding_dim() -> Optional[int]:
+        """The width the memory vector columns are ACTUALLY sized to (#2417).
+
+        Returns the frozen ``CONVERSATION_MESSAGE_EMBEDDING_DIM`` — the value
+        the ORM's ``embedding_vec`` columns were built with at import/migration
+        time and the exact width the write-path dim guard enforces against
+        (``async_conversation_store`` rejects any embedding whose length ≠ this
+        constant). It deliberately does **not** re-run ``resolve_embedding_dim()``:
+        without an explicit ``KESTREL_EMBEDDING_DIM`` that resolver consults the
+        *active provider* and can drift to a different dim (e.g. 1536) than the
+        frozen 768-dim column — which would let the set-time gate wave through a
+        route whose writes the column still silently rejects. The gate must
+        compare against the same value the write path uses.
+
+        Returns ``None`` only when the constant can't be imported (bare
+        harness), which callers treat as "can't check".
+        """
+        try:
+            from kestrel_sovereign.storage.sqla.conversation_message import (
+                CONVERSATION_MESSAGE_EMBEDDING_DIM,
+            )
+
+            dim = CONVERSATION_MESSAGE_EMBEDDING_DIM
+            return int(dim) if dim else None
+        except Exception:  # pragma: no cover - defensive; never crash a setter
+            return None
+
+    @staticmethod
+    def _dim_write_state(
+        resolved_dim: Optional[int], column_dim: Optional[int]
+    ) -> tuple[bool, Optional[str]]:
+        """Whether the resolved embedding dim can write to the column (#2417).
+
+        Returns ``(write_blocked, status)`` — ``write_blocked`` is ``True`` only
+        when both dims are known and differ (a write in this state hits the
+        storage dim guard and persists without a vector, silently pausing
+        semantic memory). ``status`` is the operator-facing popover string when
+        blocked, else ``None``. Shared by :meth:`get_embedding_settings` and
+        :meth:`aget_embedding_settings_for_route` so the route-scoped echo can
+        recompute after overlaying its own model/dim instead of carrying the
+        global route's stale flag.
+        """
+        write_blocked = bool(
+            resolved_dim is not None
+            and column_dim is not None
+            and int(resolved_dim) != int(column_dim)
+        )
+        if not write_blocked:
+            return False, None
+        status = (
+            f"selected provider cannot write — memory vectors paused "
+            f"(resolves {int(resolved_dim)}-dim, columns are "
+            f"{int(column_dim)}-dim)"
+        )
+        return True, status
+
+    def _check_embedding_dim_writable(
+        self,
+        candidate_dim: Optional[int],
+        *,
+        route: str,
+        model: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        """Refuse a route/model whose resolved dim can't write to the column (#2417).
+
+        The dim incompatibility is fully KNOWN at selection time (the resolved
+        model dim vs ``kestrel_embedding_dim``). If they differ, every future
+        memory write hits the storage dim guard (``provider returned N, column
+        is M``) and persists WITHOUT a vector — the agent's semantic memory
+        silently stops accruing. So the same set-time gate that #2326 uses for
+        dead upstreams also refuses a dim mismatch here, with an actionable
+        error naming both dims and the ways out.
+
+        ``candidate_dim`` is skipped when ``None`` (unknown — nothing to check).
+        ``force`` lets an operator mid-migration override the refusal (they are
+        intentionally re-sizing the column + reindexing).
+
+        Raises:
+            ValueError: when the resolved dim differs from the column dim and
+                ``force`` is not set.
+        """
+        if candidate_dim is None:
+            return
+        column_dim = self._deployment_embedding_dim()
+        if not column_dim or int(candidate_dim) == int(column_dim):
+            return
+        target = (
+            f"model '{model}' on route '{route}'" if model else f"route '{route}'"
+        )
+        if force:
+            logger.warning(
+                "Forced embedding %s despite dim mismatch (resolves %d-dim vs "
+                "%d-dim column) — writes are broken until the column is "
+                "re-migrated and reindexed.",
+                target,
+                int(candidate_dim),
+                int(column_dim),
+            )
+            return
+        raise ValueError(
+            f"Cannot set embedding {target}: it resolves to {int(candidate_dim)}-dim "
+            f"vectors but this deployment's memory columns are {int(column_dim)}-dim. "
+            f"Every memory write would be refused by the dim guard and persist "
+            f"without a vector, silently pausing semantic memory. Ways forward: "
+            f"(a) pick a dimension the model supports that matches the column "
+            f"(MRL 'dimensions'={int(column_dim)}); (b) migrate the deployment "
+            f"(set KESTREL_EMBEDDING_DIM={int(candidate_dim)}, re-migrate the vector "
+            f"columns, and reindex); or (c) choose a {int(column_dim)}-dim-compatible "
+            f"provider. Pass force=true to override mid-migration."
+        )
 
     def _schedule_embedding_route_persistence(
         self, route: Optional[str]
@@ -894,6 +1036,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         dim: Optional[int] = None,
         *,
         persist: bool = True,
+        force: bool = False,
     ) -> None:
         """Set a per-route embedding_model, adding a live probe on save (#2337/#2326).
 
@@ -920,6 +1063,20 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     f"Cannot set embedding_model: no configured route matches "
                     f"'{route.strip()}'. Known routes: {known or '(none)'}."
                 )
+            # Dim-compatibility gate (#2417): the pinned model resolves to a
+            # known dim (the explicit ``dim`` the UI passes from the catalog's
+            # native_dim, else the route's declared capability dim). If it
+            # differs from the column dim every write is broken — refuse unless
+            # forced, before the liveness probe.
+            candidate_dim = dim if dim is not None else self._resolved_route_embedding_dim(
+                route.strip()
+            )
+            self._check_embedding_dim_writable(
+                candidate_dim,
+                route=route.strip(),
+                model=model.strip(),
+                force=force,
+            )
             await self._probe_route_embedding_model_live(route.strip(), model.strip(), dim)
 
         self.set_route_embedding_model(route, model, dim, persist=persist)
@@ -1026,14 +1183,11 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             embedding_model = capabilities.get("embedding_model")
             embedding_dim = capabilities.get("embedding_dim")
 
-        try:
-            from kestrel_sovereign.storage.sqla.conversation_message import (
-                resolve_embedding_dim,
-            )
-
-            deployment_dim = resolve_embedding_dim()
-        except Exception:  # pragma: no cover - defensive; never crash a GET
-            deployment_dim = None
+        # #2417 — the "column dim" is the FROZEN width the write path enforces
+        # against (see :meth:`_deployment_embedding_dim`), not a re-resolved
+        # provider default. Reading it any other way lets the status echo a
+        # deployment dim that disagrees with what actually blocks writes.
+        deployment_dim = self._deployment_embedding_dim()
 
         # #2290 — surface the shared local/cloud embedding space so the UI can
         # render it as ONE entry ("qwen3-embedding-0.6b — local + cloud")
@@ -1049,12 +1203,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         if isinstance(warnings, dict) and resolved_route:
             space_change_warning = warnings.get(resolved_route)
 
+        # #2417 — an agent already in the broken state (a resolved route whose
+        # dim ≠ the column dim) has its memory writes silently paused: every
+        # write hits the storage dim guard and persists without a vector. Surface
+        # that as a first-class status the popover can render, not only server
+        # logs. Distinct from the softer #2264 "re-embed" mismatch warning: this
+        # says writes are *paused right now*.
+        write_blocked, dim_write_status = self._dim_write_state(
+            embedding_dim, deployment_dim
+        )
+
         return {
             "embedding_route": configured,
             "resolved_route": resolved_route,
             "embedding_model": embedding_model,
             "embedding_dim": embedding_dim,
             "kestrel_embedding_dim": deployment_dim,
+            "dim_write_blocked": write_blocked,
+            "dim_write_status": dim_write_status,
             "shared_space": shared_space,
             # #2337 — the runtime per-route embedding_model pins the UI's model
             # picker reflects (keyed by "<vendor>:<route>"). Empty when none set.
@@ -1124,6 +1290,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 settings["resolved_route"] = route_name
                 settings["embedding_model"] = model
                 settings["embedding_dim"] = dim
+                # #2417 — the base echo's ``dim_write_blocked``/``dim_write_status``
+                # were computed against the GLOBAL route's resolved dim. Now that
+                # this route's own ``embedding_dim`` is overlaid, recompute against
+                # it — else a forced mismatched pin could echo ``embedding_dim=1536``
+                # yet keep the global route's ``dim_write_blocked=false``.
+                (
+                    settings["dim_write_blocked"],
+                    settings["dim_write_status"],
+                ) = self._dim_write_state(dim, settings.get("kestrel_embedding_dim"))
                 # #2372 — the base echo started from ``get_embedding_settings()``,
                 # which resolves the GLOBAL active provider, so its
                 # ``shared_space``/``space_change_warning`` describe that route,
