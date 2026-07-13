@@ -226,6 +226,13 @@ class EmbeddingReindexer:
         batch_size: Rows re-embedded per batch (and per commit sweep).
         rate_limit_s: Seconds to sleep between batches — throttle for
             rate-limited cloud embedding providers. ``0`` disables.
+        retry_backoff_s: Seconds to sleep before retrying a batch that
+            failed wholesale (raised or returned all-None), split in
+            half (#2427). ``0`` retries immediately.
+        max_split_retries: Cap on the number of halving retries across
+            the whole run, so a genuinely dead service can't recurse
+            without bound. When the budget is exhausted, remaining rows
+            keep the normal ``failed`` accounting.
     """
 
     def __init__(
@@ -237,6 +244,8 @@ class EmbeddingReindexer:
         column_dim: Optional[int] = None,
         batch_size: int = 500,
         rate_limit_s: float = 0.0,
+        retry_backoff_s: float = 0.5,
+        max_split_retries: int = 24,
     ) -> None:
         if not target_profile_id:
             raise ValueError("target_profile_id is required")
@@ -246,6 +255,11 @@ class EmbeddingReindexer:
         self.column_dim = int(column_dim) if column_dim else None
         self.batch_size = max(1, int(batch_size))
         self.rate_limit_s = max(0.0, float(rate_limit_s))
+        self.retry_backoff_s = max(0.0, float(retry_backoff_s))
+        self.max_split_retries = max(0, int(max_split_retries))
+        # Per-run budget: decremented on every halving retry so a dead
+        # service can't split-retry forever (#2427).
+        self._split_retries_remaining = self.max_split_retries
         self.backend_type = getattr(db, "backend_type", None)
         self._fernet_cache: Dict[str, Any] = {}
 
@@ -435,6 +449,99 @@ class EmbeddingReindexer:
                 (_serialize_embedding(embedding), self.target, row_id),
             )
 
+    # ------------------------------------------------------------- embed+write
+
+    async def _embed_and_write(
+        self, spec: _TableSpec, pending: List[Tuple[Any, str]], stats: ReindexStats
+    ) -> None:
+        """Embed *pending* rows, halving-retrying a transient wholesale failure.
+
+        The local Ollama runner occasionally drops a single embed call
+        (``do embedding request: … EOF`` — a runner recycle under sustained
+        batch load): ``aembed_batch`` raises OR returns all-None for the whole
+        batch and the old code wrote off every row in it as ``failed`` (#2427).
+        Instead, on a wholesale failure (raised, or no usable vector for any
+        row) retry once after a short backoff with the batch SPLIT in half.
+        A transient blip just succeeds on the retry; a genuine poison row is
+        isolated by recursive halving down to a size-1 batch that fails alone,
+        so the other N-1 rows are still re-embedded. Retries draw on a per-run
+        budget (:attr:`max_split_retries`) so a truly dead service can't
+        recurse without bound — once it's exhausted, remaining rows keep the
+        normal ``failed`` accounting. Mutates *stats* in place.
+        """
+        if not pending:
+            return
+
+        raised = False
+        try:
+            embeddings = await self.service.aembed_batch([t for _, t in pending])
+        except Exception as exc:
+            logger.warning(
+                "aembed_batch failed for %s batch of %d (%s).",
+                spec.name, len(pending), exc,
+            )
+            raised = True
+            embeddings = [None] * len(pending)
+
+        # Wholesale failure: not a single row produced a usable vector. A
+        # transient runner recycle takes the whole call down like this.
+        if not any(embeddings) and len(pending) > 1 and self._split_retries_remaining > 0:
+            self._split_retries_remaining -= 1
+            half = len(pending) // 2
+            logger.info(
+                "reindex %s: batch of %d produced no embeddings (%s); retrying "
+                "split in half (%d + %d) after %.2fs backoff "
+                "[%d split-retries left this run].",
+                spec.name, len(pending), "raised" if raised else "all-empty",
+                half, len(pending) - half, self.retry_backoff_s,
+                self._split_retries_remaining,
+            )
+            if self.retry_backoff_s:
+                await asyncio.sleep(self.retry_backoff_s)
+            await self._embed_and_write(spec, pending[:half], stats)
+            await self._embed_and_write(spec, pending[half:], stats)
+            return
+
+        empty_in_batch = 0
+        for (row_id, _text), embedding in zip(pending, embeddings):
+            if not embedding:
+                stats.failed += 1
+                empty_in_batch += 1
+                # Per-row visibility for an empty vector that survives the
+                # halving retry (or a partial-empty batch) — #2360 fix item 3,
+                # silent until now. Names the exact row written off as failed.
+                logger.warning(
+                    "reindex %s: no usable embedding for row %s — written off "
+                    "as failed (a later resume pass will retry it).",
+                    spec.name, row_id,
+                )
+                continue
+            if self.column_dim is not None and len(embedding) != self.column_dim:
+                stats.skipped_dim_mismatch += 1
+                continue
+            try:
+                await self._write_row(spec, row_id, list(embedding))
+                stats.reembedded += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to write reindexed vector for %s row %s: %s",
+                    spec.name, row_id, exc,
+                )
+                stats.failed += 1
+
+        # A dead / mis-resolved embedding service returns empty vectors for
+        # every row with no exception — the exact silent scanned-N/reembedded-0
+        # failure of #2360. Make it loud: without this an operator sees only
+        # "0 re-embedded, error: null". (The raised path already logged above.)
+        if empty_in_batch and not raised:
+            logger.warning(
+                "reindex %s: embedding service returned empty vectors "
+                "for %d/%d rows in this batch (nothing written). The "
+                "resolved embedding service is likely dead or "
+                "mis-configured — check the active embedding route.",
+                spec.name, empty_in_batch, len(pending),
+            )
+
     # -------------------------------------------------------------------- main
 
     async def reindex_table(
@@ -480,50 +587,7 @@ class EmbeddingReindexer:
                 pending.append((row_id, text))
 
             if pending:
-                batch_failed = False
-                try:
-                    embeddings = await self.service.aembed_batch(
-                        [t for _, t in pending]
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "aembed_batch failed for %s batch (%s); skipping batch.",
-                        table, exc,
-                    )
-                    batch_failed = True
-                    embeddings = [None] * len(pending)
-
-                empty_in_batch = 0
-                for (row_id, _text), embedding in zip(pending, embeddings):
-                    if not embedding:
-                        stats.failed += 1
-                        empty_in_batch += 1
-                        continue
-                    if self.column_dim is not None and len(embedding) != self.column_dim:
-                        stats.skipped_dim_mismatch += 1
-                        continue
-                    try:
-                        await self._write_row(spec, row_id, list(embedding))
-                        stats.reembedded += 1
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to write reindexed vector for %s row %s: %s",
-                            table, row_id, exc,
-                        )
-                        stats.failed += 1
-
-                # A dead / mis-resolved embedding service returns empty vectors
-                # for every row with no exception — the exact silent
-                # scanned-N/reembedded-0 failure of #2360. Make it loud: without
-                # this log an operator sees only "0 re-embedded, error: null".
-                if empty_in_batch and not batch_failed:
-                    logger.warning(
-                        "reindex %s: embedding service returned empty vectors "
-                        "for %d/%d rows in this batch (nothing written). The "
-                        "resolved embedding service is likely dead or "
-                        "mis-configured — check the active embedding route.",
-                        table, empty_in_batch, len(pending),
-                    )
+                await self._embed_and_write(spec, pending, stats)
 
             if progress is not None:
                 progress(stats)
