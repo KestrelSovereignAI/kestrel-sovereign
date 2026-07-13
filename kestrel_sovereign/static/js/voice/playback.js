@@ -4,6 +4,8 @@
  * Public API:
  *   const pb = createVoicePlayback({ sampleRate: 24000 });
  *   pb.enqueue(uint8Array);   // PCM16 samples at configured rate
+ *   pb.endOfStream();         // release a short response still in pre-roll
+ *   await pb.whenIdle();      // wait until queued samples finish playing
  *   pb.flush();               // drop all buffered audio (barge-in)
  *   pb.isPlaying();
  *   pb.destroy();
@@ -49,6 +51,12 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
 
   let playing = false;
   let underflowCount = 0;
+  const idleWaiters = new Set();
+
+  function resolveIdleWaiters() {
+    for (const resolve of idleWaiters) resolve();
+    idleWaiters.clear();
+  }
 
   node.port.onmessage = (ev) => {
     const msg = ev.data;
@@ -56,6 +64,12 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     if (msg.type === 'underflow') {
       underflowCount++;
       playing = false;
+      // Each response gets its own pre-roll. Once the worklet drains, the
+      // next response starts from a fresh jitter-buffer boundary.
+      preRollBuffer = [];
+      preRollFilled = false;
+      preRollCount = 0;
+      resolveIdleWaiters();
     }
   };
 
@@ -81,12 +95,27 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
         pushToWorklet(uint8);
       }
     },
+    endOfStream() {
+      // A short utterance may never reach the normal pre-roll threshold.
+      // Release it when the provider says the response is complete.
+      if (!preRollFilled && preRollBuffer.length) {
+        for (const chunk of preRollBuffer) pushToWorklet(chunk);
+        preRollBuffer = [];
+        preRollFilled = true;
+      }
+      if (!playing) resolveIdleWaiters();
+    },
+    whenIdle() {
+      if (!playing) return Promise.resolve();
+      return new Promise((resolve) => idleWaiters.add(resolve));
+    },
     flush() {
       preRollBuffer = [];
       preRollFilled = false;
       preRollCount = 0;
       playing = false;
       node.port.postMessage({ type: 'flush' });
+      resolveIdleWaiters();
     },
     isPlaying() {
       return playing;
@@ -98,6 +127,8 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
       gain.gain.value = muted ? 0 : 1;
     },
     async destroy() {
+      playing = false;
+      resolveIdleWaiters();
       try { node.disconnect(); } catch (_) {}
       try { gain.disconnect(); } catch (_) {}
       try { await ctx.close(); } catch (_) {}

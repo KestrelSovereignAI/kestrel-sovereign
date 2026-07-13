@@ -1,5 +1,5 @@
 /**
- * realtime.js — Browser WebRTC client for the OpenAI Realtime path.
+ * realtime.js — Provider-neutral browser client for Realtime voice paths.
  *
  *   const client = await createRealtimeClient({ onEvent });
  *   await client.start();
@@ -15,37 +15,25 @@
  *    (POST /voice/realtime/session, ticket #726). Response carries
  *    { client_secret.value, expires_at, session_id, model, voice }.
  *
- * 2. Open an RTCPeerConnection. Audio is handled natively: mic track added
- *    via `getUserMedia`, remote audio played via an `<audio>` sink. The
- *    capture/playback AudioWorklets (#727) aren't needed here — OpenAI
- *    Realtime wants a live MediaStreamTrack, not raw PCM16 buffers.
+ * 2. Open the provider-declared browser transport. WebRTC providers use a
+ *    native microphone track and remote audio stream; WebSocket providers use
+ *    Kestrel's PCM16 capture/playback AudioWorklets.
  *
- * 3. Open a data channel ("oai-events") for JSON control: session updates,
- *    response cancels, tool-result commits, and incoming events from OpenAI.
+ * 3. Translate the compatible provider event stream into Kestrel voice events
+ *    (see events.js). The UI shell does not branch on provider event taxonomies.
  *
- * 4. SDP exchange: send the local offer to OpenAI directly
- *    (`POST https://api.openai.com/v1/realtime?model=...` with the ephemeral
- *    Bearer token). No backend proxy — the long-lived API key never appears
- *    in the browser.
- *
- * 5. Translate OpenAI server events → Kestrel voice events (see events.js)
- *    and forward to the caller via `onEvent`. The UI shell doesn't know
- *    anything about OpenAI's event taxonomy.
- *
- * Barge-in: OpenAI server-side VAD handles this natively — when the user
- * starts speaking, OpenAI stops sending response audio automatically.
+ * Barge-in: provider-side VAD handles turn detection; when the user starts
+ * speaking, Kestrel also flushes queued WebSocket audio immediately.
  * We also forward `speech_started` as LISTENING_STARTED so the UI can drop
  * its speaking indicator immediately.
  *
- * Tool calls: emitted as TOOL_CALL_REQUESTED events. The caller is
- * responsible for running the tool and calling `client.commitToolResult`
- * which forwards a `conversation.item.create` (type=function_call_output)
- * back over the data channel. Dispatch is not wired to sovereign tools here
- * — that's a follow-up that bridges the frontend into the agent tool
- * registry.
+ * Tool calls are collected for the complete response, dispatched as one batch
+ * through Kestrel governance, and committed before a single continuation.
  */
 
 import { Events, makeEvent } from './events.js';
+import { createVoiceCapture } from './capture.js';
+import { createVoicePlayback } from './playback.js';
 
 // GA WebRTC endpoint.  The Beta path was ``/v1/realtime`` (with the
 // model as a query string), but OpenAI's GA Realtime moved WebRTC SDP
@@ -54,44 +42,6 @@ import { Events, makeEvent } from './events.js';
 // 400s with the SDP body — the browser sees "SDP exchange failed:
 // HTTP 400".  See kestrel-voice-openai#16 (Beta -> GA migration).
 const REALTIME_SDP_URL = 'https://api.openai.com/v1/realtime/calls';
-export const DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS = 3000;
-
-export function resolveToolProgressHintDelay(config = globalThis.KestrelVoiceConfig) {
-  const raw = config?.tool_progress_hint_delay_ms ?? config?.toolBridgeDelayMs;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS;
-}
-
-export function buildToolProgressHintMessages({
-  callId = '',
-  toolName = 'tool',
-  phase = 'working',
-} = {}) {
-  const safeTool = toolName || 'tool';
-  const prompt = phase === 'still_working'
-    ? 'The tool is still running. Briefly reassure the user that you are still working on it. Do not answer the original request yet.'
-    : 'The tool is taking a moment. Briefly acknowledge that you are checking it. Do not answer the original request yet.';
-
-  return [
-    {
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [{
-          type: 'input_text',
-          text: `[Kestrel voice tool status: ${phase}; tool=${safeTool}; call_id=${callId}] ${prompt}`,
-        }],
-      },
-    },
-    {
-      type: 'response.create',
-      response: {
-        instructions: 'Say one short bridge phrase, such as "Let me check that." Do not mention internal tool names or status markers.',
-      },
-    },
-  ];
-}
 
 export function buildRealtimeToolsSessionUpdate(tools = []) {
   return {
@@ -102,35 +52,67 @@ export function buildRealtimeToolsSessionUpdate(tools = []) {
   };
 }
 
-export function createToolProgressHintScheduler({
-  delayMs = DEFAULT_TOOL_PROGRESS_HINT_DELAY_MS,
-  sendHint,
-  setTimeoutFn = setTimeout,
-  clearTimeoutFn = clearTimeout,
-} = {}) {
-  if (typeof sendHint !== 'function') {
-    throw new Error('createToolProgressHintScheduler requires sendHint');
-  }
-
-  function start(payload = {}) {
-    let fired = false;
-    let done = false;
-    const timer = setTimeoutFn(() => {
-      if (done || fired) return;
-      fired = true;
-      sendHint({ phase: 'working', ...payload });
-    }, delayMs);
-
-    return {
-      finish() {
-        done = true;
-        if (!fired) clearTimeoutFn(timer);
-      },
-    };
-  }
-
-  return { start };
+export function bytesToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
+
+export function base64ToBytes(value) {
+  const binary = atob(value || '');
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+export function applyTranscriptUpdate(current, text, cumulative = false) {
+  return cumulative ? (text || '') : `${current || ''}${text || ''}`;
+}
+
+export function normalizeToolBatchResults(calls = [], results = []) {
+  const byId = new Map(
+    (Array.isArray(results) ? results : [])
+      .filter((item) => item && typeof item === 'object')
+      .map((item) => [item.call_id, item]),
+  );
+  return (Array.isArray(calls) ? calls : []).map((call) => {
+    const item = byId.get(call.call_id);
+    const hasResult = item && Object.prototype.hasOwnProperty.call(item, 'result');
+    return {
+      call_id: call.call_id,
+      result: hasResult
+        ? item.result
+        : { error: 'tool dispatch returned no result' },
+    };
+  });
+}
+
+export function resolveRealtimeSDPEndpoint(session = {}) {
+  if (session.endpoint) return session.endpoint;
+  const model = String(session.model || '').trim();
+  return model
+    ? `${REALTIME_SDP_URL}?model=${encodeURIComponent(model)}`
+    : REALTIME_SDP_URL;
+}
+
+export async function waitForPlaybackIdle(playbackController, timeoutMs = 2000) {
+  if (typeof playbackController?.whenIdle !== 'function') return;
+  let timer = null;
+  try {
+    await Promise.race([
+      playbackController.whenIdle(),
+      new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+export function responseAllowsToolDispatch(raw = {}) {
+  const status = String(raw.response?.status ?? raw.status ?? '').toLowerCase();
+  return !['cancelled', 'canceled', 'failed', 'incomplete'].includes(status);
+}
+
 
 /**
  * @param {Object} opts
@@ -156,12 +138,22 @@ export async function createRealtimeClient({
   let session = null;    // { session_id, model, voice, client_secret }
   let pc = null;         // RTCPeerConnection
   let dc = null;         // RTCDataChannel
+  let ws = null;         // WebSocket realtime transport (xAI and future providers)
   let micStream = null;  // MediaStream from getUserMedia
   let audioSink = null;  // <audio> element for remote playback
+  let capture = null;    // PCM capture for WebSocket transports
+  let playback = null;   // PCM playback for WebSocket transports
+  let inputMuted = false;
+  let outputMuted = false;
   let closed = false;
   const persistedTurnIds = new Set();  // item_ids already sent to /transcript
   const pendingPersists = new Set();   // in-flight /transcript POST promises
   let pendingToolEvents = [];          // tool cards to attach to next assistant turn
+  let pendingToolCalls = [];           // collected until response.done
+  let cumulativeUserTranscript = '';
+  let earlyAudioChunks = [];
+  let earlyAudioBytes = 0;
+  const maxEarlyAudioBytes = 24000 * 2 * 2; // two seconds of mono PCM16
 
   /**
    * Send a JSON control message through the data channel.
@@ -169,9 +161,13 @@ export async function createRealtimeClient({
    * common and we don't want to promote them to UI errors.
    */
   function sendJSON(msg) {
-    if (!dc || dc.readyState !== 'open') return;
+    const channelOpen = dc && dc.readyState === 'open';
+    const socketOpen = ws && ws.readyState === WebSocket.OPEN;
+    if (!channelOpen && !socketOpen) return;
     try {
-      dc.send(JSON.stringify(msg));
+      const payload = JSON.stringify(msg);
+      if (channelOpen) dc.send(payload);
+      else ws.send(payload);
     } catch (err) {
       if (!closed) {
         onEvent(makeEvent(Events.ERROR, {
@@ -185,7 +181,7 @@ export async function createRealtimeClient({
   /**
    * Report a finalized turn to the backend so it lands in the agent's
    * conversation history (#1808). The realtime path is end-to-end between this
-   * browser and OpenAI, so the server never sees the transcript unless we send
+   * browser and its provider, so the server never sees the transcript unless we send
    * it. Fire-and-forget: a persistence failure must never interrupt the live
    * call, so errors are surfaced as non-fatal events only.
    *
@@ -273,13 +269,13 @@ export async function createRealtimeClient({
   }
 
   /**
-   * Translate OpenAI server events to Kestrel voice events.
+   * Translate the OpenAI-compatible provider event stream to Kestrel events.
    *
    * Unknown types are logged at debug level and skipped — OpenAI can add new
    * events without breaking this client. Missing fields fall back to empty
    * values so the UI shell never sees undefined text.
    */
-  function handleOpenAIEvent(raw) {
+  function handleProviderEvent(raw) {
     switch (raw.type) {
       case 'session.created':
         onEvent(makeEvent(Events.SESSION_READY, {
@@ -290,6 +286,10 @@ export async function createRealtimeClient({
         break;
 
       case 'input_audio_buffer.speech_started':
+        // A barge-in abandons the prior response. Completed arguments from
+        // that interrupted response must not execute or bleed into the next.
+        pendingToolCalls = [];
+        playback?.flush?.();
         onEvent(makeEvent(Events.LISTENING_STARTED, {}));
         break;
       case 'input_audio_buffer.speech_stopped':
@@ -297,16 +297,30 @@ export async function createRealtimeClient({
         break;
 
       case 'conversation.item.input_audio_transcription.delta':
+        cumulativeUserTranscript = applyTranscriptUpdate(
+          cumulativeUserTranscript, raw.delta ?? '', false,
+        );
         onEvent(makeEvent(Events.USER_TRANSCRIPT_DELTA, {
-          text: raw.delta ?? '',
+          text: cumulativeUserTranscript,
           is_final: false,
         }));
         break;
+      case 'conversation.item.input_audio_transcription.updated': {
+        cumulativeUserTranscript = applyTranscriptUpdate(
+          cumulativeUserTranscript, raw.transcript ?? '', true,
+        );
+        onEvent(makeEvent(Events.USER_TRANSCRIPT_DELTA, {
+          text: cumulativeUserTranscript,
+          is_final: false,
+        }));
+        break;
+      }
       case 'conversation.item.input_audio_transcription.completed':
         onEvent(makeEvent(Events.USER_TRANSCRIPT_FINAL, {
           text: raw.transcript ?? '',
         }));
         persistTurn('user', raw.transcript ?? '', raw.item_id);
+        cumulativeUserTranscript = '';
         break;
 
       case 'response.created':
@@ -328,7 +342,21 @@ export async function createRealtimeClient({
         }));
         persistTurn('assistant', raw.transcript ?? raw.text ?? '', raw.item_id);
         break;
+      case 'response.output_audio.delta':
+        if (playback && raw.delta) playback.enqueue(base64ToBytes(raw.delta));
+        break;
       case 'response.done':
+        playback?.endOfStream?.();
+        if (pendingToolCalls.length && responseAllowsToolDispatch(raw)) {
+          const calls = pendingToolCalls;
+          pendingToolCalls = [];
+          onEvent(makeEvent(Events.TOOL_CALL_BATCH_REQUESTED, {
+            batch_id: raw.response?.id ?? raw.response_id ?? '',
+            calls,
+          }));
+        } else {
+          pendingToolCalls = [];
+        }
         onEvent(makeEvent(Events.SPEAKING_STOPPED, {}));
         onEvent(makeEvent(Events.RESPONSE_DONE, {}));
         break;
@@ -340,11 +368,11 @@ export async function createRealtimeClient({
         } catch (_err) {
           args = { _raw: raw.arguments ?? '' };
         }
-        onEvent(makeEvent(Events.TOOL_CALL_REQUESTED, {
+        pendingToolCalls.push({
           call_id: raw.call_id ?? '',
           name: raw.name ?? '',
           arguments: args,
-        }));
+        });
         break;
       }
 
@@ -361,6 +389,115 @@ export async function createRealtimeClient({
         // console.debug('unmapped realtime event', raw);
         break;
     }
+  }
+
+  async function startWebRTC() {
+    pc = new RTCPeerConnection();
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    for (const track of micStream.getTracks()) pc.addTrack(track, micStream);
+
+    audioSink = document.createElement('audio');
+    audioSink.autoplay = true;
+    audioSink.muted = outputMuted;
+    pc.ontrack = (ev) => {
+      if (ev.streams && ev.streams[0]) audioSink.srcObject = ev.streams[0];
+    };
+
+    dc = pc.createDataChannel('oai-events');
+    dc.onmessage = (ev) => {
+      try { handleProviderEvent(JSON.parse(ev.data)); }
+      catch (err) {
+        onEvent(makeEvent(Events.ERROR, {
+          message: `Malformed realtime event: ${err.message}`, fatal: false,
+        }));
+      }
+    };
+    dc.onclose = () => {
+      if (!closed) onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'data_channel_closed' }));
+    };
+    pc.onconnectionstatechange = () => {
+      if (closed || !pc) return;
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        onEvent(makeEvent(Events.ERROR, {
+          message: `RTC connection ${pc.connectionState}`,
+          code: `rtc_${pc.connectionState}`,
+          fatal: true,
+        }));
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const sdpResp = await fetch(resolveRealtimeSDPEndpoint(session), {
+      method: 'POST',
+      body: offer.sdp,
+      headers: {
+        'Authorization': `Bearer ${session.client_secret.value}`,
+        'Content-Type': 'application/sdp',
+      },
+    });
+    if (!sdpResp.ok) throw new Error(`SDP exchange failed: HTTP ${sdpResp.status}`);
+    await pc.setRemoteDescription({ type: 'answer', sdp: await sdpResp.text() });
+  }
+
+  async function startWebSocket() {
+    capture = await createVoiceCapture({ targetSampleRate: 24000 });
+    playback = await createVoicePlayback({ sampleRate: 24000 });
+    playback.setMuted?.(outputMuted);
+    capture.onchunk((pcm) => {
+      if (inputMuted || closed) return;
+      if (ws?.readyState === WebSocket.OPEN) {
+        sendJSON({ type: 'input_audio_buffer.append', audio: bytesToBase64(pcm) });
+        return;
+      }
+      const copy = new Uint8Array(pcm);
+      earlyAudioChunks.push(copy);
+      earlyAudioBytes += copy.byteLength;
+      while (earlyAudioBytes > maxEarlyAudioBytes && earlyAudioChunks.length) {
+        earlyAudioBytes -= earlyAudioChunks.shift().byteLength;
+      }
+    });
+
+    const subprotocols = session.vendor === 'xai'
+      ? [`xai-client-secret.${session.client_secret.value}`]
+      : [];
+    ws = new WebSocket(session.endpoint, subprotocols);
+    ws.onmessage = (ev) => {
+      try { handleProviderEvent(JSON.parse(ev.data)); }
+      catch (err) {
+        onEvent(makeEvent(Events.ERROR, {
+          message: `Malformed realtime event: ${err.message}`, fatal: false,
+        }));
+      }
+    };
+    await new Promise((resolve, reject) => {
+      ws.onopen = () => {
+        if (session.session_config && Object.keys(session.session_config).length) {
+          sendJSON({ type: 'session.update', session: session.session_config });
+        }
+        for (const pcm of earlyAudioChunks) {
+          sendJSON({ type: 'input_audio_buffer.append', audio: bytesToBase64(pcm) });
+        }
+        earlyAudioChunks = [];
+        earlyAudioBytes = 0;
+        resolve();
+      };
+      ws.onerror = () => reject(new Error(`${session.provider || 'Realtime'} WebSocket failed`));
+    });
+    ws.onclose = () => {
+      if (!closed) onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'websocket_closed' }));
+    };
+    ws.onerror = () => {
+      if (!closed) {
+        onEvent(makeEvent(Events.ERROR, {
+          message: `${session.provider || 'Realtime'} WebSocket error`,
+          code: 'websocket_error',
+          fatal: true,
+        }));
+      }
+    };
   }
 
   async function start() {
@@ -394,99 +531,24 @@ export async function createRealtimeClient({
     }
     session = await resp.json();
 
-    // 2. RTCPeerConnection + mic track.
-    pc = new RTCPeerConnection();
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    for (const track of micStream.getTracks()) {
-      pc.addTrack(track, micStream);
-    }
-
-    // 3. Remote audio → <audio> sink.
-    audioSink = document.createElement('audio');
-    audioSink.autoplay = true;
-    // Don't attach to the DOM — it's a headless sink, avoids CSS interactions.
-    pc.ontrack = (ev) => {
-      if (ev.streams && ev.streams[0]) {
-        audioSink.srcObject = ev.streams[0];
-      }
-    };
-
-    // 4. Data channel — OpenAI accepts either a client-created or
-    // server-created channel; creating it client-side gives us more control
-    // over the `ordered` + `negotiated` knobs later.
-    dc = pc.createDataChannel('oai-events');
-    dc.onmessage = (ev) => {
-      try {
-        const parsed = JSON.parse(ev.data);
-        handleOpenAIEvent(parsed);
-      } catch (err) {
-        onEvent(makeEvent(Events.ERROR, {
-          message: `Malformed event from OpenAI: ${err.message}`,
-          fatal: false,
-        }));
-      }
-    };
-    dc.onclose = () => {
-      if (!closed) {
-        onEvent(makeEvent(Events.SESSION_CLOSED, { reason: 'data_channel_closed' }));
-      }
-    };
-
-    // 5. Track connection-level failures fatally so the UI can reset.
-    pc.onconnectionstatechange = () => {
-      if (closed || !pc) return;
-      if (pc.connectionState === 'failed') {
-        onEvent(makeEvent(Events.ERROR, {
-          message: 'RTC connection failed',
-          code: 'rtc_failed',
-          fatal: true,
-        }));
-      } else if (pc.connectionState === 'disconnected') {
-        onEvent(makeEvent(Events.ERROR, {
-          message: 'RTC connection lost',
-          code: 'rtc_disconnected',
-          fatal: true,
-        }));
-      }
-    };
-
-    // 6. SDP exchange — direct to OpenAI with the ephemeral token.
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    const sdpResp = await fetch(
-      `${REALTIME_SDP_URL}?model=${encodeURIComponent(session.model)}`,
-      {
-        method: 'POST',
-        body: offer.sdp,
-        headers: {
-          'Authorization': `Bearer ${session.client_secret.value}`,
-          'Content-Type': 'application/sdp',
-        },
-      },
-    );
-    if (!sdpResp.ok) {
-      throw new Error(`SDP exchange failed: HTTP ${sdpResp.status}`);
-    }
-    const answer = { type: 'answer', sdp: await sdpResp.text() };
-    await pc.setRemoteDescription(answer);
+    if (session.transport === 'websocket') await startWebSocket();
+    else if (session.transport === 'webrtc' || !session.transport) await startWebRTC();
+    else throw new Error(`Unsupported realtime transport: ${session.transport}`);
   }
 
   async function close() {
     if (closed) return;
     closed = true;
     try { dc?.close(); } catch (_) {}
+    try { ws?.close(); } catch (_) {}
     try {
       if (micStream) {
         for (const t of micStream.getTracks()) t.stop();
       }
     } catch (_) {}
     try { pc?.close(); } catch (_) {}
+    try { await capture?.destroy?.(); } catch (_) {}
+    try { await playback?.destroy?.(); } catch (_) {}
     try {
       if (audioSink) {
         audioSink.pause();
@@ -516,7 +578,9 @@ export async function createRealtimeClient({
 
   /** Barge-in: abort the in-flight agent response. */
   function cancelResponse() {
+    pendingToolCalls = [];
     sendJSON({ type: 'response.cancel' });
+    playback?.flush?.();
   }
 
   /**
@@ -544,26 +608,32 @@ export async function createRealtimeClient({
    * Return a tool's result to a pending call_id so the model continues.
    * `result` will be JSON-stringified; pass a plain serializable value.
    */
-  function commitToolResult(callId, result) {
-    sendJSON({
-      type: 'conversation.item.create',
-      item: {
-        type: 'function_call_output',
-        call_id: callId,
-        output: JSON.stringify(result),
-      },
-    });
+  async function commitToolResults(results = []) {
+    if (!results.length) return;
+    for (const { call_id: callId, result } of results) {
+      sendJSON({
+        type: 'conversation.item.create',
+        item: {
+          type: 'function_call_output',
+          call_id: callId,
+          output: JSON.stringify(result),
+        },
+      });
+    }
+    // xAI can finish delivering response audio before the browser has played
+    // it. Waiting here prevents the post-tool response from overlapping the
+    // prior response; WebRTC providers resolve immediately.
+    await waitForPlaybackIdle(playback);
     sendJSON({ type: 'response.create' });
   }
 
-  function sendToolProgressHint(payload = {}) {
-    for (const msg of buildToolProgressHintMessages(payload)) {
-      sendJSON(msg);
-    }
+  async function commitToolResult(callId, result) {
+    await commitToolResults([{ call_id: callId, result }]);
   }
 
   /** Input-level sampling for the UI meter. Returns 0..1. */
   function getInputLevel() {
+    if (capture) return capture.getLevel();
     if (!micStream || !pc) return 0;
     // Minimal implementation — the UI shell can instantiate its own
     // AnalyserNode over `micStream` if it wants a real meter. Returning 0
@@ -572,7 +642,9 @@ export async function createRealtimeClient({
   }
 
   function setMuted(muted) {
+    outputMuted = !!muted;
     if (audioSink) audioSink.muted = !!muted;
+    playback?.setMuted?.(!!muted);
   }
 
   // Gate the OUTGOING mic path. Disabling the local audio track makes WebRTC
@@ -580,6 +652,11 @@ export async function createRealtimeClient({
   // hidden turns under its pane/privacy mode) without tearing down the peer
   // connection — re-enabling resumes instantly on return.
   function setInputMuted(muted) {
+    inputMuted = !!muted;
+    if (capture) {
+      if (inputMuted) capture.pause();
+      else capture.resume();
+    }
     if (!micStream) return;
     for (const t of micStream.getAudioTracks()) t.enabled = !muted;
   }
@@ -593,7 +670,7 @@ export async function createRealtimeClient({
     updateInstructions,
     updateTools,
     commitToolResult,
-    sendToolProgressHint,
+    commitToolResults,
     whenPersisted,
     recordToolEvent,
     getInputLevel,

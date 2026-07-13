@@ -34,11 +34,7 @@ import { getOrCreateChatPane } from '../ui.js';
 import UI from '../ui-ext/registry.js';
 import bus from '../ui-ext/bus.js';
 import { Events } from './events.js';
-import {
-  createRealtimeClient,
-  createToolProgressHintScheduler,
-  resolveToolProgressHintDelay,
-} from './realtime.js';
+import { createRealtimeClient, normalizeToolBatchResults } from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
 import { State, nextStateForEvent } from './state-machine.js';
 
@@ -219,6 +215,16 @@ function settingsForAgent(agent) {
     _settingsByAgent.set(agent, s);
   }
   return s;
+}
+
+function voiceForProvider(value, providerName) {
+  if (!providerName) return '';
+  const scoped = value?.provider_voice_ids;
+  if (scoped && typeof scoped[providerName] === 'string' && scoped[providerName]) {
+    return scoped[providerName];
+  }
+  // Legacy settings stored one bare voice next to a TTS provider.
+  return value?.preferred_tts === providerName ? (value.voice || '') : '';
 }
 
 
@@ -629,9 +635,15 @@ function mountPickerModal(el) {
     <label class="kestrel-voice-field">
       <span>Voice path</span>
       <select id="voice-picker-mode" class="model-selector">
-        <option value="auto">Auto (Realtime when on OpenAI; Pipeline otherwise)</option>
-        <option value="realtime">Force Realtime (uses gpt-realtime, your chat LLM is bypassed)</option>
+        <option value="auto">Auto (match the active LLM provider)</option>
+        <option value="realtime">Prefer Realtime (provider owns the voice turn)</option>
         <option value="pipeline">Force Pipeline (STT → your chat LLM → TTS)</option>
+      </select>
+    </label>
+    <label class="kestrel-voice-field">
+      <span>Realtime provider</span>
+      <select id="voice-picker-conversation" class="model-selector">
+        <option value="">Auto (match active LLM vendor)</option>
       </select>
     </label>
     <label class="kestrel-voice-field">
@@ -650,8 +662,8 @@ function mountPickerModal(el) {
         placeholder="Speak like a 1920s newscaster, measured but excited..."></textarea>
     </label>
     <p class="kestrel-voice-hint">
-      Instructions are forwarded to the model that supports them
-      (gpt-4o-mini-tts / Realtime). Local providers ignore them.
+      Instructions are forwarded when the selected provider supports them.
+      Local providers may ignore them.
     </p>
     <div class="kestrel-voice-modal-actions">
       <button type="button" id="voice-picker-cancel" class="btn btn-secondary">Cancel</button>
@@ -854,7 +866,11 @@ async function startSession(session = activeSession()) {
   const onEvent = (ev) => handleClientEvent(agent, ev, startSeq);
 
   // Apply user picker overrides (mode + TTS) to drive routing.
-  const overrides = pickerOverridesFromUI(pinnedSettings.mode || 'auto', pinnedSettings.preferred_tts || '');
+  const overrides = pickerOverridesFromUI(
+    pinnedSettings.mode || 'auto',
+    pinnedSettings.preferred_tts || '',
+    pinnedSettings.preferred_conversation || '',
+  );
 
   // If the user explicitly picked Pipeline, skip Realtime entirely. The
   // previous flow round-tripped to /voice/realtime/session, ate a 409,
@@ -870,23 +886,26 @@ async function startSession(session = activeSession()) {
         endpoint: buildAgentUrlForAgent('/voice/realtime/session', agent),
         getAuthHeaders: voiceAuthHeaders,
         sessionRequestBody: {
-          voice: pinnedSettings.voice || '',
+          voice: voiceForProvider(pinnedSettings, overrides.preferred_conversation) || '',
           user_instructions: pinnedSettings.instructions || '',
           prefer_realtime: overrides.prefer_realtime,
           preferred_tts: overrides.preferred_tts || '',
+          preferred_conversation: overrides.preferred_conversation || '',
         },
       });
       await session.client.start();
       applyActiveSessionPolicy();
-      const realtimeModel = session.client.session?.model || 'gpt-realtime';
+      const realtimeModel = session.client.session?.model || 'realtime';
+      const realtimeProvider = session.client.session?.provider || 'realtime';
+      const realtimeVendor = session.client.session?.vendor || realtimeProvider;
       session.realtimeModel = realtimeModel;
       // Take ownership of the chat-model selector for the lifetime of this
       // session.  Acquired AFTER ``start()`` so a failed mint doesn't strand
       // the selector locked.  See #1371.
       acquireSelectorOwnership(realtimeModel, session);
-      const label = `Realtime · ${realtimeModel}`;
+      const label = `${realtimeProvider} · ${realtimeModel}`;
       const tooltip =
-        `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`;
+        `${realtimeVendor} Realtime: voice + reasoning answered by ${realtimeModel}. Switch to Pipeline in voice settings (right-click 🎙) to keep your selected chat LLM as the brain.`;
       session.pathLabel = label;
       session.pathTooltip = tooltip;
       if (session === controlSession()) setPathBadge(
@@ -924,7 +943,10 @@ async function startSession(session = activeSession()) {
       wsPath: buildAgentUrlForAgent('/voice/chat', agent),
       // Honor the picker's voice + provider choice. Without these the server
       // falls back to its config-file voice and the picker is decorative.
-      voiceId: pinnedSettings.voice || '',
+      voiceId: voiceForProvider(
+        pinnedSettings,
+        (overrides && overrides.preferred_tts) || pinnedSettings.preferred_tts || '',
+      ) || '',
       preferredTts: (overrides && overrides.preferred_tts) || pinnedSettings.preferred_tts || '',
       // Pin STT to the browser's primary language tag (e.g. "en-US" → "en")
       // so Whisper doesn't hallucinate language switches mid-utterance.
@@ -1076,8 +1098,13 @@ function handleClientEvent(agent, ev, startSeq) {
       break;
 
     case Events.TOOL_CALL_REQUESTED:
-      handleToolCall(session, ev).catch((err) => {
+      handleToolBatch(session, { batch_id: '', calls: [ev] }).catch((err) => {
         console.error('[voice/ui] tool dispatch failed:', err);
+      });
+      break;
+    case Events.TOOL_CALL_BATCH_REQUESTED:
+      handleToolBatch(session, ev).catch((err) => {
+        console.error('[voice/ui] tool batch dispatch failed:', err);
       });
       break;
 
@@ -1151,7 +1178,10 @@ function finalizeAgentTurn(session, text) {
   const div = session.agentMsgDiv;
   const buf = text || '';
   const realtimeModel = session.client?.session?.model || '';
-  const realtimeMetadata = realtimeModel ? { model: realtimeModel, provider: 'openai' } : null;
+  const realtimeMetadata = realtimeModel ? {
+    model: realtimeModel,
+    provider: session.client?.session?.vendor || session.client?.session?.provider || 'realtime',
+  } : null;
   session.agentMsgDiv = null;
   session.agentTextBuffer = '';
   // Track that this voice session produced a real, persisted turn so
@@ -1231,7 +1261,7 @@ function resetTurnState(session = activeSession()) {
 // ---------------------------------------------------------------------------
 
 
-async function handleToolCall(session, ev) {
+async function handleToolBatch(session, ev) {
   // Capture the client at function entry. The per-agent session client can be
   // nulled by stopSession()/surfaceFatalError() during the await on the
   // tool-dispatch fetch; without this snapshot, commitToolResult below would
@@ -1242,6 +1272,8 @@ async function handleToolCall(session, ev) {
     return;
   }
   const sessionId = sessionClient.session.session_id;
+  const calls = Array.isArray(ev.calls) ? ev.calls : [];
+  if (!calls.length) return;
 
   // Render a live tool card in the chat pane so the user sees the tool call,
   // mirroring text chat. Realtime tool dispatch is otherwise invisible — the
@@ -1252,74 +1284,67 @@ async function handleToolCall(session, ev) {
   // appending to the pre-tool bubble and the order reads wrong.
   if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
 
-  const toolName = ev.name || 'tool';
-  const card = {
-    name: toolName,
-    status: 'running',
-    detail: toolArgsPreview(ev.arguments),
-    pos: 0,
-    events: [{ phase: 'start', name: toolName, detail: toolArgsPreview(ev.arguments) }],
-  };
-  const cardDiv = renderVoiceToolCard(session, card);
+  const cards = calls.map((call) => {
+    const toolName = call.name || 'tool';
+    const card = {
+      name: toolName,
+      status: 'running',
+      detail: toolArgsPreview(call.arguments),
+      pos: 0,
+      startedAt: Date.now(),
+      events: [{ phase: 'start', name: toolName, detail: toolArgsPreview(call.arguments) }],
+    };
+    const cardDiv = renderVoiceToolCard(session, card);
+    sessionClient.recordToolEvent?.({ type: 'start', tool: toolName, pos: 0 });
+    return { call, card, cardDiv };
+  });
   // A tool call means a real exchange happened, so make sure the post-call
   // sidebar refresh fires even if no transcript turn lands.
   session.persistedAny = true;
-  const startedAt = Date.now();
-  // Buffer the persisted-shape events ({type,tool,ms?,error?,pos}) so they ride
-  // along with the assistant turn that persists after the tool runs — making the
-  // tool card survive a reload, exactly like text chat. pos=0: realtime runs
-  // tools before the spoken reply, so cards render above its prose.
-  sessionClient.recordToolEvent?.({ type: 'start', tool: toolName, pos: 0 });
-  const progressHint = createToolProgressHintScheduler({
-    delayMs: resolveToolProgressHintDelay(),
-    sendHint: (payload) => sessionClient.sendToolProgressHint?.(payload),
-  }).start({
-    callId: ev.call_id || '',
-    toolName,
-  });
-
-  let body;
+  let results;
   try {
     const resp = await fetch(buildAgentUrlForAgent(
-      `/voice/realtime/tools/${encodeURIComponent(sessionId)}`,
+      `/voice/realtime/tools/${encodeURIComponent(sessionId)}/batch`,
       session.agent,
     ), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...await voiceAuthHeaders() },
-      body: JSON.stringify({
-        call_id: ev.call_id,
-        name: ev.name,
-        arguments: ev.arguments,
-      }),
+      body: JSON.stringify({ calls }),
     });
-    body = await resp.json().catch(() => ({}));
+    const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      body = { error: body.detail || `tool dispatch HTTP ${resp.status}` };
+      throw new Error(body.detail || `tool dispatch HTTP ${resp.status}`);
     }
+    results = Array.isArray(body.results) ? body.results : [];
   } catch (err) {
-    body = { error: `tool dispatch threw: ${err.message}` };
-  } finally {
-    progressHint.finish();
+    results = calls.map((call) => ({
+      call_id: call.call_id,
+      result: { error: `tool dispatch threw: ${err.message}` },
+    }));
   }
 
-  // Close out the card: error envelope -> error glyph, otherwise complete.
-  const errText = body && typeof body === 'object'
-    ? (body.error ?? body.result?.error ?? null)
-    : null;
-  if (errText) {
-    card.status = 'error';
-    card.events.push({ phase: 'error', name: toolName, detail: String(errText) });
-    sessionClient.recordToolEvent?.({
-      type: 'error', tool: toolName, error: String(errText), pos: 0,
-    });
-  } else {
-    card.status = 'complete';
-    card.events.push({ phase: 'done', name: toolName, ms: Date.now() - startedAt });
-    sessionClient.recordToolEvent?.({
-      type: 'complete', tool: toolName, ms: Date.now() - startedAt, pos: 0,
-    });
+  const commitResults = normalizeToolBatchResults(calls, results);
+  const byId = new Map(commitResults.map((item) => [item.call_id, item]));
+  for (const { call, card, cardDiv } of cards) {
+    const item = byId.get(call.call_id) || {
+      call_id: call.call_id,
+      result: { error: 'tool dispatch returned no result' },
+    };
+    const errText = item.result && typeof item.result === 'object' ? item.result.error : null;
+    if (errText) {
+      card.status = 'error';
+      card.events.push({ phase: 'error', name: card.name, detail: String(errText) });
+      sessionClient.recordToolEvent?.({
+        type: 'error', tool: card.name, error: String(errText), pos: 0,
+      });
+    } else {
+      const ms = Date.now() - card.startedAt;
+      card.status = 'complete';
+      card.events.push({ phase: 'done', name: card.name, ms });
+      sessionClient.recordToolEvent?.({ type: 'complete', tool: card.name, ms, pos: 0 });
+    }
+    updateVoiceToolCard(cardDiv, card);
   }
-  updateVoiceToolCard(cardDiv, card);
 
   // If the session ended while we were awaiting the dispatch, the model is
   // gone and there's nowhere to commit. Drop silently — the model already
@@ -1329,11 +1354,12 @@ async function handleToolCall(session, ev) {
     return;
   }
 
-  // Always commit SOMETHING when the session is alive — silence wedges the model.
+  // Always commit exactly one result per requested call when the session is
+  // alive — omitting even one call_id wedges providers with parallel tools.
   try {
-    sessionClient.commitToolResult(ev.call_id, body.result ?? body);
+    await sessionClient.commitToolResults(commitResults);
   } catch (err) {
-    console.error('[voice/ui] commitToolResult failed:', err);
+    console.error('[voice/ui] commitToolResults failed:', err);
   }
 }
 
@@ -1434,6 +1460,7 @@ async function openPicker() {
   const requestId = ++pickerRequestId;
   const voiceSel = document.getElementById('voice-picker-select');
   const ttsSel = document.getElementById('voice-picker-tts');
+  const conversationSel = document.getElementById('voice-picker-conversation');
   const modeSel = document.getElementById('voice-picker-mode');
   const instructionsEl = document.getElementById('voice-picker-instructions');
 
@@ -1455,6 +1482,7 @@ async function openPicker() {
   // the stale DOM value and resolves voice for the wrong agent.
   // Codex round-4 catch on #1347.
   ttsSel.value = settings().preferred_tts || '';
+  conversationSel.value = settings().preferred_conversation || '';
 
   // Show the modal before provider calls finish. A slow auth bootstrap,
   // rate-limit, or provider probe should render as a loading/error state in
@@ -1492,6 +1520,14 @@ async function openPicker() {
           if (opt.value === s.preferred_tts) { ttsSel.value = s.preferred_tts; break; }
         }
       }
+      if (s.preferred_conversation) {
+        for (const opt of conversationSel.options) {
+          if (opt.value === s.preferred_conversation) {
+            conversationSel.value = s.preferred_conversation;
+            break;
+          }
+        }
+      }
       // #1352 — repaint the instructions textarea after hydration so
       // the operator sees the agent's persisted ``voice_directive``
       // before they hit Save.  Without this, a fresh-browser open
@@ -1520,18 +1556,21 @@ async function openPicker() {
   // Re-preview when the user toggles mode or TTS — gives instant feedback.
   modeSel.onchange = () => refreshRoutePreview(++pickerRequestId);
   ttsSel.onchange = () => refreshRoutePreview(++pickerRequestId);
+  conversationSel.onchange = () => refreshRoutePreview(++pickerRequestId);
 }
 
 
 async function refreshRoutePreview(requestId = pickerRequestId) {
   const previewEl = document.getElementById('voice-picker-route-preview');
   const ttsSel = document.getElementById('voice-picker-tts');
+  const conversationSel = document.getElementById('voice-picker-conversation');
   const modeSel = document.getElementById('voice-picker-mode');
   const voiceSel = document.getElementById('voice-picker-select');
   const previousTts = ttsSel.value || settings().preferred_tts || '';
+  const previousConversation = conversationSel.value || settings().preferred_conversation || '';
   previewEl.textContent = 'Resolving...';
 
-  const overrides = pickerOverridesFromUI(modeSel.value, previousTts);
+  const overrides = pickerOverridesFromUI(modeSel.value, previousTts, previousConversation);
   let route;
   try {
     route = await fetchRoute(overrides);
@@ -1546,7 +1585,7 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   // Render the human summary.
   const parts = [];
   if (route.path === 'realtime') {
-    parts.push(`🟢 Realtime — model: ${route.voice_model || '(discovering)'}`);
+    parts.push(`🟢 Realtime — ${route.conversation_provider || 'provider'} · model: ${route.voice_model || '(discovering)'}`);
   } else if (route.path === 'pipeline') {
     parts.push(`🟠 Pipeline — your chat LLM (${route.llm_vendor || 'unknown'}) → TTS: ${route.tts_provider || 'auto'} / STT: ${route.stt_provider || 'auto'}`);
   } else if (route.path === 'local') {
@@ -1571,6 +1610,19 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   }
   ttsSel.disabled = (route.path === 'realtime');
 
+  const installedConversation = route.available_conversation_providers || [];
+  const capabilities = route.conversation_capabilities || {};
+  conversationSel.innerHTML = '<option value="">Auto (match active LLM vendor)</option>';
+  for (const name of installedConversation) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    const vendor = capabilities[name]?.vendor;
+    opt.textContent = vendor ? `${name} · ${vendor}` : name;
+    if (name === previousConversation) opt.selected = true;
+    conversationSel.appendChild(opt);
+  }
+  conversationSel.disabled = (route.path !== 'realtime' && modeSel.value === 'pipeline');
+
   // Refresh the voice list scoped to the path's actual voice catalog.
   //   Realtime → conversation provider (e.g. openai_realtime; voices like
   //              Marin/Cedar/Alloy on the Realtime model).
@@ -1581,11 +1633,17 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   // to Realtime where those voices don't exist.
   let voiceListProvider;
   if (route.path === 'realtime') {
-    voiceListProvider = route.conversation_provider || 'openai_realtime';
+    voiceListProvider = route.conversation_provider || previousConversation || '';
   } else {
     voiceListProvider = previousTts || route.tts_provider || '';
   }
-  await refreshVoiceList(voiceSel, voiceListProvider, requestId);
+  voiceSel.dataset.provider = voiceListProvider;
+  await refreshVoiceList(
+    voiceSel,
+    voiceListProvider,
+    requestId,
+    voiceForProvider(settings(), voiceListProvider) || route.voice_id || '',
+  );
 
   // Bug #2: live-update the chat-header annotation when the picker mode
   // changes, not only after a session successfully starts. Otherwise the
@@ -1593,8 +1651,8 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   // the header still reads the prior (Pipeline) annotation.
   if (route.path === 'realtime') {
     setModelSelectorVoiceAnnotation(
-      route.voice_model || 'gpt-realtime',
-      `Voice will use ${route.voice_model || 'gpt-realtime'} (Realtime). Click 🎙 to start.`,
+      `${route.conversation_provider || 'Realtime'} · ${route.voice_model || 'discovering'}`,
+      `Voice will use ${route.conversation_provider || 'the selected provider'} / ${route.voice_model || 'a discovered model'}. Click 🎙 to start.`,
     );
   } else if (route.path === 'pipeline') {
     setModelSelectorVoiceAnnotation(
@@ -1612,7 +1670,12 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
 }
 
 
-async function refreshVoiceList(selectEl, providerName, requestId = pickerRequestId) {
+async function refreshVoiceList(
+  selectEl,
+  providerName,
+  requestId = pickerRequestId,
+  selectedVoice = '',
+) {
   selectEl.innerHTML = '<option value="">Loading voices...</option>';
   try {
     const voices = await fetchVoices(providerName);
@@ -1640,8 +1703,13 @@ async function refreshVoiceList(selectEl, providerName, requestId = pickerReques
       // Suffix with provider name when "auto" so the user can see the
       // multi-provider mix; redundant when scoped to one.
       const providerLabel = providerName ? '' : ` · ${v.provider}`;
-      opt.textContent = `${v.name} (${v.gender}, ${v.accent})${providerLabel}`;
-      if (v.voice_id === settings().voice) opt.selected = true;
+      const traits = [v.gender, v.accent, v.tone || v.energy, v.use_case]
+        .filter((value) => value && value !== 'neutral');
+      const customLabel = v.is_custom ? ' · custom' : '';
+      const traitLabel = traits.length ? ` (${traits.join(', ')})` : '';
+      opt.textContent = `${v.name}${customLabel}${traitLabel}${providerLabel}`;
+      opt.title = v.description || '';
+      if (v.voice_id === selectedVoice) opt.selected = true;
       selectEl.appendChild(opt);
     }
   } catch (err) {
@@ -1651,11 +1719,14 @@ async function refreshVoiceList(selectEl, providerName, requestId = pickerReques
 }
 
 
-function pickerOverridesFromUI(mode, preferredTts) {
+function pickerOverridesFromUI(mode, preferredTts, preferredConversation = '') {
   // Translate the mode dropdown into the resolver's prefer_realtime knob.
   // "auto" leaves prefer_realtime at the default (true) — the resolver
   // still falls back to Pipeline based on privacy + LLM vendor.
-  const overrides = { preferred_tts: preferredTts || '' };
+  const overrides = {
+    preferred_tts: preferredTts || '',
+    preferred_conversation: preferredConversation || '',
+  };
   if (mode === 'pipeline') overrides.prefer_realtime = false;
   else overrides.prefer_realtime = true;
   return overrides;
@@ -1667,6 +1738,9 @@ async function fetchRoute(overrides = {}) {
   if (overrides.prefer_realtime === false) params.set('prefer_realtime', 'false');
   if (overrides.preferred_tts) params.set('preferred_tts', overrides.preferred_tts);
   if (overrides.preferred_stt) params.set('preferred_stt', overrides.preferred_stt);
+  if (overrides.preferred_conversation) {
+    params.set('preferred_conversation', overrides.preferred_conversation);
+  }
   const qs = params.toString();
   const url = API.buildAgentUrl(`/voice/realtime/route${qs ? `?${qs}` : ''}`);
   const resp = await fetch(url, { headers: await voiceAuthHeaders() });
@@ -1682,16 +1756,28 @@ function closePicker() {
 
 
 function savePicker() {
-  const voice = document.getElementById('voice-picker-select').value;
+  const voiceSelect = document.getElementById('voice-picker-select');
+  const voice = voiceSelect.value;
+  const voiceProvider = voiceSelect.dataset.provider || '';
   const instructions = document.getElementById('voice-picker-instructions').value;
   const mode = document.getElementById('voice-picker-mode').value || 'auto';
   const preferredTts = document.getElementById('voice-picker-tts').value || '';
+  const preferredConversation = document.getElementById('voice-picker-conversation').value || '';
   // Per-agent storage: the cache for the current host agent gets the
   // new picker state in-place, then we persist to that agent's
   // localStorage slot.  Other agents' caches are untouched — switching
   // to a different agent later shows that agent's own settings.
   const agent = currentAgentKey();
-  const next = { voice, instructions, mode, preferred_tts: preferredTts };
+  const providerVoiceIds = { ...(settings().provider_voice_ids || {}) };
+  if (voiceProvider && voice) providerVoiceIds[voiceProvider] = voice;
+  const next = {
+    voice,
+    instructions,
+    mode,
+    preferred_tts: preferredTts,
+    preferred_conversation: preferredConversation,
+    provider_voice_ids: providerVoiceIds,
+  };
   _settingsByAgent.set(agent, next);
   saveSettings(agent, next);
   // Bump the save generation so any hydration that started before this
@@ -1739,8 +1825,10 @@ function savePicker() {
     seeded !== '' || _serverHydrated.has(agent)
   );
   const payload = {
-    tts_voice_id: voice,
+    tts_voice_id: voiceForProvider(next, preferredTts),
     tts_provider: preferredTts,
+    conversation_provider: preferredConversation,
+    provider_voice_ids: providerVoiceIds,
   };
   if (instructions !== '' || operatorHasSeenSomething) {
     payload.voice_directive = instructions;
@@ -1760,7 +1848,7 @@ function savePicker() {
   _pendingSaveByAgent.set(agent, inflight);
   // If a session is active, push the new instructions immediately —
   // Realtime accepts session.update mid-call. Voice/path change requires a
-  // new session (OpenAI Realtime can't hot-swap voice or model).
+  // new session (realtime providers generally cannot hot-swap voice/model).
   const session = sessionForAgent(agent);
   if (session.client && instructions) {
     try { session.client.updateInstructions(instructions); } catch (_) {}
@@ -1806,7 +1894,7 @@ async function fetchVoices(providerName = '') {
 
 
 /**
- * Look up the diagnostic reason a TTS provider has no voices. Calls
+ * Look up why a pipeline or realtime provider has no voices. Calls
  * /voice/providers/status and returns the install hint or raw error message
  * for the named provider, or null when no specific diagnostic is available.
  */
@@ -1820,7 +1908,7 @@ async function fetchProviderReason(providerName) {
     const rows = (body && body.providers) || [];
     const target = providerName.toLowerCase();
     const match = rows.find(
-      r => r.kind === 'tts'
+      r => (r.kind === 'tts' || r.kind === 'conversation')
         && (r.provider_name === providerName
             || (r.name || '').toLowerCase().includes(target))
     );
@@ -1893,7 +1981,10 @@ function isTypingTarget(el) {
 
 
 function loadSettings(agentName) {
-  const defaults = { voice: '', instructions: '', mode: 'auto', preferred_tts: '' };
+  const defaults = {
+    voice: '', instructions: '', mode: 'auto', preferred_tts: '',
+    preferred_conversation: '', provider_voice_ids: {},
+  };
   try {
     const raw = localStorage.getItem(settingsKeyForAgent(agentName));
     if (!raw) return defaults;
@@ -1905,6 +1996,10 @@ function loadSettings(agentName) {
       // back to "auto" + "" so existing users don't get a broken picker.
       mode: typeof parsed.mode === 'string' ? parsed.mode : 'auto',
       preferred_tts: typeof parsed.preferred_tts === 'string' ? parsed.preferred_tts : '',
+      preferred_conversation: typeof parsed.preferred_conversation === 'string'
+        ? parsed.preferred_conversation : '',
+      provider_voice_ids: parsed.provider_voice_ids && typeof parsed.provider_voice_ids === 'object'
+        ? { ...parsed.provider_voice_ids } : {},
     };
   } catch (_) {
     return defaults;
@@ -1997,6 +2092,21 @@ async function hydrateSettingsFromServer() {
     }
     if (!s.preferred_tts && typeof cfg.tts_provider === 'string' && cfg.tts_provider) {
       s.preferred_tts = cfg.tts_provider;
+      changedTts = true;
+    }
+    if (cfg.provider_voice_ids && typeof cfg.provider_voice_ids === 'object') {
+      s.provider_voice_ids = {
+        ...cfg.provider_voice_ids,
+        ...(s.provider_voice_ids || {}),
+      };
+    }
+    if (cfg.tts_provider && cfg.tts_voice_id && !s.provider_voice_ids[cfg.tts_provider]) {
+      s.provider_voice_ids[cfg.tts_provider] = cfg.tts_voice_id;
+    }
+    if (!s.preferred_conversation
+        && typeof cfg.conversation_provider === 'string'
+        && cfg.conversation_provider) {
+      s.preferred_conversation = cfg.conversation_provider;
       changedTts = true;
     }
     // #1352 — agent's persisted ``voice_directive`` IS the persona;
