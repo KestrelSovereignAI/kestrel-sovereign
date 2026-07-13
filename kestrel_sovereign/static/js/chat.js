@@ -2012,7 +2012,7 @@ export function renderSignalWakeChip(msg, target = null) {
     if (msg.id) div.dataset.messageId = msg.id;
 
     if (msg.id) {
-        div.appendChild(buildMessageKebab(msg, div));
+        div.appendChild(buildMessageKebab(msg, div, deps().api));
     }
 
     const attribution = document.createElement('div');
