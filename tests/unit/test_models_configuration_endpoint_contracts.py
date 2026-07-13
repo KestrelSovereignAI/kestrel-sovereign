@@ -481,6 +481,7 @@ def test_current_and_set_model_endpoints_share_runtime_preference_contract():
             "vendor": "openai",
             "route": None,
             "model_name": "gpt-5-mini",
+            "is_auto": False,
         }
         assert set_response.status_code == 200
         assert set_response.json()["full_model"] == "anthropic/claude-opus"

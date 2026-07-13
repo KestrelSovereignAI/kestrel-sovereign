@@ -4129,6 +4129,25 @@ export function appendMessagePart(type, data, paneElement = null) {
 // ============================================================================
 
 /**
+ * Refresh the model-settings header button so it shows the ACTIVE model at a
+ * glance (#2419) — e.g. "GPT-5.6 Luna · Plan", or "Auto — currently
+ * gpt-5.6-luna" when the preference is auto (making auto-drift observable).
+ *
+ * Reads the same resolved state the popover drives via ``getSummary()`` so the
+ * button never disagrees with the panel. CSS handles truncation on narrow
+ * headers; the full label rides in the span's title for hover. Falls back to
+ * the static "Model settings" before a model resolves.
+ */
+export function updateModelSettingsSummary(selector = sharedModelSelector) {
+    const summaryEl = el('model-settings-summary');
+    if (!summaryEl || !selector || typeof selector.getSummary !== 'function') return;
+    const { label } = selector.getSummary();
+    const text = label || 'Model settings';
+    summaryEl.textContent = text;
+    summaryEl.title = text;
+}
+
+/**
  * Initialize the shared model selector component
  */
 export async function loadModels() {
@@ -4153,6 +4172,18 @@ export async function loadModels() {
             element.value = '';
             if (id === 'route-selector') element.style.display = 'none';
         }
+    }
+
+    // Reset the header button label too (#2419). The dropdowns are blanked
+    // above, but the summary span still holds the PREVIOUS agent's resolved
+    // model until the new selector's init() finishes its async
+    // /api/models + /api/model/current round-trips. selectAgent() flips
+    // routing before awaiting loadModels(), so without this reset the header
+    // briefly shows the old agent's model under the new agent's name.
+    const summaryEl = el('model-settings-summary');
+    if (summaryEl) {
+        summaryEl.textContent = 'Model settings';
+        summaryEl.title = 'Model settings';
     }
 
     // Create the shared model selector instance
@@ -4185,6 +4216,10 @@ export async function loadModels() {
             deps().state.selectedProvider = vendor;    // legacy name retained
             deps().state.selectedVendor = vendor;
             deps().state.selectedRoute = route || null;
+
+            // Reflect the just-picked model on the header button immediately
+            // (#2419) — the selector already flipped off its auto flag.
+            updateModelSettingsSummary();
 
             const body = { vendor, model };
             if (route) body.route = route;
@@ -4239,6 +4274,9 @@ export async function loadModels() {
     const selection = sharedModelSelector.getSelection();
     deps().state.selectedModel = selection.model;
     deps().state.selectedProvider = selection.provider;
+
+    // Seed the header button with the resolved active model (#2419).
+    updateModelSettingsSummary();
 
     // Announce that the shared selector is (re)built so features that decorate
     // or temporarily seize it can (re)attach (#2047). chat.js itself stays
@@ -4315,6 +4353,9 @@ function checkForModelChange(content) {
             deps().state.selectedModel = selection.model;
             deps().state.selectedProvider = selection.provider;
 
+            // Keep the header button in sync with the mid-session change (#2419).
+            updateModelSettingsSummary();
+
             // Visual feedback on model selector
             const modelSelect = el('model-selector');
             if (modelSelect) {
@@ -4358,6 +4399,9 @@ export async function syncSelectorIfModelToolUsed(pane, selector = sharedModelSe
     deps().state.selectedProvider = selector.selectedProvider;
     deps().state.selectedVendor = selector.selectedProvider;
     deps().state.selectedRoute = selector.selectedRoute || null;
+    // The agent's set_model tool may have pinned OR cleared-to-auto the model;
+    // syncWithServer re-read is_auto, so refresh the header button now (#2419).
+    updateModelSettingsSummary(selector);
 }
 
 // ============================================================================

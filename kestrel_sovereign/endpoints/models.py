@@ -1432,7 +1432,10 @@ async def get_current_model(request: Request):
     """Return the currently active ``{vendor, model, route}`` selection."""
     try:
         agent = get_agent(request)
-        selection = {"model": None, "vendor": None, "route": None, "model_name": None}
+        selection = {
+            "model": None, "vendor": None, "route": None,
+            "model_name": None, "is_auto": False,
+        }
 
         if hasattr(agent, 'llm_service') and agent.llm_service:
             from kestrel_sovereign.llm.service import resolve_active_model_selection
@@ -1443,6 +1446,9 @@ async def get_current_model(request: Request):
             "vendor": selection["vendor"],
             "route": selection["route"],
             "model_name": selection["model_name"],
+            # #2419 — surface auto-resolution so the header button can render
+            # "Auto — currently <model>" and make auto-drift observable.
+            "is_auto": selection.get("is_auto", False),
         }
     except Exception as e:
         logger.error(f"Error getting current model: {e}", exc_info=True)

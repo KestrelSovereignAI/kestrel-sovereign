@@ -62,6 +62,7 @@ def test_llm_service_exposes_canonical_current_model_selection_for_vendor_prefer
         "vendor": "anthropic",
         "route": None,
         "model_name": "claude-sonnet-4-6",
+        "is_auto": False,
     }
 
 
@@ -77,6 +78,7 @@ def test_llm_service_exposes_canonical_current_model_selection_for_vendor_route_
         "vendor": "anthropic",
         "route": "plan",
         "model_name": "claude-sonnet-4-6",
+        "is_auto": False,
     }
 
 
@@ -91,6 +93,7 @@ def test_llm_service_exposes_auto_when_no_preference_or_providers():
         "vendor": None,
         "route": None,
         "model_name": "auto",
+        "is_auto": True,
     }
 
 
@@ -125,4 +128,5 @@ def test_current_model_paths_agree_for_model_only_preference():
         "vendor": None,
         "route": None,
         "model_name": "gpt-5-mini",
+        "is_auto": False,
     }
