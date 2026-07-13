@@ -105,7 +105,7 @@ The generated inventory below lists core features only: the in-tree surface disc
 Installed entry point feature classes are included in JSON output when present in the active environment.
 Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.
 
-- Current audited snapshot: `37` discoverable modules and `37` exported `Feature` subclasses.
+- Current audited snapshot: `38` discoverable modules and `38` exported `Feature` subclasses.
 
 ### `attachments` (AttachmentsFeature)
 
@@ -273,6 +273,19 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `deploy_agent` | `!deploy` | `system` | `action`, `profile`, `tag` | 138 | `enabled` |
+
+### `feature_forge` (FeatureForgeFeature)
+
+- Source: [`kestrel_sovereign/features/feature_forge/feature.py`](kestrel_sovereign/features/feature_forge/feature.py)
+- Enablement state: `enabled`
+
+| Tool | Command | Category | Params | Token cost | State |
+|---|---|---|---|---:|---|
+| `forge_feature` | `!forge` | `agent_management` | `spec` | 138 | `enabled` |
+| `forge_register` | `!forge-register` | `agent_management` | `feature_name` | 135 | `enabled` |
+| `forge_status` | `!forge-status` | `agent_management` | `feature_name` | 67 | `enabled` |
+| `forge_validate` | `!forge-validate` | `agent_management` | `feature_name` | 98 | `enabled` |
+| `list_forged` | `!forge-list` | `agent_management` |  | 22 | `enabled` |
 
 ### `health` (HealthFeature)
 
