@@ -3161,7 +3161,7 @@ let contextStatusElement = null;
  * count into the footer and offered a Compact button based on that
  * aggregate, which made no sense.
  */
-export async function updateContextStatus() {
+export async function updateContextStatus(expectedAgent = deps().api.getHostAgent()) {
     // #879: context-status footer is part of the chat surface.  No-op when
     // the host opted out so /api/agent/context-status isn't called on every
     // conversation change.
@@ -3183,6 +3183,10 @@ export async function updateContextStatus() {
         }
 
         const status = await deps().api.getContextStatus(sessionId);
+        if (
+            deps().api.getHostAgent() !== expectedAgent
+            || deps().state.currentSessionId !== sessionId
+        ) return;
         const { message_count, utilization_percent, status: contextState, warnings, route_cap, codex_thread } = status;
         const modelLabel = formatContextModelLabel(status);
 
@@ -4129,7 +4133,8 @@ export function updateModelSettingsSummary(selector = sharedModelSelector) {
 /**
  * Initialize the shared model selector component
  */
-export async function loadModels() {
+export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
+    const isCurrent = () => deps().api.getHostAgent() === expectedAgent;
     // #879: model selector lives in the chat header — skip when chat is off.
     if (!deps().api.hasCapability('chat')) return;
     // Check if SharedModelSelector is available (loaded via script tag)
@@ -4167,7 +4172,7 @@ export async function loadModels() {
 
     // Create the shared model selector instance
     // Use deps().api.buildAgentUrl() for proper multi_agent routing and pass auth headers
-    sharedModelSelector = new ModelSelector({
+    const nextModelSelector = new ModelSelector({
         providerSelectId: 'provider-selector',
         routeSelectId: 'route-selector',
         upstreamSelectId: 'upstream-selector',
@@ -4176,6 +4181,7 @@ export async function loadModels() {
         currentModelEndpoint: deps().api.buildAgentUrl('/api/model/current'),
         storagePrefix: `kestrel_${deps().api.getHostAgent() || 'default'}`,
         getAuthHeader: async () => await deps().api.applyAuth({}),
+        isCurrent,
         onModelChange: async (vendor, model, isInitialLoad, route) => {
             if (isInitialLoad) return;
 
@@ -4229,7 +4235,13 @@ export async function loadModels() {
     });
 
     // Initialize - loads models, binds events, syncs with server
-    await sharedModelSelector.init();
+    await nextModelSelector.init();
+    if (!isCurrent() || !nextModelSelector.allModelsData) {
+        nextModelSelector.destroy?.();
+        return;
+    }
+    sharedModelSelector?.destroy?.();
+    sharedModelSelector = nextModelSelector;
 
     // Expose globally so other modules (identity.js) can auto-switch on privacy change
     window._sharedModelSelector = sharedModelSelector;
@@ -4266,7 +4278,7 @@ export async function loadModels() {
     // API and lists only embedding-capable routes surfaced by /api/models.
     const EmbeddingSelectorCtor = deps().EmbeddingSelector;
     if (EmbeddingSelectorCtor && el('embedding-mode-selector')) {
-        embeddingSelector = new EmbeddingSelectorCtor({
+        const nextEmbeddingSelector = new EmbeddingSelectorCtor({
             settingsEndpoint: deps().api.buildAgentUrl('/api/embedding/settings'),
             modelsEndpoint: deps().api.buildAgentUrl('/api/embedding/models'),
             routeModelEndpoint: deps().api.buildAgentUrl('/api/embedding/route-model'),
@@ -4283,6 +4295,8 @@ export async function loadModels() {
             reindexStatusId: 'embedding-reindex-status',
             reindexEndpoint: deps().api.buildAgentUrl('/api/embedding/reindex'),
             getAuthHeader: async () => await deps().api.applyAuth({}),
+            isCurrent,
+            invalidateModelCatalog: () => sharedModelSelector?.invalidateCatalog?.(),
             getEmbeddingRoutes: () => {
                 const routes = (sharedModelSelector?.allModelsData?.routes) || [];
                 return routes
@@ -4301,7 +4315,13 @@ export async function loadModels() {
                     }));
             },
         });
-        await embeddingSelector.init();
+        await nextEmbeddingSelector.init();
+        if (!isCurrent()) {
+            nextEmbeddingSelector.destroy?.();
+            return;
+        }
+        embeddingSelector?.destroy?.();
+        embeddingSelector = nextEmbeddingSelector;
         window._embeddingSelector = embeddingSelector;
     }
 

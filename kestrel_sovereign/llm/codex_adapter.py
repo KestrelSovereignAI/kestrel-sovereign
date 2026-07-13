@@ -35,10 +35,13 @@ executor and the result back to the app-server.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
 import random
+import tempfile
 from pathlib import Path
 from typing import (
     Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union,
@@ -293,18 +296,18 @@ def _image_url_from_part(
 
 
 def _content_to_codex_input_parts(content: Any) -> List[Dict[str, Any]]:
-    """Convert OpenAI chat content parts to Responses-API input parts.
+    """Convert OpenAI chat content parts to Codex app-server user inputs.
 
     Kestrel's upstream vision path carries images in Chat Completions shape
-    (``{"type": "image_url", "image_url": {"url": "data:..."}}``). Codex's
-    app-server forwards turn input to the Responses API, where the matching
-    part is ``{"type": "input_image", "image_url": "data:..."}``.
+    (``{"type": "image_url", "image_url": {"url": "data:..."}}``). The
+    app-server protocol accepts ``UserInput`` objects, where the corresponding
+    wire item is ``{"type": "image", "url": "data:..."}``.
     """
     if isinstance(content, str):
-        return [{"type": "input_text", "text": content}]
+        return [{"type": "text", "text": content}]
     if not isinstance(content, list):
         text = "" if content is None else str(content)
-        return [{"type": "input_text", "text": text}]
+        return [{"type": "text", "text": text}]
 
     out: List[Dict[str, Any]] = []
     for part in content:
@@ -319,14 +322,14 @@ def _content_to_codex_input_parts(content: Any) -> List[Dict[str, Any]]:
         if ptype in ("text", "input_text"):
             text = part.get("text")
             if text:
-                out.append({"type": "input_text", "text": str(text)})
+                out.append({"type": "text", "text": str(text)})
             continue
         if ptype in ("image_url", "input_image"):
             url, detail = _image_url_from_part(part)
             if url:
                 item: Dict[str, Any] = {
-                    "type": "input_image",
-                    "image_url": url,
+                    "type": "image",
+                    "url": url,
                 }
                 if detail:
                     item["detail"] = detail
@@ -395,7 +398,7 @@ def _build_turn_input(
     )
     if latest_has_images:
         parts = _content_to_codex_input_parts(latest)
-        return [{"type": "input_text", "text": prefix}, *parts]
+        return [{"type": "text", "text": prefix}, *parts]
     return prefix + latest_text
 
 
@@ -405,6 +408,81 @@ def _turn_input_to_request_input(
     if isinstance(turn_input, list):
         return turn_input
     return [{"type": "text", "text": turn_input}]
+
+
+_DATA_IMAGE_SUFFIXES = {
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+def _materialize_app_server_data_images(
+    request_input: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Path]]:
+    """Turn inline image data URLs into temporary ``localImage`` inputs.
+
+    Codex app-server's current ``UserInput`` schema distinguishes remote image
+    URLs (``image``) from filesystem images (``localImage``). It accepts the
+    data-URL string as an ``image`` item but cannot infer its format and may
+    drop it as ``unsupported image unknown``. Materialize supported base64
+    image MIME types and return every path so the turn's ``finally`` block can
+    unlink them. Leave unsupported/non-base64 data URLs on the wire: the app
+    server can ignore an unsupported attachment without aborting the user's
+    accompanying text turn. Drop corrupt supported-image payloads locally for
+    the same reason: one malformed attachment must not discard valid text.
+    """
+    materialized: List[Dict[str, Any]] = []
+    temp_paths: List[Path] = []
+    try:
+        for item in request_input:
+            url = item.get("url") if item.get("type") == "image" else None
+            if not isinstance(url, str) or not url.lower().startswith("data:"):
+                materialized.append(item)
+                continue
+
+            header, separator, encoded = url.partition(",")
+            media_type = header[5:].split(";", 1)[0].lower()
+            suffix = _DATA_IMAGE_SUFFIXES.get(media_type)
+            if not separator or ";base64" not in header.lower() or suffix is None:
+                logger.warning(
+                    "CodexAdapter: leaving unsupported inline image for app-server "
+                    "fallback (media_type=%s)",
+                    media_type or "unknown",
+                )
+                materialized.append(item)
+                continue
+            try:
+                payload = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                logger.warning(
+                    "CodexAdapter: dropping corrupt inline image while preserving "
+                    "the text turn (media_type=%s)",
+                    media_type,
+                )
+                continue
+
+            with tempfile.NamedTemporaryFile(
+                prefix="kestrel-codex-image-",
+                suffix=suffix,
+                delete=False,
+            ) as image_file:
+                image_file.write(payload)
+                path = Path(image_file.name)
+            temp_paths.append(path)
+            local_item: Dict[str, Any] = {
+                "type": "localImage",
+                "path": str(path),
+            }
+            if item.get("detail"):
+                local_item["detail"] = item["detail"]
+            materialized.append(local_item)
+    except Exception:
+        for path in temp_paths:
+            path.unlink(missing_ok=True)
+        raise
+    return materialized, temp_paths
 
 
 def _turn_input_text_for_estimate(turn_input: CodexTurnInput) -> str:
@@ -1134,7 +1212,7 @@ class CodexAdapter(LLMAdapter):
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
             notes=(
                 "Codex app-server tools are executed through dynamic tool events.",
-                "OpenAI image_url parts are translated to Responses input_image parts.",
+                "OpenAI image_url parts are translated to app-server image inputs.",
             ),
         )
 
@@ -2567,6 +2645,7 @@ class CodexAdapter(LLMAdapter):
         self._ensure_codex_approval_bridge(app)
 
         sink = app.open_turn_sink(thread_id)
+        temp_image_paths: List[Path] = []
         try:
             # dynamicTools are registered at thread/start; turn/start carries
             # the user input plus per-turn overrides that mirror what
@@ -2577,9 +2656,12 @@ class CodexAdapter(LLMAdapter):
             # cwd resolution mirrors ``thread/start`` (#1734) — same
             # priority order so per-turn overrides stay consistent
             # with the workspace boundary the sandbox is enforcing.
+            request_input, temp_image_paths = _materialize_app_server_data_images(
+                _turn_input_to_request_input(turn_input)
+            )
             turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
-                "input": _turn_input_to_request_input(turn_input),
+                "input": request_input,
                 "cwd": self._resolve_thread_cwd(),
             }
             # Reuse _model_param's sentinel filter — "auto"/"default" are
@@ -2913,6 +2995,8 @@ class CodexAdapter(LLMAdapter):
             raise
         finally:
             app.close_turn_sink(thread_id)
+            for path in temp_image_paths:
+                path.unlink(missing_ok=True)
             for _unreg in unregisters:
                 try:
                     _unreg()

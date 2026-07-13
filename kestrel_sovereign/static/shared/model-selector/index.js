@@ -30,6 +30,40 @@ const VENDOR_NAMES = {
 // Back-compat alias for any caller reading the old name.
 const PROVIDER_NAMES = VENDOR_NAMES;
 
+// Catalogs are descriptive and shared by every selector instance targeting the
+// same agent endpoint. Cache the parsed response for the server's five-minute
+// discovery TTL and coalesce concurrent loads, while /api/model/current remains
+// an uncached server-authoritative sync on every agent switch.
+const MODEL_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
+const _modelCatalogCache = new Map();
+
+async function fetchModelCatalog(endpoint, headers) {
+    const now = Date.now();
+    const cached = _modelCatalogCache.get(endpoint);
+    if (cached?.data && cached.expiresAt > now) return cached.data;
+    if (cached?.promise) return cached.promise;
+
+    const promise = (async () => {
+        const response = await fetch(endpoint, { headers });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+    })();
+    _modelCatalogCache.set(endpoint, { promise });
+    try {
+        const data = await promise;
+        _modelCatalogCache.set(endpoint, {
+            data,
+            expiresAt: Date.now() + MODEL_CATALOG_CACHE_TTL_MS,
+        });
+        return data;
+    } catch (error) {
+        if (_modelCatalogCache.get(endpoint)?.promise === promise) {
+            _modelCatalogCache.delete(endpoint);
+        }
+        throw error;
+    }
+}
+
 class ModelSelector {
     /**
      * Create a two-dropdown model selector
@@ -41,6 +75,7 @@ class ModelSelector {
      * @param {string} [options.storagePrefix='kestrel'] - localStorage key prefix
      * @param {Function} [options.onModelChange] - Callback when model changes (provider, model) => void
      * @param {Function} [options.getAuthHeader] - Function returning auth header object
+     * @param {Function} [options.isCurrent] - False when this selector was superseded
      * @param {boolean} [options.sendCommandOnChange=true] - Whether to trigger onModelChange on selection
      */
     constructor(options = {}) {
@@ -66,7 +101,9 @@ class ModelSelector {
         this.storagePrefix = options.storagePrefix || 'kestrel';
         this.onModelChange = options.onModelChange || (() => {});
         this.getAuthHeader = options.getAuthHeader || (() => ({}));
+        this.isCurrent = options.isCurrent || (() => true);
         this.sendCommandOnChange = options.sendCommandOnChange !== false;
+        this._eventHandlers = null;
 
         this.allModelsData = null;
         this.selectedProvider = '';
@@ -155,28 +192,50 @@ class ModelSelector {
      * Initialize the component - load models and bind events
      */
     async init() {
-        await this.loadModels();
+        const models = await this.loadModels();
+        if (!models || !this.isCurrent()) return;
         this._bindEvents();
         await this.syncWithServer();
-        this.isInitialLoad = false;
+        if (this.isCurrent()) {
+            this.isInitialLoad = false;
+        } else {
+            this.destroy();
+        }
     }
 
     /**
      * Bind event listeners
      */
     _bindEvents() {
+        if (this._eventHandlers) return;
+        this._eventHandlers = {
+            provider: () => this._handleProviderChange(),
+            model: () => this._handleModelChange(),
+            route: () => this._handleRouteChange(),
+            upstream: () => this._handleUpstreamChange(),
+        };
         if (this.providerSelect) {
-            this.providerSelect.addEventListener('change', () => this._handleProviderChange());
+            this.providerSelect.addEventListener('change', this._eventHandlers.provider);
         }
         if (this.modelSelect) {
-            this.modelSelect.addEventListener('change', () => this._handleModelChange());
+            this.modelSelect.addEventListener('change', this._eventHandlers.model);
         }
         if (this.routeSelect) {
-            this.routeSelect.addEventListener('change', () => this._handleRouteChange());
+            this.routeSelect.addEventListener('change', this._eventHandlers.route);
         }
         if (this.upstreamSelect) {
-            this.upstreamSelect.addEventListener('change', () => this._handleUpstreamChange());
+            this.upstreamSelect.addEventListener('change', this._eventHandlers.upstream);
         }
+    }
+
+    /** Remove handlers before a switch replaces this selector instance. */
+    destroy() {
+        if (!this._eventHandlers) return;
+        this.providerSelect?.removeEventListener?.('change', this._eventHandlers.provider);
+        this.modelSelect?.removeEventListener?.('change', this._eventHandlers.model);
+        this.routeSelect?.removeEventListener?.('change', this._eventHandlers.route);
+        this.upstreamSelect?.removeEventListener?.('change', this._eventHandlers.upstream);
+        this._eventHandlers = null;
     }
 
     /**
@@ -193,21 +252,25 @@ class ModelSelector {
                 'Content-Type': 'application/json',
                 ...(await this.getAuthHeader())
             };
+            if (!this.isCurrent()) return null;
 
-            const response = await fetch(this.apiEndpoint, { headers });
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-            }
-
-            this.allModelsData = await response.json();
+            const data = await fetchModelCatalog(this.apiEndpoint, headers);
+            if (!this.isCurrent()) return null;
+            this.allModelsData = data;
             this._populateProviders();
 
             return this.allModelsData;
         } catch (e) {
+            if (!this.isCurrent()) return null;
             console.error('ModelSelector: Failed to load models:', e);
             this.providerSelect.innerHTML = '<option value="">Error loading</option>';
             return null;
         }
+    }
+
+    /** Evict this agent's descriptive catalog after a settings mutation. */
+    invalidateCatalog() {
+        _modelCatalogCache.delete(this.apiEndpoint);
     }
 
     /**
@@ -545,10 +608,12 @@ class ModelSelector {
         this._lastSyncedSelection = { vendor, model, route };
         // An explicit operator pick pins the model — no longer auto (#2419).
         this._isAuto = false;
+        this.invalidateCatalog();
         this.onModelChange(vendor, model, this.isInitialLoad, route);
     }
 
     _handleProviderChange() {
+        if (!this.isCurrent()) return;
         this.selectedProvider = this.providerSelect.value;
         this.selectedRoute = '';
         // Each vendor switch starts collapsed to the featured set, drops any
@@ -567,6 +632,7 @@ class ModelSelector {
     }
 
     _handleModelChange() {
+        if (!this.isCurrent()) return;
         const picked = this.modelSelect.value;
         // Sentinel options toggle the featured/all view rather than selecting a
         // model. Re-render and stop — no commit, no state change. (#2015)
@@ -582,6 +648,7 @@ class ModelSelector {
     }
 
     _handleRouteChange() {
+        if (!this.isCurrent()) return;
         this.selectedRoute = this.routeSelect.value;
         // A route change repopulates the model combo from THAT route's
         // discovery (#2262). Clear the previous route's cache + upstream filter,
@@ -606,6 +673,7 @@ class ModelSelector {
      * sent to the server as an OpenRouter provider-preferences pin (#2264).
      */
     _handleUpstreamChange() {
+        if (!this.isCurrent()) return;
         this.selectedUpstream = this.upstreamSelect.value || 'All';
         this._saveState();
         this._populateModels();
@@ -623,11 +691,13 @@ class ModelSelector {
                 'Content-Type': 'application/json',
                 ...(await this.getAuthHeader())
             };
+            if (!this.isCurrent()) return;
 
             const response = await fetch(this.currentModelEndpoint, { headers });
             if (!response.ok) return;
 
             const data = await response.json();
+            if (!this.isCurrent()) return;
             if (!data.model) return;
 
             // Auto-resolution flag (#2419): the server tells us whether the
@@ -736,6 +806,10 @@ class ModelSelector {
                     : syncData.model);
 
             if (vendor && bareModel) {
+                // The marker confirms a server-side mutation. Do not let a
+                // later agent switch reuse descriptive defaults/capabilities
+                // captured before that change.
+                this.invalidateCatalog();
                 // Set the selection BEFORE (re)populating so a non-featured
                 // target (e.g. an agent that switched to a deprecated model)
                 // is still rendered under the collapsed featured-only view —
@@ -917,6 +991,7 @@ class ModelSelector {
                 headers,
                 body: JSON.stringify(body)
             });
+            if (response.ok) this.invalidateCatalog();
             return response.ok;
         } catch (e) {
             console.warn('ModelSelector: Failed to set model on server:', e);
@@ -945,6 +1020,7 @@ class ModelSelector {
         this._saveState();
 
         if (triggerCallback) {
+            this.invalidateCatalog();
             this.onModelChange(this.selectedProvider, this.selectedModel);
         }
     }

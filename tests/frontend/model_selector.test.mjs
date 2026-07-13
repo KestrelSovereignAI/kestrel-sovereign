@@ -9,11 +9,21 @@ const source = fs.readFileSync(
 );
 
 function createSelect() {
+    const handlers = new Map();
     return {
         value: '',
         innerHTML: '',
         style: {},
-        addEventListener() {},
+        addEventListener(type, fn) {
+            if (!handlers.has(type)) handlers.set(type, new Set());
+            handlers.get(type).add(fn);
+        },
+        removeEventListener(type, fn) {
+            handlers.get(type)?.delete(fn);
+        },
+        listenerCount(type) {
+            return handlers.get(type)?.size || 0;
+        },
     };
 }
 
@@ -114,6 +124,26 @@ test('checkForModelChange returns false when marker payload is malformed', () =>
     const changed = selector.checkForModelChange('MODEL_CHANGED:{not valid json');
 
     assert.equal(changed, false);
+});
+
+test('selector binds once and destroy removes switch-replaced listeners', () => {
+    const { ModelSelector, providerSelect, modelSelect, routeSelect } = loadModelSelector();
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        routeSelectId: 'route-selector',
+    });
+
+    selector._bindEvents();
+    selector._bindEvents();
+    assert.equal(providerSelect.listenerCount('change'), 1);
+    assert.equal(modelSelect.listenerCount('change'), 1);
+    assert.equal(routeSelect.listenerCount('change'), 1);
+
+    selector.destroy();
+    assert.equal(providerSelect.listenerCount('change'), 0);
+    assert.equal(modelSelect.listenerCount('change'), 0);
+    assert.equal(routeSelect.listenerCount('change'), 0);
 });
 
 
@@ -448,4 +478,62 @@ test('syncWithServer reflects an agent-driven model change (#2068)', async () =>
     assert.equal(modelSelect.value, 'gpt-5.4-mini');
     assert.equal(selector.selectedProvider, 'openai');
     assert.equal(selector.selectedModel, 'gpt-5.4-mini');
+});
+
+test('model catalogs cache per agent and invalidate after a model mutation', async () => {
+    let fetched = 0;
+    const catalog = {
+        default: 'gpt-test',
+        by_vendor: { openai: [{ id: 'gpt-test', is_featured: true }] },
+        routes: [{ vendor: 'openai', route: 'api', model: 'gpt-test' }],
+    };
+    const { ModelSelector } = loadModelSelector({
+        fetchImpl: async () => {
+            fetched += 1;
+            return { ok: true, json: async () => catalog };
+        },
+    });
+    const options = {
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        apiEndpoint: '/api/agents/Kite/api/models',
+        currentModelEndpoint: null,
+    };
+
+    const first = new ModelSelector(options);
+    await first.loadModels();
+    await new ModelSelector(options).loadModels();
+
+    assert.equal(fetched, 1, 'repeat switches to Kite should reuse its parsed catalog');
+
+    first.setSelection('openai', 'gpt-test', true);
+    await new ModelSelector(options).loadModels();
+    assert.equal(fetched, 2, 'a model mutation must evict Kite\'s descriptive catalog');
+});
+
+test('a superseded selector drops a late model catalog response', async () => {
+    let resolveFetch;
+    const { ModelSelector, providerSelect } = loadModelSelector({
+        fetchImpl: () => new Promise((resolve) => { resolveFetch = resolve; }),
+    });
+    let current = true;
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        apiEndpoint: '/api/agents/Slow/api/models',
+        currentModelEndpoint: null,
+        isCurrent: () => current,
+    });
+
+    const loading = selector.loadModels();
+    await Promise.resolve();
+    current = false;
+    resolveFetch({
+        ok: true,
+        json: async () => ({ by_vendor: { openai: [{ id: 'stale' }] } }),
+    });
+    await loading;
+
+    assert.equal(selector.allModelsData, null);
+    assert.equal(providerSelect.innerHTML, '');
 });

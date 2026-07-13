@@ -115,6 +115,92 @@ class TestLoadFromConfig:
     """Test loading agents from MultiAgentConfig."""
 
     @pytest.mark.asyncio
+    async def test_load_from_config_initializes_concurrently_and_registers_in_order(self):
+        """Slow agents overlap without making fleet/UI order nondeterministic."""
+        config = MultiAgentConfig(
+            agents={
+                "first": LocalAgentConfig(data_dir=Path("/tmp/first"), port=8801),
+                "second": LocalAgentConfig(data_dir=Path("/tmp/second"), port=8802),
+            }
+        )
+        manager = AgentManager(base_data_dir=Path("/tmp"))
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+        started = []
+
+        async def initialize(name, _config):
+            started.append(name)
+            if len(started) == 2:
+                both_started.set()
+            await release.wait()
+            return _make_mock_agent(f"did:{name}")
+
+        manager._initialize_agent = initialize
+        load_task = asyncio.create_task(manager.load_from_config(config))
+
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        assert started == ["first", "second"]
+        release.set()
+
+        assert await load_task == 2
+        assert list(manager._agents) == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_startup_shuts_down_completed_unregistered_agent(self):
+        config = MultiAgentConfig(
+            agents={
+                "ready": LocalAgentConfig(data_dir=Path("/tmp/ready"), port=8801),
+                "blocked": LocalAgentConfig(data_dir=Path("/tmp/blocked"), port=8802),
+            }
+        )
+        manager = AgentManager(base_data_dir=Path("/tmp"))
+        ready_agent = _make_mock_agent("did:ready")
+        ready = asyncio.Event()
+        block = asyncio.Event()
+
+        async def initialize(name, _config):
+            if name == "ready":
+                ready.set()
+                return ready_agent
+            await block.wait()
+            return _make_mock_agent("did:blocked")
+
+        manager._initialize_agent = initialize
+        load_task = asyncio.create_task(manager.load_from_config(config))
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        load_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await load_task
+
+        ready_agent.shutdown.assert_awaited_once()
+        assert manager.list_agents() == {}
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_failed_initializer_shuts_down_partial_agent(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did
+    ):
+        mock_get_did.return_value = "did:partial"
+        partial = _make_mock_agent("did:partial")
+        partial.initialize.side_effect = RuntimeError("init failed")
+        mock_agent_cls.return_value = partial
+        manager = AgentManager(base_data_dir=Path("/tmp"))
+        config = LocalAgentConfig(data_dir=Path("/tmp/partial"), port=8801)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            with pytest.raises(RuntimeError, match="init failed"):
+                await manager._initialize_agent("partial", config)
+
+        partial.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
     @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")

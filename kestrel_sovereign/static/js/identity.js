@@ -268,12 +268,13 @@ export function reconcileNavigationCapabilities() {
 // Identity Panel
 // ============================================================================
 
-export async function loadIdentity() {
+export async function loadIdentity(expectedAgent = API.getHostAgent()) {
     // #879: deep-link defense — no /api/identity fetch when disabled.
     // identity is the default panel so disabling it is unusual but legal.
     if (!API.hasCapability('identity')) return;
     try {
         const identity = await API.getIdentity();
+        if (API.getHostAgent() !== expectedAgent) return;
         state.identity = identity;
 
         // Update page title with companion name if in multi-agent mode
@@ -395,6 +396,7 @@ export async function loadIdentity() {
             Toast,
         });
     } catch (e) {
+        if (API.getHostAgent() !== expectedAgent) return;
         const card = document.getElementById('identity-card');
         if (card) card.innerHTML = `<div style="color: var(--error); padding: 1rem;">Failed to load identity: ${e.message}</div>`;
     }
@@ -561,13 +563,14 @@ function _wireProfileEditor(identity) {
 // Privacy Indicator
 // ============================================================================
 
-export async function loadPrivacyMode() {
+export async function loadPrivacyMode(expectedAgent = API.getHostAgent()) {
     // #879: deep-link defense — no /api/agent/privacy-mode fetch when disabled.
     // Hosts that don't expose privacy controls (the chip in the chat header)
     // typically opt out so the indicator doesn't render with a stale value.
     if (!API.hasCapability('privacy')) return;
     try {
         const data = await API.getPrivacyMode();
+        if (API.getHostAgent() !== expectedAgent) return;
         state.privacyMode = data.privacy_mode;
         updatePrivacyIndicator(data.privacy_mode);
     } catch (e) {
@@ -809,6 +812,7 @@ function _renderHybridIdentityRow(identity) {
 // ============================================================================
 
 let selectedAgentName = null;
+let agentSwitchSeq = 0;
 // #2278 / #2279: the mounted `mountAgentListPane` handle + its default
 // `/api/agents` adapter. Mounted once (into `#agents-pane`) on the first
 // `loadAgents`; later calls just `refresh()`. #2279 wraps the shared list in the
@@ -1046,6 +1050,10 @@ export async function loadAgents() {
 }
 
 window.selectAgent = async function(agentName) {
+    const switchSeq = ++agentSwitchSeq;
+    const isCurrentSwitch = () => (
+        switchSeq === agentSwitchSeq && API.getHostAgent() === agentName
+    );
     const previousAgentName = selectedAgentName;
     selectedAgentName = agentName;
 
@@ -1066,7 +1074,8 @@ window.selectAgent = async function(agentName) {
     // capabilities:changed which non-destructively re-gates the nav (the boot
     // prune left every tab present because capsMap was empty). Done before the
     // panel loaders below so each self-guards against the fresh set.
-    await API.refreshCapabilities();
+    await API.refreshCapabilities({ expectedAgent: agentName });
+    if (!isCurrentSwitch()) return;
 
     // #2048: (re)load the feature UI-contributions manifest now that routing is
     // pinned. In multi-agent host mode the boot-time call in app.js hit the
@@ -1077,7 +1086,8 @@ window.selectAgent = async function(agentName) {
     // capabilities:changed emitted by refreshCapabilities above may already have
     // kicked off this same load — the loader coalesces concurrent runs, and we
     // await here so the panels are registered before the reactivation below.
-    await loadFeatureUIContributions();
+    await loadFeatureUIContributions(agentName);
+    if (!isCurrentSwitch()) return;
 
     // Mount the new agent's chat pane. Streams already in flight
     // against the previous agent's pane keep painting into that
@@ -1140,12 +1150,13 @@ window.selectAgent = async function(agentName) {
     // second request-sequence guard in identity.js.
     refreshConversationsPane();
     await Promise.all([
-        loadIdentity(),
-        loadPrivacyMode(),
-        loadModels(),
-        loadCommands(API),
-        updateContextStatus(),
+        loadIdentity(agentName),
+        loadPrivacyMode(agentName),
+        loadModels(agentName),
+        loadCommands(API, agentName),
+        updateContextStatus(agentName),
     ]);
+    if (!isCurrentSwitch()) return;
 
     // loadModels() above rebuilt the chat-model selector, discarding any lock
     // the agent:switch handler acquired. Re-lock to the now-active agent's live

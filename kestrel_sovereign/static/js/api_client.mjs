@@ -927,9 +927,16 @@ export function createApiClient({
         // Fetch the current feature capability map from the server and apply it.
         // Used at boot when the page render did not inject ``featureCapabilities``
         // (e.g. multi-agent host mode) and after a runtime enable/disable.
-        async refreshCapabilities() {
+        async refreshCapabilities({ expectedAgent = state.selectedHostAgent } = {}) {
+            // Pin both the initial request and an auth retry to the agent that
+            // owned this refresh. A rapid switch must never let a late response
+            // replace the newly-selected agent's capability map.
+            const requestAgent = expectedAgent;
             try {
-                const data = await client.request('/api/ui/capabilities');
+                const data = requestAgent
+                    ? await client.requestForAgent('/api/ui/capabilities', {}, requestAgent)
+                    : await client.request('/api/ui/capabilities');
+                if (state.selectedHostAgent !== requestAgent) return capsMap;
                 if (data && data.capabilities) {
                     this.applyServerCapabilities(data.capabilities);
                 }

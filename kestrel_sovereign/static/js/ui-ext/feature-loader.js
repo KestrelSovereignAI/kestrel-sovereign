@@ -39,13 +39,18 @@ import API from '../api.js';
 // un-prefixed. In standalone mode ``buildAgentUrl`` is a no-op (no selected
 // agent), so the URL is returned unchanged and the server's own
 // ``/features/{slug}/static/`` mount serves it.
-function pinFeatureAssetUrl(url) {
+function pinFeatureAssetUrl(url, agentName = API.getHostAgent?.()) {
     if (
         typeof url === 'string'
         && url.startsWith('/features/')
-        && typeof API.buildAgentUrl === 'function'
+        && (
+            typeof API.buildAgentUrlFor === 'function'
+            || typeof API.buildAgentUrl === 'function'
+        )
     ) {
-        return API.buildAgentUrl(url);
+        return typeof API.buildAgentUrlFor === 'function'
+            ? API.buildAgentUrlFor(url, agentName)
+            : API.buildAgentUrl(url);
     }
     return url;
 }
@@ -62,7 +67,7 @@ function injectFeatureStylesheet(href) {
     document.head.appendChild(link);
 }
 
-let _inFlight = null;
+const _inFlightByAgent = new Map();
 
 // Canonical (pre-pin) identities of assets already imported, so the same feature
 // asset executes exactly once even across agent switches. In multi-agent host
@@ -80,12 +85,15 @@ const _importedModules = new Set();
 // host force-off also suppresses loading. A failed import for one feature is
 // isolated so it cannot abort the rest of boot. Concurrent callers share the
 // same in-flight run so a boot call + an agent-select call don't double-fetch.
-export async function loadFeatureUIContributions() {
-    if (_inFlight) return _inFlight;
-    _inFlight = (async () => {
+export async function loadFeatureUIContributions(agentName = API.getHostAgent?.()) {
+    const flightKey = agentName || '__standalone__';
+    if (_inFlightByAgent.has(flightKey)) return _inFlightByAgent.get(flightKey);
+    const run = (async () => {
         let contributions = [];
         try {
-            const data = await API.request('/api/ui/contributions');
+            const data = agentName && typeof API.requestForAgent === 'function'
+                ? await API.requestForAgent('/api/ui/contributions', {}, agentName)
+                : await API.request('/api/ui/contributions');
             if (data && Array.isArray(data.contributions)) {
                 contributions = data.contributions;
             }
@@ -94,17 +102,23 @@ export async function loadFeatureUIContributions() {
             return;
         }
 
+        // The manifest and capability map are agent-specific. If selection
+        // changed while the request was in flight, the newer agent's own run
+        // will load its manifest; never import the stale agent's assets now.
+        if (agentName && API.getHostAgent?.() !== agentName) return;
+
         for (const entry of contributions) {
+            if (agentName && API.getHostAgent?.() !== agentName) return;
             if (entry.capability && !API.hasCapability(entry.capability)) continue;
             for (const href of entry.css || []) {
                 // injectFeatureStylesheet is idempotent via a DOM <link> check.
-                injectFeatureStylesheet(pinFeatureAssetUrl(href));
+                injectFeatureStylesheet(pinFeatureAssetUrl(href, agentName));
             }
             for (const mod of entry.modules || []) {
                 const modKey = `${entry.feature}::${mod}`;
                 if (_importedModules.has(modKey)) continue;
                 try {
-                    await import(pinFeatureAssetUrl(mod));
+                    await import(pinFeatureAssetUrl(mod, agentName));
                     // Mark imported only on success so a failed import can retry
                     // on the next run (e.g. after the feature is re-enabled).
                     _importedModules.add(modKey);
@@ -116,8 +130,9 @@ export async function loadFeatureUIContributions() {
                 }
             }
         }
-    })().finally(() => { _inFlight = null; });
-    return _inFlight;
+    })().finally(() => { _inFlightByAgent.delete(flightKey); });
+    _inFlightByAgent.set(flightKey, run);
+    return run;
 }
 
 // ============================================================================

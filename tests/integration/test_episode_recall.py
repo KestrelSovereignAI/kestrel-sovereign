@@ -274,8 +274,28 @@ class _OllamaEmbeddingService:
     async def aembed(self, text):
         if not text:
             return None
+        from kestrel_sovereign.llm.embedding_service import (
+            _prepare_retrieval_document,
+        )
         try:
-            r = await self._client.embed(model=self.model, input=text)
+            r = await self._client.embed(
+                model=self.model,
+                input=_prepare_retrieval_document(text, self.model),
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        embeddings = r.get("embeddings") or []
+        return list(embeddings[0]) if embeddings else None
+
+    async def aembed_query(self, text, *, instruction):
+        from kestrel_sovereign.llm.embedding_service import (
+            _prepare_retrieval_query,
+        )
+        try:
+            r = await self._client.embed(
+                model=self.model,
+                input=_prepare_retrieval_query(text, self.model, instruction),
+            )
         except Exception:  # noqa: BLE001
             return None
         embeddings = r.get("embeddings") or []

@@ -1294,6 +1294,8 @@ async def list_agent_models(
     try:
         agent = get_agent(request)
         models = []
+        served_stale_catalog = False
+        stale_embedding_routes: set = set()
 
         # Parse category if provided
         model_category = None
@@ -1332,11 +1334,47 @@ async def list_agent_models(
                     category=model_category,
                 )
             else:
+                if use_cache:
+                    from kestrel_sovereign.llm.model_cache import get_shared_model_cache
+
+                    shared_catalog = get_shared_model_cache()
+                    served_stale_catalog = (
+                        shared_catalog.get() is None
+                        and shared_catalog.get_any() is not None
+                    )
+                    if served_stale_catalog:
+                        # Keep discovery-only embedding routes truthful without
+                        # putting provider I/O back on the latency-sensitive
+                        # stale-catalog response. A prior fresh discovery leaves
+                        # its route-scoped embedding facet on this service; a
+                        # cold process can still recover obvious embedding
+                        # entries from the persisted general catalog.
+                        cached_embeddings = getattr(
+                            agent.llm_service,
+                            "_embedding_discovery_cache",
+                            None,
+                        )
+                        if cached_embeddings is not None:
+                            stale_embedding_routes = {
+                                m.route for m in cached_embeddings if m.route
+                            }
+                        else:
+                            stale_embedding_routes = {
+                                m.route
+                                for m in (shared_catalog.get_any() or [])
+                                if getattr(m, "route", None)
+                                and getattr(m, "category", None)
+                                == ModelCategory.EMBEDDING
+                            }
                 models = await agent.llm_service.discover_all_models(
                     use_cache=use_cache,
                     featured_only=featured_only,
                     category=model_category,
-                    providers=provider_list
+                    providers=provider_list,
+                    # Model catalogs are descriptive, not routing state. Keep
+                    # agent switching responsive when the five-minute cache is
+                    # stale and coalesce provider discovery in the background.
+                    stale_while_revalidate=use_cache,
                 )
 
         # Convert to dicts for JSON response
@@ -1345,8 +1383,8 @@ async def list_agent_models(
         # Group by vendor. `ModelInfo.provider` is the vendor field; the name
         # was kept for backward-file-compat but the semantic is vendor.
         by_vendor: Dict[str, List[Dict]] = {}
-        for model in models:
-            by_vendor.setdefault(model.provider, []).append(model.to_dict())
+        for model, model_data in zip(models, models_data):
+            by_vendor.setdefault(model.provider, []).append(model_data)
 
         # Rank each vendor bucket: featured first, then newest-first by the
         # provider-supplied ``created_at`` (naming-agnostic recency), then by
@@ -1366,7 +1404,11 @@ async def list_agent_models(
             bucket.sort(key=_bucket_sort_key)
 
         # Featured models (computed per ModelCatalogService rules)
-        featured = [m.to_dict() for m in models if m.is_featured]
+        featured = [
+            model_data
+            for model, model_data in zip(models, models_data)
+            if model.is_featured
+        ]
 
         # Effective default model from the runtime routing source.
         default_model = None
@@ -1383,12 +1425,13 @@ async def list_agent_models(
             # embedding-capable openai:api must not flip capability on for a
             # non-embedding openai:plan/codex sibling). Key the discovered set by
             # the model's originating route.
-            embedding_routes: set = set()
-            try:
-                discovered = await agent.llm_service.discover_embedding_models()
-                embedding_routes = {m.route for m in discovered if m.route}
-            except Exception as e:  # pragma: no cover - never fail the list
-                logger.debug(f"embedding discovery skipped in /api/models: {e}")
+            embedding_routes: set = set(stale_embedding_routes)
+            if not served_stale_catalog:
+                try:
+                    discovered = await agent.llm_service.discover_embedding_models()
+                    embedding_routes = {m.route for m in discovered if m.route}
+                except Exception as e:  # pragma: no cover - never fail the list
+                    logger.debug(f"embedding discovery skipped in /api/models: {e}")
             for p in agent.llm_service.providers:
                 capabilities = p.get("capabilities") or {}
                 route_name = p.get("name")
