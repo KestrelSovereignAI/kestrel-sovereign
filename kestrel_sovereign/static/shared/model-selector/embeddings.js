@@ -223,8 +223,19 @@ class EmbeddingSelector {
             this.reindexButton.style.display = 'none';
             this.reindexButton.disabled = false;
             if (this.reindexStatus && !this._reindexing) {
-                this.reindexStatus.textContent = '';
-                this.reindexStatus.style.display = 'none';
+                // No actionable rows. If the remaining stale rows are all
+                // unembeddable (no recoverable text), explain them instead of
+                // going silent — otherwise the operator is left wondering why a
+                // dim-mismatch warning has no re-embed action (#2426).
+                const unembeddable = s.unembeddable_rows || 0;
+                if (unembeddable) {
+                    this.reindexStatus.textContent =
+                        `${unembeddable} ${unembeddable === 1 ? 'row has' : 'rows have'} no embeddable text — nothing to re-embed.`;
+                    this.reindexStatus.style.display = '';
+                } else {
+                    this.reindexStatus.textContent = '';
+                    this.reindexStatus.style.display = 'none';
+                }
             }
             return;
         }
@@ -281,9 +292,17 @@ class EmbeddingSelector {
                     : 'Re-embed failed — could not read counts.');
                 return;
             }
-            const n = (dry.data && dry.data.total_stale) || 0;
+            // Confirm against actionable rows only — rows with no embeddable
+            // text can never be cleared, so counting them here would promise
+            // work the run can't do (#2426). Falls back to total_stale for
+            // backends that predate the split.
+            const d = dry.data || {};
+            const n = (d.actionable_stale != null ? d.actionable_stale : d.total_stale) || 0;
+            const unembeddable = d.unembeddable_rows || 0;
             if (!n) {
-                this._setReindexStatus('');
+                this._setReindexStatus(unembeddable
+                    ? `${unembeddable} ${unembeddable === 1 ? 'row has' : 'rows have'} no embeddable text — nothing to re-embed.`
+                    : '');
                 return;
             }
             const noun = n === 1 ? 'memory' : 'memories';
@@ -321,7 +340,16 @@ class EmbeddingSelector {
                     `${dim} dimension-mismatch. ${job.error || ''}`.trim());
             } else {
                 const done = job.total_reembedded || 0;
-                this._setReindexStatus(`Re-embedded ${done} ${done === 1 ? 'memory' : 'memories'}.`);
+                const unembeddable = job.unembeddable_rows || 0;
+                let msg = `Re-embedded ${done} ${done === 1 ? 'memory' : 'memories'}.`;
+                if (unembeddable) {
+                    // A corpus whose only stale rows have no recoverable text is
+                    // done, not an error — explain the rows instead (#2426).
+                    msg = done
+                        ? `${msg} ${unembeddable} ${unembeddable === 1 ? 'row has' : 'rows have'} no embeddable text.`
+                        : `${unembeddable} ${unembeddable === 1 ? 'row has' : 'rows have'} no embeddable text — nothing to re-embed.`;
+                }
+                this._setReindexStatus(msg);
             }
         } finally {
             this._reindexing = false;
@@ -1000,7 +1028,10 @@ class EmbeddingSelector {
                 // Changing the route can create stale memories; the POST echoes
                 // the authoritative count so the "Re-embed N memories" button
                 // renders immediately without waiting for a full reload (#2338).
+                // ``stale_rows`` counts only actionable rows; rows with no
+                // embeddable text are surfaced separately (#2426).
                 stale_rows: data.stale_rows,
+                unembeddable_rows: data.unembeddable_rows,
             };
             this.mode = embeddingModeForRoute(this.settings.embedding_route);
             this._render();
