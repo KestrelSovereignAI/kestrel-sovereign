@@ -555,3 +555,19 @@ description = "Emotional state tracking and mood-aware responses"
 tags = ["ai", "emotions", "personality"]
 icon = "smile"
 core = true
+
+[feature_forge]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["FeatureForgeFeature"]
+description = "Governed agent self-extension: scaffold, Iron-Rule-gate, and register forged features"
+tags = ["core", "governance", "self-extension", "devtools"]
+icon = "hammer"
+core = true
+
+[feature_forge.skills]
+forge_feature = { description = "Scaffold an inert feature package from a spec", category = "agent_management", tags = ["forge"] }
+forge_validate = { description = "Run the Iron Rule gate (narrow-only permissions)", category = "agent_management", tags = ["forge", "governance"] }
+forge_register = { description = "Queue a validated forged feature for Sovereign approval", category = "agent_management", tags = ["forge", "approval"] }
+list_forged = { description = "List forged features and their pipeline state", category = "agent_management", tags = ["forge"] }
+forge_status = { description = "Show detailed status of a forged feature", category = "agent_management", tags = ["forge"] }

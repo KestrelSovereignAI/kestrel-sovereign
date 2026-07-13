@@ -467,6 +467,23 @@ class SecurityFeature(Feature):
                 default_level=PermissionLevel.ALWAYS_ASK,
             )
 
+        # Forged-feature approval is a synthetic Sovereign gate (issue #2434).
+        # ``FeatureForgeFeature.approve_forged_feature`` is NOT a real tool on
+        # any feature's ``get_tools()``, so it is never registered by the loop
+        # above. Without an explicit row, ``ApprovalQueue.request_approval``
+        # resolves it as an unregistered/default tool, which global auto-mode
+        # promotes to AUTO — silently approving a forged feature's load with no
+        # Sovereign decision. Register it explicitly at ALWAYS_ASK (hardened, so
+        # any stale permissive row is force-upgraded) to keep it a hard rail
+        # that auto-mode can never bypass (Amendment I), mirroring the
+        # codex_native precedent above.
+        await self.permission_store.register_tool(
+            feature_name="FeatureForgeFeature",
+            tool_name="approve_forged_feature",
+            default_level=PermissionLevel.ALWAYS_ASK,
+            hardened=True,
+        )
+
         if is_demo_server:
             logger.info(
                 "Registered all tools with ALLOW (KESTREL_DEMO_SERVER=1)"

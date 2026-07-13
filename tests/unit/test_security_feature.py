@@ -1531,6 +1531,39 @@ class TestSecurityFeature:
             await feature.permission_store.get_permission("codex_native", "fileChange")
         ) == PermissionLevel.ALWAYS_ASK
 
+    @pytest.mark.asyncio
+    async def test_register_all_tools_seeds_forge_approval_as_always_ask(self, tmp_path):
+        """#2434 P1: the synthetic forge approval gate is a hard rail.
+
+        ``FeatureForgeFeature.approve_forged_feature`` is not a real tool on any
+        feature's ``get_tools()``, so without an explicit seed it would resolve
+        as an unregistered/default tool that global auto-mode promotes to AUTO —
+        silently approving a forged feature's load with no Sovereign decision.
+        ``_register_all_tools`` must seed it at ALWAYS_ASK, and that must survive
+        global auto-mode.
+        """
+        agent = MagicMock()
+        agent.features = {}
+        feature = SecurityFeature(agent)
+        feature.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feature.permission_store.initialize()
+
+        await feature._register_all_tools()
+
+        assert (
+            await feature.permission_store.get_permission(
+                "FeatureForgeFeature", "approve_forged_feature"
+            )
+        ) == PermissionLevel.ALWAYS_ASK
+
+        # Global auto-mode must NOT promote this hard rail to AUTO.
+        feature.permission_store.set_global_auto_mode(True)
+        assert (
+            await feature.permission_store.get_permission(
+                "FeatureForgeFeature", "approve_forged_feature"
+            )
+        ) == PermissionLevel.ALWAYS_ASK
+
     @staticmethod
     def _memory_feature_stub():
         """A fake MemoryFeature exposing a read tool + the destructive tools.
