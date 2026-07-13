@@ -501,7 +501,7 @@ def test_embedding_settings_endpoints_round_trip_and_expose_dims():
     POST sets/clears the embedding_route and echoes the updated settings."""
     _state = {"embedding_route": None}
 
-    def _set(route, persist=True):
+    def _set(route, persist=True, force=False):
         _state["embedding_route"] = route
 
     def _settings():
@@ -552,11 +552,11 @@ def test_embedding_settings_endpoints_round_trip_and_expose_dims():
 
         assert set_response.status_code == 200
         assert set_response.json()["embedding_route"] == "ollama:local"
-        llm_service.aset_embedding_route.assert_any_call("ollama:local")
+        llm_service.aset_embedding_route.assert_any_call("ollama:local", force=False)
 
         assert clear_response.status_code == 200
         assert clear_response.json()["embedding_route"] is None
-        llm_service.aset_embedding_route.assert_any_call(None)
+        llm_service.aset_embedding_route.assert_any_call(None, force=False)
 
         assert missing_response.status_code == 400
     finally:
@@ -570,7 +570,7 @@ def test_embedding_settings_post_round_trip_for_none_off_state():
     exposing ``kestrel_embedding_dim``."""
     _state = {"embedding_route": None}
 
-    def _set(route, persist=True):
+    def _set(route, persist=True, force=False):
         _state["embedding_route"] = route
 
     def _settings():
@@ -610,7 +610,7 @@ def test_embedding_settings_post_round_trip_for_none_off_state():
         assert set_body["embedding_dim"] is None
         # Off does not erase the deployment's stored dimension.
         assert set_body["kestrel_embedding_dim"] == 768
-        llm_service.aset_embedding_route.assert_any_call("none")
+        llm_service.aset_embedding_route.assert_any_call("none", force=False)
 
         assert get_response.status_code == 200
         get_body = get_response.json()

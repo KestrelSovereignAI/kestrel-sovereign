@@ -773,6 +773,14 @@ class _ProbeAdapter:
 def _probe_service(providers):
     service = LLMService.__new__(LLMService)
     service.providers = list(providers)
+    # These fixtures exercise the #2326 liveness probe, not the #2417 dim gate:
+    # leave the resolved dim unknown (None) so the dim-compatibility check is a
+    # no-op and the probe stays the gate under test. The dim gate has its own
+    # dedicated tests.
+    for provider in service.providers:
+        caps = provider.get("capabilities")
+        if isinstance(caps, dict):
+            caps["embedding_dim"] = None
     service._disabled_routes = {}
     service._embedding_route = None
     service._embedding_route_persistence_callback = None

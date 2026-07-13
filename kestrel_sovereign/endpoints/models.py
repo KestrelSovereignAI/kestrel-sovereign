@@ -1406,6 +1406,10 @@ async def list_agent_models(
                     # Discovery flips this on for routes with a discovered
                     # embedding model even without a TOML pin (#2338).
                     "supports_embeddings": supports_embeddings,
+                    # The dim this route resolves to (declared capability), so the
+                    # embeddings UI can mark a route whose dim can't write into the
+                    # column ("needs migration") BEFORE selection (#2417).
+                    "embedding_dim": capabilities.get("embedding_dim"),
                 })
 
         return {
@@ -1687,6 +1691,16 @@ async def set_embedding_settings(request: Request):
                 status_code=400,
                 detail="'embedding_route' must be a string or null.",
             )
+        # Operator override for the dim-compatibility gate (#2417): allowed
+        # mid-migration when the column is being re-sized + reindexed. Must be an
+        # explicit JSON boolean — a truthy non-bool (``"false"``, ``0``, ``{}``,
+        # …) must NOT silently bypass the gate.
+        force = data.get("force", False)
+        if not isinstance(force, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="'force' must be a JSON boolean (true/false).",
+            )
 
         agent = get_agent(request)
         if not hasattr(agent, "llm_service") or not agent.llm_service:
@@ -1710,7 +1724,7 @@ async def set_embedding_settings(request: Request):
             # live-probed with a canary embed so a listed-but-dead upstream
             # model (e.g. OpenRouter empty provider pool) is refused here rather
             # than silently 404'ing to keyword fallback on the next write.
-            await agent.llm_service.aset_embedding_route(route)
+            await agent.llm_service.aset_embedding_route(route, force=force)
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
@@ -1774,6 +1788,14 @@ async def set_route_embedding_model(request: Request):
                     status_code=400,
                     detail="'embedding_dim' must be an integer or null.",
                 )
+        # Operator override for the dim-compatibility gate (#2417). Must be an
+        # explicit JSON boolean — a truthy non-bool must NOT bypass the gate.
+        force = data.get("force", False)
+        if not isinstance(force, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="'force' must be a JSON boolean (true/false).",
+            )
 
         agent = get_agent(request)
         if not hasattr(agent, "llm_service") or not agent.llm_service:
@@ -1798,7 +1820,9 @@ async def set_route_embedding_model(request: Request):
 
         try:
             # Live probe-on-save for cloud routes rejects a dead slug (#2337/#2326).
-            await agent.llm_service.aset_route_embedding_model(route, model, dim)
+            await agent.llm_service.aset_route_embedding_model(
+                route, model, dim, force=force
+            )
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
