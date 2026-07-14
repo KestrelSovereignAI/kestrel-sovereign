@@ -184,18 +184,22 @@ class TestAgentRoutingMiddleware:
         resp = client.get("/api/agents/Claw/api/agent/info")
         assert resp.status_code == 200
 
-    def test_agent_prefixed_observability_events_route(self):
-        """Tasks Activity Log reaches the selected agent's observability store."""
+    def test_agent_prefixed_observability_summary_route(self):
+        """Metrics panel reaches the selected agent's observability store.
+
+        /events was retired from core in #2317 (the fleet host feature owns it);
+        /summary is the per-agent view that still routes through the agent's own
+        observability store.
+        """
         nellie = _make_mock_agent("did:nellie", "Nellie")
         app = _create_multi_agent_app({"Nellie": nellie})
 
         client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/api/agents/Nellie/api/observability/events?limit=50")
+        resp = client.get("/api/agents/Nellie/api/observability/summary?minutes=60")
 
         assert resp.status_code == 200
-        assert resp.json()["events"] == []
+        assert resp.json()["total_events"] == 0
         nellie.observability_store.query_events.assert_awaited_once()
-        assert nellie.observability_store.query_events.await_args.kwargs["limit"] == 50
 
 
 class TestAgentCRUDEndpoints:

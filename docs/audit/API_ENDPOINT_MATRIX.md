@@ -95,7 +95,6 @@ privacy: public
   - `/api/security/cancel-all`
   - `/api/security/reset-session`
 - `observability`
-  - `/api/observability/events`
   - `/api/observability/summary`
 - `saved_items`
   - `/api/saved-items`

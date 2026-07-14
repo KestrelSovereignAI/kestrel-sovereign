@@ -75,13 +75,15 @@ def test_files_head_uses_existence_check_contract():
         _restore_app(app, original)
 
 
-def test_observability_events_endpoint_returns_serialized_events():
+def test_observability_summary_endpoint_returns_serialized_summary():
+    # /events was retired in #2317 (fleet host feature owns it); /summary is the
+    # per-agent view that remains in core and reads from the same store.
     event = SimpleNamespace(
         event_id="evt-1",
         timestamp="2026-03-15T00:00:00Z",
         agent_name="Claw",
         session_id="sess-1",
-        event_type="tool_call",
+        event_type="tool_response",
         tool_name="search",
         duration_ms=12,
         success=True,
@@ -99,10 +101,10 @@ def test_observability_events_endpoint_returns_serialized_events():
     try:
         with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
             with TestClient(app) as client:
-                response = client.get("/api/observability/events", headers={"X-API-Key": "test-key"})
+                response = client.get("/api/observability/summary", headers={"X-API-Key": "test-key"})
         assert response.status_code == 200
-        assert response.json()["count"] == 1
-        assert response.json()["events"][0]["event_id"] == "evt-1"
+        assert response.json()["total_events"] == 1
+        assert response.json()["events_by_type"]["tool_response"] == 1
     finally:
         _restore_app(app, original)
 

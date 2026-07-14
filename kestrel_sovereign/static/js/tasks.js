@@ -538,7 +538,14 @@ export async function loadActivityLog() {
     if (!activityList) return;
 
     try {
-        const response = await API.request('/api/observability/events?limit=50');
+        // #2317: the raw observability event feed is owned by the fleet host
+        // feature at the host ROOT (tenant-aware), not by a per-agent core
+        // route. Reach it with requestHost() so the path is never
+        // host-agent-prefixed into /api/agents/{agent}/api/observability/events
+        // (which would hit the now-retired core route). Standalone core with no
+        // fleet feature installed returns 404/503 — degrade to an empty state
+        // rather than surfacing an error.
+        const response = await API.requestHost('/api/observability/events?limit=50');
 
         if (response.error) {
             renderActivityEmpty(response.error);
@@ -558,6 +565,10 @@ export async function loadActivityLog() {
         restoreActivityExpandedState();
 
     } catch (e) {
+        if (e && (e.status === 404 || e.status === 503)) {
+            renderActivityEmpty('Activity feed requires the fleet observability feature');
+            return;
+        }
         console.error('Failed to load activity log:', e);
         renderActivityEmpty(`Error loading activity: ${e.message}`);
     }

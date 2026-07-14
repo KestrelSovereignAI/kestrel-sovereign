@@ -311,7 +311,6 @@ Audited snapshot: **34** discoverable modules · **34** exported `Feature` subcl
 
 | Method | Path |
 |---|---|
-| `GET` | `/api/observability/events` |
 | `GET` | `/api/observability/summary` |
 
 #### [`endpoints/rasa_shim.py`](endpoints/rasa_shim.py)
