@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from packaging.utils import canonicalize_name
+
 # Non-patched constant — import directly. (``MultiAgentConfig`` itself is
 # referenced as ``cli.MultiAgentConfig`` because the test suite patches it.)
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
@@ -25,19 +27,23 @@ from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 
 def _resolve_feature_name(name: str, registry: dict) -> Optional[str]:
     """
-    Resolve a user-provided name to a registry package name.
+    Resolve a user-provided name to a registry short name.
 
-    Accepts: package name ("voice"), feature class name ("VoiceFeature"),
-    or human-friendly name (case-insensitive match).
+    Accepts a registry short name ("voice"), registered distribution name
+    ("kestrel-feature-voice"), or feature/provider class name
+    ("VoiceFeature"). Package-style names use Python's normalized-name rules,
+    so case and runs of ``-``, ``_``, or ``.`` are equivalent.
     """
-    # Direct package name match
+    # Preserve the cheapest and most common exact registry-key lookup.
     if name in registry:
         return name
 
-    # Case-insensitive package name match
-    lower = name.lower()
-    for pkg_name in registry:
-        if pkg_name.lower() == lower:
+    normalized = canonicalize_name(name)
+    for pkg_name, info in registry.items():
+        if (
+            canonicalize_name(pkg_name) == normalized
+            or canonicalize_name(info.package) == normalized
+        ):
             return pkg_name
 
     # Feature class name match
@@ -209,19 +215,6 @@ def cmd_feature_install(args) -> int:
         return 1
 
 
-# Entry-point groups that back installable Kestrel extensions. A feature or
-# provider package registers itself here; core/in-repo features do not, which is
-# exactly why they are excluded from `feature upgrade` (they ship with, and
-# upgrade with, kestrel-sovereign itself).
-_EXTENSION_ENTRY_POINT_GROUPS = (
-    "kestrel_sovereign.features",
-    "kestrel_sovereign.host_features",
-    "kestrel_sovereign.cloud_providers",
-    "kestrel_sovereign.voice_providers",
-    "kestrel_sovereign.storage_providers",
-)
-
-
 def _editable_install_path(dist_name: str) -> Optional[str]:
     """Return the local source path if *dist_name* is an editable install.
 
@@ -257,33 +250,29 @@ def _installed_extension_distributions() -> list:
     ``{dist, version, editable_path, entries: [group:name, ...]}``.
     """
     import importlib.metadata as md
+    from kestrel_sovereign.feature_registry import iter_extension_entry_points
 
     by_dist: dict = {}
-    for group in _EXTENSION_ENTRY_POINT_GROUPS:
-        try:
-            eps = md.entry_points(group=group)
-        except TypeError:  # Python <3.10 selection API
-            eps = md.entry_points().get(group, [])
-        for ep in eps:
-            dist = getattr(ep, "dist", None)
-            if dist is None:
-                continue
-            entry = by_dist.setdefault(
-                dist.name,
-                {
-                    "dist": dist.name,
-                    "version": None,
-                    "editable_path": cli._editable_install_path(dist.name),
-                    "entries": [],
-                },
-            )
-            if entry["version"] is None:
-                try:
-                    entry["version"] = md.version(dist.name)
-                except Exception:
-                    entry["version"] = "?"
-            short_group = group.rsplit(".", 1)[-1]
-            entry["entries"].append(f"{short_group}:{ep.name}")
+    for group, ep in iter_extension_entry_points():
+        dist = getattr(ep, "dist", None)
+        if dist is None:
+            continue
+        entry = by_dist.setdefault(
+            dist.name,
+            {
+                "dist": dist.name,
+                "version": None,
+                "editable_path": cli._editable_install_path(dist.name),
+                "entries": [],
+            },
+        )
+        if entry["version"] is None:
+            try:
+                entry["version"] = md.version(dist.name)
+            except Exception:
+                entry["version"] = "?"
+        short_group = group.rsplit(".", 1)[-1]
+        entry["entries"].append(f"{short_group}:{ep.name}")
     return sorted(by_dist.values(), key=lambda e: e["dist"])
 
 
@@ -544,12 +533,7 @@ def _registry_info_for(label: str, registry: dict):
     FeaturePackageInfo or None.
     """
     pkg = _resolve_feature_name(label, registry)
-    if pkg:
-        return registry[pkg]
-    for info in registry.values():
-        if info.package == label:
-            return info
-    return None
+    return registry[pkg] if pkg else None
 
 
 def _version_satisfies(version: str, spec: str) -> bool:

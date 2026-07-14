@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from kestrel_sovereign.feature_registry import (
+    EXTENSION_ENTRY_POINT_GROUPS,
     FeaturePackageInfo,
     FeatureStatus,
     InstalledFeatureRuntime,
@@ -88,6 +89,16 @@ class TestLoadRegistry:
         assert "VoiceFeature" in voice.features
         assert voice.icon == "microphone"
 
+    def test_xai_voice_provider_package_contents(self):
+        """The published xAI provider distribution is installable by registry."""
+        voice_xai = load_registry()["voice_xai"]
+        assert voice_xai.package == "kestrel-voice-xai"
+        assert set(voice_xai.features) == {
+            "XAITTSProvider",
+            "XAISTTProvider",
+            "XAIRealtimeConversationProvider",
+        }
+
     def test_missing_file_returns_empty(self):
         """Loading from a nonexistent path returns empty dict."""
         registry = load_registry(Path("/nonexistent/path.toml"))
@@ -140,6 +151,36 @@ class TestResolveStatus:
         }
         resolved = resolve_status(registry)
         assert registry["test"].status == FeatureStatus.INSTALLED
+
+    def test_voice_provider_entry_point_marks_package_installed(self):
+        """Provider entry points count as installed, not only Feature classes."""
+        registry = {
+            "voice_xai": FeaturePackageInfo(
+                name="voice_xai",
+                package="kestrel-voice-xai",
+                git="https://example.com/voice-xai.git",
+                features=["XAIRealtimeConversationProvider"],
+                description="xAI realtime voice",
+            ),
+        }
+        ep = _FakeEntryPoint(
+            name="XAIRealtime",
+            value="xai.realtime:XAIRealtimeConversationProvider",
+            dist=_FakeDistribution("kestrel-voice-xai", None),
+        )
+
+        with patch(
+            "kestrel_sovereign.feature_registry.importlib.metadata.entry_points",
+            return_value=_FakeEntryPoints([ep]),
+        ):
+            resolve_status(registry)
+
+        assert registry["voice_xai"].status == FeatureStatus.INSTALLED
+
+    def test_extension_groups_cover_current_and_legacy_voice_packages(self):
+        assert "kestrel_feature_voice_providers" in EXTENSION_ENTRY_POINT_GROUPS
+        assert "kestrel_sovereign.voice_providers" in EXTENSION_ENTRY_POINT_GROUPS
+        assert "kestrel_sovereign.conversation_providers" in EXTENSION_ENTRY_POINT_GROUPS
 
     def test_enabled_features_resolve(self):
         """Features in the enabled set resolve to ENABLED."""

@@ -258,8 +258,11 @@ kestrel = "kestrel_sovereign.testing.fixtures"
 # Features in sovereign are discovered locally via features/__init__.py
 # These groups are scanned for packages installed via pip
 [project.entry-points."kestrel_sovereign.features"]
+[project.entry-points."kestrel_sovereign.host_features"]
 [project.entry-points."kestrel_sovereign.cloud_providers"]
+[project.entry-points."kestrel_feature_voice_providers"]
 [project.entry-points."kestrel_sovereign.voice_providers"]
+[project.entry-points."kestrel_sovereign.conversation_providers"]
 [project.entry-points."kestrel_sovereign.storage_providers"]
 
 [dependency-groups]

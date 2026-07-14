@@ -139,10 +139,16 @@ Provider packages register in provider-specific groups when they extend a
 registry rather than shipping a whole feature:
 
 ```toml
+[project.entry-points."kestrel_sovereign.host_features"]
 [project.entry-points."kestrel_sovereign.cloud_providers"]
+[project.entry-points."kestrel_feature_voice_providers"]
 [project.entry-points."kestrel_sovereign.voice_providers"]
+[project.entry-points."kestrel_sovereign.conversation_providers"]
 [project.entry-points."kestrel_sovereign.storage_providers"]
 ```
+
+`kestrel_feature_voice_providers` is canonical for current TTS/STT packages;
+`kestrel_sovereign.voice_providers` is retained for legacy packages.
 
 The framework's own `pyproject.toml` declares these groups so package managers
 and feature authors have stable targets.

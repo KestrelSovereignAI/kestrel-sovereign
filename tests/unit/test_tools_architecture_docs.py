@@ -45,8 +45,11 @@ def test_tools_docs_name_current_sdk_and_feature_package_contracts():
         "kestrel_sdk.tools.base.ToolSchema",
         "kestrel_sdk.tools.result.ToolResult",
         "kestrel_sovereign.features",
+        "kestrel_sovereign.host_features",
         "kestrel_sovereign.cloud_providers",
+        "kestrel_feature_voice_providers",
         "kestrel_sovereign.voice_providers",
+        "kestrel_sovereign.conversation_providers",
         "kestrel_sovereign.storage_providers",
     ]:
         assert required in text

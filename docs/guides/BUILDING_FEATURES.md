@@ -709,6 +709,21 @@ The core cloud feature entry covers Kestrel's own `DeployFeature` and
 `kestrel-cloud-vastai`, and `kestrel-cloud-gcp` are provider packages, not
 `kestrel-feature-cloud`.
 
+Voice packages use the feature-owned TTS/STT group and the separate realtime
+conversation group:
+
+```toml
+[project.entry-points."kestrel_feature_voice_providers"]
+MyTTSProvider = "my_voice_package.tts:MyTTSProvider"
+
+[project.entry-points."kestrel_sovereign.conversation_providers"]
+MyRealtime = "my_voice_package.realtime:MyConversationProvider"
+```
+
+The legacy `kestrel_sovereign.voice_providers` group is still discovered for
+already-published providers, but new TTS/STT packages should use
+`kestrel_feature_voice_providers`.
+
 ## Complete Example
 
 Putting it all together — a feature with a tool, a hook, an HTTP endpoint, and configuration:

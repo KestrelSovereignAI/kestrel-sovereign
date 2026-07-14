@@ -42,8 +42,11 @@ def test_modular_runtime_doc_points_to_current_entry_point_groups():
 
     expected_groups = {
         FEATURE_ENTRY_POINT_GROUP,
+        "kestrel_sovereign.host_features",
         "kestrel_sovereign.cloud_providers",
+        "kestrel_feature_voice_providers",
         "kestrel_sovereign.voice_providers",
+        "kestrel_sovereign.conversation_providers",
         "kestrel_sovereign.storage_providers",
     }
 
