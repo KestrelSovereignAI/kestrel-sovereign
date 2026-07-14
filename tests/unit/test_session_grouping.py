@@ -15,12 +15,14 @@ from kestrel_sovereign.storage.session_grouping import (
 BASE = datetime(2026, 6, 29, 12, 0, 0)
 
 
-def _msg(i, role, content, *, minutes=0, session_id=None, new_session=False):
+def _msg(i, role, content, *, minutes=0, session_id=None, new_session=False, operator_signal=False):
     meta = {}
     if session_id is not None:
         meta["session_id"] = session_id
     if new_session:
         meta["new_session"] = True
+    if operator_signal:
+        meta["operator_signal"] = True
     return {
         "id": i,
         "role": role,
@@ -165,6 +167,51 @@ def test_coalesce_merges_resumed_same_uuid_clusters():
     assert s["message_count"] == 3
     assert s["user_message_count"] == 2
     assert s["preview_content"] == "earlier"  # earliest cluster's preview
+
+
+def test_operator_signal_notice_is_skipped_for_preview():
+    # A route that can't take inline system messages persists the operator
+    # notice (auto-mode/budget/governance) as role="user" so it replays, but
+    # it must never win the preview slot over the real first user message.
+    msgs = [
+        _msg(1, "user", "<operator_notice>...</operator_notice>", minutes=0,
+             session_id="s1", operator_signal=True),
+        _msg(2, "user", "what's the weather", minutes=0, session_id="s1"),
+        _msg(3, "assistant", "sunny", minutes=1, session_id="s1"),
+    ]
+    sessions = group_messages_into_sessions(msgs)
+    assert len(sessions) == 1
+    assert sessions[0]["preview_content"] == "what's the weather"
+    # Still counted as real turns for message_count/user_message_count.
+    assert sessions[0]["user_message_count"] == 2
+
+
+def test_operator_signal_only_session_has_no_preview():
+    msgs = [
+        _msg(1, "user", "<operator_notice>...</operator_notice>", minutes=0,
+             session_id="s1", operator_signal=True),
+    ]
+    sessions = group_messages_into_sessions(msgs)
+    assert len(sessions) == 1
+    assert sessions[0]["preview_content"] is None
+
+
+def test_coalesce_backfills_preview_when_first_cluster_is_operator_only():
+    # First cluster's only user row is a skipped operator notice (no real
+    # preview); the session resumes past the gap with a real user message.
+    # Coalescing must pull that real preview forward instead of surfacing an
+    # empty title (codex review follow-up).
+    msgs = [
+        _msg(1, "user", "<operator_notice>...</operator_notice>", minutes=0,
+             session_id="s-resumed", operator_signal=True),
+        _msg(2, "user", "real question", minutes=200, session_id="s-resumed"),
+    ]
+    grouped = group_messages_into_sessions(msgs)
+    assert len(grouped) == 2  # split by the gap
+    assert grouped[0]["preview_content"] is None
+    coalesced = coalesce_sessions_by_session_id(grouped)
+    assert len(coalesced) == 1
+    assert coalesced[0]["preview_content"] == "real question"
 
 
 def test_coalesce_leaves_distinct_sessions_untouched():

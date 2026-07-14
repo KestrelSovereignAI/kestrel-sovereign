@@ -183,7 +183,12 @@ def group_messages_into_sessions(
             current["messages"].append(msg)
         if role == "user":
             current["user_message_count"] += 1
-            if current["preview_content"] is None:
+            # Operator-signal fallback notices (#operator_signals.py) are
+            # persisted with role="user" so they replay in history, but they
+            # are synthetic system chatter, not something the user typed —
+            # skip them when picking the preview so an auto-mode/budget/
+            # governance notice never becomes the conversation's title.
+            if current["preview_content"] is None and not meta.get("operator_signal"):
                 current["preview_content"] = content
                 current["preview_metadata"] = meta
 
@@ -229,7 +234,13 @@ def coalesce_sessions_by_session_id(
         if session["last_message_at"] > existing["last_message_at"]:
             existing["last_message_at"] = session["last_message_at"]
         # The first occurrence is the oldest cluster, so its preview (the
-        # earliest user message) is already retained; nothing to do.
+        # earliest user message) is already retained — unless that cluster's
+        # only user row was a skipped operator-signal notice, leaving its
+        # preview None. In that case fall through to a later cluster's real
+        # preview so a resumed session never shows an empty title.
+        if existing["preview_content"] is None and session["preview_content"] is not None:
+            existing["preview_content"] = session["preview_content"]
+            existing["preview_metadata"] = session["preview_metadata"]
     return [merged[sid] for sid in order]
 
 
