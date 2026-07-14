@@ -282,7 +282,17 @@ class LLMAdapter(_SDKLLMAdapter):
         """
         return None
 
-    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+    #: When ``True`` this adapter derives its embedding catalog by id-filtering
+    #: the chat ``/models`` listing already fetched during chat discovery, so it
+    #: needs NO dedicated embedding request (#2433). Generic OpenAI-compatible
+    #: adapters set this; adapters with their OWN embedding-listing source
+    #: (OpenRouter's ``/embeddings/models``, Ollama's ``/api/show`` capability
+    #: probe) leave it ``False`` and make their own call.
+    derives_embeddings_from_chat_listing: bool = False
+
+    async def list_embedding_models(
+        self, client: Any = None, chat_models: Any = None
+    ) -> List["EmbeddingModelInfo"]:
         """Discover the embedding models this route can serve (#2338).
 
         The embedding facet of :meth:`list_models`: chat discovery answers
@@ -296,6 +306,10 @@ class LLMAdapter(_SDKLLMAdapter):
         check, OpenAI's id-prefix filter). The base returns ``[]`` — a route
         whose adapter has no embedding discovery simply reports none, exactly
         as chat discovery inherits ``NotImplementedError`` gracefully.
+
+        ``chat_models`` carries the chat model ids already discovered for this
+        route (#2433). Adapters that :attr:`derives_embeddings_from_chat_listing`
+        filter it instead of issuing a second network request; others ignore it.
         """
         return []
 

@@ -15,6 +15,7 @@ Covers:
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from kestrel_sovereign.llm.embedding_discovery import (
@@ -1062,6 +1063,402 @@ async def test_resolved_embedding_state_invariant_model_implies_dim(monkeypatch)
         assert model is not None
         assert dim is not None, "embedding_model set ⇒ embedding_dim set"
         assert provider["capabilities"].get("embedding_dim") is not None
+
+
+# --- #2433 chat-only OpenAI-compatible routes: no extra request, no traceback ---
+
+
+async def test_openai_embedding_discovery_reuses_chat_listing_without_request():
+    """Generic OpenAI-compatible routes derive embeddings from the chat listing
+    already fetched (#2433) — no second ``/v1/models`` request."""
+    adapter = OpenAIAdapter()
+    client = SimpleNamespace(
+        models=SimpleNamespace(list=AsyncMock())
+    )
+
+    models = await adapter.list_embedding_models(
+        client,
+        chat_models=[
+            "gpt-5.5",
+            "text-embedding-3-small",
+            "meta-llama/Llama-3.1-8B",  # a RunPod chat-only pin
+        ],
+    )
+
+    # The chat listing was filtered locally; no network call was issued.
+    client.models.list.assert_not_awaited()
+    assert {m.id for m in models} == {"text-embedding-3-small"}
+
+
+async def test_openai_embedding_discovery_empty_chat_listing_no_request():
+    """A chat-only route (RunPod vLLM whose model-list 404'd → empty chat set)
+    yields no embedding models and makes no embedding request (#2433)."""
+    adapter = OpenAIAdapter()
+    client = SimpleNamespace(models=SimpleNamespace(list=AsyncMock()))
+
+    models = await adapter.list_embedding_models(client, chat_models=[])
+
+    client.models.list.assert_not_awaited()
+    assert models == []
+
+
+async def test_generic_route_probe_uses_reused_chat_ids(caplog):
+    """The discovery layer passes reused chat ids to a generic adapter and never
+    logs an ERROR for a chat-only route (#2433)."""
+    import logging
+
+    adapter = OpenAIAdapter()  # derives_embeddings_from_chat_listing = True
+    client = SimpleNamespace(models=SimpleNamespace(list=AsyncMock()))
+    provider = {
+        "vendor": "openai",
+        "name": "runpod:vllm",
+        "adapter": adapter,
+        "client": client,
+        "capabilities": {},  # chat-only route: no embedding claim
+    }
+    svc = _FakeService([provider])
+    # Chat discovery found only a chat-only pin — no embedding ids. The snapshot
+    # is keyed by ROUTE, not vendor (#2433), so the route reuses its OWN listing.
+    svc._chat_models_by_route = {"runpod:vllm": ["meta-llama/Llama-3.1-8B"]}
+
+    with caplog.at_level(logging.INFO):
+        models = await svc.discover_embedding_models()
+
+    client.models.list.assert_not_awaited()
+    assert models == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("no embedding models discovered" in r.message for r in caplog.records)
+
+
+async def test_claiming_route_probe_failure_logs_error(caplog):
+    """A route that explicitly claims embedding support and then fails is a loud
+    ERROR with traceback — that observability is preserved (#2433)."""
+    import logging
+
+    failing = SimpleNamespace()
+    failing.list_embedding_models = AsyncMock(side_effect=RuntimeError("boom"))
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": failing,
+        "client": None,
+        # Explicit operator pin ⇒ a claim.
+        "embedding_model": "qwen/qwen3-embedding-8b",
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+
+    with caplog.at_level(logging.INFO):
+        await svc.discover_embedding_models()
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "a claiming route's failure must log an ERROR"
+    assert any("claims" in r.message for r in errors)
+
+
+async def test_non_claiming_route_probe_failure_is_info_not_error(caplog):
+    """A route that does NOT claim embeddings and fails is a quiet INFO, never
+    an ERROR traceback (#2433)."""
+    import logging
+
+    failing = SimpleNamespace()
+    failing.list_embedding_models = AsyncMock(side_effect=RuntimeError("404"))
+    provider = {
+        "vendor": "somevendor",
+        "name": "somevendor:route",
+        "adapter": failing,
+        "client": None,
+        "capabilities": {},  # no claim
+    }
+    svc = _FakeService([provider])
+
+    with caplog.at_level(logging.INFO):
+        await svc.discover_embedding_models()
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_auto_resolved_capability_is_not_a_claim():
+    """An auto-resolved capability the resolver wrote back is not an operator
+    claim, so it must NOT escalate a probe failure to ERROR (#2433)."""
+    route = {
+        "name": "openrouter:api",
+        "capabilities": {
+            "supports_embeddings": True,
+            "embedding_model": "qwen/qwen3-embedding-8b",
+            "embedding_model_auto_resolved": True,
+        },
+    }
+    assert ModelDiscoveryMixin._route_claims_embedding_support(route) is False
+
+    # A genuine pin (no auto marker) IS a claim.
+    pinned = {"name": "openrouter:api", "embedding_model": "x", "capabilities": {}}
+    assert ModelDiscoveryMixin._route_claims_embedding_support(pinned) is True
+
+
+async def test_concurrent_discovery_is_single_flight():
+    """Concurrent refresh+invoke coalesce behind one in-flight discovery — the
+    adapter is probed once, not twice (#2433)."""
+    import asyncio as _asyncio
+
+    call_count = {"n": 0}
+
+    async def _slow_list(client=None, chat_models=None):
+        call_count["n"] += 1
+        await _asyncio.sleep(0.05)
+        return [EmbeddingModelInfo(id="text-embedding-3-small", provider="openai")]
+
+    adapter = SimpleNamespace()
+    adapter.list_embedding_models = _slow_list
+    provider = {
+        "vendor": "openai",
+        "name": "openai:api",
+        "adapter": adapter,
+        "client": None,
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+
+    a, b = await _asyncio.gather(
+        svc.discover_embedding_models(),
+        svc.discover_embedding_models(),
+    )
+
+    assert call_count["n"] == 1
+    assert {m.id for m in a} == {"text-embedding-3-small"}
+    assert {m.id for m in b} == {"text-embedding-3-small"}
+
+
+async def test_openrouter_real_adapter_failure_propagates_and_logs_error(
+    monkeypatch, caplog
+):
+    """A REAL OpenRouterAdapter whose dedicated endpoint fails no longer swallows
+    the error as ``[]`` — it propagates to the discovery layer, which logs it
+    loudly for a route that explicitly claims embedding support (#2433).
+
+    The mock-adapter tests exercise the discovery layer's ERROR path; this one
+    proves the real adapter actually surfaces the exception to reach it.
+    """
+    import logging
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    adapter = OpenRouterAdapter()
+
+    class _FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            raise httpx.ConnectError("connection refused")
+
+    # The real adapter must raise, not return [].
+    with patch(
+        "kestrel_sovereign.llm.openrouter_adapter.httpx.AsyncClient", _FailingClient
+    ):
+        with pytest.raises(httpx.HTTPError):
+            await adapter.list_embedding_models()
+
+    # And through the discovery layer, a CLAIMING route logs an ERROR.
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": adapter,
+        "client": None,
+        "embedding_model": "qwen/qwen3-embedding-8b",  # explicit operator claim
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    with patch(
+        "kestrel_sovereign.llm.openrouter_adapter.httpx.AsyncClient", _FailingClient
+    ), caplog.at_level(logging.INFO):
+        await svc.discover_embedding_models()
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "a claiming route's real-adapter failure must log an ERROR"
+    assert any("claims" in r.message for r in errors)
+
+
+async def test_openrouter_real_adapter_failure_non_claiming_is_info(monkeypatch, caplog):
+    """The same real-adapter failure on a NON-claiming route is a quiet INFO,
+    never an ERROR traceback (#2433)."""
+    import logging
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    adapter = OpenRouterAdapter()
+
+    class _FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            raise httpx.ConnectError("connection refused")
+
+    provider = {
+        "vendor": "openrouter",
+        "name": "openrouter:api",
+        "adapter": adapter,
+        "client": None,
+        "capabilities": {},  # no claim
+    }
+    svc = _FakeService([provider])
+    with patch(
+        "kestrel_sovereign.llm.openrouter_adapter.httpx.AsyncClient", _FailingClient
+    ), caplog.at_level(logging.INFO):
+        await svc.discover_embedding_models()
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_embedding_derivation_is_route_scoped_no_sibling_leak():
+    """Two same-vendor OpenAI-compatible routes: only the route whose OWN chat
+    listing carries an embedding id advertises embeddings. The reused listing is
+    keyed by ROUTE, so one route's discovered embedding id never retags onto a
+    chat-only sibling under the same vendor (#2433)."""
+    api = {
+        "vendor": "openai",
+        "name": "openai:api",
+        "adapter": OpenAIAdapter(),  # derives_embeddings_from_chat_listing
+        "client": SimpleNamespace(models=SimpleNamespace(list=AsyncMock())),
+        "capabilities": {},
+    }
+    alt = {
+        "vendor": "openai",
+        "name": "openai:alt",
+        "adapter": OpenAIAdapter(),
+        "client": SimpleNamespace(models=SimpleNamespace(list=AsyncMock())),
+        "capabilities": {},
+    }
+    svc = _FakeService([api, alt])
+    # Each route's OWN listing: only openai:api serves an embedding id.
+    svc._chat_models_by_route = {
+        "openai:api": ["gpt-5.5", "text-embedding-3-small"],
+        "openai:alt": ["gpt-4o"],
+    }
+
+    models = await svc.discover_embedding_models()
+    # The embedding model is attributed ONLY to the route that listed it.
+    assert {(m.route, m.id) for m in models} == {
+        ("openai:api", "text-embedding-3-small")
+    }
+    assert await svc.route_advertises_embeddings(api) is True
+    assert await svc.route_advertises_embeddings(alt) is False
+    # Neither route issued a second /v1/models request — both reused their snapshot.
+    api["client"].models.list.assert_not_awaited()
+    alt["client"].models.list.assert_not_awaited()
+
+
+async def test_sibling_route_without_snapshot_fetches_own_listing():
+    """A sibling route absent from the route-keyed snapshot passes ``None`` so
+    its adapter fetches its OWN /v1/models — never reusing another route's
+    listing (#2433). This is the case where chat discovery ran one route per
+    vendor and a same-vendor sibling was not the chosen discovery route."""
+    api = {
+        "vendor": "openai",
+        "name": "openai:api",
+        "adapter": OpenAIAdapter(),
+        "client": SimpleNamespace(models=SimpleNamespace(list=AsyncMock())),
+        "capabilities": {},
+    }
+    alt_client = SimpleNamespace(
+        models=SimpleNamespace(
+            list=AsyncMock(
+                return_value=SimpleNamespace(
+                    data=[SimpleNamespace(id="text-embedding-3-large")]
+                )
+            )
+        )
+    )
+    alt = {
+        "vendor": "openai",
+        "name": "openai:alt",
+        "adapter": OpenAIAdapter(),
+        "client": alt_client,
+        "capabilities": {},
+    }
+    svc = _FakeService([api, alt])
+    # Only the discovery route is snapshotted; the sibling has NO entry.
+    svc._chat_models_by_route = {"openai:api": ["gpt-5.5", "text-embedding-3-small"]}
+
+    models = await svc.discover_embedding_models()
+    by_route = {(m.route, m.id) for m in models}
+    # api reused its snapshot; alt fetched its OWN listing (None → fetch).
+    assert ("openai:api", "text-embedding-3-small") in by_route
+    assert ("openai:alt", "text-embedding-3-large") in by_route
+    alt_client.models.list.assert_awaited_once()
+    api["client"].models.list.assert_not_awaited()
+
+
+async def test_snapshot_records_empty_listing_for_chat_only_route():
+    """A discovery route whose chat listing came back EMPTY (RunPod's 404) is
+    snapshotted as an explicit ``[]`` — a known-empty listing that stops the
+    embedding re-probe, NOT an absent entry that would trigger a fetch (#2433)."""
+    provider = {
+        "vendor": "runpod",
+        "name": "runpod:vllm",
+        "adapter": OpenAIAdapter(),
+        "client": SimpleNamespace(models=SimpleNamespace(list=AsyncMock())),
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    # Chat discovery returned NO models for this route (endpoint 404'd).
+    svc._snapshot_chat_models_by_route([])
+    assert svc._chat_models_by_route == {"runpod:vllm": []}
+
+    models = await svc.discover_embedding_models()
+    assert models == []
+    # The explicit empty snapshot ([], not None) means no second /v1/models call.
+    provider["client"].models.list.assert_not_awaited()
+
+
+async def test_cache_hit_rebuilds_route_snapshot_from_cached_catalog():
+    """On a shared-cache HIT the route-keyed snapshot is rebuilt from the cached
+    catalog before reconciliation, so embedding discovery id-filters fresh chat
+    ids instead of a stale/absent snapshot and never re-fetches (#2433)."""
+    from kestrel_sovereign.llm.model_metadata import ModelInfo, ModelCategory
+
+    provider = {
+        "vendor": "openai",
+        "name": "openai:api",
+        "adapter": OpenAIAdapter(),
+        "client": SimpleNamespace(models=SimpleNamespace(list=AsyncMock())),
+        "capabilities": {},
+    }
+    svc = _FakeService([provider])
+    # A stale snapshot from a prior cycle carried no embedding id.
+    svc._chat_models_by_route = {"openai:api": ["old-chat-only"]}
+
+    # The cached catalog now includes an embedding id for this route's vendor.
+    cached = [
+        ModelInfo(
+            id="gpt-5.5",
+            provider="openai",
+            display_name="gpt-5.5",
+            category=ModelCategory.CHAT,
+        ),
+        ModelInfo(
+            id="text-embedding-3-small",
+            provider="openai",
+            display_name="text-embedding-3-small",
+            category=ModelCategory.EMBEDDING,
+        ),
+    ]
+    # Mirrors what discover_all_models._return_cached does before reconciling.
+    svc._snapshot_chat_models_by_route(cached)
+    assert svc._chat_models_by_route == {
+        "openai:api": ["gpt-5.5", "text-embedding-3-small"]
+    }
+
+    models = await svc.discover_embedding_models()
+    assert {(m.route, m.id) for m in models} == {
+        ("openai:api", "text-embedding-3-small")
+    }
+    provider["client"].models.list.assert_not_awaited()
 
 
 async def test_discovery_cache_reused_until_cleared():

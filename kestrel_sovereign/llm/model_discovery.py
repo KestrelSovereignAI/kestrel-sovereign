@@ -99,6 +99,15 @@ class ModelDiscoveryMixin:
                 # miss — leaving it unresolved even when the cached snapshot
                 # already contains that vendor's models (#2247).
                 self._resolve_auto_providers(cached_models)
+                # Rebuild the route-keyed chat-id snapshot from the cached
+                # catalog BEFORE reconciling (#2433). Embedding discovery
+                # id-filters this snapshot instead of issuing its own
+                # ``/v1/models`` request; on a fresh discovery it is populated
+                # inline, but a shared-cache HIT skips that path entirely, so
+                # without rebuilding it here a production multi-agent host would
+                # reconcile against a stale/absent snapshot and reintroduce the
+                # per-route embedding ``/models`` probe (the RunPod 404).
+                self._snapshot_chat_models_by_route(cached_models)
                 # Same reason applies to embedding capabilities (#2338): the
                 # early return would otherwise skip the reconcile pass that only
                 # runs on a cache miss, leaving a dynamically-discovered
@@ -247,6 +256,14 @@ class ModelDiscoveryMixin:
                         f"not found in discovery — may be deprecated"
                     )
 
+        # Snapshot the discovered model ids so embedding discovery can id-filter
+        # them WITHOUT a second network request (#2433). OpenAI's ``/v1/models``
+        # listing already includes ``text-embedding-*`` ids, so a generic
+        # OpenAI-compatible route derives its embedding catalog from what chat
+        # discovery fetched — a chat-only route (RunPod vLLM whose model-list
+        # 404s) is never probed for embeddings a second time.
+        self._snapshot_chat_models_by_route(all_models)
+
         # Fold embedding discovery into route capabilities in the SAME pass as
         # chat ``auto`` resolution (#2338). This is the non-local warm-up path
         # every chat/UI discovery funnels through, so a dynamically-discovered
@@ -270,6 +287,34 @@ class ModelDiscoveryMixin:
             category=category,
             providers=providers
         )
+
+    def _snapshot_chat_models_by_route(self, models: List[ModelInfo]) -> None:
+        """Snapshot discovered chat ids keyed by the ROUTE that fetched them (#2433).
+
+        Embedding discovery reuses a route's OWN chat listing to id-filter
+        embedding models without a second ``/v1/models`` request. The snapshot
+        is keyed by ROUTE (``provider["name"]``), NOT vendor: chat discovery
+        runs one route per vendor (:meth:`_select_discovery_routes`), so the
+        listing reflects exactly THAT route's serveable set. Keying by vendor
+        would hand the same list to every sibling route under the vendor —
+        letting one route's discovered embedding ids retag onto a chat-only
+        sibling that can't embed. So we map each discovery route's name to its
+        vendor's discovered ids, and record an explicit ``[]`` for a discovery
+        route whose listing came back empty (RunPod's 404) — a KNOWN-empty
+        listing that still stops the re-probe. A sibling route that did NOT
+        drive discovery gets no entry, so :meth:`_discover_embedding_models_uncached`
+        passes ``None`` and its adapter fetches its OWN listing rather than
+        reusing another route's.
+        """
+        by_vendor: Dict[str, List[str]] = {}
+        for m in models:
+            by_vendor.setdefault(m.provider, []).append(m.id)
+        by_route: Dict[str, List[str]] = {}
+        for vendor, route in self._select_discovery_routes():
+            route_name = route.get("name")
+            if route_name:
+                by_route[route_name] = by_vendor.get(vendor, [])
+        self._chat_models_by_route = by_route
 
     async def discover_models_for_route(
         self,
@@ -363,13 +408,37 @@ class ModelDiscoveryMixin:
         if use_cache and cache is not None:
             models = list(cache)
         else:
-            models = await self._discover_embedding_models_uncached()
-            self._embedding_discovery_cache = list(models)
+            models = await self._discover_embedding_models_coalesced()
 
         if vendor:
             models = [m for m in models if m.provider == vendor]
         if route:
             models = [m for m in models if m.route == route]
+        return models
+
+    async def _discover_embedding_models_coalesced(
+        self,
+    ) -> List["EmbeddingModelInfo"]:
+        """Single-flight embedding discovery (#2433).
+
+        The "twice" in the original repro is a concurrent refresh and invoke
+        both probing the same routes. Coalesce concurrent discovery behind one
+        in-flight future so overlapping callers share a single provider sweep
+        (and a single INFO line per unsupported route) instead of each issuing
+        its own.
+        """
+        inflight = getattr(self, "_embedding_discovery_inflight", None)
+        if inflight is not None and not inflight.done():
+            return await inflight
+
+        task = asyncio.ensure_future(self._discover_embedding_models_uncached())
+        self._embedding_discovery_inflight = task
+        try:
+            models = await task
+        finally:
+            if getattr(self, "_embedding_discovery_inflight", None) is task:
+                self._embedding_discovery_inflight = None
+        self._embedding_discovery_cache = list(models)
         return models
 
     async def _discover_embedding_models_uncached(self) -> List["EmbeddingModelInfo"]:
@@ -387,10 +456,27 @@ class ModelDiscoveryMixin:
         if not isinstance(providers, list):
             providers = []
 
+        # Chat model ids already discovered this run, keyed by ROUTE (#2433).
+        # Generic OpenAI-compatible routes id-filter their OWN route's listing
+        # instead of issuing a second network request, so a chat-only route is
+        # never probed twice. Keying by route (not vendor) stops one route's
+        # discovered embedding ids from retagging onto a sibling route under the
+        # same vendor. A discovery route whose chat listing was empty carries an
+        # explicit ``[]`` entry (known-empty → no re-probe); a route with no
+        # entry (a sibling that didn't drive discovery, or a direct call before
+        # any chat discovery) gets ``None`` so its adapter fetches its own
+        # listing rather than reusing another route's.
+        chat_by_route = getattr(self, "_chat_models_by_route", None) or {}
+
         tasks = []
         for provider in providers:
             vendor = provider.get("vendor") or provider.get("name", "").split(":", 1)[0]
-            tasks.append(self._discover_embedding_for_route(vendor, provider))
+            route_name = provider.get("name")
+            tasks.append(
+                self._discover_embedding_for_route(
+                    vendor, provider, chat_by_route.get(route_name)
+                )
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         discovered: List[EmbeddingModelInfo] = []
@@ -450,29 +536,80 @@ class ModelDiscoveryMixin:
 
         return discovered
 
+    @staticmethod
+    def _route_claims_embedding_support(route: dict) -> bool:
+        """True when a route EXPLICITLY claims embedding support (#2433).
+
+        A claim is operator intent: a configured ``embedding_model`` (provider
+        level or a genuine capability pin) or a pinned ``supports_embeddings``.
+        A value the resolver auto-wrote back (``embedding_model_auto_resolved``)
+        is discovery-derived, NOT a claim — so it does not escalate a probe
+        failure to a loud ERROR. Discovery advertisement is circular with a
+        claim (#2338), so we never treat "advertises embeddings" as a claim.
+        """
+        if route.get("embedding_model"):
+            return True
+        caps = route.get("capabilities") or {}
+        if caps.get("embedding_model_auto_resolved"):
+            return False
+        return bool(caps.get("embedding_model") or caps.get("supports_embeddings"))
+
     async def _discover_embedding_for_route(
-        self, vendor: str, route: dict
+        self, vendor: str, route: dict, chat_model_ids: Optional[List[str]] = None
     ) -> List["EmbeddingModelInfo"]:
-        """Call one route's adapter embedding facet with error tolerance."""
+        """Call one route's adapter embedding facet with error tolerance (#2433).
+
+        Generic OpenAI-compatible adapters id-filter the already-fetched chat
+        listing (``chat_model_ids``) with no extra request; adapters with a
+        dedicated embedding source make their own call. An empty/absent catalog
+        is a normal unsupported-capability state (single INFO line, negative
+        cached with the aggregate discovery cache) — an ERROR with traceback is
+        reserved for a route that explicitly claims embedding support and then
+        fails unexpectedly.
+        """
         adapter = route.get("adapter")
         client = route.get("client")
         route_name = route.get("name") or vendor
         if adapter is None or not hasattr(adapter, "list_embedding_models"):
             return []
         try:
-            models = await adapter.list_embedding_models(client)
+            if getattr(adapter, "derives_embeddings_from_chat_listing", False):
+                models = await adapter.list_embedding_models(
+                    client, chat_models=chat_model_ids
+                )
+            else:
+                models = await adapter.list_embedding_models(client)
             # Retag to the vendor key so aggregation/filtering is consistent
             # even if an adapter reports its own name, AND stamp the originating
             # route so capability advertisement stays route-specific (#2338).
             for m in models:
                 m.provider = vendor
                 m.route = route_name
-            logger.debug("%s: discovered %d embedding models", route_name, len(models))
+            if models:
+                logger.debug(
+                    "%s: discovered %d embedding models", route_name, len(models)
+                )
+            else:
+                logger.info("%s: no embedding models discovered", route_name)
             return models or []
         except NotImplementedError:
             return []
         except Exception as e:
-            logger.warning("%s: embedding discovery failed: %s", vendor, e)
+            if self._route_claims_embedding_support(route):
+                logger.error(
+                    "%s: embedding discovery failed for a route that claims "
+                    "embedding support: %s",
+                    route_name,
+                    e,
+                    exc_info=True,
+                )
+            else:
+                logger.info(
+                    "%s: embedding discovery unavailable (route advertises no "
+                    "embeddings): %s",
+                    route_name,
+                    e,
+                )
             return []
 
     async def route_advertises_embeddings(self, provider: dict) -> bool:
