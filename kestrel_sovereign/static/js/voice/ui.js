@@ -36,6 +36,10 @@ import bus from '../ui-ext/bus.js';
 import { Events } from './events.js';
 import { createRealtimeClient, normalizeToolBatchResults } from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
+import {
+  applyVoiceCatalogAttribution,
+  providerDisplayName,
+} from './provider-attribution.js';
 import { State, nextStateForEvent } from './state-machine.js';
 
 // State.* + nextStateForEvent are imported from state-machine.js so the
@@ -101,9 +105,12 @@ function createSession(agent) {
     agentTextBuffer: '',
     userMsgDiv: null,
     userTranscriptBuffer: '',
+    path: '',
     pathLabel: '',
     pathTooltip: '',
     realtimeModel: '',
+    realtimeProvider: '',
+    realtimeVendor: '',
     ownsSelector: false,
     startSeq: 0,
     explicitMuted: null,
@@ -653,7 +660,11 @@ function mountPickerModal(el) {
       </select>
     </label>
     <label class="kestrel-voice-field">
-      <span>Voice</span>
+      <span>
+        Voice
+        <small id="voice-picker-provider-attribution"
+          class="kestrel-voice-provider-attribution" aria-live="polite" hidden></small>
+      </span>
       <select id="voice-picker-select" class="model-selector"></select>
     </label>
     <label class="kestrel-voice-field">
@@ -708,7 +719,7 @@ function setState(next, session = activeSession()) {
 function applyActiveSessionState() {
   const session = controlSession();
   setState(session.state, session);
-  setPathBadge(session.pathLabel, session.pathTooltip);
+  setPathBadge(session.pathLabel, session.pathTooltip, session.path);
 }
 
 // Mixing-board policy:
@@ -786,14 +797,13 @@ function acquireSelectorOwnership(realtimeModelId, session = activeSession()) {
   session.realtimeModel = realtimeModelId;
   session.ownsSelector = true;
 
-  // Pin the selector to the live Realtime model. The pin reads the model from
-  // the session each time, so onRefresh (after the dropdown rebuilds its
-  // options) re-asserts against whatever model is current. OpenAI is the only
-  // Realtime vendor today; if that changes the session payload should carry the
-  // vendor so we can pass it through here.
+  // Pin the selector to the live Realtime model. The pin reads both model and
+  // vendor from the provider-issued session so xAI, OpenAI, and future
+  // conversation providers retain their own identity through selector
+  // refreshes.
   const pin = (widget) => widget.pinToModel(
     {
-      vendor: 'openai',
+      vendor: session.realtimeVendor || 'realtime',
       model: session.realtimeModel,
       label: `🎙 ${session.realtimeModel}`,
     },
@@ -858,9 +868,12 @@ async function startSession(session = activeSession()) {
   setState(State.CONNECTING, session);
   resetTurnState(session);
   if (session === controlSession()) setPathBadge('', '');
+  session.path = '';
   session.pathLabel = '';
   session.pathTooltip = '';
   session.realtimeModel = '';
+  session.realtimeProvider = '';
+  session.realtimeVendor = '';
   setArmedAgent(agent);
 
   const onEvent = (ev) => handleClientEvent(agent, ev, startSeq);
@@ -899,18 +912,26 @@ async function startSession(session = activeSession()) {
       const realtimeProvider = session.client.session?.provider || 'realtime';
       const realtimeVendor = session.client.session?.vendor || realtimeProvider;
       session.realtimeModel = realtimeModel;
+      session.realtimeProvider = realtimeProvider;
+      session.realtimeVendor = realtimeVendor.replace(/_realtime$/i, '');
+      session.path = 'realtime';
       // Take ownership of the chat-model selector for the lifetime of this
       // session.  Acquired AFTER ``start()`` so a failed mint doesn't strand
       // the selector locked.  See #1371.
       acquireSelectorOwnership(realtimeModel, session);
-      const label = `${realtimeProvider} · ${realtimeModel}`;
+      const realtimeDisplayName = providerDisplayName(
+        session.realtimeVendor,
+        window.PROVIDER_NAMES || {},
+      );
+      const label = `${realtimeDisplayName} Realtime · ${realtimeModel}`;
       const tooltip =
-        `${realtimeVendor} Realtime: voice + reasoning answered by ${realtimeModel}. Switch to Pipeline in voice settings (right-click 🎙) to keep your selected chat LLM as the brain.`;
+        `${realtimeDisplayName} Realtime: voice + reasoning answered by ${realtimeModel}. Switch to Pipeline in voice settings (right-click 🎙) to keep your selected chat LLM as the brain.`;
       session.pathLabel = label;
       session.pathTooltip = tooltip;
       if (session === controlSession()) setPathBadge(
         label,
         tooltip,
+        session.path,
       );
       return;
     } catch (err) {
@@ -954,9 +975,12 @@ async function startSession(session = activeSession()) {
     });
     await session.client.start();
     applyActiveSessionPolicy();
+    session.path = 'pipeline';
     session.pathLabel = 'Pipeline';
     session.pathTooltip = 'Cascaded STT → your LLM → TTS. Slower than Realtime, preserves your model choice.';
-    if (session === controlSession()) setPathBadge(session.pathLabel, session.pathTooltip);
+    if (session === controlSession()) {
+      setPathBadge(session.pathLabel, session.pathTooltip, session.path);
+    }
   } catch (err) {
     surfaceFatalError(err, session);
   }
@@ -970,6 +994,7 @@ async function stopSession(session = activeSession()) {
   // pending transcript persistence before refreshing the sidebar.
   session.closingClient = c;
   session.client = null;
+  session.path = '';
   session.pathLabel = '';
   session.pathTooltip = '';
   const wasControlSession = session === controlSession();
@@ -1114,8 +1139,9 @@ function handleClientEvent(agent, ev, startSeq) {
       if (session.userMsgDiv) finalizeUserTurn(session, session.userTranscriptBuffer);
       if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
       // The realtime path persists turns server-side out of band (the browser
-      // talks directly to OpenAI), so the conversation sidebar has no idea a
-      // new session was just written. Nudge it to refresh once the call ends,
+      // talks directly to the active voice provider), so the conversation
+      // sidebar has no idea a new session was just written. Nudge it to
+      // refresh once the call ends,
       // but only if real turns landed — a connect-fail close shouldn't refetch.
       // Decoupled via a window event to avoid an import cycle with identity.js.
       if (session.persistedAny) {
@@ -1408,11 +1434,11 @@ function updateVoiceToolCard(div, card) {
 // ---------------------------------------------------------------------------
 
 
-function setPathBadge(label, tooltip) {
+function setPathBadge(label, tooltip, path = '') {
   if (!pathBadgeEl) return;  // status indicator wasn't mountable
   pathBadgeEl.textContent = label || '';
   pathBadgeEl.title = tooltip || '';
-  pathBadgeEl.dataset.path = (label || '').split(/\s+/)[0].toLowerCase();
+  pathBadgeEl.dataset.path = path;
   // Mirror the active voice model into the chat-header model selector area
   // so the user can see at a glance that voice is using a different model
   // than text chat. The chat model selector itself is unchanged (text chat
@@ -1463,8 +1489,13 @@ async function openPicker() {
   const conversationSel = document.getElementById('voice-picker-conversation');
   const modeSel = document.getElementById('voice-picker-mode');
   const instructionsEl = document.getElementById('voice-picker-instructions');
+  const attributionEl = document.getElementById('voice-picker-provider-attribution');
 
   voiceSel.innerHTML = '<option value="">Loading voices...</option>';
+  attributionEl.textContent = '· Resolving provider...';
+  attributionEl.title = '';
+  attributionEl.hidden = false;
+  attributionEl.classList.remove('is-fallback');
   modeSel.value = settings().mode || 'auto';
   instructionsEl.value = settings().instructions || '';
   // Stash the textarea's seeded value (a) so the hydration .then()
@@ -1566,6 +1597,7 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   const conversationSel = document.getElementById('voice-picker-conversation');
   const modeSel = document.getElementById('voice-picker-mode');
   const voiceSel = document.getElementById('voice-picker-select');
+  const attributionEl = document.getElementById('voice-picker-provider-attribution');
   const previousTts = ttsSel.value || settings().preferred_tts || '';
   const previousConversation = conversationSel.value || settings().preferred_conversation || '';
   previewEl.textContent = 'Resolving...';
@@ -1577,17 +1609,39 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   } catch (err) {
     if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
     previewEl.textContent = `Route preview failed: ${err.message}`;
+    attributionEl.textContent = '· Provider unavailable';
+    attributionEl.title = err.message;
+    attributionEl.hidden = false;
+    attributionEl.classList.remove('is-fallback');
     await refreshVoiceList(voiceSel, '', requestId);
     return;
   }
   if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
+
+  // Resolve the catalog owner before rendering either label. The selected
+  // chat vendor and the provider supplying speech can differ when Realtime is
+  // unavailable, and both UI surfaces must describe the actual route.
+  let voiceListProvider;
+  if (route.path === 'realtime') {
+    voiceListProvider = route.conversation_provider || previousConversation || '';
+  } else {
+    voiceListProvider = previousTts || route.tts_provider || '';
+  }
+  const attribution = applyVoiceCatalogAttribution(
+    attributionEl,
+    route,
+    voiceListProvider,
+    modeSel.value,
+    window.PROVIDER_NAMES || {},
+  );
 
   // Render the human summary.
   const parts = [];
   if (route.path === 'realtime') {
     parts.push(`🟢 Realtime — ${route.conversation_provider || 'provider'} · model: ${route.voice_model || '(discovering)'}`);
   } else if (route.path === 'pipeline') {
-    parts.push(`🟠 Pipeline — your chat LLM (${route.llm_vendor || 'unknown'}) → TTS: ${route.tts_provider || 'auto'} / STT: ${route.stt_provider || 'auto'}`);
+    const pathLabel = attribution.isFallback ? 'Pipeline fallback' : 'Pipeline';
+    parts.push(`🟠 ${pathLabel} — your chat LLM (${route.llm_vendor || 'unknown'}) → TTS: ${route.tts_provider || 'auto'} / STT: ${route.stt_provider || 'auto'}`);
   } else if (route.path === 'local') {
     parts.push(`🔒 Local — TTS: ${route.tts_provider} / STT: ${route.stt_provider}`);
   } else {
@@ -1631,12 +1685,6 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   // Without the path branch, `previousTts` ("elevenlabs") sticks across mode
   // flips and the user sees Sarah/Roger in the picker even after switching
   // to Realtime where those voices don't exist.
-  let voiceListProvider;
-  if (route.path === 'realtime') {
-    voiceListProvider = route.conversation_provider || previousConversation || '';
-  } else {
-    voiceListProvider = previousTts || route.tts_provider || '';
-  }
   voiceSel.dataset.provider = voiceListProvider;
   await refreshVoiceList(
     voiceSel,
@@ -1651,13 +1699,18 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   // the header still reads the prior (Pipeline) annotation.
   if (route.path === 'realtime') {
     setModelSelectorVoiceAnnotation(
-      `${route.conversation_provider || 'Realtime'} · ${route.voice_model || 'discovering'}`,
-      `Voice will use ${route.conversation_provider || 'the selected provider'} / ${route.voice_model || 'a discovered model'}. Click 🎙 to start.`,
+      `${attribution.label} · ${route.voice_model || 'discovering'}`,
+      `Voice will use ${attribution.label.toLowerCase()} with ${route.voice_model || 'a discovered model'}. Click 🎙 to start.`,
     );
   } else if (route.path === 'pipeline') {
+    const pathLabel = attribution.isFallback ? 'Pipeline fallback' : 'Pipeline';
+    const ttsLabel = providerDisplayName(
+      route.tts_provider,
+      window.PROVIDER_NAMES || {},
+    ) || 'auto';
     setModelSelectorVoiceAnnotation(
-      `Pipeline · ${route.tts_provider || 'auto'}`,
-      `Voice will use ${route.llm_vendor || 'your chat LLM'} for reasoning, ${route.tts_provider || 'auto-picked TTS'} for speech.`,
+      `${pathLabel} · ${ttsLabel}`,
+      `Voice will use ${route.llm_vendor || 'your chat LLM'} for reasoning, ${ttsLabel} for speech.`,
     );
   } else if (route.path === 'local') {
     setModelSelectorVoiceAnnotation(
@@ -2327,6 +2380,14 @@ function injectStyles() {
     }
     .kestrel-voice-modal-title { margin: 0; font-size: 1.1rem; }
     .kestrel-voice-field { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; }
+    .kestrel-voice-provider-attribution {
+      color: var(--text-tertiary, #9ca3af);
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .kestrel-voice-provider-attribution.is-fallback {
+      color: var(--warning-color, #f59e0b);
+    }
     .kestrel-voice-field textarea, .kestrel-voice-field select {
       width: 100%;
       padding: 0.4rem 0.55rem;

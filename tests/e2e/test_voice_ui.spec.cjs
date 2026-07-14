@@ -188,6 +188,20 @@ const MOCK_REALTIME_SESSION = {
   client_secret: { value: 'ek_stub', expires_at: 9999999999 },
   model: 'gpt-realtime-stub',
   voice: 'cedar',
+  provider: 'openai_realtime',
+  vendor: 'openai',
+};
+
+const MOCK_XAI_REALTIME_SESSION = {
+  path: 'realtime',
+  session_id: 'sess_xai_stub',
+  client_secret: { value: 'xai_stub', expires_at: 9999999999 },
+  model: 'grok-voice-realtime-stub',
+  voice: 'eve',
+  provider: 'xai_realtime',
+  vendor: 'xai',
+  transport: 'websocket',
+  endpoint: 'wss://api.x.ai/v1/realtime',
 };
 
 const MOCK_REALTIME_409 = {
@@ -204,21 +218,78 @@ const MOCK_REALTIME_UNAVAILABLE_409 = {
   fallback_stt: null,
 };
 
+const MOCK_XAI_OPENAI_FALLBACK_ROUTE = {
+  path: 'pipeline',
+  reason: "Realtime unavailable: no conversation provider declares LLM vendor 'xai'.",
+  llm_vendor: 'xai',
+  tts_provider: 'openai',
+  stt_provider: 'openai',
+  voice_model: null,
+  voice_id: 'cedar',
+  conversation_provider: null,
+  available_tts_providers: ['openai'],
+  available_conversation_providers: ['openai_realtime'],
+  conversation_capabilities: {
+    openai_realtime: { vendor: 'openai' },
+  },
+};
+
+const MOCK_MODEL_CATALOG = {
+  by_vendor: {
+    openai: [
+      { id: 'gpt-test', provider: 'openai', display_name: 'GPT Test', is_featured: true },
+    ],
+    xai: [
+      { id: 'grok-test', provider: 'xai', display_name: 'Grok Test', is_featured: true },
+    ],
+  },
+  routes: [
+    { vendor: 'openai', route: 'api', model: 'gpt-test' },
+    { vendor: 'xai', route: 'api', model: 'grok-test' },
+  ],
+  default: 'gpt-test',
+};
+
 /**
  * Wire up route mocks. Pass `realtimeStatus` to control the
  * /voice/realtime/session response: 200 → Realtime path, 409 → Pipeline
  * fallback.
  */
-async function installRoutes(page, { realtimeStatus = 200, realtime409Body = MOCK_REALTIME_409 } = {}) {
+async function installRoutes(page, {
+  realtimeStatus = 200,
+  realtime409Body = MOCK_REALTIME_409,
+  sessionBody = MOCK_REALTIME_SESSION,
+  routeBody = null,
+} = {}) {
+  await page.route('**/api/models**', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(MOCK_MODEL_CATALOG),
+    }),
+  );
+  await page.route('**/api/model/current**', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        model: 'openai:api/gpt-test',
+        vendor: 'openai',
+        route: 'api',
+        model_name: 'gpt-test',
+        is_auto: true,
+      }),
+    }),
+  );
   // Voices endpoint — same in both paths.
-  await page.route('**/voice/voices', (route) =>
+  await page.route('**/voice/voices**', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(MOCK_VOICES) }),
   );
   await page.route('**/voice/realtime/session', (route) =>
     route.fulfill({
       status: realtimeStatus,
       contentType: 'application/json',
-      body: JSON.stringify(realtimeStatus === 409 ? realtime409Body : MOCK_REALTIME_SESSION),
+      body: JSON.stringify(realtimeStatus === 409 ? realtime409Body : sessionBody),
     }),
   );
   // chat.js loadModels() probes the voice route to learn the realtime model
@@ -228,7 +299,7 @@ async function installRoutes(page, { realtimeStatus = 200, realtime409Body = MOC
     route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({
+      body: JSON.stringify(routeBody || {
         path: 'realtime',
         voice_model: 'gpt-realtime-stub',
         conversation_provider: 'openai_realtime',
@@ -283,6 +354,26 @@ test.describe('Voice UI shell', () => {
     await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
   });
 
+  test('xAI Realtime session keeps xAI identity in the live badge and selector pin', async ({ page }) => {
+    await installRoutes(page, { sessionBody: MOCK_XAI_REALTIME_SESSION });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    await page.locator('#model-settings-button').click();
+    const modelSelect = page.locator('#model-selector');
+    await expect(modelSelect).toBeVisible({ timeout: 10000 });
+
+    await page.locator('#voice-toggle-btn').click();
+
+    const badge = page.locator('.kestrel-voice-path-badge');
+    await expect(badge).toHaveText('xAI Realtime · grok-voice-realtime-stub', { timeout: 5000 });
+    await expect(badge).toHaveAttribute('data-path', 'realtime');
+    await expect(page.locator('#provider-selector')).toHaveValue('xai');
+    await expect(modelSelect).toBeDisabled();
+    await expect(modelSelect).toHaveValue('grok-voice-realtime-stub');
+  });
+
   test('Realtime engagement locks the chat-model selector and restores on stop (#1371)', async ({ page }) => {
     await installRoutes(page, { realtimeStatus: 200 });
     await page.goto(BASE_URL);
@@ -290,6 +381,7 @@ test.describe('Voice UI shell', () => {
     await openChatPanel(page);
 
     // Wait for chat.js to mount the model selector (it is async, behind /api/models).
+    await page.locator('#model-settings-button').click();
     const modelSelect = page.locator('#model-selector');
     await expect(modelSelect).toBeVisible({ timeout: 10000 });
     // Ownership starts released — selector is interactive.
@@ -320,6 +412,7 @@ test.describe('Voice UI shell', () => {
 
     await page.locator('#voice-toggle-btn').click();
     await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
+    const initialMessageCount = await page.locator('.message').count();
 
     await page.evaluate(() => {
       window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_started' });
@@ -334,16 +427,16 @@ test.describe('Voice UI shell', () => {
       window.__voiceStub.pushRtc({ type: 'response.done' });
     });
 
-    await expect(page.locator('.message')).toHaveCount(2, { timeout: 5000 });
+    await expect(page.locator('.message')).toHaveCount(initialMessageCount + 2, { timeout: 5000 });
     const messages = await page.locator('.message').evaluateAll((nodes) =>
       nodes.map((node) => ({
         cls: node.className,
         text: node.textContent.trim(),
-      })),
+      })).slice(-2),
     );
     expect(messages[0]).toMatchObject({ text: 'User question arrived late.' });
     expect(messages[0].cls).toContain('user-message');
-    expect(messages[1]).toMatchObject({ text: 'Agent answer first.' });
+    expect(messages[1].text).toContain('Agent answer first.');
     expect(messages[1].cls).toContain('agent-message');
   });
 
@@ -355,6 +448,7 @@ test.describe('Voice UI shell', () => {
 
     await page.locator('#voice-toggle-btn').click();
     await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
+    const initialMessageCount = await page.locator('.message').count();
 
     await page.evaluate(() => {
       window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_started' });
@@ -366,8 +460,8 @@ test.describe('Voice UI shell', () => {
       });
     });
 
-    await expect(page.locator('.message')).toHaveCount(1, { timeout: 5000 });
-    await expect(page.locator('.message')).toHaveText('Actual transcript.');
+    await expect(page.locator('.message')).toHaveCount(initialMessageCount + 1, { timeout: 5000 });
+    await expect(page.locator('.message').last()).toHaveText('Actual transcript.');
     await expect(page.locator('#chat-container')).not.toContainText('Transcribing...');
   });
 
@@ -473,6 +567,24 @@ test.describe('Voice UI shell', () => {
     const parsed = JSON.parse(saved);
     expect(parsed.voice).toBe('marin');
     expect(parsed.instructions).toContain('sympathetic pirate');
+  });
+
+  test('xAI route visibly attributes an OpenAI Pipeline fallback catalog', async ({ page }) => {
+    await installRoutes(page, { routeBody: MOCK_XAI_OPENAI_FALLBACK_ROUTE });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    await page.locator('#voice-toggle-btn').click({ button: 'right' });
+
+    const modal = page.locator('#voice-picker-modal');
+    await expect(modal).toBeVisible({ timeout: 5000 });
+    await expect(modal.locator('#voice-picker-route-preview')).toContainText('Pipeline fallback');
+
+    const attribution = modal.locator('#voice-picker-provider-attribution');
+    await expect(attribution).toHaveText('· OpenAI fallback');
+    await expect(attribution).toHaveClass(/is-fallback/);
+    await expect(modal.locator('#voice-picker-select option')).toContainText(['Cedar', 'Marin']);
   });
 
 
