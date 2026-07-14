@@ -1165,43 +1165,75 @@ class OpenAIAdapter(LLMAdapter):
     #: OpenAI's model list carries no category, so discovery filters by id.
     _EMBEDDING_ID_TOKENS = ("text-embedding", "embedding", "embed")
 
-    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+    #: Generic OpenAI-compatible routes expose embeddings in the SAME
+    #: ``/v1/models`` listing chat discovery already fetched, so the embedding
+    #: facet id-filters that listing rather than issuing a second request
+    #: (#2433). OpenRouter overrides this to ``False`` — its generic listing
+    #: omits embedding models, so it needs a dedicated call.
+    derives_embeddings_from_chat_listing: bool = True
+
+    async def list_embedding_models(
+        self, client: Any = None, chat_models: Any = None
+    ) -> List["EmbeddingModelInfo"]:
         """Discover embedding models by id-prefix filtering ``/v1/models`` (#2338).
 
         OpenAI's model list reports no category, so the embedding facet filters
-        the same ``client.models.list()`` payload chat discovery uses down to
-        ``text-embedding-*`` ids. OpenAI-compatible routes (Azure, etc.) that
-        pass their own client get their own embedding catalog.
+        the same ``/v1/models`` payload chat discovery uses down to
+        ``text-embedding-*`` ids. OpenAI-compatible routes (Azure, RunPod vLLM,
+        etc.) that pass their own client get their own embedding catalog.
+
+        Preferred path (#2433): ``chat_models`` carries the chat model ids
+        already discovered for this route, so we filter them WITHOUT a second
+        network request — a chat-only route (e.g. a RunPod vLLM endpoint whose
+        model-list 404s) is never probed for embeddings a second time. An empty
+        ``chat_models`` list means "chat discovery found nothing", which
+        correctly yields no embedding models. ``chat_models is None`` (a direct
+        caller without the listing on hand) falls back to fetching ``/v1/models``
+        once; failures propagate so the discovery layer can decide whether they
+        are loud (route claims embedding support) or expected-unsupported.
         """
+        provider = getattr(self, "name", "openai") or "openai"
+
+        if chat_models is not None:
+            return self._embedding_models_from_ids(
+                (getattr(m, "id", m) for m in chat_models), provider
+            )
+
+        if client is None:
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                logger.warning(
+                    "OpenAIAdapter.list_embedding_models called with client=None "
+                    "and no OPENAI_API_KEY; returning empty list"
+                )
+                return []
+            client = openai.AsyncOpenAI(api_key=api_key)
+
+        response = await client.models.list()
+        return self._embedding_models_from_ids(
+            (model.id for model in response.data), provider
+        )
+
+    def _embedding_models_from_ids(
+        self, ids: Any, provider: str
+    ) -> List["EmbeddingModelInfo"]:
+        """Filter model ids down to embedding models by id-token match (#2433)."""
         from .embedding_discovery import EmbeddingModelInfo
 
-        try:
-            if client is None:
-                api_key = os.environ.get("OPENAI_API_KEY")
-                if not api_key:
-                    logger.warning(
-                        "OpenAIAdapter.list_embedding_models called with client=None "
-                        "and no OPENAI_API_KEY; returning empty list"
-                    )
-                    return []
-                client = openai.AsyncOpenAI(api_key=api_key)
-
-            response = await client.models.list()
-            results: List[EmbeddingModelInfo] = []
-            for model in response.data:
-                low = model.id.lower()
-                if not any(tok in low for tok in self._EMBEDDING_ID_TOKENS):
-                    continue
-                results.append(EmbeddingModelInfo(
-                    id=model.id,
-                    provider=getattr(self, "name", "openai") or "openai",
-                    display_name=model.id,
-                ))
-            logger.info(f"OpenAI: discovered {len(results)} embedding models")
-            return results
-        except Exception as e:
-            logger.error(f"Failed to list OpenAI embedding models: {e}", exc_info=True)
-            return []
+        results: List[EmbeddingModelInfo] = []
+        for model_id in ids:
+            if not model_id:
+                continue
+            low = str(model_id).lower()
+            if not any(tok in low for tok in self._EMBEDDING_ID_TOKENS):
+                continue
+            results.append(EmbeddingModelInfo(
+                id=model_id,
+                provider=provider,
+                display_name=model_id,
+            ))
+        logger.info(f"OpenAI: discovered {len(results)} embedding models")
+        return results
 
     @staticmethod
     def _cache_key_for_options(model: str, markers: List[Any]) -> str:

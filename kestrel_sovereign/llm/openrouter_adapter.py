@@ -376,7 +376,14 @@ class OpenRouterAdapter(OpenAIAdapter):
             logger.warning(f"OpenRouter model discovery failed: {e}")
             return []
 
-    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+    #: OpenRouter's generic ``/models`` listing OMITS embedding models, so it
+    #: cannot derive embeddings from the chat listing — it makes a dedicated
+    #: ``/embeddings/models`` call instead (#2433). Overrides the OpenAI base.
+    derives_embeddings_from_chat_listing: bool = False
+
+    async def list_embedding_models(
+        self, client: Any = None, chat_models: Any = None
+    ) -> List["EmbeddingModelInfo"]:
         """Discover OpenRouter embedding models from the DEDICATED endpoint (#2338).
 
         OpenRouter serves embedding models from ``GET /api/v1/embeddings/models``,
@@ -385,8 +392,17 @@ class OpenRouterAdapter(OpenAIAdapter):
         models with metadata (gemini-embedding-2, pplx-embed-v1,
         qwen3-embedding-8b, gte, e5, ...).
 
-        ``client`` is accepted for contract symmetry; OpenRouter's catalog is
-        fetched with this adapter's own bearer-token ``httpx.AsyncClient``.
+        ``client``/``chat_models`` are accepted for contract symmetry;
+        OpenRouter's catalog is fetched with this adapter's own bearer-token
+        ``httpx.AsyncClient`` and the chat listing carries no embedding ids.
+
+        A dedicated-endpoint FAILURE is NOT swallowed here (#2433): it
+        propagates to :meth:`ModelDiscoveryMixin._discover_embedding_for_route`,
+        which is the layer that knows whether the route explicitly claims
+        embedding support — and therefore whether the failure is a loud ERROR
+        (claiming route) or an expected-unsupported INFO. Returning ``[]`` here
+        would erase that distinction and bury every failure as a warning. Only a
+        genuinely-unconfigured route (no ``api_key``) short-circuits to ``[]``.
         """
         from .embedding_discovery import EmbeddingModelInfo
 
@@ -397,21 +413,14 @@ class OpenRouterAdapter(OpenAIAdapter):
             return []
 
         url = f"{self.base_url}/embeddings/models"
-        try:
-            async with httpx.AsyncClient() as http_client:
-                response = await http_client.get(
-                    url,
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    timeout=HTTP_TIMEOUT_DEFAULT,
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except httpx.HTTPError as e:
-            logger.warning(f"OpenRouter embedding discovery HTTP error: {e}")
-            return []
-        except Exception as e:
-            logger.warning(f"OpenRouter embedding discovery failed: {e}")
-            return []
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.get(
+                url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=HTTP_TIMEOUT_DEFAULT,
+            )
+            response.raise_for_status()
+            payload = response.json()
 
         results: List[EmbeddingModelInfo] = []
         for m in payload.get("data", []):

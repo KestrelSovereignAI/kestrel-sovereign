@@ -962,7 +962,9 @@ class OllamaAdapter(LLMAdapter):
             logger.warning(f"Could not check embedding support for {model_name}: {e}")
             return False
 
-    async def list_embedding_models(self, client: Any = None) -> List["EmbeddingModelInfo"]:
+    async def list_embedding_models(
+        self, client: Any = None, chat_models: Any = None
+    ) -> List["EmbeddingModelInfo"]:
         """Discover locally-available embedding models (#2338).
 
         ``/api/tags`` lists installed models, ``/api/show`` reports each model's
