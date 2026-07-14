@@ -238,3 +238,39 @@ def test_upgrade_no_installed_extensions(monkeypatch, fake_registry, capsys):
     assert rc == 0
     assert spy.calls == []
     assert "No installed feature/provider packages" in capsys.readouterr().out
+
+
+def test_host_feature_entry_point_group_is_captured(monkeypatch):
+    """Host features (e.g. fleet observability, #2444) must be enumerated so
+    `feature sync --capture` records them and `feature sync` restores them after
+    `uv sync` prunes the out-of-tree package."""
+    from kestrel_sovereign import cli_features
+    from kestrel_sovereign.host_features.discovery import (
+        HOST_FEATURE_ENTRY_POINT_GROUP,
+    )
+
+    assert (
+        HOST_FEATURE_ENTRY_POINT_GROUP
+        in cli_features._EXTENSION_ENTRY_POINT_GROUPS
+    )
+
+    import importlib.metadata as md
+
+    fake_dist = types.SimpleNamespace(name="kestrel-feature-observability-fleet")
+    fake_ep = types.SimpleNamespace(name="fleet", dist=fake_dist)
+
+    def fake_entry_points(group=None):
+        if group == HOST_FEATURE_ENTRY_POINT_GROUP:
+            return [fake_ep]
+        return []
+
+    monkeypatch.setattr(md, "entry_points", fake_entry_points)
+    monkeypatch.setattr(md, "version", lambda name: "0.4.0")
+    monkeypatch.setattr(cli, "_editable_install_path", lambda name: None)
+
+    dists = cli_features._installed_extension_distributions()
+
+    names = {d["dist"] for d in dists}
+    assert "kestrel-feature-observability-fleet" in names
+    fleet = next(d for d in dists if d["dist"] == "kestrel-feature-observability-fleet")
+    assert "host_features:fleet" in fleet["entries"]

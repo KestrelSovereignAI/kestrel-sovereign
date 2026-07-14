@@ -47,3 +47,12 @@ pypi = ">=0.3,<0.4"
 [[feature]]
 name = "github"
 editable = "/Volumes/data2/projects/kestrel-feature-github"
+
+# Fleet observability host feature. Consumes the identity→tenant resolver from
+# host config key `observability_tenant_resolver` (issue #2444). Pin to the
+# v0.4 seam contract that introduced the per-request resolver hook. There is no
+# feature-registry alias for the fleet package, so name it by its raw dist name
+# (a raw `kestrel-feature-*` dist name resolves directly, per the note above).
+[[feature]]
+name = "kestrel-feature-observability-fleet"
+pypi = ">=0.4,<0.5"

@@ -416,20 +416,37 @@ def _host_config_mapping(config) -> dict:
 
     Deliberately minimal: enough for a host feature to learn the host's
     bind/port and agent roster without coupling to the full config object
-    shape. Returns ``{}`` when no multi-agent config is available (e.g. a
-    single-agent boot) — host features are host-scoped and must still mount.
-    (Moved from the retired ``kestrel_sovereign.host`` — issue #2382.)
+    shape. Carries only the tenant resolver (below) when no multi-agent config
+    is available (e.g. a single-agent boot) — host features are host-scoped and
+    must still mount. (Moved from the retired ``kestrel_sovereign.host`` — issue
+    #2382.)
+
+    Always injects the identity→tenant resolver (issue #2444) under
+    ``observability_tenant_resolver`` — the seam the fleet observability host
+    feature consumes in ``on_host_start`` to stamp each request's ``tenant_id``.
+    It is present even on a single-agent boot (config ``None``) so the store is
+    tenant-scoped regardless of deployment shape; zero-config resolves every
+    request to one stable default personal tenant (INV-SOLO).
     """
+    from kestrel_sovereign.security.tenant_resolver import (
+        HOST_CONFIG_KEY as _TENANT_RESOLVER_KEY,
+        build_tenant_resolver,
+    )
+
+    mapping: dict = {_TENANT_RESOLVER_KEY: build_tenant_resolver()}
     if config is None:
-        return {}
+        return mapping
     try:
-        return {
-            "host_bind": config.host.bind,
-            "host_port": config.host.port,
-            "agents": list(config.agents.keys()),
-        }
+        mapping.update(
+            {
+                "host_bind": config.host.bind,
+                "host_port": config.host.port,
+                "agents": list(config.agents.keys()),
+            }
+        )
     except Exception:  # noqa: BLE001
-        return {}
+        pass
+    return mapping
 
 
 def _apply_platform_host_port(config, env) -> None:
