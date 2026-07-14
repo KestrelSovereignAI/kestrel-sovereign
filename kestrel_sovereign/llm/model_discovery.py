@@ -1341,8 +1341,21 @@ class ModelDiscoveryMixin:
           * ``OpenAIAdapter`` with ``is_local=True`` → query local ``/v1/models``.
           * Any other adapter → ``adapter.list_models()``; tolerate
             ``NotImplementedError`` for subscription-only wrappers.
+
+        ``OpenRouterAdapter`` is excluded from the generic OpenAI-compatible
+        ``base_url`` branches even though it subclasses ``OpenAIAdapter`` and
+        declares a ``base_url``. Its own ``list_models`` is authoritative and
+        authenticates with the adapter's ``self.api_key`` — which
+        ``finalize_providers()`` sets to the minted bootstrap child key when a
+        route registered management-key-only (no static ``OPENROUTER_API_KEY``).
+        The generic ``_discover_openai_compatible_remote`` path instead
+        re-resolves the key from ``os.environ["OPENROUTER_API_KEY"]``, which is
+        unset in that mode, so it silently returned ``[]`` and chat ``auto``
+        never resolved — while the embedding path (``list_embedding_models``,
+        also on ``self.api_key``) discovered fine (#2436).
         """
         from .openai_adapter import OpenAIAdapter
+        from .openrouter_adapter import OpenRouterAdapter
 
         adapter = route.get("adapter")
         client = route.get("client")
@@ -1360,7 +1373,9 @@ class ModelDiscoveryMixin:
         # remain because they query the /v1/models endpoint with extra
         # context (server_context_limit, etc.) that the adapter cannot
         # know about.
-        if isinstance(adapter, OpenAIAdapter):
+        if isinstance(adapter, OpenAIAdapter) and not isinstance(
+            adapter, OpenRouterAdapter
+        ):
             if vendor == "openai" and not base_url:
                 return await self._safe_list_models(vendor, adapter, client)
             if base_url and is_local:
