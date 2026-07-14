@@ -25,23 +25,23 @@ class TestCommandsEndpoint:
 
 
 class TestObservabilityEndpoints:
-    def test_observability_events_returns_503_without_agent(self):
+    def test_observability_summary_returns_503_without_agent(self):
         app = FastAPI()
         app.include_router(observability_router)
 
         with TestClient(app) as client:
-            response = client.get("/api/observability/events")
+            response = client.get("/api/observability/summary")
 
         assert response.status_code == 503
         assert "agent" in response.json()["detail"].lower()
 
-    def test_observability_events_returns_503_without_store(self):
+    def test_observability_summary_returns_503_without_store(self):
         app = FastAPI()
         app.include_router(observability_router)
         app.state.agent = MagicMock(observability_store=None)
 
         with TestClient(app) as client:
-            response = client.get("/api/observability/events")
+            response = client.get("/api/observability/summary")
 
         assert response.status_code == 503
         assert "observability store" in response.json()["detail"].lower()

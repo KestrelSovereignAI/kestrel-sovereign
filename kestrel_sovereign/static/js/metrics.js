@@ -96,14 +96,16 @@ export async function loadMetrics() {
     // opted out of the metrics surface.
     if (!API.hasCapability('metrics')) return;
     try {
-        const [summary, eventsResp] = await Promise.all([
-            API.request('/api/observability/summary?minutes=60'),
-            API.request('/api/observability/events?limit=200'),
-        ]);
+        // #2317: core no longer serves an agent-scoped
+        // /api/observability/events — the fleet host feature owns the raw
+        // event feed. The per-agent Metrics panel renders entirely from the
+        // /summary aggregates (timeline + tool_durations pre-bucketed
+        // server-side), so a single request feeds every chart.
+        const summary = await API.request('/api/observability/summary?minutes=60');
 
         renderKPICards(summary);
-        renderTimelineChart(eventsResp.events || []);
-        renderDurationChart(eventsResp.events || []);
+        renderTimelineChart(summary.timeline || {});
+        renderDurationChart(summary.tool_durations || {});
         renderDistributionChart(summary.events_by_type || {});
         renderErrors(summary.recent_errors || []);
     } catch (e) {
@@ -190,25 +192,17 @@ function getChartColors() {
     };
 }
 
-function renderTimelineChart(events) {
+function renderTimelineChart(timeline) {
     const canvas = document.getElementById('metrics-timeline-chart');
     if (!canvas || typeof Chart === 'undefined') return;
 
-    // Group events into 5-minute buckets
-    const buckets = {};
+    // `timeline` is a server-aggregated map of 5-minute buckets keyed by ISO
+    // timestamp, each holding per-event-type counts (#2317). No client-side
+    // bucketing — the raw event feed is no longer fetched here.
+    const buckets = timeline || {};
     const typeSet = new Set();
-
-    for (const event of events) {
-        if (!event.timestamp) continue;
-        const date = new Date(event.timestamp);
-        // Round down to 5-minute bucket
-        date.setMinutes(Math.floor(date.getMinutes() / 5) * 5, 0, 0);
-        const key = date.toISOString();
-        const type = event.event_type || 'unknown';
-        typeSet.add(type);
-
-        if (!buckets[key]) buckets[key] = {};
-        buckets[key][type] = (buckets[key][type] || 0) + 1;
+    for (const key of Object.keys(buckets)) {
+        for (const type of Object.keys(buckets[key])) typeSet.add(type);
     }
 
     const sortedKeys = Object.keys(buckets).sort();
@@ -270,24 +264,16 @@ function renderTimelineChart(events) {
     });
 }
 
-function renderDurationChart(events) {
+function renderDurationChart(toolDurations) {
     const canvas = document.getElementById('metrics-duration-chart');
     if (!canvas || typeof Chart === 'undefined') return;
 
-    // Aggregate durations by tool name
-    const toolDurations = {};
-    for (const event of events) {
-        if (event.event_type !== 'tool_response' || !event.duration_ms) continue;
-        const name = event.tool_name || 'unknown';
-        if (!toolDurations[name]) toolDurations[name] = [];
-        toolDurations[name].push(event.duration_ms);
-    }
-
-    const toolNames = Object.keys(toolDurations).sort();
-    const avgDurations = toolNames.map(name => {
-        const durations = toolDurations[name];
-        return Math.round(durations.reduce((a, b) => a + b, 0) / durations.length);
-    });
+    // `toolDurations` is a server-aggregated map of tool name → average
+    // duration in ms (#2317), computed from tool_response events in the
+    // summary handler. No client-side aggregation.
+    const durationsByTool = toolDurations || {};
+    const toolNames = Object.keys(durationsByTool).sort();
+    const avgDurations = toolNames.map(name => Math.round(durationsByTool[name]));
 
     const colors = getChartColors();
 
