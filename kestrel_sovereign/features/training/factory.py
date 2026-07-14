@@ -127,6 +127,34 @@ class TrainingProviderFactory:
     # Cached instances
     _instances: Dict[str, TrainingProvider] = {}
 
+    # Methods a provider MUST expose given the capabilities it declares. Used
+    # at entry-point discovery to drop plugins whose method surface doesn't
+    # match what their `capabilities` promise (codex round-2 on #2445).
+    _REQUIRED_METHODS_BY_CAPABILITY = {
+        "training": (
+            "start_training", "get_status", "download_weights",
+            "cancel", "cleanup",
+        ),
+        "generation": ("generate_image",),
+    }
+
+    @classmethod
+    def _required_methods_missing(
+        cls, obj: type, caps: ProviderCapabilities,
+    ) -> set:
+        """Return the set of methods a plugin promised via capabilities but
+        didn't implement. Empty set means the contract holds."""
+        missing = set()
+        if getattr(caps, "training", False):
+            for name in cls._REQUIRED_METHODS_BY_CAPABILITY["training"]:
+                if not callable(getattr(obj, name, None)):
+                    missing.add(name)
+        if getattr(caps, "generation", False):
+            for name in cls._REQUIRED_METHODS_BY_CAPABILITY["generation"]:
+                if not callable(getattr(obj, name, None)):
+                    missing.add(name)
+        return missing
+
     # Providers discovered via the entry-point group (populated lazily on first
     # use). ``_ep_provider_classes`` maps entry-point name -> provider class;
     # the two parallel dicts hold each provider's declared capabilities and
@@ -172,11 +200,28 @@ class TrainingProviderFactory:
                 )
                 continue
 
-            cls._ep_provider_classes[name] = obj
-
             caps = getattr(obj, "capabilities", None)
             if not isinstance(caps, ProviderCapabilities):
                 caps = ProviderCapabilities()
+
+            # Codex round-2 P1/P2 on #2445: validate the class implements
+            # the methods its capability declaration promises. Otherwise a
+            # plugin advertising `generation=True` without `generate_image`
+            # gets selected and crashes with AttributeError at call time
+            # (and a `training=True` plugin without training methods breaks
+            # default routing). Drop violators at discovery so the factory
+            # never sees them.
+            missing = cls._required_methods_missing(obj, caps)
+            if missing:
+                logger.warning(
+                    "Training provider entry point '%s' declares "
+                    "capabilities %s but is missing required method(s): %s "
+                    "— skipping (would crash at call time)",
+                    name, caps, ", ".join(sorted(missing)),
+                )
+                continue
+
+            cls._ep_provider_classes[name] = obj
             cls._ep_provider_capabilities[name] = caps
 
             priority = getattr(obj, "priority", None)
@@ -231,7 +276,31 @@ class TrainingProviderFactory:
             return cls._instances[name]
 
         provider = cls._create_provider(name)
-        if provider and provider.is_available():
+        if not provider:
+            logger.warning(f"Provider '{name}' not available")
+            return None
+
+        # Codex round-2 P1 on #2445: a plugin's `is_available()` might raise
+        # (e.g. reachability probe against a service that's down). Treat any
+        # exception as "unavailable" for entry-point providers so one broken
+        # plugin can't brick `list_available_providers()` or default routing.
+        # Built-in providers keep the pre-fix behavior so their own bugs
+        # aren't silently swallowed.
+        cls._ensure_entry_points_loaded()
+        is_entry_point = name in cls._ep_provider_classes
+        try:
+            available = provider.is_available()
+        except Exception as e:
+            if is_entry_point:
+                logger.warning(
+                    "Entry-point provider '%s' is_available() raised: %s "
+                    "— treating as unavailable",
+                    name, e,
+                )
+                return None
+            raise
+
+        if available:
             cls._instances[name] = provider
             return provider
 

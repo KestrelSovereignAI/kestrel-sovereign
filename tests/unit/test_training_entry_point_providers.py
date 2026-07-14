@@ -20,7 +20,13 @@ from kestrel_sovereign.features.training.types import ProviderCapabilities, Prov
 
 
 class _StubProvider:
-    """Minimal available provider registered via entry point."""
+    """Minimal available provider registered via entry point.
+
+    Implements the full TrainingProvider surface for both training and
+    generation (per codex round-2 on #2445: providers advertising a
+    capability MUST implement the methods that back it — the factory
+    rejects violators at discovery).
+    """
 
     # Slots between local_mps (0) and runpod (10) in the built-in ordering.
     priority = 5
@@ -37,6 +43,13 @@ class _StubProvider:
 
     def is_available(self) -> bool:
         return True
+
+    async def start_training(self, *_args, **_kw): ...
+    async def get_status(self, *_args, **_kw): ...
+    async def download_weights(self, *_args, **_kw): ...
+    async def cancel(self, *_args, **_kw): ...
+    async def cleanup(self, *_args, **_kw): ...
+    async def generate_image(self, *_args, **_kw): ...
 
 
 class _UnavailableProvider:
@@ -70,6 +83,8 @@ class _GenerationOnlyProvider:
     def is_available(self) -> bool:
         return True
 
+    async def generate_image(self, *_args, **_kw): ...
+
 
 class _TrainingOnlyUncensoredProvider:
     """Available uncensored provider that cannot generate images.
@@ -92,6 +107,60 @@ class _TrainingOnlyUncensoredProvider:
 
     def is_available(self) -> bool:
         return True
+
+    async def start_training(self, *_args, **_kw): ...
+    async def get_status(self, *_args, **_kw): ...
+    async def download_weights(self, *_args, **_kw): ...
+    async def cancel(self, *_args, **_kw): ...
+    async def cleanup(self, *_args, **_kw): ...
+
+
+class _MissingTrainingMethodsProvider:
+    """Declares training=True but doesn't implement start_training et al.
+    Must be REJECTED at discovery (codex round-2 P2 on #2445)."""
+
+    priority = 5
+    capabilities = ProviderCapabilities(training=True, generation=False)
+    provider_name = "bad_train"
+    provider_type = ProviderType.SERVERLESS
+
+    def is_available(self) -> bool:
+        return True
+
+
+class _MissingGenerationMethodProvider:
+    """Declares generation=True but doesn't implement generate_image.
+    Must be REJECTED at discovery (codex round-2 P1 on #2445)."""
+
+    priority = 5
+    capabilities = ProviderCapabilities(training=False, generation=True)
+    provider_name = "bad_gen"
+    provider_type = ProviderType.SERVERLESS
+
+    def is_available(self) -> bool:
+        return True
+
+
+class _RaisingAvailabilityProvider:
+    """is_available() raises. Must NOT crash the factory — treated as
+    unavailable and logged (codex round-2 P1 on #2445)."""
+
+    priority = 0  # would win priority ordering if not for the raise
+    capabilities = ProviderCapabilities(
+        training=True, generation=True, uncensored=True,
+    )
+    provider_name = "raising"
+    provider_type = ProviderType.SERVERLESS
+
+    def is_available(self) -> bool:
+        raise ConnectionError("probe failed")
+
+    async def start_training(self, *_args, **_kw): ...
+    async def get_status(self, *_args, **_kw): ...
+    async def download_weights(self, *_args, **_kw): ...
+    async def cancel(self, *_args, **_kw): ...
+    async def cleanup(self, *_args, **_kw): ...
+    async def generate_image(self, *_args, **_kw): ...
 
 
 class _BehavioralOnlyProvider:
@@ -280,3 +349,56 @@ def test_behavioral_provider_satisfies_runtime_protocol():
     # only the behavioral methods still passes isinstance() — as the built-in
     # adapters (which declare no such attrs) must.
     assert isinstance(_BehavioralOnlyProvider(), TrainingProvider)
+
+
+# ---------------------------------------------------------------------------
+# Codex round-2 regressions on #2445
+# ---------------------------------------------------------------------------
+
+def test_missing_training_methods_provider_rejected_at_discovery(
+    register_entry_points, caplog,
+):
+    # Codex round-2 P2 on #2445: a plugin declaring training=True but missing
+    # start_training / get_status / etc. must be dropped at discovery. Left in,
+    # it would win priority routing then crash with AttributeError at the
+    # first training call.
+    register_entry_points(("bad_train", _MissingTrainingMethodsProvider))
+    with caplog.at_level("WARNING"):
+        available = TrainingProviderFactory.list_available_providers()
+    assert "bad_train" not in available
+    assert any("bad_train" in r.message and "missing" in r.message.lower()
+               for r in caplog.records)
+
+
+def test_missing_generation_method_provider_rejected_at_discovery(
+    register_entry_points, caplog,
+):
+    # Codex round-2 P1 on #2445: a plugin declaring generation=True but
+    # missing generate_image would be selected by get_generation_provider and
+    # crash with AttributeError at call time. Must be dropped at discovery.
+    register_entry_points(("bad_gen", _MissingGenerationMethodProvider))
+    with caplog.at_level("WARNING"):
+        available = TrainingProviderFactory.list_available_providers()
+    assert "bad_gen" not in available
+    assert any("bad_gen" in r.message and "missing" in r.message.lower()
+               for r in caplog.records)
+
+
+def test_raising_is_available_does_not_crash_factory(
+    register_entry_points, caplog,
+):
+    # Codex round-2 P1 on #2445: an entry-point provider whose is_available()
+    # raises must NOT propagate up through get_provider / default routing /
+    # list_available_providers — one broken plugin bricking the factory is
+    # exactly the anti-pattern the entry-point contract is meant to avoid.
+    register_entry_points(("raising", _RaisingAvailabilityProvider))
+    with caplog.at_level("WARNING"):
+        # Must not raise; must not select the broken provider.
+        provider = TrainingProviderFactory.get_provider("raising")
+    assert provider is None
+    assert any("raising" in r.message and "is_available" in r.message
+               for r in caplog.records)
+    # Also should not shortcircuit the default-provider fallback chain.
+    # (No other provider is registered, so we expect None or a built-in
+    # depending on the env — the key assertion is "does not raise".)
+    TrainingProviderFactory.get_default_provider()
