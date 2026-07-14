@@ -183,7 +183,12 @@ def group_messages_into_sessions(
             current["messages"].append(msg)
         if role == "user":
             current["user_message_count"] += 1
-            if current["preview_content"] is None:
+            # Operator-signal fallback notices (#operator_signals.py) are
+            # persisted with role="user" so they replay in history, but they
+            # are synthetic system chatter, not something the user typed —
+            # skip them when picking the preview so an auto-mode/budget/
+            # governance notice never becomes the conversation's title.
+            if current["preview_content"] is None and not meta.get("operator_signal"):
                 current["preview_content"] = content
                 current["preview_metadata"] = meta
 
