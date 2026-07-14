@@ -453,6 +453,111 @@ __all__ = [
 ]
 ```
 
+## Writing a Training Provider (External Package, Entry Points)
+
+The steps above add a provider **in-tree** by editing `factory.py`. External
+packages don't have to — they can register a provider through the
+`kestrel_sovereign.training_providers` entry-point group and Kestrel discovers
+it at runtime, mirroring how LLM adapters register under
+`kestrel_sovereign.llm_providers`.
+
+This is how, for example, an out-of-process generation backend (a worker that
+polls a shared queue and produces avatars/LoRA selfies) becomes a first-class
+provider on a host where no in-process provider matches — without editing
+Kestrel.
+
+### 1. Implement the `TrainingProvider` protocol
+
+Your class satisfies the same [`TrainingProvider` protocol](#trainingprovider-protocol)
+the built-in adapters do: `provider_name`, `provider_type`, `is_available()`,
+and the async `start_training` / `get_status` / `download_weights` / `cancel` /
+`cleanup` methods. `is_available()` reports availability based on **your own**
+environment checks — Kestrel does **not** add an entry to `PROVIDER_ENV_VARS`
+for external providers.
+
+Two **optional class attributes** control routing (both backward compatible —
+omit them and sensible defaults apply). The factory reads them via
+``getattr`` — they are deliberately **not** members of the
+`@runtime_checkable` `TrainingProvider` protocol, since data members on a
+runtime-checkable protocol would become *required* for `isinstance()` checks
+and break the built-in adapters that don't declare them:
+
+```python
+from kestrel_sovereign.features.training.types import (
+    ProviderCapabilities, ProviderType,
+)
+
+
+class CatalogWorkerProvider:
+    # Lower = tried first. Interleaves with built-ins on the same numeric
+    # scale: built-in provider N sits at N * 10 (local_mps=0, runpod=10,
+    # vertex_ai=20, ...). priority=5 slots between local_mps and runpod.
+    # Omit to default to the lowest priority (sorts after all built-ins).
+    priority = 5
+
+    # Declared once as a class attribute; surfaced via
+    # TrainingProviderFactory.get_capabilities("catalog_worker").
+    # Omit to default to an all-False ProviderCapabilities().
+    capabilities = ProviderCapabilities(
+        training=True,
+        generation=True,
+        uncensored=True,
+        flux_version="2.x",
+        supports_lora_download=True,
+    )
+
+    provider_name = "catalog_worker"
+    provider_type = ProviderType.SERVERLESS
+
+    def is_available(self) -> bool:
+        # Your own env / reachability check.
+        import os
+        return bool(os.getenv("FRINZ_CATALOG_DATABASE_URL"))
+
+    async def start_training(self, companion_id, avatar_data, config=None):
+        ...
+    # get_status / download_weights / cancel / cleanup ...
+```
+
+### 2. Register the entry point
+
+In your package's `pyproject.toml`:
+
+```toml
+[project.entry-points."kestrel_sovereign.training_providers"]
+catalog_worker = "frinz.services.catalog_worker_provider:CatalogWorkerProvider"
+```
+
+The entry-point **name** (`catalog_worker`) becomes the provider name used by
+`get_provider("catalog_worker")`, `list_available_providers()`, and priority
+routing.
+
+### 3. What the factory does
+
+On first use, `TrainingProviderFactory` lazily discovers every registered
+entry point, records its class, `capabilities`, and `priority`, then:
+
+- **Instantiates + checks `is_available()`** — an unavailable provider is
+  silently skipped (never appears in `list_available_providers()` and
+  `get_provider()` returns `None`).
+- **Merges into the priority order** — `_effective_priority()` interleaves
+  entry-point providers with the built-in `PROVIDER_PRIORITY` by their declared
+  `priority`, so `get_default_provider()` / `get_generation_provider()` /
+  `get_uncensored_provider()` all consider them.
+- **Gates on capability** — routing respects `capabilities`, not just
+  availability: `get_default_provider()` only returns a provider whose
+  `capabilities.training` is set, and `get_uncensored_provider()` requires
+  **both** `generation` and `uncensored`. A generation-only backend is never
+  routed into a training flow, and a training-only backend is never returned as
+  an uncensored generator.
+- **Never shadows a built-in** — an entry point whose name collides with a
+  built-in provider is ignored, and duplicate entry-point names keep the first
+  registration (both logged).
+
+No changes to `PROVIDER_PRIORITY`, `PROVIDER_ENV_VARS`, or
+`PROVIDER_CAPABILITIES` in `factory.py` are required — external providers are
+fully self-describing.
+
 ## Docker Image Support
 
 The `docker/simpletuner_api.py` supports two modes:
