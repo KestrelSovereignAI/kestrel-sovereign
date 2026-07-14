@@ -44,6 +44,12 @@ from typing import Optional, Protocol, runtime_checkable
 
 from .types import TrainingJob, TrainingStatus, TrainingConfig, ProviderType
 
+# Default priority for a provider that does not declare its own. Larger value =
+# lower priority, so an undeclared provider sorts *after* every built-in and any
+# provider that opts into an explicit priority. See TrainingProviderFactory for
+# how built-in ordering maps onto this numeric scale.
+DEFAULT_PROVIDER_PRIORITY = 1000
+
 
 @runtime_checkable
 class TrainingProvider(Protocol):
@@ -55,6 +61,26 @@ class TrainingProvider(Protocol):
     - Session-based: start_training() starts instance, submits job
 
     All cleanup is handled internally or via cleanup() method.
+
+    Optional routing metadata (entry-point providers only)
+    ------------------------------------------------------
+    A provider registered via the ``kestrel_sovereign.training_providers``
+    entry-point group may declare two *optional* class attributes that the
+    factory reads through ``getattr`` with defaults:
+
+      priority     - integer sort key; lower = tried first. Defaults to
+                     DEFAULT_PROVIDER_PRIORITY (sorts after all built-ins).
+      capabilities - ProviderCapabilities describing what the provider can do
+                     (training/generation/uncensored/...). Defaults to an
+                     all-False ProviderCapabilities().
+
+    These are deliberately **not** declared as members of this
+    ``@runtime_checkable`` Protocol. Data members on a runtime-checkable
+    Protocol become *required* for ``isinstance()`` structural checks, which
+    would break existing built-in adapters that don't set them. Because the
+    factory reads them via ``getattr(obj, "priority"/"capabilities", default)``,
+    they remain fully optional and backward compatible without polluting the
+    structural contract.
     """
 
     @property
