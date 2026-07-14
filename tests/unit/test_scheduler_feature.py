@@ -18,7 +18,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
 # =========================================================================
@@ -936,6 +939,103 @@ class TestSchedulerRunner:
         assert insert_params[3] == "failed"
 
     @pytest.mark.asyncio
+    async def test_tick_records_blocked_reason_and_pauses_schedule(self):
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            ("restart-task", "test-agent", "restart_coordinator", "* * * * *", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00"),
+        ])
+        executor = AsyncMock(
+            return_value=ScheduledTaskOutcome.blocked(
+                task_name="restart_coordinator",
+                decision="ask",
+                reason="headless scheduler cannot approve this operation",
+            )
+        )
+        runner = SchedulerRunner(db, "test-agent", executor)
+
+        await runner._tick()
+
+        insert_call = db.execute.call_args_list[0]
+        insert_params = insert_call[0][1]
+        assert insert_params[3] == "blocked"
+        assert "headless scheduler" in insert_params[4]
+        assert "Schedule id: restart-task" in insert_params[4]
+        assert "resume the schedule" in insert_params[4]
+
+        pause_call = db.execute.call_args_list[1]
+        assert "SET enabled = 0" in pause_call[0][0]
+        assert pause_call[0][1][1] == "restart-task"
+        db.fetchone.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_blocked_schedule_is_durable_and_not_retried(self, tmp_path):
+        """#2430: pause and unblock guidance survive the current process."""
+        raw_db = SQLiteBackend(str(tmp_path / "scheduler.db"))
+        await raw_db.connect()
+        db = AsyncDatabase(raw_db)
+        executor = AsyncMock(
+            return_value=ScheduledTaskOutcome.blocked(
+                task_name="restart_coordinator",
+                decision="ask",
+                reason="operator approval required",
+            )
+        )
+        runner = SchedulerRunner(db, "test-agent", executor)
+
+        try:
+            await runner._ensure_tables()
+            due_at = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json,
+                     enabled, next_run_at, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    "restart-task",
+                    "test-agent",
+                    "restart_coordinator",
+                    "* * * * *",
+                    "{}",
+                    due_at,
+                    due_at,
+                ),
+            )
+
+            await runner._tick()
+
+            schedule = await db.fetchone(
+                "SELECT enabled, last_run_at FROM scheduled_tasks WHERE id = ?",
+                ("restart-task",),
+            )
+            assert schedule is not None
+            assert schedule[0] == 0
+            assert schedule[1] is not None
+
+            history = await db.fetchone(
+                """
+                SELECT status, result_text
+                FROM task_execution_log
+                WHERE task_id = ?
+                """,
+                ("restart-task",),
+            )
+            assert history is not None
+            assert history[0] == "blocked"
+            assert "operator approval required" in history[1]
+            assert "permission to Auto" in history[1]
+            assert "resume the schedule" in history[1]
+
+            # A later poll cannot redispatch the disabled schedule.
+            await runner._tick()
+            executor.assert_awaited_once()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_tick_updates_next_run(self):
         db = _make_mock_db()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1064,10 +1164,13 @@ class TestTaskExecutor:
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_scheduled_deny_hook_blocks_tick(self, feature):
+    @pytest.mark.parametrize("decision", ["deny", "ask"])
+    async def test_scheduled_permission_hook_returns_blocked_outcome(
+        self, feature, decision,
+    ):
         """F245: a PRE_TOOL_USE DENY on a scheduler tick must block the
-        tool — the tick executor raises so the runner records the fire as
-        failed, and the tool's execute() is never called."""
+        tool. #2430: DENY/ASK is an expected headless state, so return a
+        structured outcome instead of raising through the dispatcher."""
         from types import SimpleNamespace
 
         from kestrel_sdk.hooks.base import PermissionDecision
@@ -1083,7 +1186,7 @@ class TestTaskExecutor:
         hm = MagicMock()
         hm.execute_hooks = AsyncMock(
             return_value=SimpleNamespace(
-                permission_decision=PermissionDecision.DENY,
+                permission_decision=PermissionDecision(decision),
                 permission_reason="policy forbids it",
                 updated_input=None,
                 continue_execution=False,
@@ -1092,8 +1195,14 @@ class TestTaskExecutor:
         hm.execute_hooks_parallel = AsyncMock(return_value=None)
         feature.agent.hooks_manager = hm
 
-        with pytest.raises(PermissionError):
-            await feature._lookup_and_run_tool("dangerous_op", {})
+        result = await feature._lookup_and_run_tool("dangerous_op", {})
+
+        assert isinstance(result, ScheduledTaskOutcome)
+        assert result.status == "blocked"
+        assert result.pause_schedule is True
+        assert decision in result.result_text
+        assert "policy forbids it" in result.result_text
+        assert "permission to Auto" in result.result_text
         # The tool never ran — the gate blocked it before execute().
         mock_tool.execute.assert_not_awaited()
 
@@ -1214,6 +1323,25 @@ class TestTranslateSignalResult:
             "signal_dispatch",
         )
         assert result == "ran-it"
+
+    def test_ok_action_preserves_structured_blocked_outcome(self, feature):
+        from kestrel_sdk.signals import SignalMode, Status
+
+        blocked = ScheduledTaskOutcome.blocked(
+            task_name="restart_coordinator",
+            decision="ask",
+            reason="approval is unavailable in a headless tick",
+        )
+        result = feature._translate_signal_result(
+            self._make_result(
+                Status.OK,
+                mode=SignalMode.ACTION,
+                action_result=blocked,
+            ),
+            "restart_coordinator",
+        )
+
+        assert result is blocked
 
     def test_ok_artifact_dict_is_json_encoded(self, feature):
         """ARTIFACT tools commonly return Dicts. Preserve the legacy

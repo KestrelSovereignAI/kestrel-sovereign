@@ -1158,6 +1158,16 @@ async def deprecated_agent_prefix_compat(request: Request, call_next):
     return await call_next(request)
 
 
+# Registered after every other middleware so it is the outermost ASGI layer.
+# Application/auth code sees the original query string; the scope is redacted
+# only as ``http.response.start`` crosses back to Uvicorn's access logger.
+from kestrel_sovereign.security.access_log import (
+    SensitiveQueryStringRedactionMiddleware,
+)
+
+app.add_middleware(SensitiveQueryStringRedactionMiddleware)
+
+
 if SERVE_UI:
     @app.get("/", response_class=HTMLResponse)
     async def read_root(request: Request):

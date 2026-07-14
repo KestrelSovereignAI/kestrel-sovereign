@@ -12,6 +12,7 @@ is what actually invokes the registered handlers.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -29,6 +30,7 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.signals.sources.scheduler import (
     CRON_TASKS,
     build_cron_registrations,
@@ -304,6 +306,39 @@ async def test_handler_exception_becomes_failed_status(dispatcher_components):
     result = await dispatcher.dispatch_signal(signal)
     assert result.status == Status.FAILED
     assert "tool blew up" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_permission_block_is_expected_outcome_without_dispatcher_traceback(
+    dispatcher_components, caplog,
+):
+    """#2430: headless permission blocks must not enter ERROR exception flow."""
+    agent, registry, dispatcher, _ = dispatcher_components
+    blocked = ScheduledTaskOutcome.blocked(
+        task_name="restart_coordinator",
+        decision="ask",
+        reason="operator approval required",
+    )
+
+    async def lookup_blocked(name, args):
+        return blocked
+
+    for reg in build_cron_registrations(tool_lookup=lookup_blocked):
+        registry.register(reg)
+
+    signal = Signal(
+        source=cron_source_name("restart_coordinator"),
+        kind="run",
+        mode=SignalMode.ACTION,
+        payload={},
+        target_agent=agent.did,
+    )
+    with caplog.at_level(logging.ERROR, logger="kestrel_sovereign.signals.dispatcher"):
+        result = await dispatcher.dispatch_signal(signal)
+
+    assert result.status == Status.OK
+    assert result.action_result is blocked
+    assert not caplog.records
 
 
 @pytest.mark.asyncio

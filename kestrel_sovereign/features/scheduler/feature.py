@@ -62,6 +62,7 @@ from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.base import Feature, _serialize_tool_result, tool
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run, parse
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
@@ -431,7 +432,7 @@ class SchedulerFeature(Feature):
     @staticmethod
     def _translate_signal_result(result, task_name: str) -> Any:
         """Map a SignalResult into the runner's expected return shape
-        (str | (str, float) tuple | None).
+        (str | (str, float) tuple | ScheduledTaskOutcome | None).
 
         - OK                    → action_result if ACTION, artifact if ARTIFACT
         - FAILED, DROPPED_VALIDATION, DROPPED_CYCLE
@@ -453,6 +454,8 @@ class SchedulerFeature(Feature):
                 result.action_result if result.mode == SignalMode.ACTION
                 else result.artifact
             )
+            if isinstance(payload, ScheduledTaskOutcome):
+                return payload
             # Tools may return a string, a (text, signal) tuple, a Dict,
             # or None. The runner JSON-stringifies non-tuple values for
             # task_execution_log.result_text. Pass through as-is so the
@@ -500,10 +503,10 @@ class SchedulerFeature(Feature):
         ``agent_tool.execute(**args)`` directly, so ``SecurityHook``
         DENY/ASK policy and MODIFY redaction never fired — a DENY/ASK-
         gated tool executed unchecked on every tick. Now the security
-        gate applies on every tick: a DENY or ASK decision raises (so the
-        runner records the tick as ``status='failed'`` rather than
-        silently executing), and a MODIFY hook's redacted args are the
-        ones actually passed to the tool.
+        gate applies on every tick: a DENY or ASK decision becomes a
+        structured blocked outcome (so the runner records the reason and
+        pauses the schedule), and a MODIFY hook's redacted args are the ones
+        actually passed to the tool.
         """
         hooks_manager = getattr(self.agent, "hooks_manager", None)
         effective_args = args
@@ -533,17 +536,22 @@ class SchedulerFeature(Feature):
             if isinstance(updated, dict):
                 effective_args = updated
 
-            # DENY and ASK both block the scheduled run. Treat ASK as a
-            # FAILED run, not silent execution — the scheduler has no
-            # interactive approver, so a gated tool simply does not run on
-            # tick. Raise so the runner logs status='failed'.
+            # DENY and ASK both block the scheduled run. A scheduler tick has
+            # no interactive approver, so return a structured blocked outcome
+            # that the runner can persist and pause. Returning instead of
+            # raising also keeps this expected policy state out of the signal
+            # dispatcher's ERROR/traceback path (#2430).
             blocked = evaluate_blocking_decision(pre_output)
             if blocked is not None:
                 logger.warning(
                     "Scheduler: tool %r blocked (%s) on tick: %s",
                     agent_tool.name, blocked.decision.value, blocked.reason,
                 )
-                raise PermissionError(blocked.error)
+                return ScheduledTaskOutcome.blocked(
+                    task_name=agent_tool.name,
+                    decision=blocked.decision.value,
+                    reason=blocked.reason or blocked.error,
+                )
 
             result = await agent_tool.execute(**effective_args)
 
@@ -565,7 +573,7 @@ class SchedulerFeature(Feature):
         # No hooks manager (bare test host) — execute directly.
         return await agent_tool.execute(**effective_args)
 
-    async def _lookup_and_run_tool(self, task_name: str, args: dict) -> str:
+    async def _lookup_and_run_tool(self, task_name: str, args: dict) -> Any:
         """Tool-lookup body shared by every cron source handler that
         delegates to a feature tool. This is the existing executor's
         tool-search logic, lifted out so the source registrations can
@@ -583,6 +591,8 @@ class SchedulerFeature(Feature):
                     result = await self._run_tool_hook_gated(
                         type(feature).__name__, agent_tool, args,
                     )
+                    if isinstance(result, ScheduledTaskOutcome):
+                        return result
                     # Preserve the legacy JSON-encode contract for
                     # downstream consumers (task_execution_log.result_text,
                     # endpoints/agent.py history view).
@@ -597,6 +607,8 @@ class SchedulerFeature(Feature):
                 result = await self._run_tool_hook_gated(
                     type(self).__name__, agent_tool, args,
                 )
+                if isinstance(result, ScheduledTaskOutcome):
+                    return result
                 if isinstance(result, str):
                     return result
                 return json.dumps(_serialize_tool_result(result), default=str)
