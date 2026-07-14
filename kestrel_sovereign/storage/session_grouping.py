@@ -234,7 +234,13 @@ def coalesce_sessions_by_session_id(
         if session["last_message_at"] > existing["last_message_at"]:
             existing["last_message_at"] = session["last_message_at"]
         # The first occurrence is the oldest cluster, so its preview (the
-        # earliest user message) is already retained; nothing to do.
+        # earliest user message) is already retained — unless that cluster's
+        # only user row was a skipped operator-signal notice, leaving its
+        # preview None. In that case fall through to a later cluster's real
+        # preview so a resumed session never shows an empty title.
+        if existing["preview_content"] is None and session["preview_content"] is not None:
+            existing["preview_content"] = session["preview_content"]
+            existing["preview_metadata"] = session["preview_metadata"]
     return [merged[sid] for sid in order]
 
 

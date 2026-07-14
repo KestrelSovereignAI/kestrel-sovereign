@@ -196,6 +196,24 @@ def test_operator_signal_only_session_has_no_preview():
     assert sessions[0]["preview_content"] is None
 
 
+def test_coalesce_backfills_preview_when_first_cluster_is_operator_only():
+    # First cluster's only user row is a skipped operator notice (no real
+    # preview); the session resumes past the gap with a real user message.
+    # Coalescing must pull that real preview forward instead of surfacing an
+    # empty title (codex review follow-up).
+    msgs = [
+        _msg(1, "user", "<operator_notice>...</operator_notice>", minutes=0,
+             session_id="s-resumed", operator_signal=True),
+        _msg(2, "user", "real question", minutes=200, session_id="s-resumed"),
+    ]
+    grouped = group_messages_into_sessions(msgs)
+    assert len(grouped) == 2  # split by the gap
+    assert grouped[0]["preview_content"] is None
+    coalesced = coalesce_sessions_by_session_id(grouped)
+    assert len(coalesced) == 1
+    assert coalesced[0]["preview_content"] == "real question"
+
+
 def test_coalesce_leaves_distinct_sessions_untouched():
     msgs = [
         _msg(1, "user", "a", minutes=0, session_id="s1"),
