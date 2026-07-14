@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from kestrel_sovereign.features.scheduler.cron import next_run, CronParseError
+from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ class ExecutionRecord:
 
 
 # Type alias for the callback that actually runs a task
-TaskExecutor = Callable[[str, dict], Coroutine[Any, Any, str]]
+TaskExecutor = Callable[[str, dict], Coroutine[Any, Any, Any]]
 
 
 class SchedulerRunner:
@@ -325,13 +326,20 @@ class SchedulerRunner:
         status = "success"
         result_text: Optional[str] = None
         outcome_signal: Optional[float] = None
+        pause_schedule = False
 
         try:
             raw = await self._executor(task.task_name, task.args)
+            if isinstance(raw, ScheduledTaskOutcome):
+                status = raw.status
+                result_text = (
+                    f"{raw.result_text} Schedule id: {task.id}."
+                )
+                pause_schedule = raw.pause_schedule
             # Executors may return either a plain string or a (text, signal) tuple.
             # The signal must be numeric in [0.0, 1.0]; we clamp and drop non-
             # numeric values rather than propagating garbage to the DB.
-            if isinstance(raw, tuple) and len(raw) == 2:
+            elif isinstance(raw, tuple) and len(raw) == 2:
                 result_text = raw[0] if isinstance(raw[0], str) else (str(raw[0]) if raw[0] is not None else None)
                 signal_raw = raw[1]
                 if signal_raw is None:
@@ -369,6 +377,33 @@ class SchedulerRunner:
             )
         except Exception as e:
             logger.warning("Failed to record execution for task %s: %s", task.id, e)
+
+        if pause_schedule:
+            try:
+                await self._db.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET enabled = 0, last_run_at = ?
+                    WHERE id = ? AND enabled = 1
+                    """,
+                    (now_iso, task.id),
+                )
+                logger.warning(
+                    "Scheduled task %s (%s) paused after blocked permission "
+                    "decision; change the tool permission and resume it explicitly",
+                    task.id,
+                    task.task_name,
+                )
+                return
+            except Exception as e:
+                # Do not leave the row due right now if the pause write fails;
+                # fall through to the normal next-run re-anchoring path.
+                logger.warning(
+                    "Failed to pause blocked scheduled task %s: %s; "
+                    "re-anchoring to its next cron occurrence",
+                    task.id,
+                    e,
+                )
 
         # Re-read the task row in case cron or enabled changed mid-flight.
         # If the task was paused or deleted while running, we must not compute
