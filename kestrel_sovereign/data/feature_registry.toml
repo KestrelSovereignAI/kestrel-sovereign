@@ -5,7 +5,8 @@
 # Feature Store UI. Feature packages register Feature classes through
 # kestrel_sovereign.features; provider packages use provider-specific entry
 # points such as kestrel_sovereign.cloud_providers or
-# kestrel_sovereign.voice_providers.
+# kestrel_feature_voice_providers or
+# kestrel_sovereign.conversation_providers.
 #
 # Status levels (computed at runtime by feature_registry.py):
 #   available  - listed here but not installed / not bundled

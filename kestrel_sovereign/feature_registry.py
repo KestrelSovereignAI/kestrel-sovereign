@@ -29,6 +29,19 @@ logger = logging.getLogger(__name__)
 
 REGISTRY_PATH = Path(__file__).parent / "data" / "feature_registry.toml"
 
+# Every entry-point group that can back a registry-listed extension package.
+# Keep the legacy voice group for already-published providers, while treating
+# the feature-owned group as canonical for current TTS/STT packages.
+EXTENSION_ENTRY_POINT_GROUPS = (
+    FEATURE_ENTRY_POINT_GROUP,
+    "kestrel_sovereign.host_features",
+    "kestrel_sovereign.cloud_providers",
+    "kestrel_feature_voice_providers",
+    "kestrel_sovereign.voice_providers",
+    "kestrel_sovereign.conversation_providers",
+    "kestrel_sovereign.storage_providers",
+)
+
 
 class FeatureStatus(str, Enum):
     """Runtime status of a catalog entry."""
@@ -146,31 +159,45 @@ def load_registry(path: Optional[Path] = None) -> Dict[str, FeaturePackageInfo]:
     return registry
 
 
-def _get_installed_entrypoint_classes() -> Set[str]:
-    """Get the set of Feature class names available via installed entry_points."""
-    installed: Set[str] = set()
-    try:
-        eps = importlib.metadata.entry_points()
-    except Exception:
-        return installed
-
-    if hasattr(eps, "select"):
-        feature_eps = eps.select(group=FEATURE_ENTRY_POINT_GROUP)
-    else:
-        feature_eps = eps.get(FEATURE_ENTRY_POINT_GROUP, [])
-
-    for ep in feature_eps:
-        installed.add(ep.name)
-
-    return installed
-
-
 def _entrypoint_class_name(ep_value: str, ep_name: str) -> str:
+    """Return the implementation class advertised by an entry point."""
     if ep_value and ":" in ep_value:
         attr = ep_value.split(":", 1)[1].strip()
         if attr:
             return attr.split(".")[-1]
     return ep_name
+
+
+def iter_extension_entry_points():
+    """Yield ``(group, entry_point)`` for every installed Kestrel extension.
+
+    This metadata-only iterator is the shared source of truth for registry
+    status and CLI upgrade/capture discovery. It intentionally does not import
+    extension modules.
+    """
+    try:
+        eps = importlib.metadata.entry_points()
+    except Exception:  # noqa: BLE001
+        return
+
+    for group in EXTENSION_ENTRY_POINT_GROUPS:
+        if hasattr(eps, "select"):
+            group_eps = eps.select(group=group)
+        else:
+            group_eps = eps.get(group, [])
+        for ep in group_eps:
+            yield group, ep
+
+
+def _get_installed_entrypoint_classes() -> Set[str]:
+    """Get implementation classes exposed by installed extension packages."""
+    installed: Set[str] = set()
+    for _group, ep in iter_extension_entry_points():
+        installed.add(
+            _entrypoint_class_name(getattr(ep, "value", "") or "", ep.name)
+        )
+
+    return installed
 
 
 def _read_distribution_pyproject(dist) -> Dict[str, Any]:

@@ -187,8 +187,11 @@ state into the kernel.
 The current extension groups are:
 
 - `kestrel_sovereign.features` for feature packages
+- `kestrel_sovereign.host_features` for host-scoped feature packages
 - `kestrel_sovereign.cloud_providers` for cloud provider packages
-- `kestrel_sovereign.voice_providers` for voice provider packages
+- `kestrel_feature_voice_providers` for TTS/STT provider packages
+- `kestrel_sovereign.voice_providers` for legacy TTS/STT provider packages
+- `kestrel_sovereign.conversation_providers` for realtime voice providers
 - `kestrel_sovereign.storage_providers` for storage provider packages
 
 Feature packages should register a `Feature` subclass. Provider packages should

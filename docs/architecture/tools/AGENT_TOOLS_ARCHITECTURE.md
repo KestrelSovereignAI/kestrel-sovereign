@@ -108,12 +108,22 @@ for an owning registry instead of exposing a whole feature:
 [project.entry-points."kestrel_sovereign.cloud_providers"]
 my_cloud = "my_cloud_package.provider:MyCloudProvider"
 
-[project.entry-points."kestrel_sovereign.voice_providers"]
+[project.entry-points."kestrel_sovereign.host_features"]
+my_host_feature = "my_host_package.feature:MyHostFeature"
+
+[project.entry-points."kestrel_feature_voice_providers"]
 my_voice = "my_voice_package.provider:MyVoiceProvider"
+
+[project.entry-points."kestrel_sovereign.conversation_providers"]
+my_realtime_voice = "my_voice_package.realtime:MyConversationProvider"
 
 [project.entry-points."kestrel_sovereign.storage_providers"]
 my_storage = "my_storage_package.provider:MyStorageProvider"
 ```
+
+The legacy `kestrel_sovereign.voice_providers` group remains discoverable for
+older TTS/STT packages, but new packages should use the feature-owned canonical
+group above.
 
 ## Feature Dispatcher vs Direct Tools
 

@@ -89,6 +89,43 @@ def test_editable_install_path_reads_direct_url(monkeypatch):
     assert climod._editable_install_path("pkg") is None
 
 
+def test_installed_distribution_discovery_includes_all_xai_voice_roles(monkeypatch):
+    """Canonical speech and conversation groups collapse to one distribution."""
+    import importlib.metadata as md
+    import kestrel_sovereign.feature_registry as feature_registry
+
+    dist = types.SimpleNamespace(name="kestrel-voice-xai")
+    entries = [
+        (
+            "kestrel_feature_voice_providers",
+            types.SimpleNamespace(name="XAITTSProvider", dist=dist),
+        ),
+        (
+            "kestrel_sovereign.conversation_providers",
+            types.SimpleNamespace(name="XAIRealtime", dist=dist),
+        ),
+    ]
+    monkeypatch.setattr(
+        feature_registry,
+        "iter_extension_entry_points",
+        lambda: iter(entries),
+    )
+    monkeypatch.setattr(md, "version", lambda _name: "0.1.1")
+    monkeypatch.setattr(cli, "_editable_install_path", lambda _name: None)
+
+    assert cli._installed_extension_distributions() == [
+        {
+            "dist": "kestrel-voice-xai",
+            "version": "0.1.1",
+            "editable_path": None,
+            "entries": [
+                "kestrel_feature_voice_providers:XAITTSProvider",
+                "conversation_providers:XAIRealtime",
+            ],
+        },
+    ]
+
+
 def test_upgrade_dry_run_changes_nothing(monkeypatch, fake_registry, capsys):
     monkeypatch.setattr(
         cli,
@@ -245,26 +282,25 @@ def test_host_feature_entry_point_group_is_captured(monkeypatch):
     `feature sync --capture` records them and `feature sync` restores them after
     `uv sync` prunes the out-of-tree package."""
     from kestrel_sovereign import cli_features
+    from kestrel_sovereign import feature_registry
     from kestrel_sovereign.host_features.discovery import (
         HOST_FEATURE_ENTRY_POINT_GROUP,
     )
 
     assert (
         HOST_FEATURE_ENTRY_POINT_GROUP
-        in cli_features._EXTENSION_ENTRY_POINT_GROUPS
+        in feature_registry.EXTENSION_ENTRY_POINT_GROUPS
     )
-
-    import importlib.metadata as md
 
     fake_dist = types.SimpleNamespace(name="kestrel-feature-observability-fleet")
     fake_ep = types.SimpleNamespace(name="fleet", dist=fake_dist)
+    monkeypatch.setattr(
+        feature_registry,
+        "iter_extension_entry_points",
+        lambda: iter([(HOST_FEATURE_ENTRY_POINT_GROUP, fake_ep)]),
+    )
+    import importlib.metadata as md
 
-    def fake_entry_points(group=None):
-        if group == HOST_FEATURE_ENTRY_POINT_GROUP:
-            return [fake_ep]
-        return []
-
-    monkeypatch.setattr(md, "entry_points", fake_entry_points)
     monkeypatch.setattr(md, "version", lambda name: "0.4.0")
     monkeypatch.setattr(cli, "_editable_install_path", lambda name: None)
 

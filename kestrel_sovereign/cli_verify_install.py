@@ -410,7 +410,7 @@ def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
     ``kestrel-voice-deepgram``, ``kestrel-voice-openai``,
     ``kestrel-voice-xai``) under
     ``core = false``, but those register under a different entry-point
-    group (``kestrel_sovereign.voice_providers``) and implement
+    group (``kestrel_feature_voice_providers``) and implement
     provider interfaces, not ``kestrel_sdk.features.base.Feature``.
     Running Tests 4 and 5 against them would fail spuriously
     (Feature-subclass and ``kestrel_sovereign.features`` entry-point
