@@ -215,6 +215,7 @@ def cmd_feature_install(args) -> int:
 # upgrade with, kestrel-sovereign itself).
 _EXTENSION_ENTRY_POINT_GROUPS = (
     "kestrel_sovereign.features",
+    "kestrel_sovereign.host_features",
     "kestrel_sovereign.cloud_providers",
     "kestrel_sovereign.voice_providers",
     "kestrel_sovereign.storage_providers",

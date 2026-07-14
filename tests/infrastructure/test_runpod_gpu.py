@@ -29,12 +29,18 @@ The script will:
 
 import os
 import time
-import requests
 import logging
 import pytest
-from dotenv import load_dotenv
 
+# Optional third-party dependencies for this cloud-only test. Guard each with
+# importorskip so collection degrades to a skip instead of an ImportError when
+# the infra extras aren't installed (e.g. a lean unit-test venv without
+# `requests`/`runpod`/`python-dotenv`).
+requests = pytest.importorskip("requests", reason="requests package not installed")
 runpod = pytest.importorskip("runpod", reason="runpod package not installed")
+load_dotenv = pytest.importorskip(
+    "dotenv", reason="python-dotenv package not installed"
+).load_dotenv
 
 # This is a cloud infrastructure test — skip when not explicitly requested
 pytestmark = pytest.mark.skipif(
