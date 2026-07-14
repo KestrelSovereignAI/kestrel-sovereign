@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-13
-**Scope:** 2008 tracked files (1310 `.py`, 328 `.md`, 370 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-14
+**Scope:** 2011 tracked files (1311 `.py`, 328 `.md`, 372 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -751,7 +751,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/route_credentials.py** — Single source of truth for which env vars satisfy an LLM route.
   - `def accepted_credential_envs(route_id, route)`
 - **kestrel_sovereign/llm/service.py** — LLM Service - Unified LLM provider management with remote GPU support.
-  - `class AuditResult`; `def resolve_active_model_selection(llm_service)`; `class LLMServiceError`; `class PolicyDeniedError`; `class LLMServiceAlreadyAttachedError`; `class ModelNotAvailableForRoute`; `class LLMService`
+  - `class EmbeddingSpaceConflictError`; `class AuditResult`; `def resolve_active_model_selection(llm_service)`; `class LLMServiceError`; `class PolicyDeniedError`; `class LLMServiceAlreadyAttachedError`; `class ModelNotAvailableForRoute`; `class LLMService`
 - **kestrel_sovereign/llm/streaming.py** — Streaming response logic for LLM Service.
   - `class RoutingMeta`; `class RoutingResolution`; `class LLMStreamingError`; `class StreamingMixin`
 - **kestrel_sovereign/llm/usage_tracking.py** — Usage tracking and model management for LLM Service.
@@ -986,6 +986,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/ipfs.js** — (js asset)
 - **kestrel_sovereign/static/js/kebab_menu.js** — (js asset)
 - **kestrel_sovereign/static/js/memories.js** — (js asset)
+- **kestrel_sovereign/static/js/message_kebab.js** — (js asset)
 - **kestrel_sovereign/static/js/metrics.js** — (js asset)
 - **kestrel_sovereign/static/js/new_agent_dialog.js** — (js asset)
 - **kestrel_sovereign/static/js/panels.js** — (js asset)
@@ -1118,7 +1119,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/sqla/base.py** — Declarative base for sovereign-core SQLAlchemy entities.
   - `class SovereignBase`
 - **kestrel_sovereign/storage/sqla/conversation_message.py** — SQLAlchemy mapping of the ``conversation_history`` table.
-  - `def resolve_embedding_dim(env)`; `class ConversationMessage`; `def build_conversation_message_spec(dimension)`
+  - `def resolve_embedding_dim(env)`; `class ConversationMessage`; `def configure_embedding_dim_from_service(llm_service)`; `def build_conversation_message_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/document_chunk.py** — SQLAlchemy mapping of the ``document_chunks`` table.
   - `class DocumentChunk`; `def build_document_chunk_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/embedding_profile.py** — SQLAlchemy mapping for the ``embedding_profiles`` registry (#1477).
@@ -1798,6 +1799,7 @@ Repo entry points and standard project files.
 - **tests/frontend/markdown_sanitize.test.mjs** — (mjs asset)
 - **tests/frontend/markdown_streaming_autoclose.test.mjs** — (mjs asset)
 - **tests/frontend/mermaid_cache.test.mjs** — (mjs asset)
+- **tests/frontend/message_kebab.test.mjs** — (mjs asset)
 - **tests/frontend/model_footer.test.mjs** — (mjs asset)
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
 - **tests/frontend/model_settings.test.mjs** — (mjs asset)
@@ -2446,9 +2448,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_embedding_reindex.py** — Unit tests for ``kestrel embeddings reindex`` (#2289).
   - `class FakeEmbeddingService`; `async def db()`; `async def test_dominant_embedding_profile_picks_majority(db)`; `async def test_dominant_embedding_profile_agent_scoped(db)`; `async def test_dominant_embedding_profile_none_when_empty(db)`; `async def test_dominant_embedding_profile_none_without_registry_row(db)`; `async def test_reindex_stamps_all_rows_to_target(db)`; `async def test_reindex_is_idempotent(db)`; `…`
 - **tests/unit/test_embedding_reindex_endpoint.py** — Unit tests for the UI reindex endpoint ``POST /api/embedding/reindex`` (#2336).
-  - `class DeadEmbeddingService`; `async def seeded_db()`; `async def test_reindex_dry_run_reports_counts_and_touches_nothing(seeded_db)`; `async def test_reindex_execute_round_trip_reembeds_all(seeded_db)`; `async def test_reindex_dead_service_is_error_not_false_success(seeded_db)`; `async def test_reindex_execute_empty_corpus_reports_done_inline(seeded_db)`; `async def test_reindex_pinned_dim_forwarded_rows_flip_profile(seeded_db)`; `async def test_reindex_without_dim_forwarding_would_dim_mismatch(seeded_db)`; `…`
+  - `class DeadEmbeddingService`; `async def seeded_db()`; `async def test_reindex_dry_run_reports_counts_and_touches_nothing(seeded_db)`; `async def test_reindex_execute_round_trip_reembeds_all(seeded_db)`; `async def test_reindex_dead_service_is_error_not_false_success(seeded_db)`; `def test_finalize_all_skipped_empty_is_done_not_error()`; `def test_finalize_mixed_reembed_and_skipped_empty_is_done()`; `def test_finalize_zero_reembed_with_unexplained_shortfall_is_error()`; `…`
 - **tests/unit/test_embedding_route_model.py** — Per-route embedding_model set/clear at runtime (#2337).
-  - `def test_set_then_clear_round_trip()`; `def test_set_invalidates_discovery_cache()`; `def test_set_re_advertises_embedding_capability()`; `def test_clear_restores_pre_override_capabilities()`; `def test_clear_removes_capability_added_by_override()`; `def test_unknown_route_is_rejected()`; `async def test_probe_on_save_rejects_dead_cloud_slug(monkeypatch)`; `async def test_probe_on_save_rejects_empty_vector(monkeypatch)`; `…`
+  - `def test_set_then_clear_round_trip()`; `def test_set_invalidates_discovery_cache()`; `def test_set_re_advertises_embedding_capability()`; `def test_clear_restores_pre_override_capabilities()`; `def test_clear_removes_capability_added_by_override()`; `def test_unknown_route_is_rejected()`; `async def test_probe_on_save_rejects_dead_cloud_slug(monkeypatch)`; `async def test_probe_on_save_classifies_auth_failure(monkeypatch)`; `…`
 - **tests/unit/test_embedding_service_missing_model.py** — Soften the first-run UX when Ollama hasn't pulled the embedding model yet — #657.
   - `class TestModelNotFoundIsWarningNotError`; `def test_cosine_similarity_returns_zero_for_dimension_mismatch()`
 - **tests/unit/test_embedding_space.py** — Shared local/cloud embedding space (#2290).
@@ -2679,6 +2681,8 @@ Repo entry points and standard project files.
   - `def test_pqcrypto_installed_and_importable()`; `def test_mldsa65_suite_self_registers()`; `def test_mldsa65_classified_as_post_quantum()`; `def test_mldsa65_listed_in_registry()`; `def test_class_size_constants_match_nist_fips_204_cat_3()`; `def suite()`; `def keypair(suite)`; `def test_keypair_carries_correct_suite_id(keypair)`; `…`
 - **tests/unit/test_model_catalog.py** — Unit tests for ModelCatalogService in model_catalog.py
   - `class TestModelCatalogServiceInit`; `class TestModelCatalogServiceLoad`; `class TestModelCatalogServiceEnrich`; `class TestModelCatalogServiceHelpers`; `class TestCatalogServiceSingleton`; `class TestCatalogWithRealConfig`; `class TestContextLimits`; `class TestTokenCounterCatalogIntegration`; `…`
+- **tests/unit/test_model_discovery_stale_while_revalidate.py** — Latency contract for stale-while-revalidate model catalog reads.
+  - `async def test_stale_catalog_returns_without_awaiting_provider_refresh(monkeypatch)`; `async def test_fresh_caller_joins_inflight_background_refresh(monkeypatch)`
 - **tests/unit/test_model_metadata.py** — Unit tests for ModelInfo and ModelCategory in model_metadata.py
   - `class TestModelCategory`; `class TestModelInfo`; `class TestModelInfoRoundTrip`
 - **tests/unit/test_model_preference_solvency.py** — —
