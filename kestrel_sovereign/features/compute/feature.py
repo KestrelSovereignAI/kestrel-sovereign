@@ -10,7 +10,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 from kestrel_sdk.hooks.base import Hook
@@ -27,7 +27,12 @@ from .models import (
     ComputeScript,
     ExecutionRecord,
     ScriptState,
-    calculate_risk_score,
+    calculate_risk_score as calculate_risk_score,  # compatibility re-export
+)
+from .presenters import (
+    present_execution_history,
+    present_script_detail,
+    present_script_list,
 )
 from .script_store import ScriptStore
 from .script_signer import ScriptSigner
@@ -748,47 +753,7 @@ class ComputeFeature(Feature):
         else:
             scripts = await self.script_store.list_recent(limit)
 
-        if not scripts:
-            return ToolResult.ok(
-                confirmation="No scripts found.",
-                data={"scripts": [], "count": 0},
-            )
-
-        lines = ["📜 Scripts:\n"]
-        for s in scripts:
-            status_icon = {
-                ScriptState.DRAFT: "📝",
-                ScriptState.SIGNED: "✍️",
-                ScriptState.PENDING_REVIEW: "⏳",
-                ScriptState.APPROVED: "✅",
-                ScriptState.REJECTED: "⛔",
-                ScriptState.QUEUED: "📋",
-                ScriptState.RUNNING: "⚡",
-                ScriptState.COMPLETED: "✅",
-                ScriptState.FAILED: "❌",
-            }.get(s.state, "❓")
-
-            lines.append(
-                f"  {status_icon} {s.id[:8]} | {s.name[:20]:<20} | {s.language:<6} | "
-                f"{s.state.value:<14} | risk:{s.risk_score:>3}"
-            )
-
-        return ToolResult.ok(
-            confirmation="\n".join(lines),
-            data={
-                "count": len(scripts),
-                "scripts": [
-                    {
-                        "id": s.id,
-                        "name": s.name,
-                        "language": s.language,
-                        "state": s.state.value,
-                        "risk_score": s.risk_score,
-                    }
-                    for s in scripts
-                ],
-            },
-        )
+        return present_script_list(scripts)
     
     @tool(
         name="show_script",
@@ -810,56 +775,7 @@ class ComputeFeature(Feature):
                 data={"script_id": script_id},
             )
         
-        lines = [
-            f"📜 Script: {script.name}",
-            f"   ID: {script.id}",
-            f"   Language: {script.language}",
-            f"   State: {script.state.value}",
-            f"   Purpose: {script.purpose}",
-            f"   Risk Score: {script.risk_score}/100",
-            f"   Created: {script.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
-        ]
-        
-        if script.signed_by:
-            lines.append(f"   Signed by: {script.signed_by[:32]}...")
-        
-        if script.requirements:
-            lines.append(f"   Requirements: {', '.join(script.requirements)}")
-        
-        if script.review_notes:
-            lines.append(f"   Review Notes: {script.review_notes}")
-        
-        # Security findings
-        if script.security_findings:
-            lines.append("\n🔒 Security Findings:")
-            for f in script.security_findings[:5]:  # Limit to 5
-                icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢", "info": "ℹ️"}.get(f.severity, "❓")
-                lines.append(f"   {icon} [{f.severity.upper()}] {f.description}")
-                if f.line_number:
-                    lines.append(f"      Line {f.line_number}: {f.pattern_matched[:50]}")
-        
-        # Content preview
-        lines.append("\n📝 Content:")
-        content_lines = script.content.split('\n')
-        for i, line in enumerate(content_lines[:20], 1):
-            lines.append(f"   {i:3}| {line}")
-        if len(content_lines) > 20:
-            lines.append(f"   ... ({len(content_lines) - 20} more lines)")
-
-        return ToolResult.ok(
-            confirmation="\n".join(lines),
-            data={
-                "script_id": script.id,
-                "name": script.name,
-                "language": script.language,
-                "state": script.state.value,
-                "risk_score": script.risk_score,
-                "purpose": script.purpose,
-                "requirements": script.requirements,
-                "review_notes": script.review_notes,
-                "findings_count": len(script.security_findings or []),
-            },
-        )
+        return present_script_detail(script)
     
     @tool(
         name="execution_history",
@@ -890,38 +806,7 @@ class ComputeFeature(Feature):
         else:
             executions = await self.script_store.list_recent_executions(limit)
 
-        if not executions:
-            return ToolResult.ok(
-                confirmation="No executions found.",
-                data={"executions": [], "count": 0},
-            )
-
-        lines = ["📊 Execution History:\n"]
-        for e in executions:
-            status = "✅" if e.succeeded else "❌"
-            duration = f"{e.duration_seconds:.2f}s" if e.duration_seconds else "N/A"
-            lines.append(
-                f"  {status} {e.id[:8]} | script:{e.script_id[:8]} | "
-                f"exit:{e.exit_code} | {duration} | {e.executor}"
-            )
-
-        return ToolResult.ok(
-            confirmation="\n".join(lines),
-            data={
-                "count": len(executions),
-                "executions": [
-                    {
-                        "id": e.id,
-                        "script_id": e.script_id,
-                        "exit_code": e.exit_code,
-                        "duration_seconds": e.duration_seconds,
-                        "executor": e.executor,
-                        "succeeded": e.succeeded,
-                    }
-                    for e in executions
-                ],
-            },
-        )
+        return present_execution_history(executions)
     
     # =========================================================================
     # Trash Management Tools
