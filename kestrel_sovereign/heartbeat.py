@@ -16,16 +16,15 @@ Configuration via [heartbeat] section in kestrel.toml:
 """
 
 import asyncio
-import json
 import logging
-import re
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from kestrel_sovereign.config import load_section, parse_duration
+from kestrel_sovereign.heartbeat_response import classify_heartbeat_response
 
 _UTC = timezone.utc
 
@@ -33,14 +32,6 @@ if TYPE_CHECKING:
     from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 logger = logging.getLogger(__name__)
-
-# Default heartbeat prompt sent as user input on each tick.
-HEARTBEAT_PROMPT = (
-    "[HEARTBEAT] Read HEARTBEAT.md if it exists. Follow it strictly. "
-    "Do not infer or repeat old tasks from prior chats. "
-    "If nothing needs attention, reply exactly: HEARTBEAT_OK\n"
-    "Current time: {timestamp}"
-)
 
 # Default HEARTBEAT.md template created when heartbeat is enabled but file doesn't exist.
 DEFAULT_HEARTBEAT_TEMPLATE = """\
@@ -56,13 +47,6 @@ Review these items on each heartbeat. If nothing needs attention, reply HEARTBEA
 # Maximum heartbeat results to keep in history.
 MAX_HISTORY = 50
 
-# Regex for detecting HEARTBEAT_OK token (with optional markdown/HTML wrappers).
-_OK_PATTERN = re.compile(
-    r'(?:<b>)?(?:\*\*)?HEARTBEAT_OK(?:\*\*)?(?:</b>)?[!.]*',
-    re.IGNORECASE,
-)
-
-
 @dataclass
 class HeartbeatConfig:
     """Configuration for the heartbeat system."""
@@ -73,7 +57,10 @@ class HeartbeatConfig:
     timezone: str = "UTC"
     heartbeat_file: str = "HEARTBEAT.md"
     target: str = "log"       # "log", "last_session", "none"
-    suppress_ok: bool = True  # Suppress routine HEARTBEAT_OK results
+    # Compatibility no-op: exact all-clears are always suppressed by the
+    # canonical classifier. Retain the shipped constructor/config surface
+    # until an explicit deprecation cycle removes it.
+    suppress_ok: bool = True
 
     @classmethod
     def from_config(cls) -> "HeartbeatConfig":
@@ -292,7 +279,6 @@ class HeartbeatRunner:
         from kestrel_sdk.signals import (
             Signal,
             SignalMode,
-            Status,
             Urgency,
             Visibility,
         )
@@ -355,8 +341,11 @@ class HeartbeatRunner:
         status = sig_result.status
 
         if status == Status.OK:
-            response_text = sig_result.artifact or ""
-            return self._normalize_response(response_text, timestamp, duration_ms)
+            return self._normalize_response(
+                sig_result.artifact,
+                timestamp,
+                duration_ms,
+            )
 
         if status == Status.FAILED:
             return HeartbeatResult(
@@ -377,76 +366,23 @@ class HeartbeatRunner:
         )
 
     def _normalize_response(
-        self, text: str, timestamp: str, duration_ms: int
+        self, result_body: Any, timestamp: str, duration_ms: int
     ) -> HeartbeatResult:
-        """Detect HEARTBEAT_OK token and classify result."""
-        if not text:
+        """Translate the canonical response classification into history state."""
+        classification = classify_heartbeat_response(result_body)
+        if classification.is_all_clear:
             return HeartbeatResult(
                 status="ok",
                 timestamp=timestamp,
                 duration_ms=duration_ms,
             )
 
-        # Strip HEARTBEAT_OK token
-        stripped = _OK_PATTERN.sub("", text).strip()
-
-        if not stripped:
-            # Response was just HEARTBEAT_OK (possibly with formatting)
-            return HeartbeatResult(
-                status="ok",
-                timestamp=timestamp,
-                duration_ms=duration_ms,
-            )
-
-        # Check if response contains HEARTBEAT_OK alongside other text
-        if _OK_PATTERN.search(text):
-            # OK token present but with additional content — treat as alert
-            # (agent said OK but also had something to report)
-            return HeartbeatResult(
-                status="ok",
-                message=stripped if len(stripped) > 10 else None,
-                timestamp=timestamp,
-                duration_ms=duration_ms,
-            )
-
-        # No OK token — this is an alert
         return HeartbeatResult(
             status="alert",
-            message=text,
+            message=classification.alert_text,
             timestamp=timestamp,
             duration_ms=duration_ms,
         )
-
-    def _is_within_active_hours(self) -> bool:
-        """Check if the current time is within configured active hours."""
-        if not self.config.active_hours_start or not self.config.active_hours_end:
-            return True  # No active hours configured = always active
-
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            # Python < 3.9 fallback
-            try:
-                from backports.zoneinfo import ZoneInfo
-            except ImportError:
-                logger.warning("zoneinfo not available, skipping active hours check")
-                return True
-
-        try:
-            tz = ZoneInfo(self.config.timezone)
-            now = datetime.now(tz)
-            current_time = now.strftime("%H:%M")
-            start = self.config.active_hours_start
-            end = self.config.active_hours_end
-
-            if start <= end:
-                return start <= current_time <= end
-            else:
-                # Overnight range (e.g., 22:00 - 06:00)
-                return current_time >= start or current_time <= end
-        except Exception as e:
-            logger.warning(f"Active hours check failed: {e}")
-            return True  # Fail open
 
     def _load_heartbeat_file(self) -> Optional[str]:
         """Read HEARTBEAT.md from the agent data directory."""
