@@ -179,9 +179,28 @@ async def test_with_retry_rides_out_throttle_then_succeeds():
 
 
 @pytest.mark.asyncio
+async def test_with_retry_propagates_non_retryable_exception_unchanged():
+    error = RuntimeError("permanent failure")
+    calls = 0
+
+    async def fail():
+        nonlocal calls
+        calls += 1
+        raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        await with_retry(fail)
+
+    assert raised.value is error
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_with_retry_caps_advised_delay_at_max():
+    error = _FakeRateLimit("429", status_code=429, headers={"retry-after": "9999"})
+
     async def throttled():
-        raise _FakeRateLimit("429", status_code=429, headers={"retry-after": "9999"})
+        raise error
 
     slept = []
 
@@ -189,10 +208,11 @@ async def test_with_retry_caps_advised_delay_at_max():
         slept.append(d)
 
     with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
-        with pytest.raises(_FakeRateLimit):
+        with pytest.raises(_FakeRateLimit) as raised:
             # A throttle is bounded by throttle_max_retries, not max_retries.
             await with_retry(throttled, throttle_max_retries=2)
 
+    assert raised.value is error
     assert slept and all(d <= 120.0 for d in slept)
 
 
