@@ -8,17 +8,18 @@ Tests verify:
 - Safe scripts can execute after approval
 """
 
-import asyncio
 import os
 import tempfile
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 # Import components
-from kestrel_sovereign.features.compute import ComputeFeature, ComputeScript, ScriptState
-from kestrel_sovereign.features.security import SecurityFeature, ApprovalQueue, ApprovalStatus
+from kestrel_sovereign.features.compute import (
+    ComputeFeature,
+    ScriptState,
+    TrashManager,
+)
+from kestrel_sovereign.features.security import ApprovalQueue, SecurityFeature
 from kestrel_sovereign.hooks import HooksManager
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 
@@ -191,7 +192,9 @@ class TestScriptLifecycle:
         or misregisters the security-hook chain would otherwise execute a
         forgeable legacy 'hmac:' tag.
         """
-        import base64, hashlib, hmac as hmac_mod
+        import base64
+        import hashlib
+        import hmac as hmac_mod
 
         # Write a script normally — gets a real ecdsa: signature
         await compute_feature.write_script(
@@ -460,6 +463,28 @@ class TestTrashIntegration:
         result = await compute_feature.list_trash()
         body = result.confirmation
         assert "Trash" in body or "empty" in body.lower()
+
+    @pytest.mark.asyncio
+    async def test_restore_tool_rejects_outside_source(
+        self,
+        compute_feature,
+        tmp_path,
+    ):
+        """The public tool must preserve TrashManager's source boundary."""
+        trash_dir = tmp_path / "trash"
+        trash_dir.mkdir()
+        compute_feature.trash_manager = TrashManager(trash_dir)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("host data")
+
+        result = await compute_feature.restore_from_trash(
+            str(outside),
+            str(tmp_path / "destination.txt"),
+        )
+
+        assert result.status == "error"
+        assert "outside trash directory" in (result.error or "")
+        assert outside.read_text() == "host data"
 
 
 class TestToolEnumSelfDocumentation:

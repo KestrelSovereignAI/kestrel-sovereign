@@ -5,14 +5,13 @@ Execute scripts in isolated Docker containers for maximum security.
 """
 
 import asyncio
-import json
 import logging
 import shutil
 import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
@@ -28,6 +27,8 @@ DEFAULT_IMAGES = {
     "bash": "alpine:3.19",
     "python": "python:3.11-slim",
 }
+
+_CONTAINER_TRASH_DIR = "/kestrel-trash"
 
 
 class DockerExecutor(BaseExecutor):
@@ -156,11 +157,15 @@ class DockerExecutor(BaseExecutor):
         tmpdir = tempfile.mkdtemp(prefix="kestrel_compute_docker_")
         
         try:
+            host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
+            host_trash_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
             # Rewrite script for safe deletion
             safe_content = self._policy.rewrite_script(
                 script.content,
                 script.language,
-                "/workspace",  # Container workdir
+                "/workspace" if working_dir else "/scripts",
+                runtime_trash_dir=_CONTAINER_TRASH_DIR,
             )
             
             # Write script file
@@ -190,6 +195,11 @@ class DockerExecutor(BaseExecutor):
             
             # Mount script directory
             cmd.extend(["-v", f"{tmpdir}:/scripts:ro"])
+
+            # Safe deletions must survive the container.  The rewriter uses the
+            # container path while this dedicated bind mount anchors it to the
+            # host's configured Kestrel trash directory.
+            cmd.extend(["-v", f"{host_trash_dir}:{_CONTAINER_TRASH_DIR}:rw"])
             
             # Mount working directory if provided
             if working_dir:
@@ -205,6 +215,12 @@ class DockerExecutor(BaseExecutor):
                     dst = mount.get("dst")
                     ro = mount.get("ro", True)
                     if src and dst:
+                        if dst == _CONTAINER_TRASH_DIR or dst.startswith(
+                            f"{_CONTAINER_TRASH_DIR}/"
+                        ):
+                            raise ExecutionError(
+                                f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
+                            )
                         ro_flag = ":ro" if ro else ""
                         cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
             

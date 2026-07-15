@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,6 @@ from uuid import uuid4
 
 from .base import (
     BaseExecutor,
-    ExecutionError,
     ExecutionEnvironmentError,
     ExecutionTimeoutError,
     _SAFE_ENV_VARS,
@@ -108,13 +108,13 @@ class LocalExecutor(BaseExecutor):
             safe_content = self._policy.rewrite_script(
                 script.content,
                 script.language,
-                tmpdir,
+                working_dir or tmpdir,
             )
             
             # Write script file
             if script.language == "python":
                 script_path = Path(tmpdir) / "script.py"
-                cmd = ["python", str(script_path)]
+                cmd = [sys.executable, str(script_path)]
             else:
                 script_path = Path(tmpdir) / "script.sh"
                 cmd = ["bash", str(script_path)]

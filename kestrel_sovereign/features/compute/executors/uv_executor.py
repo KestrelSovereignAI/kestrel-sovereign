@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -134,7 +135,7 @@ class UvExecutor(BaseExecutor):
             safe_content = self._policy.rewrite_script(
                 script.content,
                 "python",
-                tmpdir,
+                working_dir or tmpdir,
             )
             
             # Write script file

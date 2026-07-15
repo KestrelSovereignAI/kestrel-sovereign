@@ -11,27 +11,23 @@ Tests cover:
 - Executors
 """
 
-import asyncio
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timedelta
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 # Import compute feature components
 from kestrel_sovereign.features.compute.models import (
-    ComputePolicy,
     ComputeScript,
     ExecutionRecord,
     ScriptState,
     SecurityFinding,
-    SuggestedFix,
-    DenialResponse,
     calculate_risk_score,
 )
 from kestrel_sovereign.features.compute.script_store import ScriptStore
@@ -43,15 +39,13 @@ from kestrel_sovereign.features.compute.script_analyzer import (
     ScriptAnalyzer,
     AnalysisResult,
     analyze_script,
-    CRITICAL_PATTERNS,
-    WARNING_PATTERNS,
 )
 from kestrel_sovereign.features.compute.destructive_policy import (
     AgentDataProtectionError,
     DestructiveOperationPolicy,
     rewrite_script_for_safety,
 )
-from kestrel_sovereign.features.compute.trash_manager import TrashManager, TrashItem
+from kestrel_sovereign.features.compute.trash_manager import TrashManager
 
 
 # =============================================================================
@@ -366,7 +360,9 @@ class TestScriptSigner:
         of the script could forge the tag. Even if the math 'verifies' under
         the old algorithm, post-Wave-0B verifiers must reject it.
         """
-        import base64, hashlib, hmac as hmac_mod
+        import base64
+        import hashlib
+        import hmac as hmac_mod
 
         # Reconstruct what the old fallback produced
         canonical = f"{sample_script.name}|{sample_script.language}|{sample_script.content}|{sample_script.purpose}"
@@ -559,10 +555,8 @@ class TestDestructivePolicy:
 
         assert "mv" in result
         assert str(temp_trash_dir) in result
-        # Check that the mv part doesn't start with "rm" (the command)
-        # Use regex to avoid false positives from temp dir names containing "rm"
-        mv_part = result.split("&&")[1].strip()
-        assert mv_part.startswith("mv"), f"Expected mv command, got: {mv_part}"
+        assert "command -p mv --" in result
+        assert "builtin command" not in result
     
     def test_rewrite_rm_keeps_temp_deletion(self, temp_trash_dir):
         """Test that rm in temp dirs is not rewritten."""
@@ -570,8 +564,9 @@ class TestDestructivePolicy:
         
         result = policy.rewrite_rm("rm -rf /tmp/kestrel_compute_abc123/temp.txt")
         
-        # Should keep original rm for temp files
-        assert result.startswith("rm")
+        # The real rm remains authorized, with a runtime ownership guard.
+        assert "command -p rm -rf --" in result
+        assert "command -p mv --" not in result
 
     def test_rewrite_rm_blocks_other_agent_data(self, temp_trash_dir, tmp_path):
         """Test that shell rm cannot touch another agent's data directory."""
@@ -603,7 +598,8 @@ class TestDestructivePolicy:
 
         result = policy.rewrite_rm(f"rm -rf {current}")
 
-        assert result.startswith("rm")
+        assert "command -p rm -rf --" in result
+        assert "command -p mv --" not in result
         audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
         entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
         assert entries[-1]["decision"] == "allowed"
@@ -713,7 +709,7 @@ print("Done")
         )
 
         result = subprocess.run(
-            ["python", str(script_path)],
+            [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
             check=False,
@@ -744,7 +740,7 @@ print("Done")
         )
 
         result = subprocess.run(
-            ["python", str(script_path)],
+            [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
             check=False,
@@ -779,7 +775,7 @@ print("Done")
         )
 
         result = subprocess.run(
-            ["python", str(script_path)],
+            [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
             check=False,
@@ -816,7 +812,7 @@ print("Done")
         )
 
         result = subprocess.run(
-            ["python", str(script_path)],
+            [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
             check=False,
@@ -849,7 +845,7 @@ print("Done")
         )
 
         result = subprocess.run(
-            ["python", str(script_path)],
+            [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
             check=False,

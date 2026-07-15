@@ -101,6 +101,10 @@ dependencies = [
     "python-dotenv==1.2.2",
     "toml==0.10.2",
     "PyYAML>=6.0",
+    # Concrete Bash syntax tree used by compute's fail-closed safe-delete
+    # rewriter.  The grammar and Python binding are both MIT licensed.
+    "tree-sitter>=0.25,<1",
+    "tree-sitter-bash>=0.25,<1",
     # Interactive setup wizard prompts
     "questionary>=2.0.1",
     # Email validation
