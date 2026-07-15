@@ -35,6 +35,7 @@ from kestrel_sovereign.signals.constitution_canary import (
 from kestrel_sovereign.signals.sources.heartbeat import (
     PROMPT_TEMPLATE,
     SOURCE_NAME,
+    _heartbeat_result_summary,
     build_heartbeat_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
@@ -179,10 +180,7 @@ def test_heartbeat_active_end_boundary_stays_active():
     quiet. The +1 minute shift in `_build_quiet_hours` keeps 22:00:00
     active; quiet starts at 22:01:00."""
     from datetime import datetime, time as dtime, timezone
-    from unittest.mock import patch
-
     from kestrel_sdk.signals import (
-        AttentionPolicy,
         Signal,
         SignalMode,
         Status,
@@ -611,3 +609,59 @@ async def test_heartbeat_dispatch_high_urgency_overrides_quiet_hours(components)
     )
     result = await dispatcher.dispatch_signal(signal)
     assert result.status == Status.OK
+
+
+# ---------------------------------------------------------------------------
+# Result summaries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        "",
+        " \n\t ",
+        "HEARTBEAT_OK",
+        "HEARTBEAT_OK!",
+        "**HEARTBEAT_OK**",
+        "<b>HEARTBEAT_OK</b>",
+        "`HEARTBEAT_OK`",
+        '"HEARTBEAT_OK"',
+        "```HEARTBEAT_OK```",
+        "(HEARTBEAT_OK)",
+    ],
+)
+def test_heartbeat_result_summary_suppresses_exact_all_clear(response):
+    assert _heartbeat_result_summary(response) == ""
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "HEARTBEAT_OK\nDisk low",
+        "Disk low\nHEARTBEAT_OK",
+    ],
+)
+def test_heartbeat_result_summary_surfaces_short_alert_in_either_order(response):
+    assert _heartbeat_result_summary(response) == "Disk low"
+
+
+def test_heartbeat_result_summary_surfaces_full_no_token_alert():
+    response = "  Disk low  "
+    assert _heartbeat_result_summary(response) == response
+
+
+def test_heartbeat_result_summary_surfaces_non_string_zero():
+    assert _heartbeat_result_summary(0) == "0"
+
+
+def test_heartbeat_result_summary_surfaces_non_ascii_symbol_alert():
+    assert _heartbeat_result_summary("HEARTBEAT_OK ⚠️") == "⚠️"
+
+
+def test_heartbeat_result_summary_truncates_after_classification():
+    alert = "x" * 1001
+    assert _heartbeat_result_summary(f"HEARTBEAT_OK\n{alert}") == (
+        f"{'x' * 1000}...(truncated)"
+    )

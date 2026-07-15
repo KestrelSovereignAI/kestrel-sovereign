@@ -28,6 +28,7 @@ from kestrel_sdk.signals import (
     Trust,
     Urgency,
 )
+from kestrel_sovereign.heartbeat_response import classify_heartbeat_response
 
 
 SOURCE_NAME = "heartbeat"
@@ -129,13 +130,11 @@ def _heartbeat_result_summary(result_body: Any) -> str:
     empty (no UI noise for routine ticks). For an alert we surface
     the alert text so the operator's side channel renders something
     actionable."""
-    if not result_body:
+    classification = classify_heartbeat_response(result_body)
+    if classification.is_all_clear:
         return ""
-    text = result_body if isinstance(result_body, str) else str(result_body)
-    # Don't surface the all-clear in the UI side channel. Let routine
-    # heartbeats stay metadata-only; only alerts get a body.
-    if "HEARTBEAT_OK" in text and len(text.strip()) < 30:
-        return ""
+
+    text = classification.alert_text or ""
     if len(text) > 1000:
         return text[:1000] + "...(truncated)"
     return text

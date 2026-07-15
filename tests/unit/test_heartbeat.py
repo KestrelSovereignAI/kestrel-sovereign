@@ -2,22 +2,22 @@
 Tests for the heartbeat system (#151).
 
 Verifies HeartbeatConfig loading, HeartbeatRunner scheduling,
-response normalization, active hours checks, and API integration.
+response normalization, dispatcher translation, and API integration.
 """
 
-import asyncio
-import pytest
-from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch, PropertyMock
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
 
 from kestrel_sovereign.heartbeat import (
     HeartbeatConfig,
-    HeartbeatResult,
     HeartbeatRunner,
-    HEARTBEAT_PROMPT,
-    DEFAULT_HEARTBEAT_TEMPLATE,
-    _OK_PATTERN,
+)
+from kestrel_sovereign.heartbeat_response import (
+    HEARTBEAT_OK_PATTERN,
+    HeartbeatResponseClassification,
+    classify_heartbeat_response,
 )
 from kestrel_sovereign.config import parse_duration
 
@@ -64,7 +64,6 @@ class TestHeartbeatConfig:
         assert cfg.interval_seconds == 1800
         assert cfg.timezone == "UTC"
         assert cfg.target == "log"
-        assert cfg.suppress_ok is True
 
     @patch("kestrel_sovereign.heartbeat.load_section")
     def test_from_config_enabled(self, mock_load):
@@ -90,29 +89,83 @@ class TestHeartbeatConfig:
         assert cfg.interval_seconds == 1800
 
 
-# --- OK Pattern Tests ---
+# --- Response Classification Tests ---
 
 
-class TestOKPattern:
-    """Tests for HEARTBEAT_OK token detection."""
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        "",
+        "   \n\t",
+        "HEARTBEAT_OK",
+        "HEARTBEAT_OK!",
+        "**HEARTBEAT_OK**",
+        "<b>HEARTBEAT_OK</b>",
+        "heartbeat_ok",
+        "`HEARTBEAT_OK`",
+        '"HEARTBEAT_OK"',
+        "```HEARTBEAT_OK```",
+        "(HEARTBEAT_OK)",
+    ],
+)
+def test_classifier_recognizes_exact_all_clear_formatting(response):
+    assert classify_heartbeat_response(response) == HeartbeatResponseClassification(
+        is_all_clear=True
+    )
 
-    def test_plain_ok(self):
-        assert _OK_PATTERN.search("HEARTBEAT_OK")
 
-    def test_ok_with_exclamation(self):
-        assert _OK_PATTERN.search("HEARTBEAT_OK!")
+@pytest.mark.parametrize(
+    "response",
+    [
+        "HEARTBEAT_OK\nDisk low",
+        "Disk low\nHEARTBEAT_OK",
+    ],
+)
+def test_classifier_surfaces_short_alert_in_either_token_order(response):
+    assert classify_heartbeat_response(response) == HeartbeatResponseClassification(
+        is_all_clear=False,
+        alert_text="Disk low",
+    )
 
-    def test_bold_ok(self):
-        assert _OK_PATTERN.search("**HEARTBEAT_OK**")
 
-    def test_html_bold_ok(self):
-        assert _OK_PATTERN.search("<b>HEARTBEAT_OK</b>")
+def test_classifier_preserves_full_alert_without_token():
+    response = "  Disk low  "
+    assert classify_heartbeat_response(response) == HeartbeatResponseClassification(
+        is_all_clear=False,
+        alert_text=response,
+    )
 
-    def test_case_insensitive(self):
-        assert _OK_PATTERN.search("heartbeat_ok")
 
-    def test_no_match(self):
-        assert not _OK_PATTERN.search("Everything is fine")
+def test_classifier_treats_non_string_zero_as_alert():
+    assert classify_heartbeat_response(0) == HeartbeatResponseClassification(
+        is_all_clear=False,
+        alert_text="0",
+    )
+
+
+def test_classifier_preserves_non_ascii_symbol_alert_beside_token():
+    assert classify_heartbeat_response("HEARTBEAT_OK ⚠️") == (
+        HeartbeatResponseClassification(
+            is_all_clear=False,
+            alert_text="⚠️",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "prefixHEARTBEAT_OK",
+        "HEARTBEAT_OK_suffix",
+    ],
+)
+def test_classifier_does_not_match_token_inside_identifier(response):
+    assert HEARTBEAT_OK_PATTERN.search(response) is None
+    assert classify_heartbeat_response(response) == HeartbeatResponseClassification(
+        is_all_clear=False,
+        alert_text=response,
+    )
 
 
 # --- HeartbeatRunner Tests ---
@@ -205,11 +258,20 @@ class TestHeartbeatRunner:
 
     @pytest.mark.asyncio
     async def test_run_once_ok_with_extra_text(self, mock_agent, default_config):
-        """HEARTBEAT_OK with extra short text is still 'ok'."""
+        """Any content alongside HEARTBEAT_OK is an alert."""
         mock_agent.process_input.return_value = "HEARTBEAT_OK\nAll good."
         runner = HeartbeatRunner(mock_agent, default_config)
         result = await runner.run_once()
-        assert result.status == "ok"
+        assert result.status == "alert"
+        assert result.message == "All good."
+
+    @pytest.mark.asyncio
+    async def test_run_once_non_string_zero_is_alert(self, mock_agent, default_config):
+        mock_agent.process_input.return_value = 0
+        runner = HeartbeatRunner(mock_agent, default_config)
+        result = await runner.run_once()
+        assert result.status == "alert"
+        assert result.message == "0"
 
     @pytest.mark.asyncio
     async def test_history_tracking(self, mock_agent, default_config):
@@ -276,39 +338,8 @@ class TestHeartbeatRunner:
         assert content == "Custom checklist"
 
 
-class TestActiveHours:
-    """Tests for active hours checking."""
-
-    @pytest.fixture
-    def runner_with_hours(self, mock_agent):
-        config = HeartbeatConfig(
-            enabled=True,
-            active_hours_start="09:00",
-            active_hours_end="17:00",
-            timezone="UTC",
-        )
-        return HeartbeatRunner(mock_agent, config)
-
-    def test_no_active_hours_always_active(self, mock_agent, default_config):
-        """No active hours configured = always active."""
-        runner = HeartbeatRunner(mock_agent, default_config)
-        assert runner._is_within_active_hours() is True
-
-    @patch("kestrel_sovereign.heartbeat.datetime")
-    def test_within_hours(self, mock_dt, runner_with_hours):
-        """Inside active hours returns True."""
-        from zoneinfo import ZoneInfo
-        mock_now = datetime(2026, 3, 3, 12, 0, 0, tzinfo=ZoneInfo("UTC"))
-        mock_dt.now.return_value = mock_now
-        assert runner_with_hours._is_within_active_hours() is True
-
-    @patch("kestrel_sovereign.heartbeat.datetime")
-    def test_outside_hours(self, mock_dt, runner_with_hours):
-        """Outside active hours returns False."""
-        from zoneinfo import ZoneInfo
-        mock_now = datetime(2026, 3, 3, 23, 0, 0, tzinfo=ZoneInfo("UTC"))
-        mock_dt.now.return_value = mock_now
-        assert runner_with_hours._is_within_active_hours() is False
+class TestDispatcherTranslation:
+    """Tests for dispatcher statuses translated into heartbeat history."""
 
     @pytest.mark.asyncio
     async def test_skipped_outside_hours(self, mock_agent):
@@ -379,6 +410,37 @@ class TestResponseNormalization:
             "2026-01-01T00:00:00Z",
             100,
         )
-        assert result.status == "ok"
-        # Extra content beyond the token should be captured
-        assert result.message is not None or result.status == "ok"
+        assert result.status == "alert"
+        assert result.message == (
+            "All systems nominal. No urgent items. Memory usage at 42%."
+        )
+
+    @pytest.mark.parametrize(
+        ("response", "expected_status", "expected_message"),
+        [
+            (None, "ok", None),
+            ("HEARTBEAT_OK", "ok", None),
+            ("HEARTBEAT_OK\nDisk low", "alert", "Disk low"),
+            ("Disk low\nHEARTBEAT_OK", "alert", "Disk low"),
+            ("Disk low", "alert", "Disk low"),
+            (0, "alert", "0"),
+        ],
+    )
+    def test_runner_status_matches_canonical_classifier(
+        self,
+        runner,
+        response,
+        expected_status,
+        expected_message,
+    ):
+        result = runner._normalize_response(
+            response,
+            "2026-01-01T00:00:00Z",
+            100,
+        )
+        classification = classify_heartbeat_response(response)
+
+        assert result.status == expected_status
+        assert result.message == expected_message
+        assert (result.status == "ok") is classification.is_all_clear
+        assert result.message == classification.alert_text
