@@ -154,7 +154,7 @@ def compute_host_ui_manifest(features: List[HostFeature]) -> List[Dict[str, Any]
         manifest.append(
             {
                 "feature": slug,
-                "capability": contrib.capability or slug,
+                "capability": contrib.capability,
                 "modules": modules,
                 "css": css,
             }
