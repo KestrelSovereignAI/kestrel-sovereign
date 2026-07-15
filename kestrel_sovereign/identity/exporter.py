@@ -14,10 +14,9 @@ Usage:
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Literal, Optional, TYPE_CHECKING
 
 from .identity_package import (
     AgentIdentityPackage,
@@ -81,7 +80,7 @@ class IdentityExporter:
 
     async def export(
         self,
-        include_conversations: bool = False,
+        include_conversations: Literal[False] = False,
         include_wallet_history: bool = True,
         source_substrate: Optional[str] = None,
     ) -> AgentIdentityPackage:
@@ -89,14 +88,36 @@ class IdentityExporter:
         Export complete agent identity.
 
         Args:
-            include_conversations: Whether to include raw conversation history
-                                   (large, usually not needed if episodes exist)
+            include_conversations: Deprecated compatibility argument. Raw
+                conversation history is not part of the identity-package
+                schema, so only ``False`` is accepted. ``True`` fails loudly
+                during the deprecation window; remove this argument before
+                the next major exporter API revision. Bounded personality
+                calibration examples remain a separate, documented feature.
             include_wallet_history: Whether to include transaction history
             source_substrate: Override detected substrate type
 
         Returns:
             Complete AgentIdentityPackage ready for signing and export
+
+        Raises:
+            TypeError: If ``include_conversations`` is not a boolean.
+            ValueError: If raw conversation export is requested.
         """
+        if include_conversations is not False:
+            if not isinstance(include_conversations, bool):
+                raise TypeError(
+                    "include_conversations is a deprecated compatibility "
+                    "argument and must be False; raw conversation history "
+                    "is not part of the identity-package schema"
+                )
+            raise ValueError(
+                "include_conversations=True is unsupported: raw conversation "
+                "history is never exported in an identity package. Use the "
+                "default/False path; personality calibration examples are a "
+                "separate bounded, conversation-derived field."
+            )
+
         logger.info(f"Exporting identity for agent {self.agent_id[:20]}...")
 
         # 1. Core Identity
