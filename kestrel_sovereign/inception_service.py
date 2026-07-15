@@ -10,26 +10,18 @@ import json
 from pathlib import Path
 from dataclasses import dataclass
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization
-from kestrel_sovereign.storage import AsyncStorage, GraphNode, Edge
+from kestrel_sovereign.storage import GraphNode
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
-from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.config import load_config
 from kestrel_sovereign.security.key_storage import secure_delete
-import copy
 import argparse
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kestrel_sovereign.constitution.emancipation import EmancipationContract
 from datetime import datetime, timezone
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
-import hashlib
 import asyncio
 import os
 
@@ -218,7 +210,7 @@ def load_kestrel_identity(key_id: str, storage_dir: Optional[Path] = None) -> tu
 
     # Try encrypted key first
     try:
-        from kestrel_sovereign.security.key_storage import SecureKeyStorage, KeyStorageError
+        from kestrel_sovereign.security.key_storage import SecureKeyStorage
         storage = SecureKeyStorage(storage_dir=storage_dir)
         if storage.has_key(key_id):
             private_key = storage.load_private_key(key_id)

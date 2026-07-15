@@ -223,15 +223,12 @@ async def with_retry(
     Raises:
         The last exception if all retries fail
     """
-    last_exception = None
     attempt = 0
 
     while True:
         try:
             return await func(*args, **kwargs)
         except Exception as e:
-            last_exception = e
-
             if not is_retryable_error(e):
                 raise
 
@@ -263,8 +260,6 @@ async def with_retry(
             )
             await asyncio.sleep(delay)
             attempt += 1
-
-    raise last_exception
 
 
 async def retry_with_backoff(
