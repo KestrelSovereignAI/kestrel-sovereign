@@ -14,6 +14,21 @@ from kestrel_sovereign.setup.prompts import StubPrompter
 from kestrel_sovereign.setup.steps import keys
 
 
+@pytest.fixture(autouse=True)
+def _clean_data_key_env(monkeypatch):
+    """Start each keys-step test from a clean process environment.
+
+    The suite-wide ``_born_hybrid_inception_env`` fixture exports a
+    ``KESTREL_DATA_KEY`` so inception works elsewhere. The keys step now
+    resolves key authority *from the process environment as well as*
+    ``.env`` (#2468), so tests that exercise the generate / target-key paths
+    must not inherit that ambient export — each test opts back in explicitly
+    when it wants an exported key.
+    """
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+
 def _make_ctx(tmp_path: Path, flow: Flow, *, answers=None) -> SetupContext:
     return SetupContext(
         project_dir=tmp_path,
@@ -150,22 +165,78 @@ def test_quickstart_inception_writes_encrypted_pem_not_plaintext(tmp_path, monke
     )
 
 
-def test_keys_does_not_clobber_preexisting_os_environ_value(tmp_path, monkeypatch):
-    """If the operator already has ``KESTREL_DATA_KEY`` exported in their
-    shell, the keys step should not overwrite it in ``os.environ`` even if
-    ``.env`` was empty. (Their shell value is what inception will use, and
-    overwriting silently would be surprising.)"""
-    user_supplied = "user-shell-key-do-not-touch"
+def test_keys_adopts_exported_key_into_env_no_split_brain(tmp_path, monkeypatch):
+    """True exported-key semantics (#2468): if the operator has a valid
+    ``KESTREL_DATA_KEY`` exported in their shell and the target ``.env`` has
+    none, the keys step must persist *that same* key to the target ``.env``.
+
+    The old behaviour generated a *different* value into ``.env`` while
+    keeping the exported value effective — a split brain: inception encrypts
+    with the exported key while ``.env`` persists another, so an immediate
+    restart cannot decrypt the identity. There must be exactly one effective,
+    persisted key.
+    """
+    user_supplied = Fernet.generate_key().decode("ascii")
     monkeypatch.setenv("KESTREL_DATA_KEY", user_supplied)
     monkeypatch.delenv("KESTREL_API_KEY", raising=False)
 
     ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
     keys.run(ctx)
 
-    # The .env got a generated value (the keys step doesn't read os.environ
-    # to decide whether to generate — only ``read_env``), but os.environ
-    # keeps the user's pre-existing export.
+    env = read_env(tmp_path / ".env")
+    # The exported key is what gets persisted — not a freshly generated one.
+    assert env["KESTREL_DATA_KEY"] == user_supplied
+    # ...and it stays the effective process key. Encrypt-key == persist-key.
     assert os.environ["KESTREL_DATA_KEY"] == user_supplied
+
+
+def test_keys_conflict_exported_vs_target_blocks_before_inception(tmp_path, monkeypatch):
+    """A persisted target key and a *different* exported key is an
+    unresolvable conflict (#2468): encrypting with one while persisting the
+    other is the loss-of-custody defect. The keys step must block instead of
+    silently picking a winner — and never regenerate the target key."""
+    target = Fernet.generate_key().decode("ascii")
+    write_env(tmp_path / ".env", {"KESTREL_DATA_KEY": target})
+    monkeypatch.setenv("KESTREL_DATA_KEY", "a-different-exported-value")
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    keys.run(ctx)
+
+    assert any("KESTREL_DATA_KEY conflict" in b for b in ctx.blockers)
+    # Target key never regenerated.
+    assert read_env(tmp_path / ".env")["KESTREL_DATA_KEY"] == target
+
+
+def test_keys_existing_target_key_becomes_effective(tmp_path, monkeypatch):
+    """An existing target ``.env`` key is authoritative and is propagated to
+    ``os.environ`` so inception encrypts with exactly the persisted key —
+    even if the process env started without it."""
+    target = Fernet.generate_key().decode("ascii")
+    write_env(tmp_path / ".env", {"KESTREL_DATA_KEY": target})
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    keys.run(ctx)
+
+    assert os.environ["KESTREL_DATA_KEY"] == target
+    assert read_env(tmp_path / ".env")["KESTREL_DATA_KEY"] == target
+
+
+def test_keys_invalid_target_key_blocks(tmp_path):
+    """Corrupted persisted key material must fail before identity creation.
+
+    A passphrase is accepted (PBKDF2), so "invalid" here means material that
+    embeds whitespace/control characters — a corruption signal that would also
+    break the single-line ``.env`` format.
+    """
+    write_env(tmp_path / ".env", {"KESTREL_DATA_KEY": "broken key with spaces"})
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    keys.run(ctx)
+
+    assert any("not a valid master key" in b for b in ctx.blockers)
+    # Never regenerates a present (even if corrupted) key.
+    assert read_env(tmp_path / ".env")["KESTREL_DATA_KEY"] == "broken key with spaces"
 
 
 def test_keys_idempotent_when_everything_set(tmp_path):

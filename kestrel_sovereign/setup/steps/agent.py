@@ -170,7 +170,19 @@ def run(ctx: SetupContext) -> None:
     if not _ensure_did_web_domain(ctx):
         return
 
-    if not (ctx.agent_data_root / name / "kestrel_prime.db").exists():
+    incept_needed = not (ctx.agent_data_root / name / "kestrel_prime.db").exists()
+    if incept_needed and any("KESTREL_DATA_KEY" in b for b in ctx.blockers):
+        # The keys step could not resolve a single effective KESTREL_DATA_KEY
+        # (missing/invalid/conflicting). Never incept an identity we would
+        # encrypt with the wrong — or no — key (#2468); the born-hybrid path
+        # would either brick on the next boot or fail loud mid-inception.
+        ctx.block(
+            f"Skipped inception for '{name}': KESTREL_DATA_KEY unresolved "
+            "(see the key blocker above)."
+        )
+        return
+
+    if incept_needed:
         suffix = " (test instance)" if ctx.is_test_instance else ""
         ctx.prompter.info(
             f"Running inception for '{name}'{suffix} — generating DID + DB..."

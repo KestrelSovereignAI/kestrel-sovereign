@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """
 Inception Service: A library for programmatically creating new Kestrel agents.
+
+.. note::
+   This module must **not** call ``load_dotenv()`` at import time. Doing so
+   loaded the *current-directory* ``.env`` (e.g. a source checkout's key) into
+   ``os.environ`` the moment the module was imported — even transitively, long
+   before any target home was chosen. When setup then generated a *different*
+   ``KESTREL_DATA_KEY`` for an explicit ``KESTREL_HOME`` target, inception
+   encrypted the born identity with the stale current-directory key while the
+   target ``.env`` persisted the freshly-generated one, so an immediate restart
+   could not decrypt the identity (issue #2468). Dotenv loading must be
+   *target-aware* and is the caller's responsibility. The setup ``keys`` step
+   resolves the effective ``KESTREL_DATA_KEY`` deliberately; the CLI
+   ``create`` / ``setup agent`` paths resolve it the same way before inception
+   (``_apply_target_data_key_custody`` in ``cli.py``), loading the resolved
+   project home's ``.env`` and refusing an exported⇄persisted key conflict.
 """
-from dotenv import load_dotenv
-load_dotenv()  # Load .env before any other imports
 
 import logging
 import json

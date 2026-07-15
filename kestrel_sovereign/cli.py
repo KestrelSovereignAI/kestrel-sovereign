@@ -79,6 +79,75 @@ def _get_project_dir() -> Path:
     return project_dir()
 
 
+def _load_target_env(project_dir: Path) -> None:
+    """Load the resolved project home's ``.env`` into ``os.environ``.
+
+    Target-aware replacement for the import-time ``load_dotenv()`` that
+    ``inception_service`` used to run (which loaded the *current-directory*
+    ``.env`` and could seed the wrong ``KESTREL_DATA_KEY`` — #2468).
+    ``override=False`` so a genuinely-exported value stays authoritative.
+    """
+    from dotenv import load_dotenv
+
+    env_path = project_dir / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+
+
+def _apply_target_data_key_custody(project_dir: Path) -> Optional[str]:
+    """Resolve the single effective ``KESTREL_DATA_KEY`` for this target home
+    and make it authoritative in the process, mirroring the wizard ``keys`` step
+    (#2468).
+
+    Used by the CLI paths that can reach inception **without** running the keys
+    step — ``kestrel create`` (never runs it) and ``kestrel setup agent``
+    (single-step wizard skips it). Both previously relied on the import-time
+    ``load_dotenv()`` in ``inception_service``; with that removed they lost all
+    ``.env`` awareness, so inception could fail or encrypt with the wrong key.
+
+    Returns an error message to refuse on (an exported⇄persisted conflict, or
+    invalid key material) — the same custody block the keys step raises — or
+    ``None`` on success. On success ``os.environ[KESTREL_DATA_KEY]`` holds
+    exactly the key that is (or will be) persisted in the target ``.env``, so
+    encrypt-key == persist-key. An exported key adopted for a home that has none
+    is persisted to that home's ``.env`` so the next boot loads the same value.
+    The rest of the target ``.env`` is loaded either way.
+    """
+    from kestrel_sovereign.setup.env_file import read_env, write_env
+    from kestrel_sovereign.setup.steps.keys import (
+        DATA_KEY_ENV,
+        resolve_data_key_authority,
+    )
+
+    env_path = project_dir / ".env"
+    persisted = read_env(env_path).get(DATA_KEY_ENV)
+    exported = os.environ.get(DATA_KEY_ENV)
+
+    effective, conflict = resolve_data_key_authority(
+        persisted, exported, env_name=env_path.name
+    )
+    if conflict:
+        return conflict
+
+    if effective is None:
+        # Neither persisted nor exported. Load any other .env values and let
+        # inception's own unset-key handling apply (born-hybrid raises;
+        # did:pkh falls back to plaintext PEM). Nothing to persist.
+        _load_target_env(project_dir)
+        return None
+
+    # If the effective key was adopted from an export for a home that has none,
+    # persist it so the next boot loads the same value the process encrypts with.
+    if not (persisted or "").strip():
+        write_env(env_path, {DATA_KEY_ENV: effective})
+
+    # Make the effective key authoritative in the process, then load the rest of
+    # the target .env (override=False leaves the data key we just set intact).
+    os.environ[DATA_KEY_ENV] = effective
+    _load_target_env(project_dir)
+    return None
+
+
 def cmd_list(args) -> int:
     """List all agents in multi_agent."""
     project_dir = _get_project_dir()
@@ -116,6 +185,18 @@ def cmd_create(args) -> int:
     from kestrel_sovereign.setup.toml_file import read_toml
 
     project_dir = _get_project_dir()
+
+    # inception_service no longer loads .env at import time (that leaked the
+    # current-directory key into os.environ and could encrypt with the wrong
+    # KESTREL_DATA_KEY — #2468). Resolve the *resolved target home's* effective
+    # data key deliberately, mirroring the wizard keys step: refuse a split
+    # brain (exported key A ⇄ persisted key B) before inception rather than
+    # encrypt with one key while the home persists another.
+    custody_error = _apply_target_data_key_custody(project_dir)
+    if custody_error:
+        print(custody_error, file=sys.stderr)
+        return 1
+
     name = args.name
     agent_data_dir = project_dir / "agent_data" / name
 
@@ -1160,6 +1241,21 @@ def cmd_setup(args) -> int:
         reset=args.reset,
         is_test_instance=is_test_instance,
     )
+
+    # A single-step `kestrel setup agent` run skips the `keys` step, so it would
+    # otherwise reach inception with no .env awareness now that
+    # inception_service no longer loads .env at import time (#2468) — failing
+    # born-hybrid or writing a plaintext PEM despite a valid persisted key. Make
+    # the target home's effective KESTREL_DATA_KEY authoritative first, refusing
+    # the same custody conflict the keys step blocks on. The full wizard runs the
+    # keys step itself (which also handles --reset regeneration), so only the
+    # agent single-step needs this here.
+    if args.step == "agent" and flow is not Flow.CHECK:
+        custody_error = _apply_target_data_key_custody(project_dir)
+        if custody_error:
+            print(custody_error, file=sys.stderr)
+            return 1
+
     return run_wizard(ctx, only_step=args.step)
 
 
