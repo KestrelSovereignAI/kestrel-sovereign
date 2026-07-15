@@ -32,6 +32,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    TYPE_CHECKING,
     Union,
     Type,
     AsyncIterator,
@@ -46,6 +47,9 @@ from .cancellation import CancelToken
 from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
 from .provider_registry import provider_cache_body
+
+if TYPE_CHECKING:
+    from .invocation_context import LLMInvocationContext
 
 logger = logging.getLogger(__name__)
 
@@ -762,6 +766,7 @@ class StreamingMixin:
         *,
         duration_ms: int,
         partial: bool = False,
+        invocation_context: Optional["LLMInvocationContext"] = None,
     ) -> None:
         """Meter a streamed turn from its terminal :class:`LLMResponse`.
 
@@ -779,13 +784,30 @@ class StreamingMixin:
         if not isinstance(response, LLMResponse):
             return
         try:
+            metadata = {"streamed": True}
+            if partial:
+                metadata["partial_abort"] = True
+
+            finalizer = getattr(self, "_finalize_successful_invocation", None)
+            resolver = getattr(self, "_resolve_invocation_context", None)
+            if finalizer is not None and resolver is not None:
+                await finalizer(
+                    response,
+                    provider_name,
+                    model,
+                    path="stream_with_tool_detection",
+                    invocation_context=resolver(invocation_context),
+                    duration_ms=duration_ms,
+                    metadata=metadata,
+                    tools_used=bool(getattr(response, "tool_calls", None)),
+                )
+                return
+
+            # Compatibility for StreamingMixin-only consumers and test fakes.
             input_tokens = response.input_tokens
             output_tokens = response.output_tokens
             total_tokens = (input_tokens or 0) + (output_tokens or 0)
             await self._track_model_usage(model, provider_name, tokens=total_tokens)
-            metadata = {"streamed": True}
-            if partial:
-                metadata["partial_abort"] = True
             await self._log_llm_call(
                 provider=provider_name,
                 model=model,
@@ -1292,6 +1314,7 @@ class StreamingMixin:
         images: Optional[List[Union[str, bytes]]] = None,
         keep_trailing_system: bool = False,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional["LLMInvocationContext"] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
@@ -1356,6 +1379,12 @@ class StreamingMixin:
                     result = await execute_tool(tc)
         """
         self._check_policy()
+        resolver = getattr(self, "_resolve_invocation_context", None)
+        if resolver is not None:
+            invocation_context = resolver(
+                invocation_context,
+                session_id=session_id,
+            )
         from .remote_backend import BackendType
 
         # Try remote GPU first when active AND routing isn't pinned — #734.
@@ -1379,18 +1408,36 @@ class StreamingMixin:
                     None, model=model, provider="remote_gpu",
                 )
                 if hasattr(self._remote_adapter, "get_streaming_response_with_tools"):
-                    async for item in self._remote_adapter.get_streaming_response_with_tools(
-                        client=self._remote_client,
-                        model=model,
-                        messages=messages,
-                        tools=tools,
-                        cancel_token=cancel_token,
-                    ):
-                        if isinstance(item, LLMResponse):
-                            self._stamp_response_identity(
-                                item, model=model, provider="remote_gpu",
+                    stream_start = time.monotonic()
+                    final_response = None
+                    remote_stream = (
+                        self._remote_adapter.get_streaming_response_with_tools(
+                            client=self._remote_client,
+                            model=model,
+                            messages=messages,
+                            tools=tools,
+                            cancel_token=cancel_token,
+                        )
+                    )
+                    try:
+                        async for item in remote_stream:
+                            if isinstance(item, LLMResponse):
+                                self._stamp_response_identity(
+                                    item, model=model, provider="remote_gpu",
+                                )
+                                final_response = item
+                            yield item
+                    finally:
+                        if final_response is not None:
+                            await self._record_streamed_usage(
+                                final_response,
+                                model,
+                                "remote_gpu",
+                                duration_ms=int(
+                                    (time.monotonic() - stream_start) * 1000
+                                ),
+                                invocation_context=invocation_context,
                             )
-                        yield item
                     return
             except Exception as exc:
                 self._last_remote_error = str(exc)
@@ -1503,6 +1550,7 @@ class StreamingMixin:
                             await self._record_streamed_usage(
                                 final_response, model, provider_name,
                                 duration_ms=duration_ms,
+                                invocation_context=invocation_context,
                             )
                         elif usage_sink:
                             # Aborted before the terminal response — flush what
@@ -1517,6 +1565,7 @@ class StreamingMixin:
                                 model, provider_name,
                                 duration_ms=duration_ms,
                                 partial=True,
+                                invocation_context=invocation_context,
                             )
                     logger.info(f"Streaming with tools completed from {provider_name}")
                     return
@@ -1543,6 +1592,7 @@ class StreamingMixin:
                         await self._record_streamed_usage(
                             response, model, provider_name,
                             duration_ms=int((time.monotonic() - fb_start) * 1000),
+                            invocation_context=invocation_context,
                         )
                         if response.has_tool_calls:
                             yield response

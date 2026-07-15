@@ -6,11 +6,8 @@ No real API calls are made.
 """
 
 import asyncio
-import os
-import tempfile
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import pytest_asyncio
@@ -24,6 +21,7 @@ from kestrel_sovereign.llm.service import (
     RemoteGPUConfig,
 )
 from kestrel_sovereign.llm.error_handling import LLMAllProvidersFailedError, LLMProviderError
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 
 
 # =============================================================================
@@ -879,6 +877,445 @@ class TestMeteringAndCost:
         assert f(LLMResponse(raw=SimpleNamespace(usage=None))) is None
 
 
+class TestInvocationBoundary:
+    """#2510 — successful provider paths finalize telemetry exactly once."""
+
+    @staticmethod
+    def _activate_fake_remote(llm_service, outcome):
+        adapter = Mock()
+        adapter.create_messages = Mock(
+            return_value=[{"role": "user", "content": "hello"}]
+        )
+        adapter.get_response = AsyncMock()
+        if isinstance(outcome, BaseException):
+            adapter.get_response.side_effect = outcome
+        else:
+            adapter.get_response.return_value = outcome
+        llm_service._backend = BackendType.REMOTE_GPU
+        llm_service._remote_client = AsyncMock()
+        llm_service._remote_config = RemoteGPUConfig(
+            base_url="https://gpu.example.test/v1",
+            model="remote-model",
+        )
+        llm_service._remote_adapter = adapter
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_partial_explicit_context_inherits_task_local_identity(
+        self, llm_service
+    ):
+        llm_service.set_observability_context(
+            session_id="ambient-session",
+            companion_id="ambient-companion",
+            user_id="ambient-user",
+        )
+
+        context = llm_service._resolve_invocation_context(
+            LLMInvocationContext(correlation_id="explicit-correlation"),
+            session_id="explicit-session",
+        )
+
+        assert context == LLMInvocationContext(
+            session_id="explicit-session",
+            companion_id="ambient-companion",
+            user_id="ambient-user",
+            correlation_id="explicit-correlation",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("entrypoint", "expected_path"),
+        [
+            ("get_response", "get_response"),
+            ("generate", "get_response"),
+            ("generate_with_messages", "generate_with_messages"),
+            ("get_response_with_model", "get_response_with_model"),
+            ("get_audit_response", "get_audit_response"),
+            ("get_response_with_tools", "get_response"),
+            ("get_response_structured", "get_response"),
+        ],
+    )
+    async def test_standard_success_entrypoints_finalize_once(
+        self,
+        llm_service,
+        mock_adapter,
+        entrypoint,
+        expected_path,
+    ):
+        class StructuredResult(BaseModel):
+            answer: str
+
+        if entrypoint == "get_audit_response":
+            content = '{"risk_level": 1, "reasoning": "safe"}'
+            tool_calls = None
+        elif entrypoint == "get_response_structured":
+            content = '{"answer": "ok"}'
+            tool_calls = None
+        elif entrypoint == "get_response_with_tools":
+            content = None
+            tool_calls = [ToolCall(id="call-1", name="lookup", arguments={})]
+        else:
+            content = "ok"
+            tool_calls = None
+        mock_adapter.get_response = AsyncMock(
+            return_value=LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                input_tokens=5,
+                output_tokens=3,
+                total_tokens=8,
+            )
+        )
+        finalizer = AsyncMock(wraps=llm_service._finalize_successful_invocation)
+        llm_service._finalize_successful_invocation = finalizer
+
+        if entrypoint == "get_response":
+            await llm_service.get_response(system_prompt="system", user_prompt="hello")
+        elif entrypoint == "generate":
+            await llm_service.generate(system_prompt="system", user_prompt="hello")
+        elif entrypoint == "generate_with_messages":
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "hello"}]
+            )
+        elif entrypoint == "get_response_with_model":
+            await llm_service.get_response_with_model(
+                model_id="gpt-5-mini",
+                system_prompt="system",
+                user_prompt="hello",
+            )
+        elif entrypoint == "get_audit_response":
+            await llm_service.get_audit_response("hello")
+        elif entrypoint == "get_response_with_tools":
+            await llm_service.get_response(
+                system_prompt="system",
+                user_prompt="hello",
+                tools=[{"type": "function", "function": {"name": "lookup"}}],
+            )
+        else:
+            await llm_service.get_response(
+                system_prompt="system",
+                user_prompt="hello",
+                response_format=StructuredResult,
+            )
+
+        finalizer.assert_awaited_once()
+        assert finalizer.await_args.kwargs["path"] == expected_path
+
+    @pytest.mark.asyncio
+    async def test_remote_prompt_success_records_complete_telemetry_once(
+        self, llm_service, caplog
+    ):
+        response = LLMResponse(
+            content="remote answer",
+            input_tokens=17,
+            output_tokens=9,
+            total_tokens=26,
+            raw=SimpleNamespace(usage=SimpleNamespace(cost=0.0125)),
+        )
+        self._activate_fake_remote(llm_service, response)
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+        meter_calls = []
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        context = LLMInvocationContext(
+            session_id="session-remote",
+            companion_id="companion-remote",
+            user_id="user-remote",
+            correlation_id="correlation-remote",
+        )
+
+        with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
+            result = await llm_service.generate(
+                system_prompt="system",
+                user_prompt="hello",
+                invocation_context=context,
+            )
+
+        assert result == "remote answer"
+        llm_service._track_model_usage.assert_awaited_once_with(
+            "remote-model", "remote_gpu", tokens=26
+        )
+        store.log_llm_call.assert_awaited_once()
+        logged = store.log_llm_call.await_args.kwargs
+        assert (
+            logged["provider"],
+            logged["model"],
+            logged["input_tokens"],
+            logged["output_tokens"],
+        ) == ("remote_gpu", "remote-model", 17, 9)
+        assert logged["duration_ms"] >= 0
+        assert (logged["session_id"], logged["companion_id"], logged["user_id"]) == (
+            "session-remote",
+            "companion-remote",
+            "user-remote",
+        )
+        assert logged["metadata"] == {
+            "path": "generate.remote_gpu",
+            "force_local_only": False,
+            "correlation_id": "correlation-remote",
+            "provider_reported_cost_usd": 0.0125,
+        }
+        assert meter_calls == [
+            {
+                "companion_id": "companion-remote",
+                "user_id": "user-remote",
+                "provider": "remote_gpu",
+                "model": "remote-model",
+                "prompt_tokens": 17,
+                "completion_tokens": 9,
+                "cost": 0.0125,
+            }
+        ]
+
+        import json as _json
+
+        usage_lines = [
+            record
+            for record in caplog.records
+            if record.message.startswith("llm.usage: ")
+        ]
+        assert len(usage_lines) == 1
+        usage = _json.loads(usage_lines[0].message.removeprefix("llm.usage: "))
+        assert (
+            usage["provider"],
+            usage["model"],
+            usage["cost"],
+            usage["session_id"],
+            usage["correlation_id"],
+        ) == (
+            "remote_gpu",
+            "remote-model",
+            0.0125,
+            "session-remote",
+            "correlation-remote",
+        )
+
+    @pytest.mark.asyncio
+    async def test_remote_failure_fallback_finalizes_only_successful_provider(
+        self, llm_service
+    ):
+        self._activate_fake_remote(llm_service, ConnectionError("gpu unavailable"))
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+
+        result = await llm_service.generate(
+            system_prompt="system",
+            user_prompt="hello",
+            invocation_context=LLMInvocationContext(session_id="fallback-session"),
+        )
+
+        assert isinstance(result, str)
+        llm_service._track_model_usage.assert_awaited_once()
+        store.log_llm_call.assert_awaited_once()
+        logged = store.log_llm_call.await_args.kwargs
+        assert logged["success"] is True
+        assert logged["provider"] == "openai:api"
+        assert logged["session_id"] == "fallback-session"
+
+    @pytest.mark.asyncio
+    async def test_remote_tool_stream_finalizes_terminal_response_once(
+        self, llm_service
+    ):
+        adapter = self._activate_fake_remote(llm_service, LLMResponse(content="unused"))
+
+        async def remote_stream(**_kwargs):
+            yield "remote chunk"
+            yield LLMResponse(
+                content="remote chunk",
+                input_tokens=7,
+                output_tokens=4,
+                total_tokens=11,
+            )
+
+        adapter.get_streaming_response_with_tools = remote_stream
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+        meter_calls = []
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        context = LLMInvocationContext(
+            session_id="superseded-session",
+            companion_id="stream-companion",
+            user_id="stream-user",
+            correlation_id="stream-correlation",
+        )
+
+        items = [
+            item
+            async for item in llm_service.stream_with_tool_detection(
+                messages=[{"role": "user", "content": "hello"}],
+                tools=[{"type": "function", "function": {"name": "lookup"}}],
+                session_id="stream-session",
+                invocation_context=context,
+            )
+        ]
+
+        assert items[0] == "remote chunk"
+        assert isinstance(items[1], LLMResponse)
+        llm_service._track_model_usage.assert_awaited_once_with(
+            "remote-model", "remote_gpu", tokens=11
+        )
+        store.log_llm_call.assert_awaited_once()
+        logged = store.log_llm_call.await_args.kwargs
+        assert logged["session_id"] == "stream-session"
+        assert logged["metadata"] == {
+            "streamed": True,
+            "path": "stream_with_tool_detection",
+            "correlation_id": "stream-correlation",
+        }
+        assert len(meter_calls) == 1
+        assert meter_calls[0]["companion_id"] == "stream-companion"
+        assert meter_calls[0]["user_id"] == "stream-user"
+
+    @pytest.mark.asyncio
+    async def test_remote_message_success_finalizes_once(self, llm_service):
+        self._activate_fake_remote(
+            llm_service,
+            LLMResponse(content="remote message", input_tokens=4, output_tokens=2),
+        )
+        finalizer = AsyncMock(wraps=llm_service._finalize_successful_invocation)
+        llm_service._finalize_successful_invocation = finalizer
+
+        result = await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hello"}]
+        )
+
+        assert result == "remote message"
+        finalizer.assert_awaited_once()
+        assert (
+            finalizer.await_args.kwargs["path"] == "generate_with_messages.remote_gpu"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remote_cancellation_preserves_exception_and_records_nothing(
+        self, llm_service, mock_adapter
+    ):
+        self._activate_fake_remote(llm_service, asyncio.CancelledError())
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+
+        with pytest.raises(asyncio.CancelledError):
+            await llm_service.generate(
+                system_prompt="system",
+                user_prompt="hello",
+                invocation_context=LLMInvocationContext(session_id="cancelled-session"),
+            )
+
+        mock_adapter.get_response.assert_not_awaited()
+        llm_service._track_model_usage.assert_not_awaited()
+        store.log_llm_call.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_standard_cancellation_preserves_exception_identity(
+        self, llm_service, mock_adapter
+    ):
+        cancellation = asyncio.CancelledError("request stopped")
+        mock_adapter.get_response = AsyncMock(side_effect=cancellation)
+        finalizer = AsyncMock(wraps=llm_service._finalize_successful_invocation)
+        llm_service._finalize_successful_invocation = finalizer
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await llm_service.get_response(
+                system_prompt="system",
+                user_prompt="hello",
+            )
+
+        assert caught.value is cancellation
+        finalizer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_standard_attempts_never_finalize_success(
+        self, llm_service, mock_adapter
+    ):
+        mock_adapter.get_response = AsyncMock(
+            side_effect=LLMProviderError("test-provider", "provider failed")
+        )
+        finalizer = AsyncMock(wraps=llm_service._finalize_successful_invocation)
+        llm_service._finalize_successful_invocation = finalizer
+
+        with pytest.raises(LLMAllProvidersFailedError):
+            await llm_service.get_response(
+                system_prompt="system",
+                user_prompt="hello",
+            )
+
+        assert mock_adapter.get_response.await_count == 2
+        finalizer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_legacy_contexts_cannot_cross_contaminate(
+        self, llm_service, mock_adapter
+    ):
+        both_started = asyncio.Event()
+        started = []
+
+        async def interleaved_response(*, session_id, **_kwargs):
+            started.append(session_id)
+            if len(started) == 2:
+                both_started.set()
+            await both_started.wait()
+            if session_id == "session-a":
+                await asyncio.sleep(0.01)
+            return LLMResponse(
+                content=f"answer-{session_id}",
+                input_tokens=3,
+                output_tokens=2,
+                total_tokens=5,
+            )
+
+        mock_adapter.get_response = AsyncMock(side_effect=interleaved_response)
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+        meter_calls = []
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+
+        async def invoke(label):
+            llm_service.set_observability_context(
+                companion_id=f"companion-{label}", user_id=f"user-{label}"
+            )
+            return await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": label}],
+                session_id=f"session-{label}",
+            )
+
+        results = await asyncio.gather(invoke("a"), invoke("b"))
+
+        assert set(results) == {"answer-session-a", "answer-session-b"}
+        assert store.log_llm_call.await_count == 2
+        by_session = {
+            call.kwargs["session_id"]: call.kwargs
+            for call in store.log_llm_call.await_args_list
+        }
+        assert (
+            by_session["session-a"]["companion_id"],
+            by_session["session-a"]["user_id"],
+        ) == ("companion-a", "user-a")
+        assert (
+            by_session["session-b"]["companion_id"],
+            by_session["session-b"]["user_id"],
+        ) == ("companion-b", "user-b")
+        assert {(call["companion_id"], call["user_id"]) for call in meter_calls} == {
+            ("companion-a", "user-a"),
+            ("companion-b", "user-b"),
+        }
+
+
 class TestAutoRoutingSentinel:
     """Regression tests for #1408 — the literal string "auto" must never
     reach a provider client. It expresses routing intent ("pick whatever
@@ -1145,9 +1582,10 @@ class TestBackendLifecycle:
             user_id="user-789",
         )
 
-        assert llm_service._observability_context["session_id"] == "sess-123"
-        assert llm_service._observability_context["companion_id"] == "comp-456"
-        assert llm_service._observability_context["user_id"] == "user-789"
+        context = llm_service._resolve_invocation_context()
+        assert context.session_id == "sess-123"
+        assert context.companion_id == "comp-456"
+        assert context.user_id == "user-789"
 
     @pytest.mark.asyncio
     async def test_observability_logging_on_success(self, llm_service):

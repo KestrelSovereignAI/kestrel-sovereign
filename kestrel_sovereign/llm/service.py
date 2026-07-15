@@ -48,6 +48,11 @@ from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
 from .streaming import StreamingMixin, RoutingResolution
+from .invocation_context import (
+    LLMInvocationContext,
+    resolve_invocation_context,
+    set_ambient_invocation_context,
+)
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import RemoteBackendMixin, BackendType, RemoteGPUConfig
 from kestrel_sovereign.kestrel_config.constants import (
@@ -405,7 +410,6 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Observability store for logging LLM calls (A2A-compatible)
         # Set via set_observability_store() after initialization
         self._observability_store = None
-        self._observability_context: Dict[str, Any] = {}
 
         # Metering callback for usage billing (Vending Machine)
         # Set via set_metering_callback() after initialization
@@ -3054,20 +3058,37 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self,
         session_id: Optional[str] = None,
         companion_id: Optional[str] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
     ) -> None:
-        """Set context for observability logging (called per-request).
+        """Set task-local context for legacy observability callers.
+
+        New generation call sites should pass an immutable
+        :class:`LLMInvocationContext` directly.  This compatibility API now
+        uses a ``ContextVar`` so two concurrent requests cannot overwrite one
+        another's identity.
 
         Args:
             session_id: A2A session ID
             companion_id: Companion UUID
             user_id: User UUID
         """
-        self._observability_context = {
-            "session_id": session_id,
-            "companion_id": companion_id,
-            "user_id": user_id,
-        }
+        set_ambient_invocation_context(
+            LLMInvocationContext(
+                session_id=session_id,
+                companion_id=companion_id,
+                user_id=user_id,
+            )
+        )
+
+    @staticmethod
+    def _resolve_invocation_context(
+        context: Optional[LLMInvocationContext] = None,
+        *,
+        session_id: Optional[str] = None,
+    ) -> LLMInvocationContext:
+        """Capture one request identity before a provider call begins."""
+
+        return resolve_invocation_context(context, session_id=session_id)
 
     @staticmethod
     def _extract_provider_cost(response: Any) -> Optional[float]:
@@ -3108,28 +3129,34 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         except (TypeError, ValueError):
             return None
 
-    async def _meter_message_response(
+    async def _finalize_successful_invocation(
         self,
         response: Any,
         provider_name: str,
         model: str,
         *,
-        tools: Optional[List[Dict[str, Any]]],
-        response_format: Optional[Type[BaseModel]],
-        force_local_only: bool,
+        path: str,
+        invocation_context: LLMInvocationContext,
         duration_ms: int = 0,
+        system_prompt: Optional[str] = None,
+        user_prompt: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        force_local_only: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tools_used: Optional[bool] = None,
     ) -> None:
-        """Record usage for a successful ``generate_with_messages`` call.
-
-        The non-streaming message path previously skipped metering entirely
-        (#1804): a callback set via ``set_metering_callback`` fired for the
-        streaming path and ``get_response`` but not here. Mirror the token /
-        cost extraction ``get_response`` does so the meter sees this path too.
+        """Stamp and record one successful provider response exactly once.
 
         Best-effort: a metering/tracking failure must never break the call the
-        user is awaiting (mirrors ``_record_streamed_usage``).
+        user is awaiting.  Cancellation is deliberately not swallowed.
         """
         try:
+            self._stamp_response_identity(
+                response,
+                model=model,
+                provider=provider_name,
+            )
             input_tokens = output_tokens = None
             cache_creation_input_tokens = cache_read_input_tokens = None
             if isinstance(response, LLMResponse):
@@ -3140,6 +3167,33 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             response_text = (
                 response.content if isinstance(response, LLMResponse) else str(response)
             )
+            tool_calls_data = None
+            if isinstance(response, LLMResponse):
+                if response.tool_calls:
+                    tool_calls_data = [
+                        {"name": tool_call.name, "arguments": tool_call.arguments}
+                        for tool_call in response.tool_calls
+                    ]
+                else:
+                    executed = getattr(response, "executed_tool_calls", None)
+                    if executed:
+                        tool_calls_data = [
+                            {"name": call["name"], "arguments": call["arguments"]}
+                            for call in executed
+                        ]
+
+            cost = self._extract_provider_cost(response)
+            record_metadata = dict(metadata or {})
+            record_metadata.setdefault("path", path)
+            if force_local_only is not None:
+                record_metadata.setdefault("force_local_only", force_local_only)
+            if invocation_context.correlation_id:
+                record_metadata.setdefault(
+                    "correlation_id", invocation_context.correlation_id
+                )
+            if cost is not None:
+                record_metadata.setdefault("provider_reported_cost_usd", cost)
+
             total_tokens = (input_tokens or 0) + (output_tokens or 0)
             await self._track_model_usage(model, provider_name, tokens=total_tokens)
             await self._log_llm_call(
@@ -3147,21 +3201,24 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 model=model,
                 duration_ms=duration_ms,
                 success=True,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 response=response_text,
-                metadata={
-                    "force_local_only": force_local_only,
-                    "path": "generate_with_messages",
-                },
+                tool_calls=tool_calls_data,
+                metadata=record_metadata,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-                tools_used=tools is not None,
+                tools_used=(tools is not None if tools_used is None else tools_used),
                 structured_output=response_format is not None,
-                cost=self._extract_provider_cost(response),
+                cost=cost,
+                invocation_context=invocation_context,
             )
-        except Exception as exc:  # noqa: BLE001 - metering must not break the call
-            logger.warning("Failed to meter generate_with_messages: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - telemetry must not break the call
+            logger.warning("Failed to finalize %s LLM invocation: %s", path, exc)
 
     @handle_observability_errors
     async def _log_llm_call(
@@ -3183,6 +3240,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         tools_used: Optional[bool] = None,
         structured_output: Optional[bool] = None,
         cost: Optional[float] = None,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> None:
         """Log an LLM call to the observability store (if configured).
 
@@ -3194,6 +3252,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         cache telemetry. Picked up by Cloud Run / Cloud Logging via the
         multi_agent stdout tee (issue #812). See issue #819.
         """
+        context = self._resolve_invocation_context(invocation_context)
+        record_metadata = dict(metadata or {})
+        if context.correlation_id:
+            record_metadata.setdefault("correlation_id", context.correlation_id)
+        if cost is not None:
+            record_metadata.setdefault("provider_reported_cost_usd", cost)
+
         # Log to observability store
         if self._observability_store:
             await self._observability_store.log_llm_call(
@@ -3202,15 +3267,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 duration_ms=duration_ms,
                 success=success,
                 agent_did=self._owner_agent_did,
-                session_id=self._observability_context.get("session_id"),
-                companion_id=self._observability_context.get("companion_id"),
-                user_id=self._observability_context.get("user_id"),
+                session_id=context.session_id,
+                companion_id=context.companion_id,
+                user_id=context.user_id,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response=response,
                 error_message=error_message,
                 tool_calls=tool_calls,
-                metadata=metadata,
+                metadata=record_metadata,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
@@ -3222,10 +3287,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             LLM_DURATION,
             LLM_TOKENS,
         )
+
         if _prom:
-            LLM_CALLS.labels(
-                provider=provider, model=model, success=str(success)
-            ).inc()
+            LLM_CALLS.labels(provider=provider, model=model, success=str(success)).inc()
             LLM_DURATION.labels(provider=provider, model=model).observe(
                 duration_ms / 1000
             )
@@ -3236,8 +3300,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         # Trigger metering callback for billing (Phase 1: tracking only)
         if self._metering_callback and success:
-            companion_id = self._observability_context.get("companion_id")
-            user_id = self._observability_context.get("user_id")
+            companion_id = context.companion_id
+            user_id = context.user_id
 
             if companion_id and user_id:
                 meter_kwargs = dict(
@@ -3269,6 +3333,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "cache_read_input_tokens": cache_read_input_tokens,
                 "tools": tools_used,
                 "structured_output": structured_output,
+                "cost": cost,
+                "session_id": context.session_id,
+                "correlation_id": context.correlation_id,
             }
             logger.info("llm.usage: %s", json.dumps(usage_log, default=str))
         except Exception as log_err:
@@ -3430,6 +3497,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
         explicit_selection: bool = False,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
@@ -3488,64 +3556,19 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             tool_executor=tool_executor,
             cancel_token=cancel_token,
         )
-        self._stamp_response_identity(
-            response, model=model_to_use, provider=provider["name"],
-        )
-
-        # Calculate duration and log to observability
         duration_ms = int((time.time() - start_time) * 1000)
-        response_text = response.content if isinstance(response, LLMResponse) else str(response)
-        tool_calls_data = None
-        if isinstance(response, LLMResponse):
-            if response.tool_calls:
-                tool_calls_data = [
-                    {"name": tc.name, "arguments": tc.arguments}
-                    for tc in response.tool_calls
-                ]
-            else:
-                # Inline-executing adapters (codex app-server) populate
-                # ``executed_tool_calls`` instead of ``tool_calls`` —
-                # the LLM call still used tools, so the audit log
-                # should reflect them.
-                executed = getattr(response, "executed_tool_calls", None)
-                if executed:
-                    tool_calls_data = [
-                        {"name": e["name"], "arguments": e["arguments"]}
-                        for e in executed
-                    ]
-
-        # Extract token counts from response for billing
-        input_tokens = None
-        output_tokens = None
-        cache_creation_input_tokens = None
-        cache_read_input_tokens = None
-        if isinstance(response, LLMResponse):
-            input_tokens = response.input_tokens
-            output_tokens = response.output_tokens
-            cache_creation_input_tokens = response.cache_creation_input_tokens
-            cache_read_input_tokens = response.cache_read_input_tokens
-
-        # Track model usage with token count
-        total_tokens = (input_tokens or 0) + (output_tokens or 0)
-        await self._track_model_usage(model_to_use, provider["name"], tokens=total_tokens)
-
-        await self._log_llm_call(
-            provider=provider["name"],
-            model=model_to_use,
+        await self._finalize_successful_invocation(
+            response,
+            provider["name"],
+            model_to_use,
+            path="get_response",
+            invocation_context=self._resolve_invocation_context(invocation_context),
             duration_ms=duration_ms,
-            success=True,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            response=response_text,
-            tool_calls=tool_calls_data,
-            metadata={"force_local_only": force_local_only},
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_creation_input_tokens=cache_creation_input_tokens,
-            cache_read_input_tokens=cache_read_input_tokens,
-            tools_used=tools is not None,
-            structured_output=response_format is not None,
-            cost=self._extract_provider_cost(response),
+            tools=tools,
+            response_format=response_format,
+            force_local_only=force_local_only,
         )
 
         # Return full LLMResponse if tools or structured output requested
@@ -3556,9 +3579,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 return response.content or ""
             return response
 
-    async def get_audit_response(self, text_to_audit: str) -> Dict[str, Any]:
+    async def get_audit_response(
+        self,
+        text_to_audit: str,
+        invocation_context: Optional[LLMInvocationContext] = None,
+    ) -> Dict[str, Any]:
         """Get a structured audit response from the normal provider chain."""
         self._check_policy()
+        invocation_context = self._resolve_invocation_context(invocation_context)
         if not self.providers:
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
@@ -3671,10 +3699,24 @@ No other text or formatting.
                     # tool pattern, OpenAI natively). The OpenAI-style format="json"
                     # string is silently ignored by the Anthropic adapter, which
                     # made every audit return malformed JSON → risk_level=3 (#2032).
+                    attempt_started = time.monotonic()
                     response = await provider["adapter"].get_response(
                         client=provider["client"],
                         model=effective_model,
                         messages=messages,
+                        response_format=AuditResult,
+                    )
+                    await self._finalize_successful_invocation(
+                        response,
+                        provider["name"],
+                        effective_model,
+                        path="get_audit_response",
+                        invocation_context=invocation_context,
+                        duration_ms=int(
+                            (time.monotonic() - attempt_started) * 1000
+                        ),
+                        system_prompt=system_prompt,
+                        user_prompt=text_to_audit,
                         response_format=AuditResult,
                     )
                     content = response.content if isinstance(response, LLMResponse) else response
@@ -3725,6 +3767,7 @@ No other text or formatting.
         response_format: Optional[Type[BaseModel]] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> Union[str, LLMResponse]:
         """Get a response from providers in priority order.
 
@@ -3741,6 +3784,7 @@ No other text or formatting.
         """
         self._check_policy()
         start_time = time.time()
+        invocation_context = self._resolve_invocation_context(invocation_context)
 
         if not self.providers:
             raise RuntimeError("No LLM providers initialized.")
@@ -3810,6 +3854,7 @@ No other text or formatting.
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
                         explicit_selection=explicit_selection,
+                        invocation_context=invocation_context,
                     )
                     if llm_span and isinstance(result, LLMResponse):
                         if result.input_tokens is not None:
@@ -3846,6 +3891,7 @@ No other text or formatting.
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     error_message=str(e),
+                    invocation_context=invocation_context,
                 )
 
                 if self._configured_routes_exhausted(
@@ -3876,10 +3922,13 @@ No other text or formatting.
         model_id: str,
         system_prompt: str,
         user_prompt: str,
-        auto_pull: bool = True
+        auto_pull: bool = True,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> str:
         """Get a response using a specific model."""
         self._check_policy()
+        invocation_context = self._resolve_invocation_context(invocation_context)
+        start_time = time.monotonic()
         provider_for_model = None
         for provider in self.providers:
             if provider["model"] == model_id or model_id in provider["model"]:
@@ -3920,11 +3969,16 @@ No other text or formatting.
                 extra_body=provider_cache_body(provider_for_model),
             )
 
-            # Track model usage with token count
-            total_tokens = 0
-            if isinstance(response, LLMResponse):
-                total_tokens = (response.input_tokens or 0) + (response.output_tokens or 0)
-            await self._track_model_usage(model_id, provider_for_model["name"], tokens=total_tokens)
+            await self._finalize_successful_invocation(
+                response,
+                provider_for_model["name"],
+                model_id,
+                path="get_response_with_model",
+                invocation_context=invocation_context,
+                duration_ms=int((time.monotonic() - start_time) * 1000),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
             logger.info(f"Success from {model_id}")
             return response
 
@@ -4022,6 +4076,7 @@ No other text or formatting.
         response_format: Optional[Type[BaseModel]] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> Union[str, LLMResponse]:
         """Generate text using the active backend with automatic fallback.
 
@@ -4043,6 +4098,8 @@ No other text or formatting.
             String content or LLMResponse (if tools/structured output)
         """
         self._check_policy()
+        invocation_context = self._resolve_invocation_context(invocation_context)
+        start_time = time.monotonic()
         with optional_span("agent.llm_call", {
             "llm.method": "generate",
             "llm.model": model_override or "",
@@ -4070,8 +4127,18 @@ No other text or formatting.
                         response_format=response_format,
                         cancel_token=cancel_token,
                     )
-                    self._stamp_response_identity(
-                        response, model=model, provider="remote_gpu",
+                    await self._finalize_successful_invocation(
+                        response,
+                        "remote_gpu",
+                        model,
+                        path="generate.remote_gpu",
+                        invocation_context=invocation_context,
+                        duration_ms=int((time.monotonic() - start_time) * 1000),
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        tools=tools,
+                        response_format=response_format,
+                        force_local_only=force_local_only,
                     )
                     if llm_span:
                         llm_span.set_attribute("llm.provider", "remote_gpu")
@@ -4108,6 +4175,7 @@ No other text or formatting.
                 response_format=response_format,
                 tool_executor=tool_executor,
                 cancel_token=cancel_token,
+                invocation_context=invocation_context,
             )
 
     async def generate_with_messages(
@@ -4122,6 +4190,7 @@ No other text or formatting.
         keep_trailing_system: bool = False,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> Union[str, LLMResponse]:
         """Generate using existing message list (for multi-turn tool calling).
 
@@ -4141,7 +4210,11 @@ No other text or formatting.
             String content or LLMResponse
         """
         self._check_policy()
-        start_time = time.time()
+        invocation_context = self._resolve_invocation_context(
+            invocation_context,
+            session_id=session_id,
+        )
+        start_time = time.monotonic()
         # Try remote GPU first when active AND routing isn't pinned — #734.
         if (
             self._backend == BackendType.REMOTE_GPU
@@ -4160,14 +4233,16 @@ No other text or formatting.
                     response_format=response_format,
                     cancel_token=cancel_token,
                 )
-                self._stamp_response_identity(
-                    response, model=model, provider="remote_gpu",
-                )
-                await self._meter_message_response(
-                    response, "remote_gpu", model,
-                    tools=tools, response_format=response_format,
+                await self._finalize_successful_invocation(
+                    response,
+                    "remote_gpu",
+                    model,
+                    path="generate_with_messages.remote_gpu",
+                    invocation_context=invocation_context,
+                    tools=tools,
+                    response_format=response_format,
                     force_local_only=force_local_only,
-                    duration_ms=int((time.time() - start_time) * 1000),
+                    duration_ms=int((time.monotonic() - start_time) * 1000),
                 )
                 if tools is not None or response_format is not None:
                     return response
@@ -4332,14 +4407,16 @@ No other text or formatting.
                     tool_executor=tool_executor,
                     cancel_token=cancel_token,
                 )
-                self._stamp_response_identity(
-                    response, model=model, provider=provider["name"],
-                )
-                await self._meter_message_response(
-                    response, provider["name"], model,
-                    tools=tools, response_format=response_format,
+                await self._finalize_successful_invocation(
+                    response,
+                    provider["name"],
+                    model,
+                    path="generate_with_messages",
+                    invocation_context=invocation_context,
+                    tools=tools,
+                    response_format=response_format,
                     force_local_only=force_local_only,
-                    duration_ms=int((time.time() - start_time) * 1000),
+                    duration_ms=int((time.monotonic() - start_time) * 1000),
                 )
                 if tools is not None or response_format is not None:
                     return response
