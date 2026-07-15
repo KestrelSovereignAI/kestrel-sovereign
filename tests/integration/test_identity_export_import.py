@@ -9,10 +9,11 @@ import pytest
 import pytest_asyncio
 import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 
 from kestrel_sovereign.identity import (
     AgentIdentityPackage,
+    IDENTITY_PACKAGE_VERSION,
     IdentityExporter,
     IdentityImporter,
     export_identity,
@@ -290,6 +291,134 @@ class TestIdentityExporter:
         assert package.export_timestamp is not None
 
     @pytest.mark.asyncio
+    async def test_raw_conversation_export_request_is_rejected_before_db_access(self):
+        """The legacy option must never imply that raw history was exported."""
+        exporter = IdentityExporter(object(), "did:key:privacy-contract")
+
+        with pytest.raises(ValueError, match="raw conversation history is never exported"):
+            await exporter.export(include_conversations=True)
+
+        with pytest.raises(ValueError, match="raw conversation history is never exported"):
+            await export_identity(
+                object(),
+                "did:key:privacy-contract",
+                include_conversations=True,
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_value", [None, 0, "false", []])
+    async def test_raw_conversation_export_option_rejects_non_booleans(
+        self,
+        invalid_value,
+    ):
+        """Falsy lookalikes cannot silently select the ordinary export path."""
+        exporter = IdentityExporter(object(), "did:key:privacy-contract")
+
+        with pytest.raises(TypeError, match="must be False"):
+            await exporter.export(include_conversations=invalid_value)
+
+    @pytest.mark.asyncio
+    async def test_default_and_legacy_false_preserve_payload_and_hash(
+        self,
+        populated_db,
+        monkeypatch,
+    ):
+        """The compatibility guard must not mutate ordinary package bytes."""
+        import kestrel_sovereign.identity.exporter as exporter_module
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 15, 20, 0, tzinfo=tz)
+
+        monkeypatch.setattr(exporter_module, "datetime", FrozenDateTime)
+        db, agent_id = populated_db
+        exporter = IdentityExporter(db, agent_id)
+
+        default_package = await exporter.export(
+            source_substrate=SubstrateType.UNKNOWN.value,
+        )
+        compatibility_package = await exporter.export(
+            include_conversations=False,
+            source_substrate=SubstrateType.UNKNOWN.value,
+        )
+
+        assert default_package.package_version == IDENTITY_PACKAGE_VERSION
+        assert compatibility_package.to_dict() == default_package.to_dict()
+        assert compatibility_package.content_hash == default_package.content_hash
+
+    @pytest.mark.asyncio
+    async def test_false_path_exports_only_bounded_calibration_examples(
+        self,
+        populated_db,
+    ):
+        """Conversation-derived calibration is bounded, not a raw-history field."""
+        db, agent_id = populated_db
+        private_turns = [
+            (
+                f"PRIVATE_USER_MARKER_{index} " + ("u" * 1_200),
+                f"PRIVATE_ASSISTANT_MARKER_{index} " + ("a" * 1_700),
+            )
+            for index in range(12)
+        ]
+        for user_turn, assistant_turn in private_turns:
+            for role, content in (
+                ("user", user_turn),
+                ("assistant", assistant_turn),
+            ):
+                await db.execute(
+                    """INSERT INTO conversation_history
+                       (agent_id, role, content, metadata, created_at)
+                       VALUES (?, ?, ?, '{}', '2026-07-15T20:00:00Z')""",
+                    (agent_id, role, content),
+                )
+        await db.commit()
+
+        package = await IdentityExporter(db, agent_id).export(
+            include_conversations=False,
+            source_substrate=SubstrateType.UNKNOWN.value,
+        )
+        payload = package.to_dict()
+
+        assert "conversations" not in payload
+        assert "conversation_history" not in payload
+        assert "messages" not in payload
+        assert not {
+            "conversations",
+            "conversation_history",
+            "messages",
+        }.intersection(AgentIdentityPackage.__dataclass_fields__)
+
+        examples = package.personality.calibration_examples
+        assert payload["personality"]["calibration_examples"] == examples
+        structured_examples = {
+            (example["input"], example["output"])
+            for example in examples
+        }
+        assert structured_examples <= {
+            (user_turn[:1_000], assistant_turn[:1_500])
+            for user_turn, assistant_turn in private_turns
+        }
+        assert len(examples) == len(structured_examples) == 10
+        assert all(len(example["input"]) == 1_000 for example in examples)
+        assert all(len(example["output"]) == 1_500 for example in examples)
+
+        rendered_prompt = package.system_prompt_template
+        for example in examples[:5]:
+            assert f"User: {example['input'][:300]}" in rendered_prompt
+            assert f"Response: {example['output'][:500]}" in rendered_prompt
+            assert example["input"][:301] not in rendered_prompt
+            assert example["output"][:501] not in rendered_prompt
+        for example in examples[5:]:
+            assert f"User: {example['input'][:300]}" not in rendered_prompt
+            assert f"Response: {example['output'][:500]}" not in rendered_prompt
+
+        package_json = package.to_json()
+        for user_turn, assistant_turn in private_turns:
+            assert user_turn not in package_json
+            assert assistant_turn not in package_json
+
+    @pytest.mark.asyncio
     async def test_export_includes_episodes(self, populated_db):
         """Test that export includes memory episodes."""
         db, agent_id = populated_db
@@ -494,7 +623,7 @@ class TestIdentityImporter:
         # Second import with replace mode
         sample_package.episodes[0]["title"] = "Updated Episode"
         importer2 = IdentityImporter(test_db)
-        result = await importer2.import_package(
+        await importer2.import_package(
             sample_package,
             verify_signature=False,
             allow_unsigned=True,
