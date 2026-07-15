@@ -27,6 +27,7 @@ from .models import (
     ComputeScript,
     ExecutionRecord,
     ScriptState,
+    calculate_risk_score as calculate_risk_score,  # compatibility re-export
 )
 from .presenters import (
     present_execution_history,

@@ -228,6 +228,14 @@ class TestModels:
         score = calculate_risk_score(findings)
         assert score == 100
 
+    def test_calculate_risk_score_reexported_from_feature_module(self):
+        """Regression (#2482): compute.feature keeps the public compatibility re-export."""
+        from kestrel_sovereign.features.compute.feature import (
+            calculate_risk_score as reexported,
+        )
+
+        assert reexported is calculate_risk_score
+
 
 # =============================================================================
 # Script Store Tests
