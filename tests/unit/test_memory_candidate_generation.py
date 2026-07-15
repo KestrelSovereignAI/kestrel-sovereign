@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import suppress
 from time import perf_counter
 from unittest.mock import AsyncMock, MagicMock
 
@@ -344,6 +346,7 @@ async def test_version_rotation_rebackfills_and_reclaims_obsolete_tokens(
         )
         found = await store.get_lexical_memory_candidates("kumquat", limit=5)
         assert result["indexed"] == 1
+        assert result["garbage_collected"] > 0
         assert marker[1] == "v1:keyed:rotated-test"
         assert orphan[0] == 0
         assert [row["content"] for row in found] == ["rotated kumquat fact"]
@@ -352,7 +355,69 @@ async def test_version_rotation_rebackfills_and_reclaims_obsolete_tokens(
 
 
 @pytest.mark.asyncio
-async def test_backfill_durable_count_does_not_trust_executemany_return(
+async def test_backfill_does_not_collect_an_in_flight_message_token_set(
+    tmp_path, monkeypatch
+):
+    """Token-first message writes are ownerless only until their row commits."""
+    monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
+    db_path = str(tmp_path / "backfill-provisional-token.db")
+    writer_db = await AsyncDatabase.sqlite(db_path)
+    backfill_db = await AsyncDatabase.sqlite(db_path)
+    writer = AsyncConversationStore(writer_db, agent_id="did:test:token-writer")
+    backfiller = AsyncConversationStore(backfill_db, agent_id="did:test:token-writer")
+    insert_reached = asyncio.Event()
+    resume_insert = asyncio.Event()
+    original_insert = writer._insert_message
+
+    async def pause_before_history_insert(**kwargs):
+        insert_reached.set()
+        await resume_insert.wait()
+        return await original_insert(**kwargs)
+
+    monkeypatch.setattr(writer, "_insert_message", pause_before_history_insert)
+    write_task = asyncio.create_task(
+        writer.add_conversation("user", "provisional lexical token owner")
+    )
+    try:
+        await asyncio.wait_for(insert_reached.wait(), timeout=5)
+        assert (
+            await writer_db.fetchval(
+                "SELECT COUNT(*) FROM conversation_lexical_tokens WHERE agent_id = ?",
+                (writer.agent_id,),
+            )
+            > 0
+        )
+
+        result = await backfiller.backfill_lexical_index(batch_size=1)
+        assert result["garbage_collected"] == 0
+        assert (
+            await writer_db.fetchval(
+                "SELECT COUNT(*) FROM conversation_lexical_tokens WHERE agent_id = ?",
+                (writer.agent_id,),
+            )
+            > 0
+        )
+
+        resume_insert.set()
+        await asyncio.wait_for(write_task, timeout=5)
+        marker = await writer_db.fetchone(
+            "SELECT lexical_index_id, lexical_index_version "
+            "FROM conversation_history WHERE agent_id = ?",
+            (writer.agent_id,),
+        )
+        found = await writer.get_lexical_memory_candidates("provisional", limit=5)
+        assert marker is not None and all(marker)
+        assert [row["content"] for row in found] == ["provisional lexical token owner"]
+    finally:
+        resume_insert.set()
+        with suppress(asyncio.CancelledError):
+            await write_task
+        await writer_db.close()
+        await backfill_db.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_durable_count_does_not_trust_write_return(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
@@ -364,13 +429,13 @@ async def test_backfill_durable_count_does_not_trust_executemany_return(
             "VALUES (?, 'user', ?)",
             [(store.agent_id, f"legacy {index}") for index in range(3)],
         )
-        real_execute_many = db.execute_many
+        real_execute = db.execute
 
-        async def misleading_execute_many(sql, params):
-            result = await real_execute_many(sql, params)
+        async def misleading_execute(sql, params=()):
+            result = await real_execute(sql, params)
             return 999 if sql.startswith("UPDATE conversation_history") else result
 
-        db.execute_many = misleading_execute_many
+        monkeypatch.setattr(db, "execute", misleading_execute)
         result = await store.backfill_lexical_index(batch_size=10)
 
         assert result["attempted"] == 3
