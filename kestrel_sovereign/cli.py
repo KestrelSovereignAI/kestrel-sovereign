@@ -186,22 +186,24 @@ def cmd_create(args) -> int:
 
     project_dir = _get_project_dir()
 
-    # inception_service no longer loads .env at import time (that leaked the
-    # current-directory key into os.environ and could encrypt with the wrong
-    # KESTREL_DATA_KEY — #2468). Resolve the *resolved target home's* effective
-    # data key deliberately, mirroring the wizard keys step: refuse a split
-    # brain (exported key A ⇄ persisted key B) before inception rather than
-    # encrypt with one key while the home persists another.
-    custody_error = _apply_target_data_key_custody(project_dir)
-    if custody_error:
-        print(custody_error, file=sys.stderr)
-        return 1
-
     name = args.name
     agent_data_dir = project_dir / "agent_data" / name
 
     if (agent_data_dir / "kestrel_prime.db").exists():
         print(f"Agent '{name}' already exists at {agent_data_dir}")
+        return 1
+
+    # inception_service no longer loads .env at import time (that leaked the
+    # current-directory key into os.environ and could encrypt with the wrong
+    # KESTREL_DATA_KEY — #2468). Resolve the *resolved target home's* effective
+    # data key deliberately, mirroring the wizard keys step: refuse a split
+    # brain (exported key A ⇄ persisted key B) before inception rather than
+    # encrypt with one key while the home persists another. This runs only
+    # after the already-exists guard — an existing agent aborts before any
+    # key resolution, since no inception (and no encryption) will occur.
+    custody_error = _apply_target_data_key_custody(project_dir)
+    if custody_error:
+        print(custody_error, file=sys.stderr)
         return 1
 
     # Pick up any [emancipation] block authored in kestrel.toml so the
