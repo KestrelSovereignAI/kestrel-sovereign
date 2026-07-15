@@ -56,7 +56,10 @@ jobs:
         run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
 
       - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+        run: uv python install ${{ env.PYTHON_VERSION }} 3.11
+
+      - name: Validate minimum-version Python syntax
+        run: uv run --no-project --python 3.11 python -m compileall -q kestrel_sovereign
 
       - name: Install dependencies
         run: uv sync
