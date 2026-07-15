@@ -22,7 +22,6 @@ import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +129,65 @@ def _cleanup_dataset_dir(dataset_dir: Path) -> None:
         dataset_dir.rmdir()
     except OSError:
         pass
+
+
+def _build_generation_script(
+    *,
+    model_path: Path,
+    lora_path: str,
+    output_path: Path,
+    prompt: str,
+    num_inference_steps: int,
+    guidance_scale: float,
+    width: int,
+    height: int,
+) -> tuple[str, str]:
+    """Return fixed child source and JSON data to pass as ``sys.argv[1]``."""
+    payload = json.dumps(
+        {
+            "model_path": str(model_path),
+            "lora_path": lora_path,
+            "output_path": str(output_path),
+            "prompt": prompt,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "width": width,
+            "height": height,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    script = """\
+import json
+import sys
+
+import torch
+from diffusers import StableDiffusionXLPipeline
+
+payload = json.loads(sys.argv[1])
+
+pipe = StableDiffusionXLPipeline.from_pretrained(
+    payload["model_path"],
+    torch_dtype=torch.float16,
+    use_safetensors=True,
+)
+pipe.load_lora_weights(payload["lora_path"])
+pipe.to("mps")
+
+image = pipe(
+    prompt=payload["prompt"],
+    negative_prompt="deformed, bad anatomy, missing limbs, extra limbs, missing arms, extra arms, missing fingers, extra fingers, mutated hands, blurry, low quality",
+    num_inference_steps=payload["num_inference_steps"],
+    guidance_scale=payload["guidance_scale"],
+    width=payload["width"],
+    height=payload["height"],
+    generator=torch.Generator(device="mps").manual_seed(42),
+).images[0]
+
+image.save(payload["output_path"])
+print("OK")
+"""
+    return script, payload
 
 
 class LocalMPSTrainingAdapter(TrainingProvider):
@@ -578,43 +636,32 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                     error=f"Diffusers Python not found: {diffusers_python}",
                 )
 
-            # Inline generation script — runs in the diffusers venv
-            script = f"""
-import torch, base64, sys
-from diffusers import StableDiffusionXLPipeline
-
-pipe = StableDiffusionXLPipeline.from_pretrained(
-    "{self.model_path}",
-    torch_dtype=torch.float16,
-    use_safetensors=True,
-)
-pipe.load_lora_weights("{lora_path}")
-pipe.to("mps")
-
-image = pipe(
-    prompt="{prompt.replace('"', '\\"')}",
-    negative_prompt="deformed, bad anatomy, missing limbs, extra limbs, missing arms, extra arms, missing fingers, extra fingers, mutated hands, blurry, low quality",
-    num_inference_steps={num_inference_steps},
-    guidance_scale={guidance_scale},
-    width={width},
-    height={height},
-    generator=torch.Generator(device="mps").manual_seed(42),
-).images[0]
-
-image.save("{output_path}")
-print("OK")
-"""
+            # Keep executable source fixed; pass every dynamic value as JSON data.
+            script, payload = _build_generation_script(
+                model_path=self.model_path,
+                lora_path=lora_path,
+                output_path=output_path,
+                prompt=prompt,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                width=width,
+                height=height,
+            )
             logger.info(f"Generating selfie via subprocess: {prompt[:60]}...")
             start_time = time.monotonic()
 
             process = await asyncio.create_subprocess_exec(
-                diffusers_python, "-c", script,
+                diffusers_python,
+                "-c",
+                script,
+                payload,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "TOKENIZERS_PARALLELISM": "false"},
             )
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=300,
+                process.communicate(),
+                timeout=300,
             )
 
             elapsed = time.monotonic() - start_time
