@@ -26,8 +26,10 @@ def classify_heartbeat_response(result_body: Any) -> HeartbeatResponseClassifica
     """Classify a heartbeat response without applying presentation limits.
 
     Empty responses and a standalone ``HEARTBEAT_OK`` sentinel are routine
-    all-clears. Any content remaining beside the sentinel is an alert, as is
-    any non-empty response without the sentinel.
+    all-clears. Residue containing only whitespace or ASCII punctuation is
+    treated as a presentation wrapper and remains all-clear. Any substantive
+    content remaining beside the sentinel is an alert, as is any non-empty
+    response without the sentinel.
     """
     if result_body is None:
         return HeartbeatResponseClassification(is_all_clear=True)

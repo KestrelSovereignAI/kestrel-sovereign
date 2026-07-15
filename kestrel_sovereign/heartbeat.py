@@ -57,6 +57,10 @@ class HeartbeatConfig:
     timezone: str = "UTC"
     heartbeat_file: str = "HEARTBEAT.md"
     target: str = "log"       # "log", "last_session", "none"
+    # Compatibility no-op: exact all-clears are always suppressed by the
+    # canonical classifier. Retain the shipped constructor/config surface
+    # until an explicit deprecation cycle removes it.
+    suppress_ok: bool = True
 
     @classmethod
     def from_config(cls) -> "HeartbeatConfig":
@@ -83,6 +87,7 @@ class HeartbeatConfig:
             timezone=cfg.get("timezone", "UTC"),
             heartbeat_file=cfg.get("heartbeat_file", "HEARTBEAT.md"),
             target=cfg.get("target", "log"),
+            suppress_ok=cfg.get("suppress_ok", True),
         )
 
 

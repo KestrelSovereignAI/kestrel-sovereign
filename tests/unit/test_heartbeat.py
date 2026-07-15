@@ -64,6 +64,11 @@ class TestHeartbeatConfig:
         assert cfg.interval_seconds == 1800
         assert cfg.timezone == "UTC"
         assert cfg.target == "log"
+        assert cfg.suppress_ok is True
+
+    def test_explicit_false_suppress_ok_remains_constructor_compatible(self):
+        cfg = HeartbeatConfig(suppress_ok=False)
+        assert cfg.suppress_ok is False
 
     @patch("kestrel_sovereign.heartbeat.load_section")
     def test_from_config_enabled(self, mock_load):
@@ -74,12 +79,14 @@ class TestHeartbeatConfig:
             "active_hours_end": "22:00",
             "timezone": "America/New_York",
             "target": "last_session",
+            "suppress_ok": False,
         }
         cfg = HeartbeatConfig.from_config()
         assert cfg.enabled is True
         assert cfg.interval_seconds == 900  # 15 minutes
         assert cfg.active_hours_start == "09:00"
         assert cfg.timezone == "America/New_York"
+        assert cfg.suppress_ok is False
 
     @patch("kestrel_sovereign.heartbeat.load_section")
     def test_from_config_empty(self, mock_load):
@@ -237,6 +244,20 @@ class TestHeartbeatRunner:
         assert result.message is None
         assert result.duration_ms >= 0
         mock_agent.process_input.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_suppress_ok_false_remains_behaviorally_inert(self, mock_agent):
+        config = HeartbeatConfig(
+            enabled=True,
+            interval_seconds=60,
+            suppress_ok=False,
+        )
+        runner = HeartbeatRunner(mock_agent, config)
+
+        result = await runner.run_once()
+
+        assert result.status == "ok"
+        assert result.message is None
 
     @pytest.mark.asyncio
     async def test_run_once_alert(self, mock_agent, default_config):
