@@ -766,15 +766,16 @@ async def create_kestrel_identity_async(
         constitution_path = DEFAULT_CONSTITUTION_PATH
 
     try:
-        with open(constitution_path, "rb") as f:
-            constitution_content = f.read()
+        # Resolve the governing bytes through the SINGLE production resolver
+        # (#2463) so inception anchors exactly what verification later recomputes.
+        from kestrel_sovereign.constitution.resolver import (
+            resolve_governing_constitution_bytes,
+        )
+        constitution_content = resolve_governing_constitution_bytes(
+            emancipation_contract,
+            constitution_path=constitution_path,
+        )
         if emancipation_contract is not None and emancipation_contract.enabled:
-            from kestrel_sovereign.constitution.emancipation import apply_emancipation
-            rendered = apply_emancipation(
-                constitution_content.decode("utf-8"),
-                emancipation_contract,
-            )
-            constitution_content = rendered.encode("utf-8")
             logging.info(
                 "Amendment VIII activated for this agent — anchoring "
                 "Sovereign-authored Emancipation Contract."

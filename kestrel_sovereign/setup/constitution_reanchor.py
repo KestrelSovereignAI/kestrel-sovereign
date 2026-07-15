@@ -40,11 +40,13 @@ from pathlib import Path
 from kestrel_sovereign.constitution.emancipation import (
     EmancipationConfigError,
     EmancipationContract,
-    apply_emancipation,
     check_iron_rule,
     contract_from_json,
     contract_to_json,
     parse_emancipation_block,
+)
+from kestrel_sovereign.constitution.resolver import (
+    resolve_governing_constitution_bytes,
 )
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
 
@@ -135,8 +137,10 @@ async def reanchor_constitution(
             error=f"Agent database not found at {db_path}",
         )
 
+    # Pre-flight the canonical source so an unreadable path returns a clean
+    # ReanchorResult error rather than blowing up inside the resolver below.
     try:
-        canonical_bytes = canonical_path.read_bytes()
+        canonical_path.read_bytes()
     except OSError as exc:
         return ReanchorResult(
             agent_name=agent_name,
@@ -212,13 +216,15 @@ async def reanchor_constitution(
         anchored_contract is not None and anchored_contract.enabled
     ) else candidate_contract
 
-    if effective_contract is not None and effective_contract.enabled:
-        new_content = apply_emancipation(
-            canonical_bytes.decode("utf-8"),
-            effective_contract,
-        ).encode("utf-8")
-    else:
-        new_content = canonical_bytes
+    # Route through the single production resolver (#2463) so reanchor produces
+    # byte-identical governing content to inception + verification, pointed at
+    # the same ``canonical_path``.
+    new_content = resolve_governing_constitution_bytes(
+        effective_contract if (
+            effective_contract is not None and effective_contract.enabled
+        ) else None,
+        constitution_path=str(canonical_path),
+    )
 
     new_hash = hashlib.sha256(new_content).hexdigest()
 

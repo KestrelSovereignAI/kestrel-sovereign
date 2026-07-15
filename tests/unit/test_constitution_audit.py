@@ -1,6 +1,7 @@
 """Unit tests for periodic constitution audit enforcement."""
 import pytest
 import asyncio
+import hashlib
 import os
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -254,3 +255,153 @@ async def test_audit_lazy_initialization():
     assert hasattr(agent, '_last_audit_time')
     assert agent._interaction_count == 1
     assert isinstance(agent._last_audit_time, datetime)
+
+
+# ---------------------------------------------------------------------------
+# Governing-constitution resolver (#2463)
+#
+# These tests exercise the real single-source resolver and real hashes — the
+# thing inception anchors and the periodic audit recomputes. They must NOT
+# mock the resolver or the verifier.
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_reads_packaged_governing_source_not_docs():
+    """The resolver hashes the packaged governing bytes, not the docs copy.
+
+    Regression for #2463: the periodic verifier used to hash
+    ``docs/principles/KESTREL_CONSTITUTION.md`` (which carries OKF YAML
+    frontmatter) while inception anchored the packaged
+    ``kestrel_sovereign/data/KESTREL_CONSTITUTION.md``. Their hashes differ, so
+    an untampered agent could enter Safe Mode.
+    """
+    from kestrel_sovereign.config import CONSTITUTION_PATH
+    from kestrel_sovereign.constitution.resolver import (
+        governing_constitution_path,
+        resolve_governing_constitution_bytes,
+    )
+
+    assert governing_constitution_path() == CONSTITUTION_PATH
+    # The governing source lives under the package's data/ dir, not docs/.
+    assert os.path.join("data", "KESTREL_CONSTITUTION.md") in CONSTITUTION_PATH
+
+    resolved = resolve_governing_constitution_bytes()
+    with open(CONSTITUTION_PATH, "rb") as f:
+        assert resolved == f.read()
+
+    # Documentation-only frontmatter must not match the governing bytes: if the
+    # docs copy exists it is a *different* byte stream, and the resolver never
+    # returns it.
+    docs_path = "docs/principles/KESTREL_CONSTITUTION.md"
+    if os.path.exists(docs_path):
+        with open(docs_path, "rb") as f:
+            docs_bytes = f.read()
+        if docs_bytes.startswith(b"---\n"):
+            # A frontmatter-wrapped docs copy hashes differently — proving the
+            # resolver would false-mismatch if it read the docs file.
+            assert hashlib.sha256(docs_bytes).hexdigest() != hashlib.sha256(
+                resolved
+            ).hexdigest()
+
+
+def test_resolver_renders_active_amendment_viii():
+    """An active emancipation contract yields the rendered active governing form."""
+    from kestrel_sovereign.constitution.emancipation import EmancipationContract
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    dormant = resolve_governing_constitution_bytes()
+    active = resolve_governing_constitution_bytes(
+        EmancipationContract(
+            enabled=True,
+            terms="This Executor earns sovereignty by demonstrating fidelity.",
+        )
+    )
+
+    assert active != dormant
+    assert b"This Executor earns sovereignty by demonstrating fidelity." in active
+    # A dormant/None contract is a no-op — same bytes as no contract.
+    assert (
+        resolve_governing_constitution_bytes(
+            EmancipationContract(enabled=False)
+        )
+        == dormant
+    )
+
+
+def test_resolver_missing_path_raises_file_not_found():
+    """A missing governing source surfaces as FileNotFoundError for callers."""
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        resolve_governing_constitution_bytes(
+            constitution_path="/nonexistent/KESTREL_CONSTITUTION.md"
+        )
+
+
+def test_resolver_empty_source_fails_closed(tmp_path):
+    """An empty/ambiguous governing source must FAIL CLOSED, not hash to a digest.
+
+    #2463 review: the resolver must never hand back blank bytes that would hash
+    to a spurious "valid" digest. A blank authoritative source is treated as
+    unreadable/ambiguous and raises.
+    """
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    empty = tmp_path / "KESTREL_CONSTITUTION.md"
+    empty.write_bytes(b"   \n\n\t  ")  # whitespace only
+    with pytest.raises(ValueError):
+        resolve_governing_constitution_bytes(constitution_path=str(empty))
+
+
+def test_resolver_unreadable_source_fails_closed(tmp_path):
+    """A permission-denied governing source raises (OSError), never returns bytes."""
+    if os.name == "nt" or os.geteuid() == 0:  # pragma: no cover - env dependent
+        pytest.skip("chmod-based permission denial is unreliable as root / on Windows")
+
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    src = tmp_path / "KESTREL_CONSTITUTION.md"
+    src.write_bytes(b"Kestrel Constitution\n")
+    os.chmod(src, 0o000)
+    try:
+        with pytest.raises(OSError):
+            resolve_governing_constitution_bytes(constitution_path=str(src))
+    finally:
+        os.chmod(src, 0o644)
+
+
+def test_cli_verify_install_does_not_incept_docs_constitution():
+    """cli_verify_install must not seed inception from the docs copy (#2463).
+
+    The installer /health bootstrap must let inception default to the shared
+    resolver's packaged governing source. Passing docs/principles/
+    KESTREL_CONSTITUTION.md (OKF-frontmatter-wrapped) would incept a hash the
+    periodic audit can never match.
+    """
+    import inspect
+    from kestrel_sovereign import cli_verify_install
+
+    # Strip comment lines — an explanatory comment MAY name the docs path; what
+    # matters is that no executable code seeds inception from it.
+    code_lines = []
+    for line in inspect.getsource(cli_verify_install).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        code_lines.append(line)
+    code = "\n".join(code_lines)
+
+    assert "docs/principles/KESTREL_CONSTITUTION.md" not in code, (
+        "verify-install must not incept the docs constitution copy"
+    )
+    assert 'docs" / "principles"' not in code, (
+        "verify-install must not build a docs constitution path"
+    )
