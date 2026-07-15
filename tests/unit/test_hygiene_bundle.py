@@ -173,13 +173,9 @@ class TestSpawnCaps:
 
 
 # ---------------------------------------------------------------------------
-# subprocess imported at module top (NameError in except clauses)
+# subprocess imported at module top where its exception hierarchy is referenced
 # ---------------------------------------------------------------------------
 class TestSubprocessImports:
-    def test_local_executor_imports_subprocess(self):
-        import kestrel_sovereign.features.compute.executors.local_executor as m
-        assert hasattr(m, "subprocess")
-
     def test_docker_executor_imports_subprocess(self):
         import kestrel_sovereign.features.compute.executors.docker_executor as m
         assert hasattr(m, "subprocess")
