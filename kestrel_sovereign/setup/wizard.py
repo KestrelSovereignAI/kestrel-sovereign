@@ -53,6 +53,14 @@ def run_wizard(
         for name, step_fn in ORDERED:
             ctx.prompter.info(f"\n— {name} —")
             step_fn(ctx)
+            if ctx.halted:
+                # A step (e.g. ``keys`` on a KESTREL_DATA_KEY custody conflict)
+                # declared the whole workflow unsafe to continue. Stop before any
+                # later, key-dependent step mutates state under it (#2468).
+                ctx.prompter.info(
+                    f"\nHalting setup — {ctx.halt_reason}"
+                )
+                break
 
     if ctx.flow is not Flow.CHECK:
         _print_summary(ctx)

@@ -222,21 +222,54 @@ def test_keys_existing_target_key_becomes_effective(tmp_path, monkeypatch):
     assert read_env(tmp_path / ".env")["KESTREL_DATA_KEY"] == target
 
 
-def test_keys_invalid_target_key_blocks(tmp_path):
-    """Corrupted persisted key material must fail before identity creation.
+def test_keys_passphrase_with_spaces_preserved_exactly(tmp_path, monkeypatch):
+    """A passphrase KESTREL_DATA_KEY with internal spaces is legitimate and must
+    round-trip **byte-for-byte** (#2468).
 
-    A passphrase is accepted (PBKDF2), so "invalid" here means material that
-    embeds whitespace/control characters — a corruption signal that would also
-    break the single-line ``.env`` format.
+    ``SecureKeyStorage`` runs PBKDF2 over the exact UTF-8 bytes, so stripping or
+    normalizing the value would derive a different key than the next boot. The
+    key is quoted in ``.env`` and read back — via the runtime parser — unchanged.
     """
-    write_env(tmp_path / ".env", {"KESTREL_DATA_KEY": "broken key with spaces"})
+    passphrase = "correct horse battery staple"
+    write_env(tmp_path / ".env", {"KESTREL_DATA_KEY": passphrase})
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    keys.run(ctx)
+
+    # Not blocked, not regenerated, not stripped.
+    assert not any("KESTREL_DATA_KEY" in b for b in ctx.blockers)
+    assert keys.read_persisted_data_key(tmp_path / ".env") == passphrase
+    # Encrypt-key == persist-key, verbatim.
+    assert os.environ["KESTREL_DATA_KEY"] == passphrase
+
+
+def test_keys_invalid_exported_key_with_control_char_blocks(tmp_path, monkeypatch):
+    """Genuinely corrupt material — a value carrying a control character that
+    cannot survive a single-line ``.env`` round-trip — must fail closed before
+    inception (#2468) and never be persisted."""
+    monkeypatch.setenv("KESTREL_DATA_KEY", "line1\nline2")
 
     ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
     keys.run(ctx)
 
     assert any("not a valid master key" in b for b in ctx.blockers)
-    # Never regenerates a present (even if corrupted) key.
-    assert read_env(tmp_path / ".env")["KESTREL_DATA_KEY"] == "broken key with spaces"
+    # Nothing corrupt was written to the target home.
+    assert keys.read_persisted_data_key(tmp_path / ".env") in (None, "")
+
+
+def test_keys_check_mode_blocks_invalid_persisted_key(tmp_path):
+    """CHECK must validate the persisted key through the same parser +
+    validation setup uses — not mere presence (#2468). A value carrying a
+    control character is reported as invalid, not silently 'present'."""
+    # Write a control character directly (bypassing write_env's quoting) so the
+    # persisted line is genuinely corrupt on disk.
+    (tmp_path / ".env").write_text('KESTREL_DATA_KEY="bad\x07key"\n', encoding="utf-8")
+
+    ctx = _make_ctx(tmp_path, Flow.CHECK)
+    keys.run(ctx)
+
+    assert any("not a valid master key" in b for b in ctx.blockers)
 
 
 def test_keys_idempotent_when_everything_set(tmp_path):
