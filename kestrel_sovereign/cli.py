@@ -79,6 +79,65 @@ def _get_project_dir() -> Path:
     return project_dir()
 
 
+def _load_target_env(project_dir: Path, *, exclude: tuple[str, ...] = ()) -> None:
+    """Load the resolved project home's ``.env`` into ``os.environ``.
+
+    Target-aware replacement for the import-time ``load_dotenv()`` that
+    ``inception_service`` used to run (which loaded the *current-directory*
+    ``.env`` and could seed the wrong ``KESTREL_DATA_KEY`` — #2468). Uses
+    python-dotenv's own parser (``dotenv_values``) — the same one the runtime
+    uses — and ``setdefault`` semantics so a genuinely-exported value stays
+    authoritative (equivalent to ``load_dotenv(override=False)``).
+
+    ``exclude`` names keys to skip. The data key is excluded when this runs
+    *before* custody resolution so that seeding the persisted value into
+    ``os.environ`` cannot mask an exported⇄persisted conflict (#2468).
+    """
+    env_path = project_dir / ".env"
+    if not env_path.exists():
+        return
+    from dotenv import dotenv_values
+
+    for key, value in dotenv_values(str(env_path)).items():
+        if value is None or key in exclude:
+            continue
+        os.environ.setdefault(key, value)
+
+
+def _apply_target_data_key_custody(project_dir: Path) -> Optional[str]:
+    """Resolve the single effective ``KESTREL_DATA_KEY`` for this target home
+    and make it authoritative in the process, mirroring the wizard ``keys`` step
+    (#2468).
+
+    Used by the CLI paths that can reach inception **without** running the keys
+    step — chiefly ``kestrel create`` (never runs it). It previously relied on
+    the import-time ``load_dotenv()`` in ``inception_service``; with that removed
+    it lost all ``.env`` awareness, so inception could fail or encrypt with the
+    wrong key.
+
+    Loads the target home's non-key environment first (so an existing
+    ``KESTREL_DID_WEB_DOMAIN`` etc. is honored, not overwritten) — but *excludes*
+    the data key from that pre-load so a stale persisted value can't mask an
+    exported⇄persisted conflict — then funnels the data key through the shared
+    ``ensure_effective_data_key`` primitive: it persists (round-trip-verified)
+    and exports the one effective key, generating a fresh one if the home has
+    none. Returns an error message to refuse on (conflict / invalid / non
+    round-trippable material) — the same custody block the keys step raises — or
+    ``None`` on success, at which point ``os.environ[KESTREL_DATA_KEY]`` holds
+    exactly the key persisted in the target ``.env`` (encrypt-key == persist-key).
+    """
+    from kestrel_sovereign.setup.steps.keys import (
+        DATA_KEY_ENV,
+        ensure_effective_data_key,
+    )
+
+    _load_target_env(project_dir, exclude=(DATA_KEY_ENV,))
+    _, conflict, _, _ = ensure_effective_data_key(
+        project_dir / ".env", generate_if_missing=True
+    )
+    return conflict
+
+
 def cmd_list(args) -> int:
     """List all agents in multi_agent."""
     project_dir = _get_project_dir()
@@ -116,11 +175,25 @@ def cmd_create(args) -> int:
     from kestrel_sovereign.setup.toml_file import read_toml
 
     project_dir = _get_project_dir()
+
     name = args.name
     agent_data_dir = project_dir / "agent_data" / name
 
     if (agent_data_dir / "kestrel_prime.db").exists():
         print(f"Agent '{name}' already exists at {agent_data_dir}")
+        return 1
+
+    # inception_service no longer loads .env at import time (that leaked the
+    # current-directory key into os.environ and could encrypt with the wrong
+    # KESTREL_DATA_KEY — #2468). Resolve the *resolved target home's* effective
+    # data key deliberately, mirroring the wizard keys step: refuse a split
+    # brain (exported key A ⇄ persisted key B) before inception rather than
+    # encrypt with one key while the home persists another. This runs only
+    # after the already-exists guard — an existing agent aborts before any
+    # key resolution, since no inception (and no encryption) will occur.
+    custody_error = _apply_target_data_key_custody(project_dir)
+    if custody_error:
+        print(custody_error, file=sys.stderr)
         return 1
 
     # Pick up any [emancipation] block authored in kestrel.toml so the
@@ -1160,6 +1233,20 @@ def cmd_setup(args) -> int:
         reset=args.reset,
         is_test_instance=is_test_instance,
     )
+
+    # Load the target home's *non-key* environment before the wizard runs so an
+    # existing home's config (e.g. KESTREL_DID_WEB_DOMAIN=agents.example.com) is
+    # honored instead of being ignored and defaulted to localhost (#2468).
+    # Deliberately excludes KESTREL_DATA_KEY — its custody is resolved by the
+    # keys/agent step so an exported⇄persisted conflict is still detected — and
+    # is skipped entirely under --reset (which regenerates config from scratch)
+    # and CHECK (read-only). Inception itself no longer loads .env at import
+    # time, so this is the sole target-aware load for the wizard path.
+    if not args.reset and flow is not Flow.CHECK:
+        from kestrel_sovereign.setup.steps.keys import DATA_KEY_ENV
+
+        _load_target_env(project_dir, exclude=(DATA_KEY_ENV,))
+
     return run_wizard(ctx, only_step=args.step)
 
 

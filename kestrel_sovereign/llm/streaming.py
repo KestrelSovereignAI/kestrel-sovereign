@@ -19,6 +19,7 @@ through the list, but the fallback happens in server logs, not by
 injecting a ``[Provider X unavailable, trying next...]`` note into the
 chat stream where it corrupts the agent's response.
 """
+import asyncio
 import logging
 import time
 from typing import (
@@ -32,6 +33,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    TYPE_CHECKING,
     Union,
     Type,
     AsyncIterator,
@@ -39,13 +41,26 @@ from typing import (
 
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ProviderCapabilities, StructuredOutputMode, ToolCallStarted
+from kestrel_sdk.llm import (
+    LLMAdapter,
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolCallStarted,
+)
 
-from .adapter import LLMResponse, ThinkingDelta, messages_for
+from .adapter import (
+    LLMResponse,
+    ThinkingDelta,
+    messages_for,
+    response_usage_available,
+)
 from .cancellation import CancelToken
 from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
 from .provider_registry import provider_cache_body
+
+if TYPE_CHECKING:
+    from .invocation_context import LLMInvocationContext
 
 logger = logging.getLogger(__name__)
 
@@ -754,6 +769,27 @@ class StreamingMixin:
         except Exception:  # noqa: BLE001 - cost is best-effort
             return None
 
+    @staticmethod
+    def _adapter_has_usage_stream(adapter: Any) -> bool:
+        """Whether ``adapter`` implements the usage-bearing stream contract.
+
+        ``hasattr`` is insufficient because the SDK base class deliberately
+        exposes a ``NotImplementedError`` stub.  Instance overrides are also
+        recognized so tests and third-party adapters can supply the contract
+        without manufacturing a subclass.
+        """
+
+        namespace = getattr(adapter, "__dict__", {})
+        if "get_streaming_response_with_tools" in namespace:
+            return callable(namespace["get_streaming_response_with_tools"])
+        implementation = getattr(
+            type(adapter), "get_streaming_response_with_tools", None
+        )
+        return (
+            implementation is not None
+            and implementation is not LLMAdapter.get_streaming_response_with_tools
+        )
+
     async def _record_streamed_usage(
         self,
         response: Any,
@@ -762,8 +798,14 @@ class StreamingMixin:
         *,
         duration_ms: int,
         partial: bool = False,
+        path: str = "stream_with_tool_detection",
+        success: bool = True,
+        error_message: Optional[str] = None,
+        usage_available: Optional[bool] = None,
+        publish_identity: bool = True,
+        invocation_context: Optional["LLMInvocationContext"] = None,
     ) -> None:
-        """Meter a streamed turn from its terminal :class:`LLMResponse`.
+        """Finalize one streamed provider attempt from honest usage evidence.
 
         The streaming path never reached ``_track_model_usage`` /
         ``_log_llm_call`` (the non-streaming chokepoint), so every streamed
@@ -778,33 +820,294 @@ class StreamingMixin:
         """
         if not isinstance(response, LLMResponse):
             return
+        metadata = {"streamed": True, "path": path}
+        if partial:
+            metadata["partial_abort"] = True
+        if usage_available is None:
+            usage_available = response_usage_available(response)
+        if not usage_available:
+            metadata["usage_available"] = False
+
+        # The full service owns a single finalization boundary.  The supplied
+        # invocation context is already frozen at public API entry; deliberately
+        # do not call the resolver here after the provider await.
+        finalizer = getattr(self, "_finalize_invocation", None)
+        if finalizer is not None and invocation_context is not None:
+            try:
+                await finalizer(
+                    response,
+                    provider_name,
+                    model,
+                    success=success,
+                    path=path,
+                    invocation_context=invocation_context,
+                    duration_ms=duration_ms,
+                    metadata=metadata,
+                    tools_used=bool(getattr(response, "tool_calls", None)),
+                    error_message=error_message,
+                    publish_identity=publish_identity,
+                    usage_available=usage_available,
+                    track_model_usage=bool(usage_available),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
+                logger.warning("Failed to record streamed usage: %s", exc)
+            return
+
+        # Compatibility for StreamingMixin-only consumers and test fakes.
+        input_tokens = response.input_tokens
+        output_tokens = response.output_tokens
+        tracker = getattr(self, "_track_model_usage", None)
+        if tracker is not None and usage_available:
+            try:
+                total_tokens = (input_tokens or 0) + (output_tokens or 0)
+                await tracker(model, provider_name, tokens=total_tokens)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - independent test-fake sink
+                logger.warning("Failed to track streamed usage: %s", exc)
+
+        call_logger = getattr(self, "_log_llm_call", None)
+        if call_logger is not None:
+            try:
+                await call_logger(
+                    provider=provider_name,
+                    model=model,
+                    duration_ms=duration_ms,
+                    success=success,
+                    error_message=error_message,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_creation_input_tokens=getattr(
+                        response, "cache_creation_input_tokens", None
+                    ),
+                    cache_read_input_tokens=getattr(
+                        response, "cache_read_input_tokens", None
+                    ),
+                    tools_used=bool(getattr(response, "tool_calls", None)),
+                    metadata=metadata,
+                    cost=self._streamed_call_cost(response),
+                    usage_available=usage_available,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
+                logger.warning("Failed to log streamed usage: %s", exc)
+
+    async def _stream_adapter_with_usage(
+        self,
+        *,
+        adapter: Any,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        provider_name: str,
+        path: str,
+        invocation_context: Optional["LLMInvocationContext"],
+        expose_protocol_events: bool,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None,
+        session_id: Optional[str] = None,
+        keep_trailing_system: bool = False,
+        tool_executor: Optional[
+            Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+        ] = None,
+        cancel_token: Optional[CancelToken] = None,
+    ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
+        """The sole adapter streaming leaf and attempt-finalization boundary.
+
+        In-tree adapters expose token usage on their tool-aware stream even for
+        text-only turns.  Public plain-stream APIs consume the same stream but
+        hide its terminal protocol response, preserving their historical return
+        shape.  A third-party basic stream remains supported; it records an
+        explicit ``usage_available=false`` attempt instead of inventing zero
+        tokens or silently skipping telemetry.
+        """
+
+        common_kwargs: Dict[str, Any] = {}
+        if extra_body:
+            common_kwargs["extra_body"] = extra_body
+        if session_id:
+            common_kwargs["session_id"] = session_id
+        if keep_trailing_system:
+            common_kwargs["keep_trailing_system"] = True
+        if tool_executor is not None:
+            common_kwargs["tool_executor"] = tool_executor
+        if cancel_token is not None:
+            common_kwargs["cancel_token"] = cancel_token
+
+        usage_sink: Dict[str, Any] = {}
+        use_usage_stream = self._adapter_has_usage_stream(adapter)
+        usage_kwargs = dict(common_kwargs)
+        if system_prompt is not None:
+            usage_kwargs["system_prompt"] = system_prompt
+        if (
+            use_usage_stream
+            and getattr(adapter, "supports_partial_usage_flush", False) is True
+        ):
+            usage_kwargs["usage_sink"] = usage_sink
+
+        started = time.monotonic()
+        final_response: Optional[LLMResponse] = None
+        completed = False
+        emitted = False
+        failure: Optional[BaseException] = None
+
+        async def forward(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
+            nonlocal emitted, final_response
+            async for item in stream:
+                emitted = True
+                if isinstance(item, LLMResponse):
+                    final_response = item
+                    # Identity must be available before a consumer chooses to
+                    # stop immediately after the terminal protocol event.
+                    self._stamp_response_identity(
+                        item, model=model, provider=provider_name
+                    )
+                    if expose_protocol_events:
+                        yield item
+                    continue
+                if isinstance(item, ToolCallStarted) and not expose_protocol_events:
+                    continue
+                yield item
+
         try:
-            input_tokens = response.input_tokens
-            output_tokens = response.output_tokens
-            total_tokens = (input_tokens or 0) + (output_tokens or 0)
-            await self._track_model_usage(model, provider_name, tokens=total_tokens)
-            metadata = {"streamed": True}
-            if partial:
-                metadata["partial_abort"] = True
-            await self._log_llm_call(
-                provider=provider_name,
-                model=model,
-                duration_ms=duration_ms,
-                success=True,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cache_creation_input_tokens=getattr(
-                    response, "cache_creation_input_tokens", None
-                ),
-                cache_read_input_tokens=getattr(
-                    response, "cache_read_input_tokens", None
-                ),
-                tools_used=bool(getattr(response, "tool_calls", None)),
-                metadata=metadata,
-                cost=self._streamed_call_cost(response),
+            if use_usage_stream:
+                try:
+                    stream = adapter.get_streaming_response_with_tools(
+                        client=client,
+                        model=model,
+                        messages=messages,
+                        tools=tools,
+                        response_format=response_format,
+                        **usage_kwargs,
+                    )
+                    async for item in forward(stream):
+                        yield item
+                except NotImplementedError:
+                    # A dynamic third-party adapter can still expose the SDK
+                    # stub.  Falling back is safe only before any output escaped.
+                    if emitted:
+                        raise
+                    use_usage_stream = False
+
+            if not use_usage_stream:
+                stream = adapter.get_streaming_response(
+                    client=client,
+                    model=model,
+                    messages=messages,
+                    response_format=response_format,
+                    **common_kwargs,
+                )
+                async for item in forward(stream):
+                    yield item
+            completed = True
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if final_response is not None:
+                await self._record_streamed_usage(
+                    final_response,
+                    model,
+                    provider_name,
+                    duration_ms=duration_ms,
+                    path=path,
+                    # The terminal response was stamped before it was exposed.
+                    publish_identity=False,
+                    invocation_context=invocation_context,
+                )
+            elif usage_sink:
+                # Preserve the existing partial-usage billing behavior.  The
+                # metadata makes clear that the stream itself did not finish.
+                await self._record_streamed_usage(
+                    LLMResponse(
+                        input_tokens=usage_sink.get("input_tokens"),
+                        output_tokens=usage_sink.get("output_tokens"),
+                    ),
+                    model,
+                    provider_name,
+                    duration_ms=duration_ms,
+                    partial=True,
+                    path=path,
+                    publish_identity=False,
+                    invocation_context=invocation_context,
+                )
+            elif completed:
+                await self._record_streamed_usage(
+                    LLMResponse(),
+                    model,
+                    provider_name,
+                    duration_ms=duration_ms,
+                    path=path,
+                    usage_available=False,
+                    publish_identity=True,
+                    invocation_context=invocation_context,
+                )
+            elif failure is not None and not isinstance(
+                failure, (asyncio.CancelledError, GeneratorExit)
+            ):
+                await self._record_streamed_usage(
+                    LLMResponse(),
+                    model,
+                    provider_name,
+                    duration_ms=duration_ms,
+                    path=path,
+                    success=False,
+                    error_message=str(failure),
+                    usage_available=False,
+                    publish_identity=False,
+                    invocation_context=invocation_context,
+                )
+
+    async def _run_stream_fallback_attempt(
+        self,
+        attempt: Awaitable[Any],
+        *,
+        provider_name: str,
+        model: str,
+        path: str,
+        invocation_context: Optional["LLMInvocationContext"],
+        system_prompt: Optional[str] = None,
+        user_prompt: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        force_local_only: Optional[bool] = None,
+    ) -> Any:
+        """Finalize a non-streaming fallback through the same attempt runner."""
+
+        runner = getattr(self, "_run_provider_attempt", None)
+        if runner is not None and invocation_context is not None:
+            return await runner(
+                attempt,
+                provider_name,
+                model,
+                path=path,
+                invocation_context=invocation_context,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tools=tools,
+                response_format=response_format,
+                force_local_only=force_local_only,
+                metadata={"streaming_fallback": True},
             )
-        except Exception as exc:  # noqa: BLE001 - metering must not break stream
-            logger.warning("Failed to record streamed usage: %s", exc)
+
+        started = time.monotonic()
+        response = await attempt
+        if isinstance(response, LLMResponse):
+            await self._record_streamed_usage(
+                response,
+                model,
+                provider_name,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                path=path,
+                invocation_context=invocation_context,
+            )
+        return response
 
     async def get_streaming_response(
         self,
@@ -814,6 +1117,37 @@ class StreamingMixin:
         model_override: str = None,
         response_format: Optional[Type[BaseModel]] = None,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional["LLMInvocationContext"] = None,
+    ):
+        """Stream a prompt while freezing request identity exactly once."""
+
+        self._check_policy()
+        resolver = getattr(self, "_resolve_invocation_context", None)
+        if resolver is not None:
+            invocation_context = resolver(invocation_context)
+        async for item in self._get_streaming_response_frozen(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            force_local_only=force_local_only,
+            model_override=model_override,
+            response_format=response_format,
+            cancel_token=cancel_token,
+            invocation_context=invocation_context,
+            path="get_streaming_response",
+        ):
+            yield item
+
+    async def _get_streaming_response_frozen(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        force_local_only: bool = False,
+        model_override: str = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional["LLMInvocationContext"],
+        path: str = "get_streaming_response",
     ):
         """Get a streaming response from the LLM.
 
@@ -829,7 +1163,6 @@ class StreamingMixin:
         Yields:
             Text chunks as they arrive
         """
-        self._check_policy()
         resolution = await self._resolve_routing_with_discovery(
             model_override=model_override,
             force_local_only=force_local_only,
@@ -877,32 +1210,45 @@ class StreamingMixin:
                 supports_streaming_structured = _route_supports_streaming_structured(provider)
 
                 # Use streaming if supported (or no structured output requested)
-                if hasattr(adapter, "get_streaming_response"):
+                if callable(getattr(adapter, "get_streaming_response", None)) or (
+                    self._adapter_has_usage_stream(adapter)
+                ):
                     if response_format is None or supports_streaming_structured:
-                        try:
-                            async for chunk in adapter.get_streaming_response(
-                                client=provider["client"],
-                                model=model_to_use,
-                                messages=messages,
-                                response_format=response_format,
-                                extra_body=provider_cache_body(provider),
-                                cancel_token=cancel_token,
-                            ):
-                                yield chunk
-                            logger.info(f"Streaming completed from {provider_name}")
-                            return
-                        except NotImplementedError:
-                            # Adapter doesn't support streaming, fall through to non-streaming
-                            pass
+                        async for chunk in self._stream_adapter_with_usage(
+                            adapter=adapter,
+                            client=provider["client"],
+                            model=model_to_use,
+                            messages=messages,
+                            provider_name=provider_name,
+                            path=path,
+                            invocation_context=invocation_context,
+                            expose_protocol_events=False,
+                            response_format=response_format,
+                            extra_body=provider_cache_body(provider),
+                            cancel_token=cancel_token,
+                        ):
+                            yield chunk
+                        logger.info(f"Streaming completed from {provider_name}")
+                        return
 
                 # Fallback: use non-streaming response (required for Anthropic with structured output)
-                response = await adapter.get_response(
-                    client=provider["client"],
+                response = await self._run_stream_fallback_attempt(
+                    adapter.get_response(
+                        client=provider["client"],
+                        model=model_to_use,
+                        messages=messages,
+                        response_format=response_format,
+                        extra_body=provider_cache_body(provider),
+                        cancel_token=cancel_token,
+                    ),
+                    provider_name=provider_name,
                     model=model_to_use,
-                    messages=messages,
+                    path=f"{path}.fallback",
+                    invocation_context=invocation_context,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
                     response_format=response_format,
-                    extra_body=provider_cache_body(provider),
-                    cancel_token=cancel_token,
+                    force_local_only=force_local_only,
                 )
                 # Yield content as string (LLMResponse.content) to match streaming behavior
                 yield response.content or ""
@@ -981,6 +1327,7 @@ class StreamingMixin:
         model_override: Optional[str] = None,
         response_format: Optional[Type[BaseModel]] = None,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional["LLMInvocationContext"] = None,
     ):
         """Stream text using the active backend with automatic fallback.
 
@@ -997,6 +1344,9 @@ class StreamingMixin:
             Text chunks as they arrive (JSON chunks if response_format provided)
         """
         self._check_policy()
+        resolver = getattr(self, "_resolve_invocation_context", None)
+        if resolver is not None:
+            invocation_context = resolver(invocation_context)
         from .remote_backend import BackendType
 
         # Try remote GPU first when active AND routing isn't pinned — #734.
@@ -1010,10 +1360,15 @@ class StreamingMixin:
                 self._ensure_remote_active()
                 messages = messages_for(self._remote_adapter, user_prompt=user_prompt, system_prompt=system_prompt)
                 model = self._scrub_auto(model_override) or self._remote_config.model
-                async for chunk in self._remote_adapter.get_streaming_response(
+                async for chunk in self._stream_adapter_with_usage(
+                    adapter=self._remote_adapter,
                     client=self._remote_client,
                     model=model,
                     messages=messages,
+                    provider_name="remote_gpu",
+                    path="generate_stream.remote_gpu",
+                    invocation_context=invocation_context,
+                    expose_protocol_events=False,
                     response_format=response_format,
                     cancel_token=cancel_token,
                 ):
@@ -1025,13 +1380,15 @@ class StreamingMixin:
                 self._deactivate_remote_backend(reason=str(exc))
 
         # Fall back to standard streaming
-        async for chunk in self.get_streaming_response(
+        async for chunk in self._get_streaming_response_frozen(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             force_local_only=force_local_only,
             model_override=model_override,
             response_format=response_format,
             cancel_token=cancel_token,
+            invocation_context=invocation_context,
+            path="generate_stream",
         ):
             yield chunk
 
@@ -1043,6 +1400,7 @@ class StreamingMixin:
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional["LLMInvocationContext"] = None,
     ) -> AsyncIterator[str]:
         """Stream response using a pre-built messages array.
 
@@ -1060,6 +1418,12 @@ class StreamingMixin:
             Text chunks as they arrive from the LLM
         """
         self._check_policy()
+        resolver = getattr(self, "_resolve_invocation_context", None)
+        if resolver is not None:
+            invocation_context = resolver(
+                invocation_context,
+                session_id=session_id,
+            )
         from .remote_backend import BackendType
 
         # Try remote GPU first when active AND routing isn't pinned — #734.
@@ -1072,15 +1436,20 @@ class StreamingMixin:
             try:
                 self._ensure_remote_active()
                 model = self._scrub_auto(model_override) or self._remote_config.model
-                if hasattr(self._remote_adapter, "get_streaming_response"):
-                    async for chunk in self._remote_adapter.get_streaming_response(
-                        client=self._remote_client,
-                        model=model,
-                        messages=messages,
-                        cancel_token=cancel_token,
-                    ):
-                        yield chunk
-                    return
+                async for chunk in self._stream_adapter_with_usage(
+                    adapter=self._remote_adapter,
+                    client=self._remote_client,
+                    model=model,
+                    messages=messages,
+                    provider_name="remote_gpu",
+                    path="stream_with_messages.remote_gpu",
+                    invocation_context=invocation_context,
+                    expose_protocol_events=False,
+                    session_id=session_id,
+                    cancel_token=cancel_token,
+                ):
+                    yield chunk
+                return
             except Exception as exc:
                 self._last_remote_error = str(exc)
                 logger.warning(f"Remote GPU streaming failed: {exc}, falling back")
@@ -1122,11 +1491,18 @@ class StreamingMixin:
                 adapter = provider["adapter"]
                 model = self._resolve_concrete_model(target_model, provider)
 
-                if hasattr(adapter, "get_streaming_response"):
-                    async for chunk in adapter.get_streaming_response(
+                if callable(getattr(adapter, "get_streaming_response", None)) or (
+                    self._adapter_has_usage_stream(adapter)
+                ):
+                    async for chunk in self._stream_adapter_with_usage(
+                        adapter=adapter,
                         client=provider["client"],
                         model=model,
                         messages=messages,
+                        provider_name=provider["name"],
+                        path="stream_with_messages",
+                        invocation_context=invocation_context,
+                        expose_protocol_events=False,
                         extra_body=provider_cache_body(provider),
                         session_id=session_id,
                         cancel_token=cancel_token,
@@ -1135,13 +1511,20 @@ class StreamingMixin:
                     return
                 else:
                     # Fallback to non-streaming if adapter doesn't support it
-                    response = await adapter.get_response(
-                        client=provider["client"],
+                    response = await self._run_stream_fallback_attempt(
+                        adapter.get_response(
+                            client=provider["client"],
+                            model=model,
+                            messages=messages,
+                            extra_body=provider_cache_body(provider),
+                            session_id=session_id,
+                            cancel_token=cancel_token,
+                        ),
+                        provider_name=provider["name"],
                         model=model,
-                        messages=messages,
-                        extra_body=provider_cache_body(provider),
-                        session_id=session_id,
-                        cancel_token=cancel_token,
+                        path="stream_with_messages.fallback",
+                        invocation_context=invocation_context,
+                        force_local_only=force_local_only,
                     )
                     yield response.content if hasattr(response, 'content') else str(response)
                     return
@@ -1292,6 +1675,7 @@ class StreamingMixin:
         images: Optional[List[Union[str, bytes]]] = None,
         keep_trailing_system: bool = False,
         cancel_token: Optional[CancelToken] = None,
+        invocation_context: Optional["LLMInvocationContext"] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
@@ -1356,6 +1740,12 @@ class StreamingMixin:
                     result = await execute_tool(tc)
         """
         self._check_policy()
+        resolver = getattr(self, "_resolve_invocation_context", None)
+        if resolver is not None:
+            invocation_context = resolver(
+                invocation_context,
+                session_id=session_id,
+            )
         from .remote_backend import BackendType
 
         # Try remote GPU first when active AND routing isn't pinned — #734.
@@ -1375,23 +1765,20 @@ class StreamingMixin:
             try:
                 self._ensure_remote_active()
                 model = self._scrub_auto(model_override) or self._remote_config.model
-                self._stamp_response_identity(
-                    None, model=model, provider="remote_gpu",
-                )
-                if hasattr(self._remote_adapter, "get_streaming_response_with_tools"):
-                    async for item in self._remote_adapter.get_streaming_response_with_tools(
-                        client=self._remote_client,
-                        model=model,
-                        messages=messages,
-                        tools=tools,
-                        cancel_token=cancel_token,
-                    ):
-                        if isinstance(item, LLMResponse):
-                            self._stamp_response_identity(
-                                item, model=model, provider="remote_gpu",
-                            )
-                        yield item
-                    return
+                async for item in self._stream_adapter_with_usage(
+                    adapter=self._remote_adapter,
+                    client=self._remote_client,
+                    model=model,
+                    messages=messages,
+                    provider_name="remote_gpu",
+                    path="stream_with_tool_detection",
+                    invocation_context=invocation_context,
+                    expose_protocol_events=True,
+                    tools=tools,
+                    cancel_token=cancel_token,
+                ):
+                    yield item
+                return
             except Exception as exc:
                 self._last_remote_error = str(exc)
                 logger.warning(f"Remote GPU streaming with tools failed: {exc}, falling back")
@@ -1435,9 +1822,6 @@ class StreamingMixin:
                 adapter = provider["adapter"]
                 model = self._resolve_concrete_model(target_model, provider)
                 provider_name = provider["name"]
-                self._stamp_response_identity(
-                    None, model=model, provider=provider_name,
-                )
 
                 logger.info(f"Attempting streaming with tools from {provider_name} with {model}")
 
@@ -1450,99 +1834,54 @@ class StreamingMixin:
                 )
 
                 # Check if adapter supports streaming with tool detection
-                if hasattr(adapter, "get_streaming_response_with_tools"):
-                    # Build kwargs for provider-specific parameters
-                    kwargs = {}
-                    if system_prompt and _route_wants_tool_stream_system_prompt(provider):
-                        kwargs["system_prompt"] = system_prompt
-                    cache_body = provider_cache_body(provider)
-                    if cache_body:
-                        kwargs["extra_body"] = cache_body
-                    if session_id:
-                        kwargs["session_id"] = session_id
-                    if tool_executor is not None:
-                        kwargs["tool_executor"] = tool_executor
-                    if cancel_token is not None:
-                        kwargs["cancel_token"] = cancel_token
-                    if keep_trailing_system:
-                        kwargs["keep_trailing_system"] = True
-
-                    # Meter the streamed turn from its terminal LLMResponse.
-                    # The `finally` records even if the consumer stops iterating
-                    # after the terminal response arrives. For adapters that
-                    # report usage incrementally (Anthropic), pass a usage_sink
-                    # so a true mid-stream abort — before the terminal response
-                    # — can still flush the partial usage the provider billed
-                    # (#1684). Adapters that only surface usage at stream end
-                    # leave the sink empty, so the abort path records nothing
-                    # (there is nothing to record).
-                    usage_sink: Dict[str, Any] = {}
-                    if getattr(adapter, "supports_partial_usage_flush", False):
-                        kwargs["usage_sink"] = usage_sink
-                    stream_start = time.monotonic()
-                    final_response = None
-                    try:
-                        async for item in adapter.get_streaming_response_with_tools(
-                            client=provider["client"],
-                            model=model,
-                            messages=adapter_messages,
-                            tools=tools,
-                            **kwargs
-                        ):
-                            if isinstance(item, LLMResponse):
-                                self._stamp_response_identity(
-                                    item, model=model, provider=provider_name,
-                                )
-                                final_response = item
-                            yield item
-                    finally:
-                        duration_ms = int((time.monotonic() - stream_start) * 1000)
-                        if final_response is not None:
-                            # Normal end-of-stream: terminal response carries the
-                            # authoritative usage (and supersedes the sink).
-                            await self._record_streamed_usage(
-                                final_response, model, provider_name,
-                                duration_ms=duration_ms,
-                            )
-                        elif usage_sink:
-                            # Aborted before the terminal response — flush what
-                            # the adapter captured incrementally.
-                            await self._record_streamed_usage(
-                                LLMResponse(
-                                    content=None,
-                                    tool_calls=None,
-                                    input_tokens=usage_sink.get("input_tokens"),
-                                    output_tokens=usage_sink.get("output_tokens"),
-                                ),
-                                model, provider_name,
-                                duration_ms=duration_ms,
-                                partial=True,
-                            )
+                if self._adapter_has_usage_stream(adapter):
+                    tool_system_prompt = (
+                        system_prompt
+                        if system_prompt
+                        and _route_wants_tool_stream_system_prompt(provider)
+                        else None
+                    )
+                    async for item in self._stream_adapter_with_usage(
+                        adapter=adapter,
+                        client=provider["client"],
+                        model=model,
+                        messages=adapter_messages,
+                        provider_name=provider_name,
+                        path="stream_with_tool_detection",
+                        invocation_context=invocation_context,
+                        expose_protocol_events=True,
+                        tools=tools,
+                        extra_body=provider_cache_body(provider),
+                        system_prompt=tool_system_prompt,
+                        session_id=session_id,
+                        keep_trailing_system=keep_trailing_system,
+                        tool_executor=tool_executor,
+                        cancel_token=cancel_token,
+                    ):
+                        yield item
                     logger.info(f"Streaming with tools completed from {provider_name}")
                     return
                 else:
                     # Fallback: use non-streaming for tool detection, then stream text
                     logger.warning(f"{provider_name} doesn't support streaming with tools, using fallback")
                     if tools:
-                        fb_start = time.monotonic()
-                        response = await adapter.get_response(
-                            client=provider["client"],
+                        response = await self._run_stream_fallback_attempt(
+                            adapter.get_response(
+                                client=provider["client"],
+                                model=model,
+                                messages=adapter_messages,
+                                tools=tools,
+                                extra_body=provider_cache_body(provider),
+                                session_id=session_id,
+                                keep_trailing_system=keep_trailing_system,
+                                cancel_token=cancel_token,
+                            ),
+                            provider_name=provider_name,
                             model=model,
-                            messages=adapter_messages,
+                            path="stream_with_tool_detection.fallback",
+                            invocation_context=invocation_context,
                             tools=tools,
-                            extra_body=provider_cache_body(provider),
-                            session_id=session_id,
-                            keep_trailing_system=keep_trailing_system,
-                            cancel_token=cancel_token,
-                        )
-                        self._stamp_response_identity(
-                            response, model=model, provider=provider_name,
-                        )
-                        # adapter.get_response does not meter (only the service's
-                        # non-streaming path does), so record it here too.
-                        await self._record_streamed_usage(
-                            response, model, provider_name,
-                            duration_ms=int((time.monotonic() - fb_start) * 1000),
+                            force_local_only=force_local_only,
                         )
                         if response.has_tool_calls:
                             yield response
@@ -1553,10 +1892,15 @@ class StreamingMixin:
                         return
                     else:
                         # No tools, just stream
-                        async for chunk in adapter.get_streaming_response(
+                        async for chunk in self._stream_adapter_with_usage(
+                            adapter=adapter,
                             client=provider["client"],
                             model=model,
                             messages=adapter_messages,
+                            provider_name=provider_name,
+                            path="stream_with_tool_detection",
+                            invocation_context=invocation_context,
+                            expose_protocol_events=True,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
                             keep_trailing_system=keep_trailing_system,

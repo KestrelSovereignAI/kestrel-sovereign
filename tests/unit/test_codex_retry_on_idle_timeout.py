@@ -19,7 +19,7 @@ with retry context and keeps the transport classification + ``exceeds_cap``
 attribute so the streaming.py harness-owned check (#1429) still kicks in.
 """
 import asyncio
-from typing import Any, Dict, List
+from typing import Any, List
 from unittest.mock import MagicMock
 
 import pytest
@@ -28,7 +28,6 @@ from kestrel_sovereign.llm import codex_adapter as codex_adapter_module
 from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 from kestrel_sovereign.llm.codex_app_server import (
     CodexAppServerConnectionClosed,
-    CodexAppServerError,
     CodexAppServerTransportError,
 )
 
@@ -352,7 +351,9 @@ async def test_queued_same_session_turn_re_resolves_after_idle_timeout():
     adapter._forget_thread_usage = lambda session_id: None
     ensure_results = []
 
-    async def ensure_thread(app, session_id, model, instructions, tools):
+    async def ensure_thread(
+        app, session_id, model, instructions, tools, *, resolved_settings=None
+    ):
         cached = adapter._session_threads.get(session_id)
         if cached:
             result = (cached[0], False)
@@ -481,7 +482,9 @@ async def test_empty_session_id_completes_without_thread_re_resolution():
     adapter, _app = _runtime_adapter()
     ensure_calls = 0
 
-    async def ensure_thread(app, session_id, model, instructions, tools):
+    async def ensure_thread(
+        app, session_id, model, instructions, tools, *, resolved_settings=None
+    ):
         nonlocal ensure_calls
         ensure_calls += 1
         return "thread-sessionless", True

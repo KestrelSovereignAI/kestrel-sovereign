@@ -640,7 +640,7 @@ async def test_kem_publishing_agent_still_signs_verifiable_packages(tmp_path, mo
     )
 
     creds = await create_kestrel_identity_async(
-        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md",
+        str(tmp_path), None,
         agent_name="Publisher",
     )
     slug = creds.agent_did.rsplit(":", 1)[-1]
@@ -856,7 +856,7 @@ async def test_kem_vm_reusing_signing_id_does_not_poison_signing_vms(tmp_path, m
     )
 
     creds = await create_kestrel_identity_async(
-        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md", agent_name="Reuser",
+        str(tmp_path), None, agent_name="Reuser",
     )
     kem = generate_agent_kem_keypair(creds.agent_did.rsplit(":", 1)[-1], tmp_path)
     c_mb, _ = agent_kem_public_multibases(kem)
@@ -897,13 +897,13 @@ async def test_force_reinception_backs_up_kem_keys(tmp_path, monkeypatch):
     )
 
     old = await create_kestrel_identity_async(
-        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md", agent_name="Kembird",
+        str(tmp_path), None, agent_name="Kembird",
     )
     old_slug = old.agent_did.rsplit(":", 1)[-1]
     generate_agent_kem_keypair(old_slug, tmp_path)
 
     await create_kestrel_identity_async(
-        str(tmp_path), "docs/principles/KESTREL_CONSTITUTION.md",
+        str(tmp_path), None,
         agent_name="Kembird", force=True,
     )
     # Old KEM private keys backed up, not left live; slug detection sees

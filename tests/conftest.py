@@ -502,7 +502,7 @@ async def async_kestrel_agent(temp_dir: Path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
 
     # Create agent identity (use async version since we're in async context)
-    await create_kestrel_identity_async(str(temp_dir), "docs/principles/KESTREL_CONSTITUTION.md")
+    await create_kestrel_identity_async(str(temp_dir))
 
     # Initialize storage and agent
     db_files = list(temp_dir.glob("*.db"))

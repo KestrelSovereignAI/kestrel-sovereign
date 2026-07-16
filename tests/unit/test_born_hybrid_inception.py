@@ -29,7 +29,11 @@ from kestrel_sovereign.identity.runtime_identity import (
     load_agent_identity,
 )
 
-CONSTITUTION = "docs/principles/KESTREL_CONSTITUTION.md"
+# These tests exercise identity minting, not constitution sourcing. Pass None
+# so inception anchors the packaged governing source (config.CONSTITUTION_PATH)
+# — the exact bytes the periodic integrity audit recomputes. Passing the docs
+# copy is now correctly refused as a non-authoritative override (#2463).
+CONSTITUTION = None
 TEST_DOMAIN = "agents.kestrel-sovereign.test"
 TEST_DATA_KEY = "test-master-key-for-encryption-32chars!"
 

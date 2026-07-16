@@ -65,7 +65,13 @@ for dir in "$AGENT_DATA_DIR"/*/; do
         echo "Bootstrapping identity for agent '$agent_name'..."
         /app/.venv/bin/python -c "
 from kestrel_sovereign.inception_service import create_kestrel_identity
-creds = create_kestrel_identity('$dir', 'docs/principles/KESTREL_CONSTITUTION.md', agent_name='$agent_name')
+# Do NOT pass a constitution_path. Inception defaults to the shared
+# governing-constitution resolver's authoritative packaged source
+# (config.CONSTITUTION_PATH = kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
+# — the EXACT bytes the periodic integrity audit later recomputes (#2463).
+# Passing the docs copy (OKF-frontmatter-wrapped) would incept a hash the
+# audit can never match, self-bricking fresh container agents into Safe Mode.
+creds = create_kestrel_identity('$dir', agent_name='$agent_name')
 print(f'  Created: {creds.agent_did}')
 "
     else
