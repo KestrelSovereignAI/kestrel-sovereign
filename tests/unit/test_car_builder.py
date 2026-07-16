@@ -20,6 +20,7 @@ from kestrel_sovereign.storage.car_builder import (
     CODEC_DAG_CBOR,
     make_cid_link,
     _dag_cbor_encode,
+    _dag_cbor_decode,
 )
 
 
@@ -279,3 +280,28 @@ class TestCARRoundTrip:
         reader = CARReader(car)
         assert reader.get_block(cid) == data
         assert reader.verify()
+
+
+class TestCborRecursionBomb:
+    """Adversarial regressions for the CBOR import surface (cbor2 >=5.9.0
+    uncontrolled-recursion DoS). A malformed dag-cbor block with pathological
+    nesting must be rejected with a decode error, not crash the interpreter or
+    hang."""
+
+    def test_deeply_nested_indefinite_arrays_rejected(self):
+        # 200k indefinite-length array headers (0x9f) with no break bytes:
+        # unbounded recursion on a decoder without depth limits.
+        bomb = b"\x9f" * 200_000
+        with pytest.raises(cbor2.CBORDecodeError):
+            _dag_cbor_decode(bomb)
+
+    def test_deeply_nested_maps_rejected(self):
+        # Nested indefinite maps are equally recursive.
+        bomb = b"\xbf" * 200_000
+        with pytest.raises(cbor2.CBORDecodeError):
+            _dag_cbor_decode(bomb)
+
+    def test_truncated_block_rejected(self):
+        # Truncated / malformed input must raise, not return partial garbage.
+        with pytest.raises(cbor2.CBORDecodeError):
+            _dag_cbor_decode(b"\x9f\x01\x02")
