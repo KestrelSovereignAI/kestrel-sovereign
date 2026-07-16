@@ -577,6 +577,14 @@ async def test_mixed_sqlite_session_timestamps_keep_every_public_scope_exact(
             await storage.conversation.count_session_messages(session_id)
             == len(expected_ids)
         )
+        # Display and destructive membership must agree: hard purge may never
+        # destroy a row the session detail/soft-delete resolver hides.
+        display_rows = await storage.conversation.get_session_message_rows(
+            session_id
+        )
+        assert sorted(int(row[0]) for row in display_rows) == sorted(
+            expected_ids
+        )
         assert await storage.conversation.message_belongs_to_session(
             anchor.row_id,
             session_id,

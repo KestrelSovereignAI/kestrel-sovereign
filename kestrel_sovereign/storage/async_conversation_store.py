@@ -2049,14 +2049,28 @@ class AsyncConversationStore:
             # positional accesses on metadata/created_at don't shift.
             if start_row:
                 start_time = start_row[0]
+                # Canonicalize the timestamp prefilter/order: SQLite history
+                # mixes ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and
+                # raw TEXT comparison drops later rows whose stored form sorts
+                # below the anchor's.  The exact purge/count resolver already
+                # compares via julianday; display must see the same membership
+                # or hard purge could destroy rows this path never returned.
+                created_at_predicate = self._timestamp_predicate(
+                    "created_at", ">="
+                )
+                created_at_order = self._canonical_timestamp_sql("created_at")
                 all_rows = await self.db.fetchall(
                     f"""SELECT id, role, content, metadata, created_at,
                               rendered_content, model, provider
                        FROM conversation_history
-                       WHERE agent_id = ? AND created_at >= ?{del_clause}{archive_clause}
-                       ORDER BY created_at ASC
+                       WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
+                       ORDER BY {created_at_order} ASC
                        LIMIT ?""",
-                    (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
+                    (
+                        self.agent_id,
+                        self._timestamp_query_param(start_time),
+                        limit * 2,  # Fetch extra in case of filtering
+                    ),
                 )
 
         # Also get messages that explicitly belong to this session (resumed conversations)
