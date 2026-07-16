@@ -386,7 +386,19 @@ export const Security = {
             });
 
             if (response.success) {
-                if (!options.suppressToast) {
+                if (response.awaiter_gone) {
+                    // The in-flight tool call had already been cancelled
+                    // (Cloud Run timeout / SSE disconnect). The scope rule
+                    // was recorded for future calls, but this call is
+                    // orphaned — prompt the user to re-run it (#2558).
+                    // Always surface this — even auto-mode (suppressToast)
+                    // must let the user know their prior action orphaned,
+                    // otherwise auto-mode silently no-ops (codex round-1 P1).
+                    Toast.warning(approved
+                        ? `Approved (${scope}), but the original request had timed out — re-run the action to complete it.`
+                        : 'Recorded, but the original request had already ended.'
+                    );
+                } else if (!options.suppressToast) {
                     Toast.success(approved
                         ? `Approved (${scope})`
                         : 'Denied'

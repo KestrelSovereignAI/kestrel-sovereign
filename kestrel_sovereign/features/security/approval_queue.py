@@ -29,6 +29,14 @@ class ApprovalStatus(Enum):
     APPROVED = "approved"
     DENIED = "denied"
     TIMEOUT = "timeout"
+    # The original tool-call awaiter was cancelled (Cloud Run request
+    # timeout, SSE disconnect, client abort) before a decision landed.
+    # Distinct from PENDING (still awaitable), APPROVED/DENIED (decision
+    # landed while the awaiter was alive), and TIMEOUT (removed by the
+    # awaiter itself). A late decision on an AWAITER_GONE request still
+    # persists the scope rule for future calls, but the in-flight call is
+    # orphaned — see submit_decision / request_approval. (#2558)
+    AWAITER_GONE = "awaiter_gone"
 
 
 @dataclass
@@ -86,6 +94,12 @@ class DecisionResult:
     in_memory: bool
     persisted: bool
     error: Optional[str] = None
+    # True when the decision was accepted for a request whose original
+    # tool-call awaiter had already been cancelled (AWAITER_GONE). The
+    # scope rule is still persisted (future calls benefit), but the
+    # in-flight call is orphaned — the frontend should prompt a retry.
+    # (#2558)
+    awaiter_gone: bool = False
 
     def __bool__(self) -> bool:
         """Back-compat truthiness for callers that only need acceptance."""
@@ -540,10 +554,22 @@ class ApprovalQueue:
             # multi_agent). The user has not yet decided. Leave the
             # request in ``_pending`` so the modal stays interactive,
             # and re-raise without firing withdrawal — the modal must
-            # NOT auto-close on us.
+            # NOT auto-close on us. Mark the request AWAITER_GONE so a
+            # late ``submit_decision`` can tell the caller its click did
+            # nothing for the orphaned in-flight call (#2558).
+            # Clobber unconditionally: if a concurrent ``submit_decision``
+            # already flipped to APPROVED/DENIED and is mid-persist, the
+            # tool call itself is STILL dead — the persisted scope rule
+            # benefits future calls, but this call is orphaned regardless
+            # of who won the state-write race. ``submit_decision``'s
+            # re-check-after-persist reads AWAITER_GONE and reports
+            # ``awaiter_gone=True`` to the caller so the frontend prompts
+            # a retry.
+            request.status = ApprovalStatus.AWAITER_GONE
             logger.info(
                 f"Approval request {request.id[:8]} await cancelled; "
-                "request kept alive for user decision"
+                "request marked AWAITER_GONE — decision will still be "
+                "recorded but the tool call is orphaned"
             )
             raise
 
@@ -701,7 +727,14 @@ class ApprovalQueue:
         # request lingers in _pending for one or more event-loop
         # iterations after resume_event.set(), which is the exact race
         # window this guard closes.
-        if request.status != ApprovalStatus.PENDING:
+        # AWAITER_GONE requests are still decidable: the awaiter died
+        # (Cloud Run timeout / SSE disconnect / abort) but the request
+        # was deliberately kept in ``_pending`` so a late click still
+        # persists the scope rule for future calls. We accept it here,
+        # but the in-flight call is orphaned — signal that via
+        # ``awaiter_gone`` so the frontend can prompt a retry (#2558).
+        awaiter_gone = request.status == ApprovalStatus.AWAITER_GONE
+        if request.status != ApprovalStatus.PENDING and not awaiter_gone:
             logger.warning(
                 f"Decision submitted for already-decided request "
                 f"{request_id[:8]} (status={request.status.value}); ignored"
@@ -727,17 +760,36 @@ class ApprovalQueue:
             scope=scope,
         )
 
-        request.resume_event.set()  # Unblock the waiting coroutine
+        # Re-read status after the persist await: a concurrent awaiter
+        # cancellation may have flipped PENDING → AWAITER_GONE while we
+        # were persisting. Codex round-1 P0: without this refresh, a
+        # late-approve-then-cancel race left ``awaiter_gone=False`` for
+        # the caller (frontend never prompts a retry) and the request
+        # stranded in ``_pending`` because the AWAITER_GONE pop branch
+        # was skipped.
+        if not awaiter_gone and request.status == ApprovalStatus.AWAITER_GONE:
+            awaiter_gone = True
+
+        if not awaiter_gone:
+            request.resume_event.set()  # Unblock the waiting coroutine
+
+        # Always pop — if a live awaiter beat us to it via its finally
+        # block, this is a no-op; if the awaiter is dead, this is the
+        # only cleanup path. Cheaper than trying to detect awaiter
+        # liveness.
+        self._pending.pop(request_id, None)
 
         logger.info(
             f"Decision submitted for {request_id[:8]}: "
             f"{'approved' if approved else 'denied'} ({scope})"
+            f"{' [awaiter gone — call orphaned]' if awaiter_gone else ''}"
         )
 
         return DecisionResult(
             in_memory=True,
             persisted=persist_error is None,
             error=persist_error,
+            awaiter_gone=awaiter_gone,
         )
 
     def get_request(self, request_id: str) -> Optional[ApprovalRequest]:
@@ -766,9 +818,18 @@ class ApprovalQueue:
         if not request:
             return False
 
+        # An AWAITER_GONE request has no live waiter — its awaiter died and
+        # left the request in ``_pending`` deliberately. Setting
+        # ``resume_event`` would unblock nobody, and ``sweep_stale`` skips
+        # entries whose event is set, so the request would linger forever.
+        # Pop it ourselves instead. (#2558)
+        awaiter_gone = request.status == ApprovalStatus.AWAITER_GONE
         request.status = ApprovalStatus.DENIED
         request.user_decision = "cancelled"
-        request.resume_event.set()
+        if awaiter_gone:
+            self._pending.pop(request_id, None)
+        else:
+            request.resume_event.set()
 
         logger.info(f"Request {request_id[:8]} cancelled")
         return True
@@ -835,10 +896,16 @@ class ApprovalQueue:
             Number of requests cancelled
         """
         count = 0
-        for request in list(self._pending.values()):
+        for request_id, request in list(self._pending.items()):
+            # AWAITER_GONE requests have no live waiter to pop them — see
+            # cancel_request. Pop them directly so they don't linger. (#2558)
+            awaiter_gone = request.status == ApprovalStatus.AWAITER_GONE
             request.status = ApprovalStatus.DENIED
             request.user_decision = "cancelled_all"
-            request.resume_event.set()
+            if awaiter_gone:
+                self._pending.pop(request_id, None)
+            else:
+                request.resume_event.set()
             count += 1
 
         logger.info(f"Cancelled {count} pending requests")

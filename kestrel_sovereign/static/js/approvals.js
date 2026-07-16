@@ -58,7 +58,16 @@ async function decide(approvalId, approved, scope, remember) {
             }),
         });
         if (res && res.success) {
-            if (res.remembered && res.remembered.skipped) {
+            if (res.awaiter_gone) {
+                // The original tool call had already been cancelled (Cloud Run
+                // timeout / disconnect). The scope rule was recorded for future
+                // calls, but this call is orphaned — prompt a retry (#2558).
+                Toast.warning(
+                    approved
+                        ? `Approved (${scope}), but the original request had timed out — re-run the action to complete it.`
+                        : 'Recorded, but the original request had already ended.'
+                );
+            } else if (res.remembered && res.remembered.skipped) {
                 Toast.success(`Approved (not remembered: ${res.remembered.skipped})`);
             } else if (res.remembered) {
                 Toast.success(
