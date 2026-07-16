@@ -27,6 +27,11 @@ from .hierarchy import (
     LayerViolation,
     validate_layer_narrowing,
 )
+from .resolver import (
+    governing_constitution_path,
+    is_authoritative_governing_source,
+    resolve_governing_constitution_bytes,
+)
 
 __all__ = [
     "ConstitutionalLayer",
@@ -42,4 +47,7 @@ __all__ = [
     "contract_to_json",
     "parse_emancipation_block",
     "render_amendment_viii",
+    "governing_constitution_path",
+    "is_authoritative_governing_source",
+    "resolve_governing_constitution_bytes",
 ]

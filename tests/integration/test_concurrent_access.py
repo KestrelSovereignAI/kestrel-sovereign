@@ -213,9 +213,10 @@ class TestConcurrentAPIRequests:
         monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: str(tmp_path))
         monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path))
 
-        constitution_path = Path(__file__).parent.parent.parent / "docs" / "principles" / "KESTREL_CONSTITUTION.md"
-        if constitution_path.exists():
-            create_kestrel_identity(str(tmp_path), str(constitution_path))
+        # Omit constitution_path so inception anchors the packaged governing
+        # source the periodic integrity audit recomputes from. Passing the docs
+        # copy is now refused as a non-authoritative source (#2463).
+        create_kestrel_identity(str(tmp_path))
 
         threads_before = set(threading.enumerate())
 

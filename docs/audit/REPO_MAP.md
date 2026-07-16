@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-15
-**Scope:** 2021 tracked files (1319 `.py`, 328 `.md`, 374 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-16
+**Scope:** 2026 tracked files (1323 `.py`, 329 `.md`, 374 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -351,6 +351,8 @@ Repo entry points and standard project files.
   - `class ComputeFeature`
 - **kestrel_sovereign/features/compute/models.py** — Kestrel Compute Feature - Data Models.
   - `class ScriptState`; `class SecurityFinding`; `class SuggestedFix`; `class DenialResponse`; `class ComputeScript`; `class ExecutionRecord`; `class ComputePolicy`; `def calculate_risk_score(findings)`
+- **kestrel_sovereign/features/compute/presenters.py** — Pure presentation helpers for compute read tools.
+  - `def present_script_list(scripts)`; `def present_script_detail(script)`; `def present_execution_history(executions)`
 - **kestrel_sovereign/features/compute/script_analyzer.py** — Kestrel Compute Feature - Script Analyzer.
   - `class AnalysisResult`; `class ScriptAnalyzer`; `def analyze_script(script)`
 - **kestrel_sovereign/features/compute/script_signer.py** — Kestrel Compute Feature - Script Signer.
@@ -613,6 +615,8 @@ Repo entry points and standard project files.
   - `def run_health_check()`
 - **kestrel_sovereign/heartbeat.py** — Heartbeat system for Kestrel Sovereign.
   - `class HeartbeatConfig`; `class HeartbeatResult`; `class HeartbeatRunner`
+- **kestrel_sovereign/heartbeat_response.py** — Canonical classification of heartbeat response bodies.
+  - `class HeartbeatResponseClassification`; `def classify_heartbeat_response(result_body)`
 - **kestrel_sovereign/hooks/__init__.py** — Kestrel Hooks — HooksManager (framework implementation).
 - **kestrel_sovereign/hooks/decision_gate.py** — Shared PRE-hook decision gate.
   - `class BlockedDecision`; `def evaluate_blocking_decision(hook_output)`
@@ -1454,6 +1458,7 @@ Repo entry points and standard project files.
 - **docs/architecture/security/CONSTITUTION_EMBEDDING.md** — Kestrel Constitution Embedding Process — ## Overview
 - **docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md** — PRD: Cryptographic Log Anchoring — **1.
 - **docs/architecture/security/CRYPTO_INVENTORY.md** — Cryptographic Inventory — **Status:** Wave 0A deliverable.
+- **docs/architecture/security/IDENTITY_PACKAGE_PRIVACY.md** — Identity Package Privacy Contract — ## Contract
 - **docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md** — Kestrel Integrity Audit System — **Date:** November 9, 2025 **Version:** 1.0 **Component:** Constitutional AI Enforcement Mechanism
 - **docs/architecture/security/KEY_MANAGEMENT.md** — Key Management Architecture — ## Overview
 - **docs/architecture/security/KEY_ROTATION.md** — Key Rotation Mechanism — ## Overview
@@ -2301,6 +2306,8 @@ Repo entry points and standard project files.
   - `async def test_rewrites_compaction_marker_metadata(tmp_path)`; `async def test_rewrites_hierarchical_marker_and_salvage_reason(tmp_path)`; `async def test_leaves_unrelated_rows_alone(tmp_path)`; `async def test_idempotent_second_run_is_noop(tmp_path)`; `async def test_tolerates_invalid_metadata_json(tmp_path)`; `async def test_init_schema_runs_migration_on_startup(tmp_path)`
 - **tests/unit/test_compute_feature.py** — Unit tests for Kestrel Compute Feature.
   - `def temp_db()`; `def temp_trash_dir(temp_dir)`; `def sample_script()`; `def signer_with_ecdsa_keys(temp_db)`; `def sample_bash_script()`; `class TestModels`; `class TestScriptStore`; `class TestScriptSigner`; `…`
+- **tests/unit/test_compute_presenters.py** — Golden contracts for compute read-tool presentation.
+  - `def test_present_script_list_empty_golden()`; `def test_present_script_list_all_states_and_long_name_golden()`; `def test_present_script_detail_long_content_and_finding_limit_golden()`; `def test_present_execution_history_empty_golden()`; `def test_present_execution_history_success_failure_and_zero_duration_golden()`; `async def test_list_scripts_preserves_filtered_and_recent_queries()`; `async def test_show_script_preserves_lookup_and_missing_error()`; `async def test_execution_history_preserves_query_paths()`; `…`
 - **tests/unit/test_computer_use_audit.py** — Tests for the JSONL audit log (#836).
   - `async def test_writes_one_record(tmp_path)`; `async def test_records_in_order(tmp_path)`; `async def test_concurrent_writes_serialized(tmp_path)`; `async def test_creates_parent_dir(tmp_path)`; `async def test_forwards_to_feedback_hook(tmp_path)`; `async def test_record_includes_outcome_and_error(tmp_path)`
 - **tests/unit/test_computer_use_feature.py** — Tests for ComputerUseFeature gate ordering and lifecycle (#838).
@@ -2558,7 +2565,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_health_feature.py** — Unit Tests for the Heartbeat Feature (#151).
   - `class TestCheckDatabase`; `class TestCheckLLMService`; `class TestCheckMemorySystem`; `class TestCheckDiskSpace`; `class TestCheckContextBudget`; `class TestCheckBootstrapState`; `class TestDeriveOverallStatus`; `class TestHealthFeatureInitialize`; `…`
 - **tests/unit/test_heartbeat.py** — Tests for the heartbeat system (#151).
-  - `class TestParseDuration`; `class TestHeartbeatConfig`; `class TestOKPattern`; `def mock_agent(tmp_path)`; `def default_config()`; `class TestHeartbeatRunner`; `class TestActiveHours`; `class TestResponseNormalization`
+  - `class TestParseDuration`; `class TestHeartbeatConfig`; `def test_classifier_recognizes_exact_all_clear_formatting(response)`; `def test_classifier_surfaces_short_alert_in_either_token_order(response)`; `def test_classifier_preserves_full_alert_without_token()`; `def test_classifier_treats_non_string_zero_as_alert()`; `def test_classifier_preserves_non_ascii_symbol_alert_beside_token()`; `def test_classifier_does_not_match_token_inside_identifier(response)`; `…`
 - **tests/unit/test_hooks.py** — Unit Tests for Kestrel Hooks System.
   - `class AllowAllHook`; `class DenyAllHook`; `class RegexMatcherHook`; `class TimeoutHook`; `class SessionStartHook`; `class FailingHook`; `class AwaitsUserInputHook`; `class TestHookInput`; `…`
 - **tests/unit/test_host_features.py** — Unit tests for the host-scoped feature runtime (issue #2293, Phase 1).
@@ -2637,6 +2644,8 @@ Repo entry points and standard project files.
   - `def cwd(tmp_path, monkeypatch)`; `def test_warn_includes_no_section_message(cwd, caplog)`; `def test_warn_points_at_migrate_command_when_legacy_file_exists(cwd, caplog)`; `def test_warn_handles_post_migration_bak_case(cwd, caplog)`; `def test_warn_recommends_setup_or_example_when_neither_exists(cwd, caplog)`; `def test_warn_minimal_hint_when_nothing_present(cwd, caplog)`; `def test_llmservice_init_emits_warning_when_config_section_empty(cwd, caplog)`; `def test_llmservice_init_does_not_warn_when_config_present(tmp_path, monkeypatch, caplog)`
 - **tests/unit/test_local_mps_adapter_async_contracts.py** — Contracts for Local MPS training adapter async offload boundaries.
   - `def adapter(tmp_path)`; `def tracked_to_thread()`; `async def test_start_training_offloads_file_setup_and_process_launch(adapter, tracked_to_thread)`; `async def test_failed_status_offloads_log_tail_read(adapter, tracked_to_thread)`; `async def test_status_without_process_offloads_output_scan(adapter, tracked_to_thread)`; `async def test_download_weights_offloads_lora_read(adapter, tracked_to_thread)`; `async def test_cancel_offloads_process_termination(adapter, tracked_to_thread)`; `async def test_cleanup_offloads_dataset_removal(adapter, tracked_to_thread)`; `…`
+- **tests/unit/test_local_mps_adapter_script_safety.py** — Security contracts for the Local MPS generation subprocess script.
+  - `def test_generation_script_keeps_dynamic_values_out_of_executable_source()`; `async def test_generate_image_passes_script_values_as_json_argv(tmp_path, monkeypatch)`
 - **tests/unit/test_local_route_timeout.py** — Local-route client timeout (issue #1954).
   - `def test_local_client_gets_generous_default_timeout()`; `def test_local_client_timeout_is_route_configurable()`; `def test_local_flag_alone_also_triggers_timeout()`
 - **tests/unit/test_lumpy_prune.py** — Tests for the lumpy-prune anchor and safety-net helper (#1430).

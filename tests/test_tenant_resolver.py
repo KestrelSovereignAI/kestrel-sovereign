@@ -9,10 +9,19 @@ from kestrel_sovereign.auth import CallerContext, AuthMethod
 from kestrel_sovereign.security.tenant_resolver import (
     DEFAULT_PERSONAL_TENANT_ID,
     HOST_CONFIG_KEY,
+    MULTITENANT_ENV_VAR,
+    bind_org_tenant_provider,
     build_tenant_resolver,
     resolve_tenant,
     tenant_id_for_identity,
 )
+
+
+@pytest.fixture
+def multitenant(monkeypatch):
+    """Opt the resolver into per-principal isolation via the env flag."""
+    monkeypatch.setenv(MULTITENANT_ENV_VAR, "1")
+    yield
 
 
 def _request(caller=None, session=None):
@@ -49,7 +58,20 @@ def test_solo_owner_resolves_to_default_tenant():
     assert resolve_tenant(bare) == DEFAULT_PERSONAL_TENANT_ID
 
 
-def test_distinct_authenticated_users_resolve_to_distinct_tenants():
+def test_authenticated_user_defaults_to_single_tenant():
+    """INV-SOLO (issue #2554): without multi-tenant config an authenticated
+    owner shares the one default tenant, so they see local emitters' events."""
+    owner = _request(
+        caller=CallerContext.authenticated("jaslogic@gmail.com", AuthMethod.OAUTH_SESSION)
+    )
+    assert resolve_tenant(owner) == DEFAULT_PERSONAL_TENANT_ID
+
+    # Cookie-session path is likewise single-tenant by default.
+    cookie = _request(session={"user_email": "jaslogic@gmail.com"})
+    assert resolve_tenant(cookie) == DEFAULT_PERSONAL_TENANT_ID
+
+
+def test_distinct_authenticated_users_resolve_to_distinct_tenants(multitenant):
     """Acceptance: two distinct principals → two tenants (store isolates them)."""
     alice = _request(
         caller=CallerContext.authenticated("alice@example.com", AuthMethod.OAUTH_SESSION)
@@ -69,18 +91,47 @@ def test_distinct_authenticated_users_resolve_to_distinct_tenants():
     assert t_bob != DEFAULT_PERSONAL_TENANT_ID
 
 
-def test_same_user_is_deterministic_and_case_insensitive():
+def test_same_user_is_deterministic_and_case_insensitive(multitenant):
     a = _request(caller=CallerContext.authenticated("User@Example.com"))
     b = _request(caller=CallerContext.authenticated("user@example.com"))
     assert resolve_tenant(a) == resolve_tenant(b)
 
 
-def test_session_cookie_fallback_when_no_caller():
+def test_session_cookie_fallback_when_no_caller(multitenant):
     """Cookie session (no CallerContext yet) still resolves the user's tenant."""
     req = _request(session={"user_email": "carol@example.com"})
     tenant = resolve_tenant(req)
     assert tenant == tenant_id_for_identity("carol@example.com")
     assert tenant != DEFAULT_PERSONAL_TENANT_ID
+
+
+def test_bound_org_provider_enables_and_supplies_tenant():
+    """A bound Castle Organization→tenant_id provider both enables multi-tenancy
+    and is the source of truth for a principal's tenant."""
+    org_tenant = uuid.uuid5(uuid.NAMESPACE_DNS, "acme-org")
+
+    def provider(identity):
+        return org_tenant if identity == "alice@example.com" else None
+
+    bind_org_tenant_provider(provider)
+    try:
+        alice = _request(
+            caller=CallerContext.authenticated("alice@example.com", AuthMethod.OAUTH_SESSION)
+        )
+        assert resolve_tenant(alice) == org_tenant
+
+        # Provider returns None → fall back to deterministic uuid5 (still
+        # multi-tenant, since a provider is bound).
+        bob = _request(
+            caller=CallerContext.authenticated("bob@example.com", AuthMethod.JWT)
+        )
+        assert resolve_tenant(bob) == tenant_id_for_identity("bob@example.com")
+
+        # Solo owner (no distinct principal) still lands on the default tenant.
+        anon = _request(caller=CallerContext.anonymous())
+        assert resolve_tenant(anon) == DEFAULT_PERSONAL_TENANT_ID
+    finally:
+        bind_org_tenant_provider(None)
 
 
 def test_build_tenant_resolver_returns_callable_matching_seam():
