@@ -181,8 +181,15 @@ def _check_constitution_drift(
         return
 
     canonical = _canonical_constitution_path()
+    # Up-front readability guard: if the canonical governing source itself
+    # cannot be read, no agent can be drift-checked against it, and the failure
+    # is independent of any per-agent DB state. Surface it once and stop rather
+    # than letting an empty/unreadable per-agent DB short-circuit the loop
+    # before the canonical read is ever reached (#2463). The per-agent resolve
+    # below still renders each agent's Amendment VIII contract for the actual
+    # hash comparison; this only pre-checks that the file exists and is readable.
     try:
-        on_disk_hash = hashlib.sha256(canonical.read_bytes()).hexdigest()
+        canonical.read_bytes()
     except OSError as exc:
         report.warn.append(
             f"Constitution drift check skipped — cannot read canonical "
@@ -211,6 +218,47 @@ def _check_constitution_drift(
             report.warn.append(
                 f"{name}: constitution drift check skipped — agent node missing "
                 f"constitution_hash property (older agent? re-incept to anchor)"
+            )
+            continue
+
+        # Recompute the EXPECTED hash the way the periodic integrity audit does
+        # (#2463): resolve the packaged governing bytes through the shared
+        # resolver, rendering this agent's anchored Amendment VIII emancipation
+        # contract if it has one. Hashing raw package bytes here would false-flag
+        # every emancipated agent as "drifted" and could not diagnose an active/
+        # custom agent consistently with the runtime verifier.
+        contract_json = _read_anchored_emancipation_contract(db_path)
+        try:
+            from kestrel_sovereign.constitution.emancipation import (
+                EmancipationConfigError,
+                contract_from_json,
+            )
+            from kestrel_sovereign.constitution.resolver import (
+                resolve_governing_constitution_bytes,
+            )
+
+            contract = contract_from_json(contract_json)
+            on_disk_hash = hashlib.sha256(
+                resolve_governing_constitution_bytes(
+                    contract, constitution_path=str(canonical)
+                )
+            ).hexdigest()
+        except FileNotFoundError as exc:
+            report.warn.append(
+                f"{name}: Constitution drift check skipped — cannot read "
+                f"canonical {canonical}: {exc}"
+            )
+            continue
+        except EmancipationConfigError as exc:
+            report.fail.append(
+                f"{name}: anchored emancipation contract is corrupted ({exc}); "
+                f"the agent will fail its integrity audit. Re-anchor it."
+            )
+            continue
+        except (OSError, ValueError) as exc:
+            report.warn.append(
+                f"{name}: constitution drift check skipped — cannot resolve "
+                f"governing constitution: {exc}"
             )
             continue
 
@@ -304,3 +352,40 @@ def _read_anchored_constitution_hash(db_path: Path):
         return _NoHashProperty()
 
     return stored_hash
+
+
+def _read_anchored_emancipation_contract(db_path: Path):
+    """Read the agent node's ``emancipation_contract`` property from a Kestrel DB.
+
+    Returns the raw property value (typically a JSON string or dict, as anchored
+    at inception) or ``None`` when there is no agent row / no contract / the DB
+    is unreadable. Doctor needs this so it can render Amendment VIII the same way
+    the runtime integrity audit does before hashing the governing bytes (#2463).
+    Failing soft to ``None`` here is correct — a dormant/None contract yields the
+    canonical bytes, which is the right expectation for a non-emancipated agent.
+    """
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute(
+                "SELECT properties FROM graph_nodes "
+                "WHERE node_type='agent' LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+
+    if row is None or row[0] is None:
+        return None
+
+    try:
+        properties = (
+            json.loads(row[0])
+            if isinstance(row[0], (str, bytes, bytearray))
+            else row[0]
+        )
+    except (TypeError, ValueError):
+        return None
+
+    if not isinstance(properties, dict):
+        return None
+
+    return properties.get("emancipation_contract")

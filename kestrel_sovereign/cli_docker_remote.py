@@ -4,7 +4,7 @@ and ``scripts/run_docker_remote.sh``).
 
 Lightweight Docker workflow for running Kestrel against remote LLM
 providers (OpenAI, Anthropic, etc.) — the ``Dockerfile.agent.remote``
-image skips torch / spacy / chromadb so the image is ~500MB instead
+image skips torch / spacy so the image is ~500MB instead
 of ~32GB.
 
 Subverbs:
@@ -120,7 +120,7 @@ def _cmd_build(args) -> int:
     image = f"{_IMAGE_NAME}:{tag}"
 
     print(f"Building {image} for {platform} ...")
-    print("Using lightweight dependencies (no torch, spacy, chromadb)")
+    print("Using lightweight dependencies (no torch, spacy)")
     rc = run_streaming(
         [
             "docker", "build",
@@ -325,7 +325,7 @@ def add_docker_subcommand(
     remote_p = docker_sub.add_parser(
         "remote",
         help="Remote-LLM mode (lightweight image, ~500MB, no "
-             "torch/spacy/chromadb)",
+             "torch/spacy)",
     )
     remote_sub = remote_p.add_subparsers(dest="docker_remote_command")
 

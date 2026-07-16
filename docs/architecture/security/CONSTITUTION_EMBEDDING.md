@@ -55,12 +55,24 @@ did:pkh:eip155:1:{ethereum_address}
 This DID serves as the agent's permanent identifier and becomes the `node_id` for the agent in the knowledge graph.
 
 ### 4. Constitution Storage (CRITICAL)
-The constitution is stored as the **FIRST file** in the agent's storage:
+The constitution is stored as the **FIRST file** in the agent's storage. The
+bytes come from the single governing-constitution resolver
+(`kestrel_sovereign.constitution.resolver.resolve_governing_constitution_bytes`),
+which reads the packaged canonical source at `config.CONSTITUTION_PATH` —
+the same source the periodic integrity audit recomputes from:
 ```python
-with open(constitution_path, "rb") as f:
-    constitution_content = f.read()
+constitution_content = resolve_governing_constitution_bytes(contract)
 constitution_hash = storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
 ```
+
+> **Deprecation (#2463):** inception and offline reanchor now REFUSE a
+> `constitution_path` override that is not the packaged governing source.
+> Anchoring bytes from any other path manufactured agents guaranteed to
+> fail their next periodic audit and enter Safe Mode. A legitimate custom
+> governing source is expressed by pointing `config.CONSTITUTION_PATH` at
+> it (the one seam every path — inception, audit, reanchor, doctor — reads).
+> Restoring first-class custom sources via a tamper-bound, Sovereign-signed
+> source descriptor is tracked as a follow-up issue.
 
 The hash is computed as SHA-256:
 ```

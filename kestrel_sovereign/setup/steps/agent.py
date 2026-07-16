@@ -170,7 +170,30 @@ def run(ctx: SetupContext) -> None:
     if not _ensure_did_web_domain(ctx):
         return
 
-    if not (ctx.agent_data_root / name / "kestrel_prime.db").exists():
+    incept_needed = not (ctx.agent_data_root / name / "kestrel_prime.db").exists()
+    if incept_needed:
+        # Centralize custody at the *actual* inception boundary (#2468): resolve,
+        # persist (round-trip-verified) and export the one effective
+        # KESTREL_DATA_KEY right before inception, so encrypt-key == persist-key
+        # regardless of how we got here. This closes two gaps the keys step alone
+        # could not:
+        #   * a single-step ``kestrel setup agent`` skips the keys step entirely;
+        #   * ``--reset`` moves ``.env`` aside at wizard start, so a key resolved
+        #     *before* reset would be lost — resolving here (after reset) persists
+        #     the effective key that the immediate next boot will actually load.
+        # Never incept an identity we would encrypt with the wrong — or no — key.
+        from kestrel_sovereign.setup.steps.keys import ensure_effective_data_key
+
+        _, custody_conflict, _, _ = ensure_effective_data_key(
+            ctx.env_path, generate_if_missing=True
+        )
+        if custody_conflict:
+            ctx.block(
+                f"Skipped inception for '{name}': {custody_conflict}"
+            )
+            return
+
+    if incept_needed:
         suffix = " (test instance)" if ctx.is_test_instance else ""
         ctx.prompter.info(
             f"Running inception for '{name}'{suffix} — generating DID + DB..."

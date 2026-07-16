@@ -26,6 +26,8 @@ from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
+from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
+
 from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
@@ -186,7 +188,7 @@ class AgentManager:
         cleanup explicitly.
         """
         try:
-            await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+            await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
         except (asyncio.TimeoutError, Exception) as exc:
             logger.warning(
                 "Failed to clean up unregistered agent %r: %s",
@@ -378,7 +380,7 @@ class AgentManager:
             if agent is not None:
                 self._agent_names.pop(agent.agent_id, None)
                 try:
-                    await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+                    await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
                     logger.info(f"Agent '{name}' shut down")
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.warning(f"Agent '{name}' shutdown issue: {e}")
@@ -409,6 +411,46 @@ class AgentManager:
                 raise ValueError("No free agent ports remain in 8801-65535.")
         self._reserved_ports.add(candidate)
         return candidate
+
+    def _data_key_custody_conflict(self) -> Optional[str]:
+        """Return a custody-conflict message if the process ``KESTREL_DATA_KEY``
+        disagrees with the one persisted in the resolved home ``.env`` (#2468).
+
+        Reuses the setup path's resolver so runtime inception enforces the same
+        contract: encrypting a new identity with a key the home ``.env`` does not
+        persist would brick that agent on the next boot. Returns ``None`` when
+        custody is coherent (matching keys, only-persisted, or only-exported).
+        Best-effort: never raises — a resolver/import failure must not block the
+        running fleet, only a *positive* conflict does.
+        """
+        try:
+            from kestrel_sovereign.setup.steps.keys import (
+                DATA_KEY_ENV,
+                read_persisted_data_key,
+                resolve_data_key_authority,
+            )
+
+            # Read the *same* ``.env`` whose ``KESTREL_DATA_KEY`` actually
+            # seeded ``os.environ`` at boot. ``server.py`` loads the resolved
+            # project home first (``override=False`` → wins), then CWD only to
+            # fill gaps. ``_base_data_dir`` is hard-wired to ``Path.cwd()``, so
+            # comparing against it would diverge whenever ``kestrel start`` is
+            # launched from a source checkout under an explicit ``KESTREL_HOME``
+            # — producing a false conflict (or missing a real one) (#2468).
+            try:
+                from kestrel_sovereign.paths import project_dir as _resolve_project_dir
+
+                env_path = _resolve_project_dir() / ".env"
+            except Exception:
+                env_path = self._base_data_dir / ".env"
+            persisted = read_persisted_data_key(env_path)
+            exported = os.environ.get(DATA_KEY_ENV)
+            _, conflict = resolve_data_key_authority(
+                persisted, exported, env_name=env_path.name
+            )
+            return conflict
+        except Exception:
+            return None
 
     async def create_agent(
         self,
@@ -445,6 +487,17 @@ class AgentManager:
         """
         if self.get_agent(name) is not None:
             raise ValueError(f"Agent '{name}' already exists")
+
+        # Custody guard (#2468): runtime inception (POST /api/agents, spawned
+        # children) reaches ``create_kestrel_identity_async`` without the setup
+        # resolver, so verify — through the *same* resolver setup uses — that the
+        # KESTREL_DATA_KEY this process would encrypt with matches the one
+        # persisted in the resolved home ``.env``. Refuse a split brain (exported
+        # key A ⇄ persisted key B) before any identity is written, rather than
+        # mint an agent the next boot cannot decrypt.
+        custody_conflict = self._data_key_custody_conflict()
+        if custody_conflict:
+            raise ValueError(custody_conflict)
 
         # Allocate the port BEFORE inception (codex round 6): failing the
         # allocation after inception leaves an orphaned identity directory.

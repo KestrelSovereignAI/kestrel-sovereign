@@ -1,111 +1,208 @@
-"""
-Comprehensive Structured Output Test Suite
+"""Structured-output coverage across the supported LLM providers.
 
-Tests Pydantic response_format support across all LLM providers.
+Network-backed cases require both credentials and ``KESTREL_LIVE_TESTS=1``.
+Credentials alone never authorize a paid request.
 """
-import asyncio
+
 import json
-import logging
 import os
-import pytest
-from typing import List, Literal, Optional
+from types import SimpleNamespace
+from typing import Literal
+from unittest.mock import AsyncMock
 
+import pytest
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
 
 from kestrel_sovereign.llm.service import LLMService
-
-load_dotenv()
-
-logger = logging.getLogger(__name__)
 
 
 # =============================================================================
 # Test Response Models
 # =============================================================================
 
+
 class SimpleResponse(BaseModel):
     """Simple structured response for basic tests."""
+
     answer: str = Field(description="The answer to the question")
-    confidence: float = Field(description="Confidence level between 0.0 and 1.0 (e.g. 0.95)")
+    confidence: float = Field(
+        description="Confidence level between 0.0 and 1.0 (e.g. 0.95)"
+    )
 
 
 class ListResponse(BaseModel):
     """Response with a list field."""
+
     thoughts: str = Field(description="Thoughts about the request")
-    items: List[str] = Field(description="List of items")
+    items: list[str] = Field(description="List of items")
 
 
 class MathResponse(BaseModel):
     """Response for math problems."""
+
     result: int = Field(description="The numeric result")
     explanation: str = Field(description="Brief explanation of the calculation")
 
 
 class AnalysisResponse(BaseModel):
     """Complex response with nested fields."""
+
     summary: str = Field(description="Brief summary")
-    key_points: List[str] = Field(description="Main points")
-    sentiment: Literal["positive", "negative", "neutral"] = Field(description="Overall sentiment")
-    confidence_score: float = Field(description="Confidence between 0.0 and 1.0 (e.g. 0.95)")
+    key_points: list[str] = Field(description="Main points")
+    sentiment: Literal["positive", "negative", "neutral"] = Field(
+        description="Overall sentiment"
+    )
+    confidence_score: float = Field(
+        description="Confidence between 0.0 and 1.0 (e.g. 0.95)"
+    )
 
 
 # =============================================================================
 # Provider Test Matrix
 # =============================================================================
 
-# Providers to test (will skip if not configured)
-# Using smaller/cheaper models for faster tests:
-# - OpenAI: gpt-5-mini (cheap, fast)
-# - Anthropic: claude-haiku-4-5-20251001 (Claude Haiku 4.5)
-# - Vertex: gemini-3-flash-preview (fast, cheap)
-PROVIDERS = [
+# Smaller models keep explicitly opted-in live runs inexpensive.
+PROVIDER_MODEL_MATRIX = (
     ("openai", "gpt-5-mini"),
     ("anthropic", "claude-haiku-4-5-20251001"),
     ("vertex_ai", "gemini-3-flash-preview"),
-]
+)
+
+_LIVE_TESTS_ENV = "KESTREL_LIVE_TESTS"
+_PROVIDER_CREDENTIAL_ENV_VARS = {
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    "vertex_ai": ("GOOGLE_API_KEY", "GCP_PROJECT_ID"),
+}
 
 
-def provider_available(provider_name: str) -> bool:
-    """Check if a provider is available based on environment."""
-    if provider_name == "openai":
-        return bool(os.environ.get("OPENAI_API_KEY"))
-    elif provider_name == "anthropic":
-        return bool(os.environ.get("ANTHROPIC_API_KEY"))
-    elif provider_name == "vertex_ai":
-        return bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GCP_PROJECT_ID"))
-    return False
+def _provider_available(provider_name: str) -> bool:
+    """Return whether credentials for a declared matrix provider exist."""
+    return any(
+        os.environ.get(variable, "").strip()
+        for variable in _PROVIDER_CREDENTIAL_ENV_VARS.get(provider_name, ())
+    )
+
+
+def _require_live_opt_in() -> None:
+    """Skip before external client use unless live tests are explicitly enabled."""
+    if os.environ.get(_LIVE_TESTS_ENV) != "1":
+        pytest.skip(f"live test requires explicit opt-in: set {_LIVE_TESTS_ENV}=1")
+
+
+def _require_live_provider(provider_name: str) -> None:
+    """Require explicit live opt-in and credentials for one provider."""
+    _require_live_opt_in()
+    if not _provider_available(provider_name):
+        credential_names = " or ".join(_PROVIDER_CREDENTIAL_ENV_VARS[provider_name])
+        pytest.skip(f"{provider_name} requires {credential_names}")
+
+
+async def _get_matrix_response(llm_service, provider: str, model: str, **request):
+    """Call a declared matrix model only after crossing the live-test gate."""
+    _require_live_provider(provider)
+    return await llm_service.get_response(model_override=model, **request)
 
 
 # =============================================================================
 # Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 def llm_service():
     """Create an LLM service instance."""
-    from kestrel_sovereign.llm.service import LLMService
+
     return LLMService()
+
+
+def _set_fake_provider_credentials(monkeypatch, provider: str) -> None:
+    """Populate inert credentials for hermetic live-gate regressions."""
+    for variable in _PROVIDER_CREDENTIAL_ENV_VARS[provider]:
+        monkeypatch.setenv(variable, "test-credential-must-never-reach-network")
+
+
+class TestStructuredOutputHermeticity:
+    """Regression coverage for the live gate and provider/model matrix."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
+    async def test_credentials_without_opt_in_never_reach_service(
+        self,
+        monkeypatch,
+        provider,
+        model,
+    ):
+        monkeypatch.delenv(_LIVE_TESTS_ENV, raising=False)
+        _set_fake_provider_credentials(monkeypatch, provider)
+        get_response = AsyncMock(
+            side_effect=AssertionError("network-capable service call was reached")
+        )
+        service = SimpleNamespace(get_response=get_response)
+
+        with pytest.raises(pytest.skip.Exception, match=_LIVE_TESTS_ENV):
+            await _get_matrix_response(
+                service,
+                provider,
+                model,
+                system_prompt="system",
+                user_prompt="user",
+                response_format=SimpleResponse,
+            )
+
+        get_response.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
+    async def test_opted_in_mock_routes_each_declared_model(
+        self,
+        monkeypatch,
+        provider,
+        model,
+    ):
+        monkeypatch.setenv(_LIVE_TESTS_ENV, "1")
+        _set_fake_provider_credentials(monkeypatch, provider)
+        expected = object()
+        get_response = AsyncMock(return_value=expected)
+        service = SimpleNamespace(get_response=get_response)
+
+        response = await _get_matrix_response(
+            service,
+            provider,
+            model,
+            system_prompt="system",
+            user_prompt="user",
+            response_format=SimpleResponse,
+        )
+
+        assert response is expected
+        get_response.assert_awaited_once_with(
+            model_override=model,
+            system_prompt="system",
+            user_prompt="user",
+            response_format=SimpleResponse,
+        )
 
 
 # =============================================================================
 # Basic Structured Output Tests
 # =============================================================================
 
+
+@pytest.mark.live
 class TestStructuredOutputBasic:
     """Basic structured output tests for each provider."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider,model", PROVIDERS)
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
     async def test_simple_structured_response(self, llm_service, provider, model):
         """Test simple structured response with answer and confidence."""
-        if not provider_available(provider):
-            pytest.skip(f"{provider} not configured")
-
-        response = await llm_service.get_response(
+        response = await _get_matrix_response(
+            llm_service,
+            provider,
+            model,
             system_prompt="You are a helpful assistant. Always respond with high confidence.",
             user_prompt="What is 2+2?",
-            model_override=provider,
             response_format=SimpleResponse,
         )
 
@@ -117,20 +214,21 @@ class TestStructuredOutputBasic:
         parsed = SimpleResponse.model_validate(data)
         assert "4" in parsed.answer.lower() or parsed.answer == "4"
         # Some LLMs return 0-1, others 0-100 despite the field description
-        confidence = parsed.confidence / 100 if parsed.confidence > 1 else parsed.confidence
+        confidence = (
+            parsed.confidence / 100 if parsed.confidence > 1 else parsed.confidence
+        )
         assert 0 <= confidence <= 1
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider,model", PROVIDERS)
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
     async def test_list_structured_response(self, llm_service, provider, model):
         """Test structured response with list field."""
-        if not provider_available(provider):
-            pytest.skip(f"{provider} not configured")
-
-        response = await llm_service.get_response(
+        response = await _get_matrix_response(
+            llm_service,
+            provider,
+            model,
             system_prompt="You are a helpful assistant.",
             user_prompt="List 3 primary colors.",
-            model_override=provider,
             response_format=ListResponse,
         )
 
@@ -142,16 +240,15 @@ class TestStructuredOutputBasic:
         assert parsed.thoughts is not None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider,model", PROVIDERS)
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
     async def test_math_structured_response(self, llm_service, provider, model):
         """Test math problem with structured numeric response."""
-        if not provider_available(provider):
-            pytest.skip(f"{provider} not configured")
-
-        response = await llm_service.get_response(
+        response = await _get_matrix_response(
+            llm_service,
+            provider,
+            model,
             system_prompt="You are a math assistant. Solve problems accurately.",
             user_prompt="What is 15 multiplied by 7?",
-            model_override=provider,
             response_format=MathResponse,
         )
 
@@ -167,20 +264,21 @@ class TestStructuredOutputBasic:
 # Complex Structured Output Tests
 # =============================================================================
 
+
+@pytest.mark.live
 class TestStructuredOutputComplex:
     """Complex structured output tests."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider,model", PROVIDERS)
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
     async def test_analysis_response(self, llm_service, provider, model):
         """Test complex analysis response with multiple fields."""
-        if not provider_available(provider):
-            pytest.skip(f"{provider} not configured")
-
-        response = await llm_service.get_response(
+        response = await _get_matrix_response(
+            llm_service,
+            provider,
+            model,
             system_prompt="You are a text analyst. Analyze text for sentiment and key points.",
             user_prompt="The product exceeded my expectations. Great quality and fast shipping!",
-            model_override=provider,
             response_format=AnalysisResponse,
         )
 
@@ -191,7 +289,11 @@ class TestStructuredOutputComplex:
         assert parsed.sentiment in ["positive", "negative", "neutral"]
         assert len(parsed.key_points) >= 1
         # Some LLMs return 0-100 despite the field description
-        score = parsed.confidence_score / 100 if parsed.confidence_score > 1 else parsed.confidence_score
+        score = (
+            parsed.confidence_score / 100
+            if parsed.confidence_score > 1
+            else parsed.confidence_score
+        )
         assert 0 <= score <= 1
 
 
@@ -199,14 +301,15 @@ class TestStructuredOutputComplex:
 # Direct Adapter Tests
 # =============================================================================
 
+
+@pytest.mark.live
 class TestAdapterStructuredOutput:
     """Test structured output directly on adapters."""
 
     @pytest.mark.asyncio
     async def test_openai_adapter_structured(self):
         """Test OpenAI adapter structured output directly."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        _require_live_provider("openai")
 
         import openai
         from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
@@ -215,8 +318,7 @@ class TestAdapterStructuredOutput:
         adapter = OpenAIAdapter()
 
         messages = adapter.create_messages(
-            user_prompt="What is 5+5?",
-            system_prompt="Answer math questions."
+            user_prompt="What is 5+5?", system_prompt="Answer math questions."
         )
 
         response = await adapter.get_response(
@@ -234,8 +336,7 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_anthropic_adapter_structured(self):
         """Test Anthropic adapter structured output directly."""
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            pytest.skip("ANTHROPIC_API_KEY not set")
+        _require_live_provider("anthropic")
 
         import anthropic
         from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
@@ -252,7 +353,7 @@ class TestAdapterStructuredOutput:
             model="claude-haiku-4-5-20251001",
             messages=messages,
             response_format=MathResponse,
-            system_prompt="Answer math questions accurately."
+            system_prompt="Answer math questions accurately.",
         )
 
         assert response.content is not None
@@ -263,16 +364,14 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_vertex_adapter_structured(self):
         """Test Vertex AI adapter structured output directly."""
-        if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GCP_PROJECT_ID")):
-            pytest.skip("Google credentials not set")
+        _require_live_provider("vertex_ai")
 
         from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
 
         adapter = VertexAIAdapter()
 
         messages = adapter.create_messages(
-            user_prompt="What is 8+2?",
-            system_prompt="Answer math questions."
+            user_prompt="What is 8+2?", system_prompt="Answer math questions."
         )
 
         response = await adapter.get_response(
@@ -290,6 +389,8 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_ollama_adapter_structured(self):
         """Test Ollama adapter structured output directly."""
+        _require_live_opt_in()
+
         try:
             import ollama
         except ImportError:
@@ -310,19 +411,23 @@ class TestAdapterStructuredOutput:
 
         messages = adapter.create_messages(
             user_prompt="What is 6+4?",
-            system_prompt="Answer math questions. Always respond with valid JSON."
+            system_prompt="Answer math questions. Always respond with valid JSON.",
         )
 
         # Use a small model that's likely to be available
         # Try llama3.2:latest first, fall back to any available model
         model_to_use = None
-        model_list = models.models if hasattr(models, 'models') else models.get('models', [])
+        model_list = (
+            models.models if hasattr(models, "models") else models.get("models", [])
+        )
         for m in model_list:
-            model_name = m.model if hasattr(m, 'model') else m.get('model', m.get('name', ''))
+            model_name = (
+                m.model if hasattr(m, "model") else m.get("model", m.get("name", ""))
+            )
             if model_name:
                 model_to_use = model_name
                 # Prefer smaller models
-                if 'llama3.2' in model_name.lower() or 'qwen' in model_name.lower():
+                if "llama3.2" in model_name.lower() or "qwen" in model_name.lower():
                     break
 
         if not model_to_use:
@@ -343,6 +448,8 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_ollama_adapter_streaming_structured(self):
         """Test Ollama adapter streaming with structured output."""
+        _require_live_opt_in()
+
         try:
             import ollama
         except ImportError:
@@ -362,8 +469,7 @@ class TestAdapterStructuredOutput:
         adapter = OllamaAdapter()
 
         messages = adapter.create_messages(
-            user_prompt="What is 4+4?",
-            system_prompt="Answer math questions."
+            user_prompt="What is 4+4?", system_prompt="Answer math questions."
         )
 
         # Use adapter.list_models() which correctly categorizes embedding vs chat models
@@ -397,24 +503,26 @@ class TestAdapterStructuredOutput:
 # Edge Cases
 # =============================================================================
 
+
+@pytest.mark.live
 class TestStructuredOutputEdgeCases:
     """Edge case tests for structured output."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider,model", PROVIDERS)
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
     async def test_empty_list_response(self, llm_service, provider, model):
         """Test that empty list is handled correctly."""
-        if not provider_available(provider):
-            pytest.skip(f"{provider} not configured")
 
         class EmptyListResponse(BaseModel):
-            items: List[str] = Field(description="List of items (can be empty)")
+            items: list[str] = Field(description="List of items (can be empty)")
             reason: str = Field(description="Why the list is empty or not")
 
-        response = await llm_service.get_response(
+        response = await _get_matrix_response(
+            llm_service,
+            provider,
+            model,
             system_prompt="You are helpful.",
             user_prompt="List all months that have 32 days.",
-            model_override=provider,
             response_format=EmptyListResponse,
         )
 
@@ -426,12 +534,9 @@ class TestStructuredOutputEdgeCases:
         assert isinstance(parsed.reason, str) and len(parsed.reason) > 0
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider,model", PROVIDERS)
+    @pytest.mark.parametrize("provider,model", PROVIDER_MODEL_MATRIX)
     async def test_optional_fields(self, llm_service, provider, model):
         """Test response model with optional fields."""
-        if not provider_available(provider):
-            pytest.skip(f"{provider} not configured")
-
         # OpenAI doesn't support Optional fields in structured output
         # All fields must be in the 'required' array
         if provider == "openai":
@@ -439,12 +544,14 @@ class TestStructuredOutputEdgeCases:
 
         class OptionalResponse(BaseModel):
             answer: str = Field(description="The answer")
-            details: Optional[str] = Field(default=None, description="Optional details")
+            details: str | None = Field(default=None, description="Optional details")
 
-        response = await llm_service.get_response(
+        response = await _get_matrix_response(
+            llm_service,
+            provider,
+            model,
             system_prompt="You are helpful. Be concise.",
             user_prompt="What color is the sky?",
-            model_override=provider,
             response_format=OptionalResponse,
         )
 
@@ -459,14 +566,15 @@ class TestStructuredOutputEdgeCases:
 # Streaming with Structured Output
 # =============================================================================
 
+
+@pytest.mark.live
 class TestStreamingStructuredOutput:
     """Test streaming with structured output (where supported)."""
 
     @pytest.mark.asyncio
     async def test_openai_streaming_structured(self):
         """Test OpenAI streaming with structured output."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        _require_live_provider("openai")
 
         import openai
         from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
@@ -475,8 +583,7 @@ class TestStreamingStructuredOutput:
         adapter = OpenAIAdapter()
 
         messages = adapter.create_messages(
-            user_prompt="What is 3+3?",
-            system_prompt="Answer math questions."
+            user_prompt="What is 3+3?", system_prompt="Answer math questions."
         )
 
         chunks = []
@@ -502,17 +609,16 @@ class TestStreamingStructuredOutput:
 # Service Layer Streaming Tests
 # =============================================================================
 
+
+@pytest.mark.live
 class TestServiceStreamingStructuredOutput:
     """Test streaming structured output through the service layer."""
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(
-        not os.environ.get("OPENAI_API_KEY", "").strip(),
-        reason="Requires OpenAI API key"
-    )
-    @pytest.mark.asyncio
     async def test_service_streaming_structured_openai(self):
         """Test streaming structured output via service layer with OpenAI."""
+        _require_live_provider("openai")
+
         service = LLMService()
 
         chunks = []
@@ -533,13 +639,10 @@ class TestServiceStreamingStructuredOutput:
         assert parsed.result == 10
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(
-        not os.environ.get("OPENAI_API_KEY", "").strip(),
-        reason="Requires OpenAI API key"
-    )
-    @pytest.mark.asyncio
     async def test_service_generate_stream_structured(self):
         """Test generate_stream with structured output."""
+        _require_live_provider("openai")
+
         service = LLMService()
 
         chunks = []
@@ -557,13 +660,10 @@ class TestServiceStreamingStructuredOutput:
         assert len(parsed.items) == 3
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(
-        not os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        and not os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip(),
-        reason="anthropic not configured"
-    )
     async def test_streaming_fallback_for_non_streaming_provider(self):
         """Test that non-streaming providers fall back gracefully."""
+        _require_live_provider("anthropic")
+
         service = LLMService()
 
         # Anthropic streaming with structured output falls back to non-streaming

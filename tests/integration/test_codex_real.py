@@ -14,8 +14,10 @@ way to catch app-server protocol drift between releases.
 """
 from __future__ import annotations
 
+import base64
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -27,11 +29,19 @@ _BIN = os.environ.get(
     "KESTREL_CODEX_APP_SERVER_BIN",
     "/Applications/Codex.app/Contents/Resources/codex",
 )
-_HAVE = Path(_BIN).exists() and (Path.home() / ".codex" / "auth.json").exists()
+_REAL_HOME = Path.home()
+_REAL_CODEX_HOME = Path(
+    os.environ.get("CODEX_HOME", str(_REAL_HOME / ".codex"))
+).expanduser().resolve()
+_HAVE = Path(_BIN).exists() and (_REAL_CODEX_HOME / "auth.json").exists()
+_LIVE_OPT_IN = os.environ.get("KESTREL_RUN_LIVE_CODEX") == "1"
 
 pytestmark = pytest.mark.skipif(
-    not _HAVE,
-    reason="codex binary + ~/.codex/auth.json required for live app-server test",
+    not (_HAVE and _LIVE_OPT_IN),
+    reason=(
+        "set KESTREL_RUN_LIVE_CODEX=1 with a codex binary and linked "
+        "auth.json to run billed live app-server tests"
+    ),
 )
 
 
@@ -104,20 +114,74 @@ async def test_streaming_text_real():
 
 
 @pytest.mark.asyncio
-async def test_vision_call_gpt55_real():
+async def test_vision_call_gpt55_real(tmp_path, monkeypatch):
     """Live multimodal smoke: Chat image_url input reaches Codex as an
-    app-server image input and the model can answer from the image."""
-    adapter = CodexAdapter()
+    app-server image input and the explicitly requested GPT-5.5 completes.
+
+    HOME, CODEX_HOME, config, workspace, and materialized image paths are all
+    isolated. Only auth.json (and installation_id when present) are linked
+    from the operator's real Codex home. This prevents ambient model/effort
+    config from changing what the smoke actually exercises.
+    """
+    source_codex_home = tmp_path / "source-codex-home"
+    runtime_home = tmp_path / "runtime-home"
+    workspace = tmp_path / "workspace"
+    image_dir = tmp_path / "images"
+    for directory in (
+        source_codex_home,
+        runtime_home,
+        workspace,
+        image_dir,
+    ):
+        directory.mkdir()
+    for filename in ("auth.json", "installation_id"):
+        source = _REAL_CODEX_HOME / filename
+        if source.exists():
+            (source_codex_home / filename).symlink_to(source)
+    (source_codex_home / "config.toml").write_text(
+        'model = "gpt-5.5"\nmodel_reasoning_effort = "max"\n',
+        encoding="utf-8",
+    )
+
+    # Valid 32x32 RGB red PNG, decoded to an isolated fixture path first so a
+    # corrupt compressed stream cannot masquerade as an adapter/protocol bug.
+    red_png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAANUlEQVR4nO3Q"
+        "sQ0AMAzDsLT//9yeoCkbeYAN6LzZdZf3x0GSKEmUJEoSJYmSREmiJFGSaMoH"
+        "o8QBPwYSAhsAAAAASUVORK5CYII=",
+        validate=True,
+    )
+    image_fixture = image_dir / "solid-red.png"
+    image_fixture.write_bytes(red_png_bytes)
+    from PIL import Image
+
+    with Image.open(image_fixture) as image:
+        image.verify()
+        assert image.size == (32, 32)
     red_png = (
         "data:image/png;base64,"
-        "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABLUlEQVR4nO3T"
-        "MREAMAwDsST8ObcwtLwIePjzvol0dD0F0HoAVgCsAFgBsAJgBcAKgBUAKwBW"
-        "AKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAK"
-        "gBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgB"
-        "sAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsA"
-        "VgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXA"
-        "CoAVACsAVgCsAFgBsAKM9QHP4QH/xCXf5QAAAABJRU5ErkJggg=="
+        + base64.b64encode(image_fixture.read_bytes()).decode("ascii")
     )
+
+    monkeypatch.setenv("HOME", str(runtime_home))
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    monkeypatch.setenv("KESTREL_CODEX_CWD", str(workspace))
+    monkeypatch.setenv("TMPDIR", str(image_dir))
+    # tempfile caches the first resolved temp directory process-wide; pin the
+    # adapter's NamedTemporaryFile path even if another test initialized it.
+    monkeypatch.setattr(tempfile, "tempdir", str(image_dir))
+
+    adapter = CodexAdapter()
+    app = adapter._app_server()
+    app_requests = []
+    real_request = app.request
+
+    async def recording_request(method, params=None, *, timeout=120):
+        if method in ("thread/start", "turn/start"):
+            app_requests.append((method, dict(params or {})))
+        return await real_request(method, params, timeout=timeout)
+
+    monkeypatch.setattr(app, "request", recording_request)
     try:
         resp = await adapter.get_response(
             client=None,
@@ -143,6 +207,16 @@ async def test_vision_call_gpt55_real():
     print(f"\nvision gpt-5.5: {resp.content!r}", file=sys.stderr)
     assert isinstance(resp, LLMResponse)
     assert "red" in (resp.content or "").lower()
+    thread_params = next(
+        params for method, params in app_requests if method == "thread/start"
+    )
+    turn_params = next(
+        params for method, params in app_requests if method == "turn/start"
+    )
+    assert thread_params["model"] == turn_params["model"] == "gpt-5.5"
+    assert thread_params["config"]["model_reasoning_effort"] == "xhigh"
+    assert turn_params["effort"] == "xhigh"
+    assert not list(image_dir.glob("kestrel-codex-image-*"))
 
 
 @pytest.mark.asyncio
