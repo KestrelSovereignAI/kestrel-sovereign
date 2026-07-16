@@ -3353,7 +3353,11 @@ class CodexAdapter(LLMAdapter):
         cancel_token = kwargs.get("cancel_token")
         keep_trailing_system = bool(kwargs.get("keep_trailing_system"))
         idx = 0
-        async for ev in self._run_turn(
+        # This is the canonical usage-bearing stream for both tool and plain
+        # callers.  The retry helper already bypasses retries when ``tools`` is
+        # truthy, so tool-call semantics remain unchanged while text-only
+        # callers retain the safe pre-output idle retry of get_streaming_response.
+        async for ev in self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
             keep_trailing_system=keep_trailing_system,
