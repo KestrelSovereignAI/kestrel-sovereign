@@ -175,6 +175,10 @@ class ContextResult:
     # hardening invariant (Review record, PR #1306).
     degraded_mode: bool = False
     mandatory_system_tokens: int = 0
+    # Exact per-turn snapshot used to derive prompt adaptation. The turn
+    # orchestrator reuses this same object for governance-delta notices so the
+    # two views cannot drift when model state changes during context assembly.
+    state_of_mind: Any = None
 
 
 class ContextManager:
@@ -425,6 +429,14 @@ class ContextManager:
         """
         warnings: List[str] = []
 
+        # Resolve constitutional awareness once. Prompt adaptation is stable
+        # top-level context; mutable StateOfMind fields travel as append-only
+        # operator facts. Returning this exact object in ContextResult keeps
+        # those two views on the same per-turn snapshot.
+        state_of_mind, prompt_adaptation = (
+            self._resolve_state_of_mind_snapshot()
+        )
+
         # Handle EPHEMERAL mode - no retrieval
         if privacy_mode == "EPHEMERAL":
             return await self._build_ephemeral_context(
@@ -434,6 +446,8 @@ class ContextManager:
                 system_prompt_addendum=system_prompt_addendum,
                 system_prompt_budget_bytes=system_prompt_budget_bytes,
                 anchored_doctrine=anchored_doctrine,
+                state_of_mind=state_of_mind,
+                prompt_adaptation=prompt_adaptation,
             )
 
         # Use provided history or fetch from storage
@@ -442,18 +456,6 @@ class ContextManager:
         else:
             history = await self.conversation_manager.get_conversation_history()
         message_count = len(history)
-
-        # Get constitutional awareness. Prompt adaptation is stable enough for
-        # the top-level prefix; mutable StateOfMind fields are delivered by the
-        # operator-signal producer as append-only turn facts.
-        prompt_adaptation = None
-        state_of_mind = None
-        if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
-            try:
-                state_of_mind = self.llm_service.get_state_of_mind()
-                prompt_adaptation = state_of_mind.prompt_adaptation
-            except Exception as e:
-                logger.warning(f"Failed to get constitutional state of mind: {e}")
 
         # Measure the non-borrowable mandatory governance floor for the
         # #1309 elastic budget (Emma 2026-05-20). When the floor cannot
@@ -508,6 +510,7 @@ class ContextManager:
                 warnings=warnings,
                 degraded_mode=True,
                 mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
             )
 
         # 1. Build system prompt. When the caller sets
@@ -964,6 +967,7 @@ class ContextManager:
                         warnings=warnings,
                         degraded_mode=True,
                         mandatory_system_tokens=mandatory_system_tokens,
+                        state_of_mind=state_of_mind,
                     )
                 if conv_store is not None:
                     try:
@@ -1017,6 +1021,7 @@ class ContextManager:
                             warnings=warnings,
                             degraded_mode=True,
                             mandatory_system_tokens=mandatory_system_tokens,
+                            state_of_mind=state_of_mind,
                         )
 
         logger.info(
@@ -1047,7 +1052,23 @@ class ContextManager:
             dropped_clauses=dropped_clauses_for_audit,
             degraded_mode=False,
             mandatory_system_tokens=mandatory_system_tokens,
+            state_of_mind=state_of_mind,
         )
+
+    def _resolve_state_of_mind_snapshot(self) -> Tuple[Any, Any]:
+        """Resolve the state and prompt adaptation exactly once per build."""
+        if not self.llm_service or not hasattr(
+            self.llm_service, "get_state_of_mind"
+        ):
+            return None, None
+        try:
+            state_of_mind = self.llm_service.get_state_of_mind()
+            return state_of_mind, state_of_mind.prompt_adaptation
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to get constitutional state of mind: %s", exc
+            )
+            return None, None
 
     async def _build_ephemeral_context(
         self,
@@ -1057,6 +1078,8 @@ class ContextManager:
         system_prompt_addendum: Optional[str] = None,
         system_prompt_budget_bytes: Optional[int] = None,
         anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        state_of_mind: Any = None,
+        prompt_adaptation: Any = None,
     ) -> ContextResult:
         """
         Build minimal context for EPHEMERAL privacy mode.
@@ -1064,17 +1087,6 @@ class ContextManager:
         In EPHEMERAL mode, no history or memories are retrieved.
         Only the system prompt and constitution are included.
         """
-        # Get constitutional awareness. Mutable StateOfMind delivery is handled
-        # by the operator-signal producer, not the stable top-level prefix.
-        prompt_adaptation = None
-        state_of_mind = None
-        if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
-            try:
-                state_of_mind = self.llm_service.get_state_of_mind()
-                prompt_adaptation = state_of_mind.prompt_adaptation
-            except Exception as e:
-                logger.warning(f"Failed to get constitutional state of mind: {e}")
-
         # The EPHEMERAL MODE notice is fixed text appended after the
         # budget-aware assembly. Codex round-13 P2 caught that we
         # must reserve its bytes too, otherwise the notice can push
@@ -1153,6 +1165,7 @@ class ContextManager:
             warnings=["EPHEMERAL mode: no history available"],
             injected_clauses=injected_clauses_for_audit,
             dropped_clauses=dropped_clauses_for_audit,
+            state_of_mind=state_of_mind,
         )
 
     # Delegate to ConversationManager

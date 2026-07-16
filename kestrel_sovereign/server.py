@@ -30,18 +30,22 @@ from kestrel_sovereign.telemetry import setup_tracing
 
 # Load environment variables from .env file.
 # override=False: Don't clobber env vars already set by ProcessManager
-# (e.g., KESTREL_DB_PATH is set per-agent in multi_agent mode).
+# (e.g., KESTREL_DB_PATH is set per-agent in multi_agent mode). With
+# override=False the FIRST source to define a key wins, so order is
+# custody-critical: the resolved project home must be consulted BEFORE the
+# current directory (#2468). A stray source-checkout ``.env`` in CWD must never
+# shadow the KESTREL_DATA_KEY the agent's identity was encrypted under, or the
+# server would boot with a key that cannot decrypt its own memory.
 #
-# Resolution order:
-#   1. CWD/.env — the project the operator is running from. This is what the
-#      pre-move root-level server.py loaded by virtue of sitting next to .env.
-#   2. <project_dir>/.env — the resolved project (KESTREL_HOME, marker walk-up,
-#      or ~/.kestrel for pip-installed users). Crucial for pip installs where
-#      CWD may be wherever the operator launched ``kestrel start`` from.
+# Resolution order (first defined wins):
+#   1. <project_dir>/.env — the resolved project home (KESTREL_HOME, marker
+#      walk-up, or ~/.kestrel for pip-installed users). This is the home whose
+#      persisted KESTREL_DATA_KEY the identity was encrypted under; authoritative.
+#   2. CWD/.env — the directory the operator happened to launch from; only fills
+#      in keys the home did not define.
 #   3. <package-dir>/.env — legacy: source clones where someone dropped a .env
 #      next to the package source.
 # python-dotenv silently no-ops on missing files, so all three calls are safe.
-load_dotenv(Path.cwd() / ".env", override=False)
 try:
     from kestrel_sovereign.paths import project_dir as _resolve_project_dir
     load_dotenv(_resolve_project_dir() / ".env", override=False)
@@ -49,6 +53,7 @@ except Exception:
     # Resolver should never raise, but a .env load is best-effort: if
     # this somehow blows up we want the server to keep booting.
     pass
+load_dotenv(Path.cwd() / ".env", override=False)
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
 from kestrel_sovereign.logging_config import (

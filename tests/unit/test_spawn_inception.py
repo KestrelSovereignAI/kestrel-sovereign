@@ -22,15 +22,17 @@ def tmp_dir(tmp_path):
 
 @pytest.fixture
 def constitution_path():
-    path = Path(__file__).parent.parent.parent / "docs" / "principles" / "KESTREL_CONSTITUTION.md"
-    if path.exists():
-        return str(path)
-    # Fallback: create a minimal constitution for testing
-    import tempfile
-    fd, fpath = tempfile.mkstemp(suffix=".md")
-    with os.fdopen(fd, "w") as f:
-        f.write("# Test Constitution\n\nArticle 1: Test principle.\n")
-    return fpath
+    # Anchor from the packaged governing source — the exact bytes the periodic
+    # integrity audit recomputes. Inception now refuses a non-authoritative
+    # override (e.g. the docs copy) because it would guarantee a next-audit
+    # Safe Mode (#2463). These tests exercise parent-DID/controller wiring, not
+    # constitution content, so they use the authoritative source.
+    return str(
+        Path(__file__).resolve().parent.parent.parent
+        / "kestrel_sovereign"
+        / "data"
+        / "KESTREL_CONSTITUTION.md"
+    )
 
 
 @pytest.mark.asyncio

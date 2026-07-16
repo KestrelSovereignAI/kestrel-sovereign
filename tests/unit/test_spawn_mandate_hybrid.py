@@ -240,6 +240,31 @@ def test_hybrid_mandate_with_wrong_parent_identity_rejected(
     )
 
 
+def test_classical_signature_for_hybrid_parent_rejected(hybrid_parent):
+    """#2400: a bare-hex classical secp256k1 signature must NOT verify
+    for a hybrid parent. Wire-format sniffing would otherwise route it
+    to classical ECDSA and bypass HYBRID_REQUIRED entirely — a
+    post-cutoff classical downgrade. Policy-first: hybrid parent +
+    non-hybrid signature → reject outright."""
+    identity, legacy_kp, _ = hybrid_parent
+    mandate = _make_mandate(parent_did=identity.legacy_did)
+    # Sign classically (no parent_identity) so we get a bare-hex sig
+    # that DOES verify against legacy_kp.public_key on its own.
+    signed = sign_mandate(mandate, legacy_kp.private_key)
+    assert not signed.parent_signature.startswith("hybrid:")
+    # Sanity: without the hybrid identity it verifies classically.
+    assert verify_mandate(signed, legacy_kp.public_key) is True
+    # But presenting the same classical mandate for the hybrid parent
+    # must be rejected as a downgrade.
+    ok = verify_mandate(
+        signed, legacy_kp.public_key, parent_identity=identity,
+    )
+    assert ok is False, (
+        "classical-only signature accepted for a hybrid parent — "
+        "HYBRID_REQUIRED downgrade bypass (#2400)"
+    )
+
+
 def test_garbage_signature_format_rejected(hybrid_parent):
     """Not a known prefix and not parseable as hex → rejected."""
     identity, legacy_kp, _ = hybrid_parent

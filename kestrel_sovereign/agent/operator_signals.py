@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,90 @@ class OperatorSignalBatch:
     @property
     def has_events(self) -> bool:
         return bool(self.events)
+
+
+class OperatorTurnInjectionResult(NamedTuple):
+    """Outcome of adding operator facts to one outbound LLM turn.
+
+    ``injected_message`` is the exact message appended to ``messages``, or
+    ``None`` when the producer had nothing to report. Inline system notices
+    are deliberately never persisted (#2009).
+    """
+
+    batch: OperatorSignalBatch
+    injected_message: Optional[Dict[str, str]]
+
+    @property
+    def keep_trailing_system(self) -> bool:
+        """Whether the selected adapter must preserve the inline system turn."""
+        return self.batch.keep_trailing_system
+
+
+async def inject_operator_turn(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    context_result: Any,
+    session_id: Optional[str],
+    model_override: Optional[str],
+    force_local_only: bool,
+) -> OperatorTurnInjectionResult:
+    """Collect and inject operator facts through the canonical turn contract.
+
+    The outbound message is always appended before optional fallback
+    persistence. Persistence failure therefore never suppresses in-flight
+    delivery. Native inline system notices remain ephemeral so a failed LLM
+    turn cannot leave a durable trailing-system poison pill (#2009).
+    """
+    producer = getattr(agent, "operator_signal_producer", None)
+    if isinstance(producer, OperatorSignalProducer):
+        batch = await producer.collect_for_turn(
+            session_id=session_id,
+            llm_service=agent.llm_service,
+            model_override=model_override,
+            force_local_only=force_local_only,
+            budget_summary=context_result.budget_summary,
+            state_of_mind=getattr(context_result, "state_of_mind", None),
+        )
+    else:
+        batch = OperatorSignalBatch.empty()
+
+    if not batch.has_events:
+        return OperatorTurnInjectionResult(
+            batch=batch,
+            injected_message=None,
+        )
+
+    injected_message = {"role": batch.role, "content": batch.content}
+    messages.append(injected_message)
+
+    if batch.role != "system":
+        try:
+            await agent.privacy_agent.add_conversation(
+                batch.role,
+                batch.content,
+                metadata={
+                    "sent_form": True,
+                    "operator_signal": True,
+                    "operator_signal_sources": [
+                        event.source for event in batch.events
+                    ],
+                    "operator_signal_fallback": batch.fallback,
+                },
+                session_id=session_id,
+                rendered_content=batch.content,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to persist operator signal turn; continuing with "
+                "in-flight delivery only: %s",
+                exc,
+                exc_info=True,
+            )
+
+    return OperatorTurnInjectionResult(
+        batch=batch,
+        injected_message=injected_message,
+    )
 
 
 def supports_inline_system_for_next_route(

@@ -72,6 +72,21 @@ One vendor can have **several** routes. For example:
 
 A route's composite key is `"<vendor>:<route>"`. The route key is the routing identity; the vendor is the grouping identity.
 
+#### Codex reasoning-effort compatibility
+
+`openai:plan` reads the running Codex app-server's model catalog before a turn
+when `model_reasoning_effort` is configured. Legacy `max` remains a native
+value for models that advertise it; for a model with a lower advertised
+ceiling (currently GPT-5.5 at `xhigh`), Kestrel treats `max` as a compatibility
+alias for that ceiling. Unknown capability metadata fails before
+`thread/start` instead of forwarding an unproved value. The adapter freezes
+the resulting model/effort pair for both `thread/start` and `turn/start`.
+
+The static compatibility rank is scheduled for removal in Kestrel 1.0 once
+the Codex protocol exposes stable semantic ranks. Live capability negotiation
+remains authoritative; the disk model cache is only a bounded fallback when
+the live catalog RPC is unavailable.
+
 ### 3. Model
 
 Which weights. Lives inside a vendor. Always an opaque ID string — **never** a literal in Python.
