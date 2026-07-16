@@ -4,8 +4,16 @@ Deploy Provider Abstract Base Class.
 Defines the interface that all deployment providers must implement.
 """
 
+import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from ._health import probe_http_health
+
+if TYPE_CHECKING:
+    from ..models import DeploymentProfile
+
+logger = logging.getLogger(__name__)
 
 
 class DeployProvider(ABC):
@@ -85,7 +93,6 @@ class DeployProvider(ABC):
         """
         ...
 
-    @abstractmethod
     async def health_check(self, url: str) -> Dict[str, Any]:
         """
         Check health of a deployed service.
@@ -96,7 +103,10 @@ class DeployProvider(ABC):
         Returns:
             Health result dict with keys: healthy, status_code, response_time
         """
-        ...
+        result = await probe_http_health(url)
+        if error := result.get("error"):
+            logger.warning("Health check failed: %s", error)
+        return dict(result)
 
     def cleanup(self) -> None:
         """

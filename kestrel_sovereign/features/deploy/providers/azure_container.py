@@ -8,7 +8,6 @@ Supports both single-agent and multi_agent (multi-agent) deployment modes.
 import asyncio
 import logging
 import os
-import time
 from typing import Any, Dict, List, Optional
 
 from ..models import DeployManagerError, DeploymentProfile
@@ -134,12 +133,9 @@ class AzureContainerProvider(DeployProvider):
                 Configuration,
                 Container,
                 ContainerApp,
-                CustomScaleRule,
-                Dapr,
                 EnvironmentVar,
                 Ingress,
                 Scale,
-                ScaleRule,
                 Secret,
                 Template,
             )
@@ -208,15 +204,13 @@ class AzureContainerProvider(DeployProvider):
 
             # Check if app exists (update vs create)
             try:
-                existing = await asyncio.to_thread(
+                await asyncio.to_thread(
                     client.container_apps.get,
                     resource_group_name=self.resource_group,
                     container_app_name=service_name,
                 )
-                is_update = True
                 logger.info(f"Updating existing Container App: {service_name}")
             except Exception:
-                is_update = False
                 logger.info(f"Creating new Container App: {service_name}")
 
             # Create or update
@@ -451,30 +445,3 @@ class AzureContainerProvider(DeployProvider):
         except Exception as e:
             logger.error(f"Failed to list deployments: {e}", exc_info=True)
             return []
-
-    async def health_check(self, url: str) -> Dict[str, Any]:
-        """Check health of a deployed Container App."""
-        import httpx
-
-        try:
-            health_url = f"{url.rstrip('/')}/health"
-            start_time = time.time()
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(health_url)
-                response_time = time.time() - start_time
-
-                return {
-                    "healthy": 200 <= response.status_code < 400,
-                    "status_code": response.status_code,
-                    "response_time": response_time,
-                }
-
-        except Exception as e:
-            logger.warning(f"Health check failed: {e}")
-            return {
-                "healthy": False,
-                "status_code": None,
-                "response_time": None,
-                "error": str(e),
-            }
