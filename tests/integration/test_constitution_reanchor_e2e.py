@@ -64,10 +64,20 @@ This is version 2. The agent must reanchor to pick this up.
 
 
 @pytest.mark.asyncio
-async def test_reanchor_updates_all_five_locations(tmp_path):
+async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V1)
     v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+
+    # Inception and reanchor now REFUSE non-authoritative constitution
+    # sources (#2463): the periodic audit always recomputes from the
+    # governing source at ``config.CONSTITUTION_PATH``. Make this test's
+    # constitution THE governing source — the sanctioned seam for a custom
+    # source — rather than a rejected override. ``governing_constitution_path``
+    # reads the config attribute dynamically, so a monkeypatch is enough.
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
 
     agent_dir = tmp_path / "agent_data" / "TestAgent"
 
@@ -157,10 +167,13 @@ async def test_reanchor_updates_all_five_locations(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reanchor_no_op_when_already_anchored(tmp_path):
+async def test_reanchor_no_op_when_already_anchored(tmp_path, monkeypatch):
     """Running reanchor with no drift must not write anything."""
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
     agent_dir = tmp_path / "agent_data" / "TestAgent"
 
     await create_kestrel_identity_async(
@@ -186,7 +199,7 @@ async def test_reanchor_no_op_when_already_anchored(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path):
+async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
     """If anything inside the five-location update raises, the entire
     transaction must roll back and the live DB is byte-identical to
     its pre-reanchor state. (The file-level backup is the *outer*
@@ -201,6 +214,9 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path):
 
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
     agent_dir = tmp_path / "agent_data" / "TestAgent"
     creds = await create_kestrel_identity_async(
         output_dir=str(agent_dir),
@@ -252,9 +268,12 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reanchor_drift_unforced_does_not_write(tmp_path):
+async def test_reanchor_drift_unforced_does_not_write(tmp_path, monkeypatch):
     constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
     constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
     agent_dir = tmp_path / "agent_data" / "TestAgent"
 
     creds = await create_kestrel_identity_async(

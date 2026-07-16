@@ -10,23 +10,20 @@ This executor provides NO isolation and should never be used in production.
 import asyncio
 import logging
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from uuid import uuid4
 
 from .base import (
     BaseExecutor,
     ExecutionEnvironmentError,
     ExecutionTimeoutError,
+    _ExecutionContext,
+    _ExecutionResult,
     _SAFE_ENV_VARS,
 )
-from ..models import ComputeScript, ExecutionRecord
 from ..destructive_policy import DestructiveOperationPolicy
+from ..models import ComputeScript, ExecutionRecord
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +57,7 @@ class LocalExecutor(BaseExecutor):
             max_output_bytes: Maximum stdout/stderr size to capture
             require_env_flag: Require KESTREL_ALLOW_LOCAL_COMPUTE=true
         """
-        self._max_output_bytes = max_output_bytes
+        super().__init__(max_output_bytes=max_output_bytes)
         self._require_env_flag = require_env_flag
         self._policy = DestructiveOperationPolicy(
             current_agent_data_path=current_agent_data_path
@@ -96,143 +93,66 @@ class LocalExecutor(BaseExecutor):
             raise ExecutionEnvironmentError(
                 "Local executor not enabled. Set KESTREL_ALLOW_LOCAL_COMPUTE=true"
             )
-        
-        execution_id = str(uuid4())
-        started_at = datetime.now()
-        
-        # Create temporary directory for script
-        tmpdir = tempfile.mkdtemp(prefix="kestrel_compute_local_")
-        
+
+        async def run(context: _ExecutionContext) -> _ExecutionResult:
+            return await self._execute_script(script, working_dir, context)
+
+        return await self._execute_with_lifecycle(
+            script,
+            temp_dir_prefix="kestrel_compute_local_",
+            runner=run,
+        )
+
+    async def _execute_script(
+        self,
+        script: ComputeScript,
+        working_dir: Optional[str],
+        context: _ExecutionContext,
+    ) -> _ExecutionResult:
+        safe_content = self._policy.rewrite_script(
+            script.content,
+            script.language,
+            working_dir or context.workdir,
+        )
+
+        if script.language == "python":
+            script_path = Path(context.workdir) / "script.py"
+            cmd = [sys.executable, str(script_path)]
+        else:
+            script_path = Path(context.workdir) / "script.sh"
+            cmd = ["bash", str(script_path)]
+
+        script_path.write_text(safe_content)
+        script_path.chmod(0o755)
+
+        # Only pass safe host variables; script-specific values remain explicit.
+        env = {key: value for key, value in os.environ.items() if key in _SAFE_ENV_VARS}
+        env.update(script.environment)
+
+        logger.warning(
+            "Executing script %s... with LOCAL executor (no isolation!)",
+            script.id[:8],
+        )
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=working_dir or context.workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=os.name == "posix",
+        )
+
         try:
-            # Rewrite script for safe deletion
-            safe_content = self._policy.rewrite_script(
-                script.content,
-                script.language,
-                working_dir or tmpdir,
+            stdout, stderr = await self._capture_process_output(
+                process,
+                timeout_seconds=script.timeout_seconds,
+                terminate=lambda: self._kill_process_group(process),
             )
-            
-            # Write script file
-            if script.language == "python":
-                script_path = Path(tmpdir) / "script.py"
-                cmd = [sys.executable, str(script_path)]
-            else:
-                script_path = Path(tmpdir) / "script.sh"
-                cmd = ["bash", str(script_path)]
-            
-            script_path.write_text(safe_content)
-            script_path.chmod(0o755)
-            
-            # Prepare environment - only pass safe variables, never leak secrets
-            env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_VARS}
-            env.update(script.environment)
-            
-            logger.warning(
-                f"Executing script {script.id[:8]}... with LOCAL executor (no isolation!)"
-            )
-            
-            # Execute
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=working_dir or tmpdir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=script.timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                try:
-                    process.kill()
-                    await process.wait()
-                except (ProcessLookupError, OSError, asyncio.CancelledError) as e:
-                    logger.debug(f"Failed to kill process on timeout: {e}")
-                raise ExecutionTimeoutError(script.id, script.timeout_seconds)
-            
-            completed_at = datetime.now()
-            
-            # Process output
-            stdout_str = stdout.decode(errors="replace")
-            stderr_str = stderr.decode(errors="replace")
-            
-            if len(stdout_str) > self._max_output_bytes:
-                stdout_str = stdout_str[:self._max_output_bytes] + "\n... [output truncated]"
-            if len(stderr_str) > self._max_output_bytes:
-                stderr_str = stderr_str[:self._max_output_bytes] + "\n... [output truncated]"
-            
-            record = ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=process.returncode,
-                stdout=stdout_str,
-                stderr=stderr_str,
-                executor="local",
-                workdir=tmpdir,
-            )
-            
-            logger.info(
-                f"Script {script.id[:8]}... completed with exit code {process.returncode} "
-                f"in {record.duration_seconds:.2f}s"
-            )
-            
-            return record
-            
-        except ExecutionTimeoutError:
-            raise
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            logger.error(f"Local execution failed: {e}")
-            completed_at = datetime.now()
+        except TimeoutError:
+            raise ExecutionTimeoutError(script.id, script.timeout_seconds) from None
 
-            return ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=-1,
-                stdout="",
-                stderr=str(e),
-                executor="local",
-                workdir=tmpdir,
-            )
-        except (UnicodeDecodeError, ValueError) as e:
-            logger.error(f"Local execution failed due to encoding/value error: {e}")
-            completed_at = datetime.now()
-
-            return ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=-1,
-                stdout="",
-                stderr=str(e),
-                executor="local",
-                workdir=tmpdir,
-            )
-        except Exception as e:
-            logger.error(f"Local execution failed: {e}", exc_info=True)
-            completed_at = datetime.now()
-
-            return ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=-1,
-                stdout="",
-                stderr=str(e),
-                executor="local",
-                workdir=tmpdir,
-            )
-            
-        finally:
-            # Clean up temporary directory
-            try:
-                shutil.rmtree(tmpdir)
-            except (PermissionError, OSError) as e:
-                logger.warning(f"Failed to clean up temp dir {tmpdir}: {e}")
+        return _ExecutionResult(
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )

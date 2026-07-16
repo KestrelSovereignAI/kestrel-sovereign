@@ -8,16 +8,19 @@ import asyncio
 import logging
 import os
 import shutil
-import subprocess
-import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from uuid import uuid4
 
-from .base import BaseExecutor, ExecutionError, ExecutionTimeoutError, _SAFE_ENV_VARS
-from ..models import ComputeScript, ExecutionRecord
+from .base import (
+    BaseExecutor,
+    ExecutionError,
+    ExecutionTimeoutError,
+    _ExecutionContext,
+    _ExecutionResult,
+    _SAFE_ENV_VARS,
+)
 from ..destructive_policy import DestructiveOperationPolicy
+from ..models import ComputeScript, ExecutionRecord
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +54,9 @@ class UvExecutor(BaseExecutor):
             uv_path: Path to uv binary (default: auto-detect)
             max_output_bytes: Maximum stdout/stderr size to capture
         """
+        super().__init__(max_output_bytes=max_output_bytes)
         self._uv_path = uv_path
         self._cached_uv_path: Optional[str] = None
-        self._max_output_bytes = max_output_bytes
         self._policy = DestructiveOperationPolicy(
             current_agent_data_path=current_agent_data_path
         )
@@ -123,159 +126,70 @@ class UvExecutor(BaseExecutor):
         uv_path = self._get_uv_path()
         if not uv_path:
             raise ExecutionError("uv binary not found")
-        
-        execution_id = str(uuid4())
-        started_at = datetime.now()
-        
-        # Create temporary directory for execution
-        tmpdir = tempfile.mkdtemp(prefix="kestrel_compute_")
-        
+
+        async def run(context: _ExecutionContext) -> _ExecutionResult:
+            return await self._execute_script(script, working_dir, context, uv_path)
+
+        return await self._execute_with_lifecycle(
+            script,
+            temp_dir_prefix="kestrel_compute_",
+            runner=run,
+        )
+
+    async def _execute_script(
+        self,
+        script: ComputeScript,
+        working_dir: Optional[str],
+        context: _ExecutionContext,
+        uv_path: str,
+    ) -> _ExecutionResult:
+        safe_content = self._policy.rewrite_script(
+            script.content,
+            "python",
+            working_dir or context.workdir,
+        )
+
+        script_path = Path(context.workdir) / "script.py"
+        script_path.write_text(safe_content)
+
+        if script.requirements:
+            req_path = Path(context.workdir) / "requirements.txt"
+            req_path.write_text("\n".join(script.requirements))
+
+        # Only pass safe host variables; never leak host credentials to scripts.
+        env = {key: value for key, value in os.environ.items() if key in _SAFE_ENV_VARS}
+        # Avoid uv falling back to an inaccessible cache beneath host HOME.
+        env["UV_CACHE_DIR"] = str(Path(context.workdir) / ".uv-cache")
+        # Script-supplied overrides win (matches LocalExecutor semantics).
+        env.update(script.environment)
+
+        cmd = [uv_path, "run"]
+        for requirement in script.requirements:
+            cmd.extend(["--with", requirement])
+        cmd.append(str(script_path))
+
+        logger.info("Executing script %s... with uv", script.id[:8])
+        logger.debug("Command: %s", " ".join(cmd))
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=working_dir or context.workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=os.name == "posix",
+        )
+
         try:
-            # Rewrite script for safe deletion
-            safe_content = self._policy.rewrite_script(
-                script.content,
-                "python",
-                working_dir or tmpdir,
+            stdout, stderr = await self._capture_process_output(
+                process,
+                timeout_seconds=script.timeout_seconds,
+                terminate=lambda: self._kill_process_group(process),
             )
-            
-            # Write script file
-            script_path = Path(tmpdir) / "script.py"
-            script_path.write_text(safe_content)
-            
-            # Write requirements if present
-            if script.requirements:
-                req_path = Path(tmpdir) / "requirements.txt"
-                req_path.write_text("\n".join(script.requirements))
-            
-            # Prepare environment - only pass safe variables, never leak
-            # host secrets (API keys, KESTREL_DATA_KEY, etc.) into the script.
-            env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_VARS}
-            # The allowlist strips host UV_CACHE_DIR/XDG_CACHE_HOME, so uv would
-            # otherwise fall back to a cache under HOME (~/.cache/uv) that can be
-            # unreadable in sandboxed/service environments. Point uv at a
-            # controlled per-execution cache inside the temp dir instead.
-            env["UV_CACHE_DIR"] = str(Path(tmpdir) / ".uv-cache")
-            # Script-supplied overrides win (matches LocalExecutor semantics).
-            env.update(script.environment)
-            
-            # Build uv command
-            # Use --isolated to create a fresh environment
-            cmd = [uv_path, "run"]
-            
-            if script.requirements:
-                # Add requirements
-                for req in script.requirements:
-                    cmd.extend(["--with", req])
-            
-            cmd.append(str(script_path))
-            
-            logger.info(f"Executing script {script.id[:8]}... with uv")
-            logger.debug(f"Command: {' '.join(cmd)}")
-            
-            # Execute the script
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=working_dir or tmpdir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=script.timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                # Kill the process on timeout
-                try:
-                    process.kill()
-                    await process.wait()
-                except (ProcessLookupError, OSError, asyncio.CancelledError) as e:
-                    logger.debug(f"Failed to kill process on timeout: {e}")
-                raise ExecutionTimeoutError(script.id, script.timeout_seconds)
-            
-            completed_at = datetime.now()
-            
-            # Truncate output if too large
-            stdout_str = stdout.decode(errors="replace")
-            stderr_str = stderr.decode(errors="replace")
-            
-            if len(stdout_str) > self._max_output_bytes:
-                stdout_str = stdout_str[:self._max_output_bytes] + "\n... [output truncated]"
-            if len(stderr_str) > self._max_output_bytes:
-                stderr_str = stderr_str[:self._max_output_bytes] + "\n... [output truncated]"
-            
-            record = ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=process.returncode,
-                stdout=stdout_str,
-                stderr=stderr_str,
-                executor="uv",
-                workdir=tmpdir,
-            )
-            
-            logger.info(
-                f"Script {script.id[:8]}... completed with exit code {process.returncode} "
-                f"in {record.duration_seconds:.2f}s"
-            )
-            
-            return record
-            
-        except ExecutionTimeoutError:
-            raise
-        except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            logger.error(f"Script execution failed: {e}")
-            completed_at = datetime.now()
+        except TimeoutError:
+            raise ExecutionTimeoutError(script.id, script.timeout_seconds) from None
 
-            return ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=-1,
-                stdout="",
-                stderr=str(e),
-                executor="uv",
-                workdir=tmpdir,
-            )
-        except (UnicodeDecodeError, ValueError) as e:
-            logger.error(f"Script execution failed due to encoding/value error: {e}")
-            completed_at = datetime.now()
-
-            return ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=-1,
-                stdout="",
-                stderr=str(e),
-                executor="uv",
-                workdir=tmpdir,
-            )
-        except Exception as e:
-            logger.error(f"Script execution failed: {e}", exc_info=True)
-            completed_at = datetime.now()
-
-            return ExecutionRecord(
-                id=execution_id,
-                script_id=script.id,
-                started_at=started_at,
-                completed_at=completed_at,
-                exit_code=-1,
-                stdout="",
-                stderr=str(e),
-                executor="uv",
-                workdir=tmpdir,
-            )
-            
-        finally:
-            # Clean up temporary directory
-            try:
-                shutil.rmtree(tmpdir)
-            except (PermissionError, OSError) as e:
-                logger.warning(f"Failed to clean up temp dir {tmpdir}: {e}")
+        return _ExecutionResult(
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )

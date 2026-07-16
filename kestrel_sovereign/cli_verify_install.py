@@ -344,19 +344,26 @@ def _test_2_core_sovereign(work_dir: Path) -> List[VerifyResult]:
     # install + first run, not a half-configured server.
     agent_dir = work_dir / "test2" / "agent_data"
     agent_dir.mkdir(parents=True, exist_ok=True)
-    constitution_path = repo / "docs" / "principles" / "KESTREL_CONSTITUTION.md"
     if not _python_check(
         venv_dir,
         (
             "from kestrel_sovereign.inception_service "
             "import create_kestrel_identity\n"
-            # The /health probe agent is an ephemeral local test
-            # fixture — nothing publishes its DID document, so the
-            # classical did:pkh method keeps verify-install free of
-            # the born-hybrid KESTREL_DID_WEB_DOMAIN/KESTREL_DATA_KEY
-            # requirements (#2397).
+            # Do NOT pass a constitution_path. Inception then defaults to the
+            # shared resolver's authoritative packaged governing source
+            # (config.CONSTITUTION_PATH = kestrel_sovereign/data/
+            # KESTREL_CONSTITUTION.md) — the exact same bytes the periodic
+            # integrity audit later recomputes (#2463). Passing the docs copy
+            # here (docs/principles/KESTREL_CONSTITUTION.md carries OKF YAML
+            # frontmatter) would incept a hash the audit can never match,
+            # false-tripping Safe Mode on a clean install.
+            #
+            # The /health probe agent is an ephemeral local test fixture —
+            # nothing publishes its DID document, so the classical did:pkh
+            # method keeps verify-install free of the born-hybrid
+            # KESTREL_DID_WEB_DOMAIN/KESTREL_DATA_KEY requirements (#2397).
             f"create_kestrel_identity({str(agent_dir)!r}, "
-            f"{str(constitution_path)!r}, identity_method='did:pkh')\n"
+            f"identity_method='did:pkh')\n"
             "print('identity bootstrapped')\n"
         ),
         env_extra={"KESTREL_DB_PATH": str(agent_dir)},

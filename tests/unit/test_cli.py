@@ -391,7 +391,15 @@ def multi_agent_env(tmp_path):
     # Stub .env so the first-run setup hook in cmd_start does not fire.
     # cmd_start tests assume a configured project; the first-run path is
     # exercised separately in test_cli_first_run.py.
-    (tmp_path / ".env").write_text("KESTREL_DATA_KEY=stub\n")
+    #
+    # Persist the same key the suite-wide autouse fixture
+    # (`_born_hybrid_inception_env`) exports into os.environ. cmd_create's
+    # pre-inception custody guard (#2468) refuses an exported⇄persisted
+    # KESTREL_DATA_KEY split-brain, so a mismatched stub here would (correctly)
+    # block agent creation. Matching them keeps this home's custody coherent.
+    (tmp_path / ".env").write_text(
+        "KESTREL_DATA_KEY=test-master-key-for-encryption-32chars!\n"
+    )
 
     return tmp_path
 

@@ -40,7 +40,7 @@ def client(monkeypatch):
         monkeypatch.setenv("KESTREL_API_KEY", test_api_key)
 
         # Create real agent identity with real constitution
-        create_kestrel_identity(agent_dir, "docs/principles/KESTREL_CONSTITUTION.md")
+        create_kestrel_identity(agent_dir)
 
         # Track threads before TestClient starts
         threads_before = set(threading.enumerate())

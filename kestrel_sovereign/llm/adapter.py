@@ -35,6 +35,28 @@ from .image_utils import process_images
 if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
 
+
+def response_usage_available(response: Any) -> bool:
+    """Whether a response carries provider-reported token evidence.
+
+    A completed call is not proof of zero usage.  Providers that omit usage
+    must retain ``None`` token fields so telemetry can distinguish "unknown"
+    from an actual zero.  Keep this predicate shared by streaming and
+    non-streaming finalizers so neither path invents billable usage.
+    """
+
+    return isinstance(response, LLMResponse) and any(
+        getattr(response, field) is not None
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+
+
 @dataclass(frozen=True)
 class ThinkingDelta:
     """Provider-separated model reasoning emitted during a stream.

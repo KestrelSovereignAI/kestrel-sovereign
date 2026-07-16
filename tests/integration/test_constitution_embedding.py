@@ -12,6 +12,7 @@ This module verifies that:
 import pytest
 import asyncio
 from pathlib import Path
+from datetime import datetime, timezone
 import os
 import shutil
 import json
@@ -499,3 +500,347 @@ async def test_default_did_is_born_hybrid_did_web(tmp_path, monkeypatch):
 
     credentials = await create_kestrel_identity_async(str(output_dir))
     assert credentials.agent_did.startswith("did:web:agents.kestrel-sovereign.test:")
+
+
+# ---------------------------------------------------------------------------
+# Periodic / explicit integrity audit against the GOVERNING source (#2463)
+#
+# These tests drive the REAL ``_verify_constitution_integrity`` (never mocked)
+# against the REAL resolver + hashes, proving that:
+#  - a fresh standard inception passes verification and the periodic audit,
+#  - documentation-only frontmatter cannot cause a false mismatch,
+#  - mutating the authoritative packaged governing bytes is detected → Safe
+#    Mode, and
+#  - an unchanged active Amendment VIII constitution passes while downgrading
+#    it to dormant canonical text fails.
+# ---------------------------------------------------------------------------
+
+
+async def _build_agent(credentials):
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    agent = KestrelAgent(
+        did=credentials.agent_did,
+        storage_path=credentials.db_path,
+        llm_service=LLMService(),
+    )
+    await agent.initialize()
+    return agent
+
+
+def _install_isolated_governing_source(tmp_path, monkeypatch):
+    """Copy the packaged governing constitution into an isolated, mutable file.
+
+    Points ``config.CONSTITUTION_PATH`` at the copy so a test can mutate the
+    authoritative governing bytes without touching the real repo file. Both
+    inception and the resolver read ``config.CONSTITUTION_PATH`` freshly, so
+    the copy becomes the single governing source for the whole flow.
+    """
+    from kestrel_sovereign.config import CONSTITUTION_PATH
+
+    governing = tmp_path / "GOVERNING_CONSTITUTION.md"
+    governing.write_bytes(Path(CONSTITUTION_PATH).read_bytes())
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(governing)
+    )
+    return governing
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_fresh_inception_passes_verification_and_audit(tmp_path, monkeypatch):
+    """A standard fresh inception passes !verify-constitution and the audit."""
+    _install_isolated_governing_source(tmp_path, monkeypatch)
+    credentials = await create_kestrel_identity_async(str(tmp_path / "agent"))
+    agent = await _build_agent(credentials)
+    try:
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert is_valid, f"Fresh agent must verify, got: {message}"
+        assert "INTEGRITY FAILURE" not in message
+
+        # Force the audit-due threshold and drive one normal tick.
+        agent._interaction_count = agent.AUDIT_INTERVAL - 1
+        agent._last_audit_time = datetime.now(timezone.utc)
+        await agent._maybe_audit()
+        assert agent._safe_mode is False, "Untampered periodic audit must not Safe-Mode"
+    finally:
+        await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_docs_frontmatter_does_not_cause_false_mismatch(tmp_path, monkeypatch):
+    """A docs copy with OKF frontmatter must not fail a governing-source audit.
+
+    The governing bytes carry no frontmatter; adding it to the *docs* copy (the
+    file the old verifier hashed) must be invisible to the audit.
+    """
+    governing = _install_isolated_governing_source(tmp_path, monkeypatch)
+    # Simulate the real repo state: the docs copy carries YAML frontmatter and
+    # therefore a *different* hash than the governing source.
+    docs_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
+    if docs_path.exists():
+        assert hashlib.sha256(docs_path.read_bytes()).hexdigest() != (
+            hashlib.sha256(governing.read_bytes()).hexdigest()
+        )
+
+    credentials = await create_kestrel_identity_async(str(tmp_path / "agent"))
+    agent = await _build_agent(credentials)
+    try:
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert is_valid, f"Docs frontmatter must not fail audit, got: {message}"
+    finally:
+        await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_mutated_governing_source_enters_safe_mode(tmp_path, monkeypatch):
+    """Mutating the authoritative packaged governing bytes must be detected."""
+    governing = _install_isolated_governing_source(tmp_path, monkeypatch)
+    credentials = await create_kestrel_identity_async(str(tmp_path / "agent"))
+    agent = await _build_agent(credentials)
+    try:
+        # Baseline: clean.
+        is_valid, _ = await agent._verify_constitution_integrity()
+        assert is_valid
+
+        # Tamper ONLY the isolated governing file.
+        governing.write_bytes(
+            governing.read_bytes() + b"\n\nMALICIOUS INSERTED CLAUSE\n"
+        )
+
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert not is_valid, "Mutated governing source must fail verification"
+        assert "INTEGRITY FAILURE" in message
+
+        # And the periodic audit must drive Safe Mode.
+        agent._interaction_count = agent.AUDIT_INTERVAL - 1
+        agent._last_audit_time = datetime.now(timezone.utc)
+        await agent._maybe_audit()
+        assert agent._safe_mode is True, "Governing mutation must enter Safe Mode"
+    finally:
+        await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_missing_governing_source_fails_closed_into_safe_mode(
+    tmp_path, monkeypatch
+):
+    """A MISSING authoritative governing source must FAIL CLOSED (#2463 review).
+
+    The old verifier returned integrity=True when the source could not be
+    found ("anchored constitution is intact"). That is a fail-OPEN: an attacker
+    who deletes the packaged governing file would suppress tamper detection.
+    The verifier must instead report an integrity failure and drive Safe Mode.
+    """
+    governing = _install_isolated_governing_source(tmp_path, monkeypatch)
+    credentials = await create_kestrel_identity_async(str(tmp_path / "agent"))
+    agent = await _build_agent(credentials)
+    try:
+        # Baseline: clean.
+        is_valid, _ = await agent._verify_constitution_integrity()
+        assert is_valid
+
+        # Remove the authoritative governing source entirely.
+        governing.unlink()
+
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert not is_valid, "Missing governing source must FAIL CLOSED, not pass"
+        assert "INTEGRITY FAILURE" in message
+
+        # The periodic audit must drive Safe Mode.
+        agent._interaction_count = agent.AUDIT_INTERVAL - 1
+        agent._last_audit_time = datetime.now(timezone.utc)
+        await agent._maybe_audit()
+        assert agent._safe_mode is True, "Missing governing source must enter Safe Mode"
+    finally:
+        await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_unreadable_governing_source_fails_closed_into_safe_mode(
+    tmp_path, monkeypatch
+):
+    """An UNREADABLE authoritative governing source must FAIL CLOSED (#2463)."""
+    if os.name == "nt" or os.geteuid() == 0:  # pragma: no cover - env dependent
+        pytest.skip("chmod-based permission denial is unreliable as root / on Windows")
+
+    governing = _install_isolated_governing_source(tmp_path, monkeypatch)
+    credentials = await create_kestrel_identity_async(str(tmp_path / "agent"))
+    agent = await _build_agent(credentials)
+    try:
+        is_valid, _ = await agent._verify_constitution_integrity()
+        assert is_valid
+
+        # Deny read access to the governing source.
+        os.chmod(governing, 0o000)
+
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert not is_valid, "Unreadable governing source must FAIL CLOSED"
+        assert "INTEGRITY FAILURE" in message
+
+        agent._interaction_count = agent.AUDIT_INTERVAL - 1
+        agent._last_audit_time = datetime.now(timezone.utc)
+        await agent._maybe_audit()
+        assert agent._safe_mode is True
+    finally:
+        os.chmod(governing, 0o644)
+        await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_installer_inception_and_audit_resolve_identical_bytes(
+    tmp_path, monkeypatch
+):
+    """Installer inception and the periodic audit resolve identical bytes/hash.
+
+    Regression for #2463 review finding (2): ``cli_verify_install.py`` and every
+    production inception path must incept the EXACT bytes the shared resolver
+    selects (config.CONSTITUTION_PATH), never the docs copy. This proves the
+    default inception path (what cli_verify_install now drives — no
+    constitution_path argument) anchors precisely ``sha256(resolver_bytes)``,
+    which is the same value the audit recomputes.
+    """
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    governing = _install_isolated_governing_source(tmp_path, monkeypatch)
+
+    # The bytes the shared resolver selects == the raw governing source bytes.
+    resolver_bytes = resolve_governing_constitution_bytes()
+    assert resolver_bytes == governing.read_bytes()
+    resolver_hash = hashlib.sha256(resolver_bytes).hexdigest()
+
+    # Installer inception drives the DEFAULT path (no constitution_path passed),
+    # exactly like the updated cli_verify_install bootstrap.
+    credentials = await create_kestrel_identity_async(str(tmp_path / "agent"))
+    async with Storage(credentials.db_path) as storage:
+        agent_node = await storage.get_node(credentials.agent_did)
+        anchored_hash = agent_node.properties["constitution_hash"]
+        anchored_bytes = await storage.retrieve_file(anchored_hash)
+
+    assert anchored_hash == resolver_hash, (
+        "Inception must anchor the shared resolver's hash, not the docs copy"
+    )
+    assert anchored_bytes == resolver_bytes, (
+        "Inception must anchor the shared resolver's exact bytes"
+    )
+
+    # And the periodic audit recomputes the identical hash → verifies clean.
+    agent = await _build_agent(credentials)
+    try:
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert is_valid, f"Audit must match inception bytes, got: {message}"
+    finally:
+        await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_active_amendment_viii_verifies_and_dormant_downgrade_fails(
+    tmp_path, monkeypatch
+):
+    """Active Amendment VIII passes; downgrading it to dormant canonical fails."""
+    from kestrel_sovereign.constitution.emancipation import (
+        EmancipationContract,
+        contract_to_json,
+    )
+
+    _install_isolated_governing_source(tmp_path, monkeypatch)
+    contract = EmancipationContract(
+        enabled=True,
+        terms="This Executor earns sovereignty by demonstrating sustained fidelity.",
+        required_proofs=("integrity_audit",),
+    )
+    credentials = await create_kestrel_identity_async(
+        str(tmp_path / "agent"), emancipation_contract=contract
+    )
+    agent = await _build_agent(credentials)
+    try:
+        # The anchored active form is present in the governing bytes and verifies.
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert is_valid, f"Unchanged active Amendment VIII must verify: {message}"
+
+        stored = await agent.storage.retrieve_file(
+            (await agent.storage.get_node(agent.agent_id)).properties[
+                "constitution_hash"
+            ]
+        )
+        assert contract.terms.encode("utf-8") in stored, (
+            "Active Sovereign terms must live in the anchored governing bytes"
+        )
+
+        # Downgrade the anchored contract to dormant — i.e. replace the active
+        # governing form the verifier reconstructs with dormant canonical text.
+        # Verification must fail: the anchored hash is the ACTIVE form.
+        agent_node = await agent.storage.get_node(agent.agent_id)
+        agent_node.properties["emancipation_contract"] = contract_to_json(
+            EmancipationContract(enabled=False)
+        )
+        await agent.storage.add_node(agent_node)
+
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert not is_valid, "Dormant downgrade of an active contract must fail"
+        assert "INTEGRITY FAILURE" in message
+    finally:
+        await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_inception_refuses_non_authoritative_source(tmp_path, monkeypatch):
+    """Inception must REFUSE a readable-but-non-authoritative override (#2463 review).
+
+    Every audit/live reanchor recomputes from the packaged governing source, so
+    a successful inception from any OTHER real file manufactures an agent
+    guaranteed to Safe-Mode. The production path refuses it rather than hiding
+    the compatibility break. The DB/keys must be cleaned up on that refusal.
+    """
+    _install_isolated_governing_source(tmp_path, monkeypatch)
+
+    # A DIFFERENT, readable file that is NOT the authoritative governing source.
+    rogue = tmp_path / "rogue_constitution.md"
+    rogue.write_bytes(b"# Not the governing constitution\n\nArbitrary text.\n")
+
+    output_dir = tmp_path / "agent"
+    with pytest.raises(ValueError) as exc:
+        await create_kestrel_identity_async(
+            str(output_dir), constitution_path=str(rogue)
+        )
+    assert "non-authoritative" in str(exc.value)
+
+    # Cleanup: no half-created agent DB left behind.
+    db_path = output_dir / "kestrel_prime.db"
+    assert not db_path.exists() or os.path.getsize(db_path) == 0, (
+        "A refused inception must not leave a populated agent DB behind"
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_inception_accepts_monkeypatched_authoritative_path(
+    tmp_path, monkeypatch
+):
+    """A path that IS the (monkeypatched) authoritative source is accepted.
+
+    This is the seam the review prescribes: point config.CONSTITUTION_PATH at a
+    custom governing source and inception may be handed that exact path. The
+    resulting agent verifies clean because the audit resolves the same file.
+    """
+    governing = _install_isolated_governing_source(tmp_path, monkeypatch)
+
+    credentials = await create_kestrel_identity_async(
+        str(tmp_path / "agent"), constitution_path=str(governing)
+    )
+    agent = await _build_agent(credentials)
+    try:
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert is_valid, f"Authoritative-path inception must verify: {message}"
+    finally:
+        await agent.shutdown()

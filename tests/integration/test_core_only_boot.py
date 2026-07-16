@@ -70,7 +70,7 @@ def client(monkeypatch):
         test_api_key = "test-core-only-key-12345"
         monkeypatch.setenv("KESTREL_API_KEY", test_api_key)
 
-        create_kestrel_identity(agent_dir, "docs/principles/KESTREL_CONSTITUTION.md")
+        create_kestrel_identity(agent_dir)
 
         threads_before = set(threading.enumerate())
 
