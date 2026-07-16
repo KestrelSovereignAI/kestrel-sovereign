@@ -440,3 +440,134 @@ def test_is_authoritative_governing_source(monkeypatch, tmp_path):
     assert is_authoritative_governing_source(str(custom)) is True
     # ...and the previously-packaged path is now non-authoritative.
     assert is_authoritative_governing_source(str(rogue)) is False
+
+
+# ---------------------------------------------------------------------------
+# Three-proof integrity verifier regressions (#2463 review matrix).
+#
+# `_verify_constitution_integrity` must fail closed on every tamper class:
+# missing anchor, missing blob row, undecryptable/corrupt blob, blob-digest
+# mismatch, and a missing or mis-targeted governed_by edge — and only pass
+# when the blob, the edge, AND live-source parity all hold.
+# ---------------------------------------------------------------------------
+
+def _verifier_agent(constitution_bytes: bytes, anchor: str | None):
+    """Mock agent wired so each proof of the real verifier can be failed
+    independently. Defaults to the all-good state; tests break one leg."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    agent = MagicMock(spec=KestrelAgent)
+    agent.agent_id = "did:web:test:agent"
+    agent.verify_constitution_overlay = AsyncMock(return_value=(True, "ok"))
+    agent._verify_spawn_mandate_constraints = AsyncMock(return_value=(True, "ok"))
+
+    node = MagicMock()
+    node.properties = {}
+    if anchor is not None:
+        node.properties["constitution_hash"] = anchor
+
+    edge = MagicMock()
+    edge.label = "governed_by"
+    edge.target_id = anchor
+
+    agent.storage = MagicMock()
+    agent.storage.get_node = AsyncMock(return_value=node)
+    agent.storage.retrieve_file = AsyncMock(return_value=constitution_bytes)
+    agent.storage.get_edges_from = AsyncMock(return_value=[edge])
+
+    agent._verify_constitution_integrity = (
+        ConstitutionMixin._verify_constitution_integrity.__get__(agent, KestrelAgent)
+    )
+    return agent, node, edge
+
+
+@pytest.fixture
+def governing_source(tmp_path, monkeypatch):
+    """Point the packaged governing source at a known tmp file."""
+    import kestrel_sovereign.config as ks_config
+
+    content = b"# Test governing constitution\n\nBe honest.\n"
+    path = tmp_path / "KESTREL_CONSTITUTION.md"
+    path.write_bytes(content)
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(path))
+    return content, hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_verifier_passes_when_all_three_proofs_hold(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert ok, msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_missing_anchor(governing_source):
+    content, _ = governing_source
+    agent, _, _ = _verifier_agent(content, anchor=None)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "No anchored constitution hash" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_missing_blob_row(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    agent.storage.retrieve_file = AsyncMock(return_value=None)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "missing" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_undecryptable_blob(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    agent.storage.retrieve_file = AsyncMock(side_effect=ValueError("bad decrypt"))
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "retrieve/decrypt" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_blob_digest_mismatch(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(b"tampered blob bytes", anchor)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "does not hash to its stored anchor" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_missing_governance_edge(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    agent.storage.get_edges_from = AsyncMock(return_value=[])
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "governed_by" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_mistargeted_governance_edge(governing_source):
+    content, anchor = governing_source
+    agent, _, edge = _verifier_agent(content, anchor)
+    edge.target_id = "0" * 64  # points at some other document
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "governed_by" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_governing_source_mutation(governing_source, tmp_path):
+    """Blob+edge intact but the packaged governing source changed → PROOF 3 fails."""
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    import kestrel_sovereign.config as ks_config
+    from pathlib import Path
+
+    Path(ks_config.CONSTITUTION_PATH).write_bytes(b"# Mutated governing source\n")
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "modified" in msg
