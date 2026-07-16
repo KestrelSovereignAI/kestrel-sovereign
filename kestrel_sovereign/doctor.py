@@ -181,6 +181,21 @@ def _check_constitution_drift(
         return
 
     canonical = _canonical_constitution_path()
+    # Up-front readability guard: if the canonical governing source itself
+    # cannot be read, no agent can be drift-checked against it, and the failure
+    # is independent of any per-agent DB state. Surface it once and stop rather
+    # than letting an empty/unreadable per-agent DB short-circuit the loop
+    # before the canonical read is ever reached (#2463). The per-agent resolve
+    # below still renders each agent's Amendment VIII contract for the actual
+    # hash comparison; this only pre-checks that the file exists and is readable.
+    try:
+        canonical.read_bytes()
+    except OSError as exc:
+        report.warn.append(
+            f"Constitution drift check skipped — cannot read canonical "
+            f"{canonical}: {exc}"
+        )
+        return
 
     for name, cfg in agents.items():
         db_path = (project_dir / cfg.data_dir / "kestrel_prime.db").resolve()
