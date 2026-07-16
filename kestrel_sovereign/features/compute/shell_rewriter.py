@@ -163,8 +163,9 @@ class ShellScriptRewriter:
         source = content.encode("utf-8")
         tree = self._parser.parse(source)
         if tree.root_node.has_error:
-            if not _RM_WORD_PATTERN.search(content):
-                return content
+            # A shell can execute commands preceding a later syntax error, so
+            # a partially-parsed script must never skip command/path policy
+            # checks.  Fail closed on any parse error.
             raise ShellRewriteError(
                 "Refusing to rewrite syntactically invalid shell code"
             )

@@ -270,27 +270,36 @@ class DestructiveOperationPolicy:
         workdir: Optional[str] = None,
         *,
         runtime_trash_dir: Optional[str | Path] = None,
+        script_cwd: Optional[str] = None,
     ) -> str:
-        """Rewrite shell deletion using a concrete Bash syntax tree."""
+        """Rewrite shell deletion using a concrete Bash syntax tree.
+
+        ``workdir`` is the executor-owned workspace authorized for direct
+        deletion.  ``script_cwd`` is the directory the script's relative
+        paths resolve against at runtime; it defaults to ``workdir`` but is
+        never itself an authorization: a caller-supplied working directory
+        must not become a real-delete root.
+        """
+        resolution_cwd = script_cwd or workdir
         trash_dir = _absolute_path(runtime_trash_dir or self.trash_dir)
         rewriter = ShellScriptRewriter(
             trash_dir=trash_dir,
             workdir=workdir,
             assert_delete_allowed=lambda target: (
                 self.assert_agent_data_deletion_allowed(
-                    self._resolve_shell_target(target, workdir),
+                    self._resolve_shell_target(target, resolution_cwd),
                     "rm",
                 )
             ),
             assert_command_allowed=lambda command: self.assert_shell_command_allowed(
                 command,
-                workdir,
+                resolution_cwd,
             ),
             direct_delete_root=lambda target: (
                 str(root)
                 if (
                     root := self._direct_delete_root(
-                        self._resolve_shell_target(target, workdir),
+                        self._resolve_shell_target(target, resolution_cwd),
                         workdir,
                     )
                 )
@@ -394,12 +403,21 @@ class DestructiveOperationPolicy:
         workdir: Optional[str] = None,
         *,
         runtime_trash_dir: Optional[str | Path] = None,
+        script_cwd: Optional[str] = None,
     ) -> str:
+        """Rewrite one script for safe deletion.
+
+        ``workdir`` is the executor-owned workspace authorized for direct
+        deletion.  ``script_cwd`` (bash only) is the runtime working
+        directory that relative operands resolve against; the Python runtime
+        resolves paths in the child process against its real cwd instead.
+        """
         if language == "bash":
             return self.rewrite_bash_script(
                 content,
                 workdir,
                 runtime_trash_dir=runtime_trash_dir,
+                script_cwd=script_cwd,
             )
         if language == "python":
             return self.rewrite_python_script(

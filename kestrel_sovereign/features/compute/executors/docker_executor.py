@@ -197,11 +197,16 @@ class DockerExecutor(BaseExecutor):
         host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
         host_trash_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+        # Container mounts (/scripts, /workspace) are read-only, so no
+        # workdir is authorized for direct deletion; every delete moves to
+        # the trash bind mount.  The container cwd only resolves relative
+        # operands for policy checks.
         safe_content = self._policy.rewrite_script(
             script.content,
             script.language,
-            "/workspace" if working_dir else "/scripts",
+            None,
             runtime_trash_dir=_CONTAINER_TRASH_DIR,
+            script_cwd="/workspace" if working_dir else "/scripts",
         )
 
         script_name = "script.py" if script.language == "python" else "script.sh"

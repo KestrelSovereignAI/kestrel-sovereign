@@ -711,3 +711,112 @@ def test_restore_rejects_trash_root_replaced_during_startup(
 
     assert (original_trash / item.parent.name / item.name).read_text() == "trashed"
     assert not destination.exists()
+
+def test_invalid_shell_fails_closed_even_without_rm(
+    tmp_path: Path,
+    trash_dir: Path,
+) -> None:
+    """A parse error must never skip command/path policy checks.
+
+    Shells execute commands preceding a later syntax error, so returning the
+    original script would let a protected-path mv run before the shell
+    reports the error.
+    """
+    policy = DestructiveOperationPolicy(trash_dir=trash_dir)
+    script = f"mv {tmp_path}/agent_data/other /tmp/x\nif"
+
+    with pytest.raises(ShellRewriteError, match="syntactically invalid"):
+        policy.rewrite_bash_script(script)
+
+
+def test_python_runtime_rename_moves_the_symlink_not_its_target(
+    tmp_path: Path,
+    trash_dir: Path,
+) -> None:
+    """os.rename on a symlink must rename the link itself, never the target."""
+    policy = DestructiveOperationPolicy(trash_dir=trash_dir)
+    target = tmp_path / "target.txt"
+    target.write_text("target data")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    renamed = tmp_path / "renamed-link"
+    content = (
+        "import os\n"
+        f"os.rename({str(link)!r}, {str(renamed)!r})\n"
+    )
+    script_path = tmp_path / "rename-link.py"
+    script_path.write_text(policy.rewrite_python_script(content))
+
+    completed = subprocess.run(
+        [sys.executable, str(script_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "target data"
+    assert not link.exists() and not link.is_symlink()
+    assert renamed.is_symlink()
+    assert renamed.read_text() == "target data"
+
+
+def test_caller_working_dir_is_not_a_direct_delete_root(
+    tmp_path: Path,
+    trash_dir: Path,
+) -> None:
+    """A caller-supplied cwd resolves relative operands but never
+    authorizes real deletion; only the executor-owned workspace does."""
+    policy = DestructiveOperationPolicy(trash_dir=trash_dir)
+    executor_workdir = tmp_path / "executor-owned"
+    executor_workdir.mkdir()
+    host_working_dir = tmp_path / "host-project"
+    host_working_dir.mkdir()
+    precious = host_working_dir / "precious.txt"
+    precious.write_text("host data")
+
+    rewritten = policy.rewrite_bash_script(
+        "rm precious.txt",
+        str(executor_workdir),
+        script_cwd=str(host_working_dir),
+    )
+    completed = subprocess.run(
+        ["sh", "-c", rewritten],
+        cwd=host_working_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "command -p mv --" in rewritten
+    assert 'rm -- "$@"' not in rewritten
+    assert completed.returncode == 0, completed.stderr
+    assert not precious.exists()
+    assert next(trash_dir.glob("*/precious.txt")).read_text() == "host data"
+
+
+@pytest.mark.asyncio
+async def test_local_executor_trashes_relative_delete_in_caller_working_dir(
+    tmp_path: Path,
+    trash_dir: Path,
+) -> None:
+    working_dir = tmp_path / "caller-cwd"
+    working_dir.mkdir()
+    precious = working_dir / "keep-safe.txt"
+    precious.write_text("irreplaceable")
+    policy = DestructiveOperationPolicy(trash_dir=trash_dir)
+    executor = LocalExecutor(require_env_flag=False)
+    executor._policy = policy
+    script = ComputeScript(
+        id="cwd-containment",
+        name="cwd-containment",
+        language="bash",
+        content='rm "keep-safe.txt"',
+        purpose="prove caller working dirs stay trash-contained",
+    )
+
+    record = await executor.execute(script, working_dir=str(working_dir))
+
+    assert record.exit_code == 0, record.stderr
+    assert not precious.exists()
+    assert next(trash_dir.glob("*/keep-safe.txt")).read_text() == "irreplaceable"

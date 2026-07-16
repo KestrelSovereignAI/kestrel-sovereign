@@ -109,10 +109,13 @@ class LocalExecutor(BaseExecutor):
         working_dir: Optional[str],
         context: _ExecutionContext,
     ) -> _ExecutionResult:
+        # Only the executor-owned temp dir authorizes direct deletion; a
+        # caller-supplied working_dir is the resolution cwd for checks only.
         safe_content = self._policy.rewrite_script(
             script.content,
             script.language,
-            working_dir or context.workdir,
+            context.workdir,
+            script_cwd=working_dir or context.workdir,
         )
 
         if script.language == "python":

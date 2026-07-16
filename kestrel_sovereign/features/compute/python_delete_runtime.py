@@ -191,11 +191,12 @@ def install_safe_delete_runtime(
             raise ValueError(
                 "Safe rename does not support dir_fd or extra os.rename arguments"
             )
-        src_path = _Path(src).expanduser().resolve(strict=False)
-        dst_path = _Path(dst).expanduser().resolve(strict=False)
-        assert_agent_data_allowed(src_path, "rename")
-        assert_agent_data_allowed(dst_path, "rename")
-        return original_rename(src_path, dst_path)
+        # Resolved paths authorize the operation only; the original operands
+        # are passed through so symlink operands keep os.rename semantics
+        # (rename the link itself, replace a link destination).
+        assert_agent_data_allowed(_Path(src).resolve(strict=False), "rename")
+        assert_agent_data_allowed(_Path(dst).resolve(strict=False), "rename")
+        return original_rename(src, dst)
 
     def safe_replace(src, dst, *args, **kwargs):
         if internal_filesystem_operation.get():
@@ -204,11 +205,11 @@ def install_safe_delete_runtime(
             raise ValueError(
                 "Safe replace does not support dir_fd or extra os.replace arguments"
             )
-        src_path = _Path(src).expanduser().resolve(strict=False)
-        dst_path = _Path(dst).expanduser().resolve(strict=False)
-        assert_agent_data_allowed(src_path, "replace")
-        assert_agent_data_allowed(dst_path, "replace")
-        return original_replace(src_path, dst_path)
+        # Authorize on resolved paths; operate on the original operands so
+        # symlink semantics match os.replace.
+        assert_agent_data_allowed(_Path(src).resolve(strict=False), "replace")
+        assert_agent_data_allowed(_Path(dst).resolve(strict=False), "replace")
+        return original_replace(src, dst)
 
     def safe_truncate(path, length, *args, **kwargs):
         try:
@@ -243,19 +244,15 @@ def install_safe_delete_runtime(
                 raise
 
     def path_safe_rename(self, target):
-        source = _Path(self).expanduser().resolve(strict=False)
-        destination = _Path(target).expanduser().resolve(strict=False)
-        assert_agent_data_allowed(source, "rename")
-        assert_agent_data_allowed(destination, "rename")
-        original_rename(source, destination)
+        assert_agent_data_allowed(_Path(self).resolve(strict=False), "rename")
+        assert_agent_data_allowed(_Path(target).resolve(strict=False), "rename")
+        original_rename(self, target)
         return _Path(target)
 
     def path_safe_replace(self, target):
-        source = _Path(self).expanduser().resolve(strict=False)
-        destination = _Path(target).expanduser().resolve(strict=False)
-        assert_agent_data_allowed(source, "replace")
-        assert_agent_data_allowed(destination, "replace")
-        original_replace(source, destination)
+        assert_agent_data_allowed(_Path(self).resolve(strict=False), "replace")
+        assert_agent_data_allowed(_Path(target).resolve(strict=False), "replace")
+        original_replace(self, target)
         return _Path(target)
 
     _os.remove = safe_remove
