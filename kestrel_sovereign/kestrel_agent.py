@@ -4471,24 +4471,90 @@ Expected Duration: {expected_duration}
                 pending_steps -= 1
             return max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, share)
 
+        def _harvest(task, label: str) -> str:
+            """Read a completed task's outcome, recording degradation."""
+            if task.cancelled():
+                state["cancelled"] = True
+                return "cancelled"
+            exc = task.exception()
+            if exc is None:
+                return "ok"
+            logging.warning(
+                "Durable shutdown step '%s' failed: %s",
+                label,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            state["degraded"] = True
+            return "error"
+
+        def _abandon(task) -> None:
+            """Force-terminate an over-guard / cancelled tail step.
+
+            ``task.cancel()`` alone is not enough: a step that suppresses
+            ``CancelledError`` keeps running forever and would hang a graceful
+            event-loop teardown that awaits every still-pending task (and, in
+            production, leak past process exit). Closing the underlying
+            coroutine throws ``GeneratorExit`` — a ``BaseException`` the step
+            cannot swallow with ``except CancelledError`` — so the frame is
+            guaranteed to unwind. A done callback retrieves the resulting
+            exception so it is never surfaced as "exception never retrieved".
+            """
+            task.cancel()  # cooperative first; unblocks well-behaved steps
+            coro = task.get_coro()
+            if coro is not None:
+                try:
+                    coro.close()  # hard stop — GeneratorExit cannot be suppressed
+                except Exception:
+                    pass
+            # Retrieve the eventual exception once the task reconciles to done.
+            task.add_done_callback(
+                lambda t: None if t.cancelled() else t.exception()
+            )
+
         async def _bounded(coro, guard: float, label: str, *, shielded: bool = False):
             """Run one tail step bounded by ``guard``.
 
             The coroutine is scheduled as a task and awaited only up to
-            ``guard``; if it exceeds the guard it is CANCELLED and ABANDONED
-            (never awaited), so a step that hangs or suppresses cancellation
-            cannot stall the tail beyond ``guard``. When ``shielded`` the
-            underlying task is protected from external cancellation (used for
+            ``guard`` via ``asyncio.wait`` — which, unlike ``asyncio.wait_for``,
+            does NOT wait for the task's cancellation to complete on timeout.
+            If the step exceeds the guard it is CANCELLED, hard-terminated, and
+            ABANDONED (never awaited), so a step that hangs *or suppresses
+            cancellation* cannot stall the tail beyond ``guard`` (the outer
+            ``wait_for`` / CLI "forcing exit" branch stays reachable) nor leak
+            past it. When ``shielded`` the underlying task keeps running if the
+            tail's own await is cancelled externally (used for
             ``force_snapshot`` so cancellation neither aborts it nor skips the
             following ``stop()``); it is still bounded by ``guard``.
             """
             task = asyncio.ensure_future(coro)
-            awaitable = asyncio.shield(task) if shielded else task
             try:
-                await asyncio.wait_for(awaitable, timeout=guard)
-                return "ok"
-            except asyncio.TimeoutError:
-                task.cancel()  # best-effort; do NOT await — may suppress cancel
+                done, _pending = await asyncio.wait({task}, timeout=guard)
+            except asyncio.CancelledError:
+                # The tail's own await was cancelled externally. ``asyncio.wait``
+                # does not cancel its futures, so a shielded task is still
+                # running — give it a bounded chance to finish so data-critical
+                # steps are not aborted, then propagate via state["cancelled"].
+                state["cancelled"] = True
+                if shielded:
+                    try:
+                        done, _pending = await asyncio.wait({task}, timeout=guard)
+                    except asyncio.CancelledError:
+                        _abandon(task)
+                        state["degraded"] = True
+                        return "abandoned"
+                    if task in done:
+                        return _harvest(task, label)
+                    _abandon(task)
+                    state["degraded"] = True
+                    return "abandoned"
+                _abandon(task)  # do NOT await — may suppress cancel
+                return "cancelled"
+
+            if task not in done:
+                # Exceeded the guard. Hard-terminate but do NOT await — the step
+                # may suppress cancellation and would otherwise hang us.
+                _abandon(task)
                 logging.warning(
                     "Durable shutdown step '%s' exceeded %.2fs; abandoned "
                     "(shutdown degraded).",
@@ -4497,30 +4563,8 @@ Expected Duration: {expected_duration}
                 )
                 state["degraded"] = True
                 return "abandoned"
-            except asyncio.CancelledError:
-                state["cancelled"] = True
-                if shielded:
-                    # Shielded work keeps running; give it a bounded chance to
-                    # finish so data-critical steps are not aborted, then
-                    # propagate cancellation upward via state["cancelled"].
-                    try:
-                        await asyncio.wait_for(asyncio.shield(task), timeout=guard)
-                        return "ok"
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        task.cancel()
-                        state["degraded"] = True
-                        return "abandoned"
-                task.cancel()
-                return "cancelled"
-            except Exception as e:
-                logging.warning(
-                    "Durable shutdown step '%s' failed: %s",
-                    label,
-                    e,
-                    exc_info=True,
-                )
-                state["degraded"] = True
-                return "error"
+
+            return _harvest(task, label)
 
         # Cancel agent-owned background work before storage/sync shutdown.
         await _bounded(
