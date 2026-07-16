@@ -16,20 +16,24 @@ import os
 import re
 import struct
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
 from .session_grouping import (
+    coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
     summarize_sessions,
 )
 from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
-from .lexical_memory_index import ConversationLexicalIndex
+from .lexical_memory_index import (
+    ConversationLexicalIndex,
+    LexicalIndexReplacement,
+)
 from .encryption import (
     get_fernet, get_agent_fernet, encrypt_string, decrypt_string, remove_enc_flag,
     DecryptionError
@@ -40,6 +44,30 @@ logger = logging.getLogger(__name__)
 
 # Current key version for new encryptions
 CURRENT_KEY_VERSION = 1
+
+# Keep exact-id purge statements below the oldest supported SQLite bind
+# ceiling (999).  PostgreSQL permits much larger statements, but sharing one
+# conservative batch size keeps the destructive path backend-neutral.
+_EXACT_PURGE_BATCH_SIZE = 500
+_PURGE_SELECT_PLACEHOLDER = "__KESTREL_PURGE_SELECT_COLUMNS__"
+_PURGE_BASE_SELECT_COLUMNS = (
+    "id, role, content, metadata, created_at, deleted_at"
+)
+_PURGE_LEXICAL_SELECT_COLUMNS = (
+    f"{_PURGE_BASE_SELECT_COLUMNS}, lexical_index_id"
+)
+_PURGE_NO_LEXICAL_SELECT_COLUMNS = (
+    f"{_PURGE_BASE_SELECT_COLUMNS}, "
+    "CAST(NULL AS TEXT) AS lexical_index_id"
+)
+
+
+class ConversationLexicalSchemaError(RuntimeError):
+    """The history/token-table halves of the lexical schema disagree."""
+
+
+class ConversationSessionTimestampError(RuntimeError):
+    """Exact session membership cannot be proven from stored chronology."""
 
 
 def _escape_like_session_value(session_id: str) -> str:
@@ -486,34 +514,273 @@ class AsyncConversationStore:
             )
         )
 
-    async def _audit_conversation_rows(
+    async def _conversation_lexical_purge_capability(self) -> tuple[str, bool]:
+        """Return the safe purge projection and whether token cleanup exists.
+
+        The #2339 lexical migration is deliberately non-fatal at startup.  A
+        database may therefore have neither additive schema piece while still
+        supporting ordinary conversation reads and hard deletion.  In that
+        state there cannot be lexical-token residue, so the purge snapshot uses
+        a typed NULL owner column instead of referencing a column that is not
+        present.
+
+        The inverse partial state is unsafe: if the token table exists without
+        ``conversation_history.lexical_index_id``, ownership cannot be proven.
+        Fail before audit or deletion rather than destroying history while
+        leaving possibly-sensitive token rows behind.
+        """
+        if self.db.backend_type == "postgres":
+            lexical_tokens_available = bool(
+                await self.db.fetchval(
+                    "SELECT to_regclass(?) IS NOT NULL",
+                    ("conversation_lexical_tokens",),
+                )
+            )
+            lexical_owner_column_available = bool(
+                await self.db.fetchval(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM pg_attribute "
+                    "WHERE attrelid = to_regclass(?) AND attname = ? "
+                    "AND attnum > 0 AND NOT attisdropped)",
+                    ("conversation_history", "lexical_index_id"),
+                )
+            )
+        else:
+            lexical_tokens_available = await self.db.table_exists(
+                "conversation_lexical_tokens"
+            )
+            lexical_owner_column_available = bool(
+                await self.db.fetchone(
+                    "SELECT 1 FROM pragma_table_info('conversation_history') "
+                    "WHERE name = ? LIMIT 1",
+                    ("lexical_index_id",),
+                )
+            )
+
+        if lexical_tokens_available and not lexical_owner_column_available:
+            raise ConversationLexicalSchemaError(
+                "conversation_lexical_tokens exists but "
+                "conversation_history.lexical_index_id is absent; refusing "
+                "hard purge because lexical-token ownership cannot be proven"
+            )
+
+        if not lexical_tokens_available:
+            return _PURGE_NO_LEXICAL_SELECT_COLUMNS, False
+        return _PURGE_LEXICAL_SELECT_COLUMNS, True
+
+    def _exact_id_purge_queries(
         self,
-        query: str,
-        params: tuple[Any, ...],
+        message_ids: Sequence[int],
+    ) -> list[Tuple[str, tuple[Any, ...]]]:
+        """Build bounded, globally-ascending selectors for exact IDs."""
+        ordered_ids = sorted({int(message_id) for message_id in message_ids})
+        queries: list[Tuple[str, tuple[Any, ...]]] = []
+        for start in range(0, len(ordered_ids), _EXACT_PURGE_BATCH_SIZE):
+            batch = ordered_ids[start : start + _EXACT_PURGE_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            queries.append(
+                (
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} "
+                    "FROM conversation_history "
+                    f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                    "ORDER BY id ASC",
+                    (self.agent_id, *batch),
+                )
+            )
+        return queries
+
+    @staticmethod
+    def _render_purge_queries(
+        selection_queries: Sequence[Tuple[str, tuple[Any, ...]]],
+        projection: str,
+    ) -> list[Tuple[str, tuple[Any, ...]]]:
+        """Materialize capability-aware purge projections exactly once."""
+        rendered = []
+        for query, params in selection_queries:
+            if query.count(_PURGE_SELECT_PLACEHOLDER) != 1:
+                raise ValueError(
+                    "Hard-purge selectors must contain exactly one canonical "
+                    "projection placeholder"
+                )
+            rendered.append(
+                (query.replace(_PURGE_SELECT_PLACEHOLDER, projection), params)
+            )
+        return rendered
+
+    async def _purge_conversation_rows(
+        self,
+        selection_queries: Optional[Sequence[Tuple[str, tuple[Any, ...]]]],
         *,
         operation_type: str,
         scope: dict[str, Any],
         reason: str,
-    ) -> list[dict[str, Any]]:
-        rows = await self.db.fetchall(query, params)
-        snapshot = [
-            {
-                "id": row[0],
-                "role": row[1],
-                "content": row[2],
-                "metadata": row[3],
-                "created_at": row[4],
-                "deleted_at": row[5],
-            }
-            for row in rows
-        ]
-        await self._audit_destructive_operation(
-            operation_type=operation_type,
-            rows=snapshot,
-            scope=scope,
-            reason=reason,
-        )
-        return snapshot
+        resolve_message_ids: Optional[
+            Callable[[], Awaitable[Sequence[int]]]
+        ] = None,
+    ) -> int:
+        """Audit and atomically destroy one immutable message-id snapshot.
+
+        The selectors run exactly once.  Their result is the complete set the
+        audit covers and the only set the destructive transaction may touch.
+        This matters for broad retention/privacy predicates: a row inserted
+        after the snapshot must survive rather than being deleted unaudited by
+        a second evaluation of the predicate.
+
+        Blind-index token rows are removed in the same transaction as their
+        owning conversation rows.  ``conversation_lexical_tokens`` has no
+        foreign-key cascade, so every hard-purge API must come through this
+        primitive or it will leave privacy-sensitive residue.
+
+        PostgreSQL selectors must yield rows in ascending message-id order,
+        and multi-query selectors must partition that same order.  This is the
+        global row-lock order shared with lexical backfill; violating it can
+        deadlock an overlapping privacy purge.
+        """
+        if (selection_queries is None) == (resolve_message_ids is None):
+            raise ValueError(
+                "Provide either hard-purge selection queries or one exact-ID "
+                "resolver"
+            )
+
+        # Surface a static partial schema as the domain-specific error rather
+        # than letting the database transaction wrapper obscure it. The state
+        # is re-read under the destructive transaction's writer/DDL boundary
+        # below so a concurrent startup migration cannot stale this decision.
+        await self._conversation_lexical_purge_capability()
+        deferred_error: Optional[Exception] = None
+        purged = 0
+        async with self.db.transaction():
+            if self.db.backend_type == "postgres":
+                # The lexical migration ALTERs conversation_history before it
+                # creates token storage. Hold its DDL boundary while resolving
+                # capabilities and deleting the immutable row snapshot.
+                await self.db.execute(
+                    "LOCK TABLE conversation_history IN ACCESS SHARE MODE"
+                )
+            else:
+                # SQLite's default BEGIN is deferred.  Reserve the writer slot
+                # before reading the audit snapshot so another connection
+                # cannot replace a selected row's bytes while the external
+                # audit sink is appending their hash.
+                await self.db.execute(
+                    "UPDATE conversation_history SET id = id WHERE 0"
+                )
+
+            projection, lexical_tokens_available = (
+                await self._conversation_lexical_purge_capability()
+            )
+
+            active_scope = dict(scope)
+            active_queries = selection_queries
+            if resolve_message_ids is not None:
+                try:
+                    resolved_ids = sorted(
+                        {
+                            int(message_id)
+                            for message_id in await resolve_message_ids()
+                        }
+                    )
+                except ConversationSessionTimestampError as error:
+                    # Leave the transaction without touching history or the
+                    # audit sink, then preserve the domain error rather than
+                    # obscuring it behind the backend's TransactionError.
+                    deferred_error = error
+                    resolved_ids = []
+                if deferred_error is None and not resolved_ids:
+                    return 0
+                if deferred_error is None:
+                    active_scope["message_ids"] = resolved_ids
+                    active_queries = self._exact_id_purge_queries(resolved_ids)
+                else:
+                    active_queries = ()
+
+            rendered_queries = self._render_purge_queries(
+                active_queries or (), projection
+            )
+
+            rows_by_id: dict[int, tuple[Any, ...]] = {}
+            for query, params in rendered_queries:
+                if self.db.backend_type == "postgres":
+                    query = f"{query.rstrip()} FOR UPDATE"
+                for row in await self.db.fetchall(query, params):
+                    rows_by_id.setdefault(int(row[0]), row)
+
+            rows = list(rows_by_id.values())
+            snapshot = [
+                {
+                    "id": row[0],
+                    "role": row[1],
+                    "content": row[2],
+                    "metadata": row[3],
+                    "created_at": row[4],
+                    "deleted_at": row[5],
+                }
+                for row in rows
+            ]
+            if deferred_error is None:
+                try:
+                    await self._audit_destructive_operation(
+                        operation_type=operation_type,
+                        rows=snapshot,
+                        scope=active_scope,
+                        reason=reason,
+                    )
+                except Exception as error:
+                    # Exit the database transaction without deleting anything,
+                    # then restore the audit sink's historical exception contract
+                    # instead of letting the backend wrap it as TransactionError.
+                    deferred_error = error
+
+            if deferred_error is None:
+                message_ids = list(rows_by_id)
+                lexical_index_ids = list(
+                    dict.fromkeys(
+                        str(row[6]) for row in rows if row[6] is not None
+                    )
+                )
+            else:
+                message_ids = []
+                lexical_index_ids = []
+            for start in range(0, len(message_ids), _EXACT_PURGE_BATCH_SIZE):
+                batch = message_ids[start : start + _EXACT_PURGE_BATCH_SIZE]
+                placeholders = ",".join("?" for _ in batch)
+                affected = await self.db.execute(
+                    "DELETE FROM conversation_history "
+                    f"WHERE agent_id = ? AND id IN ({placeholders})",
+                    (self.agent_id, *batch),
+                )
+                purged += _rows_affected(affected)
+
+            # Delete a key only after its selected owners are gone, and only
+            # when no surviving row still owns it.  Legacy databases did not
+            # enforce lexical-key uniqueness, so deleting tokens first could
+            # silently break recall for a surviving row that shared the key.
+            if lexical_tokens_available:
+                async with self._lexical_index.serialized_token_cleanup(
+                    lexical_index_ids
+                ) as cleanup_keys:
+                    for start in range(
+                        0, len(cleanup_keys), _EXACT_PURGE_BATCH_SIZE
+                    ):
+                        batch = cleanup_keys[
+                            start : start + _EXACT_PURGE_BATCH_SIZE
+                        ]
+                        placeholders = ",".join("?" for _ in batch)
+                        await self.db.execute(
+                            "DELETE FROM conversation_lexical_tokens "
+                            "WHERE agent_id = ? "
+                            f"AND lexical_index_id IN ({placeholders}) "
+                            "AND NOT EXISTS ("
+                            "SELECT 1 FROM conversation_history "
+                            "WHERE agent_id = ? "
+                            "AND conversation_history.lexical_index_id = "
+                            "conversation_lexical_tokens.lexical_index_id)",
+                            (self.agent_id, *batch, self.agent_id),
+                        )
+
+        if deferred_error is not None:
+            raise deferred_error
+        return purged
 
     def _lazy_embedding_service(self) -> Optional[Any]:
         """Return the active chat provider's embedding service when available.
@@ -566,6 +833,39 @@ class AsyncConversationStore:
             return "NOW()"
         return "datetime('now')"
 
+    def _timestamp_query_param(self, value: Any) -> Any:
+        """Adapt the public ISO-string timestamp contract for PostgreSQL.
+
+        SQLite's query expressions normalize its mixed timestamp text with
+        ``julianday`` and accept the public ``*_iso`` argument directly.
+        asyncpg instead binds a ``TIMESTAMP`` predicate as a Python
+        :class:`datetime`, so pass the equivalent naive UTC value on
+        PostgreSQL. Invalid values remain unchanged: PostgreSQL rejects them,
+        while SQLite's ``julianday`` produces NULL and the destructive
+        predicate safely matches no rows.
+        """
+        if self.db.backend_type != "postgres":
+            return value
+        parsed = coerce_session_timestamp(value)
+        return value if parsed is None else parsed
+
+    def _canonical_timestamp_sql(self, expression: str) -> str:
+        """Normalize one timestamp SQL expression for the active backend."""
+        if self.db.backend_type == "sqlite":
+            # SQLite history contains both ``YYYY-MM-DD HH:MM:SS`` and public
+            # ISO-8601 ``T``/``Z`` representations.  Comparing or ordering the
+            # raw TEXT puts a space before ``T`` and misorders same-day values.
+            return f"julianday({expression})"
+        return expression
+
+    def _timestamp_predicate(self, column: str, operator: str) -> str:
+        """Compare timestamps canonically across supported storage formats."""
+        if operator not in {"<", ">="}:
+            raise ValueError(f"Unsupported timestamp comparison: {operator}")
+        left = self._canonical_timestamp_sql(column)
+        right = self._canonical_timestamp_sql("?")
+        return f"{left} {operator} {right}"
+
     @property
     def encryption_enabled(self) -> bool:
         """Check if encryption at rest is enabled."""
@@ -614,20 +914,15 @@ class AsyncConversationStore:
             if not prev_sid:
                 return self._new_session_id()
 
-            # Compare gap; reuse if within window
-            from datetime import datetime, timezone, timedelta
-            if isinstance(prev_created_at, str):
-                try:
-                    prev_dt = datetime.fromisoformat(prev_created_at.replace("Z", "+00:00"))
-                except ValueError:
-                    return self._new_session_id()
-            else:
+            # Compare gap through the same canonical parser used by display and
+            # destructive session grouping. PostgreSQL returns ``datetime``
+            # objects while legacy SQLite rows may use SQL, ISO, Z, or offset
+            # strings; all normalize to one naive-UTC arithmetic domain.
+            prev_dt = coerce_session_timestamp(prev_created_at)
+            if prev_dt is None:
                 return self._new_session_id()
 
-            if prev_dt.tzinfo is None:
-                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
-
-            now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             gap = now - prev_dt
             if gap < timedelta(minutes=self._IMPLICIT_SESSION_GAP_MINUTES):
                 return prev_sid
@@ -1603,6 +1898,103 @@ class AsyncConversationStore:
             session_id, limit, include_archived=False
         )
 
+    @staticmethod
+    def _filter_session_rows(
+        rows: Sequence[tuple],
+        session_id: str,
+        *,
+        limit: Optional[int],
+        include_markers: bool,
+        metadata_index: int = 3,
+        created_at_index: int = 4,
+        reject_invalid_timestamps: bool = False,
+    ) -> List[tuple]:
+        """Apply the canonical time-gap/resumption rules to candidate rows.
+
+        Display reads and exact lifecycle snapshots deliberately share this
+        one filter.  The exact-ID path selects only ``id``/``metadata``/
+        ``created_at`` and supplies the corresponding indexes so unbounded
+        privacy purges do not materialize encrypted message bodies merely to
+        resolve membership.
+        """
+        from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
+
+        seen_ids: set[int] = set()
+        candidates: list[tuple[datetime, int, tuple, dict[str, Any]]] = []
+        fallback_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+        session_id_str = str(session_id)
+        for row in rows:
+            row_id = int(row[0])
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            metadata_json = row[metadata_index]
+            meta: dict[str, Any] = {}
+            if metadata_json:
+                try:
+                    meta = json.loads(metadata_json)
+                except json.JSONDecodeError as error:
+                    logger.warning(
+                        "Failed to parse metadata for message in session %s: %s",
+                        session_id,
+                        error,
+                    )
+            timestamp = coerce_session_timestamp(row[created_at_index])
+            if timestamp is None:
+                # Fail closed only when membership would depend on gap
+                # chronology. A row whose metadata.session_id matches the
+                # requested session EXACTLY is a proven member regardless of
+                # its timestamp — refusing it would leave explicit
+                # (UUID/resumed) sessions containing one malformed
+                # created_at undeletable through count/guard/purge.
+                if (
+                    reject_invalid_timestamps
+                    and meta.get("session_id") != session_id_str
+                ):
+                    raise ConversationSessionTimestampError(
+                        "Refusing exact conversation-session resolution because "
+                        f"message {row_id} has an invalid created_at timestamp"
+                    )
+                timestamp = fallback_timestamp
+            candidates.append(
+                (timestamp, row_id, row, meta)
+            )
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+
+        session_rows = []
+        last_timestamp: Optional[datetime] = None
+        is_first = True
+
+        for timestamp, _row_id, row, meta in candidates:
+            is_resumed_message = meta.get("session_id") == session_id_str
+
+            if not is_first and not is_resumed_message and meta.get("new_session"):
+                break
+
+            if last_timestamp and not is_resumed_message:
+                gap_minutes = (
+                    timestamp - last_timestamp
+                ).total_seconds() / 60
+                if gap_minutes > SESSION_GAP_MINUTES:
+                    # It belongs to a later implicit session. Keep scanning for
+                    # explicit resumptions of the requested session.
+                    continue
+
+            if not include_markers and meta.get("type") == "session_marker":
+                last_timestamp = timestamp
+                is_first = False
+                continue
+
+            session_rows.append(row)
+            last_timestamp = timestamp
+            is_first = False
+
+            if limit is not None and len(session_rows) >= limit:
+                break
+
+        # Match the historical newest-first raw-row contract.
+        return list(reversed(session_rows))
+
     async def _get_session_messages(
         self,
         session_id: str,
@@ -1645,8 +2037,6 @@ class AsyncConversationStore:
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
         archive_clause = "" if include_archived else " AND archived_at IS NULL"
-        from datetime import datetime
-        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
 
         # Try to interpret session_id as a message ID for time-based grouping.
         # If it isn't (e.g. a UUID-based implicit session_id), skip this path
@@ -1667,14 +2057,28 @@ class AsyncConversationStore:
             # positional accesses on metadata/created_at don't shift.
             if start_row:
                 start_time = start_row[0]
+                # Canonicalize the timestamp prefilter/order: SQLite history
+                # mixes ``YYYY-MM-DD HH:MM:SS`` and ISO-8601 ``T`` forms, and
+                # raw TEXT comparison drops later rows whose stored form sorts
+                # below the anchor's.  The exact purge/count resolver already
+                # compares via julianday; display must see the same membership
+                # or hard purge could destroy rows this path never returned.
+                created_at_predicate = self._timestamp_predicate(
+                    "created_at", ">="
+                )
+                created_at_order = self._canonical_timestamp_sql("created_at")
                 all_rows = await self.db.fetchall(
                     f"""SELECT id, role, content, metadata, created_at,
                               rendered_content, model, provider
                        FROM conversation_history
-                       WHERE agent_id = ? AND created_at >= ?{del_clause}{archive_clause}
-                       ORDER BY created_at ASC
+                       WHERE agent_id = ? AND {created_at_predicate}{del_clause}{archive_clause}
+                       ORDER BY {created_at_order} ASC
                        LIMIT ?""",
-                    (self.agent_id, start_time, limit * 2)  # Fetch extra in case of filtering
+                    (
+                        self.agent_id,
+                        self._timestamp_query_param(start_time),
+                        limit * 2,  # Fetch extra in case of filtering
+                    ),
                 )
 
         # Also get messages that explicitly belong to this session (resumed conversations)
@@ -1704,92 +2108,104 @@ class AsyncConversationStore:
             (self.agent_id, f'%"session_id":"{esc}"%', limit)
         )
 
-        # Merge resumed rows (dedupe by id)
-        seen_ids = set()
-        merged_rows = []
-        for row in all_rows + resumed_rows + resumed_rows_alt:
-            if row[0] not in seen_ids:
-                seen_ids.add(row[0])
-                merged_rows.append(row)
+        return self._filter_session_rows(
+            [*all_rows, *resumed_rows, *resumed_rows_alt],
+            session_id,
+            limit=limit,
+            include_markers=include_markers,
+        )
 
-        # Sort by created_at
-        merged_rows.sort(key=lambda r: r[4] or '')
+    async def _get_complete_session_message_ids(
+        self,
+        session_id: str,
+        *,
+        deleted_filter: str = "all",
+        include_markers: bool = True,
+        include_archived: bool = True,
+    ) -> list[int]:
+        """Resolve one uncapped session-membership snapshot in one statement.
 
-        # Filter to only include messages in this session
-        session_rows = []
-        last_timestamp = None
-        is_first = True
-        session_id_str = str(session_id)
+        A one-statement candidate read gives PostgreSQL one READ COMMITTED
+        snapshot; splitting the spaced/minified metadata forms across separate
+        queries could otherwise admit an insert between them.  Hard purge calls
+        this inside its destructive transaction, then locks the immutable ID
+        set in bounded ascending batches.  SQLite reserves its writer slot
+        before this query, so its snapshot cannot race a concurrent writer.
 
-        for row in merged_rows:
-            created_at = row[4]
-            metadata_json = row[3]
+        Only fields needed by the shared grouping algorithm are materialized;
+        encrypted message bodies remain untouched even for very large sessions.
+        """
+        del_clause = self._deleted_filter_clause(deleted_filter).replace(
+            "deleted_at", "c.deleted_at"
+        )
+        archive_clause = (
+            "" if include_archived else " AND c.archived_at IS NULL"
+        )
+        escaped_session_id = _escape_like_session_value(session_id)
+        spaced_pattern = f'%"session_id": "{escaped_session_id}"%'
+        compact_pattern = f'%"session_id":"{escaped_session_id}"%'
+        row_id = coerce_persistent_message_id(session_id)
 
-            # Parse timestamp
-            if isinstance(created_at, str):
-                for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S.%f']:
-                    try:
-                        timestamp = datetime.strptime(created_at, fmt)
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    timestamp = datetime.now()
-            elif created_at:
-                timestamp = created_at
-            else:
-                timestamp = datetime.now()
+        if row_id is None:
+            query_prefix = ""
+            candidate_source = "conversation_history c"
+            membership_predicate = (
+                "(c.metadata LIKE ? ESCAPE '\\' "
+                "OR c.metadata LIKE ? ESCAPE '\\')"
+            )
+            params: tuple[Any, ...] = (
+                self.agent_id,
+                spaced_pattern,
+                compact_pattern,
+            )
+        else:
+            query_prefix = (
+                "WITH anchor AS ("
+                "SELECT created_at FROM conversation_history "
+                "WHERE id = ? AND agent_id = ?"
+                ") "
+            )
+            # LEFT JOIN (not CROSS JOIN): a numeric session id can be
+            # metadata-only — the client supplied it explicitly, or the legacy
+            # anchor row was already hard-deleted.  An empty anchor CTE must
+            # drop only the time-grouping branch, never the metadata branch,
+            # or purge/count would miss rows the display resolver still finds.
+            candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
+            candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
+            anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
+            membership_predicate = (
+                "(EXISTS (SELECT 1 FROM anchor) "
+                f"AND ({candidate_timestamp} >= {anchor_timestamp} "
+                f"OR {candidate_timestamp} IS NULL "
+                f"OR {anchor_timestamp} IS NULL) "
+                "OR c.metadata LIKE ? ESCAPE '\\' "
+                "OR c.metadata LIKE ? ESCAPE '\\')"
+            )
+            params = (
+                row_id,
+                self.agent_id,
+                self.agent_id,
+                spaced_pattern,
+                compact_pattern,
+            )
 
-            # Check if this message explicitly belongs to this session (resumed)
-            is_resumed_message = False
-            if metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                    if meta.get('session_id') == session_id_str:
-                        is_resumed_message = True
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for message in session {session_id}: {e}")
-
-            # Check for new_session marker (skip after first message, but not for resumed)
-            if not is_first and not is_resumed_message and metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                    if meta.get('new_session'):
-                        break
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for new_session check: {e}")
-
-            # Check time gap (only for non-resumed messages)
-            if last_timestamp and not is_resumed_message:
-                gap_minutes = (timestamp - last_timestamp).total_seconds() / 60
-                if gap_minutes > SESSION_GAP_MINUTES:
-                    # Skip this non-resumed message (it belongs to a different session)
-                    # Continue looking for resumed messages that explicitly belong to this session
-                    continue
-
-            # Skip session markers from results, UNLESS a lifecycle op asked to
-            # include them (so delete/restore/purge clears the session's anchor
-            # and never leaves an orphan marker — #2027).
-            if not include_markers and metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                    if meta.get('type') == 'session_marker':
-                        last_timestamp = timestamp
-                        is_first = False
-                        continue
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for session_marker check: {e}")
-
-            session_rows.append(row)
-            last_timestamp = timestamp
-            is_first = False
-
-            if len(session_rows) >= limit:
-                break
-
-        # Return in DESC order to match the non-session query format
-        # (will be reversed by caller in get_conversation_history)
-        return list(reversed(session_rows))
+        candidates = await self.db.fetchall(
+            f"{query_prefix}SELECT c.id, c.metadata, c.created_at "
+            f"FROM {candidate_source} WHERE c.agent_id = ? AND "
+            f"{membership_predicate}{del_clause}{archive_clause} "
+            "ORDER BY c.id ASC",
+            params,
+        )
+        session_rows = self._filter_session_rows(
+            candidates,
+            session_id,
+            limit=None,
+            include_markers=include_markers,
+            metadata_index=1,
+            created_at_index=2,
+            reject_invalid_timestamps=True,
+        )
+        return sorted({int(row[0]) for row in session_rows})
 
     async def get_full_history(self) -> List[Dict[str, Any]]:
         """Get complete live conversation history with automatic decryption.
@@ -2384,30 +2800,31 @@ class AsyncConversationStore:
         """Hard-delete a single message (#763).
 
         Removes the row regardless of whether it's currently live or
-        already soft-deleted. The ``reason`` argument is recorded by
-        the caller in the audit log; this method just performs the
-        DELETE.
+        already soft-deleted. The ``reason`` argument is recorded in the
+        fail-closed destructive audit before this method performs the DELETE.
 
         Returns:
             True if a row was destroyed, False if not found.
         """
-        await self._audit_conversation_rows(
-            "SELECT id, role, content, metadata, created_at, deleted_at "
-            "FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (message_id, self.agent_id),
+        purged = await self._purge_conversation_rows(
+            [
+                (
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
+                    "WHERE id = ? AND agent_id = ?",
+                    (message_id, self.agent_id),
+                )
+            ],
             operation_type="purge_message",
             scope={"table": "conversation_history", "message_id": message_id},
             reason=reason,
         )
-        affected = await self.db.execute_commit(
-            "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
-            (message_id, self.agent_id),
-        )
-        deleted = _rows_affected(affected) > 0
+        deleted = purged > 0
         if deleted:
             logger.info(
                 "purge_message id=%s agent=%s reason=%s",
-                message_id, self.agent_id, reason,
+                message_id,
+                self.agent_id,
+                reason,
             )
         return deleted
 
@@ -2423,42 +2840,32 @@ class AsyncConversationStore:
         Returns:
             Number of rows destroyed.
         """
-        # include_markers=True so purge also destroys the session's marker —
-        # no orphan anchor left behind (#2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="all", include_markers=True
-        )
-        if not rows:
-            return 0
-
-        ids = [row[0] for row in rows]
-        if not ids:
-            return 0
-
-        placeholders = ",".join("?" for _ in ids)
-        params = [*ids, self.agent_id]
-        await self._audit_conversation_rows(
-            "SELECT id, role, content, metadata, created_at, deleted_at "
-            f"FROM conversation_history WHERE id IN ({placeholders}) AND agent_id = ?",
-            tuple(params),
+        # Resolve the complete membership set inside the destructive transaction.
+        # The resolver is one statement (one immutable membership snapshot), then
+        # _purge_conversation_rows locks its exact IDs in globally ascending,
+        # backend-neutral batches.  A post-snapshot insert therefore survives,
+        # while a >10k session is never silently truncated.
+        purged = await self._purge_conversation_rows(
+            None,
             operation_type="purge_conversation_session",
             scope={
                 "table": "conversation_history",
                 "session_id": session_id,
-                "message_ids": ids,
             },
             reason=reason,
+            resolve_message_ids=lambda: self._get_complete_session_message_ids(
+                session_id,
+                deleted_filter="all",
+                include_markers=True,
+            ),
         )
-        affected = await self.db.execute_commit(
-            f"DELETE FROM conversation_history "
-            f"WHERE id IN ({placeholders}) AND agent_id = ?",
-            tuple(params),
-        )
-        purged = _rows_affected(affected)
         if purged:
             logger.info(
                 "purge_conversation_session sid=%s agent=%s reason=%s rows=%d",
-                session_id, self.agent_id, reason, purged,
+                session_id,
+                self.agent_id,
+                reason,
+                purged,
             )
         return purged
 
@@ -2474,22 +2881,23 @@ class AsyncConversationStore:
         wipes the entire history regardless of when rows were authored
         (#867).
         """
-        await self._audit_conversation_rows(
-            "SELECT id, role, content, metadata, created_at, deleted_at "
-            "FROM conversation_history WHERE agent_id = ? ORDER BY id ASC",
-            (self.agent_id,),
+        purged = await self._purge_conversation_rows(
+            [
+                (
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
+                    "WHERE agent_id = ? ORDER BY id ASC",
+                    (self.agent_id,),
+                )
+            ],
             operation_type="purge_all",
             scope={"table": "conversation_history"},
             reason=reason,
         )
-        affected = await self.db.execute_commit(
-            "DELETE FROM conversation_history WHERE agent_id = ?",
-            (self.agent_id,),
-        )
-        purged = _rows_affected(affected)
         logger.info(
             "purge_all agent=%s reason=%s rows=%d",
-            self.agent_id, reason, purged,
+            self.agent_id,
+            reason,
+            purged,
         )
         return purged
 
@@ -2519,14 +2927,20 @@ class AsyncConversationStore:
             logger.warning(
                 "purge_all_since called without since_iso — refusing to purge "
                 "(agent=%s, reason=%s)",
-                self.agent_id, reason,
+                self.agent_id,
+                reason,
             )
             return 0
-        await self._audit_conversation_rows(
-            "SELECT id, role, content, metadata, created_at, deleted_at "
-            "FROM conversation_history WHERE agent_id = ? AND created_at >= ? "
-            "ORDER BY id ASC",
-            (self.agent_id, since_iso),
+        created_at_predicate = self._timestamp_predicate("created_at", ">=")
+        purged = await self._purge_conversation_rows(
+            [
+                (
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
+                    f"WHERE agent_id = ? AND {created_at_predicate} "
+                    "ORDER BY id ASC",
+                    (self.agent_id, self._timestamp_query_param(since_iso)),
+                )
+            ],
             operation_type="purge_all_since",
             scope={
                 "table": "conversation_history",
@@ -2534,15 +2948,12 @@ class AsyncConversationStore:
             },
             reason=reason,
         )
-        affected = await self.db.execute_commit(
-            "DELETE FROM conversation_history "
-            "WHERE agent_id = ? AND created_at >= ?",
-            (self.agent_id, since_iso),
-        )
-        purged = _rows_affected(affected)
         logger.info(
             "purge_all_since agent=%s since=%s reason=%s rows=%d",
-            self.agent_id, since_iso, reason, purged,
+            self.agent_id,
+            since_iso,
+            reason,
+            purged,
         )
         return purged
 
@@ -2565,10 +2976,10 @@ class AsyncConversationStore:
         2. ``deleted_at < ?`` — the cutoff. Caller computes
            ``now - retention_days`` once per sweep so all rows in a
            batch use the same threshold.
-        3. ``LIMIT ?`` (via ``IN (subquery)``) — prevents a runaway
-           sweep from stalling the writer thread for minutes if the
-           agent suddenly has 500k aged rows. The janitor calls back
-           on the next tick to drain the rest.
+        3. ``LIMIT ?`` on the one-time snapshot — prevents a runaway sweep
+           from stalling the writer thread for minutes if the agent suddenly
+           has 500k aged rows. The janitor calls back on the next tick to drain
+           the rest.
 
         Args:
             cutoff_iso: ISO-8601 timestamp string. Rows whose
@@ -2586,21 +2997,29 @@ class AsyncConversationStore:
         if max_rows <= 0:
             return 0
 
-        # SQLite doesn't support LIMIT directly inside DELETE on every
-        # build path, and even when it does the syntax differs from
-        # PostgreSQL. The IN (SELECT ... LIMIT ...) form is portable.
-        await self._audit_conversation_rows(
-            "SELECT id, role, content, metadata, created_at, deleted_at "
-            "FROM conversation_history "
-            "WHERE id IN ("
-            "  SELECT id FROM conversation_history "
-            "  WHERE agent_id = ? "
-            "    AND deleted_at IS NOT NULL "
-            "    AND deleted_at < ? "
-            "  ORDER BY deleted_at ASC "
-            "  LIMIT ?"
-            ") ORDER BY deleted_at ASC",
-            (self.agent_id, cutoff_iso, max_rows),
+        deleted_at_predicate = self._timestamp_predicate("deleted_at", "<")
+        deleted_at_order = self._canonical_timestamp_sql("deleted_at")
+        purged = await self._purge_conversation_rows(
+            [
+                (
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
+                    "WHERE agent_id = ? AND deleted_at IS NOT NULL "
+                    f"AND {deleted_at_predicate} "
+                    "AND id IN ("
+                    "SELECT id FROM conversation_history "
+                    "WHERE agent_id = ? AND deleted_at IS NOT NULL "
+                    f"AND {deleted_at_predicate} "
+                    f"ORDER BY {deleted_at_order} ASC, id ASC LIMIT ?"
+                    ") ORDER BY id ASC",
+                    (
+                        self.agent_id,
+                        self._timestamp_query_param(cutoff_iso),
+                        self.agent_id,
+                        self._timestamp_query_param(cutoff_iso),
+                        max_rows,
+                    ),
+                )
+            ],
             operation_type="purge_trash_older_than",
             scope={
                 "table": "conversation_history",
@@ -2609,23 +3028,13 @@ class AsyncConversationStore:
             },
             reason=reason,
         )
-        affected = await self.db.execute_commit(
-            "DELETE FROM conversation_history "
-            "WHERE id IN ("
-            "  SELECT id FROM conversation_history "
-            "  WHERE agent_id = ? "
-            "    AND deleted_at IS NOT NULL "
-            "    AND deleted_at < ? "
-            "  ORDER BY deleted_at ASC "
-            "  LIMIT ?"
-            ")",
-            (self.agent_id, cutoff_iso, max_rows),
-        )
-        purged = _rows_affected(affected)
         if purged:
             logger.info(
                 "purge_trash_older_than agent=%s cutoff=%s reason=%s rows=%d",
-                self.agent_id, cutoff_iso, reason, purged,
+                self.agent_id,
+                cutoff_iso,
+                reason,
+                purged,
             )
         return purged
 
@@ -2679,9 +3088,9 @@ class AsyncConversationStore:
     ) -> int:
         """Count messages a session resolves to (#2019).
 
-        Uses the SAME resolver (``_get_session_messages``) that delete / restore
-        / purge use, so a destructive preview counts exactly what the operation
-        will touch — including legacy row-id sessions only partially in Trash,
+        Uses the same uncapped exact-membership resolver as hard purge, so a
+        permanent-deletion preview counts exactly what that operation will
+        touch — including legacy row-id sessions only partially in Trash,
         whose deleted subset a grouped summary would mis-key.
 
         Args:
@@ -2689,33 +3098,36 @@ class AsyncConversationStore:
             deleted_filter: ``live`` / ``deleted`` / ``all`` (default ``all``,
                 matching ``purge_conversation_session``).
         """
-        # include_markers=True so the purge preview count matches what purge
-        # actually destroys (which now includes the marker — #2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter=deleted_filter, include_markers=True
+        # The preview and permanent purge share the same uncapped membership
+        # snapshot, including structural marker rows (#2027).
+        message_ids = await self._get_complete_session_message_ids(
+            session_id,
+            deleted_filter=deleted_filter,
+            include_markers=True,
         )
-        return len(rows)
+        return len(message_ids)
 
     async def message_belongs_to_session(
         self, message_id: Any, session_id: str
     ) -> bool:
         """True if ``message_id`` resolves within ``session_id`` (#2022).
 
-        Uses the SAME resolver (``_get_session_messages`` with
-        ``deleted_filter='all'``) that delete / restore / purge use, so a
-        ``session_id`` guard on a single-message operation agrees exactly with
-        the session-grain tools — across live AND trashed rows (a restore guard
-        must match a message already in Trash). Identity, never content.
+        Uses the same uncapped exact-membership resolver as the hard-purge
+        preview and operation, so a ``session_id`` guard agrees across live and
+        trashed rows (a restore guard must match a message already in Trash).
+        Identity, never content.
         """
         target = coerce_persistent_message_id(message_id)
         if target is None:
             return False
-        # include_markers=True: a session's marker row genuinely belongs to it,
-        # so a by-id guard on the marker resolves consistently (#2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="all", include_markers=True
+        # Include markers and use the uncapped resolver so a guard cannot deny a
+        # valid message merely because 10k earlier rows share its session.
+        message_ids = await self._get_complete_session_message_ids(
+            session_id,
+            deleted_filter="all",
+            include_markers=True,
         )
-        return any(row[0] == target for row in rows)
+        return target in message_ids
 
     async def find_messages_matching(
         self, content_pattern: str, session_id: Optional[str] = None
@@ -3406,14 +3818,17 @@ class AsyncConversationStore:
     ) -> Dict[str, Any]:
         """Resumably blind-index every current live conversation row.
 
-        Token rows are committed before the conversation's coverage marker.
-        An interruption can therefore leave only harmless orphan tokens; the
-        message itself stays on the complete decrypt-scan fallback until the
-        marker update succeeds.
+        Backfill revalidates each hydrated owner and commits its token rows and
+        coverage marker atomically.  A concurrent hard purge therefore wins
+        either before or after the whole replacement; it can never leave a
+        token-only remnant from stale hydrated data. Garbage collection is
+        deliberately limited to obsolete keys from successfully replaced
+        owners: new-message writers commit tokens before their history row, so
+        a broad ownerless-token sweep can mistake an in-flight write for trash.
         """
         started = perf_counter()
         initial_health = await self._lexical_index.health()
-        scanned = attempted = failed = 0
+        scanned = attempted = failed = garbage_collected = 0
         after_id: Optional[int] = None
         page_size = max(1, int(batch_size))
         while max_rows is None or scanned < max_rows:
@@ -3437,15 +3852,17 @@ class AsyncConversationStore:
             if not rows:
                 break
             ids = [int(row[0]) for row in rows]
-            old_keys = [str(row[1]) for row in rows if row[1]]
+            old_keys_by_id = {
+                int(row[0]): str(row[1]) if row[1] is not None else None
+                for row in rows
+            }
             after_id = ids[-1]
             scanned += len(ids)
             hydrated = {
                 int(row["id"]): row
                 for row in await self.get_messages_by_ids(ids)
             }
-            index_entries: List[Tuple[str, Iterable[str]]] = []
-            update_rows: List[Tuple[str, str, str, int]] = []
+            replacement_entries: List[LexicalIndexReplacement] = []
             for row_id in ids:
                 row = hydrated.get(row_id)
                 if row is None:
@@ -3454,35 +3871,28 @@ class AsyncConversationStore:
                 content = row.get("content") or ""
                 tokens = _tokenize_for_search(_strip_search_wrappers(content))
                 message_key = self._lexical_index.backfill_message_key(row_id)
-                index_entries.append((message_key, tokens))
-                update_rows.append((
-                    message_key,
-                    self._lexical_index.version,
-                    self.agent_id,
-                    row_id,
-                ))
-            try:
-                await self._lexical_index.index_messages(index_entries)
-                await self.db.execute_many(
-                    "UPDATE conversation_history SET lexical_index_id = ?, "
-                    "lexical_index_version = ? WHERE agent_id = ? AND id = ?",
-                    update_rows,
-                )
-                attempted += len(update_rows)
-                new_keys = {entry[0] for entry in index_entries}
-                obsolete_keys = [key for key in old_keys if key not in new_keys]
-                if obsolete_keys:
-                    await self.db.execute_many(
-                        "DELETE FROM conversation_lexical_tokens "
-                        "WHERE agent_id = ? AND lexical_index_id = ?",
-                        [(self.agent_id, old_key) for old_key in obsolete_keys],
+                replacement_entries.append(
+                    LexicalIndexReplacement(
+                        message_id=row_id,
+                        expected_key=old_keys_by_id[row_id],
+                        replacement_key=message_key,
+                        tokens=tokens,
                     )
+                )
+            try:
+                replacement_result = (
+                    await self._lexical_index.replace_existing_messages(
+                        replacement_entries
+                    )
+                )
+                attempted += len(replacement_entries)
+                garbage_collected += replacement_result.garbage_collected
             except Exception as exc:  # noqa: BLE001 - continue resumable sweep
                 logger.warning(
                     "Lexical index backfill batch ending at message %s failed: %s",
                     after_id, exc,
                 )
-                failed += len(update_rows)
+                failed += len(replacement_entries)
             if len(rows) < remaining:
                 break
         health = await self.get_lexical_index_health()
@@ -3493,20 +3903,6 @@ class AsyncConversationStore:
             0,
             min(scanned, int(health["indexed_current"]) - initial_health.indexed_current),
         )
-        garbage_collected = 0
-        try:
-            deleted = await self.db.execute_commit(
-                "DELETE FROM conversation_lexical_tokens "
-                "WHERE agent_id = ? AND NOT EXISTS ("
-                "SELECT 1 FROM conversation_history c "
-                "WHERE c.agent_id = conversation_lexical_tokens.agent_id "
-                "AND c.lexical_index_id = "
-                "conversation_lexical_tokens.lexical_index_id)",
-                (self.agent_id,),
-            )
-            garbage_collected = _rows_affected(deleted)
-        except Exception as exc:  # noqa: BLE001 - coverage work already durable
-            logger.warning("Lexical orphan-token cleanup failed: %s", exc)
         return {
             "scanned": scanned,
             "attempted": attempted,

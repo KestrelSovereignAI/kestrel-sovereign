@@ -13,7 +13,6 @@ if within 30 minutes; mints a new UUID otherwise.
 These tests verify the wiring is real, not aspirational.
 """
 
-import asyncio
 import json
 import pytest
 import tempfile
@@ -140,6 +139,25 @@ class TestSessionGapBoundary:
         )
         sessions = [json.loads(r[0])["session_id"] for r in rows]
         assert sessions[0] == sessions[1] == "recent-session"
+
+    @pytest.mark.asyncio
+    async def test_postgres_datetime_shape_reuses_recent_session(
+        self, store, monkeypatch
+    ):
+        """The canonical parser accepts PostgreSQL's native datetime rows."""
+        recent = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+        monkeypatch.setattr(
+            store.db,
+            "fetchone",
+            AsyncMock(
+                return_value=(
+                    json.dumps({"session_id": "postgres-session"}),
+                    recent,
+                )
+            ),
+        )
+
+        assert await store._derive_implicit_session_id() == "postgres-session"
 
 
 class TestSessionIdRetrieval:

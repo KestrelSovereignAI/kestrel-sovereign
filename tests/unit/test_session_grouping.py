@@ -5,9 +5,10 @@ sessions, used by BOTH the /api/conversations endpoint and the agent's
 list_conversations memory tool. If it drifts, the UI and the agent disagree on
 session boundaries and the agent can soft-delete the wrong conversation.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from kestrel_sovereign.storage.session_grouping import (
+    coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
 )
@@ -143,6 +144,42 @@ def test_unparseable_timestamp_uses_injected_clock():
     sessions = group_messages_into_sessions(msgs, now=BASE)
     assert len(sessions) == 1
     assert sessions[0]["started_at"] == BASE.isoformat()
+
+
+def test_timestamp_coercion_normalizes_iso_offsets_to_naive_utc():
+    expected = datetime(2026, 6, 29, 12, 0, 0)
+
+    assert coerce_session_timestamp("2026-06-29 12:00:00") == expected
+    assert coerce_session_timestamp("2026-06-29T12:00:00Z") == expected
+    assert coerce_session_timestamp("2026-06-29T13:00:00+01:00") == expected
+    assert coerce_session_timestamp(
+        datetime(2026, 6, 29, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+    ) == expected
+    assert coerce_session_timestamp("not-a-date") is None
+
+
+def test_grouping_safely_mixes_naive_and_aware_timestamp_shapes():
+    msgs = [
+        {
+            "id": 1,
+            "role": "user",
+            "content": "first",
+            "metadata": {},
+            "created_at": "2026-06-29 12:00:00",
+        },
+        {
+            "id": 2,
+            "role": "assistant",
+            "content": "second",
+            "metadata": {},
+            "created_at": "2026-06-29T13:01:00+01:00",
+        },
+    ]
+
+    sessions = group_messages_into_sessions(msgs)
+
+    assert len(sessions) == 1
+    assert sessions[0]["message_count"] == 2
 
 
 def test_empty_input_returns_no_sessions():
