@@ -2664,7 +2664,9 @@ class TalonCoordinatorFeature(Feature):
                 data={
                     "success": True,
                     "state": "exists",
-                    "workspace": existing,
+                    "workspace": await self._workspace_state_with_status(
+                        repo_resolved
+                    ),
                 },
             )
 

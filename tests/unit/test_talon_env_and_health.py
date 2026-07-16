@@ -822,6 +822,44 @@ async def test_setup_workspace_clones_outside_running_source(
 
 
 @pytest.mark.asyncio
+async def test_setup_workspace_no_fetch_reports_clean_state(tmp_path, monkeypatch):
+    """The ``fetch=False`` fast path on an existing checkout still reports
+    git cleanliness, matching the fetch/clone branches and
+    ``talon_workspace_status``.
+    """
+    import subprocess
+
+    monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+
+    workspace = tmp_path / "org__repo"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", str(workspace)], check=True, capture_output=True,
+    )
+    (workspace / "dirty.txt").write_text("untracked\n", encoding="utf-8")
+
+    sec = SimpleNamespace(
+        name="SecurityFeature",
+        approval_queue=SimpleNamespace(
+            request_approval=AsyncMock(return_value=(True, "user")),
+        ),
+    )
+    agent = SimpleNamespace(
+        _scheduler=None,
+        features={"SecurityFeature": sec},
+    )
+    agent.get_feature = lambda name: sec if name == "SecurityFeature" else None
+    feat = TalonCoordinatorFeature(agent)
+
+    result = await feat.talon_setup_workspace(repo="org/repo", fetch=False)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["state"] == "exists"
+    assert result.data["workspace"]["clean"] is False
+
+
+@pytest.mark.asyncio
 async def test_setup_workspace_denied_without_approval(tmp_path, monkeypatch):
     """Workspace setup is approval-gated. Without approval, fails
     with ``approval_denied`` and creates nothing on disk.

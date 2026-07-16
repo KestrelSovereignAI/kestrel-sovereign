@@ -57,7 +57,16 @@ def _signal_process_tree(
 
 
 def _process_tree_alive(proc: asyncio.subprocess.Process) -> bool:
-    """Whether the retained private group still has a live member."""
+    """Whether the retained private group still has a live member.
+
+    Windows limitation: there is no process-group probe analogous to POSIX
+    ``killpg(pid, 0)``, so liveness degrades to the root's return code. A
+    descendant that outlives a normally-exited root is invisible here and to
+    ``taskkill /T`` (whose tree walk needs the root PID alive). Closing that
+    gap requires assigning the child to a Job Object with kill-on-close at
+    launch; until then Windows descendant cleanup is best-effort and bounded
+    to the root's lifetime.
+    """
 
     if is_windows():
         return proc.returncode is None
