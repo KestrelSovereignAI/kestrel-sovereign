@@ -1379,6 +1379,269 @@ class TestLifecycle:
         # ...nor the durable storage close.
         mock_storage.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_hung_prefix_component_does_not_starve_later_feature(
+        self, tmp_path
+    ):
+        """A hung PREFIX component (heartbeat) cannot starve a later feature (#2409).
+
+        This reproduces the exact blocker the reviewer demonstrated on
+        ``4bb9e425``: with a tiny internal budget/reserve, a
+        cancellation-cooperative hung *heartbeat* (a prefix op, not a feature)
+        followed by a real ``LateFeature`` and MCP/LLM/TaskManager sentinels,
+        all wrapped in the production-style outer ``asyncio.wait_for``. The
+        old fair-share denominator covered only the feature sweep, so the hung
+        heartbeat consumed the whole prefix window and the later feature's
+        body never ran (``late_shutdown_calls == 0``). The unified per-op
+        budget must give the heartbeat only its fair slice so every later
+        sentinel's coroutine BODY actually runs.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        heartbeat_started = asyncio.Event()
+        late_started = asyncio.Event()
+        mcp_started = asyncio.Event()
+        llm_started = asyncio.Event()
+        task_mgr_started = asyncio.Event()
+
+        async def _hung_heartbeat():
+            heartbeat_started.set()
+            # Cancellation-cooperative: an infinite wait that yields to the
+            # loop so wait_for's cancellation actually lands.
+            await asyncio.Event().wait()
+
+        heartbeat = MagicMock()
+        heartbeat.stop = _hung_heartbeat
+        agent.heartbeat_runner = heartbeat
+
+        async def _late_shutdown():
+            late_started.set()
+
+        late = MagicMock()
+        late.shutdown = _late_shutdown
+
+        async def _mcp_shutdown():
+            mcp_started.set()
+
+        mcp = MagicMock()
+        mcp.shutdown = _mcp_shutdown
+        # ``mcp_agent`` is a read-only property backed by features["MCPAgent"];
+        # the dedicated MCP block handles it and the sweep skips it.
+        agent.features = {"LateFeature": late, "MCPAgent": mcp}
+
+        async def _llm_close():
+            llm_started.set()
+
+        llm = MagicMock()
+        llm.close = _llm_close
+        agent.llm_service = llm
+
+        async def _task_mgr_close():
+            task_mgr_started.set()
+
+        task_mgr = MagicMock()
+        task_mgr.close = _task_mgr_close
+        agent.task_manager = task_mgr
+
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        with patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S",
+            0.20,
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_DURABLE_RESERVE_S",
+            0.05,
+        ), patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+            0.01,
+        ):
+            await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+
+        assert heartbeat_started.is_set()
+        # Every later op's coroutine BODY must have executed — proven by events
+        # set from inside the bodies, not by AsyncMock call assertions (a
+        # timeout-zero coroutine can be "called" without its body starting).
+        assert late_started.is_set(), "later feature body was starved"
+        assert mcp_started.is_set(), "MCP shutdown body was starved"
+        assert llm_started.is_set(), "LLM close body was starved"
+        assert task_mgr_started.is_set(), "TaskManager close body was starved"
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_durable_tail_bounds_cancellation_suppressing_step(
+        self, tmp_path
+    ):
+        """A tail step that suppresses cancellation cannot hang the tail (#2409).
+
+        ``asyncio.wait_for`` cancels once and then waits for completion. If the
+        durable tail performed fresh unbounded awaits, a step that swallows
+        ``CancelledError`` would make the outer timeout / CLI "forcing exit"
+        branch unreachable forever. The tail must ABANDON such a step past its
+        guard and continue to the data-critical storage close.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        storage_started = asyncio.Event()
+
+        async def _suppresses_cancel():
+            # Swallow cancellation and keep running forever.
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    continue
+
+        async def _close_storage():
+            storage_started.set()
+
+        # Force the memory step to be the cancellation-suppressing hang.
+        agent.memory_system = MagicMock()
+        agent.memory_system.shutdown = _suppresses_cancel
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock(side_effect=_close_storage)
+        agent.storage = mock_storage
+
+        with patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+            0.05,
+        ):
+            # Must finish well within a generous outer bound despite the
+            # suppressing step; the tail's own guard bounds it.
+            await asyncio.wait_for(agent.shutdown(), timeout=3.0)
+
+        # Storage close (data-critical) still ran after the hung step was
+        # abandoned.
+        assert storage_started.is_set()
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_force_snapshot_completes_it_and_stops(
+        self, tmp_path
+    ):
+        """Cancellation during force_snapshot: snapshot completes, stop() runs (#2409).
+
+        The final snapshot is shielded so cancellation neither aborts it nor
+        skips the following ``stop()`` (which releases the sync worker), while
+        cancellation still propagates out of ``shutdown()``.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        snapshot_completed = asyncio.Event()
+        stop_called = asyncio.Event()
+
+        async def _slow_snapshot():
+            await asyncio.sleep(0.1)
+            snapshot_completed.set()
+
+        async def _stop():
+            stop_called.set()
+
+        sync = MagicMock()
+        sync.is_running = True
+        sync.force_snapshot = _slow_snapshot
+        sync.stop = _stop
+        agent._sync_service = sync
+
+        # A feature that cancels the whole shutdown, so cancellation is in
+        # flight when the durable tail (and its force_snapshot) runs.
+        cancelling = MagicMock()
+        cancelling.shutdown = AsyncMock(side_effect=asyncio.CancelledError())
+        agent.features = {"Canceller": cancelling}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.shutdown()
+
+        # Snapshot was NOT aborted by the in-flight cancellation...
+        assert snapshot_completed.is_set()
+        # ...and stop() still ran...
+        assert stop_called.is_set()
+        # ...and storage still closed...
+        mock_storage.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_abandoned_tail_step_is_not_reported_as_completed(
+        self, tmp_path, caplog
+    ):
+        """No 'durable cleanup completed' when a tail step was abandoned (#2409)."""
+        import logging as _logging
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        async def _hangs():
+            await asyncio.Event().wait()
+
+        agent.memory_system = MagicMock()
+        agent.memory_system.shutdown = _hangs
+        agent.features = {}
+        agent.llm_service = None
+        agent.task_manager = None
+        mock_storage = AsyncMock()
+        mock_storage.close = AsyncMock()
+        agent.storage = mock_storage
+
+        with patch(
+            "kestrel_sovereign.kestrel_agent.KESTREL_SHUTDOWN_TAIL_MIN_STEP_S",
+            0.05,
+        ), caplog.at_level(_logging.INFO):
+            await asyncio.wait_for(agent.shutdown(), timeout=3.0)
+
+        text = caplog.text
+        # The abandoned step must be surfaced as DEGRADED, never "completed".
+        assert "DEGRADED" in text
+        assert "async shutdown complete." not in text or "DEGRADED" in text
+        # Storage still closed despite the degraded step.
+        mock_storage.close.assert_called_once()
+
+    def test_resolve_shutdown_budget_clamps_reserve_over_budget(self):
+        """reserve >= budget is an explicit, safe clamp (#2409)."""
+        from kestrel_sovereign import kestrel_agent as ka
+
+        with patch.object(ka, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", 4.0), patch.object(
+            ka, "KESTREL_SHUTDOWN_DURABLE_RESERVE_S", 10.0
+        ):
+            prefix, reserve = ka._resolve_shutdown_budget()
+
+        # Prefix keeps a nonzero majority; reserve clamped to at most half.
+        assert prefix > 0
+        assert reserve > 0
+        assert reserve <= 4.0 / 2.0
+        assert abs((prefix + reserve) - 4.0) < 1e-9
+
+    def test_resolve_shutdown_budget_clamps_timeout_over_outer(self):
+        """An internal timeout above the production outer deadline is clamped (#2409)."""
+        from kestrel_sovereign import kestrel_agent as ka
+        from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
+
+        with patch.object(
+            ka, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", float(SHUTDOWN_TIMEOUT) + 100.0
+        ), patch.object(ka, "KESTREL_SHUTDOWN_DURABLE_RESERVE_S", 1.0):
+            prefix, reserve = ka._resolve_shutdown_budget()
+
+        # Total internal budget never exceeds the outer deadline.
+        assert prefix + reserve <= float(SHUTDOWN_TIMEOUT) + 1e-9
+
 
 # =============================================================================
 # Tests for Error Handling
