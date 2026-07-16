@@ -143,6 +143,8 @@ class UvExecutor(BaseExecutor):
         context: _ExecutionContext,
         uv_path: str,
     ) -> _ExecutionResult:
+        # Only the executor-owned temp dir authorizes direct deletion; the
+        # Python runtime resolves relative paths against the child's cwd.
         safe_content = self._policy.rewrite_script(
             script.content,
             "python",

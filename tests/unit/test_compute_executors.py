@@ -736,3 +736,52 @@ async def test_docker_debug_log_redacts_script_environment_values(
         command for command in commands if _is_docker_command(command, "run")
     )
     assert "COMPUTE_TOKEN=do-not-log-this-secret" in run_command
+
+
+class TestDockerTrashStaging:
+    """The Docker executor mounts a per-execution staging dir, never the
+    shared trash root (#2485 review P1); staged entries are promoted
+    host-side after the run."""
+
+    def test_promote_moves_entries_and_removes_staging(self, tmp_path):
+        from kestrel_sovereign.features.compute.executors.docker_executor import (
+            DockerExecutor,
+        )
+
+        trash_root = tmp_path / "trash"
+        trash_root.mkdir()
+        staging = trash_root / ".staging-x"
+        (staging / "rm_aaaa1111").mkdir(parents=True)
+        (staging / "rm_aaaa1111" / "victim.txt").write_text("v")
+
+        DockerExecutor._promote_staged_trash(staging, trash_root)
+
+        assert not staging.exists()
+        assert (trash_root / "rm_aaaa1111" / "victim.txt").read_text() == "v"
+
+    def test_promote_suffixes_on_collision(self, tmp_path):
+        from kestrel_sovereign.features.compute.executors.docker_executor import (
+            DockerExecutor,
+        )
+
+        trash_root = tmp_path / "trash"
+        (trash_root / "rm_aaaa1111").mkdir(parents=True)
+        (trash_root / "rm_aaaa1111" / "old.txt").write_text("old")
+        staging = trash_root / ".staging-y"
+        (staging / "rm_aaaa1111").mkdir(parents=True)
+        (staging / "rm_aaaa1111" / "new.txt").write_text("new")
+
+        DockerExecutor._promote_staged_trash(staging, trash_root)
+
+        assert (trash_root / "rm_aaaa1111" / "old.txt").read_text() == "old"
+        assert (trash_root / "rm_aaaa1111.1" / "new.txt").read_text() == "new"
+        assert not staging.exists()
+
+    def test_promote_missing_staging_is_a_noop(self, tmp_path):
+        from kestrel_sovereign.features.compute.executors.docker_executor import (
+            DockerExecutor,
+        )
+
+        DockerExecutor._promote_staged_trash(
+            tmp_path / "trash" / ".staging-gone", tmp_path / "trash"
+        )

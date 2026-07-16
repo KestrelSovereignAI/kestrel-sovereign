@@ -10,6 +10,7 @@ This executor provides NO isolation and should never be used in production.
 import asyncio
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -108,15 +109,18 @@ class LocalExecutor(BaseExecutor):
         working_dir: Optional[str],
         context: _ExecutionContext,
     ) -> _ExecutionResult:
+        # Only the executor-owned temp dir authorizes direct deletion; a
+        # caller-supplied working_dir is the resolution cwd for checks only.
         safe_content = self._policy.rewrite_script(
             script.content,
             script.language,
             context.workdir,
+            script_cwd=working_dir or context.workdir,
         )
 
         if script.language == "python":
             script_path = Path(context.workdir) / "script.py"
-            cmd = ["python", str(script_path)]
+            cmd = [sys.executable, str(script_path)]
         else:
             script_path = Path(context.workdir) / "script.sh"
             cmd = ["bash", str(script_path)]

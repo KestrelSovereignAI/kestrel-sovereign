@@ -1,31 +1,35 @@
-"""
-Kestrel Compute Feature - Destructive Operation Policy.
+"""Canonical destructive-operation policy for the compute feature.
 
-Rewrites rm and other destructive operations to use trash folder instead
-of permanent deletion. This ensures user data is never permanently lost
-by agent actions.
+Shell syntax-tree handling lives in :mod:`shell_rewriter`; the standalone
+Python child-process runtime lives in :mod:`python_delete_runtime`.  This
+module owns the shared configuration, agent-data policy, and public rewrite
+surface only.
 """
 
+import ast
+from datetime import datetime, timezone
+import json
 import logging
 import os
+from pathlib import Path
 import re
 import shlex
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import List, Optional
+from typing import Optional
+
+from . import python_delete_runtime
+from .shell_rewriter import ShellRewriteError, ShellScriptRewriter
+
 
 logger = logging.getLogger(__name__)
 
 
-# Default trash directory
-DEFAULT_TRASH_DIR = Path(os.environ.get(
-    "KESTREL_TRASH_DIR",
-    os.path.expanduser("~/.kestrel/trash")
-))
+DEFAULT_TRASH_DIR = Path(
+    os.environ.get("KESTREL_TRASH_DIR", os.path.expanduser("~/.kestrel/trash"))
+)
 
-# Directories where true deletion is allowed (agent's temp workspace)
-# Include both /tmp and /private/tmp for macOS compatibility
+# Each value denotes a parent plus a generated-directory name prefix, not an
+# arbitrary string prefix.  ``is_deletable_path`` resolves both sides and uses
+# path components so symlinks and prefix siblings cannot escape containment.
 DEFAULT_DELETABLE_PREFIXES = [
     "/tmp/kestrel_compute_",
     "/tmp/kestrel_scratch_",
@@ -34,23 +38,20 @@ DEFAULT_DELETABLE_PREFIXES = [
 ]
 
 AGENT_DATA_DIR_NAME = "agent_data"
+_PYTHON_ENCODING_COOKIE = re.compile(r"coding[:=]\s*[-\w.]+")
 
 
 class AgentDataProtectionError(PermissionError):
-    """Raised when compute tries to delete another agent's data directory."""
+    """Raised when compute tries to mutate another agent's data directory."""
 
 
 def _resolve_path(path: str | Path) -> Path:
-    """Resolve paths for prefix checks without requiring the target to exist."""
+    """Resolve paths for component checks without requiring the target."""
     return Path(path).expanduser().resolve(strict=False)
 
 
-def _path_is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
+def _absolute_path(path: str | Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
 
 
 def _contains_agent_data_segment(path: Path) -> bool:
@@ -58,46 +59,29 @@ def _contains_agent_data_segment(path: Path) -> bool:
 
 
 class DestructiveOperationPolicy:
+    """Govern shell/Python deletion and cross-agent filesystem access.
+
+    ``is_deletable_path`` remains a public classification helper for callers
+    that need to reason about executor-owned workspaces.  Rewriters preserve
+    the established direct-delete authorization for those workspaces and the
+    current agent's own data, but revalidate the owning root in the child
+    immediately before the filesystem operation.
     """
-    Policy for handling rm and other destructive operations.
-    
-    Rules:
-    1. `rm` is NEVER executed directly
-    2. `rm` is rewritten to `mv <target> ~/.kestrel/trash/<timestamp>_<basename>`
-    3. EXCEPTION: Files in agent's temp workspace can be truly deleted
-    
-    Example:
-        policy = DestructiveOperationPolicy()
-        
-        # Rewrite a command
-        safe_cmd = policy.rewrite_rm("rm -rf /data/old_files")
-        # Returns: mkdir -p ~/.kestrel/trash/20251201_143022 && mv /data/old_files ~/.kestrel/trash/20251201_143022/
-        
-        # Rewrite an entire bash script
-        safe_script = policy.rewrite_script(script_content, "bash", "/tmp/kestrel_compute_abc123")
-    """
-    
+
     def __init__(
         self,
         trash_dir: Optional[Path] = None,
-        deletable_prefixes: Optional[List[str]] = None,
+        deletable_prefixes: Optional[list[str]] = None,
         current_agent_data_path: Optional[str | Path] = None,
-    ):
-        """
-        Initialize the policy.
-        
-        Args:
-            trash_dir: Path to trash directory (default: ~/.kestrel/trash)
-            deletable_prefixes: Paths where true deletion is allowed
-            current_agent_data_path: This agent's own data directory. Paths
-                under other agent_data children are untouchable.
-        """
+    ) -> None:
         self.trash_dir = trash_dir or DEFAULT_TRASH_DIR
-        self.deletable_prefixes = deletable_prefixes or DEFAULT_DELETABLE_PREFIXES
+        self.deletable_prefixes = (
+            list(deletable_prefixes)
+            if deletable_prefixes is not None
+            else list(DEFAULT_DELETABLE_PREFIXES)
+        )
         self.current_agent_data_path = (
-            _resolve_path(current_agent_data_path)
-            if current_agent_data_path
-            else None
+            _resolve_path(current_agent_data_path) if current_agent_data_path else None
         )
         self.agent_data_audit_log = self.trash_dir / "agent_data_access_audit.jsonl"
 
@@ -108,10 +92,10 @@ class DestructiveOperationPolicy:
         decision: str,
         reason: str,
     ) -> None:
-        """Append a best-effort audit row for attempts touching agent_data."""
+        """Append a best-effort audit row for attempts touching agent data."""
         try:
             resolved = _resolve_path(path)
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             resolved = Path(str(path))
 
         if not _contains_agent_data_segment(resolved):
@@ -129,7 +113,6 @@ class DestructiveOperationPolicy:
                 else None
             ),
         }
-
         logger.warning(
             "agent_data access audit: action=%s decision=%s path=%s reason=%s",
             action,
@@ -145,23 +128,20 @@ class DestructiveOperationPolicy:
             logger.warning("Could not write agent_data access audit log: %s", exc)
 
     def is_own_agent_data_path(self, path: str | Path) -> bool:
-        """Return True when path is inside this agent's own data directory."""
         if self.current_agent_data_path is None:
             return False
         try:
             resolved = _resolve_path(path)
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             return False
-        return (
-            resolved == self.current_agent_data_path
-            or _path_is_relative_to(resolved, self.current_agent_data_path)
+        return resolved == self.current_agent_data_path or resolved.is_relative_to(
+            self.current_agent_data_path
         )
 
     def is_agent_data_path(self, path: str | Path) -> bool:
-        """Return True when path is inside an agent_data tree."""
         try:
             resolved = _resolve_path(path)
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             resolved = Path(str(path))
         return _contains_agent_data_segment(resolved)
 
@@ -170,117 +150,68 @@ class DestructiveOperationPolicy:
         path: str | Path,
         action: str = "delete",
     ) -> None:
-        """Block deletion/trashing of another agent's data."""
         if not self.is_agent_data_path(path):
             return
         if self.is_own_agent_data_path(path):
             self.audit_agent_data_access(path, action, "allowed", "own_agent_data")
             return
-
         self.audit_agent_data_access(path, action, "blocked", "other_agent_data")
         raise AgentDataProtectionError(
             f"Refusing to {action} another agent's data: {_resolve_path(path)}"
         )
-    
-    def is_deletable_path(self, path: str, script_workdir: Optional[str] = None) -> bool:
-        """
-        Check if a path is in a deletable (temp) location.
-        
-        Args:
-            path: The path to check
-            script_workdir: The script's working directory (also deletable)
-            
-        Returns:
-            True if path can be truly deleted, False if should go to trash
-        """
-        # Expand user home
-        if path.startswith("~"):
-            path = os.path.expanduser(path)
-        
-        # Resolve to absolute path
-        try:
-            resolved = str(Path(path).resolve())
-        except Exception:
-            resolved = path
-        
-        # Check against deletable prefixes. Also check the original (pre-resolve)
-        # path so Unix-style temp paths like /tmp/kestrel_compute_* are recognised
-        # on Windows, where Path.resolve() turns them into C:\tmp\... variants.
-        for prefix in self.deletable_prefixes:
-            if resolved.startswith(prefix) or path.startswith(prefix):
-                return True
-        
-        # Check against script workdir
-        if script_workdir and resolved.startswith(script_workdir):
-            return True
 
-        if self.is_own_agent_data_path(resolved):
-            return True
-        
-        return False
-    
-    def rewrite_rm(self, command: str, script_workdir: Optional[str] = None) -> str:
-        """
-        Rewrite rm commands to mv to trash.
-        
-        Args:
-            command: Original command containing rm
-            script_workdir: If set, files in this dir can be truly deleted
-            
-        Returns:
-            Rewritten command (mv to trash) or original if in temp workspace
-        """
-        # Parse rm command
-        # Match: rm [-options] target1 [target2 ...]
-        rm_match = re.match(r'^(\s*)rm\s+(-[rfivI]+\s+)?(.+)$', command)
-        if not rm_match:
-            return command
-        
-        indent = rm_match.group(1) or ""
-        options = rm_match.group(2) or ""
-        targets_str = rm_match.group(3).strip()
-        
-        # Parse targets (handle quoted paths)
-        try:
-            target_paths = shlex.split(targets_str)
-        except ValueError:
-            # If parsing fails, treat as single target
-            target_paths = [targets_str]
-        
-        # Check if ALL targets are in deletable prefixes
-        for target in target_paths:
-            self.assert_agent_data_deletion_allowed(
-                self._resolve_shell_target(target, script_workdir),
-                "rm",
-            )
+    def is_deletable_path(
+        self,
+        path: str,
+        script_workdir: Optional[str] = None,
+    ) -> bool:
+        """Return whether ``path`` resolves inside an executor-owned workspace."""
+        return self._direct_delete_root(path, script_workdir) is not None
 
-        all_deletable = all(self.is_deletable_path(t, script_workdir) for t in target_paths)
-        
-        if all_deletable:
-            # Allow true deletion for temp files
-            logger.debug(f"Allowing true rm for temp paths: {target_paths}")
-            return command
-        
-        # Rewrite to mv to trash
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        trash_subdir = self.trash_dir / timestamp
-        
-        # Build safe command
-        # Quote paths properly to handle spaces
-        quoted_targets = " ".join(shlex.quote(t) for t in target_paths)
-        
-        safe_command = (
-            f"{indent}mkdir -p {shlex.quote(str(trash_subdir))} && "
-            f"mv {quoted_targets} {shlex.quote(str(trash_subdir))}/"
-        )
-        
-        logger.info(f"Rewrote rm to trash: {targets_str} -> {trash_subdir}")
-        return safe_command
+    def _direct_delete_root(
+        self,
+        path: str | Path,
+        script_workdir: Optional[str] = None,
+    ) -> Optional[Path]:
+        """Return the exact root authorizing direct deletion, if any."""
+        try:
+            resolved_path = _resolve_path(path)
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+        for configured_prefix in self.deletable_prefixes:
+            prefix_path = Path(configured_prefix).expanduser()
+            prefix_parent = _resolve_path(prefix_path.parent)
+            try:
+                relative = resolved_path.relative_to(prefix_parent)
+            except ValueError:
+                continue
+            if relative.parts and relative.parts[0].startswith(prefix_path.name):
+                return prefix_parent / relative.parts[0]
+
+        if script_workdir:
+            workdir_path = _resolve_path(script_workdir)
+            if resolved_path == workdir_path or resolved_path.is_relative_to(
+                workdir_path
+            ):
+                return workdir_path
+
+        if self.is_own_agent_data_path(resolved_path):
+            return self.current_agent_data_path
+        return None
+
+    def rewrite_rm(
+        self,
+        command: str,
+        script_workdir: Optional[str] = None,
+    ) -> str:
+        """Rewrite a shell fragment through the canonical syntax-tree path."""
+        return self.rewrite_bash_script(command, script_workdir)
 
     def _resolve_shell_target(
         self,
         target: str,
-        script_workdir: Optional[str] = None,
+        script_workdir: Optional[str],
     ) -> str:
         if os.path.isabs(target) or not script_workdir:
             return target
@@ -288,20 +219,21 @@ class DestructiveOperationPolicy:
 
     def assert_shell_command_allowed(
         self,
-        line: str,
+        command: str,
         script_workdir: Optional[str] = None,
     ) -> None:
-        """Reject shell access to another agent's data path in any pipeline segment."""
-        stripped = line.strip()
+        """Reject static shell paths that target another agent's data."""
+        stripped = command.strip()
         if not stripped:
             return
-
         try:
             lexer = shlex.shlex(stripped, posix=True, punctuation_chars=";&|")
             lexer.whitespace_split = True
             parts = list(lexer)
-        except ValueError:
-            parts = stripped.split()
+        except ValueError as exc:
+            raise ShellRewriteError(
+                f"Could not classify shell command paths: {exc}"
+            ) from exc
 
         for token in parts:
             if not token or set(token) <= {";", "&", "|"}:
@@ -312,7 +244,7 @@ class DestructiveOperationPolicy:
                     "shell",
                 )
 
-        for match in re.finditer(r'(?:^|[^0-9])(?:>>?|<>)\s*([^\s;&|]+)', line):
+        for match in re.finditer(r"(?:^|[^0-9])(?:>>?|<>)\s*([^\s;&|]+)", command):
             target = match.group(1).strip()
             if target:
                 self.assert_agent_data_deletion_allowed(
@@ -320,369 +252,181 @@ class DestructiveOperationPolicy:
                     "redirect",
                 )
 
-    def _shell_token_candidate_paths(self, token: str) -> List[str]:
-        """Extract possible path payloads from a shell token."""
+    @staticmethod
+    def _shell_token_candidate_paths(token: str) -> list[str]:
         candidates = [token]
-
         if "=" in token:
             _, value = token.split("=", 1)
             if value:
                 candidates.append(value)
-
         stripped = token.lstrip("0123456789<>")
         if stripped and stripped != token:
             candidates.append(stripped)
-
         return candidates
-    
-    def rewrite_bash_script(self, content: str, workdir: Optional[str] = None) -> str:
+
+    def rewrite_bash_script(
+        self,
+        content: str,
+        workdir: Optional[str] = None,
+        *,
+        runtime_trash_dir: Optional[str | Path] = None,
+        script_cwd: Optional[str] = None,
+    ) -> str:
+        """Rewrite shell deletion using a concrete Bash syntax tree.
+
+        ``workdir`` is the executor-owned workspace authorized for direct
+        deletion.  ``script_cwd`` is the directory the script's relative
+        paths resolve against at runtime; it defaults to ``workdir`` but is
+        never itself an authorization: a caller-supplied working directory
+        must not become a real-delete root.
         """
-        Rewrite all destructive operations in a bash script.
-        
-        Args:
-            content: The script content
-            workdir: The script's working directory
-            
-        Returns:
-            Rewritten script with rm -> mv transformations
-        """
-        lines = content.split('\n')
-        rewritten = []
-        
-        for line in lines:
-            stripped = line.strip()
-            
-            # Skip comments and empty lines
-            if stripped.startswith('#') or not stripped:
-                rewritten.append(line)
-                continue
-            
-            # Check for rm command (not in a string or comment)
-            if re.match(r'^(\s*)rm\s', line):
-                rewritten.append(self.rewrite_rm(line, workdir))
-            else:
-                self.assert_shell_command_allowed(line, workdir)
-                rewritten.append(line)
-        
-        return '\n'.join(rewritten)
-    
-    def get_python_safe_remove_helper(self, workdir: Optional[str] = None) -> str:
-        """
-        Get Python code to inject at the top of scripts for safe deletion.
-        
-        This uses sys.modules manipulation to persistently patch os.remove, 
-        os.unlink, shutil.rmtree and pathlib.Path.unlink to use trash folder 
-        instead of permanent deletion.
-        
-        Args:
-            workdir: The script's working directory
-            
-        Returns:
-            Python code to prepend to scripts
-        """
-        # Use repr() so Windows paths with backslashes (e.g. C:\Users\...) don't
-        # produce invalid string-escape sequences (\U, \n, \t) when embedded in
-        # the generated Python source.
-        trash_dir_literal = repr(str(self.trash_dir))
-        workdir_literal = repr(workdir or "")
-        prefixes_str = repr(self.deletable_prefixes)
-        current_agent_data_literal = repr(
-            str(self.current_agent_data_path) if self.current_agent_data_path else ""
+        resolution_cwd = script_cwd or workdir
+        trash_dir = _absolute_path(runtime_trash_dir or self.trash_dir)
+        rewriter = ShellScriptRewriter(
+            trash_dir=trash_dir,
+            workdir=workdir,
+            assert_delete_allowed=lambda target: (
+                self.assert_agent_data_deletion_allowed(
+                    self._resolve_shell_target(target, resolution_cwd),
+                    "rm",
+                )
+            ),
+            assert_command_allowed=lambda command: self.assert_shell_command_allowed(
+                command,
+                resolution_cwd,
+            ),
+            direct_delete_root=lambda target: (
+                str(root)
+                if (
+                    root := self._direct_delete_root(
+                        self._resolve_shell_target(target, resolution_cwd),
+                        workdir,
+                    )
+                )
+                is not None
+                else None
+            ),
+            current_agent_data_root=self.current_agent_data_path,
+        )
+        return rewriter.rewrite(content)
+
+    def get_python_safe_remove_helper(
+        self,
+        workdir: Optional[str] = None,
+        *,
+        runtime_trash_dir: Optional[str | Path] = None,
+    ) -> str:
+        """Build a bootstrap from the standalone canonical Python runtime."""
+        runtime_source = Path(python_delete_runtime.__file__).read_text(
+            encoding="utf-8"
+        )
+        trash_dir = str(_absolute_path(runtime_trash_dir or self.trash_dir))
+        current_agent_data = (
+            str(self.current_agent_data_path)
+            if self.current_agent_data_path is not None
+            else None
+        )
+        runtime_workdir = str(_resolve_path(workdir)) if workdir else None
+        return (
+            "# === KESTREL SAFE DELETION RUNTIME ===\n"
+            "# Compatibility names: _kestrel_safe_remove, _KESTREL_TRASH_DIR\n"
+            "_kestrel_runtime_namespace = {\n"
+            "    '__name__': '_kestrel_safe_delete_runtime',\n"
+            "}\n"
+            f"exec({runtime_source!r}, _kestrel_runtime_namespace)\n"
+            "_kestrel_runtime_namespace['install_safe_delete_runtime'](\n"
+            f"    {trash_dir!r},\n"
+            f"    {current_agent_data!r},\n"
+            f"    {self.deletable_prefixes!r},\n"
+            f"    {runtime_workdir!r},\n"
+            ")\n"
+            "del _kestrel_runtime_namespace\n"
+            "# === END KESTREL SAFE DELETION RUNTIME ===\n"
         )
 
-        return f'''
-# === KESTREL SAFE DELETION WRAPPER ===
-# This code ensures deletions go to trash instead of being permanent
-# Uses sys.modules patching to make changes persistent across imports
+    def rewrite_python_script(
+        self,
+        content: str,
+        workdir: Optional[str] = None,
+        *,
+        runtime_trash_dir: Optional[str | Path] = None,
+    ) -> str:
+        """Install safe deletion after legal module prologue statements."""
+        helper = self.get_python_safe_remove_helper(
+            workdir,
+            runtime_trash_dir=runtime_trash_dir,
+        )
+        insertion_offset = self._python_runtime_insertion_offset(content)
+        prefix = content[:insertion_offset]
+        suffix = content[insertion_offset:]
+        separator = "" if not prefix or prefix.endswith("\n") else "\n"
+        return f"{prefix}{separator}{helper}{suffix}"
 
-import sys as _kestrel_sys
-
-# Import modules directly BEFORE any user code runs
-import shutil as _kestrel_shutil_original
-import os as _kestrel_os_original
-import builtins as _kestrel_builtins_original
-import json as _kestrel_json
-from pathlib import Path as _KestrelPathOriginal
-from datetime import datetime as _kestrel_datetime, timezone as _kestrel_timezone
-
-_KESTREL_TRASH_DIR = _KestrelPathOriginal({trash_dir_literal})
-_KESTREL_WORKDIR = {workdir_literal}
-_KESTREL_DELETABLE_PREFIXES = {prefixes_str}
-_KESTREL_CURRENT_AGENT_DATA = _KestrelPathOriginal({current_agent_data_literal}).expanduser().resolve() if {current_agent_data_literal} else None
-_KESTREL_AGENT_DATA_AUDIT_LOG = _KESTREL_TRASH_DIR / "agent_data_access_audit.jsonl"
-_KESTREL_PATCHED = False
-
-class _KestrelAgentDataProtectionError(PermissionError):
-    pass
-
-def _kestrel_is_relative_to(path, parent):
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-def _kestrel_is_agent_data_path(path) -> bool:
-    return "agent_data" in _KestrelPathOriginal(path).parts
-
-def _kestrel_is_own_agent_data(path) -> bool:
-    if _KESTREL_CURRENT_AGENT_DATA is None:
-        return False
-    return path == _KESTREL_CURRENT_AGENT_DATA or _kestrel_is_relative_to(path, _KESTREL_CURRENT_AGENT_DATA)
-
-def _kestrel_audit_agent_data(path, action, decision, reason):
-    if not _kestrel_is_agent_data_path(path):
-        return
-    entry = {{
-        "timestamp": _kestrel_datetime.now(_kestrel_timezone.utc).isoformat(),
-        "action": action,
-        "decision": decision,
-        "reason": reason,
-        "path": str(path),
-        "current_agent_data_path": str(_KESTREL_CURRENT_AGENT_DATA) if _KESTREL_CURRENT_AGENT_DATA else None,
-    }}
-    try:
-        _KESTREL_AGENT_DATA_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _KESTREL_AGENT_DATA_AUDIT_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(_kestrel_json.dumps(entry, sort_keys=True) + "\\n")
-    except Exception:
-        pass
-
-def _kestrel_assert_agent_data_allowed(path, action):
-    if not _kestrel_is_agent_data_path(path):
-        return
-    if _kestrel_is_own_agent_data(path):
-        _kestrel_audit_agent_data(path, action, "allowed", "own_agent_data")
-        return
-    _kestrel_audit_agent_data(path, action, "blocked", "other_agent_data")
-    raise _KestrelAgentDataProtectionError(f"Refusing to {{action}} another agent's data: {{path}}")
-
-def _kestrel_is_deletable(path: str) -> bool:
-    """Check if path can be truly deleted."""
-    try:
-        resolved = str(_KestrelPathOriginal(path).expanduser().resolve())
-    except Exception:
-        resolved = path
-    resolved_path = _KestrelPathOriginal(resolved)
-    
-    for prefix in _KESTREL_DELETABLE_PREFIXES:
-        if resolved.startswith(prefix):
-            return True
-    
-    if _KESTREL_WORKDIR and resolved.startswith(_KESTREL_WORKDIR):
-        return True
-
-    if _kestrel_is_own_agent_data(resolved_path):
-        return True
-    
-    return False
-
-# Store original functions ONCE
-_kestrel_original_remove = _kestrel_os_original.remove
-_kestrel_original_unlink = _kestrel_os_original.unlink
-_kestrel_original_rename = _kestrel_os_original.rename
-_kestrel_original_replace = _kestrel_os_original.replace
-_kestrel_original_truncate = _kestrel_os_original.truncate
-_kestrel_original_open = _kestrel_builtins_original.open
-_kestrel_original_rmtree = _kestrel_shutil_original.rmtree
-_kestrel_original_path_open = _KestrelPathOriginal.open
-_kestrel_original_path_unlink = _KestrelPathOriginal.unlink
-_kestrel_original_path_rename = _KestrelPathOriginal.rename
-_kestrel_original_path_replace = _KestrelPathOriginal.replace
-
-def _kestrel_safe_remove(path, *args, **kwargs):
-    """Move to trash instead of deleting (unless in temp workspace)."""
-    p = _KestrelPathOriginal(path).expanduser().resolve()
-    _kestrel_assert_agent_data_allowed(p, "delete")
-    
-    if _kestrel_is_deletable(str(p)):
-        # Allow true deletion for temp files
-        if p.is_dir():
-            import os as _kestrel_os_module
-            _saved_remove = _kestrel_os_module.remove
-            _saved_unlink = _kestrel_os_module.unlink
-            try:
-                _kestrel_os_module.remove = _kestrel_original_remove
-                _kestrel_os_module.unlink = _kestrel_original_unlink
-                _kestrel_original_rmtree(str(p))
-            finally:
-                _kestrel_os_module.remove = _saved_remove
-                _kestrel_os_module.unlink = _saved_unlink
-        else:
-            _kestrel_original_unlink(str(p))
-    else:
-        # Move to trash
-        timestamp = _kestrel_datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        trash_subdir = _KESTREL_TRASH_DIR / timestamp
-        trash_subdir.mkdir(parents=True, exist_ok=True)
-        _kestrel_shutil_original.move(str(p), str(trash_subdir / p.name))
-
-def _kestrel_safe_rmtree(path, *args, **kwargs):
-    """Safe rmtree that moves to trash."""
-    _kestrel_safe_remove(path)
-
-def _kestrel_safe_rename(src, dst, *args, **kwargs):
-    """Block renames that move or overwrite another agent's data."""
-    src_path = _KestrelPathOriginal(src).expanduser().resolve()
-    dst_path = _KestrelPathOriginal(dst).expanduser().resolve()
-    _kestrel_assert_agent_data_allowed(src_path, "rename")
-    _kestrel_assert_agent_data_allowed(dst_path, "rename")
-    return _kestrel_original_rename(src, dst, *args, **kwargs)
-
-def _kestrel_safe_replace(src, dst, *args, **kwargs):
-    """Block replaces that move or overwrite another agent's data."""
-    src_path = _KestrelPathOriginal(src).expanduser().resolve()
-    dst_path = _KestrelPathOriginal(dst).expanduser().resolve()
-    _kestrel_assert_agent_data_allowed(src_path, "replace")
-    _kestrel_assert_agent_data_allowed(dst_path, "replace")
-    return _kestrel_original_replace(src, dst, *args, **kwargs)
-
-def _kestrel_safe_truncate(path, length, *args, **kwargs):
-    """Block truncate calls against another agent's data."""
-    try:
-        p = _KestrelPathOriginal(path).expanduser().resolve()
-    except TypeError:
-        return _kestrel_original_truncate(path, length, *args, **kwargs)
-    _kestrel_assert_agent_data_allowed(p, "truncate")
-    return _kestrel_original_truncate(path, length, *args, **kwargs)
-
-def _kestrel_safe_open(file, mode="r", *args, **kwargs):
-    """Block builtins.open calls that would truncate another agent's data."""
-    if isinstance(mode, str) and "w" in mode:
+    @staticmethod
+    def _python_runtime_insertion_offset(content: str) -> int:
         try:
-            p = _KestrelPathOriginal(file).expanduser().resolve()
-        except TypeError:
-            return _kestrel_original_open(file, mode, *args, **kwargs)
-        _kestrel_assert_agent_data_allowed(p, "open_truncate")
-    return _kestrel_original_open(file, mode, *args, **kwargs)
+            module = ast.parse(content)
+        except SyntaxError as exc:
+            raise ValueError(f"Cannot instrument invalid Python source: {exc}") from exc
 
-def _kestrel_path_safe_open(self, mode="r", *args, **kwargs):
-    """Block Path.open calls that would truncate another agent's data."""
-    if isinstance(mode, str) and "w" in mode:
-        p = _KestrelPathOriginal(self).expanduser().resolve()
-        _kestrel_assert_agent_data_allowed(p, "open_truncate")
-    return _kestrel_original_path_open(self, mode, *args, **kwargs)
+        insertion_line = 0
+        body_index = 0
+        if (
+            module.body
+            and isinstance(module.body[0], ast.Expr)
+            and isinstance(module.body[0].value, ast.Constant)
+            and isinstance(module.body[0].value.value, str)
+        ):
+            insertion_line = module.body[0].end_lineno or module.body[0].lineno
+            body_index = 1
 
-def _kestrel_path_safe_unlink(self, missing_ok=False):
-    """Safe Path.unlink that moves to trash."""
-    try:
-        _kestrel_safe_remove(str(self))
-    except FileNotFoundError:
-        if not missing_ok:
-            raise
+        while body_index < len(module.body):
+            node = module.body[body_index]
+            if not isinstance(node, ast.ImportFrom) or node.module != "__future__":
+                break
+            insertion_line = node.end_lineno or node.lineno
+            body_index += 1
 
-def _kestrel_path_safe_rename(self, target):
-    """Safe Path.rename that blocks another agent's data."""
-    source = _KestrelPathOriginal(self).expanduser().resolve()
-    dest = _KestrelPathOriginal(target).expanduser().resolve()
-    _kestrel_assert_agent_data_allowed(source, "rename")
-    _kestrel_assert_agent_data_allowed(dest, "rename")
-    return _kestrel_original_path_rename(self, target)
+        lines = content.splitlines(keepends=True)
+        if insertion_line == 0:
+            if lines and lines[0].startswith("#!"):
+                insertion_line = 1
+            for index, line in enumerate(lines[:2], start=1):
+                if _PYTHON_ENCODING_COOKIE.search(line):
+                    insertion_line = max(insertion_line, index)
+        return sum(len(line) for line in lines[:insertion_line])
 
-def _kestrel_path_safe_replace(self, target):
-    """Safe Path.replace that blocks another agent's data."""
-    source = _KestrelPathOriginal(self).expanduser().resolve()
-    dest = _KestrelPathOriginal(target).expanduser().resolve()
-    _kestrel_assert_agent_data_allowed(source, "replace")
-    _kestrel_assert_agent_data_allowed(dest, "replace")
-    return _kestrel_original_path_replace(self, target)
-
-def _kestrel_apply_patches():
-    """Apply patches to os, shutil, and pathlib modules in sys.modules."""
-    global _KESTREL_PATCHED
-    if _KESTREL_PATCHED:
-        return
-    
-    # Patch os module
-    import os
-    os.remove = _kestrel_safe_remove
-    os.unlink = _kestrel_safe_remove
-    os.rename = _kestrel_safe_rename
-    os.replace = _kestrel_safe_replace
-    os.truncate = _kestrel_safe_truncate
-
-    import builtins
-    builtins.open = _kestrel_safe_open
-    
-    # Patch shutil module  
-    import shutil
-    shutil.rmtree = _kestrel_safe_rmtree
-    
-    # Patch pathlib.Path class
-    import pathlib
-    pathlib.Path.open = _kestrel_path_safe_open
-    pathlib.Path.unlink = _kestrel_path_safe_unlink
-    pathlib.Path.rename = _kestrel_path_safe_rename
-    pathlib.Path.replace = _kestrel_path_safe_replace
-    # Also patch PurePath descendants
-    if hasattr(pathlib, 'PosixPath'):
-        pathlib.PosixPath.open = _kestrel_path_safe_open
-        pathlib.PosixPath.unlink = _kestrel_path_safe_unlink
-        pathlib.PosixPath.rename = _kestrel_path_safe_rename
-        pathlib.PosixPath.replace = _kestrel_path_safe_replace
-    if hasattr(pathlib, 'WindowsPath'):
-        pathlib.WindowsPath.open = _kestrel_path_safe_open
-        pathlib.WindowsPath.unlink = _kestrel_path_safe_unlink
-        pathlib.WindowsPath.rename = _kestrel_path_safe_rename
-        pathlib.WindowsPath.replace = _kestrel_path_safe_replace
-    
-    _KESTREL_PATCHED = True
-
-# Apply patches immediately
-_kestrel_apply_patches()
-
-# === END KESTREL SAFE DELETION WRAPPER ===
-
-'''
-    
-    def rewrite_python_script(self, content: str, workdir: Optional[str] = None) -> str:
-        """
-        Rewrite a Python script to use safe deletion.
-        
-        Prepends the safe_remove helper to the script.
-        
-        Args:
-            content: The script content
-            workdir: The script's working directory
-            
-        Returns:
-            Rewritten script with safe deletion wrapper
-        """
-        helper = self.get_python_safe_remove_helper(workdir)
-        
-        # Handle shebang - keep it at the top
-        if content.startswith('#!'):
-            lines = content.split('\n', 1)
-            shebang = lines[0]
-            rest = lines[1] if len(lines) > 1 else ""
-            return f"{shebang}\n{helper}\n{rest}"
-        
-        return f"{helper}\n{content}"
-    
     def rewrite_script(
         self,
         content: str,
         language: str,
         workdir: Optional[str] = None,
+        *,
+        runtime_trash_dir: Optional[str | Path] = None,
+        script_cwd: Optional[str] = None,
     ) -> str:
-        """
-        Rewrite a script to use safe deletion based on language.
-        
-        Args:
-            content: The script content
-            language: "bash" or "python"
-            workdir: The script's working directory
-            
-        Returns:
-            Rewritten script
+        """Rewrite one script for safe deletion.
+
+        ``workdir`` is the executor-owned workspace authorized for direct
+        deletion.  ``script_cwd`` (bash only) is the runtime working
+        directory that relative operands resolve against; the Python runtime
+        resolves paths in the child process against its real cwd instead.
         """
         if language == "bash":
-            return self.rewrite_bash_script(content, workdir)
-        elif language == "python":
-            return self.rewrite_python_script(content, workdir)
-        else:
-            logger.warning(f"Unknown language '{language}', not rewriting")
-            return content
+            return self.rewrite_bash_script(
+                content,
+                workdir,
+                runtime_trash_dir=runtime_trash_dir,
+                script_cwd=script_cwd,
+            )
+        if language == "python":
+            return self.rewrite_python_script(
+                content,
+                workdir,
+                runtime_trash_dir=runtime_trash_dir,
+            )
+        logger.warning("Unknown language %r, not rewriting", language)
+        return content
 
 
 def rewrite_script_for_safety(
@@ -690,16 +434,15 @@ def rewrite_script_for_safety(
     language: str,
     workdir: Optional[str] = None,
 ) -> str:
-    """
-    Convenience function to rewrite a script for safe deletion.
-    
-    Args:
-        content: The script content
-        language: "bash" or "python"
-        workdir: The script's working directory
-        
-    Returns:
-        Rewritten script
-    """
-    policy = DestructiveOperationPolicy()
-    return policy.rewrite_script(content, language, workdir)
+    """Rewrite one script with the default destructive-operation policy."""
+    return DestructiveOperationPolicy().rewrite_script(content, language, workdir)
+
+
+__all__ = [
+    "AgentDataProtectionError",
+    "DEFAULT_DELETABLE_PREFIXES",
+    "DEFAULT_TRASH_DIR",
+    "DestructiveOperationPolicy",
+    "ShellRewriteError",
+    "rewrite_script_for_safety",
+]
