@@ -1729,3 +1729,48 @@ async def test_cancelled_backfill_token_write_rolls_back_before_purge(
         assert unobserved == []
     finally:
         loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_with_malformed_timestamp_still_purges(tmp_path):
+    """A UUID/resumed session row whose membership is proven by an exact
+    metadata.session_id match must remain countable/guardable/purgeable even
+    when its created_at is malformed — chronology plays no part in explicit
+    membership, so failing closed there would leave the session undeletable
+    (final review round P2)."""
+    db_path = tmp_path / "explicit-session-bad-timestamp.db"
+    agent_id = f"did:test:explicit-bad-timestamp:{uuid4()}"
+    session_id = str(uuid4())
+    async with AsyncStorage(str(db_path), agent_id=agent_id) as storage:
+        good = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="valid timestamp member",
+            session_id=session_id,
+            created_at="2026-06-01 12:00:00",
+        )
+        malformed = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="malformed timestamp member",
+            session_id=session_id,
+            created_at="not-a-timestamp",
+        )
+        bystander = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="different session entirely",
+            session_id=str(uuid4()),
+            created_at="2026-06-01 12:00:30",
+        )
+
+        assert await storage.conversation.count_session_messages(session_id) == 2
+        assert await storage.conversation.message_belongs_to_session(
+            malformed.row_id, session_id
+        )
+
+        purged = await storage.conversation.purge_conversation_session(session_id)
+        assert purged == 2
+        await _assert_destroyed(storage.db, good)
+        await _assert_destroyed(storage.db, malformed)
+        await _assert_present(storage.db, bystander)

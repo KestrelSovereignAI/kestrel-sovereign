@@ -1920,32 +1920,14 @@ class AsyncConversationStore:
         from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
         seen_ids: set[int] = set()
-        candidates: list[tuple[datetime, int, tuple]] = []
+        candidates: list[tuple[datetime, int, tuple, dict[str, Any]]] = []
         fallback_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+        session_id_str = str(session_id)
         for row in rows:
             row_id = int(row[0])
             if row_id in seen_ids:
                 continue
             seen_ids.add(row_id)
-            timestamp = coerce_session_timestamp(row[created_at_index])
-            if timestamp is None:
-                if reject_invalid_timestamps:
-                    raise ConversationSessionTimestampError(
-                        "Refusing exact conversation-session resolution because "
-                        f"message {row_id} has an invalid created_at timestamp"
-                    )
-                timestamp = fallback_timestamp
-            candidates.append(
-                (timestamp, row_id, row)
-            )
-        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
-
-        session_rows = []
-        last_timestamp: Optional[datetime] = None
-        is_first = True
-        session_id_str = str(session_id)
-
-        for timestamp, _row_id, row in candidates:
             metadata_json = row[metadata_index]
             meta: dict[str, Any] = {}
             if metadata_json:
@@ -1957,7 +1939,33 @@ class AsyncConversationStore:
                         session_id,
                         error,
                     )
+            timestamp = coerce_session_timestamp(row[created_at_index])
+            if timestamp is None:
+                # Fail closed only when membership would depend on gap
+                # chronology. A row whose metadata.session_id matches the
+                # requested session EXACTLY is a proven member regardless of
+                # its timestamp — refusing it would leave explicit
+                # (UUID/resumed) sessions containing one malformed
+                # created_at undeletable through count/guard/purge.
+                if (
+                    reject_invalid_timestamps
+                    and meta.get("session_id") != session_id_str
+                ):
+                    raise ConversationSessionTimestampError(
+                        "Refusing exact conversation-session resolution because "
+                        f"message {row_id} has an invalid created_at timestamp"
+                    )
+                timestamp = fallback_timestamp
+            candidates.append(
+                (timestamp, row_id, row, meta)
+            )
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
 
+        session_rows = []
+        last_timestamp: Optional[datetime] = None
+        is_first = True
+
+        for timestamp, _row_id, row, meta in candidates:
             is_resumed_message = meta.get("session_id") == session_id_str
 
             if not is_first and not is_resumed_message and meta.get("new_session"):
