@@ -17,8 +17,8 @@ import asyncio
 import logging
 import os
 import re
-import time
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.config import load_config
@@ -31,6 +31,7 @@ from .models import (
     DeployStatus,
 )
 from .providers.azure_container import AzureContainerProvider
+from .providers._health import probe_http_health
 from .providers.base import DeployProvider
 from .providers.cloudrun import CloudRunProvider
 
@@ -323,34 +324,46 @@ class DeployManagerCore:
         Returns:
             True if healthy, False if timeout
         """
-        import httpx
-
-        timeout = timeout or self.health_check_timeout
-        health_url = f"{service_url.rstrip('/')}{self.health_check_path}"
-
-        start_time = time.time()
+        timeout = self.health_check_timeout if timeout is None else timeout
+        deadline = monotonic() + timeout
         current_interval = poll_interval
 
-        logger.info(f"Verifying health at {health_url} (timeout: {timeout}s)")
+        logger.info(
+            "Verifying health for %s at %s (timeout: %ss)",
+            service_url,
+            self.health_check_path,
+            timeout,
+        )
 
-        while (time.time() - start_time) < timeout:
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(health_url)
+        while (remaining := deadline - monotonic()) > 0:
+            result = await probe_http_health(
+                service_url,
+                path=self.health_check_path,
+                timeout=min(10.0, remaining),
+            )
+            if result["healthy"]:
+                if monotonic() >= deadline:
+                    logger.debug(
+                        "Ignoring healthy response received after the deadline"
+                    )
+                    break
+                logger.info(
+                    "Service is healthy (status: %s)", result["status_code"]
+                )
+                return True
 
-                    if 200 <= response.status_code < 400:
-                        logger.info(f"Service is healthy (status: {response.status_code})")
-                        return True
-
-                    logger.debug(f"Service returned {response.status_code}, retrying...")
-
-            except (OSError, ConnectionError) as e:
-                logger.debug(f"Service not ready yet: {e}")
-            except Exception as e:
-                logger.debug(f"Unexpected error checking health: {e}")
+            if result["status_code"] is not None:
+                logger.debug(
+                    "Service returned %s, retrying...", result["status_code"]
+                )
+            else:
+                logger.debug("Service not ready yet: %s", result.get("error"))
 
             # Wait with exponential backoff (max 30s)
-            await asyncio.sleep(min(current_interval, 30))
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(current_interval, 30, remaining))
             current_interval *= 1.5
 
         logger.warning(f"Health check timed out after {timeout}s")

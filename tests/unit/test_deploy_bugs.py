@@ -8,16 +8,11 @@ Bug 3: Temp credential file must be cleaned up via explicit cleanup() method.
 
 import os
 import tempfile
-import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from kestrel_sovereign.features.deploy.core import DeployManagerCore
-from kestrel_sovereign.features.deploy.models import (
-    DeploymentProfile,
-    DeployProviderType,
-)
 from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
 
 
@@ -125,116 +120,8 @@ class TestBug1AzureResourceGroup:
 # ---------------------------------------------------------------------------
 
 
-class TestBug2HealthCheckStatusCodes:
-    """Verify that 4xx status codes are NOT treated as healthy."""
-
-    @pytest.mark.asyncio
-    async def test_health_check_rejects_404(self):
-        """A 404 response must not be considered healthy."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 404
-            mock_client.return_value.__aenter__.return_value.get.return_value = (
-                mock_response
-            )
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check(
-                "https://kestrel-dev-abc.run.app"
-            )
-
-            assert result["healthy"] is False
-            assert result["status_code"] == 404
-
-    @pytest.mark.asyncio
-    async def test_health_check_rejects_403(self):
-        """A 403 response must not be considered healthy."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 403
-            mock_client.return_value.__aenter__.return_value.get.return_value = (
-                mock_response
-            )
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check(
-                "https://kestrel-dev-abc.run.app"
-            )
-
-            assert result["healthy"] is False
-            assert result["status_code"] == 403
-
-    @pytest.mark.asyncio
-    async def test_health_check_rejects_401(self):
-        """A 401 response must not be considered healthy."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 401
-            mock_client.return_value.__aenter__.return_value.get.return_value = (
-                mock_response
-            )
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check(
-                "https://kestrel-dev-abc.run.app"
-            )
-
-            assert result["healthy"] is False
-            assert result["status_code"] == 401
-
-    @pytest.mark.asyncio
-    async def test_health_check_accepts_200(self):
-        """A 200 response must be considered healthy."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_client.return_value.__aenter__.return_value.get.return_value = (
-                mock_response
-            )
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check(
-                "https://kestrel-dev-abc.run.app"
-            )
-
-            assert result["healthy"] is True
-            assert result["status_code"] == 200
-
-    @pytest.mark.asyncio
-    async def test_health_check_accepts_301_redirect(self):
-        """A 301 redirect should be treated as healthy (service is reachable)."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 301
-            mock_client.return_value.__aenter__.return_value.get.return_value = (
-                mock_response
-            )
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check(
-                "https://kestrel-dev-abc.run.app"
-            )
-
-            assert result["healthy"] is True
-            assert result["status_code"] == 301
-
-    @pytest.mark.asyncio
-    async def test_health_check_rejects_500(self):
-        """A 500 response must not be considered healthy."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 500
-            mock_client.return_value.__aenter__.return_value.get.return_value = (
-                mock_response
-            )
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check(
-                "https://kestrel-dev-abc.run.app"
-            )
-
-            assert result["healthy"] is False
-            assert result["status_code"] == 500
+class TestBug2ReadinessStatusCodes:
+    """Verify readiness polling delegates the shared status contract."""
 
     @pytest.mark.asyncio
     async def test_verify_health_rejects_404(self, sample_config_cloudrun_only):

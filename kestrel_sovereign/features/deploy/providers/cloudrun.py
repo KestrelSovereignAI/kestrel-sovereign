@@ -5,10 +5,8 @@ Implements deployment to Google Cloud Run using the google-cloud-run SDK.
 """
 
 import asyncio
-import atexit
 import logging
 import os
-import time
 from typing import Any, Dict, List, Optional
 
 from ..models import DeployManagerError, DeploymentProfile
@@ -159,6 +157,7 @@ class CloudRunProvider(DeployProvider):
         Programmatizes scripts/cloudrun/deploy_dev.sh and deploy_prod.sh.
         """
         try:
+            from google.api_core.exceptions import NotFound
             from google.cloud.run_v2 import Service
             from google.cloud.run_v2.types import (
                 Container,
@@ -182,7 +181,7 @@ class CloudRunProvider(DeployProvider):
                 )
                 is_update = True
                 logger.info(f"Updating existing Cloud Run service: {service_name}")
-            except Exception:
+            except NotFound:
                 is_update = False
                 logger.info(f"Creating new Cloud Run service: {service_name}")
 
@@ -243,7 +242,7 @@ class CloudRunProvider(DeployProvider):
                 )
 
             # Wait for operation to complete
-            logger.info(f"Waiting for Cloud Run operation to complete...")
+            logger.info("Waiting for Cloud Run operation to complete...")
             result = await asyncio.to_thread(operation.result, timeout=600)
 
             # Allow unauthenticated invocations — matches the bash
@@ -287,7 +286,7 @@ class CloudRunProvider(DeployProvider):
         the role manually as a backstop.
         """
         try:
-            from google.iam.v1 import iam_policy_pb2, policy_pb2
+            from google.iam.v1 import iam_policy_pb2
 
             get_req = iam_policy_pb2.GetIamPolicyRequest(resource=service_path)
             policy = await asyncio.to_thread(client.get_iam_policy, request=get_req)
@@ -329,8 +328,6 @@ class CloudRunProvider(DeployProvider):
         """Get Cloud Run service status."""
         try:
             client = self._get_services_client()
-            service_path = f"projects/{self.project_id}/locations/*/services/{service_name}"
-
             # List services to find the exact location
             parent = f"projects/{self.project_id}/locations/-"
             services = await asyncio.to_thread(client.list_services, parent=parent)
@@ -440,7 +437,7 @@ class CloudRunProvider(DeployProvider):
 
         except ImportError as e:
             raise DeployManagerError(
-                f"google-cloud-logging not installed. Run: pip install google-cloud-logging"
+                "google-cloud-logging not installed. Run: pip install google-cloud-logging"
             ) from e
         except Exception as e:
             logger.error(f"Failed to get logs: {e}", exc_info=True)
@@ -475,30 +472,3 @@ class CloudRunProvider(DeployProvider):
         except Exception as e:
             logger.error(f"Failed to list deployments: {e}", exc_info=True)
             return []
-
-    async def health_check(self, url: str) -> Dict[str, Any]:
-        """Check health of a deployed service."""
-        import httpx
-
-        try:
-            health_url = f"{url.rstrip('/')}/health"
-            start_time = time.time()
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(health_url)
-                response_time = time.time() - start_time
-
-                return {
-                    "healthy": 200 <= response.status_code < 400,
-                    "status_code": response.status_code,
-                    "response_time": response_time,
-                }
-
-        except Exception as e:
-            logger.warning(f"Health check failed: {e}")
-            return {
-                "healthy": False,
-                "status_code": None,
-                "response_time": None,
-                "error": str(e),
-            }
