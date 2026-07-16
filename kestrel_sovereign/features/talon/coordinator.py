@@ -13,7 +13,6 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import tempfile
 import time
 import urllib.error
@@ -27,7 +26,14 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign._async_process import (
+    SubprocessCleanupError,
+    start_async_process,
+    terminate_process_tree,
+)
+from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.cli.terminal import redact_secrets
 from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
 # Mesh is gone (#1367 phase 5). Talon dispatch now uses the A2A
 # task-submission path — same wire endpoint as send_a2a_task on
@@ -37,8 +43,6 @@ from kestrel_sovereign.features.talon.runtime import (
     TalonBatchExecution,
     TalonExecution,
     TalonIterateExecution,
-    TalonPolicy,
-    TalonPreference,
     TalonRuntimeError,
     TalonRuntimeRequest,
     build_talon_batch_invocation,
@@ -161,6 +165,12 @@ _TERMINAL_TALON_STATES = frozenset(
 _SUCCESSFUL_TALON_STATE = "complete"
 
 _PR_NUMBER_FROM_URL_RE = re.compile(r"/pull/(\d+)")
+
+# Bounded commands retain only a modest tail from each stream. Every public
+# Talon surface exposes at most 2,000 characters of evidence, so a 64 KiB byte
+# cap leaves ample UTF-8/traceback context without letting a hostile test or git
+# filter grow the coordinator process without bound.
+_TALON_CAPTURE_LIMIT_BYTES = 65_536
 
 
 def _pr_number_from_url(url: Optional[str]) -> Optional[int]:
@@ -1529,15 +1539,17 @@ class TalonCoordinatorFeature(Feature):
         # closes (root cause of the #1299/#1301/#1303 Talon failures).
         # Talon stamps ``agent-claimed`` itself as part of claiming.
         requested = [
-            l.strip() for l in (labels or "").split(",") if l.strip()
+            label.strip()
+            for label in (labels or "").split(",")
+            if label.strip()
         ]
         applied_labels = [
-            l for l in requested
-            if l.lower() not in _TALON_RESERVED_LABELS
+            label
+            for label in requested
+            if label.lower() not in _TALON_RESERVED_LABELS
         ]
         stripped_labels = [
-            l for l in requested
-            if l.lower() in _TALON_RESERVED_LABELS
+            label for label in requested if label.lower() in _TALON_RESERVED_LABELS
         ]
 
         async def _run_create(cmd_labels: List[str]):
@@ -2019,7 +2031,7 @@ class TalonCoordinatorFeature(Feature):
         evidence = await verifier.verify_commands(
             command_list, timeout=timeout_int, note=note
         )
-        head = self._git_describe_head(run_cwd)
+        head = await self._git_describe_head(run_cwd)
         data = {
             "success": True,
             "repo": self._resolve_repo(repo),
@@ -2128,12 +2140,12 @@ class TalonCoordinatorFeature(Feature):
             env, _stripped = sanitize_untrusted_env()
             started = time.monotonic()
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    cwd=str(run_cwd),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                result = await run_bounded_subprocess(
+                    argv,
+                    cwd=run_cwd,
                     env=env,
+                    timeout=timeout,
+                    max_output_bytes=_TALON_CAPTURE_LIMIT_BYTES,
                 )
             except FileNotFoundError as e:
                 return CommandExecution(
@@ -2146,15 +2158,11 @@ class TalonCoordinatorFeature(Feature):
                     error=f"sandbox refused to execute {argv[0]}: {e}",
                 )
             except Exception as e:  # noqa: BLE001
-                return CommandExecution(ran=False, error=f"failed to launch: {e}")
-
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                return CommandExecution(
+                    ran=False, error=f"subprocess tooling error: {e}"
                 )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+
+            if result.timed_out:
                 duration_ms = int((time.monotonic() - started) * 1000)
                 return CommandExecution(
                     ran=False,
@@ -2164,9 +2172,9 @@ class TalonCoordinatorFeature(Feature):
             duration_ms = int((time.monotonic() - started) * 1000)
             return CommandExecution(
                 ran=True,
-                returncode=proc.returncode,
-                stdout=stdout_b.decode(errors="replace"),
-                stderr=stderr_b.decode(errors="replace"),
+                returncode=result.returncode,
+                stdout=redact_secrets(result.stdout.decode(errors="replace")),
+                stderr=redact_secrets(result.stderr.decode(errors="replace")),
                 duration_ms=duration_ms,
             )
 
@@ -2251,12 +2259,14 @@ class TalonCoordinatorFeature(Feature):
         kind, value = self._parse_verify_ref(ref)
         if not value:
             return {"ok": False, "error": "empty ref"}
+        network_env = self._build_git_subprocess_env(require_github_token=False)
 
         if kind == "pr":
             fetch = await self._git_run(
                 ["fetch", "origin", f"refs/pull/{value}/head"],
                 cwd=workspace,
                 timeout=120,
+                env=network_env,
             )
             if not fetch.get("ok"):
                 return {
@@ -2285,7 +2295,10 @@ class TalonCoordinatorFeature(Feature):
             # make origin/<branch> the source of truth so a stale local
             # branch cannot be verified accidentally.
             fetch = await self._git_run(
-                ["fetch", "--all", "--prune"], cwd=workspace, timeout=120
+                ["fetch", "--all", "--prune"],
+                cwd=workspace,
+                timeout=120,
+                env=network_env,
             )
             if not fetch.get("ok"):
                 return {
@@ -2327,7 +2340,7 @@ class TalonCoordinatorFeature(Feature):
                         ),
                     }
 
-        head = self._git_describe_head(workspace)
+        head = await self._git_describe_head(workspace)
         return {
             "ok": True,
             "checked_out_ref": head.get("ref"),
@@ -2335,51 +2348,87 @@ class TalonCoordinatorFeature(Feature):
         }
 
     async def _git_run(
-        self, args: List[str], *, cwd: Path, timeout: int = 120
+        self,
+        args: List[str],
+        *,
+        cwd: Path,
+        timeout: int = 120,
+        env: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Run a git subcommand in ``cwd`` and capture its outcome.
 
-        Prefers the sanitized, token-bearing subprocess env so fetches
-        from private remotes authenticate; falls back to the plain
-        environment when no GitHub token is configured, so verifying a
-        local branch never requires a token. Returns
+        The default git-only environment strips every provider, Kestrel, data,
+        and GitHub credential. Network callers explicitly provide the narrower
+        token-bearing environment from :meth:`_build_git_subprocess_env`;
+        local commands never need that authority. Returns
         ``{"ok", "error", "stdout"}``.
         """
+        if env is None:
+            env = sanitize_untrusted_env()[0]
         try:
-            env = self._build_subprocess_env()
-        except RuntimeError:
-            env = dict(os.environ)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "git", *args,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
+            # A workspace may be attacker-controlled. Override hooks for every
+            # coordinator-owned git command so a planted post-checkout hook
+            # cannot inherit even the narrowly-scoped GitHub credential.
+            with tempfile.TemporaryDirectory(prefix="kestrel-git-hooks-") as hooks:
+                result = await run_bounded_subprocess(
+                    ["git", "-c", f"core.hooksPath={hooks}", *args],
+                    cwd=cwd,
+                    env=env,
+                    timeout=timeout,
+                    max_output_bytes=_TALON_CAPTURE_LIMIT_BYTES,
+                )
         except FileNotFoundError as e:
             return {"ok": False, "error": f"git not found: {e}"}
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        except (OSError, SubprocessCleanupError) as e:
+            return {
+                "ok": False,
+                "error": redact_secrets(f"git could not run: {e}"),
+            }
+        except Exception as e:  # noqa: BLE001
+            # Preserve the historical mapping-shaped private API even if the
+            # shared runner itself encounters an unexpected collection error.
+            # Cancellation remains transparent because CancelledError is not
+            # an Exception on supported Python versions.
+            return {
+                "ok": False,
+                "error": redact_secrets(f"git subprocess tooling error: {e}"),
+            }
+        if result.timed_out:
             return {
                 "ok": False,
                 "error": f"git {args[0]} timed out after {timeout}s",
             }
-        if proc.returncode != 0:
+        stdout = redact_secrets(result.stdout.decode(errors="replace"))
+        stderr = redact_secrets(result.stderr.decode(errors="replace"))
+        if result.returncode != 0:
             return {
                 "ok": False,
-                "error": stderr_b.decode(errors="replace")[-500:]
-                or f"git {args[0]} failed (exit {proc.returncode})",
+                "error": stderr[-500:]
+                or f"git {args[0]} failed (exit {result.returncode})",
             }
-        return {"ok": True, "stdout": stdout_b.decode(errors="replace")}
+        return {"ok": True, "stdout": stdout}
 
     @staticmethod
-    def _git_describe_head(workspace: Path) -> Dict[str, Optional[str]]:
+    def _build_git_subprocess_env(*, require_github_token: bool) -> Dict[str, str]:
+        """Build a git-only env with no LLM, Kestrel, or data credentials."""
+
+        env, _stripped = sanitize_untrusted_env()
+        token = (
+            os.environ.get("GH_TOKEN")
+            or os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GITHUB_PAT")
+        )
+        if require_github_token and not token:
+            raise RuntimeError(
+                "kestrel-talon needs GITHUB_TOKEN, GH_TOKEN, or GITHUB_PAT "
+                "in the kestrel-sovereign environment to access GitHub."
+            )
+        if token:
+            env["GITHUB_TOKEN"] = token
+            env["GH_TOKEN"] = token
+        return env
+
+    async def _git_describe_head(self, workspace: Path) -> Dict[str, Optional[str]]:
         """Best-effort current ref + full HEAD SHA of a checkout.
 
         ``ref`` is the symbolic branch name when on a branch, else the
@@ -2387,26 +2436,17 @@ class TalonCoordinatorFeature(Feature):
         SHA. Either may be ``None`` if git can't be queried.
         """
 
-        def _run(args: List[str]) -> Optional[str]:
-            try:
-                proc = subprocess.run(
-                    ["git", *args],
-                    cwd=str(workspace),
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        async def _run(args: List[str]) -> Optional[str]:
+            result = await self._git_run(args, cwd=workspace, timeout=10)
+            if not result.get("ok"):
                 return None
-            if proc.returncode != 0:
-                return None
-            out = proc.stdout.strip()
+            out = str(result.get("stdout") or "").strip()
             return out or None
 
-        head_sha = _run(["rev-parse", "HEAD"])
-        ref = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+        head_sha = await _run(["rev-parse", "HEAD"])
+        ref = await _run(["rev-parse", "--abbrev-ref", "HEAD"])
         if ref == "HEAD":  # detached
-            ref = _run(["rev-parse", "--short", "HEAD"])
+            ref = await _run(["rev-parse", "--short", "HEAD"])
         return {"ref": ref, "head_sha": head_sha}
 
     @tool(
@@ -2503,7 +2543,7 @@ class TalonCoordinatorFeature(Feature):
         ``talon_setup_workspace`` first.
         """
         repo_resolved = self._resolve_repo(repo)
-        state = self._workspace_state(repo_resolved)
+        state = await self._workspace_state_with_status(repo_resolved)
         data = {"success": True, "repo": repo_resolved, **state}
 
         # Honesty: this is a read-only inspect, but reporting OK on
@@ -2604,7 +2644,9 @@ class TalonCoordinatorFeature(Feature):
                             "success": False,
                             "state": "fetch_failed",
                             "error": fetch_result["error"],
-                            "workspace": self._workspace_state(repo_resolved),
+                            "workspace": await self._workspace_state_with_status(
+                                repo_resolved
+                            ),
                         },
                     )
                 return ToolResult.ok(
@@ -2612,7 +2654,9 @@ class TalonCoordinatorFeature(Feature):
                     data={
                         "success": True,
                         "state": "refreshed",
-                        "workspace": self._workspace_state(repo_resolved),
+                        "workspace": await self._workspace_state_with_status(
+                            repo_resolved
+                        ),
                     },
                 )
             return ToolResult.ok(
@@ -2620,7 +2664,9 @@ class TalonCoordinatorFeature(Feature):
                 data={
                     "success": True,
                     "state": "exists",
-                    "workspace": existing,
+                    "workspace": await self._workspace_state_with_status(
+                        repo_resolved
+                    ),
                 },
             )
 
@@ -2650,7 +2696,7 @@ class TalonCoordinatorFeature(Feature):
             data={
                 "success": True,
                 "state": "created",
-                "workspace": self._workspace_state(repo_resolved),
+                "workspace": await self._workspace_state_with_status(repo_resolved),
             },
         )
 
@@ -2706,55 +2752,32 @@ class TalonCoordinatorFeature(Feature):
 
     async def _git_clone(self, url: str, dest: Path) -> Dict[str, Any]:
         try:
-            env = self._build_subprocess_env()
+            env = self._build_git_subprocess_env(require_github_token=True)
         except RuntimeError as e:
             return {"ok": False, "error": str(e)}
-        proc = await asyncio.create_subprocess_exec(
-            "git", "clone", url, str(dest),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await self._git_run(
+            ["clone", url, str(dest)],
+            cwd=dest.parent,
+            timeout=300,
             env=env,
         )
-        try:
-            _stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=300,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return {"ok": False, "error": "git clone timed out (300s)"}
-        if proc.returncode != 0:
-            return {
-                "ok": False,
-                "error": stderr.decode(errors="replace")[-500:] or "git clone failed",
-            }
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error") or "git clone failed"}
         return {"ok": True}
 
     async def _git_fetch(self, workspace: Path) -> Dict[str, Any]:
         try:
-            env = self._build_subprocess_env()
+            env = self._build_git_subprocess_env(require_github_token=True)
         except RuntimeError as e:
             return {"ok": False, "error": str(e)}
-        proc = await asyncio.create_subprocess_exec(
-            "git", "fetch", "--all", "--prune",
-            cwd=str(workspace),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await self._git_run(
+            ["fetch", "--all", "--prune"],
+            cwd=workspace,
+            timeout=120,
             env=env,
         )
-        try:
-            _stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=120,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return {"ok": False, "error": "git fetch timed out (120s)"}
-        if proc.returncode != 0:
-            return {
-                "ok": False,
-                "error": stderr.decode(errors="replace")[-500:] or "git fetch failed",
-            }
+        if not result.get("ok"):
+            return {"ok": False, "error": result.get("error") or "git fetch failed"}
         return {"ok": True}
 
     @staticmethod
@@ -2824,9 +2847,9 @@ class TalonCoordinatorFeature(Feature):
     def _workspace_state(cls, repo_resolved: str) -> Dict[str, Any]:
         """Read-only snapshot of a workspace clone's state.
 
-        Returns a dict with: ``path``, ``exists``, ``is_git`` (has
-        ``.git``), ``head`` (current ref or ``None``), ``clean``
-        (no uncommitted changes; ``None`` when not a git checkout),
+        Returns a structural dict with: ``path``, ``exists``, ``is_git`` (has
+        ``.git``), ``head`` (current ref or ``None``), ``clean`` (initially
+        ``None``; :meth:`_workspace_state_with_status` fills it asynchronously),
         ``last_fetch_at`` (mtime of ``.git/FETCH_HEAD`` or ``None``),
         ``safe`` (passes ``_assert_workspace_safe``).
         """
@@ -2867,20 +2890,6 @@ class TalonCoordinatorFeature(Feature):
             except OSError:
                 pass
 
-        # Working-tree cleanliness — porcelain check via subprocess so
-        # we don't reimplement git status. Tolerates missing git.
-        try:
-            proc = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(path),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            state["clean"] = (proc.returncode == 0 and not proc.stdout.strip())
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            state["clean"] = None
-
         fetch_head = git_dir / "FETCH_HEAD"
         if fetch_head.is_file():
             try:
@@ -2890,6 +2899,23 @@ class TalonCoordinatorFeature(Feature):
             except OSError:
                 pass
 
+        return state
+
+    async def _workspace_state_with_status(self, repo_resolved: str) -> Dict[str, Any]:
+        """Add bounded git cleanliness to the structural workspace snapshot."""
+
+        state = dict(self._workspace_state(repo_resolved))
+        if not state.get("safe") or not state.get("exists") or not state.get("is_git"):
+            return state
+        result = await self._git_run(
+            ["status", "--porcelain"],
+            cwd=Path(state["path"]),
+            timeout=10,
+            env=sanitize_untrusted_env()[0],
+        )
+        state["clean"] = (
+            not str(result.get("stdout") or "").strip() if result.get("ok") else None
+        )
         return state
 
     @tool(
@@ -3335,33 +3361,33 @@ class TalonCoordinatorFeature(Feature):
         # crash with our env. Bounded: --help returns in < 5s.
         cmd = [talon_bin, "--help"]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            result = await run_bounded_subprocess(
+                cmd,
                 env=built_env,
+                timeout=15,
+                max_output_bytes=_TALON_CAPTURE_LIMIT_BYTES,
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=15,
-            )
-        except asyncio.TimeoutError:
+        except Exception as e:
+            report["execute"] = {"ok": False, "error": redact_secrets(str(e))}
+            return _wrap(report)
+
+        if result.timed_out:
             report["execute"] = {
                 "ok": False,
                 "error": "kestrel-talon --help timed out after 15s",
             }
             return _wrap(report)
-        except Exception as e:
-            report["execute"] = {"ok": False, "error": str(e)}
-            return _wrap(report)
 
-        out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
+        out = redact_secrets(result.stdout.decode(errors="replace"))
+        err = redact_secrets(result.stderr.decode(errors="replace"))
         first_out_line = next((ln for ln in out.splitlines() if ln.strip()), "")
         report["execute"] = {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
+            "ok": result.returncode == 0,
+            "returncode": result.returncode,
             "first_line": first_out_line[:200],
             "stderr_tail": err[-400:] if err else "",
+            "stdout_truncated": result.stdout_truncated,
+            "stderr_truncated": result.stderr_truncated,
         }
 
         report["healthy"] = bool(report["execute"]["ok"])
@@ -3817,12 +3843,13 @@ class TalonCoordinatorFeature(Feature):
             return False
         return True
 
-    def _persist_jobs(self) -> None:
+    def _persist_jobs(self) -> bool:
         """Write CLI-background job metadata to the durable registry.
 
         Excludes non-serialisable fields (the asyncio ``process``
         handle) so ``talon_status`` and ``talon_job_log`` keep working
-        after a feature/server restart.
+        after a feature/server restart. Returns whether the atomic replace
+        succeeded; initial dispatch uses this as its ownership-transfer gate.
         """
         registry: Dict[str, Any] = {}
         for jid, info in self._jobs.items():
@@ -3831,13 +3858,13 @@ class TalonCoordinatorFeature(Feature):
             registry[jid] = {
                 k: v for k, v in info.items() if k != "process"
             }
-        path = self._jobs_registry_path()
         # Use a unique tmp file per writer so concurrent _persist_jobs
         # calls from sibling feature instances cannot clobber each
         # other's pre-replace temp content. os.replace() is atomic on
         # POSIX so the final rename remains race-free.
         tmp_path: Optional[str] = None
         try:
+            path = self._jobs_registry_path()
             tmp_fd, tmp_path = tempfile.mkstemp(
                 prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
             )
@@ -3845,13 +3872,15 @@ class TalonCoordinatorFeature(Feature):
                 json.dump(registry, f)
             os.replace(tmp_path, path)
             tmp_path = None
-        except OSError as e:
+            return True
+        except (OSError, TypeError, ValueError) as e:
             logger.warning(f"Failed to persist talon job registry: {e}")
             if tmp_path:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+            return False
 
     def _reload_persisted_jobs(self) -> None:
         """Merge durably-persisted CLI jobs into the in-memory map.
@@ -4005,25 +4034,29 @@ class TalonCoordinatorFeature(Feature):
         wrapped = ["sh", "-c", wrapper_script, "_talon_wrapper"] + cmd
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *wrapped,
+            proc = await start_async_process(
+                wrapped,
                 stdout=log_file,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
-                cwd=os.environ.get("KESTREL_TALON_CWD") or str(_DEFAULT_PROJECT_PARENT),
+                cwd=Path(
+                    os.environ.get("KESTREL_TALON_CWD")
+                    or str(_DEFAULT_PROJECT_PARENT)
+                ),
             )
         except Exception as e:
+            return {"dispatched": False, "error": redact_secrets(str(e))}
+        finally:
+            # Close our handle on success, failure, or caller cancellation —
+            # the child gets its own descriptor. Otherwise the file stays open
+            # in the host for the subprocess lifetime and launch cancellation
+            # leaks the parent's descriptor.
             log_file.close()
-            return {"dispatched": False, "error": str(e)}
-        # Close our handle — the child has its own. Otherwise the file
-        # stays open in our process for the lifetime of the subprocess
-        # and no one else can rotate/inspect it cleanly.
-        log_file.close()
 
         info: Dict[str, Any] = {
             "method": "cli_background",
             "label": label,
-            "command": " ".join(cmd),
+            "command": redact_secrets(" ".join(cmd)),
             "status": "dispatched",
             "pid": proc.pid,
             "started_at": datetime.now(timezone.utc).isoformat(),
@@ -4034,7 +4067,42 @@ class TalonCoordinatorFeature(Feature):
         if extra_meta:
             info.update(extra_meta)
         self._jobs[job_id] = info
-        self._persist_jobs()
+        if not self._persist_jobs():
+            # The process becomes intentionally independent of this feature
+            # only after its durable row exists. Before that ownership
+            # transfer, a launch must fail closed and tear down the complete
+            # private group; otherwise a Kestrel restart would orphan an
+            # invisible Talon job.
+            self._jobs.pop(job_id, None)
+            try:
+                await terminate_process_tree(proc)
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.error(
+                    "Failed to clean up unpersisted Talon job %s: %s",
+                    job_id,
+                    cleanup_error,
+                    exc_info=True,
+                )
+                return {
+                    "dispatched": False,
+                    "error": (
+                        "Could not persist Talon job ownership, and process-tree "
+                        f"cleanup failed: {redact_secrets(str(cleanup_error))}"
+                    ),
+                }
+            for artifact in (log_path, exit_path, Path(f"{exit_path}.tmp")):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError:
+                    logger.debug(
+                        "Could not remove unowned Talon artifact %s",
+                        artifact,
+                        exc_info=True,
+                    )
+            return {
+                "dispatched": False,
+                "error": "Could not persist durable Talon job ownership",
+            }
 
         logger.info(
             f"Dispatched talon job {job_id} (pid={proc.pid}, "
@@ -4055,66 +4123,9 @@ class TalonCoordinatorFeature(Feature):
             ),
         }
 
-    async def _dispatch_via_cli(self, args: List[str]) -> Dict[str, Any]:
-        """Fall back to kestrel-talon CLI via subprocess."""
-        talon_bin = self._find_talon_bin()
-        if not talon_bin:
-            return {
-                "dispatched": False,
-                "error": (
-                    "kestrel-talon not found. Set KESTREL_TALON_BIN, install "
-                    "kestrel-talon into the kestrel-sovereign venv "
-                    "(`uv sync`), or place a sibling checkout at "
-                    "../kestrel-talon with its own .venv."
-                ),
-            }
-
-        try:
-            env = self._build_subprocess_env()
-        except RuntimeError as e:
-            return {"dispatched": False, "error": str(e)}
-
-        # Same env stamping as the background funnel (kestrel-talon#53).
-        observability = self._observability_context()
-        if observability:
-            env = {**env, **observability}
-
-        cmd = [talon_bin] + args
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=300,
-            )
-            success = proc.returncode == 0
-            return {
-                "dispatched": success,
-                "method": "cli",
-                "command": " ".join(cmd),
-                "returncode": proc.returncode,
-                "stdout": stdout.decode(errors="replace")[-500:] if stdout else "",
-                "stderr": stderr.decode(errors="replace")[-500:] if stderr else "",
-            }
-        except asyncio.TimeoutError:
-            return {"dispatched": False, "error": "CLI command timed out (300s)"}
-        except Exception as e:
-            return {"dispatched": False, "error": str(e)}
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _get_peers_feature(self):
-        """Get the PeersFeature instance if available."""
-        if hasattr(self.agent, '_features'):
-            for f in self.agent._features:
-                if type(f).__name__ == "PeersFeature":
-                    return f
-        return None
 
     def _discover_host_url(self) -> Optional[str]:
         """Discover the multi_agent host URL."""

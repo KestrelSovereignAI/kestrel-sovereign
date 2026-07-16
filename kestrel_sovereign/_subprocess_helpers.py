@@ -22,6 +22,11 @@ playwright test) and need the same three primitives:
 in-module copies (the extraction is risky for that file's
 identity-bootstrap path). New modules in tier 3 use this shared
 surface so the same idiom isn't copy-pasted three more times.
+
+Async process ownership lives in :mod:`kestrel_sovereign._async_process`, and
+bounded captured execution lives in
+:mod:`kestrel_sovereign._bounded_subprocess`. Both launch paths reuse
+:func:`new_process_group_kwargs` so sync and async group setup cannot drift.
 """
 
 from __future__ import annotations
@@ -34,12 +39,20 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 
 def is_windows() -> bool:
     """Single source of truth for the platform branch in this module."""
     return sys.platform == "win32"
+
+
+def new_process_group_kwargs() -> dict[str, Any]:
+    """Keyword arguments that give sync or async subprocesses a private group."""
+
+    if is_windows():
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
 
 
 def run_streaming(
@@ -93,10 +106,7 @@ def start_background_process(
         "stdout": stdout,
         "stderr": stderr,
     }
-    if is_windows():
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
+    kwargs.update(new_process_group_kwargs())
     return subprocess.Popen(list(cmd), **kwargs)  # type: ignore[arg-type]
 
 
@@ -171,6 +181,7 @@ def wait_for_health(
 
 __all__ = [
     "is_windows",
+    "new_process_group_kwargs",
     "run_streaming",
     "start_background_process",
     "stop_process",

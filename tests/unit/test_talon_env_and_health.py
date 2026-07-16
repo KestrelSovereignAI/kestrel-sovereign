@@ -12,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.tools.result import ToolResultStatus
 
 import pytest
 
+from kestrel_sovereign._async_process import terminate_process_tree
+from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
 
 
@@ -68,23 +70,121 @@ def test_build_subprocess_env_raises_when_no_github_token(monkeypatch):
         TalonCoordinatorFeature._build_subprocess_env()
 
 
-@pytest.mark.asyncio
-async def test_dispatch_via_cli_returns_clear_error_when_no_token(monkeypatch):
-    """The error must surface as a structured result, not raise — the
-    agent has to be able to report it back to the user.
-    """
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.delenv("GITHUB_PAT", raising=False)
-    feat = _make_feature()
-    with patch.object(
-        TalonCoordinatorFeature, "_find_talon_bin",
-        return_value="/fake/kestrel-talon",
-    ):
-        result = await feat._dispatch_via_cli(["claim", "--issue", "1"])
+def test_build_git_subprocess_env_keeps_only_github_credential(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "data-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_git_only")
 
-    assert result["dispatched"] is False
-    assert "GITHUB_TOKEN" in result["error"]
+    env = TalonCoordinatorFeature._build_git_subprocess_env(
+        require_github_token=True
+    )
+
+    assert env["GITHUB_TOKEN"] == "ghp_git_only"
+    assert env["GH_TOKEN"] == "ghp_git_only"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "KESTREL_DATA_KEY" not in env
+
+
+@pytest.mark.asyncio
+async def test_local_git_run_does_not_inherit_github_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_local_git_must_not_receive")
+    feature = _make_feature()
+    captured: dict = {}
+
+    async def fake_run(args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return BoundedProcessResult(
+            argv=tuple(args),
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+            duration_ms=1,
+        )
+
+    with patch(
+        "kestrel_sovereign.features.talon.coordinator.run_bounded_subprocess",
+        side_effect=fake_run,
+    ):
+        result = await feature._git_run(["status"], cwd=tmp_path)
+
+    assert result["ok"] is True
+    assert "GITHUB_TOKEN" not in captured["env"]
+    assert "GH_TOKEN" not in captured["env"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_status_git_probe_uses_untrusted_env(monkeypatch, tmp_path):
+    """A hostile workspace git config must not inherit agent credentials."""
+
+    for key, value in {
+        "ANTHROPIC_API_KEY": "sk-ant-secret",
+        "OPENAI_API_KEY": "sk-openai-secret",
+        "GITHUB_TOKEN": "ghp_secret",
+        "KESTREL_DATA_KEY": "data-secret",
+    }.items():
+        monkeypatch.setenv(key, value)
+    feature = _make_feature()
+    captured: dict = {}
+
+    async def fake_run(args, **kwargs):
+        captured["args"] = list(args)
+        captured["env"] = kwargs["env"]
+        return BoundedProcessResult(
+            argv=tuple(args),
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+            duration_ms=1,
+        )
+
+    structural = {
+        "repo": "org/repo",
+        "path": str(tmp_path),
+        "exists": True,
+        "is_git": True,
+        "head": "main",
+        "clean": None,
+        "last_fetch_at": None,
+        "safe": True,
+    }
+    with (
+        patch.object(feature, "_workspace_state", return_value=structural),
+        patch(
+            "kestrel_sovereign.features.talon.coordinator.run_bounded_subprocess",
+            side_effect=fake_run,
+        ),
+    ):
+        state = await feature._workspace_state_with_status("org/repo")
+
+    assert state["clean"] is True
+    assert captured["args"][:2] == ["git", "-c"]
+    assert captured["args"][2].startswith("core.hooksPath=")
+    for secret in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "KESTREL_DATA_KEY",
+    ):
+        assert secret not in captured["env"]
+
+
+@pytest.mark.asyncio
+async def test_git_run_returns_redacted_mapping_on_runner_failure(tmp_path):
+    feature = _make_feature()
+    secret = "github_pat_AAAAAAAAAAAAAAAAAAAAA"
+
+    with patch(
+        "kestrel_sovereign.features.talon.coordinator.run_bounded_subprocess",
+        side_effect=RuntimeError(f"pipe failed while handling {secret}"),
+    ):
+        result = await feature._git_run(["status"], cwd=tmp_path)
+
+    assert result["ok"] is False
+    assert "subprocess tooling error" in result["error"]
+    assert secret not in result["error"]
+    assert "[REDACTED]" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -119,20 +219,22 @@ async def test_talon_health_runs_help_and_reports_success(monkeypatch, tmp_path)
 
     captured_env: dict = {}
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
+    async def fake_run_bounded_subprocess(args, **kwargs):
         captured_env.update(kwargs.get("env") or {})
-        proc = AsyncMock()
-        proc.returncode = 0
-        proc.communicate = AsyncMock(
-            return_value=(b"Usage: kestrel-talon [options]\n", b""),
+        return BoundedProcessResult(
+            argv=tuple(args),
+            returncode=0,
+            stdout=b"Usage: kestrel-talon [options]\n",
+            stderr=b"",
+            duration_ms=1,
         )
-        return proc
 
     feat = _make_feature()
     with patch.object(
         TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
     ), patch(
-        "asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec,
+        "kestrel_sovereign.features.talon.coordinator.run_bounded_subprocess",
+        side_effect=fake_run_bounded_subprocess,
     ):
         envelope = await feat.talon_health()
 
@@ -162,17 +264,21 @@ async def test_talon_health_reports_help_failure(monkeypatch, tmp_path):
     fake_bin.write_text("#!/bin/sh\necho 'boom' >&2\nexit 7\n")
     fake_bin.chmod(0o755)
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        proc = AsyncMock()
-        proc.returncode = 7
-        proc.communicate = AsyncMock(return_value=(b"", b"boom\n"))
-        return proc
+    async def fake_run_bounded_subprocess(args, **kwargs):
+        return BoundedProcessResult(
+            argv=tuple(args),
+            returncode=7,
+            stdout=b"",
+            stderr=b"boom\n",
+            duration_ms=1,
+        )
 
     feat = _make_feature()
     with patch.object(
         TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
     ), patch(
-        "asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec,
+        "kestrel_sovereign.features.talon.coordinator.run_bounded_subprocess",
+        side_effect=fake_run_bounded_subprocess,
     ):
         envelope = await feat.talon_health()
 
@@ -237,8 +343,56 @@ async def test_dispatch_via_cli_background_returns_immediately_and_logs(
         # Reap the long-running fake-talon child so pytest doesn't
         # hang on shutdown waiting for it.
         proc = feat._jobs[result["job_id"]]["process"]
-        proc.kill()
-        await proc.wait()
+        await terminate_process_tree(proc, terminate_grace=0.1, reap_timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_background_dispatch_cleans_group_if_ownership_cannot_persist(
+    tmp_path, monkeypatch,
+):
+    """No durable registry row means the detached process was never handed off."""
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n")
+    fake_bin.chmod(0o755)
+    feat = TalonCoordinatorFeature(
+        SimpleNamespace(_scheduler=None, storage_path=str(tmp_path / "agent.db"))
+    )
+    proc = MagicMock(pid=4242, returncode=None)
+    cleanup = AsyncMock()
+    captured: dict = {}
+
+    async def fake_create(*args, **kwargs):
+        captured.update(kwargs)
+        return proc
+
+    with (
+        patch.object(
+            TalonCoordinatorFeature,
+            "_find_talon_bin",
+            return_value=str(fake_bin),
+        ),
+        patch.object(feat, "_persist_jobs", return_value=False),
+        patch(
+            "kestrel_sovereign.features.talon.coordinator.terminate_process_tree",
+            cleanup,
+        ),
+        patch("asyncio.create_subprocess_exec", side_effect=fake_create),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["claim", "--repo", "x/y", "--issue", "1"],
+            label="claim:x/y#1",
+        )
+
+    assert result["dispatched"] is False
+    assert "persist" in result["error"].lower()
+    cleanup.assert_awaited_once_with(proc)
+    assert feat._jobs == {}
+    if os.name == "nt":
+        assert captured["creationflags"]
+    else:
+        assert captured["start_new_session"] is True
 
 
 @pytest.mark.asyncio
@@ -668,6 +822,44 @@ async def test_setup_workspace_clones_outside_running_source(
 
 
 @pytest.mark.asyncio
+async def test_setup_workspace_no_fetch_reports_clean_state(tmp_path, monkeypatch):
+    """The ``fetch=False`` fast path on an existing checkout still reports
+    git cleanliness, matching the fetch/clone branches and
+    ``talon_workspace_status``.
+    """
+    import subprocess
+
+    monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+
+    workspace = tmp_path / "org__repo"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", str(workspace)], check=True, capture_output=True,
+    )
+    (workspace / "dirty.txt").write_text("untracked\n", encoding="utf-8")
+
+    sec = SimpleNamespace(
+        name="SecurityFeature",
+        approval_queue=SimpleNamespace(
+            request_approval=AsyncMock(return_value=(True, "user")),
+        ),
+    )
+    agent = SimpleNamespace(
+        _scheduler=None,
+        features={"SecurityFeature": sec},
+    )
+    agent.get_feature = lambda name: sec if name == "SecurityFeature" else None
+    feat = TalonCoordinatorFeature(agent)
+
+    result = await feat.talon_setup_workspace(repo="org/repo", fetch=False)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["state"] == "exists"
+    assert result.data["workspace"]["clean"] is False
+
+
+@pytest.mark.asyncio
 async def test_setup_workspace_denied_without_approval(tmp_path, monkeypatch):
     """Workspace setup is approval-gated. Without approval, fails
     with ``approval_denied`` and creates nothing on disk.
@@ -725,4 +917,3 @@ async def test_workspace_status_reports_unsafe(monkeypatch):
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["safe"] is False
     assert "running agent's source tree" in result.data["unsafe_reason"]
-

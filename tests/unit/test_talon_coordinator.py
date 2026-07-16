@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
 from kestrel_sovereign.features.talon.verification import CommandExecution
 from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
@@ -715,18 +716,6 @@ class TestA2ADispatch:
             assert result["reason"] == "no_a2a_host"
 
 
-class TestCLIDispatch:
-    @pytest.mark.asyncio
-    async def test_no_binary(self):
-        feature = TalonCoordinatorFeature(_make_agent())
-        with patch.object(
-            TalonCoordinatorFeature, "_find_talon_bin", return_value=None
-        ):
-            result = await feature._dispatch_via_cli(["claim", "--repo", "a/b", "--issue", "1"])
-            assert result["dispatched"] is False
-            assert "not found" in result["error"]
-
-
 class TestTalonWait:
     """The TalonWaitable provider driven by the generic engine.
 
@@ -1024,8 +1013,6 @@ class TestTalonVerify:
     @pytest.mark.asyncio
     async def test_verify_executor_sanitizes_untrusted_env(self, tmp_path, monkeypatch):
         """F302: the verify subprocess gets no provider creds and no GH token."""
-        import asyncio as _asyncio
-
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-secret")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
@@ -1041,11 +1028,14 @@ class TestTalonVerify:
 
         captured = {}
 
-        async def fake_create(*argv, **kwargs):
+        async def fake_run(argv, **kwargs):
             captured["env"] = kwargs["env"]
             raise FileNotFoundError("stop after env is built")
 
-        with patch.object(_asyncio, "create_subprocess_exec", side_effect=fake_create):
+        with patch(
+            "kestrel_sovereign.features.talon.coordinator.run_bounded_subprocess",
+            side_effect=fake_run,
+        ):
             await executor("pytest -q", timeout=5)
 
         env = captured["env"]
@@ -1062,6 +1052,32 @@ class TestTalonVerify:
             assert leaked not in env, f"{leaked} must be stripped from verify env"
         # Non-secret vars are preserved so the command can still run.
         assert env.get("PATH_SHOULD_SURVIVE") == "keep-me"
+
+    @pytest.mark.asyncio
+    async def test_verify_executor_redacts_captured_output(self, tmp_path):
+        feature = TalonCoordinatorFeature(_make_agent())
+        executor = feature._make_verify_executor(tmp_path)
+
+        fake_result = BoundedProcessResult(
+            argv=("pytest", "-q"),
+            returncode=1,
+            stdout=b"token=plain-text-secret\n",
+            stderr=b"sk-abcdefghijk123456789\n",
+            duration_ms=4,
+        )
+        with patch(
+            "kestrel_sovereign.features.talon.coordinator.run_bounded_subprocess",
+            new_callable=AsyncMock,
+            return_value=fake_result,
+        ):
+            execution = await executor("pytest -q", timeout=5)
+
+        assert execution.ran is True
+        assert execution.returncode == 1
+        assert "plain-text-secret" not in execution.stdout
+        assert "sk-abcdefghijk123456789" not in execution.stderr
+        assert "[REDACTED]" in execution.stdout
+        assert "[REDACTED]" in execution.stderr
 
     @pytest.mark.asyncio
     async def test_verify_allowlisted_pass(self, tmp_path):
