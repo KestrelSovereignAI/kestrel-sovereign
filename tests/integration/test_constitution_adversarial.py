@@ -219,11 +219,11 @@ class TestCrossUserIsolation:
         agent_a_dir.mkdir()
         agent_b_dir.mkdir()
 
-        constitution_path = "docs/principles/KESTREL_CONSTITUTION.md"
-
-        # Create identities (use async version since we're in async context)
-        await create_kestrel_identity_async(str(agent_a_dir), constitution_path)
-        await create_kestrel_identity_async(str(agent_b_dir), constitution_path)
+        # Omit constitution_path so inception anchors the packaged governing
+        # source; passing the docs copy is now refused as non-authoritative
+        # (#2463).
+        await create_kestrel_identity_async(str(agent_a_dir))
+        await create_kestrel_identity_async(str(agent_b_dir))
 
         # Find databases
         db_a = list(agent_a_dir.glob("*.db"))[0]
