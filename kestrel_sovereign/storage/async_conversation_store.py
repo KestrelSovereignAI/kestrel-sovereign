@@ -2143,12 +2143,19 @@ class AsyncConversationStore:
                 "WHERE id = ? AND agent_id = ?"
                 ") "
             )
-            candidate_source = "conversation_history c CROSS JOIN anchor"
+            # LEFT JOIN (not CROSS JOIN): a numeric session id can be
+            # metadata-only — the client supplied it explicitly, or the legacy
+            # anchor row was already hard-deleted.  An empty anchor CTE must
+            # drop only the time-grouping branch, never the metadata branch,
+            # or purge/count would miss rows the display resolver still finds.
+            candidate_source = "conversation_history c LEFT JOIN anchor ON 1=1"
             candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
             anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
             membership_predicate = (
-                f"({candidate_timestamp} >= {anchor_timestamp} "
+                "(EXISTS (SELECT 1 FROM anchor) "
+                f"AND ({candidate_timestamp} >= {anchor_timestamp} "
                 f"OR {candidate_timestamp} IS NULL "
+                f"OR {anchor_timestamp} IS NULL) "
                 "OR c.metadata LIKE ? ESCAPE '\\' "
                 "OR c.metadata LIKE ? ESCAPE '\\')"
             )

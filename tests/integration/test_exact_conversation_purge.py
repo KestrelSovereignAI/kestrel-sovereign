@@ -1122,6 +1122,36 @@ async def test_purge_session_removes_all_blind_indexes_and_retains_title(db_back
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_purge_numeric_session_without_anchor_row_purges_metadata_members(
+    db_backend,
+):
+    """A numeric session id can be metadata-only (client-supplied, or the
+    legacy anchor row was already hard-deleted).  The exact resolver must
+    still purge the metadata-matched members instead of reporting 0."""
+    agent_id = f"did:test:purge-anchorless:{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    max_id = await storage.db.fetchval(
+        "SELECT COALESCE(MAX(id), 0) FROM conversation_history", ()
+    )
+    session_id = str(int(max_id) + 1_000_000)  # numeric, no such row id
+    first = await _seed_indexed_message(
+        storage.db, agent_id, content="anchorless first", session_id=session_id
+    )
+    second = await _seed_indexed_message(
+        storage.db, agent_id, content="anchorless second", session_id=session_id
+    )
+    survivor = await _seed_indexed_message(
+        storage.db, agent_id, content="unrelated", session_id=f"s-{uuid4()}"
+    )
+
+    assert await storage.conversation.purge_conversation_session(session_id) == 2
+    await _assert_destroyed(storage.db, first)
+    await _assert_destroyed(storage.db, second)
+    await _assert_present(storage.db, survivor)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_purge_all_removes_only_the_agents_rows_and_blind_indexes(db_backend):
     agent_id = f"did:test:purge-all:{uuid4()}"
     other_agent_id = f"did:test:purge-all-other:{uuid4()}"
