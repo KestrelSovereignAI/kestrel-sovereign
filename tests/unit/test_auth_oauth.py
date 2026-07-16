@@ -150,3 +150,74 @@ class TestOAuthDisabled:
             test_client = TestClient(test_app)
             resp = test_client.get("/auth/login", follow_redirects=False)
             assert resp.status_code == 503
+
+
+class TestJwtAlgorithmConfusion:
+    """Adversarial regressions for the JWT verification surface (PyJWT
+    >=2.13.0 rejects a public-key JWK accepted as an HMAC secret, i.e. forged
+    HS256 tokens). ``_verify_jwt`` pins ``algorithms=["HS256"]`` and must reject
+    tokens signed with any other algorithm or key family."""
+
+    def test_valid_hs256_roundtrips(self):
+        from kestrel_sovereign.endpoints.auth_oauth import _create_jwt, _verify_jwt
+
+        with patch.dict(os.environ, {"JWT_SECRET_KEY": "shhh-secret"}, clear=True):
+            token = _create_jwt("allowed@gmail.com", "Al")
+            payload = _verify_jwt(token)
+            assert payload is not None
+            assert payload["sub"] == "allowed@gmail.com"
+
+    def test_none_algorithm_token_rejected(self):
+        import jwt
+        from kestrel_sovereign.endpoints.auth_oauth import _verify_jwt
+
+        with patch.dict(os.environ, {"JWT_SECRET_KEY": "shhh-secret"}, clear=True):
+            forged = jwt.encode({"sub": "attacker@evil.com"}, None, algorithm="none")
+            assert _verify_jwt(forged) is None
+
+    def test_pubkey_encode_as_hmac_secret_is_refused(self):
+        """PyJWT >=2.13.0 refuses to even *encode* an HS256 token using an
+        asymmetric public key as the HMAC secret — the encoder side of the
+        algorithm-confusion advisory."""
+        import jwt
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pub_pem = key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        with pytest.raises(jwt.exceptions.InvalidKeyError):
+            jwt.encode({"sub": "attacker@evil.com"}, pub_pem, algorithm="HS256")
+
+    def test_rs256_public_key_as_hmac_secret_rejected(self):
+        """The core advisory scenario built by hand (bypassing the fixed
+        encoder): an HS256 token whose MAC key is an RSA public key PEM must
+        not verify against our HS256-only decoder keyed on the real secret."""
+        import base64
+        import hashlib
+        import hmac
+        import json
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        from kestrel_sovereign.endpoints.auth_oauth import _verify_jwt
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pub_pem = key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+
+        def b64u(raw: bytes) -> str:
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+        header = b64u(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+        body = b64u(json.dumps({"sub": "attacker@evil.com"}).encode())
+        signing_input = f"{header}.{body}".encode()
+        # Attacker MACs with the public key as the shared secret.
+        sig = hmac.new(pub_pem, signing_input, hashlib.sha256).digest()
+        forged = f"{header}.{body}.{b64u(sig)}"
+
+        with patch.dict(os.environ, {"JWT_SECRET_KEY": "shhh-secret"}, clear=True):
+            assert _verify_jwt(forged) is None
