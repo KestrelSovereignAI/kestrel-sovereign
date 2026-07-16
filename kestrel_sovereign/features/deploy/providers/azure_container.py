@@ -129,6 +129,7 @@ class AzureContainerProvider(DeployProvider):
     ) -> Dict[str, Any]:
         """Deploy to Azure Container Apps."""
         try:
+            from azure.core.exceptions import ResourceNotFoundError
             from azure.mgmt.appcontainers.models import (
                 Configuration,
                 Container,
@@ -210,7 +211,7 @@ class AzureContainerProvider(DeployProvider):
                     container_app_name=service_name,
                 )
                 logger.info(f"Updating existing Container App: {service_name}")
-            except Exception:
+            except ResourceNotFoundError:
                 logger.info(f"Creating new Container App: {service_name}")
 
             # Create or update

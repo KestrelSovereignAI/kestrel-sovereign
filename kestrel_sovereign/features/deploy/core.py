@@ -342,6 +342,11 @@ class DeployManagerCore:
                 timeout=min(10.0, remaining),
             )
             if result["healthy"]:
+                if monotonic() >= deadline:
+                    logger.debug(
+                        "Ignoring healthy response received after the deadline"
+                    )
+                    break
                 logger.info(
                     "Service is healthy (status: %s)", result["status_code"]
                 )

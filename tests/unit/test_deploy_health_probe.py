@@ -23,6 +23,7 @@ from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvide
         ("https://agent.example", "/health", "https://agent.example/health"),
         ("https://agent.example/", "health", "https://agent.example/health"),
         ("https://agent.example///", "//ready", "https://agent.example/ready"),
+        ("https://agent.example/app/", "", "https://agent.example/app"),
     ],
 )
 def test_build_health_url_normalizes_boundary_slashes(
@@ -82,6 +83,34 @@ async def test_probe_translates_request_error_without_fabricating_timing() -> No
     }
 
 
+@pytest.mark.parametrize("slow_phase", ["request", "client_exit"])
+async def test_probe_deadline_covers_complete_http_lifecycle(
+    slow_phase: str,
+) -> None:
+    response = MagicMock(status_code=200)
+
+    async def wait_forever(*_args: object) -> None:
+        await asyncio.sleep(3600)
+
+    with patch("httpx.AsyncClient") as client_class:
+        client = client_class.return_value
+        entered_client = client.__aenter__.return_value
+        entered_client.get = AsyncMock(return_value=response)
+        if slow_phase == "request":
+            entered_client.get.side_effect = wait_forever
+        else:
+            client.__aexit__.side_effect = wait_forever
+
+        result = await probe_http_health("https://agent.example", timeout=0.01)
+
+    assert result == {
+        "healthy": False,
+        "status_code": None,
+        "response_time": None,
+        "error": "TimeoutError",
+    }
+
+
 async def test_probe_never_consumes_caller_cancellation() -> None:
     with patch("httpx.AsyncClient") as client_class:
         client_class.return_value.__aenter__.return_value.get = AsyncMock(
@@ -95,6 +124,35 @@ async def test_probe_never_consumes_caller_cancellation() -> None:
 def test_cloud_providers_share_the_default_health_contract() -> None:
     assert CloudRunProvider.health_check is DeployProvider.health_check
     assert AzureContainerProvider.health_check is DeployProvider.health_check
+
+
+async def test_default_provider_logs_whenever_probe_returns_an_error_key(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = CloudRunProvider.__new__(CloudRunProvider)
+    probe = AsyncMock(
+        return_value={
+            "healthy": False,
+            "status_code": None,
+            "response_time": None,
+            "error": "",
+        }
+    )
+
+    with (
+        caplog.at_level(
+            "WARNING",
+            logger="kestrel_sovereign.features.deploy.providers.base",
+        ),
+        patch(
+            "kestrel_sovereign.features.deploy.providers.base.probe_http_health",
+            probe,
+        ),
+    ):
+        result = await provider.health_check("https://agent.example")
+
+    assert result["error"] == ""
+    assert "Health check failed:" in caplog.text
 
 
 async def test_readiness_polling_delegates_custom_path_to_shared_probe() -> None:
@@ -116,6 +174,34 @@ async def test_readiness_polling_delegates_custom_path_to_shared_probe() -> None
     assert probe.await_args.args == ("https://agent.example/",)
     assert probe.await_args.kwargs["path"] == "readyz"
     assert 0 < probe.await_args.kwargs["timeout"] <= 5
+
+
+async def test_readiness_rejects_a_healthy_response_received_after_deadline() -> None:
+    manager = DeployManagerCore.__new__(DeployManagerCore)
+    manager.health_check_timeout = 120
+    manager.health_check_path = "/health"
+    now = 100.0
+
+    async def late_success(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal now
+        now = 106.0
+        return {
+            "healthy": True,
+            "status_code": 200,
+            "response_time": 6.0,
+        }
+
+    with (
+        patch(
+            "kestrel_sovereign.features.deploy.core.monotonic",
+            side_effect=lambda: now,
+        ),
+        patch(
+            "kestrel_sovereign.features.deploy.core.probe_http_health",
+            side_effect=late_success,
+        ),
+    ):
+        assert not await manager._verify_health("https://agent.example", timeout=5)
 
 
 async def test_readiness_backoff_cannot_sleep_past_deadline() -> None:

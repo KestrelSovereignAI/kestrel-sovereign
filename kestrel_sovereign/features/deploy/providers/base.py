@@ -104,8 +104,8 @@ class DeployProvider(ABC):
             Health result dict with keys: healthy, status_code, response_time
         """
         result = await probe_http_health(url)
-        if error := result.get("error"):
-            logger.warning("Health check failed: %s", error)
+        if "error" in result:
+            logger.warning("Health check failed: %s", result["error"])
         return dict(result)
 
     def cleanup(self) -> None:

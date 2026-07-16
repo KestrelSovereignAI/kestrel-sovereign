@@ -4,20 +4,24 @@ Unit tests for Cloud Run deployment provider.
 Tests the Cloud Run provider with mocked google-cloud-run SDK.
 """
 
+import asyncio
 import os
-import pytest
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 pytest.importorskip("google.cloud.run_v2", reason="google-cloud-run not installed (cloud extras)")
 
+from google.api_core.exceptions import NotFound, ServiceUnavailable
+from google.cloud.run_v2.types import Condition
+
 from kestrel_sovereign.features.deploy.models import (
     DeploymentProfile,
-    DeployProviderType,
     DeployManagerError,
+    DeployProviderType,
 )
 from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
-from google.cloud.run_v2.types import Condition
 
 
 @pytest.fixture
@@ -91,8 +95,8 @@ class TestCloudRunProviderDeploy:
         mock_client = MagicMock()
         mock_services_client.return_value = mock_client
 
-        # Mock get_service to raise exception (service doesn't exist)
-        mock_client.get_service.side_effect = Exception("404 not found")
+        # Mock get_service to report that the service doesn't exist.
+        mock_client.get_service.side_effect = NotFound("service absent")
 
         # Mock create_service operation
         mock_operation = MagicMock()
@@ -181,6 +185,51 @@ class TestCloudRunProviderDeploy:
         assert not mock_client.create_service.called
 
     @pytest.mark.asyncio
+    async def test_deploy_does_not_misclassify_lookup_failure_as_absent(
+        self, mock_services_client, deployment_profile
+    ):
+        """Only the provider's explicit not-found error selects create."""
+        mock_client = MagicMock()
+        mock_services_client.return_value = mock_client
+        mock_client.get_service.side_effect = ServiceUnavailable(
+            "lookup unavailable"
+        )
+
+        provider = CloudRunProvider(project_id="test-project")
+        provider._services_client = mock_client
+
+        with pytest.raises(DeployManagerError, match="lookup unavailable"):
+            await provider.deploy(
+                image="gcr.io/test-project/kestrel:latest",
+                service_name="kestrel-dev",
+                profile=deployment_profile,
+            )
+
+        mock_client.create_service.assert_not_called()
+        mock_client.update_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deploy_lookup_preserves_caller_cancellation(
+        self, mock_services_client, deployment_profile
+    ):
+        mock_client = MagicMock()
+        mock_services_client.return_value = mock_client
+        mock_client.get_service.side_effect = asyncio.CancelledError()
+
+        provider = CloudRunProvider(project_id="test-project")
+        provider._services_client = mock_client
+
+        with pytest.raises(asyncio.CancelledError):
+            await provider.deploy(
+                image="gcr.io/test-project/kestrel:latest",
+                service_name="kestrel-dev",
+                profile=deployment_profile,
+            )
+
+        mock_client.create_service.assert_not_called()
+        mock_client.update_service.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_deploy_update_preserves_out_of_band_settings(
         self, mock_services_client, deployment_profile
     ):
@@ -236,7 +285,7 @@ class TestCloudRunProviderDeploy:
         # Setup mocks
         mock_client = MagicMock()
         mock_services_client.return_value = mock_client
-        mock_client.get_service.side_effect = Exception("404 not found")
+        mock_client.get_service.side_effect = NotFound("service absent")
 
         mock_operation = MagicMock()
         mock_result = MagicMock()
@@ -432,49 +481,3 @@ class TestCloudRunProviderList:
         assert result[0]["status"] == "active"
         assert result[0]["url"] == "https://kestrel-dev-abc123.run.app"
         assert result[1]["name"] == "kestrel-prod"
-
-
-class TestCloudRunProviderHealthCheck:
-    """Test CloudRunProvider.health_check() method."""
-
-    @pytest.mark.asyncio
-    async def test_health_check_healthy(self):
-        """Test health check of healthy service."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_client.return_value.__aenter__.return_value.get.return_value = mock_response
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check("https://kestrel-dev-abc123.run.app")
-
-            assert result["healthy"] is True
-            assert result["status_code"] == 200
-            assert "response_time" in result
-
-    @pytest.mark.asyncio
-    async def test_health_check_unhealthy(self):
-        """Test health check of unhealthy service."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_response = MagicMock()
-            mock_response.status_code = 503
-            mock_client.return_value.__aenter__.return_value.get.return_value = mock_response
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check("https://kestrel-dev-abc123.run.app")
-
-            assert result["healthy"] is False
-            assert result["status_code"] == 503
-
-    @pytest.mark.asyncio
-    async def test_health_check_error(self):
-        """Test health check when service is unreachable."""
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_client.return_value.__aenter__.return_value.get.side_effect = Exception("Connection refused")
-
-            provider = CloudRunProvider(project_id="test-project")
-            result = await provider.health_check("https://kestrel-dev-abc123.run.app")
-
-            assert result["healthy"] is False
-            assert result["status_code"] is None
-            assert "error" in result

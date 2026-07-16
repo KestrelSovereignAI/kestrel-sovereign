@@ -157,6 +157,7 @@ class CloudRunProvider(DeployProvider):
         Programmatizes scripts/cloudrun/deploy_dev.sh and deploy_prod.sh.
         """
         try:
+            from google.api_core.exceptions import NotFound
             from google.cloud.run_v2 import Service
             from google.cloud.run_v2.types import (
                 Container,
@@ -180,7 +181,7 @@ class CloudRunProvider(DeployProvider):
                 )
                 is_update = True
                 logger.info(f"Updating existing Cloud Run service: {service_name}")
-            except Exception:
+            except NotFound:
                 is_update = False
                 logger.info(f"Creating new Cloud Run service: {service_name}")
 
