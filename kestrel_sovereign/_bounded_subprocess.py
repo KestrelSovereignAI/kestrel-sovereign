@@ -22,7 +22,6 @@ from kestrel_sovereign._async_process import (
     DEFAULT_TERMINATE_GRACE_SECONDS,
     _terminate_and_await,
     start_async_process,
-    terminate_process_tree,
 )
 
 
@@ -120,9 +119,10 @@ async def run_bounded_subprocess(
     """Run an argv command with bounded output and process-tree cleanup.
 
     Launch errors retain their original exception types for caller-side error
-    classification. Timeout is represented by ``timed_out``. Cancellation is
-    propagated only after the complete private process group reaches a bounded
-    terminal cleanup outcome.
+    classification. Timeout is represented by ``timed_out``. Every exit path
+    (success, timeout, error, cancellation) first drives the private process
+    group to a bounded terminal cleanup outcome, so detached descendants that
+    closed or redirected the inherited pipes cannot outlive this call.
     """
 
     argv = tuple(str(part) for part in cmd)
@@ -149,11 +149,8 @@ async def run_bounded_subprocess(
         _collect_process(proc, max_output_bytes),
         name=f"subprocess-{proc.pid}-completion",
     )
-    timed_out = False
     try:
         done, _pending = await asyncio.wait({completion}, timeout=timeout)
-        if done:
-            captured = completion.result()
     except asyncio.CancelledError as cancellation:
         cleanup = asyncio.create_task(
             _terminate_and_await(
@@ -167,33 +164,27 @@ async def run_bounded_subprocess(
         outcome = await await_owned_task(cleanup, cancellation)
         raise_owned_outcome(outcome, operation="cancelled subprocess cleanup")
         raise AssertionError("cancelled cleanup unexpectedly returned")
-    except Exception as process_error:
-        try:
-            await terminate_process_tree(
-                proc,
-                terminate_grace=terminate_grace,
-                reap_timeout=reap_timeout,
-            )
-        except Exception as cleanup_error:  # noqa: BLE001
-            process_error.add_note(f"subprocess cleanup also failed: {cleanup_error}")
-        raise
 
-    if not done:
-        timed_out = True
-        cleanup = asyncio.create_task(
-            _terminate_and_await(
-                proc,
-                completion,
-                terminate_grace=terminate_grace,
-                reap_timeout=reap_timeout,
-            ),
-            name=f"subprocess-{proc.pid}-timeout-cleanup",
-        )
-        outcome = await await_owned_task(cleanup)
-        captured = raise_owned_outcome(
-            outcome,
-            operation="timed-out subprocess cleanup",
-        )
+    # Both branches settle through the same tree cleanup: on timeout it kills
+    # the still-running command, and on normal completion it sweeps any
+    # detached descendant that survived the root exit (a child that closed or
+    # redirected the inherited pipes would otherwise outlive this call).
+    timed_out = not done
+    phase = "timed-out" if timed_out else "completed"
+    cleanup = asyncio.create_task(
+        _terminate_and_await(
+            proc,
+            completion,
+            terminate_grace=terminate_grace,
+            reap_timeout=reap_timeout,
+        ),
+        name=f"subprocess-{proc.pid}-{phase}-cleanup",
+    )
+    outcome = await await_owned_task(cleanup)
+    captured = raise_owned_outcome(
+        outcome,
+        operation=f"{phase} subprocess cleanup",
+    )
 
     returncode, stdout, stdout_truncated, stderr, stderr_truncated = captured
     return BoundedProcessResult(

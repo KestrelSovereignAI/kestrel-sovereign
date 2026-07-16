@@ -50,7 +50,12 @@ def _descendant_script(*, ignore_sigterm: bool) -> str:
     return f"import signal, time\n{signal_setup}\ntime.sleep(60)\n"
 
 
-def _parent_script(*, ignore_sigterm: bool, detach_child_output: bool = False) -> str:
+def _parent_script(
+    *,
+    ignore_sigterm: bool,
+    detach_child_output: bool = False,
+    exit_after_spawn: bool = False,
+) -> str:
     signal_setup = (
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)" if ignore_sigterm else "pass"
     )
@@ -59,6 +64,7 @@ def _parent_script(*, ignore_sigterm: bool, detach_child_output: bool = False) -
         if detach_child_output
         else ""
     )
+    epilogue = "sys.exit(0)" if exit_after_spawn else "time.sleep(60)"
     return (
         "import pathlib, signal, subprocess, sys, time\n"
         f"{signal_setup}\n"
@@ -66,7 +72,7 @@ def _parent_script(*, ignore_sigterm: bool, detach_child_output: bool = False) -
         f"{child_stdio})\n"
         "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
         "print(child.pid, flush=True)\n"
-        "time.sleep(60)\n"
+        f"{epilogue}\n"
     )
 
 
@@ -91,6 +97,34 @@ async def test_timeout_terminates_descendant_group_and_reaps_leader(tmp_path):
 
     assert result.timed_out is True
     assert time.monotonic() - started < 3.0
+    await _wait_for_file(pid_file)
+    await _assert_pid_gone(int(pid_file.read_text(encoding="utf-8")))
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group assertion")
+async def test_success_sweeps_detached_descendant_after_root_exit(tmp_path):
+    pid_file = tmp_path / "child.pid"
+
+    result = await run_bounded_subprocess(
+        [
+            sys.executable,
+            "-c",
+            _parent_script(
+                ignore_sigterm=False,
+                detach_child_output=True,
+                exit_after_spawn=True,
+            ),
+            str(pid_file),
+            _descendant_script(ignore_sigterm=True),
+        ],
+        timeout=30,
+        terminate_grace=0.2,
+        reap_timeout=1.0,
+    )
+
+    assert result.timed_out is False
+    assert result.returncode == 0
     await _wait_for_file(pid_file)
     await _assert_pid_gone(int(pid_file.read_text(encoding="utf-8")))
 
@@ -159,10 +193,18 @@ async def test_launch_failure_preserves_exception_type(tmp_path):
 @pytest.mark.asyncio
 async def test_internal_collection_failure_still_terminates_process_tree(monkeypatch):
     proc = MagicMock(pid=4242, returncode=None)
-    cleanup = AsyncMock()
+    recorded: dict = {}
 
     async def fail_collection(*_args, **_kwargs):
         raise RuntimeError("pipe reader failed")
+
+    async def spy_terminate_and_await(
+        proc_arg, completion, *, terminate_grace, reap_timeout
+    ):
+        recorded["proc"] = proc_arg
+        recorded["terminate_grace"] = terminate_grace
+        recorded["reap_timeout"] = reap_timeout
+        return await completion
 
     monkeypatch.setattr(
         bounded_helpers,
@@ -170,7 +212,9 @@ async def test_internal_collection_failure_still_terminates_process_tree(monkeyp
         AsyncMock(return_value=proc),
     )
     monkeypatch.setattr(bounded_helpers, "_collect_process", fail_collection)
-    monkeypatch.setattr(bounded_helpers, "terminate_process_tree", cleanup)
+    monkeypatch.setattr(
+        bounded_helpers, "_terminate_and_await", spy_terminate_and_await
+    )
 
     with pytest.raises(RuntimeError, match="pipe reader failed"):
         await run_bounded_subprocess(
@@ -180,11 +224,11 @@ async def test_internal_collection_failure_still_terminates_process_tree(monkeyp
             reap_timeout=0.5,
         )
 
-    cleanup.assert_awaited_once_with(
-        proc,
-        terminate_grace=0.25,
-        reap_timeout=0.5,
-    )
+    assert recorded == {
+        "proc": proc,
+        "terminate_grace": 0.25,
+        "reap_timeout": 0.5,
+    }
 
 
 @pytest.mark.asyncio
