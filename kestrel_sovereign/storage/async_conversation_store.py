@@ -16,13 +16,14 @@ import os
 import re
 import struct
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
 from .session_grouping import (
+    coerce_session_timestamp,
     coalesce_sessions_by_session_id,
     group_messages_into_sessions,
     summarize_sessions,
@@ -63,6 +64,10 @@ _PURGE_NO_LEXICAL_SELECT_COLUMNS = (
 
 class ConversationLexicalSchemaError(RuntimeError):
     """The history/token-table halves of the lexical schema disagree."""
+
+
+class ConversationSessionTimestampError(RuntimeError):
+    """Exact session membership cannot be proven from stored chronology."""
 
 
 def _escape_like_session_value(session_id: str) -> str:
@@ -642,7 +647,7 @@ class AsyncConversationStore:
         # is re-read under the destructive transaction's writer/DDL boundary
         # below so a concurrent startup migration cannot stale this decision.
         await self._conversation_lexical_purge_capability()
-        audit_error: Optional[Exception] = None
+        deferred_error: Optional[Exception] = None
         purged = 0
         async with self.db.transaction():
             if self.db.backend_type == "postgres":
@@ -668,16 +673,26 @@ class AsyncConversationStore:
             active_scope = dict(scope)
             active_queries = selection_queries
             if resolve_message_ids is not None:
-                resolved_ids = sorted(
-                    {
-                        int(message_id)
-                        for message_id in await resolve_message_ids()
-                    }
-                )
-                if not resolved_ids:
+                try:
+                    resolved_ids = sorted(
+                        {
+                            int(message_id)
+                            for message_id in await resolve_message_ids()
+                        }
+                    )
+                except ConversationSessionTimestampError as error:
+                    # Leave the transaction without touching history or the
+                    # audit sink, then preserve the domain error rather than
+                    # obscuring it behind the backend's TransactionError.
+                    deferred_error = error
+                    resolved_ids = []
+                if deferred_error is None and not resolved_ids:
                     return 0
-                active_scope["message_ids"] = resolved_ids
-                active_queries = self._exact_id_purge_queries(resolved_ids)
+                if deferred_error is None:
+                    active_scope["message_ids"] = resolved_ids
+                    active_queries = self._exact_id_purge_queries(resolved_ids)
+                else:
+                    active_queries = ()
 
             rendered_queries = self._render_purge_queries(
                 active_queries or (), projection
@@ -702,20 +717,21 @@ class AsyncConversationStore:
                 }
                 for row in rows
             ]
-            try:
-                await self._audit_destructive_operation(
-                    operation_type=operation_type,
-                    rows=snapshot,
-                    scope=active_scope,
-                    reason=reason,
-                )
-            except Exception as error:
-                # Exit the database transaction without deleting anything,
-                # then restore the audit sink's historical exception contract
-                # instead of letting the backend wrap it as TransactionError.
-                audit_error = error
+            if deferred_error is None:
+                try:
+                    await self._audit_destructive_operation(
+                        operation_type=operation_type,
+                        rows=snapshot,
+                        scope=active_scope,
+                        reason=reason,
+                    )
+                except Exception as error:
+                    # Exit the database transaction without deleting anything,
+                    # then restore the audit sink's historical exception contract
+                    # instead of letting the backend wrap it as TransactionError.
+                    deferred_error = error
 
-            if audit_error is None:
+            if deferred_error is None:
                 message_ids = list(rows_by_id)
                 lexical_index_ids = list(
                     dict.fromkeys(
@@ -762,8 +778,8 @@ class AsyncConversationStore:
                             (self.agent_id, *batch, self.agent_id),
                         )
 
-        if audit_error is not None:
-            raise audit_error
+        if deferred_error is not None:
+            raise deferred_error
         return purged
 
     def _lazy_embedding_service(self) -> Optional[Any]:
@@ -828,15 +844,10 @@ class AsyncConversationStore:
         while SQLite's ``julianday`` produces NULL and the destructive
         predicate safely matches no rows.
         """
-        if self.db.backend_type != "postgres" or isinstance(value, datetime):
+        if self.db.backend_type != "postgres":
             return value
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            return value
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
+        parsed = coerce_session_timestamp(value)
+        return value if parsed is None else parsed
 
     def _canonical_timestamp_sql(self, expression: str) -> str:
         """Normalize one timestamp SQL expression for the active backend."""
@@ -903,20 +914,15 @@ class AsyncConversationStore:
             if not prev_sid:
                 return self._new_session_id()
 
-            # Compare gap; reuse if within window
-            from datetime import datetime, timezone, timedelta
-            if isinstance(prev_created_at, str):
-                try:
-                    prev_dt = datetime.fromisoformat(prev_created_at.replace("Z", "+00:00"))
-                except ValueError:
-                    return self._new_session_id()
-            else:
+            # Compare gap through the same canonical parser used by display and
+            # destructive session grouping. PostgreSQL returns ``datetime``
+            # objects while legacy SQLite rows may use SQL, ISO, Z, or offset
+            # strings; all normalize to one naive-UTC arithmetic domain.
+            prev_dt = coerce_session_timestamp(prev_created_at)
+            if prev_dt is None:
                 return self._new_session_id()
 
-            if prev_dt.tzinfo is None:
-                prev_dt = prev_dt.replace(tzinfo=timezone.utc)
-
-            now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             gap = now - prev_dt
             if gap < timedelta(minutes=self._IMPLICIT_SESSION_GAP_MINUTES):
                 return prev_sid
@@ -1901,6 +1907,7 @@ class AsyncConversationStore:
         include_markers: bool,
         metadata_index: int = 3,
         created_at_index: int = 4,
+        reject_invalid_timestamps: bool = False,
     ) -> List[tuple]:
         """Apply the canonical time-gap/resumption rules to candidate rows.
 
@@ -1910,33 +1917,26 @@ class AsyncConversationStore:
         privacy purges do not materialize encrypted message bodies merely to
         resolve membership.
         """
-        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
-
-        def parse_timestamp(value: Any) -> datetime:
-            if isinstance(value, str):
-                for fmt in (
-                    "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%dT%H:%M:%S",
-                    "%Y-%m-%d %H:%M:%S.%f",
-                ):
-                    try:
-                        return datetime.strptime(value, fmt)
-                    except ValueError:
-                        continue
-                return datetime.now()
-            if isinstance(value, datetime):
-                return value
-            return datetime.now()
+        from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
         seen_ids: set[int] = set()
         candidates: list[tuple[datetime, int, tuple]] = []
+        fallback_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
         for row in rows:
             row_id = int(row[0])
             if row_id in seen_ids:
                 continue
             seen_ids.add(row_id)
+            timestamp = coerce_session_timestamp(row[created_at_index])
+            if timestamp is None:
+                if reject_invalid_timestamps:
+                    raise ConversationSessionTimestampError(
+                        "Refusing exact conversation-session resolution because "
+                        f"message {row_id} has an invalid created_at timestamp"
+                    )
+                timestamp = fallback_timestamp
             candidates.append(
-                (parse_timestamp(row[created_at_index]), row_id, row)
+                (timestamp, row_id, row)
             )
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
 
@@ -2125,6 +2125,8 @@ class AsyncConversationStore:
         row_id = coerce_persistent_message_id(session_id)
 
         if row_id is None:
+            query_prefix = ""
+            candidate_source = "conversation_history c"
             membership_predicate = (
                 "(c.metadata LIKE ? ESCAPE '\\' "
                 "OR c.metadata LIKE ? ESCAPE '\\')"
@@ -2135,24 +2137,32 @@ class AsyncConversationStore:
                 compact_pattern,
             )
         else:
+            query_prefix = (
+                "WITH anchor AS ("
+                "SELECT created_at FROM conversation_history "
+                "WHERE id = ? AND agent_id = ?"
+                ") "
+            )
+            candidate_source = "conversation_history c CROSS JOIN anchor"
+            candidate_timestamp = self._canonical_timestamp_sql("c.created_at")
+            anchor_timestamp = self._canonical_timestamp_sql("anchor.created_at")
             membership_predicate = (
-                "(c.created_at >= ("
-                "SELECT anchor.created_at FROM conversation_history anchor "
-                "WHERE anchor.id = ? AND anchor.agent_id = ?) "
+                f"({candidate_timestamp} >= {anchor_timestamp} "
+                f"OR {candidate_timestamp} IS NULL "
                 "OR c.metadata LIKE ? ESCAPE '\\' "
                 "OR c.metadata LIKE ? ESCAPE '\\')"
             )
             params = (
-                self.agent_id,
                 row_id,
+                self.agent_id,
                 self.agent_id,
                 spaced_pattern,
                 compact_pattern,
             )
 
         candidates = await self.db.fetchall(
-            "SELECT c.id, c.metadata, c.created_at "
-            "FROM conversation_history c WHERE c.agent_id = ? AND "
+            f"{query_prefix}SELECT c.id, c.metadata, c.created_at "
+            f"FROM {candidate_source} WHERE c.agent_id = ? AND "
             f"{membership_predicate}{del_clause}{archive_clause} "
             "ORDER BY c.id ASC",
             params,
@@ -2164,6 +2174,7 @@ class AsyncConversationStore:
             include_markers=include_markers,
             metadata_index=1,
             created_at_index=2,
+            reject_invalid_timestamps=True,
         )
         return sorted({int(row[0]) for row in session_rows})
 

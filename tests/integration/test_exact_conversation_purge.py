@@ -20,6 +20,7 @@ import pytest
 from kestrel_sovereign.storage import AsyncStorage
 from kestrel_sovereign.storage.async_conversation_store import (
     AsyncConversationStore,
+    ConversationSessionTimestampError,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import TransactionError
@@ -33,6 +34,15 @@ from kestrel_sovereign.storage.lexical_memory_index import (
 class _IndexedMessage:
     row_id: int
     lexical_index_id: str
+
+
+class _CollectingAudit:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def append(self, event: Any) -> int:
+        self.events.append(event)
+        return len(self.events)
 
 
 def _timestamp_value(
@@ -500,6 +510,207 @@ async def test_session_preview_and_hard_purge_are_not_capped_at_ten_thousand(
         )
         == 0
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("anchor_timestamp", "other_timestamp", "other_belongs"),
+    [
+        (
+            "2026-06-01T12:00:00",
+            "2026-06-01 12:01:00",
+            True,
+        ),
+        (
+            "2026-06-01 12:00:00",
+            "2026-06-01T10:00:00",
+            False,
+        ),
+        (
+            "2026-06-01 12:00:00",
+            "2026-06-01T12:01:00Z",
+            True,
+        ),
+        (
+            "2026-06-01T12:00:00Z",
+            "2026-06-01T13:01:00+01:00",
+            True,
+        ),
+    ],
+    ids=[
+        "t-anchor-space-successor",
+        "space-anchor-t-prior-session",
+        "space-anchor-z-successor",
+        "equivalent-offset-successor",
+    ],
+)
+async def test_mixed_sqlite_session_timestamps_keep_every_public_scope_exact(
+    tmp_path,
+    anchor_timestamp,
+    other_timestamp,
+    other_belongs,
+):
+    """Preview, guard, audit, and purge share canonical chronology."""
+    db_path = tmp_path / "mixed-session-timestamps.db"
+    agent_id = f"did:test:mixed-session-timestamps:{uuid4()}"
+    async with AsyncStorage(str(db_path), agent_id=agent_id) as storage:
+        anchor = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="requested legacy-session anchor",
+            created_at=anchor_timestamp,
+        )
+        other = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="mixed-format chronology peer",
+            created_at=other_timestamp,
+        )
+        audit = _CollectingAudit()
+        storage.conversation._destructive_audit = audit
+        session_id = str(anchor.row_id)
+        expected_ids = [anchor.row_id]
+        if other_belongs:
+            expected_ids.append(other.row_id)
+
+        assert (
+            await storage.conversation.count_session_messages(session_id)
+            == len(expected_ids)
+        )
+        assert await storage.conversation.message_belongs_to_session(
+            anchor.row_id,
+            session_id,
+        )
+        assert (
+            await storage.conversation.message_belongs_to_session(
+                other.row_id,
+                session_id,
+            )
+            is other_belongs
+        )
+        assert (
+            await storage.conversation.purge_conversation_session(session_id)
+            == len(expected_ids)
+        )
+
+        assert len(audit.events) == 1
+        assert audit.events[0].row_count == len(expected_ids)
+        assert audit.events[0].scope["message_ids"] == sorted(expected_ids)
+        await _assert_destroyed(storage.db, anchor)
+        if other_belongs:
+            await _assert_destroyed(storage.db, other)
+        else:
+            await _assert_present(storage.db, other)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_implicit_session_gap_boundaries_match_on_both_backends(db_backend):
+    """Exactly 30 minutes belongs; prior and just-over-gap rows do not."""
+    agent_id = f"did:test:session-gap-parity:{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    started_at = datetime(2026, 7, 1, 12, 0, 0)
+    anchor = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="gap-boundary anchor",
+        created_at=started_at,
+    )
+    boundary = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="exactly thirty minutes later",
+        created_at=started_at + timedelta(minutes=30),
+    )
+    following = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="more than thirty minutes after the boundary",
+        created_at=started_at + timedelta(minutes=60, microseconds=1),
+    )
+    prior = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="unrelated prior session",
+        created_at=started_at - timedelta(hours=2),
+    )
+    session_id = str(anchor.row_id)
+
+    assert await storage.conversation.count_session_messages(session_id) == 2
+    assert await storage.conversation.message_belongs_to_session(
+        boundary.row_id,
+        session_id,
+    )
+    assert not await storage.conversation.message_belongs_to_session(
+        following.row_id,
+        session_id,
+    )
+    assert not await storage.conversation.message_belongs_to_session(
+        prior.row_id,
+        session_id,
+    )
+    assert await storage.conversation.purge_conversation_session(session_id) == 2
+    await _assert_destroyed(storage.db, anchor)
+    await _assert_destroyed(storage.db, boundary)
+    await _assert_present(storage.db, following)
+    await _assert_present(storage.db, prior)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("anchor_timestamp", "other_timestamp"),
+    [
+        ("not-a-timestamp", "2026-06-01 12:01:00"),
+        ("2026-06-01 12:00:00", "not-a-timestamp"),
+    ],
+    ids=["invalid-anchor", "invalid-candidate"],
+)
+async def test_malformed_implicit_session_timestamp_fails_before_audit_or_purge(
+    tmp_path,
+    anchor_timestamp,
+    other_timestamp,
+):
+    db_path = tmp_path / "malformed-session-timestamp.db"
+    agent_id = f"did:test:malformed-session-timestamp:{uuid4()}"
+    async with AsyncStorage(str(db_path), agent_id=agent_id) as storage:
+        anchor = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="must not be partially purged",
+            created_at=anchor_timestamp,
+        )
+        other = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="chronology cannot be proven",
+            created_at=other_timestamp,
+        )
+        audit = _CollectingAudit()
+        storage.conversation._destructive_audit = audit
+        session_id = str(anchor.row_id)
+
+        with pytest.raises(
+            ConversationSessionTimestampError,
+            match="invalid created_at timestamp",
+        ):
+            await storage.conversation.count_session_messages(session_id)
+        with pytest.raises(
+            ConversationSessionTimestampError,
+            match="invalid created_at timestamp",
+        ):
+            await storage.conversation.message_belongs_to_session(
+                other.row_id,
+                session_id,
+            )
+        with pytest.raises(
+            ConversationSessionTimestampError,
+            match="invalid created_at timestamp",
+        ):
+            await storage.conversation.purge_conversation_session(session_id)
+
+        assert audit.events == []
+        await _assert_present(storage.db, anchor)
+        await _assert_present(storage.db, other)
 
 
 @pytest.mark.asyncio

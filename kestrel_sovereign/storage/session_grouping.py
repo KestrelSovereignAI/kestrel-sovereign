@@ -15,35 +15,52 @@ plain dicts, and hands them here.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from kestrel_sovereign.kestrel_config.constants import SESSION_GAP_MINUTES
 
 
-def _coerce_timestamp(created_at: Any) -> datetime:
-    """Best-effort parse of a stored ``created_at`` into a datetime.
+def coerce_session_timestamp(created_at: Any) -> Optional[datetime]:
+    """Parse a stored timestamp into one comparable naive-UTC datetime.
 
     Mirrors the lenient parsing the conversations endpoint has always used:
-    accept datetimes as-is, try a handful of string formats, and fall back to
-    ISO parsing. Returns ``None`` only when there is genuinely nothing to parse;
-    callers substitute their own clock in that case.
+    accept datetimes as-is, try the historical SQL/ISO string formats, and
+    fall back to :meth:`datetime.fromisoformat` for ``Z``/offset-bearing values.
+
+    SQLite conversation history legitimately contains a mixture of naive SQL
+    timestamps and ISO-8601 values.  Treat naive values as UTC and normalize
+    aware values to naive UTC so sorting and gap arithmetic can never raise on
+    an aware/naive mixture.  ``None`` means chronology cannot be established;
+    presentation callers may substitute a clock, while destructive callers
+    must fail closed.
     """
+    parsed: Optional[datetime]
     if isinstance(created_at, datetime):
-        return created_at
-    if created_at is None:
-        return None
-    if isinstance(created_at, str):
+        parsed = created_at
+    elif isinstance(created_at, str):
+        parsed = None
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
             try:
-                return datetime.strptime(created_at, fmt)
+                parsed = datetime.strptime(created_at, fmt)
+                break
             except ValueError:
                 continue
-        try:
-            return datetime.fromisoformat(created_at)
-        except ValueError:
-            return None
-    return None
+        if parsed is None:
+            try:
+                parsed = datetime.fromisoformat(
+                    created_at[:-1] + "+00:00"
+                    if created_at.endswith("Z")
+                    else created_at
+                )
+            except ValueError:
+                return None
+    else:
+        return None
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def group_messages_into_sessions(
@@ -126,7 +143,11 @@ def group_messages_into_sessions(
         if not isinstance(meta, dict):
             meta = {}
 
-        timestamp = _coerce_timestamp(msg.get("created_at")) or now or datetime.now()
+        timestamp = (
+            coerce_session_timestamp(msg.get("created_at"))
+            or coerce_session_timestamp(now)
+            or datetime.now(timezone.utc).replace(tzinfo=None)
+        )
 
         is_new_session_marker = bool(meta.get("new_session"))
         meta_session_id = None
