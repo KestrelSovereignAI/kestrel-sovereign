@@ -3211,6 +3211,25 @@ Expected Duration: {expected_duration}
         # as a pre-existing memory. The user message is stored after context
         # assembly (below).
         constitution = await self._get_governing_constitution()
+
+        # FAIL CLOSED (#2463 review): `_get_governing_constitution()` returns
+        # error-sentinel strings ("Error: ...") when the anchored constitution
+        # cannot be retrieved/anchored. Those are non-empty strings but NOT a
+        # constitution body — proceeding would send the model the error text in
+        # place of the governing constitution. Refuse the turn rather than issue
+        # the model call, matching the signal dispatcher and streaming path.
+        if isinstance(constitution, str) and constitution.lstrip().startswith("Error:"):
+            logging.error(
+                "process_input refused: _get_governing_constitution returned an "
+                "error sentinel (%s); not issuing the model call without a "
+                "governing constitution.",
+                constitution,
+            )
+            return (
+                "I cannot continue this turn safely: my governing constitution "
+                "could not be loaded. Please verify system integrity."
+            )
+
         try:
             history = await self.privacy_agent.get_conversation_history(limit=50, session_id=session_id)
             logging.debug(

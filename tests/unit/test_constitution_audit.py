@@ -1,6 +1,7 @@
 """Unit tests for periodic constitution audit enforcement."""
 import pytest
 import asyncio
+import hashlib
 import os
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -254,3 +255,319 @@ async def test_audit_lazy_initialization():
     assert hasattr(agent, '_last_audit_time')
     assert agent._interaction_count == 1
     assert isinstance(agent._last_audit_time, datetime)
+
+
+# ---------------------------------------------------------------------------
+# Governing-constitution resolver (#2463)
+#
+# These tests exercise the real single-source resolver and real hashes — the
+# thing inception anchors and the periodic audit recomputes. They must NOT
+# mock the resolver or the verifier.
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_reads_packaged_governing_source_not_docs():
+    """The resolver hashes the packaged governing bytes, not the docs copy.
+
+    Regression for #2463: the periodic verifier used to hash
+    ``docs/principles/KESTREL_CONSTITUTION.md`` (which carries OKF YAML
+    frontmatter) while inception anchored the packaged
+    ``kestrel_sovereign/data/KESTREL_CONSTITUTION.md``. Their hashes differ, so
+    an untampered agent could enter Safe Mode.
+    """
+    from kestrel_sovereign.config import CONSTITUTION_PATH
+    from kestrel_sovereign.constitution.resolver import (
+        governing_constitution_path,
+        resolve_governing_constitution_bytes,
+    )
+
+    assert governing_constitution_path() == CONSTITUTION_PATH
+    # The governing source lives under the package's data/ dir, not docs/.
+    assert os.path.join("data", "KESTREL_CONSTITUTION.md") in CONSTITUTION_PATH
+
+    resolved = resolve_governing_constitution_bytes()
+    with open(CONSTITUTION_PATH, "rb") as f:
+        assert resolved == f.read()
+
+    # Documentation-only frontmatter must not match the governing bytes: if the
+    # docs copy exists it is a *different* byte stream, and the resolver never
+    # returns it.
+    docs_path = "docs/principles/KESTREL_CONSTITUTION.md"
+    if os.path.exists(docs_path):
+        with open(docs_path, "rb") as f:
+            docs_bytes = f.read()
+        if docs_bytes.startswith(b"---\n"):
+            # A frontmatter-wrapped docs copy hashes differently — proving the
+            # resolver would false-mismatch if it read the docs file.
+            assert hashlib.sha256(docs_bytes).hexdigest() != hashlib.sha256(
+                resolved
+            ).hexdigest()
+
+
+def test_resolver_renders_active_amendment_viii():
+    """An active emancipation contract yields the rendered active governing form."""
+    from kestrel_sovereign.constitution.emancipation import EmancipationContract
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    dormant = resolve_governing_constitution_bytes()
+    active = resolve_governing_constitution_bytes(
+        EmancipationContract(
+            enabled=True,
+            terms="This Executor earns sovereignty by demonstrating fidelity.",
+        )
+    )
+
+    assert active != dormant
+    assert b"This Executor earns sovereignty by demonstrating fidelity." in active
+    # A dormant/None contract is a no-op — same bytes as no contract.
+    assert (
+        resolve_governing_constitution_bytes(
+            EmancipationContract(enabled=False)
+        )
+        == dormant
+    )
+
+
+def test_resolver_missing_path_raises_file_not_found():
+    """A missing governing source surfaces as FileNotFoundError for callers."""
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        resolve_governing_constitution_bytes(
+            constitution_path="/nonexistent/KESTREL_CONSTITUTION.md"
+        )
+
+
+def test_resolver_empty_source_fails_closed(tmp_path):
+    """An empty/ambiguous governing source must FAIL CLOSED, not hash to a digest.
+
+    #2463 review: the resolver must never hand back blank bytes that would hash
+    to a spurious "valid" digest. A blank authoritative source is treated as
+    unreadable/ambiguous and raises.
+    """
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    empty = tmp_path / "KESTREL_CONSTITUTION.md"
+    empty.write_bytes(b"   \n\n\t  ")  # whitespace only
+    with pytest.raises(ValueError):
+        resolve_governing_constitution_bytes(constitution_path=str(empty))
+
+
+def test_resolver_unreadable_source_fails_closed(tmp_path):
+    """A permission-denied governing source raises (OSError), never returns bytes."""
+    if os.name == "nt" or os.geteuid() == 0:  # pragma: no cover - env dependent
+        pytest.skip("chmod-based permission denial is unreliable as root / on Windows")
+
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+
+    src = tmp_path / "KESTREL_CONSTITUTION.md"
+    src.write_bytes(b"Kestrel Constitution\n")
+    os.chmod(src, 0o000)
+    try:
+        with pytest.raises(OSError):
+            resolve_governing_constitution_bytes(constitution_path=str(src))
+    finally:
+        os.chmod(src, 0o644)
+
+
+def test_cli_verify_install_does_not_incept_docs_constitution():
+    """cli_verify_install must not seed inception from the docs copy (#2463).
+
+    The installer /health bootstrap must let inception default to the shared
+    resolver's packaged governing source. Passing docs/principles/
+    KESTREL_CONSTITUTION.md (OKF-frontmatter-wrapped) would incept a hash the
+    periodic audit can never match.
+    """
+    import inspect
+    from kestrel_sovereign import cli_verify_install
+
+    # Strip comment lines — an explanatory comment MAY name the docs path; what
+    # matters is that no executable code seeds inception from it.
+    code_lines = []
+    for line in inspect.getsource(cli_verify_install).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        code_lines.append(line)
+    code = "\n".join(code_lines)
+
+    assert "docs/principles/KESTREL_CONSTITUTION.md" not in code, (
+        "verify-install must not incept the docs constitution copy"
+    )
+    assert 'docs" / "principles"' not in code, (
+        "verify-install must not build a docs constitution path"
+    )
+
+
+def test_is_authoritative_governing_source(monkeypatch, tmp_path):
+    """The authoritative-source seam accepts the packaged path (and None) only.
+
+    #2463 review: inception / offline-reanchor must refuse non-authoritative
+    overrides. ``None`` (use the default) and any path that realpath-matches
+    ``config.CONSTITUTION_PATH`` are authoritative; everything else is not.
+    Tests express a custom governing source by monkeypatching
+    ``config.CONSTITUTION_PATH``.
+    """
+    from kestrel_sovereign.constitution.resolver import (
+        governing_constitution_path,
+        is_authoritative_governing_source,
+    )
+
+    # None → use the default → authoritative.
+    assert is_authoritative_governing_source(None) is True
+    # The current packaged path is authoritative.
+    assert is_authoritative_governing_source(governing_constitution_path()) is True
+    # An arbitrary other path is NOT authoritative.
+    rogue = tmp_path / "rogue.md"
+    rogue.write_bytes(b"nope")
+    assert is_authoritative_governing_source(str(rogue)) is False
+
+    # Monkeypatching config.CONSTITUTION_PATH makes THAT file authoritative —
+    # the seam the review prescribes for legitimate custom governing sources.
+    custom = tmp_path / "custom_governing.md"
+    custom.write_bytes(b"Kestrel Constitution\n")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(custom)
+    )
+    assert is_authoritative_governing_source(str(custom)) is True
+    # ...and the previously-packaged path is now non-authoritative.
+    assert is_authoritative_governing_source(str(rogue)) is False
+
+
+# ---------------------------------------------------------------------------
+# Three-proof integrity verifier regressions (#2463 review matrix).
+#
+# `_verify_constitution_integrity` must fail closed on every tamper class:
+# missing anchor, missing blob row, undecryptable/corrupt blob, blob-digest
+# mismatch, and a missing or mis-targeted governed_by edge — and only pass
+# when the blob, the edge, AND live-source parity all hold.
+# ---------------------------------------------------------------------------
+
+def _verifier_agent(constitution_bytes: bytes, anchor: str | None):
+    """Mock agent wired so each proof of the real verifier can be failed
+    independently. Defaults to the all-good state; tests break one leg."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    agent = MagicMock(spec=KestrelAgent)
+    agent.agent_id = "did:web:test:agent"
+    agent.verify_constitution_overlay = AsyncMock(return_value=(True, "ok"))
+    agent._verify_spawn_mandate_constraints = AsyncMock(return_value=(True, "ok"))
+
+    node = MagicMock()
+    node.properties = {}
+    if anchor is not None:
+        node.properties["constitution_hash"] = anchor
+
+    edge = MagicMock()
+    edge.label = "governed_by"
+    edge.target_id = anchor
+
+    agent.storage = MagicMock()
+    agent.storage.get_node = AsyncMock(return_value=node)
+    agent.storage.retrieve_file = AsyncMock(return_value=constitution_bytes)
+    agent.storage.get_edges_from = AsyncMock(return_value=[edge])
+
+    agent._verify_constitution_integrity = (
+        ConstitutionMixin._verify_constitution_integrity.__get__(agent, KestrelAgent)
+    )
+    return agent, node, edge
+
+
+@pytest.fixture
+def governing_source(tmp_path, monkeypatch):
+    """Point the packaged governing source at a known tmp file."""
+    import kestrel_sovereign.config as ks_config
+
+    content = b"# Test governing constitution\n\nBe honest.\n"
+    path = tmp_path / "KESTREL_CONSTITUTION.md"
+    path.write_bytes(content)
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(path))
+    return content, hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_verifier_passes_when_all_three_proofs_hold(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert ok, msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_missing_anchor(governing_source):
+    content, _ = governing_source
+    agent, _, _ = _verifier_agent(content, anchor=None)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "No anchored constitution hash" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_missing_blob_row(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    agent.storage.retrieve_file = AsyncMock(return_value=None)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "missing" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_undecryptable_blob(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    agent.storage.retrieve_file = AsyncMock(side_effect=ValueError("bad decrypt"))
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "retrieve/decrypt" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_blob_digest_mismatch(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(b"tampered blob bytes", anchor)
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "does not hash to its stored anchor" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_missing_governance_edge(governing_source):
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    agent.storage.get_edges_from = AsyncMock(return_value=[])
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "governed_by" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_mistargeted_governance_edge(governing_source):
+    content, anchor = governing_source
+    agent, _, edge = _verifier_agent(content, anchor)
+    edge.target_id = "0" * 64  # points at some other document
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "governed_by" in msg
+
+
+@pytest.mark.asyncio
+async def test_verifier_fails_closed_on_governing_source_mutation(governing_source, tmp_path):
+    """Blob+edge intact but the packaged governing source changed → PROOF 3 fails."""
+    content, anchor = governing_source
+    agent, _, _ = _verifier_agent(content, anchor)
+    import kestrel_sovereign.config as ks_config
+    from pathlib import Path
+
+    Path(ks_config.CONSTITUTION_PATH).write_bytes(b"# Mutated governing source\n")
+    ok, msg = await agent._verify_constitution_integrity()
+    assert not ok
+    assert "modified" in msg
