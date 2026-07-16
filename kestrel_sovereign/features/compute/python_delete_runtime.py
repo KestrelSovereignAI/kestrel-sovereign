@@ -136,6 +136,13 @@ def install_safe_delete_runtime(
         is_symlink = lexical.is_symlink()
         resolved = lexical.resolve(strict=False)
         assert_agent_data_allowed(resolved, "delete")
+        if is_symlink:
+            # Deleting a symlink moves the entry itself, so its physical
+            # location must be authorized too, not only the followed target:
+            # a link parked inside another agent's data would otherwise
+            # escape that directory through its own removal.
+            entry = lexical.parent.resolve(strict=False) / lexical.name
+            assert_agent_data_allowed(entry, "delete")
         return lexical, resolved, is_symlink
 
     def move_to_trash(lexical: _Path, resolved: _Path, is_symlink: bool) -> None:
