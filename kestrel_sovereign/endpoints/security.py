@@ -503,12 +503,23 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
         "approved": data.approved,
         "scope": data.scope,
         "persisted": decision.persisted,
+        # True when the original tool-call awaiter had already been cancelled
+        # (Cloud Run request timeout, SSE disconnect, client abort). The scope
+        # rule was still recorded for future calls, but THIS call is orphaned —
+        # the frontend should tell the user to retry it. (#2558)
+        "awaiter_gone": decision.awaiter_gone,
     }
     if decision.error is not None:
         result["warning"] = (
             "Decision was accepted in memory, but durable persistence failed"
         )
         result["persistence_error"] = decision.error
+    if decision.awaiter_gone:
+        result["warning"] = (
+            "Your decision was recorded and will apply to future calls, but "
+            "the original request had already been cancelled — re-run the "
+            "action to complete it now."
+        )
     # Only present when a rule was actually remembered.
     if remembered is not None:
         result["remembered"] = remembered

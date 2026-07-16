@@ -207,6 +207,7 @@ def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()
             "approved": True,
             "scope": "session",
             "persisted": True,
+            "awaiter_gone": False,
         }
         security_feature.approval_queue.submit_decision.assert_awaited_once_with(
             "req-1", True, "session"
@@ -216,6 +217,36 @@ def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()
         assert cancel_all_response.json()["cancelled"] == 3
         assert reset_response.status_code == 200
         security_feature.permission_store.clear_session_overrides.assert_called_once_with()
+    finally:
+        _restore_app(app, original)
+
+
+def test_security_approve_serializes_awaiter_gone_flag():
+    # When the queue reports the awaiter had already been cancelled, the
+    # /api/security/approve response must surface awaiter_gone + a retry
+    # warning so the console can prompt the user (#2558).
+    security_feature = _make_security_feature()
+    security_feature.approval_queue.submit_decision.return_value = DecisionResult(
+        in_memory=True,
+        persisted=True,
+        awaiter_gone=True,
+    )
+    agent = MagicMock(features={"SecurityFeature": security_feature})
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/security/approve",
+                    headers=_api_headers(),
+                    json={"approval_id": "req-1", "approved": True, "scope": "session"},
+                )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is True
+        assert body["awaiter_gone"] is True
+        assert "re-run" in body["warning"]
     finally:
         _restore_app(app, original)
 

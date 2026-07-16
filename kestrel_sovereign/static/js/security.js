@@ -387,10 +387,21 @@ export const Security = {
 
             if (response.success) {
                 if (!options.suppressToast) {
-                    Toast.success(approved
-                        ? `Approved (${scope})`
-                        : 'Denied'
-                    );
+                    if (response.awaiter_gone) {
+                        // The in-flight tool call had already been cancelled
+                        // (Cloud Run timeout / SSE disconnect). The scope rule
+                        // was recorded for future calls, but this call is
+                        // orphaned — prompt the user to re-run it (#2558).
+                        Toast.warning(approved
+                            ? `Approved (${scope}), but the original request had timed out — re-run the action to complete it.`
+                            : 'Recorded, but the original request had already ended.'
+                        );
+                    } else {
+                        Toast.success(approved
+                            ? `Approved (${scope})`
+                            : 'Denied'
+                        );
+                    }
                 }
             } else {
                 if (!options.suppressToast) {

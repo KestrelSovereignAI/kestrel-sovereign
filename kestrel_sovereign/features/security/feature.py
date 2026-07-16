@@ -784,6 +784,33 @@ class SecurityFeature(Feature):
                 data={"request_id": full_id, "decision_attempted": "approved"},
             )
 
+        # The original tool-call awaiter had already been cancelled (Cloud Run
+        # request timeout / SSE disconnect / abort). The scope rule was still
+        # recorded for future calls, but THIS call is orphaned — report a
+        # partial so the caller knows the approval didn't resume anything and
+        # the action must be re-run. (#2558)
+        if decision.awaiter_gone:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Recorded approval of {request_id[:8]} ({scope}), but the "
+                    "original request had already been cancelled — re-run the "
+                    "action to complete it now."
+                ),
+                error=(
+                    "The tool call awaiting this approval had already ended "
+                    "(timeout/disconnect); the scope rule applies to future "
+                    "calls but this call is orphaned."
+                ),
+                data={
+                    "request_id": full_id,
+                    "scope": scope,
+                    "decision": "approved",
+                    "scope_persisted": decision.persisted,
+                    "awaiter_gone": True,
+                    "persistence_error": decision.error,
+                },
+            )
+
         if decision.persisted:
             return ToolResult.ok(
                 confirmation=f"Approved {request_id[:8]} ({scope})",
@@ -792,6 +819,7 @@ class SecurityFeature(Feature):
                     "scope": scope,
                     "decision": "approved",
                     "scope_persisted": True,
+                    "awaiter_gone": False,
                 },
             )
         return ToolResult.partial(
@@ -808,6 +836,7 @@ class SecurityFeature(Feature):
                 "scope": scope,
                 "decision": "approved",
                 "scope_persisted": False,
+                "awaiter_gone": False,
                 "persistence_error": decision.error,
             },
         )
@@ -851,6 +880,10 @@ class SecurityFeature(Feature):
                     "request_id": full_id,
                     "decision": "user_denied",
                     "scope_persisted": True,
+                    # The awaiter may already be gone (the call ended before
+                    # the deny landed); harmless for a denial, but surfaced so
+                    # callers can distinguish it. (#2558)
+                    "awaiter_gone": decision.awaiter_gone,
                 },
             )
         if decision.in_memory:
@@ -864,6 +897,7 @@ class SecurityFeature(Feature):
                     "request_id": full_id,
                     "decision": "user_denied",
                     "scope_persisted": False,
+                    "awaiter_gone": decision.awaiter_gone,
                     "persistence_error": decision.error,
                 },
             )
