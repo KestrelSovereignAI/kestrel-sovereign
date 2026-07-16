@@ -463,6 +463,100 @@ async def test_postgres_session_and_full_purge_share_one_row_lock_order(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_session_preview_and_hard_purge_are_not_capped_at_ten_thousand(
+    db_backend,
+):
+    """The public success count must cover the complete permanent deletion."""
+    agent_id = f"did:test:purge-large-session:{uuid4()}"
+    session_id = f"session-{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    row_count = 10_001
+    started_at = datetime(2026, 7, 1, 12, 0, 0)
+    await storage.db.execute_many(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                agent_id,
+                "user",
+                f"large session row {index}",
+                json.dumps({"session_id": session_id}),
+                _timestamp_value(
+                    storage.db,
+                    started_at + timedelta(microseconds=index),
+                ),
+            )
+            for index in range(row_count)
+        ],
+    )
+
+    assert await storage.conversation.count_session_messages(session_id) == row_count
+    assert await storage.conversation.purge_conversation_session(session_id) == row_count
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+            (agent_id,),
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_session_insert_after_membership_snapshot_survives_unaudited(
+    db_backend,
+    monkeypatch,
+):
+    """The exact-ID phase cannot absorb a later matching session row."""
+    agent_id = f"did:test:purge-session-snapshot:{uuid4()}"
+    session_id = f"session-{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    target = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="present in membership snapshot",
+        session_id=session_id,
+    )
+    events: list[Any] = []
+
+    class _RecordingAudit:
+        async def append(self, event: Any) -> int:
+            events.append(event)
+            return len(events)
+
+    storage.conversation._destructive_audit = _RecordingAudit()
+    original_resolver = storage.conversation._get_complete_session_message_ids
+    inserted: _IndexedMessage | None = None
+
+    async def insert_after_snapshot(*args, **kwargs):
+        nonlocal inserted
+        snapshot_ids = await original_resolver(*args, **kwargs)
+        inserted = await _seed_indexed_message(
+            storage.db,
+            agent_id,
+            content="committed after membership snapshot",
+            session_id=session_id,
+        )
+        return snapshot_ids
+
+    monkeypatch.setattr(
+        storage.conversation,
+        "_get_complete_session_message_ids",
+        insert_after_snapshot,
+    )
+
+    assert await storage.conversation.purge_conversation_session(session_id) == 1
+    assert inserted is not None
+    await _assert_destroyed(storage.db, target)
+    await _assert_present(storage.db, inserted)
+    assert len(events) == 1
+    assert events[0].row_count == 1
+    assert events[0].scope["message_ids"] == [target.row_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_concurrent_backfills_reclaim_the_final_shared_key(
     db_backend, monkeypatch
 ):

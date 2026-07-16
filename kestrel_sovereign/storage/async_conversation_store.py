@@ -18,7 +18,7 @@ import struct
 import uuid
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
@@ -48,9 +48,21 @@ CURRENT_KEY_VERSION = 1
 # ceiling (999).  PostgreSQL permits much larger statements, but sharing one
 # conservative batch size keeps the destructive path backend-neutral.
 _EXACT_PURGE_BATCH_SIZE = 500
-_PURGE_SELECT_COLUMNS = (
-    "id, role, content, metadata, created_at, deleted_at, lexical_index_id"
+_PURGE_SELECT_PLACEHOLDER = "__KESTREL_PURGE_SELECT_COLUMNS__"
+_PURGE_BASE_SELECT_COLUMNS = (
+    "id, role, content, metadata, created_at, deleted_at"
 )
+_PURGE_LEXICAL_SELECT_COLUMNS = (
+    f"{_PURGE_BASE_SELECT_COLUMNS}, lexical_index_id"
+)
+_PURGE_NO_LEXICAL_SELECT_COLUMNS = (
+    f"{_PURGE_BASE_SELECT_COLUMNS}, "
+    "CAST(NULL AS TEXT) AS lexical_index_id"
+)
+
+
+class ConversationLexicalSchemaError(RuntimeError):
+    """The history/token-table halves of the lexical schema disagree."""
 
 
 def _escape_like_session_value(session_id: str) -> str:
@@ -497,13 +509,109 @@ class AsyncConversationStore:
             )
         )
 
+    async def _conversation_lexical_purge_capability(self) -> tuple[str, bool]:
+        """Return the safe purge projection and whether token cleanup exists.
+
+        The #2339 lexical migration is deliberately non-fatal at startup.  A
+        database may therefore have neither additive schema piece while still
+        supporting ordinary conversation reads and hard deletion.  In that
+        state there cannot be lexical-token residue, so the purge snapshot uses
+        a typed NULL owner column instead of referencing a column that is not
+        present.
+
+        The inverse partial state is unsafe: if the token table exists without
+        ``conversation_history.lexical_index_id``, ownership cannot be proven.
+        Fail before audit or deletion rather than destroying history while
+        leaving possibly-sensitive token rows behind.
+        """
+        if self.db.backend_type == "postgres":
+            lexical_tokens_available = bool(
+                await self.db.fetchval(
+                    "SELECT to_regclass(?) IS NOT NULL",
+                    ("conversation_lexical_tokens",),
+                )
+            )
+            lexical_owner_column_available = bool(
+                await self.db.fetchval(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM pg_attribute "
+                    "WHERE attrelid = to_regclass(?) AND attname = ? "
+                    "AND attnum > 0 AND NOT attisdropped)",
+                    ("conversation_history", "lexical_index_id"),
+                )
+            )
+        else:
+            lexical_tokens_available = await self.db.table_exists(
+                "conversation_lexical_tokens"
+            )
+            lexical_owner_column_available = bool(
+                await self.db.fetchone(
+                    "SELECT 1 FROM pragma_table_info('conversation_history') "
+                    "WHERE name = ? LIMIT 1",
+                    ("lexical_index_id",),
+                )
+            )
+
+        if lexical_tokens_available and not lexical_owner_column_available:
+            raise ConversationLexicalSchemaError(
+                "conversation_lexical_tokens exists but "
+                "conversation_history.lexical_index_id is absent; refusing "
+                "hard purge because lexical-token ownership cannot be proven"
+            )
+
+        if not lexical_tokens_available:
+            return _PURGE_NO_LEXICAL_SELECT_COLUMNS, False
+        return _PURGE_LEXICAL_SELECT_COLUMNS, True
+
+    def _exact_id_purge_queries(
+        self,
+        message_ids: Sequence[int],
+    ) -> list[Tuple[str, tuple[Any, ...]]]:
+        """Build bounded, globally-ascending selectors for exact IDs."""
+        ordered_ids = sorted({int(message_id) for message_id in message_ids})
+        queries: list[Tuple[str, tuple[Any, ...]]] = []
+        for start in range(0, len(ordered_ids), _EXACT_PURGE_BATCH_SIZE):
+            batch = ordered_ids[start : start + _EXACT_PURGE_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            queries.append(
+                (
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} "
+                    "FROM conversation_history "
+                    f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                    "ORDER BY id ASC",
+                    (self.agent_id, *batch),
+                )
+            )
+        return queries
+
+    @staticmethod
+    def _render_purge_queries(
+        selection_queries: Sequence[Tuple[str, tuple[Any, ...]]],
+        projection: str,
+    ) -> list[Tuple[str, tuple[Any, ...]]]:
+        """Materialize capability-aware purge projections exactly once."""
+        rendered = []
+        for query, params in selection_queries:
+            if query.count(_PURGE_SELECT_PLACEHOLDER) != 1:
+                raise ValueError(
+                    "Hard-purge selectors must contain exactly one canonical "
+                    "projection placeholder"
+                )
+            rendered.append(
+                (query.replace(_PURGE_SELECT_PLACEHOLDER, projection), params)
+            )
+        return rendered
+
     async def _purge_conversation_rows(
         self,
-        selection_queries: Sequence[Tuple[str, tuple[Any, ...]]],
+        selection_queries: Optional[Sequence[Tuple[str, tuple[Any, ...]]]],
         *,
         operation_type: str,
         scope: dict[str, Any],
         reason: str,
+        resolve_message_ids: Optional[
+            Callable[[], Awaitable[Sequence[int]]]
+        ] = None,
     ) -> int:
         """Audit and atomically destroy one immutable message-id snapshot.
 
@@ -523,13 +631,28 @@ class AsyncConversationStore:
         global row-lock order shared with lexical backfill; violating it can
         deadlock an overlapping privacy purge.
         """
-        lexical_tokens_available = await self.db.table_exists(
-            "conversation_lexical_tokens"
-        )
+        if (selection_queries is None) == (resolve_message_ids is None):
+            raise ValueError(
+                "Provide either hard-purge selection queries or one exact-ID "
+                "resolver"
+            )
+
+        # Surface a static partial schema as the domain-specific error rather
+        # than letting the database transaction wrapper obscure it. The state
+        # is re-read under the destructive transaction's writer/DDL boundary
+        # below so a concurrent startup migration cannot stale this decision.
+        await self._conversation_lexical_purge_capability()
         audit_error: Optional[Exception] = None
         purged = 0
         async with self.db.transaction():
-            if self.db.backend_type == "sqlite":
+            if self.db.backend_type == "postgres":
+                # The lexical migration ALTERs conversation_history before it
+                # creates token storage. Hold its DDL boundary while resolving
+                # capabilities and deleting the immutable row snapshot.
+                await self.db.execute(
+                    "LOCK TABLE conversation_history IN ACCESS SHARE MODE"
+                )
+            else:
                 # SQLite's default BEGIN is deferred.  Reserve the writer slot
                 # before reading the audit snapshot so another connection
                 # cannot replace a selected row's bytes while the external
@@ -538,8 +661,30 @@ class AsyncConversationStore:
                     "UPDATE conversation_history SET id = id WHERE 0"
                 )
 
+            projection, lexical_tokens_available = (
+                await self._conversation_lexical_purge_capability()
+            )
+
+            active_scope = dict(scope)
+            active_queries = selection_queries
+            if resolve_message_ids is not None:
+                resolved_ids = sorted(
+                    {
+                        int(message_id)
+                        for message_id in await resolve_message_ids()
+                    }
+                )
+                if not resolved_ids:
+                    return 0
+                active_scope["message_ids"] = resolved_ids
+                active_queries = self._exact_id_purge_queries(resolved_ids)
+
+            rendered_queries = self._render_purge_queries(
+                active_queries or (), projection
+            )
+
             rows_by_id: dict[int, tuple[Any, ...]] = {}
-            for query, params in selection_queries:
+            for query, params in rendered_queries:
                 if self.db.backend_type == "postgres":
                     query = f"{query.rstrip()} FOR UPDATE"
                 for row in await self.db.fetchall(query, params):
@@ -561,7 +706,7 @@ class AsyncConversationStore:
                 await self._audit_destructive_operation(
                     operation_type=operation_type,
                     rows=snapshot,
-                    scope=scope,
+                    scope=active_scope,
                     reason=reason,
                 )
             except Exception as error:
@@ -1747,6 +1892,101 @@ class AsyncConversationStore:
             session_id, limit, include_archived=False
         )
 
+    @staticmethod
+    def _filter_session_rows(
+        rows: Sequence[tuple],
+        session_id: str,
+        *,
+        limit: Optional[int],
+        include_markers: bool,
+        metadata_index: int = 3,
+        created_at_index: int = 4,
+    ) -> List[tuple]:
+        """Apply the canonical time-gap/resumption rules to candidate rows.
+
+        Display reads and exact lifecycle snapshots deliberately share this
+        one filter.  The exact-ID path selects only ``id``/``metadata``/
+        ``created_at`` and supplies the corresponding indexes so unbounded
+        privacy purges do not materialize encrypted message bodies merely to
+        resolve membership.
+        """
+        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
+
+        def parse_timestamp(value: Any) -> datetime:
+            if isinstance(value, str):
+                for fmt in (
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S.%f",
+                ):
+                    try:
+                        return datetime.strptime(value, fmt)
+                    except ValueError:
+                        continue
+                return datetime.now()
+            if isinstance(value, datetime):
+                return value
+            return datetime.now()
+
+        seen_ids: set[int] = set()
+        candidates: list[tuple[datetime, int, tuple]] = []
+        for row in rows:
+            row_id = int(row[0])
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            candidates.append(
+                (parse_timestamp(row[created_at_index]), row_id, row)
+            )
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+
+        session_rows = []
+        last_timestamp: Optional[datetime] = None
+        is_first = True
+        session_id_str = str(session_id)
+
+        for timestamp, _row_id, row in candidates:
+            metadata_json = row[metadata_index]
+            meta: dict[str, Any] = {}
+            if metadata_json:
+                try:
+                    meta = json.loads(metadata_json)
+                except json.JSONDecodeError as error:
+                    logger.warning(
+                        "Failed to parse metadata for message in session %s: %s",
+                        session_id,
+                        error,
+                    )
+
+            is_resumed_message = meta.get("session_id") == session_id_str
+
+            if not is_first and not is_resumed_message and meta.get("new_session"):
+                break
+
+            if last_timestamp and not is_resumed_message:
+                gap_minutes = (
+                    timestamp - last_timestamp
+                ).total_seconds() / 60
+                if gap_minutes > SESSION_GAP_MINUTES:
+                    # It belongs to a later implicit session. Keep scanning for
+                    # explicit resumptions of the requested session.
+                    continue
+
+            if not include_markers and meta.get("type") == "session_marker":
+                last_timestamp = timestamp
+                is_first = False
+                continue
+
+            session_rows.append(row)
+            last_timestamp = timestamp
+            is_first = False
+
+            if limit is not None and len(session_rows) >= limit:
+                break
+
+        # Match the historical newest-first raw-row contract.
+        return list(reversed(session_rows))
+
     async def _get_session_messages(
         self,
         session_id: str,
@@ -1789,8 +2029,6 @@ class AsyncConversationStore:
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
         archive_clause = "" if include_archived else " AND archived_at IS NULL"
-        from datetime import datetime
-        from kestrel_sdk.config.constants import SESSION_GAP_MINUTES
 
         # Try to interpret session_id as a message ID for time-based grouping.
         # If it isn't (e.g. a UUID-based implicit session_id), skip this path
@@ -1848,92 +2086,86 @@ class AsyncConversationStore:
             (self.agent_id, f'%"session_id":"{esc}"%', limit)
         )
 
-        # Merge resumed rows (dedupe by id)
-        seen_ids = set()
-        merged_rows = []
-        for row in all_rows + resumed_rows + resumed_rows_alt:
-            if row[0] not in seen_ids:
-                seen_ids.add(row[0])
-                merged_rows.append(row)
+        return self._filter_session_rows(
+            [*all_rows, *resumed_rows, *resumed_rows_alt],
+            session_id,
+            limit=limit,
+            include_markers=include_markers,
+        )
 
-        # Sort by created_at
-        merged_rows.sort(key=lambda r: r[4] or '')
+    async def _get_complete_session_message_ids(
+        self,
+        session_id: str,
+        *,
+        deleted_filter: str = "all",
+        include_markers: bool = True,
+        include_archived: bool = True,
+    ) -> list[int]:
+        """Resolve one uncapped session-membership snapshot in one statement.
 
-        # Filter to only include messages in this session
-        session_rows = []
-        last_timestamp = None
-        is_first = True
-        session_id_str = str(session_id)
+        A one-statement candidate read gives PostgreSQL one READ COMMITTED
+        snapshot; splitting the spaced/minified metadata forms across separate
+        queries could otherwise admit an insert between them.  Hard purge calls
+        this inside its destructive transaction, then locks the immutable ID
+        set in bounded ascending batches.  SQLite reserves its writer slot
+        before this query, so its snapshot cannot race a concurrent writer.
 
-        for row in merged_rows:
-            created_at = row[4]
-            metadata_json = row[3]
+        Only fields needed by the shared grouping algorithm are materialized;
+        encrypted message bodies remain untouched even for very large sessions.
+        """
+        del_clause = self._deleted_filter_clause(deleted_filter).replace(
+            "deleted_at", "c.deleted_at"
+        )
+        archive_clause = (
+            "" if include_archived else " AND c.archived_at IS NULL"
+        )
+        escaped_session_id = _escape_like_session_value(session_id)
+        spaced_pattern = f'%"session_id": "{escaped_session_id}"%'
+        compact_pattern = f'%"session_id":"{escaped_session_id}"%'
+        row_id = coerce_persistent_message_id(session_id)
 
-            # Parse timestamp
-            if isinstance(created_at, str):
-                for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S.%f']:
-                    try:
-                        timestamp = datetime.strptime(created_at, fmt)
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    timestamp = datetime.now()
-            elif created_at:
-                timestamp = created_at
-            else:
-                timestamp = datetime.now()
+        if row_id is None:
+            membership_predicate = (
+                "(c.metadata LIKE ? ESCAPE '\\' "
+                "OR c.metadata LIKE ? ESCAPE '\\')"
+            )
+            params: tuple[Any, ...] = (
+                self.agent_id,
+                spaced_pattern,
+                compact_pattern,
+            )
+        else:
+            membership_predicate = (
+                "(c.created_at >= ("
+                "SELECT anchor.created_at FROM conversation_history anchor "
+                "WHERE anchor.id = ? AND anchor.agent_id = ?) "
+                "OR c.metadata LIKE ? ESCAPE '\\' "
+                "OR c.metadata LIKE ? ESCAPE '\\')"
+            )
+            params = (
+                self.agent_id,
+                row_id,
+                self.agent_id,
+                spaced_pattern,
+                compact_pattern,
+            )
 
-            # Check if this message explicitly belongs to this session (resumed)
-            is_resumed_message = False
-            if metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                    if meta.get('session_id') == session_id_str:
-                        is_resumed_message = True
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for message in session {session_id}: {e}")
-
-            # Check for new_session marker (skip after first message, but not for resumed)
-            if not is_first and not is_resumed_message and metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                    if meta.get('new_session'):
-                        break
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for new_session check: {e}")
-
-            # Check time gap (only for non-resumed messages)
-            if last_timestamp and not is_resumed_message:
-                gap_minutes = (timestamp - last_timestamp).total_seconds() / 60
-                if gap_minutes > SESSION_GAP_MINUTES:
-                    # Skip this non-resumed message (it belongs to a different session)
-                    # Continue looking for resumed messages that explicitly belong to this session
-                    continue
-
-            # Skip session markers from results, UNLESS a lifecycle op asked to
-            # include them (so delete/restore/purge clears the session's anchor
-            # and never leaves an orphan marker — #2027).
-            if not include_markers and metadata_json:
-                try:
-                    meta = json.loads(metadata_json)
-                    if meta.get('type') == 'session_marker':
-                        last_timestamp = timestamp
-                        is_first = False
-                        continue
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for session_marker check: {e}")
-
-            session_rows.append(row)
-            last_timestamp = timestamp
-            is_first = False
-
-            if len(session_rows) >= limit:
-                break
-
-        # Return in DESC order to match the non-session query format
-        # (will be reversed by caller in get_conversation_history)
-        return list(reversed(session_rows))
+        candidates = await self.db.fetchall(
+            "SELECT c.id, c.metadata, c.created_at "
+            "FROM conversation_history c WHERE c.agent_id = ? AND "
+            f"{membership_predicate}{del_clause}{archive_clause} "
+            "ORDER BY c.id ASC",
+            params,
+        )
+        session_rows = self._filter_session_rows(
+            candidates,
+            session_id,
+            limit=None,
+            include_markers=include_markers,
+            metadata_index=1,
+            created_at_index=2,
+        )
+        return sorted({int(row[0]) for row in session_rows})
 
     async def get_full_history(self) -> List[Dict[str, Any]]:
         """Get complete live conversation history with automatic decryption.
@@ -2537,7 +2769,7 @@ class AsyncConversationStore:
         purged = await self._purge_conversation_rows(
             [
                 (
-                    f"SELECT {_PURGE_SELECT_COLUMNS} FROM conversation_history "
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
                     "WHERE id = ? AND agent_id = ?",
                     (message_id, self.agent_id),
                 )
@@ -2568,42 +2800,24 @@ class AsyncConversationStore:
         Returns:
             Number of rows destroyed.
         """
-        # include_markers=True so purge also destroys the session's marker —
-        # no orphan anchor left behind (#2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="all", include_markers=True
-        )
-        if not rows:
-            return 0
-
-        # Every hard-purge selector acquires PostgreSQL row locks in ascending
-        # message-id order.  _get_session_messages returns newest-first; batching
-        # that order would lock high ids and then low ids, deadlocking against
-        # purge_all/purge_all_since, which lock low-to-high.
-        ids = sorted({int(row[0]) for row in rows})
-        if not ids:
-            return 0
-
-        selection_queries = []
-        for start in range(0, len(ids), _EXACT_PURGE_BATCH_SIZE):
-            batch = ids[start : start + _EXACT_PURGE_BATCH_SIZE]
-            placeholders = ",".join("?" for _ in batch)
-            selection_queries.append(
-                (
-                    f"SELECT {_PURGE_SELECT_COLUMNS} FROM conversation_history "
-                    f"WHERE agent_id = ? AND id IN ({placeholders}) ORDER BY id ASC",
-                    (self.agent_id, *batch),
-                )
-            )
+        # Resolve the complete membership set inside the destructive transaction.
+        # The resolver is one statement (one immutable membership snapshot), then
+        # _purge_conversation_rows locks its exact IDs in globally ascending,
+        # backend-neutral batches.  A post-snapshot insert therefore survives,
+        # while a >10k session is never silently truncated.
         purged = await self._purge_conversation_rows(
-            selection_queries,
+            None,
             operation_type="purge_conversation_session",
             scope={
                 "table": "conversation_history",
                 "session_id": session_id,
-                "message_ids": ids,
             },
             reason=reason,
+            resolve_message_ids=lambda: self._get_complete_session_message_ids(
+                session_id,
+                deleted_filter="all",
+                include_markers=True,
+            ),
         )
         if purged:
             logger.info(
@@ -2630,7 +2844,7 @@ class AsyncConversationStore:
         purged = await self._purge_conversation_rows(
             [
                 (
-                    f"SELECT {_PURGE_SELECT_COLUMNS} FROM conversation_history "
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
                     "WHERE agent_id = ? ORDER BY id ASC",
                     (self.agent_id,),
                 )
@@ -2681,7 +2895,7 @@ class AsyncConversationStore:
         purged = await self._purge_conversation_rows(
             [
                 (
-                    f"SELECT {_PURGE_SELECT_COLUMNS} FROM conversation_history "
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
                     f"WHERE agent_id = ? AND {created_at_predicate} "
                     "ORDER BY id ASC",
                     (self.agent_id, self._timestamp_query_param(since_iso)),
@@ -2748,7 +2962,7 @@ class AsyncConversationStore:
         purged = await self._purge_conversation_rows(
             [
                 (
-                    f"SELECT {_PURGE_SELECT_COLUMNS} FROM conversation_history "
+                    f"SELECT {_PURGE_SELECT_PLACEHOLDER} FROM conversation_history "
                     "WHERE agent_id = ? AND deleted_at IS NOT NULL "
                     f"AND {deleted_at_predicate} "
                     "AND id IN ("
@@ -2834,9 +3048,9 @@ class AsyncConversationStore:
     ) -> int:
         """Count messages a session resolves to (#2019).
 
-        Uses the SAME resolver (``_get_session_messages``) that delete / restore
-        / purge use, so a destructive preview counts exactly what the operation
-        will touch — including legacy row-id sessions only partially in Trash,
+        Uses the same uncapped exact-membership resolver as hard purge, so a
+        permanent-deletion preview counts exactly what that operation will
+        touch — including legacy row-id sessions only partially in Trash,
         whose deleted subset a grouped summary would mis-key.
 
         Args:
@@ -2844,33 +3058,36 @@ class AsyncConversationStore:
             deleted_filter: ``live`` / ``deleted`` / ``all`` (default ``all``,
                 matching ``purge_conversation_session``).
         """
-        # include_markers=True so the purge preview count matches what purge
-        # actually destroys (which now includes the marker — #2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter=deleted_filter, include_markers=True
+        # The preview and permanent purge share the same uncapped membership
+        # snapshot, including structural marker rows (#2027).
+        message_ids = await self._get_complete_session_message_ids(
+            session_id,
+            deleted_filter=deleted_filter,
+            include_markers=True,
         )
-        return len(rows)
+        return len(message_ids)
 
     async def message_belongs_to_session(
         self, message_id: Any, session_id: str
     ) -> bool:
         """True if ``message_id`` resolves within ``session_id`` (#2022).
 
-        Uses the SAME resolver (``_get_session_messages`` with
-        ``deleted_filter='all'``) that delete / restore / purge use, so a
-        ``session_id`` guard on a single-message operation agrees exactly with
-        the session-grain tools — across live AND trashed rows (a restore guard
-        must match a message already in Trash). Identity, never content.
+        Uses the same uncapped exact-membership resolver as the hard-purge
+        preview and operation, so a ``session_id`` guard agrees across live and
+        trashed rows (a restore guard must match a message already in Trash).
+        Identity, never content.
         """
         target = coerce_persistent_message_id(message_id)
         if target is None:
             return False
-        # include_markers=True: a session's marker row genuinely belongs to it,
-        # so a by-id guard on the marker resolves consistently (#2027).
-        rows = await self._get_session_messages(
-            session_id, limit=10_000, deleted_filter="all", include_markers=True
+        # Include markers and use the uncapped resolver so a guard cannot deny a
+        # valid message merely because 10k earlier rows share its session.
+        message_ids = await self._get_complete_session_message_ids(
+            session_id,
+            deleted_filter="all",
+            include_markers=True,
         )
-        return any(row[0] == target for row in rows)
+        return target in message_ids
 
     async def find_messages_matching(
         self, content_pattern: str, session_id: Optional[str] = None
