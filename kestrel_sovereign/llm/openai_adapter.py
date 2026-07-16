@@ -9,6 +9,7 @@ Adapter for OpenAI's chat completion API with full support for:
 """
 import json
 import os
+import re
 import openai
 import logging
 from dataclasses import asdict, is_dataclass
@@ -68,6 +69,16 @@ logger = logging.getLogger(__name__)
 
 _split_thinking_from_content = split_thinking_from_content
 _ThinkingContentSplitter = ThinkingContentSplitter
+
+# Native OpenAI currently rejects function tools combined with reasoning on
+# gpt-5.6 through /v1/chat/completions. Keep the model matcher beside the
+# endpoint adapter: compatible providers and the Responses API do not inherit
+# this transport-specific restriction. The boundary accepts qualified ids and
+# snapshots without accidentally matching a future gpt-5.60 family.
+_GPT56_CHAT_FUNCTION_REASONING_MODEL_PATTERN = re.compile(
+    r"(?:^|[/:])gpt-5\.6(?:[.-]|$)",
+    re.IGNORECASE,
+)
 
 
 def _capability_kwargs(**kwargs: Any) -> Dict[str, Any]:
@@ -396,13 +407,11 @@ class OpenAIAdapter(LLMAdapter):
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
 
-            request_options = kwargs.get("request_options")
-            if request_options is not None:
-                extra_kwargs = self.apply_request_options(
-                    extra_kwargs,
-                    request_options,
-                    model=model,
-                )
+            extra_kwargs = self._prepare_chat_completion_request(
+                extra_kwargs,
+                model=model,
+                options=kwargs.get("request_options"),
+            )
 
             response = await with_retry(
                 client.chat.completions.create,
@@ -533,13 +542,11 @@ class OpenAIAdapter(LLMAdapter):
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
 
-            request_options = kwargs.get("request_options")
-            if request_options is not None:
-                extra_kwargs = self.apply_request_options(
-                    extra_kwargs,
-                    request_options,
-                    model=model,
-                )
+            extra_kwargs = self._prepare_chat_completion_request(
+                extra_kwargs,
+                model=model,
+                options=kwargs.get("request_options"),
+            )
 
             logger.info(f"Starting OpenAI stream for model: {model}")
             stream = await with_retry(
@@ -658,13 +665,11 @@ class OpenAIAdapter(LLMAdapter):
             if "extra_body" in kwargs and kwargs["extra_body"]:
                 extra_kwargs["extra_body"] = kwargs["extra_body"]
 
-            request_options = kwargs.get("request_options")
-            if request_options is not None:
-                extra_kwargs = self.apply_request_options(
-                    extra_kwargs,
-                    request_options,
-                    model=model,
-                )
+            extra_kwargs = self._prepare_chat_completion_request(
+                extra_kwargs,
+                model=model,
+                options=kwargs.get("request_options"),
+            )
 
             # Request streaming with usage stats
             extra_kwargs["stream_options"] = {"include_usage": True}
@@ -1025,6 +1030,73 @@ class OpenAIAdapter(LLMAdapter):
             raise ValueError("file_ref.id is required")
         return {"file_id": file_id}
 
+    def _prepare_chat_completion_request(
+        self,
+        request_kwargs: Dict[str, Any],
+        *,
+        model: str,
+        options: Any = None,
+    ) -> Dict[str, Any]:
+        """Apply options and enforce chat-completions compatibility once.
+
+        All non-streaming, text-streaming, tool-streaming, and batch request
+        builders finish here. Keeping the endpoint policy after raw option
+        merging means neither a caller-supplied top-level value nor
+        ``extra_body`` can restore a combination the native endpoint rejects.
+        """
+        out = request_kwargs
+        if options is not None:
+            out = self.apply_request_options(out, options, model=model)
+
+        if not self._requires_none_reasoning_for_function_tools(out, model=model):
+            return out
+
+        extra_body = out.get("extra_body")
+        nested_effort = (
+            extra_body.get("reasoning_effort") if isinstance(extra_body, dict) else None
+        )
+        requested_effort = out.get("reasoning_effort")
+        if requested_effort in (None, "none") and nested_effort not in (
+            None,
+            "none",
+        ):
+            requested_effort = nested_effort
+        if requested_effort not in (None, "none"):
+            logger.warning(
+                "OpenAI %s function-tool request uses /v1/chat/completions, "
+                "which requires reasoning_effort='none'; normalized %r (#2501)",
+                model,
+                requested_effort,
+            )
+
+        out["reasoning_effort"] = "none"
+        if isinstance(extra_body, dict) and "reasoning_effort" in extra_body:
+            # The OpenAI SDK merges extra_body into the final payload after its
+            # typed arguments, so a nested value could otherwise override the
+            # normalized top-level field. Copy before removing it to preserve
+            # the caller's dictionary and every unrelated cache/custom field.
+            normalized_extra_body = dict(extra_body)
+            normalized_extra_body.pop("reasoning_effort")
+            out["extra_body"] = normalized_extra_body
+        return out
+
+    def _requires_none_reasoning_for_function_tools(
+        self,
+        request_kwargs: Dict[str, Any],
+        *,
+        model: str,
+    ) -> bool:
+        """Whether native chat-completions requires reasoning to be disabled."""
+        if (
+            not self._native_openai
+            or not _GPT56_CHAT_FUNCTION_REASONING_MODEL_PATTERN.search(model)
+        ):
+            return False
+        tools = request_kwargs.get("tools")
+        return isinstance(tools, list) and any(
+            isinstance(tool, dict) and tool.get("type") == "function" for tool in tools
+        )
+
     def apply_request_options(
         self,
         request_kwargs: Dict[str, Any],
@@ -1297,14 +1369,11 @@ class OpenAIAdapter(LLMAdapter):
         if getattr(request, "format", None) == "json":
             body["response_format"] = {"type": "json_object"}
         body.update(getattr(request, "kwargs", None) or {})
-        request_options = getattr(request, "request_options", None)
-        if request_options is not None:
-            body = self.apply_request_options(
-                body,
-                request_options,
-                model=body["model"],
-            )
-        return body
+        return self._prepare_chat_completion_request(
+            body,
+            model=body["model"],
+            options=getattr(request, "request_options", None),
+        )
 
     @staticmethod
     def _batch_handle(batch: Any) -> Any:

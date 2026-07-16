@@ -99,6 +99,74 @@ def _client():
     return client
 
 
+class _EmptyAsyncStream:
+    """Minimal async iterator for request-shaping tests."""
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+_FUNCTION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "harmless",
+            "description": "Return a harmless fixture value.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
+_NO_REQUEST_OPTIONS = object()
+
+
+async def _capture_chat_completion_request(
+    path,
+    *,
+    native_openai,
+    model,
+    tools,
+    reasoning_effort,
+):
+    adapter = OpenAIAdapter(native_openai=native_openai)
+    client = _client()
+    call_kwargs = {}
+    if reasoning_effort is not _NO_REQUEST_OPTIONS:
+        call_kwargs["request_options"] = RequestOptions(
+            reasoning_effort=reasoning_effort
+        )
+
+    if path == "non_streaming":
+        await adapter.get_response(
+            client,
+            model,
+            [{"role": "user", "content": "hello"}],
+            tools=tools,
+            **call_kwargs,
+        )
+    else:
+        client.chat.completions.create.return_value = _EmptyAsyncStream()
+        method = (
+            adapter.get_streaming_response
+            if path == "streaming"
+            else adapter.get_streaming_response_with_tools
+        )
+        async for _ in method(
+            client,
+            model,
+            [{"role": "user", "content": "hello"}],
+            tools=tools,
+            **call_kwargs,
+        ):
+            pass
+
+    client.chat.completions.create.assert_awaited_once()
+    client.responses.create.assert_not_awaited()
+    return client.chat.completions.create.await_args.kwargs
+
+
 def test_openai_v5_capability_flags_and_round_trip():
     caps = OpenAIAdapter(native_openai=True).provider_capabilities()
 
@@ -204,6 +272,220 @@ async def test_get_response_applies_request_options_to_chat_completion():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["non_streaming", "streaming", "streaming_with_tools"],
+)
+@pytest.mark.parametrize(
+    (
+        "native_openai",
+        "model",
+        "tools",
+        "configured_effort",
+        "expected_effort",
+    ),
+    [
+        pytest.param(
+            True,
+            "gpt-5.6-luna",
+            _FUNCTION_TOOLS,
+            _NO_REQUEST_OPTIONS,
+            "none",
+            id="affected-default-effort",
+        ),
+        pytest.param(
+            True,
+            "gpt-5.6-luna",
+            _FUNCTION_TOOLS,
+            "ultra",
+            "none",
+            id="affected-explicit-effort",
+        ),
+        pytest.param(
+            True,
+            "gpt-5.6-sol-2026-07-01",
+            _FUNCTION_TOOLS,
+            "high",
+            "none",
+            id="affected-snapshot",
+        ),
+        pytest.param(
+            True,
+            "gpt-5.6-luna",
+            None,
+            "ultra",
+            "ultra",
+            id="affected-model-without-tools",
+        ),
+        pytest.param(
+            True,
+            "gpt-5.6-luna",
+            None,
+            _NO_REQUEST_OPTIONS,
+            None,
+            id="affected-model-default-without-tools",
+        ),
+        pytest.param(
+            True,
+            "gpt-5.5",
+            _FUNCTION_TOOLS,
+            "high",
+            "high",
+            id="unaffected-model",
+        ),
+        pytest.param(
+            True,
+            "gpt-5.5",
+            _FUNCTION_TOOLS,
+            _NO_REQUEST_OPTIONS,
+            None,
+            id="unaffected-model-default-effort",
+        ),
+        pytest.param(
+            True,
+            "gpt-5.60-luna",
+            _FUNCTION_TOOLS,
+            "high",
+            "high",
+            id="unrelated-version-prefix",
+        ),
+        pytest.param(
+            False,
+            "gpt-5.6-luna",
+            _FUNCTION_TOOLS,
+            "high",
+            "high",
+            id="openai-compatible-route",
+        ),
+    ],
+)
+async def test_chat_completion_tool_reasoning_compatibility_matrix(
+    path,
+    native_openai,
+    model,
+    tools,
+    configured_effort,
+    expected_effort,
+):
+    """Only native gpt-5.6 function turns lose reasoning on chat completions."""
+    kwargs = await _capture_chat_completion_request(
+        path,
+        native_openai=native_openai,
+        model=model,
+        tools=tools,
+        reasoning_effort=configured_effort,
+    )
+
+    if expected_effort is None:
+        assert "reasoning_effort" not in kwargs
+    else:
+        assert kwargs["reasoning_effort"] == expected_effort
+
+
+@pytest.mark.asyncio
+async def test_gpt56_tool_normalization_preserves_cache_body_and_raw_fields():
+    adapter = OpenAIAdapter(native_openai=True)
+    client = _client()
+    raw_extra_body = {"reasoning_effort": "high", "custom": True}
+    await adapter.get_response(
+        client,
+        "gpt-5.6-luna",
+        [{"role": "user", "content": "hello"}],
+        tools=_FUNCTION_TOOLS,
+        request_options=RequestOptions(
+            cache_markers=[CacheMarker(index=0, label="system")],
+            reasoning_effort="high",
+            raw={
+                "reasoning_effort": "ultra",
+                "extra_body": raw_extra_body,
+            },
+        ),
+    )
+
+    kwargs = client.chat.completions.create.await_args.kwargs
+    assert kwargs["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in kwargs["extra_body"]
+    assert kwargs["extra_body"]["custom"] is True
+    assert kwargs["extra_body"]["prompt_cache_key"].startswith("kestrel:gpt-5.6-luna:")
+    assert raw_extra_body == {"reasoning_effort": "high", "custom": True}
+
+
+@pytest.mark.asyncio
+async def test_gpt56_tool_request_serializes_accepted_chat_completion_payload():
+    """Exercise the real OpenAI SDK transport without network or billing."""
+    import httpx
+    import openai
+
+    captured = {}
+
+    async def handle_request(request):
+        captured["path"] = request.url.path
+        captured["body"] = json.loads((await request.aread()).decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-5.6-luna",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        async with openai.AsyncOpenAI(
+            api_key="fixture",
+            base_url="https://openai.invalid/v1",
+            http_client=http_client,
+            max_retries=0,
+        ) as client:
+            response = await OpenAIAdapter(native_openai=True).get_response(
+                client,
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "hello"}],
+                tools=_FUNCTION_TOOLS,
+                request_options=RequestOptions(reasoning_effort="high"),
+            )
+
+    assert captured["path"] == "/v1/chat/completions"
+    assert captured["body"]["reasoning_effort"] == "none"
+    assert captured["body"]["tools"] == _FUNCTION_TOOLS
+    assert response.content == "ok"
+
+
+@pytest.mark.parametrize("configured_effort", [_NO_REQUEST_OPTIONS, "high"])
+def test_batch_chat_completion_uses_same_gpt56_tool_policy(configured_effort):
+    request_options = (
+        None
+        if configured_effort is _NO_REQUEST_OPTIONS
+        else RequestOptions(reasoning_effort=configured_effort)
+    )
+    body = OpenAIAdapter(native_openai=True)._batch_request_body(
+        BatchRequest(
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=_FUNCTION_TOOLS,
+            request_options=request_options,
+        )
+    )
+
+    assert body["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
 async def test_count_tokens_returns_estimated_token_count():
     result = await OpenAIAdapter().count_tokens(
         _client(),
@@ -293,7 +575,31 @@ async def test_raw_request_dispatches_provider_unique_operations():
 
 @pytest.mark.live
 @pytest.mark.skipif(
-    not os.environ.get("KESTREL_LIVE_TESTS") or not os.environ.get("OPENAI_API_KEY"),
+    os.environ.get("KESTREL_LIVE_TESTS") != "1"
+    or not os.environ.get("OPENAI_API_KEY"),
+    reason="live smoke requires explicit opt-in: set KESTREL_LIVE_TESTS=1 and OPENAI_API_KEY",
+)
+@pytest.mark.asyncio
+async def test_live_gpt56_chat_completion_accepts_harmless_function_tool():
+    import openai
+
+    adapter = OpenAIAdapter(native_openai=True)
+    client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=0)
+    response = await adapter.get_response(
+        client,
+        os.environ.get("OPENAI_GPT56_SMOKE_MODEL", "gpt-5.6-luna"),
+        [{"role": "user", "content": "Reply with OK or call the harmless tool."}],
+        tools=_FUNCTION_TOOLS,
+        request_options=RequestOptions(reasoning_effort="high"),
+    )
+
+    assert response.content or response.tool_calls
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    os.environ.get("KESTREL_LIVE_TESTS") != "1"
+    or not os.environ.get("OPENAI_API_KEY"),
     reason="live smoke requires explicit opt-in: set KESTREL_LIVE_TESTS=1 and OPENAI_API_KEY",
 )
 @pytest.mark.asyncio
