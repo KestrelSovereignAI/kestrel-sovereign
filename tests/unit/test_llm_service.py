@@ -922,6 +922,273 @@ class TestInvocationBoundary:
             correlation_id="explicit-correlation",
         )
 
+    def test_legacy_ambient_context_is_service_local(self, llm_service):
+        """Two services in one task must never share billing identity."""
+
+        other = object.__new__(LLMService)
+        llm_service.set_observability_context(
+            companion_id="first-companion", user_id="first-user"
+        )
+
+        assert llm_service._resolve_invocation_context().companion_id == (
+            "first-companion"
+        )
+        assert other._resolve_invocation_context() == LLMInvocationContext()
+        other._stamp_response_identity(None, model="bare-model", provider="bare")
+        assert other.get_last_response_identity() == {
+            "model": "bare-model",
+            "provider": "bare",
+        }
+
+    @pytest.mark.asyncio
+    async def test_scoped_context_restores_parent_and_child_keeps_snapshot(
+        self, llm_service
+    ):
+        llm_service.set_observability_context(companion_id="outer")
+        child_started = asyncio.Event()
+        release_child = asyncio.Event()
+
+        async def inherited_child():
+            child_started.set()
+            await release_child.wait()
+            return llm_service._resolve_invocation_context()
+
+        with llm_service.observability_context(companion_id="inner"):
+            with llm_service.observability_context(companion_id="leaf"):
+                assert (
+                    llm_service._resolve_invocation_context().companion_id
+                    == "leaf"
+                )
+            assert (
+                llm_service._resolve_invocation_context().companion_id == "inner"
+            )
+            child = asyncio.create_task(inherited_child())
+            await child_started.wait()
+
+        assert llm_service._resolve_invocation_context().companion_id == "outer"
+        llm_service.reset_observability_context()
+        release_child.set()
+        assert (await child).companion_id == "inner"
+
+        async def unrelated_child():
+            return llm_service._resolve_invocation_context()
+
+        assert await asyncio.create_task(unrelated_child()) == LLMInvocationContext()
+
+    @pytest.mark.asyncio
+    async def test_remote_fallback_keeps_entry_context_after_ambient_mutation(
+        self, llm_service
+    ):
+        adapter = self._activate_fake_remote(
+            llm_service, LLMResponse(content="unused")
+        )
+
+        async def mutate_then_fail(**_kwargs):
+            llm_service.set_observability_context(
+                companion_id="late-companion", user_id="late-user"
+            )
+            raise ConnectionError("remote failed late")
+
+        adapter.get_response = AsyncMock(side_effect=mutate_then_fail)
+        llm_service.set_observability_context(
+            companion_id="entry-companion", user_id="entry-user"
+        )
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+
+        await llm_service.generate(system_prompt="system", user_prompt="hello")
+
+        assert store.log_llm_call.await_count == 2
+        for call in store.log_llm_call.await_args_list:
+            assert call.kwargs["companion_id"] == "entry-companion"
+            assert call.kwargs["user_id"] == "entry-user"
+
+    @pytest.mark.asyncio
+    async def test_nested_audit_cannot_change_persisted_visible_identity(
+        self, llm_service, mock_adapter
+    ):
+        """Persistence must attribute a string response to its visible call."""
+
+        mock_adapter.get_response = AsyncMock(
+            return_value=LLMResponse(
+                content="visible answer", input_tokens=4, output_tokens=2
+            )
+        )
+        visible = await llm_service.get_response(
+            system_prompt="system", user_prompt="hello"
+        )
+        assert visible == "visible answer"
+        assert llm_service.get_last_response_identity() == {
+            "model": "gpt-5-mini",
+            "provider": "openai:api",
+        }
+
+        audit_provider = dict(llm_service.providers[0])
+        audit_provider.update(
+            name="audit:api",
+            vendor="audit",
+            route="api",
+            model="audit-model",
+        )
+        llm_service.providers = [audit_provider]
+        mock_adapter.provider_capabilities = Mock(
+            return_value=SimpleNamespace(supports_structured_output=True)
+        )
+        mock_adapter.get_response = AsyncMock(
+            return_value=LLMResponse(
+                content='{"risk_level": 1, "reasoning": "safe"}',
+                input_tokens=3,
+                output_tokens=1,
+            )
+        )
+
+        assert (await llm_service.get_audit_response(visible))["risk_level"] == 1
+        assert llm_service.get_last_response_identity() == {
+            "model": "gpt-5-mini",
+            "provider": "openai:api",
+        }
+
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        agent = object.__new__(KestrelAgent)
+        agent.llm_service = llm_service
+        agent.privacy_agent = SimpleNamespace(add_conversation=AsyncMock())
+        await agent._persist_assistant_conversation(visible, response=visible)
+
+        persisted = agent.privacy_agent.add_conversation.await_args
+        assert persisted.args == ("assistant", "visible answer")
+        assert persisted.kwargs["model"] == "gpt-5-mini"
+        assert persisted.kwargs["provider"] == "openai:api"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("broken_sink", ["usage_db", "store", "meter"])
+    async def test_ordinary_sink_failure_does_not_suppress_siblings(
+        self, llm_service, broken_sink, caplog
+    ):
+        tracker = AsyncMock()
+        store = AsyncMock()
+        meter_calls = []
+
+        if broken_sink == "usage_db":
+            tracker.side_effect = RuntimeError("usage db down")
+        if broken_sink == "store":
+            store.log_llm_call.side_effect = OSError("store down")
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+            if broken_sink == "meter":
+                raise RuntimeError("meter down")
+
+        llm_service._track_model_usage = tracker
+        llm_service.set_observability_store(store)
+        llm_service.set_metering_callback(meter)
+        llm_service.set_observability_context(
+            companion_id="sink-companion", user_id="sink-user"
+        )
+
+        with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
+            result = await llm_service.get_response(
+                system_prompt="system", user_prompt="hello"
+            )
+
+        assert isinstance(result, str)
+        tracker.assert_awaited_once()
+        store.log_llm_call.assert_awaited_once()
+        assert len(meter_calls) == 1
+        assert sum(
+            record.message.startswith("llm.usage: ") for record in caplog.records
+        ) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cancelled_sink", ["usage_db", "store", "meter"])
+    async def test_sink_cancellation_propagates_unchanged(
+        self, llm_service, cancelled_sink
+    ):
+        cancellation = asyncio.CancelledError(f"cancelled in {cancelled_sink}")
+        tracker = AsyncMock()
+        store = AsyncMock()
+        if cancelled_sink == "usage_db":
+            tracker.side_effect = cancellation
+        if cancelled_sink == "store":
+            store.log_llm_call.side_effect = cancellation
+
+        async def meter(**_kwargs):
+            if cancelled_sink == "meter":
+                raise cancellation
+
+        llm_service._track_model_usage = tracker
+        llm_service.set_observability_store(store)
+        llm_service.set_metering_callback(meter)
+        llm_service.set_observability_context(
+            companion_id="cancel-companion", user_id="cancel-user"
+        )
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await llm_service.get_response(
+                system_prompt="system", user_prompt="hello"
+            )
+
+        assert caught.value is cancellation
+
+    @pytest.mark.asyncio
+    async def test_missing_provider_usage_is_unknown_and_never_zero_billed(
+        self, llm_service, mock_adapter
+    ):
+        mock_adapter.get_response = AsyncMock(
+            return_value=LLMResponse(content="answer without usage")
+        )
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+        meter_calls = []
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        llm_service.set_observability_context(
+            companion_id="unknown-companion", user_id="unknown-user"
+        )
+
+        assert (
+            await llm_service.get_response(
+                system_prompt="system", user_prompt="hello"
+            )
+            == "answer without usage"
+        )
+
+        llm_service._track_model_usage.assert_not_awaited()
+        assert meter_calls == []
+        logged = store.log_llm_call.await_args.kwargs
+        assert logged["input_tokens"] is None
+        assert logged["output_tokens"] is None
+        assert logged["metadata"]["usage_available"] is False
+
+    @pytest.mark.asyncio
+    async def test_total_only_usage_is_tracked_but_not_zero_billed(
+        self, llm_service, mock_adapter
+    ):
+        mock_adapter.get_response = AsyncMock(
+            return_value=LLMResponse(content="answer", total_tokens=9)
+        )
+        llm_service._track_model_usage = AsyncMock()
+        meter_calls = []
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        llm_service.set_observability_context(
+            companion_id="total-companion", user_id="total-user"
+        )
+
+        await llm_service.get_response(system_prompt="system", user_prompt="hello")
+
+        llm_service._track_model_usage.assert_awaited_once_with(
+            "gpt-5-mini", "openai:api", tokens=9
+        )
+        assert meter_calls == []
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("entrypoint", "expected_path"),
@@ -1096,7 +1363,7 @@ class TestInvocationBoundary:
         )
 
     @pytest.mark.asyncio
-    async def test_remote_failure_fallback_finalizes_only_successful_provider(
+    async def test_remote_failure_fallback_records_each_provider_attempt_once(
         self, llm_service
     ):
         self._activate_fake_remote(llm_service, ConnectionError("gpu unavailable"))
@@ -1112,11 +1379,17 @@ class TestInvocationBoundary:
 
         assert isinstance(result, str)
         llm_service._track_model_usage.assert_awaited_once()
-        store.log_llm_call.assert_awaited_once()
-        logged = store.log_llm_call.await_args.kwargs
-        assert logged["success"] is True
-        assert logged["provider"] == "openai:api"
-        assert logged["session_id"] == "fallback-session"
+        assert store.log_llm_call.await_count == 2
+        failed, succeeded = [
+            call.kwargs for call in store.log_llm_call.await_args_list
+        ]
+        assert (failed["success"], failed["provider"]) == (False, "remote_gpu")
+        assert failed["error_message"] == "gpu unavailable"
+        assert (succeeded["success"], succeeded["provider"]) == (
+            True,
+            "openai:api",
+        )
+        assert failed["session_id"] == succeeded["session_id"] == "fallback-session"
 
     @pytest.mark.asyncio
     async def test_remote_tool_stream_finalizes_terminal_response_once(
@@ -1176,6 +1449,128 @@ class TestInvocationBoundary:
         assert len(meter_calls) == 1
         assert meter_calls[0]["companion_id"] == "stream-companion"
         assert meter_calls[0]["user_id"] == "stream-user"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("entrypoint", "expected_path"),
+        [
+            ("get_streaming_response", "get_streaming_response"),
+            ("generate_stream", "generate_stream"),
+            ("stream_with_messages", "stream_with_messages"),
+        ],
+    )
+    async def test_plain_streams_meter_terminal_usage_once_without_exposing_it(
+        self, llm_service, mock_adapter, entrypoint, expected_path
+    ):
+        attempts = 0
+
+        async def usage_stream(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            yield "visible chunk"
+            yield LLMResponse(
+                content="visible chunk",
+                input_tokens=8,
+                output_tokens=5,
+                total_tokens=13,
+            )
+
+        mock_adapter.get_streaming_response_with_tools = usage_stream
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+        meter_calls = []
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        context = LLMInvocationContext(
+            companion_id="plain-companion",
+            user_id="plain-user",
+            correlation_id="plain-correlation",
+        )
+        if entrypoint == "get_streaming_response":
+            stream = llm_service.get_streaming_response(
+                system_prompt="system",
+                user_prompt="hello",
+                invocation_context=context,
+            )
+        elif entrypoint == "generate_stream":
+            stream = llm_service.generate_stream(
+                system_prompt="system",
+                user_prompt="hello",
+                invocation_context=context,
+            )
+        else:
+            stream = llm_service.stream_with_messages(
+                messages=[{"role": "user", "content": "hello"}],
+                invocation_context=context,
+            )
+
+        assert [item async for item in stream] == ["visible chunk"]
+        assert attempts == 1
+        llm_service._track_model_usage.assert_awaited_once_with(
+            "gpt-5-mini", "openai:api", tokens=13
+        )
+        store.log_llm_call.assert_awaited_once()
+        logged = store.log_llm_call.await_args.kwargs
+        assert logged["metadata"]["path"] == expected_path
+        assert logged["metadata"]["correlation_id"] == "plain-correlation"
+        assert len(meter_calls) == 1
+        assert meter_calls[0]["prompt_tokens"] == 8
+        assert meter_calls[0]["completion_tokens"] == 5
+
+    @pytest.mark.asyncio
+    async def test_unknown_plain_stream_usage_is_logged_but_never_billed(
+        self, llm_service, mock_adapter, caplog
+    ):
+        async def basic_stream(**_kwargs):
+            yield "legacy chunk"
+
+        mock_adapter.get_streaming_response = Mock(return_value=basic_stream())
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+        meter_calls = []
+
+        async def meter(**kwargs):
+            meter_calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        llm_service.set_observability_context(
+            companion_id="legacy-companion", user_id="legacy-user"
+        )
+
+        with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
+            items = [
+                item
+                async for item in llm_service.get_streaming_response(
+                    system_prompt="system", user_prompt="hello"
+                )
+            ]
+
+        assert items == ["legacy chunk"]
+        llm_service._track_model_usage.assert_not_awaited()
+        store.log_llm_call.assert_awaited_once()
+        logged = store.log_llm_call.await_args.kwargs
+        assert logged["input_tokens"] is None
+        assert logged["output_tokens"] is None
+        assert logged["metadata"]["usage_available"] is False
+        assert meter_calls == []
+
+        import json as _json
+
+        usage_lines = [
+            record.message.removeprefix("llm.usage: ")
+            for record in caplog.records
+            if record.message.startswith("llm.usage: ")
+        ]
+        assert len(usage_lines) == 1
+        usage = _json.loads(usage_lines[0])
+        assert usage["usage_available"] is False
+        assert usage["input_tokens"] is None
+        assert usage["output_tokens"] is None
 
     @pytest.mark.asyncio
     async def test_remote_message_success_finalizes_once(self, llm_service):
@@ -1243,6 +1638,8 @@ class TestInvocationBoundary:
         )
         finalizer = AsyncMock(wraps=llm_service._finalize_successful_invocation)
         llm_service._finalize_successful_invocation = finalizer
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
 
         with pytest.raises(LLMAllProvidersFailedError):
             await llm_service.get_response(
@@ -1252,6 +1649,19 @@ class TestInvocationBoundary:
 
         assert mock_adapter.get_response.await_count == 2
         finalizer.assert_not_awaited()
+        assert store.log_llm_call.await_count == 2
+        assert all(
+            call.kwargs["success"] is False
+            for call in store.log_llm_call.await_args_list
+        )
+        assert all(
+            call.kwargs["system_prompt"] == "system"
+            and call.kwargs["user_prompt"] == "hello"
+            for call in store.log_llm_call.await_args_list
+        )
+        assert [
+            call.kwargs["provider"] for call in store.log_llm_call.await_args_list
+        ] == ["openai:api", "anthropic:api"]
 
     @pytest.mark.asyncio
     async def test_concurrent_legacy_contexts_cannot_cross_contaminate(

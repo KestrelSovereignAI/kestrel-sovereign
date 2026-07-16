@@ -44,7 +44,8 @@ import random
 import tempfile
 from pathlib import Path
 from typing import (
-    Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union,
+    Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type,
+    TYPE_CHECKING, Union,
 )
 
 from pydantic import BaseModel
@@ -67,6 +68,9 @@ from .codex_app_server import (
 from .continuation_store import ContinuationStore, InMemoryContinuationStore
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.features.computer_use.policy import Decision
 
 logger = logging.getLogger(__name__)
 
@@ -3218,7 +3222,11 @@ class CodexAdapter(LLMAdapter):
         cancel_token = kwargs.get("cancel_token")
         keep_trailing_system = bool(kwargs.get("keep_trailing_system"))
         idx = 0
-        async for ev in self._run_turn(
+        # This is the canonical usage-bearing stream for both tool and plain
+        # callers.  The retry helper already bypasses retries when ``tools`` is
+        # truthy, so tool-call semantics remain unchanged while text-only
+        # callers retain the safe pre-output idle retry of get_streaming_response.
+        async for ev in self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
             cancel_token=cancel_token,
             keep_trailing_system=keep_trailing_system,

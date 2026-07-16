@@ -134,7 +134,10 @@ def test_record_streamed_usage_meters_terminal_response():
     assert lk["provider"] == "anthropic" and lk["model"] == "claude-x"
     assert lk["input_tokens"] == 10 and lk["output_tokens"] == 20
     assert lk["success"] is True
-    assert lk["metadata"] == {"streamed": True}
+    assert lk["metadata"] == {
+        "streamed": True,
+        "path": "stream_with_tool_detection",
+    }
     assert lk["tools_used"] is False
 
 
@@ -234,7 +237,10 @@ def test_stream_with_tool_detection_records_usage_exactly_once(monkeypatch):
     svc._log_llm_call.assert_awaited_once()
     _, lk = svc._log_llm_call.await_args
     assert lk["input_tokens"] == 11 and lk["output_tokens"] == 22
-    assert lk["metadata"] == {"streamed": True}
+    assert lk["metadata"] == {
+        "streamed": True,
+        "path": "stream_with_tool_detection",
+    }
 
 
 class _FakeStreamingAdapter:
@@ -302,6 +308,82 @@ def test_get_streaming_response_warms_discovery_on_auto(monkeypatch):
 
     asyncio.run(_run())
     svc.discover_all_models.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "expected_path"),
+    [
+        ("get_streaming_response", "get_streaming_response"),
+        ("generate_stream", "generate_stream"),
+        ("stream_with_messages", "stream_with_messages"),
+    ],
+)
+def test_plain_streaming_entrypoints_share_usage_bearing_leaf(
+    monkeypatch, entrypoint, expected_path
+):
+    """Plain APIs hide the terminal response but finalize its usage once."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.streaming.provider_cache_body", lambda provider: None
+    )
+    svc = _RoutingService(_FakeStreamAdapter())
+
+    async def _run():
+        if entrypoint == "get_streaming_response":
+            stream = svc.get_streaming_response(
+                system_prompt="system", user_prompt="hello"
+            )
+        elif entrypoint == "generate_stream":
+            stream = svc.generate_stream(
+                system_prompt="system", user_prompt="hello"
+            )
+        else:
+            stream = svc.stream_with_messages(
+                messages=[{"role": "user", "content": "hello"}]
+            )
+        return [item async for item in stream]
+
+    items = asyncio.run(_run())
+
+    assert items == ["hello ", "world"]
+    svc._track_model_usage.assert_awaited_once_with(
+        "claude-x", "anthropic", tokens=33
+    )
+    svc._log_llm_call.assert_awaited_once()
+    logged = svc._log_llm_call.await_args.kwargs
+    assert (logged["input_tokens"], logged["output_tokens"]) == (11, 22)
+    assert logged["usage_available"] is True
+    assert logged["metadata"] == {"streamed": True, "path": expected_path}
+
+
+def test_basic_stream_records_unknown_usage_without_zero_token_tracking(monkeypatch):
+    """Third-party basic streams are observable but never fake billable usage."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.streaming.provider_cache_body", lambda provider: None
+    )
+    svc = _RoutingService(_FakeStreamingAdapter())
+
+    async def _run():
+        return [
+            item
+            async for item in svc.get_streaming_response(
+                system_prompt="system", user_prompt="hello"
+            )
+        ]
+
+    assert asyncio.run(_run()) == ["ok"]
+    svc._track_model_usage.assert_not_awaited()
+    svc._log_llm_call.assert_awaited_once()
+    logged = svc._log_llm_call.await_args.kwargs
+    assert logged["input_tokens"] is None
+    assert logged["output_tokens"] is None
+    assert logged["usage_available"] is False
+    assert logged["metadata"] == {
+        "streamed": True,
+        "path": "get_streaming_response",
+        "usage_available": False,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -494,7 +576,11 @@ def test_record_streamed_usage_tags_partial_abort():
     asyncio.run(svc._record_streamed_usage(
         resp, "claude-x", "anthropic", duration_ms=9, partial=True))
     _, lk = svc._log_llm_call.await_args
-    assert lk["metadata"] == {"streamed": True, "partial_abort": True}
+    assert lk["metadata"] == {
+        "streamed": True,
+        "path": "stream_with_tool_detection",
+        "partial_abort": True,
+    }
     assert lk["input_tokens"] == 100 and lk["output_tokens"] == 5
 
 
@@ -565,7 +651,11 @@ def test_stream_with_tool_detection_flushes_partial_on_abort(monkeypatch):
     svc._log_llm_call.assert_awaited_once()
     _, lk = svc._log_llm_call.await_args
     assert lk["input_tokens"] == 100 and lk["output_tokens"] == 3
-    assert lk["metadata"] == {"streamed": True, "partial_abort": True}
+    assert lk["metadata"] == {
+        "streamed": True,
+        "path": "stream_with_tool_detection",
+        "partial_abort": True,
+    }
 
 
 def test_non_flushing_adapter_records_nothing_on_abort(monkeypatch):
