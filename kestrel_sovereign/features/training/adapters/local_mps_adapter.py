@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import _local_mps_generation_lifecycle as _generation_lifecycle
 from ..protocol import TrainingProvider, TrainingSubmissionError
 from ..types import (
     TrainingConfig,
@@ -45,9 +46,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_PATH = os.environ.get("LOCAL_MPS_MODEL_PATH", "")
 DEFAULT_WORKING_DIR = os.environ.get(
     "LOCAL_MPS_WORKING_DIR",
-    os.path.join(os.environ.get("KESTREL_DATA_DIR", os.path.expanduser("~")), "kestrel-training"),
+    os.path.join(
+        os.environ.get("KESTREL_DATA_DIR", os.path.expanduser("~")), "kestrel-training"
+    ),
 )
 DEFAULT_DIFFUSERS_PATH = os.environ.get("DIFFUSERS_PATH", "")
+
+GENERATION_TIMEOUT_SECONDS = 300
 
 
 def _prepare_training_files(
@@ -67,7 +72,9 @@ def _prepare_training_files(
     metadata_path.write_text(metadata_content + "\n", encoding="utf-8")
 
 
-def _start_training_process(cmd: list[str], cwd: Path, env: dict[str, str], log_file: Path) -> subprocess.Popen:
+def _start_training_process(
+    cmd: list[str], cwd: Path, env: dict[str, str], log_file: Path
+) -> subprocess.Popen:
     """Start the background training process with stdout redirected to a log file."""
     with open(log_file, "w", encoding="utf-8") as log:
         return subprocess.Popen(
@@ -134,8 +141,9 @@ def _cleanup_dataset_dir(dataset_dir: Path) -> None:
 def _build_generation_script(
     *,
     model_path: Path,
-    lora_path: str,
-    output_path: Path,
+    lora_path: str | None,
+    lora_fd: int | None,
+    output_fd: int,
     prompt: str,
     num_inference_steps: int,
     guidance_scale: float,
@@ -147,7 +155,8 @@ def _build_generation_script(
         {
             "model_path": str(model_path),
             "lora_path": lora_path,
-            "output_path": str(output_path),
+            "lora_fd": lora_fd,
+            "output_fd": output_fd,
             "prompt": prompt,
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
@@ -159,6 +168,7 @@ def _build_generation_script(
     )
     script = """\
 import json
+import os
 import sys
 
 import torch
@@ -171,7 +181,21 @@ pipe = StableDiffusionXLPipeline.from_pretrained(
     torch_dtype=torch.float16,
     use_safetensors=True,
 )
-pipe.load_lora_weights(payload["lora_path"])
+if payload["lora_fd"] is None:
+    pipe.load_lora_weights(payload["lora_path"])
+else:
+    from safetensors.torch import load as load_safetensors
+
+    lora_size = os.fstat(payload["lora_fd"]).st_size
+    lora_bytes = bytearray()
+    lora_offset = 0
+    while lora_offset < lora_size:
+        chunk = os.pread(payload["lora_fd"], min(1024 * 1024, lora_size - lora_offset), lora_offset)
+        if not chunk:
+            raise OSError("Short read from inherited LoRA descriptor")
+        lora_bytes.extend(chunk)
+        lora_offset += len(chunk)
+    pipe.load_lora_weights(load_safetensors(bytes(lora_bytes)))
 pipe.to("mps")
 
 image = pipe(
@@ -184,7 +208,12 @@ image = pipe(
     generator=torch.Generator(device="mps").manual_seed(42),
 ).images[0]
 
-image.save(payload["output_path"])
+os.ftruncate(payload["output_fd"], 0)
+os.lseek(payload["output_fd"], 0, os.SEEK_SET)
+with os.fdopen(os.dup(payload["output_fd"]), "wb") as output_file:
+    image.save(output_file, format="PNG")
+    output_file.flush()
+    os.fsync(output_file.fileno())
 print("OK")
 """
     return script, payload
@@ -240,10 +269,6 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         self._active_jobs: dict[str, dict[str, Any]] = {}
         self._training_processes: dict[str, subprocess.Popen] = {}
 
-        # Lazy-loaded diffusers pipeline for generation
-        self._pipeline = None
-        self._pipeline_loaded = False
-
     def is_available(self) -> bool:
         """
         Check if local MPS training is available.
@@ -261,11 +286,16 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         # Check for diffusers format (should have model_index.json)
         model_index = self.model_path / "model_index.json"
         if not model_index.exists():
-            logger.warning(f"Model at {self.model_path} is not in diffusers format (missing model_index.json)")
+            logger.warning(
+                f"Model at {self.model_path} is not in diffusers format (missing model_index.json)"
+            )
             return False
 
         # Check diffusers training script
-        training_script = self.diffusers_path / "examples/text_to_image/train_text_to_image_lora_sdxl.py"
+        training_script = (
+            self.diffusers_path
+            / "examples/text_to_image/train_text_to_image_lora_sdxl.py"
+        )
         if not training_script.exists():
             logger.warning(f"Diffusers training script not found at {training_script}")
             return False
@@ -273,6 +303,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         # Check PyTorch MPS
         try:
             import torch
+
             if not torch.backends.mps.is_available():
                 logger.warning("PyTorch MPS backend not available")
                 return False
@@ -307,7 +338,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             raise TrainingSubmissionError(
                 "Local MPS training not available",
                 provider=self.provider_name,
-                details={"check": "Run is_available() for details"}
+                details={"check": "Run is_available() for details"},
             )
 
         config = config or TrainingConfig()
@@ -321,10 +352,12 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         avatar_filename = f"{trigger_word}_portrait.png"
         avatar_path = dataset_dir / avatar_filename
         metadata_path = dataset_dir / "metadata.jsonl"
-        metadata_content = json.dumps({
-            "file_name": avatar_filename,
-            "text": f"{trigger_word} portrait photo, professional headshot"
-        })
+        metadata_content = json.dumps(
+            {
+                "file_name": avatar_filename,
+                "text": f"{trigger_word} portrait photo, professional headshot",
+            }
+        )
         await asyncio.to_thread(
             _prepare_training_files,
             job_dir,
@@ -347,16 +380,23 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             # Training parameters
             steps = config.steps or 500
             learning_rate = config.learning_rate or 1e-4
-            lora_rank = config.lora_rank or 128  # High rank for strong identity encoding
+            lora_rank = (
+                config.lora_rank or 128
+            )  # High rank for strong identity encoding
 
             # Diffusers script needs a single int resolution, not multi-res string
             raw_resolution = config.resolution or "512"
             resolution = int(str(raw_resolution).split(",")[0].strip())
 
             # Build training command using diffusers script
-            training_script = self.diffusers_path / "examples/text_to_image/train_text_to_image_lora_sdxl.py"
+            training_script = (
+                self.diffusers_path
+                / "examples/text_to_image/train_text_to_image_lora_sdxl.py"
+            )
 
-            from kestrel_sovereign.kestrel_config.constants import DEFAULT_TRAINING_BATCH_SIZE
+            from kestrel_sovereign.kestrel_config.constants import (
+                DEFAULT_TRAINING_BATCH_SIZE,
+            )
 
             cmd = [
                 str(self.diffusers_path / ".venv/bin/python3"),
@@ -387,13 +427,15 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             )
 
             self._training_processes[job_id] = process
-            logger.info(f"Training process started (PID: {process.pid}), logging to {log_file}")
+            logger.info(
+                f"Training process started (PID: {process.pid}), logging to {log_file}"
+            )
 
         except Exception as e:
             raise TrainingSubmissionError(
                 f"Failed to start training: {e}",
                 provider=self.provider_name,
-                details={"error": str(e)}
+                details={"error": str(e)},
             )
 
         # Track job
@@ -604,27 +646,41 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         guidance_scale = config.guidance_scale if config else 7.5
         width = config.width if config else 1024
         height = config.height if config else 1024
-        temp_lora: Path | None = None
-
-        output_path = self.working_dir / "generated_selfie.png"
+        generation_workspace: _generation_lifecycle.GenerationWorkspaceLease | None = (
+            None
+        )
+        generation_process: _generation_lifecycle.GenerationProcessLease | None = None
+        process_communicated = False
+        pending_cancellation: asyncio.CancelledError | None = None
 
         try:
+            generation_workspace = (
+                await _generation_lifecycle.create_generation_workspace(
+                    self.working_dir,
+                )
+            )
             # Resolve LoRA path
-            lora_path = None
+            lora_path: str | None = None
+            private_lora: _generation_lifecycle.GenerationArtifactLease | None = None
             if config and config.lora_path:
                 lora_path = config.lora_path
                 if lora_path.startswith("file://"):
                     lora_path = lora_path[7:]
             elif lora_bytes:
-                # Save bytes to temp file
-                temp_lora = self.working_dir / "temp_lora.safetensors"
-                await asyncio.to_thread(temp_lora.write_bytes, lora_bytes)
-                lora_path = str(temp_lora)
+                private_lora = await _generation_lifecycle.create_generation_artifact(
+                    generation_workspace,
+                    "lora.safetensors",
+                    lora_bytes,
+                )
 
-            lora_file = Path(lora_path) if lora_path else None
-            if not lora_file or not await asyncio.to_thread(_path_exists, lora_file):
+            if private_lora is None and (
+                not lora_path
+                or not await asyncio.to_thread(_path_exists, Path(lora_path))
+            ):
                 return GenerationResult(
-                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    job_id="local-mps",
+                    images=[],
+                    state=GenerationState.FAILED,
                     error=f"LoRA file not found: {lora_path}",
                 )
 
@@ -632,15 +688,23 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             diffusers_python = str(self.diffusers_path / ".venv/bin/python3")
             if not await asyncio.to_thread(_path_exists, Path(diffusers_python)):
                 return GenerationResult(
-                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    job_id="local-mps",
+                    images=[],
+                    state=GenerationState.FAILED,
                     error=f"Diffusers Python not found: {diffusers_python}",
                 )
+
+            output_artifact = await _generation_lifecycle.create_generation_artifact(
+                generation_workspace,
+                "generated.png",
+            )
 
             # Keep executable source fixed; pass every dynamic value as JSON data.
             script, payload = _build_generation_script(
                 model_path=self.model_path,
                 lora_path=lora_path,
-                output_path=output_path,
+                lora_fd=private_lora.fd if private_lora is not None else None,
+                output_fd=output_artifact.fd,
                 prompt=prompt,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
@@ -650,19 +714,22 @@ class LocalMPSTrainingAdapter(TrainingProvider):
             logger.info(f"Generating selfie via subprocess: {prompt[:60]}...")
             start_time = time.monotonic()
 
-            process = await asyncio.create_subprocess_exec(
+            inherited_fds = [output_artifact.fd]
+            if private_lora is not None:
+                inherited_fds.append(private_lora.fd)
+            generation_process = await _generation_lifecycle.start_generation_process(
                 diffusers_python,
-                "-c",
                 script,
                 payload,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "TOKENIZERS_PARALLELISM": "false"},
+                inherited_fds=inherited_fds,
+                workspace=generation_workspace,
             )
-            stdout, stderr = await asyncio.wait_for(
+            process = generation_process.process
+            _stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=300,
+                timeout=GENERATION_TIMEOUT_SECONDS,
             )
+            process_communicated = True
 
             elapsed = time.monotonic() - start_time
 
@@ -670,20 +737,25 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                 error_msg = stderr.decode()[-500:] if stderr else "Unknown error"
                 logger.error(f"Generation subprocess failed: {error_msg}")
                 return GenerationResult(
-                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    job_id="local-mps",
+                    images=[],
+                    state=GenerationState.FAILED,
                     error=f"Generation failed: {error_msg}",
                     elapsed_seconds=elapsed,
                 )
 
-            # Read output image and convert to base64
-            if not await asyncio.to_thread(_path_exists, output_path):
+            # Read the retained output inode rather than reopening its name.
+            img_bytes = await _generation_lifecycle.read_generation_artifact(
+                output_artifact
+            )
+            if not img_bytes:
                 return GenerationResult(
-                    job_id="local-mps", images=[], state=GenerationState.FAILED,
+                    job_id="local-mps",
+                    images=[],
+                    state=GenerationState.FAILED,
                     error="Generation produced no output file",
                     elapsed_seconds=elapsed,
                 )
-
-            img_bytes = await asyncio.to_thread(output_path.read_bytes)
             img_base64 = base64.b64encode(img_bytes).decode()
             data_url = f"data:image/png;base64,{img_base64}"
 
@@ -696,43 +768,39 @@ class LocalMPSTrainingAdapter(TrainingProvider):
                 elapsed_seconds=elapsed,
             )
 
+        except asyncio.CancelledError as error:
+            pending_cancellation = error
         except asyncio.TimeoutError:
             return GenerationResult(
-                job_id="local-mps", images=[], state=GenerationState.FAILED,
-                error="Generation timed out (300s)",
+                job_id="local-mps",
+                images=[],
+                state=GenerationState.FAILED,
+                error=f"Generation timed out ({GENERATION_TIMEOUT_SECONDS}s)",
             )
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return GenerationResult(
-                job_id="local-mps", images=[], state=GenerationState.FAILED,
+                job_id="local-mps",
+                images=[],
+                state=GenerationState.FAILED,
                 error=str(e),
             )
         finally:
-            if await asyncio.to_thread(_path_exists, output_path):
-                await asyncio.to_thread(output_path.unlink)
-            if temp_lora and await asyncio.to_thread(_path_exists, temp_lora):
-                await asyncio.to_thread(temp_lora.unlink)
+            await _generation_lifecycle.finalize_generation_resources(
+                process=generation_process,
+                process_communicated=process_communicated,
+                workspace=generation_workspace,
+                pending_cancellation=pending_cancellation,
+            )
+
+        if pending_cancellation is not None:
+            raise pending_cancellation
+        raise RuntimeError("Generation ended without a result")
 
     async def close(self) -> None:
         """Close resources."""
         # Cancel any active training
         for job_id in list(self._training_processes.keys()):
             await self.cancel(job_id)
-
-        # Unload pipeline
-        if self._pipeline is not None:
-            del self._pipeline
-            self._pipeline = None
-            self._pipeline_loaded = False
-
-            import gc
-            gc.collect()
-
-            try:
-                import torch
-                if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-            except Exception:
-                pass
 
         logger.info("LocalMPSTrainingAdapter closed")
