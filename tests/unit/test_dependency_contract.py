@@ -22,6 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 #: reviewed decision to reintroduce the dependency.
 BANNED_PACKAGES = {
     "chromadb": "#2547 — unused; unpatched critical CVE-2026-45829",
+    "langchain": "#2546 — unused; family carries open high-severity advisories",
+    "langchain-community": "#2546 — unused; pulls langsmith/langchain-classic alerts",
+    "langsmith": "#2546 — transitive of unused langchain-community; open advisories",
 }
 
 
