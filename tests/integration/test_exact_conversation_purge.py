@@ -11,7 +11,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -59,7 +59,9 @@ async def _seed_indexed_message(
     deleted_at: datetime | str | None = None,
     lexical_index_id: str | None = None,
 ) -> _IndexedMessage:
-    lexical_index_id = lexical_index_id or uuid4().hex
+    lexical_index_id = (
+        uuid4().hex if lexical_index_id is None else lexical_index_id
+    )
     metadata = json.dumps({"session_id": session_id}) if session_id else "{}"
     created_at = created_at or datetime(2026, 7, 1, 12, 0, 0)
     await db.execute(
@@ -195,6 +197,38 @@ async def test_purge_message_removes_its_blind_index(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_purge_message_reclaims_an_empty_legacy_lexical_key(db_backend):
+    """Empty TEXT is a stored key, not the absence of a key."""
+    agent_id = f"did:test:purge-empty-key:{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    target = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="empty legacy key must be reclaimed",
+        lexical_index_id="",
+    )
+
+    assert await storage.conversation.purge_message(target.row_id) is True
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_history "
+            "WHERE agent_id = ? AND id = ?",
+            (agent_id, target.row_id),
+        )
+        == 0
+    )
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ''",
+            (agent_id,),
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_purge_preserves_shared_blind_index_until_last_owner(db_backend):
     """Legacy duplicate ownership must not turn one purge into collateral loss."""
     agent_id = f"did:test:purge-shared-key:{uuid4()}"
@@ -318,6 +352,117 @@ async def test_concurrent_final_shared_key_purges_reclaim_tokens(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_postgres_session_and_full_purge_share_one_row_lock_order(
+    db_backend, monkeypatch
+):
+    """A >500-row session purge cannot deadlock a concurrent full purge."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL row-lock ordering regression")
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    agent_id = f"did:test:purge-row-lock-order:{uuid4()}"
+    session_id = f"session-{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    second_db = AsyncDatabase(
+        PostgresBackend.from_pool(storage.db.backend._pool)
+    )
+    second_store = AsyncConversationStore(second_db, agent_id=agent_id)
+    started_at = datetime(2026, 7, 1, 12, 0, 0)
+    await storage.db.execute_many(
+        "INSERT INTO conversation_history "
+        "(agent_id, role, content, metadata, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                agent_id,
+                "user",
+                f"session row {index}",
+                json.dumps({"session_id": session_id}),
+                started_at + timedelta(seconds=index),
+            )
+            for index in range(600)
+        ]
+        + [
+            (
+                agent_id,
+                "user",
+                "full purge must also remove this row",
+                json.dumps({"session_id": f"other-{uuid4()}"}),
+                started_at + timedelta(seconds=700),
+            )
+        ],
+    )
+
+    first_batch_locked = asyncio.Event()
+    resume_session_purge = asyncio.Event()
+    full_purge_started = asyncio.Event()
+    first_batch_ids: list[int] = []
+    original_first_fetchall = storage.db.fetchall
+    original_second_fetchall = second_db.fetchall
+
+    async def pause_after_first_session_lock(sql: str, params: tuple = ()):
+        rows = await original_first_fetchall(sql, params)
+        if (
+            not first_batch_locked.is_set()
+            and "lexical_index_id" in sql
+            and "id IN (" in sql
+            and "FOR UPDATE" in sql
+        ):
+            first_batch_ids.extend(int(row[0]) for row in rows)
+            first_batch_locked.set()
+            await resume_session_purge.wait()
+        return rows
+
+    async def observe_full_purge(sql: str, params: tuple = ()):
+        if "lexical_index_id" in sql and "FOR UPDATE" in sql:
+            full_purge_started.set()
+        return await original_second_fetchall(sql, params)
+
+    monkeypatch.setattr(storage.db, "fetchall", pause_after_first_session_lock)
+    monkeypatch.setattr(second_db, "fetchall", observe_full_purge)
+    session_task: asyncio.Task[int] | None = None
+    full_task: asyncio.Task[int] | None = None
+    try:
+        session_task = asyncio.create_task(
+            storage.conversation.purge_conversation_session(session_id)
+        )
+        await asyncio.wait_for(first_batch_locked.wait(), timeout=5)
+        assert len(first_batch_ids) == 500
+        assert first_batch_ids == sorted(first_batch_ids)
+
+        full_task = asyncio.create_task(second_store.purge_all())
+        await asyncio.wait_for(full_purge_started.wait(), timeout=5)
+        done, _pending = await asyncio.wait({full_task}, timeout=0.1)
+        assert not done, "full purge must wait for the first ascending row lock"
+
+        resume_session_purge.set()
+        session_count, full_count = await asyncio.wait_for(
+            asyncio.gather(session_task, full_task),
+            timeout=10,
+        )
+        assert session_count == 600
+        assert full_count == 1
+        assert (
+            await storage.db.fetchval(
+                "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+                (agent_id,),
+            )
+            == 0
+        )
+    finally:
+        resume_session_purge.set()
+        tasks = [task for task in (session_task, full_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_concurrent_backfills_reclaim_the_final_shared_key(
     db_backend, monkeypatch
 ):
@@ -415,6 +560,230 @@ async def test_concurrent_backfills_reclaim_the_final_shared_key(
             cleanup_gate.release_first.set()
         await _cancel_and_observe(first_task)
         await _cancel_and_observe(second_task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("owner_state", ["live", "deleted", "archived"])
+async def test_backfill_uses_a_fresh_key_when_replacement_has_another_owner(
+    db_backend, owner_state
+):
+    """Replacement never clobbers a current, trashed, or archived owner."""
+    agent_id = f"did:test:backfill-replacement-owner:{owner_state}:{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    index = storage.conversation._lexical_index
+    target = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="target collision fact",
+        lexical_index_id=f"old-target-key-{uuid4()}",
+    )
+    proposed_key = index.backfill_message_key(target.row_id)
+    survivor = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="survivor collision fact",
+        lexical_index_id=proposed_key,
+        deleted_at=(
+            datetime(2026, 7, 2, 12, 0, 0)
+            if owner_state == "deleted"
+            else None
+        ),
+    )
+    await storage.db.execute(
+        "UPDATE conversation_history SET lexical_index_version = ? "
+        "WHERE id = ? AND agent_id = ?",
+        (index.version, survivor.row_id, agent_id),
+    )
+    if owner_state == "archived":
+        await storage.db.execute(
+            "UPDATE conversation_history SET archived_at = ? "
+            "WHERE id = ? AND agent_id = ?",
+            (
+                _timestamp_value(
+                    storage.db,
+                    datetime(2026, 7, 2, 12, 0, 0),
+                ),
+                survivor.row_id,
+                agent_id,
+            ),
+        )
+    await index.index_message(proposed_key, ("survivor", "collision"))
+
+    if owner_state == "live":
+        assert await index.candidate_message_ids(("survivor",), limit=10) == [
+            survivor.row_id
+        ]
+
+    result = await storage.conversation.backfill_lexical_index(
+        batch_size=1,
+        max_rows=1,
+    )
+    target_marker = await storage.db.fetchone(
+        "SELECT lexical_index_id, lexical_index_version "
+        "FROM conversation_history WHERE id = ? AND agent_id = ?",
+        (target.row_id, agent_id),
+    )
+    survivor_marker = await storage.db.fetchone(
+        "SELECT lexical_index_id, lexical_index_version "
+        "FROM conversation_history WHERE id = ? AND agent_id = ?",
+        (survivor.row_id, agent_id),
+    )
+
+    assert result["indexed"] == 1
+    assert target_marker is not None
+    assert target_marker[0] not in {target.lexical_index_id, proposed_key}
+    assert target_marker[1] == index.version
+    assert survivor_marker == (proposed_key, index.version)
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ? AND token_hash = ?",
+            (agent_id, proposed_key, index.hash_token("survivor")),
+        )
+        == 1
+    )
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ? AND token_hash = ?",
+            (agent_id, target_marker[0], index.hash_token("target")),
+        )
+        == 1
+    )
+    if owner_state == "live":
+        assert await index.candidate_message_ids(("survivor",), limit=10) == [
+            survivor.row_id
+        ]
+        assert await index.candidate_message_ids(("target",), limit=10) == [
+            target.row_id
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_backfill_rolls_back_if_fresh_collision_fallback_is_owned(
+    db_backend, monkeypatch
+):
+    """An occupied fallback fails closed without changing owners or tokens."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.storage import lexical_memory_index
+
+    agent_id = f"did:test:backfill-fallback-owner:{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    index = storage.conversation._lexical_index
+    target = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="target must roll back",
+        lexical_index_id=f"old-target-key-{uuid4()}",
+    )
+    proposed_key = index.backfill_message_key(target.row_id)
+    fallback_key = f"occupied-fallback-{uuid4()}"
+    proposed_owner = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="proposed key owner",
+        lexical_index_id=proposed_key,
+    )
+    fallback_owner = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="fallback key owner",
+        lexical_index_id=fallback_key,
+    )
+    await storage.db.execute_many(
+        "UPDATE conversation_history SET lexical_index_version = ? "
+        "WHERE id = ? AND agent_id = ?",
+        [
+            (index.version, proposed_owner.row_id, agent_id),
+            (index.version, fallback_owner.row_id, agent_id),
+        ],
+    )
+    await index.index_message(proposed_key, ("proposed",))
+    await index.index_message(fallback_key, ("fallback",))
+    monkeypatch.setattr(
+        lexical_memory_index,
+        "uuid4",
+        lambda: SimpleNamespace(hex=fallback_key),
+    )
+
+    with pytest.raises(
+        TransactionError,
+        match="Fresh lexical replacement key is already owned",
+    ):
+        await index.replace_existing_messages(
+            [
+                LexicalIndexReplacement(
+                    message_id=target.row_id,
+                    expected_key=target.lexical_index_id,
+                    replacement_key=proposed_key,
+                    tokens=("target",),
+                )
+            ]
+        )
+
+    assert await storage.db.fetchone(
+        "SELECT lexical_index_id, lexical_index_version "
+        "FROM conversation_history WHERE id = ? AND agent_id = ?",
+        (target.row_id, agent_id),
+    ) == (target.lexical_index_id, "v1:test")
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ? AND token_hash = ?",
+            (agent_id, proposed_key, index.hash_token("proposed")),
+        )
+        == 1
+    )
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ? AND token_hash = ?",
+            (agent_id, fallback_key, index.hash_token("fallback")),
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_backfill_repairs_and_reclaims_an_empty_legacy_key(db_backend):
+    agent_id = f"did:test:backfill-empty-key:{uuid4()}"
+    storage = await _storage_for_backend(db_backend, agent_id)
+    index = storage.conversation._lexical_index
+    target = await _seed_indexed_message(
+        storage.db,
+        agent_id,
+        content="empty key backfill fact",
+        lexical_index_id="",
+    )
+
+    result = await storage.conversation.backfill_lexical_index(
+        batch_size=1,
+        max_rows=1,
+    )
+    marker = await storage.db.fetchone(
+        "SELECT lexical_index_id, lexical_index_version "
+        "FROM conversation_history WHERE id = ? AND agent_id = ?",
+        (target.row_id, agent_id),
+    )
+
+    assert result["indexed"] == 1
+    assert marker is not None and marker[0]
+    assert marker[1] == index.version
+    assert (
+        await storage.db.fetchval(
+            "SELECT COUNT(*) FROM conversation_lexical_tokens "
+            "WHERE agent_id = ? AND lexical_index_id = ''",
+            (agent_id,),
+        )
+        == 0
+    )
+    assert await index.candidate_message_ids(("empty",), limit=10) == [
+        target.row_id
+    ]
 
 
 @pytest.mark.asyncio

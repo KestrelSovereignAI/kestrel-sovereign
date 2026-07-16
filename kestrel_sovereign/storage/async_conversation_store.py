@@ -517,6 +517,11 @@ class AsyncConversationStore:
         owning conversation rows.  ``conversation_lexical_tokens`` has no
         foreign-key cascade, so every hard-purge API must come through this
         primitive or it will leave privacy-sensitive residue.
+
+        PostgreSQL selectors must yield rows in ascending message-id order,
+        and multi-query selectors must partition that same order.  This is the
+        global row-lock order shared with lexical backfill; violating it can
+        deadlock an overlapping privacy purge.
         """
         lexical_tokens_available = await self.db.table_exists(
             "conversation_lexical_tokens"
@@ -568,7 +573,9 @@ class AsyncConversationStore:
             if audit_error is None:
                 message_ids = list(rows_by_id)
                 lexical_index_ids = list(
-                    dict.fromkeys(str(row[6]) for row in rows if row[6])
+                    dict.fromkeys(
+                        str(row[6]) for row in rows if row[6] is not None
+                    )
                 )
             else:
                 message_ids = []
@@ -2569,7 +2576,11 @@ class AsyncConversationStore:
         if not rows:
             return 0
 
-        ids = [row[0] for row in rows]
+        # Every hard-purge selector acquires PostgreSQL row locks in ascending
+        # message-id order.  _get_session_messages returns newest-first; batching
+        # that order would lock high ids and then low ids, deadlocking against
+        # purge_all/purge_all_since, which lock low-to-high.
+        ids = sorted({int(row[0]) for row in rows})
         if not ids:
             return 0
 
@@ -2740,8 +2751,15 @@ class AsyncConversationStore:
                     f"SELECT {_PURGE_SELECT_COLUMNS} FROM conversation_history "
                     "WHERE agent_id = ? AND deleted_at IS NOT NULL "
                     f"AND {deleted_at_predicate} "
-                    f"ORDER BY {deleted_at_order} ASC, id ASC LIMIT ?",
+                    "AND id IN ("
+                    "SELECT id FROM conversation_history "
+                    "WHERE agent_id = ? AND deleted_at IS NOT NULL "
+                    f"AND {deleted_at_predicate} "
+                    f"ORDER BY {deleted_at_order} ASC, id ASC LIMIT ?"
+                    ") ORDER BY id ASC",
                     (
+                        self.agent_id,
+                        self._timestamp_query_param(cutoff_iso),
                         self.agent_id,
                         self._timestamp_query_param(cutoff_iso),
                         max_rows,
@@ -3578,7 +3596,8 @@ class AsyncConversationStore:
                 break
             ids = [int(row[0]) for row in rows]
             old_keys_by_id = {
-                int(row[0]): str(row[1]) if row[1] else None for row in rows
+                int(row[0]): str(row[1]) if row[1] is not None else None
+                for row in rows
             }
             after_id = ids[-1]
             scanned += len(ids)

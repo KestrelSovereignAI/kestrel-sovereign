@@ -21,6 +21,7 @@ import hmac
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Iterable, List, Optional, Sequence
+from uuid import uuid4
 
 from kestrel_sovereign.security.encryption import (
     MasterKeyNotConfiguredError,
@@ -194,7 +195,15 @@ class ConversationLexicalIndex:
         takes the boundary before replacement-token writes, preserving one
         global order: history rows, advisory keys, then token rows.
         """
-        ordered_keys = tuple(sorted({str(key) for key in lexical_index_ids if key}))
+        ordered_keys = tuple(
+            sorted(
+                {
+                    str(key)
+                    for key in lexical_index_ids
+                    if key is not None
+                }
+            )
+        )
         if not ordered_keys:
             yield ordered_keys
             return
@@ -222,6 +231,20 @@ class ConversationLexicalIndex:
                 )
             yield ordered_keys
 
+    async def _has_other_owner(
+        self,
+        lexical_index_id: str,
+        message_id: int,
+    ) -> bool:
+        """Whether any current, trashed, or archived row shares this key."""
+        owner = await self.db.fetchval(
+            "SELECT 1 FROM conversation_history "
+            "WHERE agent_id = ? AND lexical_index_id = ? "
+            "AND id != ? LIMIT 1",
+            (self.agent_id, lexical_index_id, message_id),
+        )
+        return owner is not None
+
     async def replace_existing_messages(
         self,
         entries: Sequence[LexicalIndexReplacement],
@@ -232,22 +255,30 @@ class ConversationLexicalIndex:
         updating each owner inside the same transaction as its token writes
         prevents a stale backfill from recreating blind-index residue after a
         concurrent hard purge.  Cancellation or any write failure rolls both
-        the coverage marker and token set back together.
+        the coverage marker and token set back together. If legacy data already
+        assigns the deterministic replacement key to another row, this method
+        moves the target to a fresh opaque key rather than clobbering the shared
+        digest set.
         """
         if not entries:
             return LexicalIndexReplacementResult(updated=0, garbage_collected=0)
 
         updated = 0
         garbage_collected = 0
-        updated_entries: list[LexicalIndexReplacement] = []
-        obsolete_keys: set[str] = set()
+        updated_entries: list[tuple[LexicalIndexReplacement, str]] = []
         owner_key_predicate = (
             "lexical_index_id IS NOT DISTINCT FROM ?"
             if self.db.backend_type == "postgres"
             else "lexical_index_id IS ?"
         )
+        # Match the hard-purge row-lock order before taking any advisory key
+        # locks. Direct callers are not required to pre-sort their batch.
+        prepared_entries = [
+            (entry, uuid4().hex)
+            for entry in sorted(entries, key=lambda candidate: candidate.message_id)
+        ]
         async with self.db.transaction():
-            for entry in entries:
+            for entry, collision_fallback in prepared_entries:
                 affected = await self.db.execute(
                     "UPDATE conversation_history "
                     "SET lexical_index_id = ?, lexical_index_version = ? "
@@ -266,20 +297,87 @@ class ConversationLexicalIndex:
                     continue
 
                 updated += 1
-                updated_entries.append(entry)
-                if (
-                    entry.expected_key
-                    and entry.expected_key != entry.replacement_key
-                ):
-                    obsolete_keys.add(entry.expected_key)
+                updated_entries.append((entry, collision_fallback))
 
-            token_mutation_keys = obsolete_keys.union(
-                entry.replacement_key for entry in updated_entries
-            )
+            # Lock every possible old/final key before resolving replacement
+            # ownership.  The fresh fallback is pre-generated so collision
+            # handling never acquires a late advisory lock out of global order.
+            token_mutation_keys: set[str] = set()
+            for entry, collision_fallback in updated_entries:
+                if entry.expected_key is not None:
+                    token_mutation_keys.add(entry.expected_key)
+                token_mutation_keys.add(entry.replacement_key)
+                token_mutation_keys.add(collision_fallback)
+
             async with self.serialized_token_cleanup(
                 token_mutation_keys
             ) as cleanup_keys:
-                for entry in updated_entries:
+                resolved_entries: list[LexicalIndexReplacement] = []
+                obsolete_keys: set[str] = set()
+                for entry, collision_fallback in updated_entries:
+                    replacement_key = entry.replacement_key
+                    other_owner = await self._has_other_owner(
+                        replacement_key,
+                        entry.message_id,
+                    )
+                    if other_owner:
+                        replacement_key = collision_fallback
+                        fallback_owner = await self._has_other_owner(
+                            replacement_key,
+                            entry.message_id,
+                        )
+                        if fallback_owner:
+                            raise RuntimeError(
+                                "Fresh lexical replacement key is already owned; "
+                                "retry the atomic backfill batch"
+                            )
+                        moved = await self.db.execute(
+                            "UPDATE conversation_history "
+                            "SET lexical_index_id = ? "
+                            "WHERE agent_id = ? AND id = ? "
+                            "AND lexical_index_id = ?",
+                            (
+                                replacement_key,
+                                self.agent_id,
+                                entry.message_id,
+                                entry.replacement_key,
+                            ),
+                        )
+                        if moved != 1:
+                            raise RuntimeError(
+                                "Lexical replacement owner changed during "
+                                "collision resolution"
+                            )
+                        # The proposed key was assigned only tentatively.  If
+                        # no survivor owns it, reclaim any pre-existing residue.
+                        obsolete_keys.add(entry.replacement_key)
+
+                    # Recheck immediately before token mutation.  All Kestrel
+                    # backfill/purge writers for this key are now serialized;
+                    # a remaining owner means replacing the digest set would
+                    # silently remove that row from exact lexical recall.
+                    if await self._has_other_owner(
+                        replacement_key,
+                        entry.message_id,
+                    ):
+                        raise RuntimeError(
+                            "Lexical replacement key remains multiply owned"
+                        )
+
+                    resolved_entry = LexicalIndexReplacement(
+                        message_id=entry.message_id,
+                        expected_key=entry.expected_key,
+                        replacement_key=replacement_key,
+                        tokens=entry.tokens,
+                    )
+                    resolved_entries.append(resolved_entry)
+                    if (
+                        entry.expected_key is not None
+                        and entry.expected_key != replacement_key
+                    ):
+                        obsolete_keys.add(entry.expected_key)
+
+                for entry in resolved_entries:
                     await self.db.execute(
                         "DELETE FROM conversation_lexical_tokens "
                         "WHERE agent_id = ? AND lexical_index_id = ?",
