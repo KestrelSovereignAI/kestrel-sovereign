@@ -557,6 +557,14 @@ class ApprovalQueue:
             # NOT auto-close on us. Mark the request AWAITER_GONE so a
             # late ``submit_decision`` can tell the caller its click did
             # nothing for the orphaned in-flight call (#2558).
+            # Clobber unconditionally: if a concurrent ``submit_decision``
+            # already flipped to APPROVED/DENIED and is mid-persist, the
+            # tool call itself is STILL dead — the persisted scope rule
+            # benefits future calls, but this call is orphaned regardless
+            # of who won the state-write race. ``submit_decision``'s
+            # re-check-after-persist reads AWAITER_GONE and reports
+            # ``awaiter_gone=True`` to the caller so the frontend prompts
+            # a retry.
             request.status = ApprovalStatus.AWAITER_GONE
             logger.info(
                 f"Approval request {request.id[:8]} await cancelled; "
@@ -752,14 +760,24 @@ class ApprovalQueue:
             scope=scope,
         )
 
-        if awaiter_gone:
-            # No live awaiter to unblock — setting ``resume_event`` here
-            # only races the sweep, and the awaiter's finally-block that
-            # normally pops ``_pending`` is gone with the awaiter. Pop it
-            # ourselves so the orphaned request doesn't linger.
-            self._pending.pop(request_id, None)
-        else:
+        # Re-read status after the persist await: a concurrent awaiter
+        # cancellation may have flipped PENDING → AWAITER_GONE while we
+        # were persisting. Codex round-1 P0: without this refresh, a
+        # late-approve-then-cancel race left ``awaiter_gone=False`` for
+        # the caller (frontend never prompts a retry) and the request
+        # stranded in ``_pending`` because the AWAITER_GONE pop branch
+        # was skipped.
+        if not awaiter_gone and request.status == ApprovalStatus.AWAITER_GONE:
+            awaiter_gone = True
+
+        if not awaiter_gone:
             request.resume_event.set()  # Unblock the waiting coroutine
+
+        # Always pop — if a live awaiter beat us to it via its finally
+        # block, this is a no-op; if the awaiter is dead, this is the
+        # only cleanup path. Cheaper than trying to detect awaiter
+        # liveness.
+        self._pending.pop(request_id, None)
 
         logger.info(
             f"Decision submitted for {request_id[:8]}: "
