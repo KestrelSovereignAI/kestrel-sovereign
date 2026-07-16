@@ -8,8 +8,10 @@ Tests cover:
 - ContextManager orchestration
 """
 
-import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 # Import components to test
 from kestrel_sovereign.agent.token_counter import (
@@ -251,6 +253,41 @@ class TestContextManagerIntegration:
         assert "EPHEMERAL" in result.system_prompt
         assert result.messages == []
         assert "EPHEMERAL mode" in result.warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_build_context_reuses_one_state_of_mind_snapshot(self):
+        """Prompt adaptation and turn notices share one exact snapshot."""
+        from kestrel_sovereign.agent.context_manager import ContextManager
+
+        mock_storage = MagicMock()
+        state = SimpleNamespace(
+            prompt_adaptation=SimpleNamespace(preamble="snapshot preamble")
+        )
+        llm_service = MagicMock()
+        llm_service.get_state_of_mind.return_value = state
+        llm_service.get_active_model_selection.return_value = {
+            "model": "gpt-4",
+            "vendor": None,
+            "route": None,
+            "model_name": "gpt-4",
+        }
+        llm_service.get_active_model_id.return_value = "gpt-4"
+        manager = ContextManager(
+            storage=mock_storage,
+            model="gpt-4",
+            agent_id="test-agent",
+            llm_service=llm_service,
+        )
+
+        result = await manager.build_context(
+            query="test query",
+            constitution="Test constitution",
+            privacy_mode="EPHEMERAL",
+        )
+
+        llm_service.get_state_of_mind.assert_called_once_with()
+        assert result.state_of_mind is state
+        assert "snapshot preamble" in result.system_prompt
 
     @pytest.mark.asyncio
     async def test_get_budget_status(self):
