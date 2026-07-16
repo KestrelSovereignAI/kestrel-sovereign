@@ -19,6 +19,7 @@ anchored — rather than the dormant canonical text.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from .emancipation import EmancipationContract, apply_emancipation
@@ -33,6 +34,31 @@ def governing_constitution_path() -> str:
     from kestrel_sovereign.config import CONSTITUTION_PATH
 
     return CONSTITUTION_PATH
+
+
+def is_authoritative_governing_source(constitution_path: Optional[str]) -> bool:
+    """Return True when ``constitution_path`` is the authoritative governing source.
+
+    The periodic integrity audit ALWAYS recomputes the governing hash from the
+    packaged source (``governing_constitution_path()`` == ``config.CONSTITUTION_PATH``).
+    Any inception / offline-reanchor that anchors bytes from a *different* source
+    manufactures an agent guaranteed to fail its next audit and Safe-Mode, so the
+    production paths must refuse non-authoritative inputs (issue #2463 review).
+
+    ``None`` means "use the packaged default" and is therefore authoritative.
+    Otherwise the path is compared on ``os.path.realpath`` so symlinks, ``..``
+    segments, and differently-spelled-but-equivalent paths still count as the
+    packaged source. Tests that need a *custom* governing source monkeypatch
+    ``config.CONSTITUTION_PATH`` (which this function reads through
+    ``governing_constitution_path()``), making their copy the authoritative
+    source rather than a rejected override — exactly the seam the review calls
+    for ("tests can monkeypatch the resolver").
+    """
+    if constitution_path is None:
+        return True
+    return os.path.realpath(constitution_path) == os.path.realpath(
+        governing_constitution_path()
+    )
 
 
 def resolve_governing_constitution_bytes(

@@ -296,7 +296,7 @@ class TestPrivacyModeEnforcement:
         from kestrel_sovereign.privacy import PrivacyMode
         from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
-        await create_kestrel_identity_async(str(temp_dir), "docs/principles/KESTREL_CONSTITUTION.md")
+        await create_kestrel_identity_async(str(temp_dir))
         db_files = list(temp_dir.glob("*.db"))
         db_path = str(db_files[0]) if db_files else str(temp_dir / "test.db")
 

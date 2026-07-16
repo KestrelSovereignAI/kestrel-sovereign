@@ -405,3 +405,38 @@ def test_cli_verify_install_does_not_incept_docs_constitution():
     assert 'docs" / "principles"' not in code, (
         "verify-install must not build a docs constitution path"
     )
+
+
+def test_is_authoritative_governing_source(monkeypatch, tmp_path):
+    """The authoritative-source seam accepts the packaged path (and None) only.
+
+    #2463 review: inception / offline-reanchor must refuse non-authoritative
+    overrides. ``None`` (use the default) and any path that realpath-matches
+    ``config.CONSTITUTION_PATH`` are authoritative; everything else is not.
+    Tests express a custom governing source by monkeypatching
+    ``config.CONSTITUTION_PATH``.
+    """
+    from kestrel_sovereign.constitution.resolver import (
+        governing_constitution_path,
+        is_authoritative_governing_source,
+    )
+
+    # None → use the default → authoritative.
+    assert is_authoritative_governing_source(None) is True
+    # The current packaged path is authoritative.
+    assert is_authoritative_governing_source(governing_constitution_path()) is True
+    # An arbitrary other path is NOT authoritative.
+    rogue = tmp_path / "rogue.md"
+    rogue.write_bytes(b"nope")
+    assert is_authoritative_governing_source(str(rogue)) is False
+
+    # Monkeypatching config.CONSTITUTION_PATH makes THAT file authoritative —
+    # the seam the review prescribes for legitimate custom governing sources.
+    custom = tmp_path / "custom_governing.md"
+    custom.write_bytes(b"Kestrel Constitution\n")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(custom)
+    )
+    assert is_authoritative_governing_source(str(custom)) is True
+    # ...and the previously-packaged path is now non-authoritative.
+    assert is_authoritative_governing_source(str(rogue)) is False

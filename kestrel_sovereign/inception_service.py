@@ -769,12 +769,33 @@ async def create_kestrel_identity_async(
         # Resolve the governing bytes through the SINGLE production resolver
         # (#2463) so inception anchors exactly what verification later recomputes.
         from kestrel_sovereign.constitution.resolver import (
+            is_authoritative_governing_source,
             resolve_governing_constitution_bytes,
         )
         constitution_content = resolve_governing_constitution_bytes(
             emancipation_contract,
             constitution_path=constitution_path,
         )
+        # REFUSE non-authoritative production overrides (#2463 review). The
+        # periodic integrity audit ALWAYS recomputes from the packaged governing
+        # source; anchoring bytes from any OTHER path (e.g. the docs copy with
+        # OKF frontmatter) would incept an agent guaranteed to fail its next
+        # audit and Safe-Mode. Rather than hide that compatibility break, we
+        # refuse it. A legitimate custom governing source is expressed by
+        # pointing ``config.CONSTITUTION_PATH`` at it (the single seam every
+        # path reads); a signed custom-source descriptor is tracked for a
+        # future design. The check runs AFTER the resolve so a missing/unreadable
+        # path still surfaces its FileNotFoundError/OSError first.
+        if not is_authoritative_governing_source(constitution_path):
+            raise ValueError(
+                f"Refusing to incept from non-authoritative constitution source "
+                f"{constitution_path!r}: the periodic integrity audit recomputes "
+                f"the governing hash from the packaged source, so an agent "
+                f"anchored elsewhere is guaranteed to fail its next audit and "
+                f"enter Safe Mode. Omit constitution_path to use the packaged "
+                f"governing source, or point config.CONSTITUTION_PATH at your "
+                f"authoritative source (#2463)."
+            )
         if emancipation_contract is not None and emancipation_contract.enabled:
             logging.info(
                 "Amendment VIII activated for this agent — anchoring "

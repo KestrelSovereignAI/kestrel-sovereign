@@ -29,6 +29,7 @@ from .hierarchy import (
 )
 from .resolver import (
     governing_constitution_path,
+    is_authoritative_governing_source,
     resolve_governing_constitution_bytes,
 )
 
@@ -47,5 +48,6 @@ __all__ = [
     "parse_emancipation_block",
     "render_amendment_viii",
     "governing_constitution_path",
+    "is_authoritative_governing_source",
     "resolve_governing_constitution_bytes",
 ]

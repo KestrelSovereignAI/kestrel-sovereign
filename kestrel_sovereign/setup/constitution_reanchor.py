@@ -152,6 +152,33 @@ async def reanchor_constitution(
             error=f"Cannot read canonical constitution at {canonical_path}: {exc}",
         )
 
+    # REFUSE non-authoritative sources (#2463 review): the periodic integrity
+    # audit recomputes from the packaged governing source, so reanchoring to any
+    # other file would produce an agent guaranteed to fail its next audit. A
+    # legitimate custom governing source is expressed by pointing
+    # config.CONSTITUTION_PATH at it, not by passing an arbitrary --constitution-path.
+    from kestrel_sovereign.constitution.resolver import (
+        is_authoritative_governing_source,
+    )
+
+    if not is_authoritative_governing_source(str(canonical_path)):
+        return ReanchorResult(
+            agent_name=agent_name,
+            db_path=db_path,
+            canonical_path=canonical_path,
+            old_hash=None,
+            new_hash=None,
+            backup_path=None,
+            error=(
+                f"Refusing to reanchor to non-authoritative constitution source "
+                f"{canonical_path}: the periodic integrity audit recomputes from "
+                f"the packaged governing source, so an agent anchored elsewhere "
+                f"would fail its next audit and Safe-Mode. Reanchor against the "
+                f"packaged source (omit --constitution-path) or point "
+                f"config.CONSTITUTION_PATH at your authoritative source (#2463)."
+            ),
+        )
+
     old_hash, agent_did, anchored_contract_json = await _read_agent_anchor(db_path)
     if old_hash is None:
         return ReanchorResult(

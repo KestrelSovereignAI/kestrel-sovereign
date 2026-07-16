@@ -790,3 +790,57 @@ async def test_active_amendment_viii_verifies_and_dormant_downgrade_fails(
         assert "INTEGRITY FAILURE" in message
     finally:
         await agent.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_inception_refuses_non_authoritative_source(tmp_path, monkeypatch):
+    """Inception must REFUSE a readable-but-non-authoritative override (#2463 review).
+
+    Every audit/live reanchor recomputes from the packaged governing source, so
+    a successful inception from any OTHER real file manufactures an agent
+    guaranteed to Safe-Mode. The production path refuses it rather than hiding
+    the compatibility break. The DB/keys must be cleaned up on that refusal.
+    """
+    _install_isolated_governing_source(tmp_path, monkeypatch)
+
+    # A DIFFERENT, readable file that is NOT the authoritative governing source.
+    rogue = tmp_path / "rogue_constitution.md"
+    rogue.write_bytes(b"# Not the governing constitution\n\nArbitrary text.\n")
+
+    output_dir = tmp_path / "agent"
+    with pytest.raises(ValueError) as exc:
+        await create_kestrel_identity_async(
+            str(output_dir), constitution_path=str(rogue)
+        )
+    assert "non-authoritative" in str(exc.value)
+
+    # Cleanup: no half-created agent DB left behind.
+    db_path = output_dir / "kestrel_prime.db"
+    assert not db_path.exists() or os.path.getsize(db_path) == 0, (
+        "A refused inception must not leave a populated agent DB behind"
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_inception_accepts_monkeypatched_authoritative_path(
+    tmp_path, monkeypatch
+):
+    """A path that IS the (monkeypatched) authoritative source is accepted.
+
+    This is the seam the review prescribes: point config.CONSTITUTION_PATH at a
+    custom governing source and inception may be handed that exact path. The
+    resulting agent verifies clean because the audit resolves the same file.
+    """
+    governing = _install_isolated_governing_source(tmp_path, monkeypatch)
+
+    credentials = await create_kestrel_identity_async(
+        str(tmp_path / "agent"), constitution_path=str(governing)
+    )
+    agent = await _build_agent(credentials)
+    try:
+        is_valid, message = await agent._verify_constitution_integrity()
+        assert is_valid, f"Authoritative-path inception must verify: {message}"
+    finally:
+        await agent.shutdown()
