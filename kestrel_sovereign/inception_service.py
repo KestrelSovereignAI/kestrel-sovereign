@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """
 Inception Service: A library for programmatically creating new Kestrel agents.
+
+.. note::
+   This module must **not** call ``load_dotenv()`` at import time. Doing so
+   loaded the *current-directory* ``.env`` (e.g. a source checkout's key) into
+   ``os.environ`` the moment the module was imported — even transitively, long
+   before any target home was chosen. When setup then generated a *different*
+   ``KESTREL_DATA_KEY`` for an explicit ``KESTREL_HOME`` target, inception
+   encrypted the born identity with the stale current-directory key while the
+   target ``.env`` persisted the freshly-generated one, so an immediate restart
+   could not decrypt the identity (issue #2468). Dotenv loading must be
+   *target-aware* and is the caller's responsibility. The setup ``keys`` step
+   resolves the effective ``KESTREL_DATA_KEY`` deliberately; the CLI
+   ``create`` / ``setup agent`` paths resolve it the same way before inception
+   (``_apply_target_data_key_custody`` in ``cli.py``), loading the resolved
+   project home's ``.env`` and refusing an exported⇄persisted key conflict.
 """
-from dotenv import load_dotenv
-load_dotenv()  # Load .env before any other imports
 
 import logging
 import json
@@ -758,15 +771,37 @@ async def create_kestrel_identity_async(
         constitution_path = DEFAULT_CONSTITUTION_PATH
 
     try:
-        with open(constitution_path, "rb") as f:
-            constitution_content = f.read()
-        if emancipation_contract is not None and emancipation_contract.enabled:
-            from kestrel_sovereign.constitution.emancipation import apply_emancipation
-            rendered = apply_emancipation(
-                constitution_content.decode("utf-8"),
-                emancipation_contract,
+        # Resolve the governing bytes through the SINGLE production resolver
+        # (#2463) so inception anchors exactly what verification later recomputes.
+        from kestrel_sovereign.constitution.resolver import (
+            is_authoritative_governing_source,
+            resolve_governing_constitution_bytes,
+        )
+        constitution_content = resolve_governing_constitution_bytes(
+            emancipation_contract,
+            constitution_path=constitution_path,
+        )
+        # REFUSE non-authoritative production overrides (#2463 review). The
+        # periodic integrity audit ALWAYS recomputes from the packaged governing
+        # source; anchoring bytes from any OTHER path (e.g. the docs copy with
+        # OKF frontmatter) would incept an agent guaranteed to fail its next
+        # audit and Safe-Mode. Rather than hide that compatibility break, we
+        # refuse it. A legitimate custom governing source is expressed by
+        # pointing ``config.CONSTITUTION_PATH`` at it (the single seam every
+        # path reads); a signed custom-source descriptor is tracked for a
+        # future design. The check runs AFTER the resolve so a missing/unreadable
+        # path still surfaces its FileNotFoundError/OSError first.
+        if not is_authoritative_governing_source(constitution_path):
+            raise ValueError(
+                f"Refusing to incept from non-authoritative constitution source "
+                f"{constitution_path!r}: the periodic integrity audit recomputes "
+                f"the governing hash from the packaged source, so an agent "
+                f"anchored elsewhere is guaranteed to fail its next audit and "
+                f"enter Safe Mode. Omit constitution_path to use the packaged "
+                f"governing source, or point config.CONSTITUTION_PATH at your "
+                f"authoritative source (#2463)."
             )
-            constitution_content = rendered.encode("utf-8")
+        if emancipation_contract is not None and emancipation_contract.enabled:
             logging.info(
                 "Amendment VIII activated for this agent — anchoring "
                 "Sovereign-authored Emancipation Contract."

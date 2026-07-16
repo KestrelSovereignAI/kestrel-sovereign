@@ -10,21 +10,35 @@ the seam that maps the authenticated principal to a stable ``tenant_id``:
 * machine API key (e.g. the talon emitter) → the tenant the key is bound to
 
 **Zero-config default (INV-IDENTITY / INV-SOLO).** With no org/identity
-infrastructure, every request resolves to a single stable
-:data:`DEFAULT_PERSONAL_TENANT_ID`. The solo owner (sovereign API key, an
-internal/anonymous caller, or agent traffic they own) always lands on that one
-tenant, so the store never returns zero rows for the legitimate owner and never
-leaks across tenants. Only a *distinct authenticated user* (a different
-OAuth/JWT email) derives a distinct, deterministic ``uuid5`` tenant, so a
-downstream store isolates two principals.
+infrastructure, **every** request — including one carrying an authenticated
+OAuth/JWT email — resolves to the single stable
+:data:`DEFAULT_PERSONAL_TENANT_ID`. Single-tenant is the default; multi-tenancy
+is strictly additive. This keeps the solo owner and the local API-key emitters
+(talon, per-agent hook) on the *same* tenant, so the logged-in owner's browser
+sees the events those emitters posted instead of a fail-closed empty store
+(issue #2554).
+
+Per-principal isolation is **opt-in**, engaged only when multi-tenancy is
+actually configured:
+
+* a Castle ``Organization → tenant_id`` provider is bound via
+  :func:`bind_org_tenant_provider` (the real multi-tenant path,
+  kestrel-castle#18), or
+* the env flag :data:`MULTITENANT_ENV_VAR` (``KESTREL_OBSERVABILITY_MULTITENANT``)
+  is truthy.
+
+When multi-tenancy is on, a *distinct authenticated user* (a different OAuth/JWT
+email) derives a distinct, deterministic ``uuid5`` tenant (or the Castle
+provider's tenant), so a downstream store isolates two principals.
 
 This is the seam Castle later swaps to ``Organization → tenant_id`` (INV-TENANT)
-with **no observability code change** — it only replaces
-:func:`resolve_tenant` / the injected callable.
+with **no observability code change** — it only binds a provider here or
+replaces the injected callable.
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from typing import Any, Callable, Optional
 
@@ -43,7 +57,41 @@ DEFAULT_PERSONAL_TENANT_ID: uuid.UUID = uuid.uuid5(
 # (fleet v0.4.0 seam contract, issue #2444).
 HOST_CONFIG_KEY = "observability_tenant_resolver"
 
+#: Env flag that opts a deployment into per-principal tenant isolation. Truthy
+#: values (``1``/``true``/``yes``/``on``) enable multi-tenant resolution; unset
+#: or falsey keeps the single-tenant default (INV-SOLO, issue #2554).
+MULTITENANT_ENV_VAR = "KESTREL_OBSERVABILITY_MULTITENANT"
+
 TenantResolver = Callable[[Any], uuid.UUID]
+
+#: Optional Castle-bound ``identity → tenant_id`` provider. When set, it is both
+#: the multi-tenant *signal* and the source of truth for a principal's tenant
+#: (``Organization → tenant_id``). ``None`` means no org model is bound.
+OrgTenantProvider = Callable[[str], Optional[uuid.UUID]]
+_org_tenant_provider: Optional[OrgTenantProvider] = None
+
+
+def bind_org_tenant_provider(provider: Optional[OrgTenantProvider]) -> None:
+    """Bind (or clear) the Castle ``Organization → tenant_id`` provider.
+
+    Binding a provider both **enables** multi-tenant resolution and supplies the
+    authoritative tenant for a principal. Pass ``None`` to unbind and fall back
+    to the single-tenant default (unless :data:`MULTITENANT_ENV_VAR` is set).
+    """
+    global _org_tenant_provider
+    _org_tenant_provider = provider
+
+
+def _multitenant_enabled() -> bool:
+    """True when per-principal isolation is opted into (provider or env flag)."""
+    if _org_tenant_provider is not None:
+        return True
+    return os.environ.get(MULTITENANT_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def tenant_id_for_identity(identity: Optional[str]) -> uuid.UUID:
@@ -93,13 +141,33 @@ def _principal_identity(request: Any) -> Optional[str]:
 def resolve_tenant(request: Any) -> uuid.UUID:
     """Resolve the authenticated principal of ``request`` to a ``tenant_id``.
 
-    Always returns a concrete :class:`uuid.UUID` (never ``None``) so INV-SOLO
-    holds: the legitimate solo owner is guaranteed a stable, non-empty tenant.
-    Matches the fleet seam signature ``Callable[[Request], Optional[uuid.UUID]]``
-    (a concrete UUID is a valid return; the fleet store only needs ``None`` to
-    trigger its own fallback, which this resolver renders unnecessary).
+    Single-tenant by default (INV-SOLO, issue #2554): with no multi-tenant
+    config every request — including one carrying an authenticated email —
+    resolves to :data:`DEFAULT_PERSONAL_TENANT_ID`, so the solo owner shares one
+    tenant with the local API-key emitters and sees their events.
+
+    Per-principal isolation is engaged only when multi-tenancy is opted into (a
+    bound Castle provider or :data:`MULTITENANT_ENV_VAR`). When on, a distinct
+    authenticated principal derives a distinct tenant — from the Castle
+    ``Organization → tenant_id`` provider when bound, else a deterministic
+    ``uuid5``.
+
+    Always returns a concrete :class:`uuid.UUID` (never ``None``, fail-closed).
+    Matches the fleet seam signature ``Callable[[Request], Optional[uuid.UUID]]``.
     """
-    return tenant_id_for_identity(_principal_identity(request))
+    if not _multitenant_enabled():
+        return DEFAULT_PERSONAL_TENANT_ID
+
+    identity = _principal_identity(request)
+    if not identity or not identity.strip():
+        return DEFAULT_PERSONAL_TENANT_ID
+
+    if _org_tenant_provider is not None:
+        tenant = _org_tenant_provider(identity)
+        if tenant is not None:
+            return tenant
+
+    return tenant_id_for_identity(identity)
 
 
 def build_tenant_resolver() -> TenantResolver:
@@ -115,8 +183,11 @@ def build_tenant_resolver() -> TenantResolver:
 __all__ = [
     "DEFAULT_PERSONAL_TENANT_ID",
     "HOST_CONFIG_KEY",
+    "MULTITENANT_ENV_VAR",
     "TENANT_NAMESPACE",
+    "OrgTenantProvider",
     "TenantResolver",
+    "bind_org_tenant_provider",
     "build_tenant_resolver",
     "resolve_tenant",
     "tenant_id_for_identity",

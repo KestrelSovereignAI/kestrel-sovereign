@@ -1,6 +1,6 @@
 # Dockerfile for Kestrel Agent - Remote LLM Dependencies
 # Uses external LLM services (OpenAI, etc.) - smaller image (~500MB vs 32GB)
-# Installs base dependencies only (no [local] extras like torch, spacy, chromadb)
+# Installs base dependencies only (no heavyweight [local] inference extras)
 ARG TARGETARCH
 FROM --platform=linux/${TARGETARCH} python:3.11-slim
 

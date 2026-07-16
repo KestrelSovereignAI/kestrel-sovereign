@@ -563,7 +563,7 @@ class TestFeatureStoreAPI:
             monkeypatch.delenv(DISABLED_FEATURES_ENV, raising=False)
             monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
 
-            create_kestrel_identity(agent_dir, "docs/principles/KESTREL_CONSTITUTION.md")
+            create_kestrel_identity(agent_dir)
 
             threads_before = set(threading.enumerate())
 
@@ -597,7 +597,7 @@ class TestFeatureStoreAPI:
             monkeypatch.setenv(DISABLED_FEATURES_ENV, "ExternalGPUFeature")
             monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
 
-            create_kestrel_identity(agent_dir, "docs/principles/KESTREL_CONSTITUTION.md")
+            create_kestrel_identity(agent_dir)
 
             threads_before = set(threading.enumerate())
 

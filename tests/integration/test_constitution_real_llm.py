@@ -47,7 +47,7 @@ async def client(monkeypatch):
         monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
 
         # Now, create the identity in that directory
-        await create_kestrel_identity_async(agent_dir, "docs/principles/KESTREL_CONSTITUTION.md")
+        await create_kestrel_identity_async(agent_dir)
 
         # Track threads before TestClient starts
         threads_before = set(threading.enumerate())

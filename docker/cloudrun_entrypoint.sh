@@ -35,7 +35,14 @@ if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null && ! ls "$AGENT_DIR"/*_did.json 
     /app/.venv/bin/python -c "
 import sys; sys.path.insert(0, '/app')
 from kestrel_sovereign.inception_service import create_kestrel_identity
-creds = create_kestrel_identity('$AGENT_DIR', 'docs/principles/KESTREL_CONSTITUTION.md')
+# Do NOT pass a constitution_path. Inception defaults to the shared
+# governing-constitution resolver's authoritative packaged source
+# (config.CONSTITUTION_PATH = kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
+# — the EXACT bytes the periodic integrity audit later recomputes (#2463).
+# Passing the docs copy (docs/principles/KESTREL_CONSTITUTION.md carries OKF
+# YAML frontmatter) would incept a hash the audit can never match, so fresh
+# container agents would self-brick into Safe Mode on their first audit.
+creds = create_kestrel_identity('$AGENT_DIR')
 print(f'Agent created: {creds.agent_did}')
 "
 else

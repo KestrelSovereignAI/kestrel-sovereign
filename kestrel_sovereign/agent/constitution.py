@@ -493,56 +493,154 @@ class ConstitutionMixin:
 
         stored_hash = agent_node.properties.get("constitution_hash")
         if not stored_hash:
-            logging.warning("No constitution hash stored - cannot verify integrity.")
-            return True, "WARNING: No anchored constitution hash."
+            # FAIL CLOSED (#2463 review): a missing anchor gives the integrity
+            # verifier nothing to prove against. Lazy auto-anchoring (in
+            # ``_get_governing_constitution``) is NOT verification — an
+            # integrity verifier whose anchor was deleted must fail closed and
+            # drive Safe Mode, not silently report success. Legacy migration of
+            # pre-anchor agents is a separate, operator-driven concern.
+            logging.critical(
+                "CONSTITUTION INTEGRITY: no anchored constitution_hash on the "
+                "agent identity node (deleted? never anchored?)."
+            )
+            return False, (
+                "INTEGRITY FAILURE: No anchored constitution hash — the agent's "
+                "governing anchor is missing. Re-anchor with a signed amendment "
+                "artifact before resuming."
+            )
+
+        # PROOF 1 — the operative stored blob must be retrievable, decryptable,
+        # and hash to the stored anchor (#2463 review). Merely matching the
+        # package hash to the anchor property does not prove the agent's own
+        # anchored copy is intact: a missing file row, corrupt ciphertext/
+        # plaintext, or a wrong data key would otherwise pass silently. Retrieve
+        # it (this decrypts through the storage layer), reject None/decrypt
+        # failures, and confirm SHA-256(plaintext) == anchor.
+        try:
+            stored_bytes = await self.storage.retrieve_file(stored_hash)
+        except Exception as e:  # noqa: BLE001 — decrypt/IO failure = integrity failure
+            logging.critical(
+                "CONSTITUTION INTEGRITY: cannot retrieve/decrypt anchored blob "
+                "%s: %s", stored_hash, e,
+            )
+            return False, (
+                f"INTEGRITY FAILURE: Cannot retrieve/decrypt the anchored "
+                f"constitution blob (missing row / wrong key / corruption): {e}"
+            )
+        if stored_bytes is None:
+            logging.critical(
+                "CONSTITUTION INTEGRITY: anchored blob %s is missing.",
+                stored_hash,
+            )
+            return False, (
+                "INTEGRITY FAILURE: Anchored constitution blob is missing "
+                "(file row deleted?)."
+            )
+        stored_blob_hash = hashlib.sha256(stored_bytes).hexdigest()
+        if stored_blob_hash != stored_hash:
+            logging.critical(
+                "CONSTITUTION INTEGRITY: anchored blob hash %s != anchor %s",
+                stored_blob_hash, stored_hash,
+            )
+            return False, (
+                "INTEGRITY FAILURE: Anchored constitution blob does not hash to "
+                "its stored anchor (corruption/tamper)."
+            )
+
+        # PROOF 2 — the governance edge (agent --governed_by--> constitution)
+        # must exist and point at the anchored constitution hash (#2463 review).
+        # Without this an attacker could repoint or delete the governance
+        # relationship while leaving the hash property intact.
+        try:
+            governance_edges = await self.storage.get_edges_from(self.agent_id)
+        except Exception as e:  # noqa: BLE001
+            logging.critical(
+                "CONSTITUTION INTEGRITY: cannot read governance edges: %s", e,
+            )
+            return False, (
+                f"INTEGRITY FAILURE: Cannot read the agent's governance edges: {e}"
+            )
+        has_governance_edge = any(
+            getattr(edge, "label", None) == "governed_by"
+            and getattr(edge, "target_id", None) == stored_hash
+            for edge in (governance_edges or [])
+        )
+        if not has_governance_edge:
+            logging.critical(
+                "CONSTITUTION INTEGRITY: missing/wrong governed_by edge for "
+                "anchor %s.", stored_hash,
+            )
+            return False, (
+                "INTEGRITY FAILURE: Missing or mis-targeted governed_by edge to "
+                "the anchored constitution (governance relationship tampered?)."
+            )
+
+        # PROOF 3 — live-source parity. Recompute the hash from the AUTHORITATIVE
+        # packaged governing source
+        # through the single production resolver (#2463) — the same source
+        # inception anchored — NOT the documentation copy under docs/ (which
+        # carries OKF frontmatter and drifts) and NOT the stored blob itself
+        # (comparing the blob to its own hash can never detect a mutation of
+        # the governing source). For an agent with an active Amendment VIII
+        # emancipation contract, the resolver renders the active form so we
+        # compare against the correctly-rendered governing bytes.
+        from kestrel_sovereign.constitution.emancipation import (
+            EmancipationConfigError,
+            contract_from_json,
+        )
+        from kestrel_sovereign.constitution.resolver import (
+            resolve_governing_constitution_bytes,
+        )
 
         try:
-            stored_content = await self.storage.retrieve_file(stored_hash)
+            contract = contract_from_json(
+                agent_node.properties.get("emancipation_contract")
+            )
+        except EmancipationConfigError as e:
+            return False, (
+                f"INTEGRITY FAILURE: Anchored emancipation contract is corrupted: {e}"
+            )
+
+        try:
+            governing_content = resolve_governing_constitution_bytes(contract)
         except Exception as e:
-            return False, f"INTEGRITY FAILURE: Cannot retrieve stored constitution: {e}"
+            # FAIL CLOSED (#2463 review): the authoritative packaged governing
+            # source is a wheel-shipped data file that MUST always be present
+            # and readable. If it is missing, unreadable, or otherwise cannot
+            # be resolved (FileNotFoundError / OSError / empty-source
+            # ValueError), we CANNOT prove the anchored constitution still
+            # matches its governing source — so we must NOT report success
+            # merely because the source could not be loaded. Treat any
+            # resolution failure as an integrity failure and drive the agent
+            # into Safe Mode.
+            logging.critical(
+                "CONSTITUTION INTEGRITY: cannot resolve the authoritative "
+                "governing constitution source: %s",
+                e,
+            )
+            return False, (
+                f"INTEGRITY FAILURE: Cannot resolve authoritative governing "
+                f"constitution (source missing/unreadable/ambiguous): {e}"
+            )
 
-        constitution_paths = [
-            "docs/principles/KESTREL_CONSTITUTION.md",
-            "/app/docs/principles/KESTREL_CONSTITUTION.md",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs/principles/KESTREL_CONSTITUTION.md")
-        ]
+        governing_hash = hashlib.sha256(governing_content).hexdigest()
+        if governing_hash != stored_hash:
+            logging.critical(
+                "CONSTITUTION MISMATCH!\n"
+                f"  Anchored:  {stored_hash}\n"
+                f"  Governing: {governing_hash}"
+            )
+            return False, (
+                "INTEGRITY FAILURE: Governing constitution has been modified."
+            )
 
-        for path in constitution_paths:
-            try:
-                with open(path, "rb") as f:
-                    file_content = f.read()
-                file_hash = hashlib.sha256(file_content).hexdigest()
-
-                if file_hash != stored_hash:
-                    logging.critical(
-                        f"CONSTITUTION MISMATCH!\n"
-                        f"  Anchored: {stored_hash}\n"
-                        f"  File:     {file_hash}\n"
-                        f"  Path:     {path}"
-                    )
-                    return False, f"INTEGRITY FAILURE: Constitution at {path} has been modified."
-                else:
-                    logging.info(f"Constitution integrity verified against {path}")
-                    base_msg = f"Constitution integrity verified. Hash: {stored_hash[:16]}..."
-                    # Also verify spawn mandate constraints if present
-                    spawn_valid, spawn_msg = await self._verify_spawn_mandate_constraints()
-                    if not spawn_valid:
-                        return False, spawn_msg
-                    return True, base_msg
-            except FileNotFoundError:
-                continue
-            except Exception as e:
-                logging.warning(f"Could not read constitution from {path}: {e}")
-                continue
-
-        logging.info("No filesystem constitution found, but anchored constitution is intact.")
-
+        logging.info("Constitution integrity verified against governing source.")
+        base_msg = f"Constitution integrity verified. Hash: {stored_hash[:16]}..."
         # Also verify spawn mandate constraints if present
         spawn_valid, spawn_msg = await self._verify_spawn_mandate_constraints()
         if not spawn_valid:
             return False, spawn_msg
-
-        return True, f"Anchored constitution verified. Hash: {stored_hash[:16]}..."
+        return True, base_msg
 
     # ------------------------------------------------------------------
     # Per-agent constitution overlay anchoring (#1722)
@@ -866,6 +964,33 @@ class ConstitutionMixin:
             return False
         return True
 
+    async def _anchor_constitution_governance(self, constitution_hash: str) -> None:
+        """Ensure the constitution document node + ``governed_by`` edge exist.
+
+        Inception creates a ``document`` node keyed by the constitution content
+        hash and links ``agent --governed_by--> constitution`` (issue #2463's
+        integrity proof 2 checks that edge). Every OTHER path that changes the
+        anchored ``constitution_hash`` (signed reanchor, legacy lazy anchoring)
+        MUST maintain the same governance structure, or the periodic audit would
+        fail closed on a legitimately re-anchored agent. This mirrors the
+        inception wiring so the byte-selection seam and its governance edge stay
+        in lockstep.
+        """
+        constitution_node = GraphNode(
+            node_id=constitution_hash,
+            node_type="document",
+            label="KESTREL_CONSTITUTION",
+            properties={
+                "hash": constitution_hash,
+                "type": "Constitution",
+                "anchored_at": self._get_timestamp(),
+            },
+        )
+        await self.storage.add_node(constitution_node)  # upsert
+        await self.storage.add_edge(
+            self.agent_id, constitution_hash, "governed_by"
+        )
+
     async def reanchor_constitution(
         self,
         expected_hash: str = None,
@@ -899,28 +1024,44 @@ class ConstitutionMixin:
 
         old_hash = agent_node.properties.get("constitution_hash", "none")
 
-        constitution_paths = [
-            "docs/principles/KESTREL_CONSTITUTION.md",
-            "/app/docs/principles/KESTREL_CONSTITUTION.md",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs/principles/KESTREL_CONSTITUTION.md"),
-        ]
+        # Resolve the new governing bytes through the SINGLE production resolver
+        # (#2463) reading the authoritative packaged source
+        # (config.CONSTITUTION_PATH), rendered to this agent's anchored
+        # Amendment VIII active form — NOT the documentation copy under docs/
+        # (which carries OKF frontmatter and drifts). Reanchoring off the docs
+        # copy would anchor a hash the periodic audit — which recomputes from
+        # the packaged source — could never match, false-tripping Safe Mode.
+        from kestrel_sovereign.config import CONSTITUTION_PATH
+        from kestrel_sovereign.constitution.emancipation import (
+            EmancipationConfigError,
+            contract_from_json,
+        )
+        from kestrel_sovereign.constitution.resolver import (
+            resolve_governing_constitution_bytes,
+        )
 
-        constitution_content = None
-        constitution_path_used = None
-        for path in constitution_paths:
-            try:
-                with open(path, "rb") as f:
-                    constitution_content = f.read()
-                    constitution_path_used = path
-                    break
-            except FileNotFoundError:
-                continue
-            except Exception as e:
-                logging.warning(f"Failed to read {path}: {e}")
-                continue
+        try:
+            reanchor_contract = contract_from_json(
+                agent_node.properties.get("emancipation_contract")
+            )
+        except EmancipationConfigError as e:
+            return (
+                f"Error: Anchored emancipation contract is corrupted: {e}. "
+                f"Refusing to reanchor without a clean structured receipt."
+            )
 
-        if constitution_content is None:
+        constitution_path_used = CONSTITUTION_PATH
+        try:
+            constitution_content = resolve_governing_constitution_bytes(
+                reanchor_contract,
+                constitution_path=CONSTITUTION_PATH,
+            )
+        except FileNotFoundError:
             return "Error: No constitution file found on disk."
+        except Exception as e:
+            # FAIL CLOSED: an unreadable/ambiguous governing source must not be
+            # anchored (#2463).
+            return f"Error: Cannot resolve authoritative governing constitution: {e}"
 
         new_hash = hashlib.sha256(constitution_content).hexdigest()
 
@@ -994,6 +1135,11 @@ class ConstitutionMixin:
         )
         await self.storage.add_node(artifact_node)
 
+        # Maintain the governance document node + governed_by edge for the new
+        # anchor so the periodic integrity audit's edge proof (#2463) still holds
+        # after a legitimate reanchor.
+        await self._anchor_constitution_governance(stored_hash)
+
         agent_node.properties["constitution_hash"] = stored_hash
         agent_node.properties["constitution_reanchor"] = {
             "timestamp": self._get_timestamp(),
@@ -1053,34 +1199,44 @@ class ConstitutionMixin:
         if not constitution_hash:
             logging.warning("Constitution hash not found. Attempting to load and anchor default.")
 
-            constitution_paths = [
-                "docs/principles/KESTREL_CONSTITUTION.md",
-                "/app/docs/principles/KESTREL_CONSTITUTION.md",
-                "../docs/principles/KESTREL_CONSTITUTION.md",
-                os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs/principles/KESTREL_CONSTITUTION.md")
-            ]
+            # Auto-anchor the SAME authoritative packaged governing bytes the
+            # periodic audit later recomputes (#2463) via the single production
+            # resolver — reading config.CONSTITUTION_PATH rendered to this
+            # agent's anchored Amendment VIII form — NOT the docs/ copy (OKF
+            # frontmatter → different hash → false Safe Mode on the next audit).
+            from kestrel_sovereign.config import CONSTITUTION_PATH
+            from kestrel_sovereign.constitution.emancipation import (
+                EmancipationConfigError,
+                contract_from_json,
+            )
+            from kestrel_sovereign.constitution.resolver import (
+                resolve_governing_constitution_bytes,
+            )
 
-            constitution_content = None
-            constitution_path_used = None
+            try:
+                anchor_contract = contract_from_json(
+                    agent_node.properties.get("emancipation_contract")
+                )
+            except EmancipationConfigError as e:
+                return f"Error: Anchored emancipation contract is corrupted: {e}"
 
-            for path in constitution_paths:
-                try:
-                    with open(path, "rb") as f:
-                        constitution_content = f.read()
-                        constitution_path_used = path
-                        logging.info(f"Loaded constitution from: {path}")
-                        break
-                except FileNotFoundError:
-                    continue
-                except Exception as e:
-                    logging.warning(f"Failed to read {path}: {e}")
-                    continue
-
-            if constitution_content is None:
+            constitution_path_used = CONSTITUTION_PATH
+            try:
+                constitution_content = resolve_governing_constitution_bytes(
+                    anchor_contract,
+                    constitution_path=CONSTITUTION_PATH,
+                )
+            except FileNotFoundError:
                 return "Error: No constitution file found."
+            except Exception as e:
+                # FAIL CLOSED: never anchor an unreadable/ambiguous source.
+                return f"Error: Cannot resolve authoritative governing constitution: {e}"
 
             try:
                 constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
+                # Mirror inception's governance wiring so the integrity audit's
+                # edge proof (#2463) holds for a lazily-anchored legacy agent.
+                await self._anchor_constitution_governance(constitution_hash)
                 agent_node.properties["constitution_hash"] = constitution_hash
                 await self.storage.add_node(agent_node)
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
