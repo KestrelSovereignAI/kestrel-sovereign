@@ -8,6 +8,7 @@ import asyncio
 import logging
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -196,6 +197,13 @@ class DockerExecutor(BaseExecutor):
     ) -> _ExecutionResult:
         host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
         host_trash_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Mount a PER-EXECUTION staging directory, never the shared trash
+        # root: a read/write bind of the root would let any container script
+        # read or corrupt entries trashed by previous runs and other agents.
+        # Staged entries are promoted into the real trash root host-side
+        # after the container exits (same filesystem, atomic renames).
+        staging_dir = host_trash_dir / f".staging-{uuid.uuid4().hex[:12]}"
+        staging_dir.mkdir(mode=0o700)
 
         # Container mounts (/scripts, /workspace) are read-only, so no
         # workdir is authorized for direct deletion; every delete moves to
@@ -234,7 +242,7 @@ class DockerExecutor(BaseExecutor):
         # Safe deletions must survive the container.  The rewriter uses the
         # container path while this dedicated bind mount anchors it to the
         # host's configured Kestrel trash directory.
-        cmd.extend(["-v", f"{host_trash_dir}:{_CONTAINER_TRASH_DIR}:rw"])
+        cmd.extend(["-v", f"{staging_dir}:{_CONTAINER_TRASH_DIR}:rw"])
 
         if working_dir:
             cmd.extend(["-v", f"{working_dir}:/workspace:ro"])
@@ -288,6 +296,11 @@ class DockerExecutor(BaseExecutor):
             )
         except TimeoutError:
             raise ExecutionTimeoutError(script.id, script.timeout_seconds) from None
+        finally:
+            # Promote staged trash entries even on timeout/failure: deletions
+            # performed before the interruption already happened, and their
+            # trash entries must stay restorable from the real trash root.
+            self._promote_staged_trash(staging_dir, host_trash_dir)
 
         return _ExecutionResult(
             exit_code=process.returncode,
@@ -295,6 +308,36 @@ class DockerExecutor(BaseExecutor):
             stderr=stderr,
             container_id=container_name,
         )
+
+    @staticmethod
+    def _promote_staged_trash(staging_dir: Path, host_trash_dir: Path) -> None:
+        """Move per-execution staged trash entries into the real trash root.
+
+        Renames each staged entry (same filesystem, atomic) with a collision
+        suffix, then removes the staging directory. Best-effort: a promotion
+        failure must not mask the execution result — but it is logged loudly
+        because it strands restorable trash entries in a hidden directory.
+        """
+        try:
+            if not staging_dir.is_dir():
+                return
+            for entry in staging_dir.iterdir():
+                destination = host_trash_dir / entry.name
+                suffix = 0
+                while destination.exists():
+                    suffix += 1
+                    destination = host_trash_dir / f"{entry.name}.{suffix}"
+                entry.rename(destination)
+            staging_dir.rmdir()
+        except OSError:
+            logger.warning(
+                "Failed to promote staged trash entries from %s into %s; "
+                "trashed files remain there and are NOT visible to trash "
+                "restore/listing until moved manually.",
+                staging_dir,
+                host_trash_dir,
+                exc_info=True,
+            )
 
     @staticmethod
     def _container_name(execution_id: str) -> str:

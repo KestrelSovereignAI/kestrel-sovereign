@@ -275,6 +275,13 @@ class TrashManager:
             if not subdir.is_dir():
                 continue
 
+            # Hidden dot-directories are never trash entries — chiefly the
+            # per-execution `.staging-*` bind-mount directories the Docker
+            # executor promotes from after a run; mid-flight entries must not
+            # be listed (or restored) before promotion.
+            if subdir.name.startswith("."):
+                continue
+
             deleted_at = _entry_deleted_at(subdir)
             if deleted_at is None:
                 continue

@@ -464,6 +464,7 @@ class ShellScriptRewriter:
         quoted_root = shlex.quote(self._trash_dir)
         template = str(Path(self._trash_dir) / f"{operation_prefix}_XXXXXXXX")
         quoted_template = shlex.quote(template)
+        entry_var = f"{resolved_var}_entry"
         lines = [
             f"  {item_status}=0;",
             (
@@ -475,12 +476,24 @@ class ShellScriptRewriter:
                 f"{quoted_target}) || {item_status}=1;"
             ),
             f'    {source_var}="${{{resolved_var}}}";',
+            # For a symlink the entry ITSELF is what gets moved, so its
+            # physical location must pass the agent-data guard too — not only
+            # the followed target. A link parked inside another agent's data
+            # (pointing elsewhere) would otherwise escape that directory
+            # through its own removal.
+            f'    {entry_var}="${{{resolved_var}}}";',
             f"    if command -p test -L {quoted_target}; then",
             f"      {source_var}={quoted_target};",
+            (
+                f"      {entry_var}=$(command -p dirname -- {quoted_target}) && "
+                f'{entry_var}="$(command -p realpath -- "${{{entry_var}}}")"/'
+                f'"$(command -p basename -- {quoted_target})" || {item_status}=1;'
+            ),
             "    fi;",
         ]
 
         lines.extend(self._runtime_agent_data_guard(target, resolved_var, item_status))
+        lines.extend(self._runtime_agent_data_guard(target, entry_var, item_status))
 
         if not recursive:
             lines.extend(

@@ -820,3 +820,50 @@ async def test_local_executor_trashes_relative_delete_in_caller_working_dir(
     assert record.exit_code == 0, record.stderr
     assert not precious.exists()
     assert next(trash_dir.glob("*/keep-safe.txt")).read_text() == "irreplaceable"
+
+
+def test_shell_rm_rejects_symlink_entry_inside_another_agents_data(
+    tmp_path: Path,
+    trash_dir: Path,
+) -> None:
+    """A symlink ENTRY parked in another agent's data dir must be protected
+    even when its target resolves outside agent_data: deleting the link
+    removes the entry itself from that directory (#2485 review P2)."""
+    outside_target = tmp_path / "outside-target.txt"
+    outside_target.write_text("outside")
+    other_agent = tmp_path / "agent_data" / "other"
+    other_agent.mkdir(parents=True)
+    link = other_agent / "their-link"
+    link.symlink_to(outside_target)
+
+    policy = DestructiveOperationPolicy(trash_dir=trash_dir)
+    rewritten = policy.rewrite_bash_script(f'rm "{link}"')
+
+    completed = subprocess.run(
+        ["sh", "-c", rewritten],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "another agent's runtime data" in completed.stderr
+    assert link.is_symlink(), "the other agent's symlink entry must survive"
+    assert list(trash_dir.iterdir()) == []
+
+
+def test_trash_listing_skips_hidden_staging_directories(
+    trash_dir: Path,
+) -> None:
+    """Per-execution `.staging-*` bind-mount dirs (Docker executor) must not
+    surface as trash entries before promotion."""
+    from kestrel_sovereign.features.compute.trash_manager import TrashManager
+
+    staging = trash_dir / ".staging-abc123"
+    staging.mkdir(parents=True)
+    (staging / "rm_pending123").mkdir()
+    (staging / "rm_pending123" / "inflight.txt").write_text("mid-run")
+
+    manager = TrashManager(trash_dir=trash_dir)
+    items = manager.list_items()
+    assert items == [], "mid-flight staged entries must not be listed"
