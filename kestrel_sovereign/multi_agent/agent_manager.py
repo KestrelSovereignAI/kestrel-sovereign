@@ -26,6 +26,8 @@ from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
+from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
+
 from .config import LocalAgentConfig, MultiAgentConfig
 
 logger = logging.getLogger(__name__)
@@ -186,7 +188,7 @@ class AgentManager:
         cleanup explicitly.
         """
         try:
-            await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+            await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
         except (asyncio.TimeoutError, Exception) as exc:
             logger.warning(
                 "Failed to clean up unregistered agent %r: %s",
@@ -378,7 +380,7 @@ class AgentManager:
             if agent is not None:
                 self._agent_names.pop(agent.agent_id, None)
                 try:
-                    await asyncio.wait_for(agent.shutdown(), timeout=5.0)
+                    await asyncio.wait_for(agent.shutdown(), timeout=SHUTDOWN_TIMEOUT)
                     logger.info(f"Agent '{name}' shut down")
                 except (asyncio.TimeoutError, Exception) as e:
                     logger.warning(f"Agent '{name}' shutdown issue: {e}")

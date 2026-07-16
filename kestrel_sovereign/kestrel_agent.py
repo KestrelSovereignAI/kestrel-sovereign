@@ -12,6 +12,7 @@ from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.config import TRUSTED_AGENTS_DIR
+from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from typing import Optional, Dict, List, Any, Union
 import re
 from pathlib import Path
@@ -134,6 +135,105 @@ KESTREL_DIMINISHING_THRESHOLD = int(os.environ.get("KESTREL_DIMINISHING_THRESHOL
 KESTREL_MAX_LOW_DELTA = int(os.environ.get("KESTREL_MAX_LOW_DELTA", "5"))
 # Stop if iteration count exceeds this percentage of max_iterations budget
 KESTREL_BUDGET_STOP_PCT = int(os.environ.get("KESTREL_BUDGET_STOP_PCT", "90"))
+
+# Overall internal budget for the *fallible prefix* of whole-agent shutdown
+# (#2409). Kept coherent with the production outer deadline: the CLI/server/
+# AgentManager paths all wrap agent.shutdown() in
+# asyncio.wait_for(..., timeout=SHUTDOWN_TIMEOUT). If the internal per-step
+# bounds summed higher than that outer deadline, a single hung early step
+# could consume the whole outer budget and the outer wait_for — not our own
+# composition — would be what stops us, starving every later step. So the
+# internal sweep budget defaults to the SAME value as the production outer
+# deadline (override with KESTREL_AGENT_SHUTDOWN_TIMEOUT_S) and every fallible
+# step is bounded against a shared deadline derived from it.
+KESTREL_AGENT_SHUTDOWN_TIMEOUT_S = float(
+    os.environ.get("KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", str(SHUTDOWN_TIMEOUT))
+)
+
+# Headroom carved out of the sweep budget for the durable cleanup tail
+# (background tasks, memory, sync snapshot, storage close). The fallible
+# prefix may only spend budget up to (deadline - this reserve), so the
+# durable tail always has time to run *within* the outer deadline instead of
+# relying on the outer wait_for cancellation to trigger it.
+KESTREL_SHUTDOWN_DURABLE_RESERVE_S = float(
+    os.environ.get("KESTREL_SHUTDOWN_DURABLE_RESERVE_S", "1.0")
+)
+
+# Per-feature *cap* for the whole-agent shutdown sweep (#2409). A single
+# feature that hangs in shutdown() must not stall the sweep or starve the
+# durable cleanup tail (background tasks, memory, sync snapshot, storage
+# close); once this elapses the feature is abandoned and the sweep moves on.
+# The effective bound is min(this cap, fair share of the remaining sweep
+# budget) — see shutdown() — so this cap never lets one feature exceed its
+# slice of the coherent deadline above.
+KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S = float(
+    os.environ.get("KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S", "30")
+)
+
+# Minimum per-step guard (seconds) for the durable cleanup tail. Even when the
+# budget is nearly exhausted, each durable step (background-task cleanup,
+# memory, final snapshot, storage close) gets at least this nonzero attempt so
+# data is never silently dropped for lack of a sliver of time. The tail is
+# still bounded overall: a step that exceeds its guard is ABANDONED (not
+# awaited — so a coroutine that suppresses cancellation cannot hang the tail
+# past this guard), logged at WARNING, and the shutdown is reported as
+# *degraded* — never as "completed".
+KESTREL_SHUTDOWN_TAIL_MIN_STEP_S = float(
+    os.environ.get("KESTREL_SHUTDOWN_TAIL_MIN_STEP_S", "0.5")
+)
+
+
+def _resolve_shutdown_budget() -> tuple[float, float]:
+    """Resolve ``(prefix_budget, tail_reserve)`` for whole-agent shutdown.
+
+    Both values are clamped and validated against the production outer
+    deadline (``SHUTDOWN_TIMEOUT``) so the internal deadline composition can
+    never be incoherent:
+
+    * The total internal budget is clamped to at most ``SHUTDOWN_TIMEOUT``.
+      An override above it would let the outer ``wait_for`` (not our own
+      composition) be what stops us, starving later steps and the durable
+      tail; the mismatch is logged at WARNING and reconciled by clamping.
+    * The durable-tail reserve is clamped into ``[min_step, total / 2]`` so
+      the tail always has a nonzero, honest window and the fallible prefix
+      always keeps the majority of the budget. ``reserve >= total`` is an
+      explicit, safe clamp (logged), not a zero-budget prefix.
+
+    Returns ``(prefix_budget, tail_reserve)`` with both strictly > 0.
+    """
+    outer = float(SHUTDOWN_TIMEOUT)
+    total = KESTREL_AGENT_SHUTDOWN_TIMEOUT_S
+    if total <= 0:
+        total = outer
+    if total > outer:
+        logging.warning(
+            "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S=%.2fs exceeds the production "
+            "outer shutdown deadline (%.2fs); clamping to keep the internal "
+            "deadline coherent with the outer wait_for.",
+            total,
+            outer,
+        )
+        total = outer
+
+    max_reserve = total / 2.0
+    reserve = KESTREL_SHUTDOWN_DURABLE_RESERVE_S
+    if reserve >= total:
+        logging.warning(
+            "KESTREL_SHUTDOWN_DURABLE_RESERVE_S=%.2fs >= internal shutdown "
+            "budget %.2fs; clamping the durable reserve to %.2fs so the "
+            "fallible prefix keeps a nonzero budget.",
+            reserve,
+            total,
+            max_reserve,
+        )
+        reserve = max_reserve
+    reserve = min(max(reserve, 0.0), max_reserve)
+    if reserve <= 0.0:
+        reserve = min(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, max_reserve)
+
+    prefix_budget = max(0.0, total - reserve)
+    return prefix_budget, reserve
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -3973,124 +4073,491 @@ Expected Duration: {expected_duration}
         )
 
     async def shutdown(self):
-        """Properly clean up all agent resources including async MCP connections."""
-        # EPHEMERAL hard-purge defense-in-depth (#767). If the agent
-        # process is exiting while still in EPHEMERAL, the session is
-        # closing — fire the hard-purge so any leak doesn't survive
-        # the restart. Best-effort; never block shutdown on failure.
+        """Properly clean up all agent resources including async MCP connections.
+
+        The whole method is a *fallible prefix* wrapped in one try/finally.
+        The prefix stops every agent-owned worker and every feature; the
+        ``finally`` runs the safety-critical durable tail (background-task
+        cleanup, memory shutdown, final sync snapshot, storage close).
+
+        Cancellation contract (#2409): agent.shutdown() is wrapped in
+        ``asyncio.wait_for(..., timeout=SHUTDOWN_TIMEOUT)`` by the CLI /
+        server / AgentManager paths. If the outer timeout cancels us
+        *anywhere* in the prefix — while stopping the heartbeat, the resume
+        monitor, the salvage worker, SecurityFeature, or any other feature —
+        we must NOT skip the durable tail. So the ENTIRE prefix lives inside
+        the try, the durable tail always runs in the ``finally``, and
+        CancelledError is re-raised only after that tail completes (never
+        reporting a successful shutdown post-cancellation).
+
+        Deadline composition is kept coherent with the production outer
+        deadline: the prefix shares a single internal budget
+        (``KESTREL_AGENT_SHUTDOWN_TIMEOUT_S``, defaulting to the same value
+        the outer ``wait_for`` uses) minus a durable-tail reserve, and every
+        step is bounded against it. Features additionally fair-divide the
+        remaining budget so a single hung early feature can consume only its
+        own slice and cannot starve a later feature — or the durable tail.
+        """
+        loop = asyncio.get_running_loop()
+        prefix_budget, tail_reserve = _resolve_shutdown_budget()
+        # Shared deadline for the fallible prefix. Reserve headroom so the
+        # durable tail runs WITHIN the outer deadline rather than relying on
+        # the outer wait_for cancellation to trigger it.
+        prefix_deadline = loop.time() + prefix_budget
+
+        def _remaining() -> float:
+            return max(0.0, prefix_deadline - loop.time())
+
+        security_feature = self.features.get("SecurityFeature")
+        mcp_feature = self.mcp_agent
+
+        # ONE ordered count/budget across EVERY fallible prefix operation
+        # (#2409 review). Each op gets a fair share of the LIVE remaining
+        # budget divided by the number of ops still pending (itself included),
+        # so a single hung EARLY op — ephemeral purge, heartbeat, resume,
+        # salvage, SecurityFeature, any feature, MCP, LLM, or TaskManager —
+        # can consume only its slice and never starves a later op or the
+        # durable tail. This is what makes the internal deadline composition
+        # coherent with the production outer wait_for.
+        remaining_features = [
+            (name, feature)
+            for name, feature in self.features.items()
+            if feature is not security_feature
+            and feature is not mcp_feature
+            and hasattr(feature, "shutdown")
+        ]
+
+        has_ephemeral = getattr(self, "_privacy_mode", None) == PrivacyMode.EPHEMERAL
+        has_heartbeat = bool(
+            getattr(self, "heartbeat_runner", None)
+        )
+        has_resume = bool(getattr(self, "resume_monitor", None))
+        has_salvage = bool(getattr(self, "context_manager", None))
+        has_security = bool(security_feature and hasattr(security_feature, "shutdown"))
+        has_mcp = bool(self.mcp_agent and hasattr(self.mcp_agent, "shutdown"))
+        has_llm = bool(self.llm_service and hasattr(self.llm_service, "close"))
+        has_task_mgr = bool(self.task_manager and hasattr(self.task_manager, "close"))
+
+        pending_ops = (
+            int(has_ephemeral)
+            + int(has_heartbeat)
+            + int(has_resume)
+            + int(has_salvage)
+            + int(has_security)
+            + len(remaining_features)
+            + int(has_mcp)
+            + int(has_llm)
+            + int(has_task_mgr)
+        )
+
+        def _step_budget() -> float:
+            """Fair share of the live remaining budget for the next op.
+
+            Consumes one pending-op slot each call: the returned bound is
+            ``remaining / pending`` (capped by the per-feature cap), so an op
+            that hangs burns only its slice and the ops after it still get a
+            fair division of whatever budget is left.
+            """
+            nonlocal pending_ops
+            remaining = _remaining()
+            share = remaining / pending_ops if pending_ops > 1 else remaining
+            if pending_ops > 0:
+                pending_ops -= 1
+            return min(KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S, share)
+
+        shutdown_cancelled = False
         try:
+            # EPHEMERAL hard-purge defense-in-depth (#767). If the agent
+            # process is exiting while still in EPHEMERAL, the session is
+            # closing — fire the hard-purge so any leak doesn't survive
+            # the restart. Best-effort; never block shutdown on failure.
             if getattr(self, "_privacy_mode", None) == PrivacyMode.EPHEMERAL:
-                await self._purge_ephemeral_leaks(
-                    reason="ephemeral-agent-shutdown",
+                try:
+                    await asyncio.wait_for(
+                        self._purge_ephemeral_leaks(
+                            reason="ephemeral-agent-shutdown",
+                        ),
+                        timeout=_step_budget(),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "ephemeral hard-purge during shutdown timed out"
+                    )
+                except Exception as e:
+                    logging.warning(
+                        "ephemeral hard-purge during shutdown failed: %s", e
+                    )
+
+            # Stop heartbeat runner
+            if hasattr(self, 'heartbeat_runner') and self.heartbeat_runner:
+                try:
+                    await asyncio.wait_for(
+                        self.heartbeat_runner.stop(), timeout=_step_budget()
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning("Stopping heartbeat timed out")
+                except Exception as e:
+                    logging.warning(f"Error stopping heartbeat: {e}")
+
+            # Stop resume monitor (#1545)
+            if hasattr(self, 'resume_monitor') and self.resume_monitor:
+                try:
+                    await asyncio.wait_for(
+                        self.resume_monitor.stop(), timeout=_step_budget()
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning("Stopping resume monitor timed out")
+                except Exception as e:
+                    logging.warning(f"Error stopping resume monitor: {e}")
+
+            # Stop C / #1311 durable salvage worker. Drains in-flight
+            # summary tasks; the janitor catches up the rest on next start.
+            if hasattr(self, "context_manager") and self.context_manager:
+                try:
+                    await asyncio.wait_for(
+                        self.context_manager.stop_salvage_worker(),
+                        timeout=_step_budget(),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning("Stopping salvage worker timed out")
+                except Exception as e:
+                    logging.warning(f"Error stopping salvage worker: {e}")
+
+            # Shutdown security feature if it exists
+            if security_feature and hasattr(security_feature, 'shutdown'):
+                try:
+                    await asyncio.wait_for(
+                        security_feature.shutdown(), timeout=_step_budget()
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning("Security feature shutdown timed out")
+                except (AttributeError, TypeError, ConnectionError) as e:
+                    logging.warning(f"Error during security shutdown: {e}")
+                except Exception as e:
+                    logging.warning(f"Error during security shutdown: {e}", exc_info=True)
+
+            # Shutdown every other loaded feature via its standard lifecycle
+            # (#2409). Feature-owned background workers (health, delivery,
+            # scheduler, ...) only cancel/await when their own shutdown()
+            # runs; whole-agent shutdown previously reached only
+            # SecurityFeature, leaking those workers past process exit.
+            # Skip SecurityFeature (already stopped above) and the MCP agent
+            # (handled by its own block below) so neither is double-stopped,
+            # and run here — before storage teardown — so a feature can still
+            # flush against live storage without racing it. ``remaining_features``
+            # was computed above and folded into the shared ``pending_ops``
+            # count, so each feature already fair-divides the SAME live budget
+            # as every other prefix op (heartbeat, MCP, LLM, TaskManager, ...).
+            for feature_name, feature in remaining_features:
+                per_feature = _step_budget()
+                try:
+                    await asyncio.wait_for(
+                        feature.shutdown(), timeout=per_feature
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "Feature '%s' shutdown exceeded %.2fs; abandoning "
+                        "and continuing sweep",
+                        feature_name,
+                        per_feature,
+                    )
+                except asyncio.CancelledError:
+                    # Whole-agent shutdown is being cancelled. Stop the sweep
+                    # and propagate to the durable tail via `finally`.
+                    logging.warning(
+                        "Feature '%s' shutdown cancelled; running durable "
+                        "cleanup before propagating",
+                        feature_name,
+                    )
+                    raise
+                except Exception as e:
+                    logging.warning(
+                        "Error during feature '%s' shutdown: %s",
+                        feature_name,
+                        e,
+                        exc_info=True,
+                    )
+
+            # Shutdown MCP agent if it exists
+            if self.mcp_agent and hasattr(self.mcp_agent, 'shutdown'):
+                try:
+                    await asyncio.wait_for(
+                        self.mcp_agent.shutdown(), timeout=_step_budget()
+                    )
+                except asyncio.CancelledError:
+                    logging.warning(
+                        "MCP shutdown cancelled; running durable cleanup "
+                        "before propagating"
+                    )
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning("MCP shutdown timed out")
+                except (AttributeError, TypeError, ConnectionError) as e:
+                    logging.warning(f"Error during MCP shutdown: {e}")
+                except Exception as e:
+                    logging.warning(f"Error during MCP shutdown: {e}", exc_info=True)
+
+            # Close LLM service async clients
+            if self.llm_service and hasattr(self.llm_service, 'close'):
+                try:
+                    await asyncio.wait_for(
+                        self.llm_service.close(), timeout=_step_budget()
+                    )
+                except asyncio.CancelledError:
+                    logging.debug("LLM service close cancelled")
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning("LLM service close timed out")
+                except (AttributeError, TypeError, ConnectionError) as e:
+                    logging.warning(f"Error closing LLM service: {e}")
+                except Exception as e:
+                    logging.warning(f"Error closing LLM service: {e}", exc_info=True)
+
+            # Close TaskManager stores (critical for preventing thread leaks)
+            if self.task_manager and hasattr(self.task_manager, 'close'):
+                try:
+                    await asyncio.wait_for(
+                        self.task_manager.close(), timeout=_step_budget()
+                    )
+                except asyncio.CancelledError:
+                    logging.debug("TaskManager close cancelled")
+                    raise
+                except asyncio.TimeoutError:
+                    logging.warning("TaskManager close timed out")
+                except (AttributeError, TypeError, ConnectionError) as e:
+                    logging.warning(f"Error closing TaskManager: {e}")
+                except Exception as e:
+                    logging.warning(f"Error closing TaskManager: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            shutdown_cancelled = True
+        finally:
+            # Durable cleanup tail — safety-critical, always runs even under
+            # cancellation. It has its OWN finite, honest deadline
+            # (``tail_reserve``) so a tail step that hangs or suppresses
+            # cancellation cannot make the outer wait_for / CLI "forcing exit"
+            # branch unreachable. Returns whether cancellation was observed
+            # and whether any step degraded (abandoned/errored).
+            tail_cancelled, tail_degraded = await self._run_durable_shutdown_tail(
+                tail_reserve
+            )
+            if tail_cancelled:
+                shutdown_cancelled = True
+
+        if shutdown_cancelled:
+            # Never report success after cancellation: re-raise so the outer
+            # asyncio.wait_for surfaces the timeout/cancellation. Report the
+            # tail honestly — only say cleanup "completed" when it actually
+            # did; if a step was abandoned, say so.
+            if tail_degraded:
+                logging.warning(
+                    "Kestrel Agent shutdown cancelled; durable cleanup ran but "
+                    "was DEGRADED (one or more steps abandoned — see warnings "
+                    "above); propagating cancellation."
                 )
-        except Exception as e:
+            else:
+                logging.warning(
+                    "Kestrel Agent shutdown cancelled; durable cleanup "
+                    "completed; propagating cancellation."
+                )
+            raise asyncio.CancelledError()
+
+        if tail_degraded:
             logging.warning(
-                "ephemeral hard-purge during shutdown failed: %s", e
+                "Kestrel Agent async shutdown complete, but durable cleanup "
+                "was DEGRADED — one or more steps were abandoned "
+                "(see warnings above)."
+            )
+        else:
+            logging.info("Kestrel Agent async shutdown complete.")
+
+    async def _run_durable_shutdown_tail(
+        self, tail_reserve: float
+    ) -> tuple[bool, bool]:
+        """Run the safety-critical durable shutdown steps.
+
+        These persist data and prevent leaks (agent-owned background-task
+        cleanup, memory shutdown, the final sync snapshot, and storage
+        close) and MUST complete even when a feature/MCP/LLM/TaskManager
+        shutdown above was cancelled by the outer ``asyncio.wait_for``
+        timeout. Each step guards its own errors so one failure never skips
+        the rest.
+
+        The tail is itself BOUNDED (#2409 review). Python ``asyncio.wait_for``
+        cancels once and then waits for cancellation to complete; if the tail
+        performed fresh *unbounded* awaits, a step that hangs or suppresses
+        cancellation would make the outer timeout / "forcing exit" branch
+        unreachable forever. So every step runs against a finite guard derived
+        from ``tail_reserve`` and is ABANDONED (not awaited) if it exceeds the
+        guard. Each data-critical step still gets a nonzero attempt
+        (``KESTREL_SHUTDOWN_TAIL_MIN_STEP_S``).
+
+        Returns ``(cancelled, degraded)``:
+        * ``cancelled`` — a step observed cancellation, so the caller
+          re-raises ``CancelledError`` after the tail (never reporting a
+          successful shutdown post-cancellation).
+        * ``degraded`` — a step was abandoned past its guard or errored, so
+          the caller must NOT describe the cleanup as "completed".
+        """
+        loop = asyncio.get_running_loop()
+        tail_deadline = loop.time() + max(
+            KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, tail_reserve
+        )
+
+        state = {"cancelled": False, "degraded": False}
+
+        # Count the tail steps that will actually run so each fair-divides the
+        # live remaining tail budget (with a nonzero floor per step).
+        memory_system = getattr(self, "memory_system", None)
+        run_memory = bool(memory_system and hasattr(memory_system, "shutdown"))
+        sync_service = getattr(self, "_sync_service", None)
+        run_sync = bool(sync_service and sync_service.is_running)
+        run_storage = hasattr(self.storage, "close")
+        # The sync path makes TWO guarded steps (snapshot + stop), so it must
+        # count as two in the fair-division denominator — otherwise sync-stop
+        # runs at pending_steps==1 and claims the entire remaining budget,
+        # starving the data-critical storage-close of its fair share.
+        pending_steps = 1 + int(run_memory) + 2 * int(run_sync) + int(run_storage)
+
+        def _step_guard() -> float:
+            nonlocal pending_steps
+            remaining = max(0.0, tail_deadline - loop.time())
+            share = remaining / pending_steps if pending_steps > 1 else remaining
+            if pending_steps > 0:
+                pending_steps -= 1
+            return max(KESTREL_SHUTDOWN_TAIL_MIN_STEP_S, share)
+
+        def _harvest(task, label: str) -> str:
+            """Read a completed task's outcome, recording degradation."""
+            if task.cancelled():
+                state["cancelled"] = True
+                return "cancelled"
+            exc = task.exception()
+            if exc is None:
+                return "ok"
+            logging.warning(
+                "Durable shutdown step '%s' failed: %s",
+                label,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            state["degraded"] = True
+            return "error"
+
+        def _abandon(task) -> None:
+            """Force-terminate an over-guard / cancelled tail step.
+
+            ``task.cancel()`` alone is not enough: a step that suppresses
+            ``CancelledError`` keeps running forever and would hang a graceful
+            event-loop teardown that awaits every still-pending task (and, in
+            production, leak past process exit). Closing the underlying
+            coroutine throws ``GeneratorExit`` — a ``BaseException`` the step
+            cannot swallow with ``except CancelledError`` — so the frame is
+            guaranteed to unwind. A done callback retrieves the resulting
+            exception so it is never surfaced as "exception never retrieved".
+            """
+            task.cancel()  # cooperative first; unblocks well-behaved steps
+            coro = task.get_coro()
+            if coro is not None:
+                try:
+                    coro.close()  # hard stop — GeneratorExit cannot be suppressed
+                except Exception:
+                    pass
+            # Retrieve the eventual exception once the task reconciles to done.
+            task.add_done_callback(
+                lambda t: None if t.cancelled() else t.exception()
             )
 
-        # Stop heartbeat runner
-        if hasattr(self, 'heartbeat_runner') and self.heartbeat_runner:
-            try:
-                await self.heartbeat_runner.stop()
-            except Exception as e:
-                logging.warning(f"Error stopping heartbeat: {e}")
+        async def _bounded(coro, guard: float, label: str, *, shielded: bool = False):
+            """Run one tail step bounded by ``guard``.
 
-        # Stop resume monitor (#1545)
-        if hasattr(self, 'resume_monitor') and self.resume_monitor:
+            The coroutine is scheduled as a task and awaited only up to
+            ``guard`` via ``asyncio.wait`` — which, unlike ``asyncio.wait_for``,
+            does NOT wait for the task's cancellation to complete on timeout.
+            If the step exceeds the guard it is CANCELLED, hard-terminated, and
+            ABANDONED (never awaited), so a step that hangs *or suppresses
+            cancellation* cannot stall the tail beyond ``guard`` (the outer
+            ``wait_for`` / CLI "forcing exit" branch stays reachable) nor leak
+            past it. When ``shielded`` the underlying task keeps running if the
+            tail's own await is cancelled externally (used for
+            ``force_snapshot`` so cancellation neither aborts it nor skips the
+            following ``stop()``); it is still bounded by ``guard``.
+            """
+            task = asyncio.ensure_future(coro)
             try:
-                await self.resume_monitor.stop()
-            except Exception as e:
-                logging.warning(f"Error stopping resume monitor: {e}")
-
-        # Stop C / #1311 durable salvage worker. Drains in-flight
-        # summary tasks; the janitor catches up the rest on next start.
-        if hasattr(self, "context_manager") and self.context_manager:
-            try:
-                await self.context_manager.stop_salvage_worker()
-            except Exception as e:
-                logging.warning(f"Error stopping salvage worker: {e}")
-
-        # Shutdown security feature if it exists
-        security_feature = self.features.get("SecurityFeature")
-        if security_feature and hasattr(security_feature, 'shutdown'):
-            try:
-                await security_feature.shutdown()
-            except (AttributeError, TypeError, ConnectionError) as e:
-                logging.warning(f"Error during security shutdown: {e}")
-            except Exception as e:
-                logging.warning(f"Error during security shutdown: {e}", exc_info=True)
-
-        # Shutdown MCP agent if it exists
-        if self.mcp_agent and hasattr(self.mcp_agent, 'shutdown'):
-            try:
-                await self.mcp_agent.shutdown()
-            except (AttributeError, TypeError, ConnectionError) as e:
-                logging.warning(f"Error during MCP shutdown: {e}")
-            except Exception as e:
-                logging.warning(f"Error during MCP shutdown: {e}", exc_info=True)
-
-        # Close LLM service async clients
-        if self.llm_service and hasattr(self.llm_service, 'close'):
-            try:
-                await self.llm_service.close()
+                done, _pending = await asyncio.wait({task}, timeout=guard)
             except asyncio.CancelledError:
-                logging.debug("LLM service close cancelled")
-            except (AttributeError, TypeError, ConnectionError) as e:
-                logging.warning(f"Error closing LLM service: {e}")
-            except Exception as e:
-                logging.warning(f"Error closing LLM service: {e}", exc_info=True)
+                # The tail's own await was cancelled externally. ``asyncio.wait``
+                # does not cancel its futures, so a shielded task is still
+                # running — give it a bounded chance to finish so data-critical
+                # steps are not aborted, then propagate via state["cancelled"].
+                state["cancelled"] = True
+                if shielded:
+                    try:
+                        done, _pending = await asyncio.wait({task}, timeout=guard)
+                    except asyncio.CancelledError:
+                        _abandon(task)
+                        state["degraded"] = True
+                        return "abandoned"
+                    if task in done:
+                        return _harvest(task, label)
+                    _abandon(task)
+                    state["degraded"] = True
+                    return "abandoned"
+                _abandon(task)  # do NOT await — may suppress cancel
+                return "cancelled"
 
-        # Close TaskManager stores (critical for preventing thread leaks)
-        if self.task_manager and hasattr(self.task_manager, 'close'):
-            try:
-                await self.task_manager.close()
-            except asyncio.CancelledError:
-                logging.debug("TaskManager close cancelled")
-            except (AttributeError, TypeError, ConnectionError) as e:
-                logging.warning(f"Error closing TaskManager: {e}")
-            except Exception as e:
-                logging.warning(f"Error closing TaskManager: {e}", exc_info=True)
+            if task not in done:
+                # Exceeded the guard. Hard-terminate but do NOT await — the step
+                # may suppress cancellation and would otherwise hang us.
+                _abandon(task)
+                logging.warning(
+                    "Durable shutdown step '%s' exceeded %.2fs; abandoned "
+                    "(shutdown degraded).",
+                    label,
+                    guard,
+                )
+                state["degraded"] = True
+                return "abandoned"
+
+            return _harvest(task, label)
 
         # Cancel agent-owned background work before storage/sync shutdown.
-        try:
-            await self._shutdown_background_tasks()
-        except asyncio.CancelledError:
-            logging.debug("Background task shutdown cancelled")
-        except Exception as e:
-            logging.warning(f"Error shutting down background tasks: {e}", exc_info=True)
+        await _bounded(
+            self._shutdown_background_tasks(), _step_guard(), "background-tasks"
+        )
 
         # Stop memory-owned bookkeeping before storage/sync shutdown.
-        memory_system = getattr(self, "memory_system", None)
-        if memory_system and hasattr(memory_system, "shutdown"):
-            try:
-                await memory_system.shutdown()
-            except asyncio.CancelledError:
-                logging.debug("Memory system shutdown cancelled")
-            except Exception as e:
-                logging.warning(f"Error shutting down memory system: {e}", exc_info=True)
+        if run_memory:
+            await _bounded(memory_system.shutdown(), _step_guard(), "memory-system")
 
-        # Final snapshot to all sync targets before closing storage
-        if getattr(self, '_sync_service', None) and self._sync_service.is_running:
-            try:
-                await self._sync_service.force_snapshot()
-                await self._sync_service.stop()
+        # Final snapshot to all sync targets before closing storage. The
+        # snapshot is SHIELDED so cancellation neither aborts it nor skips the
+        # ``stop()`` that releases the sync worker.
+        if run_sync:
+            status = await _bounded(
+                sync_service.force_snapshot(),
+                _step_guard(),
+                "sync-snapshot",
+                shielded=True,
+            )
+            # Always attempt stop() — even if the snapshot was abandoned or
+            # cancellation was observed — so the sync worker is released.
+            await _bounded(sync_service.stop(), _step_guard(), "sync-stop")
+            if status == "ok":
                 logging.info("Sync service: final snapshot flushed")
-            except asyncio.CancelledError:
-                logging.debug("Sync service flush cancelled")
-            except (AttributeError, TypeError, ConnectionError) as e:
-                logging.warning(f"Error flushing sync service: {e}")
-            except Exception as e:
-                logging.warning(f"Error flushing sync service: {e}", exc_info=True)
 
-        # Close storage
-        if hasattr(self.storage, 'close'):
-            try:
-                await self.storage.close()
-            except asyncio.CancelledError:
-                logging.debug("Storage close cancelled")
-            except (AttributeError, TypeError, ConnectionError, OSError) as e:
-                logging.warning(f"Error closing storage: {e}")
-            except Exception as e:
-                logging.warning(f"Error closing storage: {e}", exc_info=True)
+        # Close storage — data-critical, gets its own nonzero guard.
+        if run_storage:
+            await _bounded(self.storage.close(), _step_guard(), "storage-close")
 
-        logging.info("Kestrel Agent async shutdown complete.")
+        return state["cancelled"], state["degraded"]
