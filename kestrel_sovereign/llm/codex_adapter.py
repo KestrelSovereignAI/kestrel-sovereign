@@ -42,10 +42,11 @@ import logging
 import os
 import random
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
-    Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type,
-    TYPE_CHECKING, Union,
+    TYPE_CHECKING,
+    Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union,
 )
 
 from pydantic import BaseModel
@@ -64,6 +65,10 @@ from .codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
     CodexAppServerTransportError,
+)
+from .codex_reasoning import (
+    normalize_codex_reasoning_effort,
+    resolve_codex_reasoning_capability,
 )
 from .continuation_store import ContinuationStore, InMemoryContinuationStore
 from .gpt5_overlay import prepend_gpt5_overlay
@@ -86,6 +91,24 @@ ToolExecutor = Callable[
     [str, Dict[str, Any]],
     Awaitable[Tuple[Dict[str, Any], Any]],
 ]
+
+
+@dataclass(frozen=True)
+class _CodexTurnSettings:
+    """One immutable model/config selection shared by both turn RPCs.
+
+    ``model`` is the optional wire override after the account-cache guard;
+    ``selected_model`` is the concrete model whose capability ceiling applies
+    (the wire override or the effective Codex config default). Resolving this
+    once prevents a cache refresh between ``thread/start`` and ``turn/start``
+    from switching either model or reasoning effort mid-turn.
+    """
+
+    model: Optional[str]
+    selected_model: Optional[str]
+    configured_reasoning_effort: Optional[str]
+    reasoning_effort: Optional[str]
+    cwd: str
 
 
 def _system_content_text(content: Any) -> str:
@@ -1234,6 +1257,68 @@ class CodexAdapter(LLMAdapter):
             return None
         return model
 
+    async def _resolve_codex_turn_settings(
+        self,
+        app: CodexAppServerClient,
+        model: str,
+    ) -> _CodexTurnSettings:
+        """Freeze the effective model, cwd, and effort for one turn.
+
+        The app-server must already be started so ``config/read`` and
+        ``model/list`` describe the same running process that will receive the
+        turn. ``_effective_model_param`` is deliberately called exactly once:
+        its disk-backed serveability cache can refresh while ``model/list`` is
+        in flight, but a single turn may never switch models at the later RPC.
+        """
+        cwd = self._resolve_thread_cwd()
+        config_snapshot = await app.request(
+            "config/read",
+            {"cwd": cwd, "includeLayers": False},
+            timeout=30,
+        )
+        if not isinstance(config_snapshot, dict):
+            raise CodexAppServerError(
+                "codex config/read returned a non-object response; update the "
+                "Codex app/CLI before starting a turn."
+            )
+        effective_config = config_snapshot.get("config")
+        if effective_config is None:
+            effective_config = {}
+        elif not isinstance(effective_config, dict):
+            raise CodexAppServerError(
+                "codex config/read returned a non-object config; update the "
+                "Codex app/CLI before starting a turn."
+            )
+        configured_model = effective_config.get("model")
+        if configured_model is not None and not isinstance(configured_model, str):
+            raise CodexAppServerError(
+                "Codex config model must be a string before starting a turn."
+            )
+
+        model_param = self._effective_model_param(model)
+        selected_model = model_param or configured_model
+        configured_effort = effective_config.get("model_reasoning_effort")
+        reasoning_effort: Optional[str] = None
+        if configured_effort is not None:
+            capability = await resolve_codex_reasoning_capability(
+                app,
+                selected_model,
+                self._read_codex_models_cache,
+            )
+            reasoning_effort = normalize_codex_reasoning_effort(
+                configured_effort,
+                capability,
+                model=selected_model,
+            )
+
+        return _CodexTurnSettings(
+            model=model_param,
+            selected_model=selected_model,
+            configured_reasoning_effort=configured_effort,
+            reasoning_effort=reasoning_effort,
+            cwd=cwd,
+        )
+
     @staticmethod
     def _thread_fingerprint(
         model_param: Optional[str], instructions: Optional[str],
@@ -1242,6 +1327,7 @@ class CodexAdapter(LLMAdapter):
         cwd: Optional[str] = None,
         sandbox: Optional[str] = None,
         approval_policy: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> str:
         """Stable hash of every thread-scoped setting the app-server
         only consumes at ``thread/start``. Used to invalidate a cached
@@ -1250,7 +1336,8 @@ class CodexAdapter(LLMAdapter):
         otherwise silently ignored.
 
         #1734 codex review folds ``cwd`` + ``sandbox`` +
-        ``approval_policy`` into the fingerprint. Without them, a
+        ``approval_policy`` into the fingerprint. #2488 also includes the
+        effective reasoning effort. Without these values, a
         session that initially started without an attached agent
         (cwd → process cwd fallback) would silently keep that cwd
         when the agent attached later — codex never replays
@@ -1266,6 +1353,7 @@ class CodexAdapter(LLMAdapter):
                 "c": cwd or "",
                 "s": sandbox or "",
                 "a": approval_policy or "",
+                "r": reasoning_effort or "",
             },
             sort_keys=True, separators=(",", ":"), default=str,
         )
@@ -1275,6 +1363,8 @@ class CodexAdapter(LLMAdapter):
         self, app: CodexAppServerClient, session_id: Optional[str],
         model: str, instructions: Optional[str],
         dynamic_tools: Optional[List[Dict[str, Any]]],
+        *,
+        resolved_settings: Optional[_CodexTurnSettings] = None,
     ) -> Tuple[str, bool]:
         """Return ``(thread_id, is_fresh)`` for this session.
 
@@ -1291,7 +1381,11 @@ class CodexAdapter(LLMAdapter):
         unavoidable given the protocol; mirrors OpenClaw's fingerprint
         reset behaviour.
         """
-        m = self._effective_model_param(model)
+        settings = resolved_settings or await self._resolve_codex_turn_settings(
+            app,
+            model,
+        )
+        m = settings.model
         # #1734 codex review: cwd + sandbox + approval_policy are
         # thread-scoped settings codex only consumes at thread/start,
         # so they MUST be in the fingerprint. Without that, a session
@@ -1299,12 +1393,13 @@ class CodexAdapter(LLMAdapter):
         # back to tempdir / Path.cwd()) would keep that cwd silently
         # when the agent attached later — codex never replays
         # thread/start for an existing thread.
-        thread_cwd = self._resolve_thread_cwd()
+        thread_cwd = settings.cwd
         fingerprint = self._thread_fingerprint(
-            m, instructions, dynamic_tools,
+            settings.selected_model, instructions, dynamic_tools,
             cwd=thread_cwd,
             sandbox=_CODEX_SANDBOX,
             approval_policy=_CODEX_APPROVAL_POLICY,
+            reasoning_effort=settings.reasoning_effort,
         )
 
         # Per-session lock; bare path for session-less calls (each
@@ -1403,6 +1498,21 @@ class CodexAdapter(LLMAdapter):
                 )
             if m:
                 params["model"] = m
+            if settings.reasoning_effort is not None:
+                params["config"]["model_reasoning_effort"] = (
+                    settings.reasoning_effort
+                )
+            if (
+                settings.reasoning_effort
+                != settings.configured_reasoning_effort
+            ):
+                logger.warning(
+                    "codex: model %r does not support configured reasoning "
+                    "effort %r; using advertised ceiling %r (#2488)",
+                    settings.selected_model,
+                    settings.configured_reasoning_effort,
+                    settings.reasoning_effort,
+                )
             if instructions:
                 params["developerInstructions"] = instructions
             if dynamic_tools:
@@ -2561,8 +2671,14 @@ class CodexAdapter(LLMAdapter):
                 "use openai:api or thread an executor through "
                 "generate_with_messages / stream_with_tool_detection."
             )
+        turn_settings = await self._resolve_codex_turn_settings(app, model)
         thread_id, fresh = await self._ensure_thread(
-            app, session_id, model, instructions, dyn,
+            app,
+            session_id,
+            model,
+            instructions,
+            dyn,
+            resolved_settings=turn_settings,
         )
         turn_input = _build_turn_input(input_messages, fresh_thread=fresh)
 
@@ -2597,7 +2713,12 @@ class CodexAdapter(LLMAdapter):
                 break
             lock.release()
             thread_id, fresh = await self._ensure_thread(
-                app, session_id, model, instructions, dyn,
+                app,
+                session_id,
+                model,
+                instructions,
+                dyn,
+                resolved_settings=turn_settings,
             )
             turn_input = _build_turn_input(input_messages, fresh_thread=fresh)
             lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
@@ -2666,7 +2787,7 @@ class CodexAdapter(LLMAdapter):
             turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
                 "input": request_input,
-                "cwd": self._resolve_thread_cwd(),
+                "cwd": turn_settings.cwd,
             }
             # Reuse _model_param's sentinel filter — "auto"/"default" are
             # kestrel-side route placeholders, not real model ids; the
@@ -2674,9 +2795,15 @@ class CodexAdapter(LLMAdapter):
             # that the previous unconditional pass would break
             # ``openai:plan`` agents whose route was configured with
             # ``model = "auto"``.
-            m_for_turn = self._effective_model_param(model)
+            m_for_turn = turn_settings.model
             if m_for_turn:
                 turn_params["model"] = m_for_turn
+            # Codex app-server v2's turn/start schema names the top-level
+            # reasoning override ``effort`` (not model_reasoning_effort). Reuse
+            # the exact immutable value sent through thread/start so a config
+            # or model-cache refresh cannot create a split-brain turn.
+            if turn_settings.reasoning_effort is not None:
+                turn_params["effort"] = turn_settings.reasoning_effort
             # Deliver a mid-conversation operator signal (governance /
             # auto-mode / token-budget) inline via the app-server's per-turn
             # developer channel — the codex equivalent of an OpenAI
@@ -2697,7 +2824,11 @@ class CodexAdapter(LLMAdapter):
                     "mode": "default",
                     "settings": {
                         "model": m_for_turn,
-                        "reasoning_effort": None,
+                        # collaborationMode takes precedence over top-level
+                        # ``effort`` when present, so it must carry the same
+                        # normalized value rather than restoring the ambient
+                        # (possibly unsupported) configuration.
+                        "reasoning_effort": turn_settings.reasoning_effort,
                         "developer_instructions": turn_developer_instructions,
                     },
                 }
