@@ -103,6 +103,28 @@ def test_opt_out_flag(monkeypatch):
     assert ps.phoenix_enabled() is False
 
 
+def test_supervision_suppressed_under_pytest(monkeypatch):
+    # Installed + not opted out, but we ARE under pytest → the lifespan must
+    # NOT spawn a real Phoenix subprocess (issue #2570: no real Phoenix in CI).
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    assert ps._running_under_pytest() is True
+    assert ps.should_supervise_phoenix() is False
+
+
+def test_supervision_active_outside_pytest(monkeypatch):
+    # Simulate a real host process (not under pytest) with Phoenix installed.
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps, "_running_under_pytest", lambda: False)
+    assert ps.should_supervise_phoenix() is True
+
+
+def test_supervision_off_when_disabled_outside_pytest(monkeypatch):
+    # Not under pytest, but Phoenix not enabled → still no supervision.
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: False)
+    monkeypatch.setattr(ps, "_running_under_pytest", lambda: False)
+    assert ps.should_supervise_phoenix() is False
+
+
 # ---------------------------------------------------------------------------
 # OTLP autowiring (INV-SOLO)
 # ---------------------------------------------------------------------------
@@ -332,20 +354,28 @@ async def _noop_lifespan(_app):
     yield
 
 
-def _client_with_state(phoenix_state):
+def _client_with_state(phoenix_state, monkeypatch):
+    """Return the shared host ``app`` wired for a route test.
+
+    Uses ``monkeypatch`` so every mutation (the no-op lifespan, the app.state
+    fields) is restored after the test. ``app`` is a process-wide singleton
+    (``from server import app``); permanently swapping its lifespan_context here
+    would leak a no-op lifespan into every later ``TestClient(app)`` in the same
+    pytest session.
+    """
     from server import app
 
-    app.router.lifespan_context = _noop_lifespan
-    app.state.agent = None
-    app.state.agent_manager = None
-    app.state.startup_error = None
-    app.state.phoenix = phoenix_state
+    monkeypatch.setattr(app.router, "lifespan_context", _noop_lifespan)
+    monkeypatch.setattr(app.state, "agent", None, raising=False)
+    monkeypatch.setattr(app.state, "agent_manager", None, raising=False)
+    monkeypatch.setattr(app.state, "startup_error", None, raising=False)
+    monkeypatch.setattr(app.state, "phoenix", phoenix_state, raising=False)
     return app
 
 
 def test_phoenix_route_requires_auth(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
-    app = _client_with_state(None)
+    app = _client_with_state(None, monkeypatch)
     with TestClient(app) as client:
         # No auth at all → 401 (never leaks whether Phoenix is up).
         r = client.get("/phoenix/")
@@ -354,7 +384,7 @@ def test_phoenix_route_requires_auth(monkeypatch):
 
 def test_phoenix_route_503_when_disabled(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
-    app = _client_with_state(None)
+    app = _client_with_state(None, monkeypatch)
     with TestClient(app) as client:
         r = client.get("/phoenix/", headers={"X-API-Key": "test-key-123"})
     assert r.status_code == 503
@@ -363,10 +393,39 @@ def test_phoenix_route_503_when_disabled(monkeypatch):
 
 def test_mint_endpoint_requires_auth(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
-    app = _client_with_state(None)
+    app = _client_with_state(None, monkeypatch)
     with TestClient(app) as client:
         r = client.post("/api/host/phoenix/session")
     assert r.status_code == 401
+
+
+def test_real_lifespan_never_spawns_phoenix_under_pytest(monkeypatch):
+    """End-to-end: the *real* host lifespan must not spawn a Phoenix subprocess
+    while running under pytest, even when arize-phoenix looks installed.
+
+    This is the guard that keeps ``pytest -q`` from launching (and then tearing
+    down, SIGTERM→SIGKILL) a heavyweight Phoenix per ``TestClient`` startup.
+    """
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+    # Make Phoenix look installed so only the pytest guard can stop a spawn.
+    monkeypatch.setattr(ps, "phoenix_available", lambda: True)
+    assert ps.should_supervise_phoenix() is False  # suppressed: we're in pytest
+
+    # Trip on ANY subprocess spawn from the supervisor.
+    def _tripwire(*_a, **_k):
+        raise AssertionError("Phoenix subprocess spawned under pytest")
+
+    monkeypatch.setattr(ps.subprocess, "Popen", _tripwire)
+
+    from server import app
+
+    # Use the REAL lifespan (do not swap in the no-op) so the guarded startup
+    # path actually runs; just neutralise app.state afterwards via monkeypatch.
+    with TestClient(app) as client:
+        r = client.get("/phoenix/", headers={"X-API-Key": "test-key-123"})
+    # Phoenix was never supervised → the proxy reports it disabled.
+    assert getattr(app.state, "phoenix", None) is None
+    assert r.status_code == 503
 
 
 def test_mint_then_proxy_with_embed_cookie(tmp_path, monkeypatch):
@@ -381,7 +440,7 @@ def test_mint_then_proxy_with_embed_cookie(tmp_path, monkeypatch):
     sup = _running_supervisor(
         tmp_path, root_path="/phoenix", transport=httpx.MockTransport(handler)
     )
-    app = _client_with_state(sup)
+    app = _client_with_state(sup, monkeypatch)
 
     with TestClient(app) as client:
         # Mint requires standard auth (API key here).

@@ -102,10 +102,45 @@ def phoenix_enabled() -> bool:
 
     Enabled by default whenever ``arize-phoenix`` is installed. Opt out with
     ``KESTREL_PHOENIX_ENABLED=0`` even when installed.
+
+    This is the *installed-and-not-opted-out* predicate. Whether the host
+    lifespan should actually spawn the subprocess right now is
+    :func:`should_supervise_phoenix`, which additionally suppresses auto-start
+    inside the automated test suite.
     """
     if _falsy(os.environ.get("KESTREL_PHOENIX_ENABLED")):
         return False
     return phoenix_available()
+
+
+def _running_under_pytest() -> bool:
+    """True when executing inside the pytest test suite.
+
+    ``pytest`` is always imported into ``sys.modules`` for a test run and never
+    in a real ``uvicorn``/``gunicorn`` host process, so this cleanly separates
+    the two. ``PYTEST_CURRENT_TEST`` is also honoured for defence in depth.
+    """
+    return "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+
+
+def should_supervise_phoenix() -> bool:
+    """Whether the host lifespan should actually launch a supervised Phoenix.
+
+    This is :func:`phoenix_enabled` **and** not running under pytest. The host
+    must never spawn a *real* Phoenix subprocess during automated tests — issue
+    #2570 acceptance is explicit: "no real Phoenix needed in CI", and the
+    dedicated tests stub the process. Without this guard, every integration
+    test that starts the app through ``TestClient`` (triggering the lifespan)
+    would spawn a heavyweight Phoenix subprocess and then pay its
+    SIGTERM/SIGKILL teardown on shutdown — mirroring how agent subprocesses are
+    gated out of the test path (``KESTREL_MULTI_AGENT``).
+
+    Direct :meth:`PhoenixSupervisor.start` calls are intentionally *not* guarded
+    here, so unit tests can still exercise the (stubbed) spawn/stop lifecycle.
+    """
+    if _running_under_pytest():
+        return False
+    return phoenix_enabled()
 
 
 def phoenix_port() -> int:
@@ -581,6 +616,7 @@ __all__ = [
     "PhoenixSupervisor",
     "phoenix_available",
     "phoenix_enabled",
+    "should_supervise_phoenix",
     "phoenix_port",
     "phoenix_grpc_port",
     "phoenix_working_dir",

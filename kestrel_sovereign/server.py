@@ -483,10 +483,10 @@ async def lifespan(app: FastAPI):
         from kestrel_sovereign.phoenix_supervisor import (
             PhoenixSupervisor,
             autowire_otlp_endpoint,
-            phoenix_enabled,
+            should_supervise_phoenix,
         )
 
-        if phoenix_enabled():
+        if should_supervise_phoenix():
             supervisor = PhoenixSupervisor()
             # Don't block agent boot on the health wait — the exporter connects
             # lazily and the UI proxy tolerates a still-starting Phoenix.
@@ -502,12 +502,22 @@ async def lifespan(app: FastAPI):
                         endpoint,
                     )
         else:
-            from kestrel_sovereign.phoenix_supervisor import phoenix_available
-
-            logger.info(
-                "Phoenix trace backend disabled (installed=%s) — /phoenix returns 503.",
-                phoenix_available(),
+            from kestrel_sovereign.phoenix_supervisor import (
+                _running_under_pytest,
+                phoenix_available,
             )
+
+            if _running_under_pytest():
+                logger.info(
+                    "Phoenix supervision suppressed under pytest (installed=%s) — "
+                    "/phoenix returns 503.",
+                    phoenix_available(),
+                )
+            else:
+                logger.info(
+                    "Phoenix trace backend disabled (installed=%s) — /phoenix returns 503.",
+                    phoenix_available(),
+                )
     except Exception as exc:  # noqa: BLE001 - Phoenix must never block startup
         logger.warning("Phoenix supervision setup failed: %s", exc)
         app.state.phoenix = None
