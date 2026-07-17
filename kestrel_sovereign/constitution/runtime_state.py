@@ -105,7 +105,7 @@ class ConstitutionRuntimeStateStore:
                 agent_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 reason TEXT,
-                authorization TEXT,
+                authorization_detail TEXT,
                 occurred_at {timestamp_type} NOT NULL
             );
 
@@ -197,7 +197,8 @@ class ConstitutionRuntimeStateStore:
                 await self._backend.execute(
                     """
                     INSERT INTO constitution_runtime_events
-                        (agent_id, event_type, reason, authorization, occurred_at)
+                        (agent_id, event_type, reason, authorization_detail,
+                         occurred_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
                     (
@@ -213,7 +214,7 @@ class ConstitutionRuntimeStateStore:
         """Return transition history in insertion order (operator/test aid)."""
         rows = await self._backend.fetch_all(
             """
-            SELECT event_type, reason, authorization, occurred_at
+            SELECT event_type, reason, authorization_detail, occurred_at
               FROM constitution_runtime_events
              WHERE agent_id = ?
              ORDER BY id
