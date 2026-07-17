@@ -617,9 +617,11 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - `GET /`
 - `GET /api/auth/key`
 - `GET /api/host/csrf`
+- `POST /api/host/phoenix/session`
 - `GET /api/host/ui/contributions`
 - `GET /health`
 - `GET /health/detailed`
+- `/phoenix` and `/phoenix/{path}` — same-origin authenticated reverse proxy to the host-supervised Phoenix trace UI (embed-session cookie; all methods)
 
 ### Router families mounted by `kestrel_sovereign/server.py`
 
