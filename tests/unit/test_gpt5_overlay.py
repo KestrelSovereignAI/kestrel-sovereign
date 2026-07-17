@@ -90,64 +90,41 @@ class TestPrependGpt5Overlay:
         assert a.startswith(GPT5_BEHAVIOR_CONTRACT)
 
 
-class TestProactiveElevationDiscipline:
-    """#1734 (supersedes #1718's reactive retry): codex 0.138's sandbox
-    profile is ``workspace-write`` (#1734) — writes inside the per-agent
-    workspace + ``/tmp`` succeed silently, writes outside are blocked.
-    The reactive retry from #1718 was correct under ``read-only`` but
-    is no longer the dominant case.
-
-    The proactive clause tells GPT-5 agents to request elevation
-    BEFORE running a command that writes outside the workspace, not
-    after a sandbox failure. Cleaner mental model, fewer round-trips,
-    and avoids the stdout-injection vector entirely (no parsing of
-    error text required).
-
-    Lives in <tool_discipline> so it inherits the byte-stable
-    prefix-cache invariant. Anthropic-backed agents do not see this
-    overlay and do not need it — their shell path goes through
-    ``_run_gates`` directly (no codex sandbox layer).
-    """
+class TestHostToolBoundaryDiscipline:
+    """#1965: GPT-5 must not seek provider-native tool bypasses."""
 
     @pytest.mark.parametrize(
         "phrase",
         [
-            "workspace",
-            "request elevation",
-            "host approval queue",
-            "Treat operator-denied results as terminal",
-            "outside the workspace",
+            "sole authority",
+            "provider-native execution path",
+            "filesystem",
+            "report the action as blocked",
+            "operator-denied results as terminal",
         ],
     )
-    def test_contract_carries_proactive_elevation_clause(self, phrase):
+    def test_contract_carries_host_tool_boundary(self, phrase):
         assert phrase in GPT5_BEHAVIOR_CONTRACT, (
             f"GPT5 contract must mention {phrase!r} so the model knows "
-            f"to request elevation proactively for out-of-workspace writes"
+            f"that host tools are the only authorized action path"
         )
 
-    def test_proactive_clause_inside_tool_discipline(self):
-        # Lives in <tool_discipline>, not floating, so it composes with
-        # the rest of the tool-use guidance and stays cache-stable.
+    def test_boundary_clause_inside_tool_discipline(self):
         td_start = GPT5_BEHAVIOR_CONTRACT.index("<tool_discipline>")
         td_end = GPT5_BEHAVIOR_CONTRACT.index("</tool_discipline>")
         td_block = GPT5_BEHAVIOR_CONTRACT[td_start:td_end]
-        assert "request elevation" in td_block
-        assert "outside the workspace" in td_block
+        assert "provider-native execution path" in td_block
+        assert "sole authority" in td_block
 
-    def test_proactive_clause_replaces_reactive_retry(self):
-        # #1718's reactive clause keyed off "Operation not permitted"
-        # as a retry trigger. Under #1734's workspace-write sandbox,
-        # the model proactively requests elevation BEFORE the write,
-        # so the reactive trigger is no longer in the contract.
+    def test_boundary_clause_removes_native_sandbox_guidance(self):
         assert "Operation not permitted" not in GPT5_BEHAVIOR_CONTRACT, (
-            "reactive 'Operation not permitted' trigger from #1718 was "
-            "superseded by #1734's proactive elevation clause; the "
-            "phrase should no longer appear in the contract"
+            "provider sandbox errors are not an authorized retry signal"
         )
         assert "retry once" not in GPT5_BEHAVIOR_CONTRACT, (
-            "the reactive 'retry once' wording was replaced by proactive "
-            "elevation — request before, not retry after"
+            "a blocked host action must not be retried through another path"
         )
+        assert "request elevation" not in GPT5_BEHAVIOR_CONTRACT
+        assert "freely read anywhere" not in GPT5_BEHAVIOR_CONTRACT
 
     def test_proactive_clause_excludes_user_denial_as_trigger(self):
         # Carry-forward from #1718 codex review: "rejected by user"
@@ -155,14 +132,12 @@ class TestProactiveElevationDiscipline:
         # ignores the operator's decision.
         assert "rejected by user" not in GPT5_BEHAVIOR_CONTRACT
 
-    def test_proactive_clause_not_in_other_blocks(self):
-        # Spot-check: the clause must not have been duplicated into
-        # other contract sections by a future edit.
+    def test_boundary_clause_not_in_other_blocks(self):
         for tag in ("<execution_policy>", "<output_contract>", "<completion_contract>"):
             start = GPT5_BEHAVIOR_CONTRACT.index(tag)
             end = GPT5_BEHAVIOR_CONTRACT.index(tag.replace("<", "</"))
             block = GPT5_BEHAVIOR_CONTRACT[start:end]
-            assert "request elevation" not in block, (
-                f"elevation clause must live in <tool_discipline>, "
+            assert "provider-native execution path" not in block, (
+                f"host-tool boundary must live in <tool_discipline>, "
                 f"not duplicated into {tag}"
             )

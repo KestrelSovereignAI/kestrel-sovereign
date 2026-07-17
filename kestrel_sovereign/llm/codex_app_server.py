@@ -33,10 +33,12 @@ Server→client requests come in two flavors:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
+import tomllib
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
@@ -49,9 +51,38 @@ from .cancellation import (
 
 logger = logging.getLogger(__name__)
 
-# Hard floor — matches kestrel-claw ``MIN_CODEX_APP_SERVER_VERSION``. The
-# app-server JSON-RPC contract changed in incompatible ways below this.
-MIN_CODEX_APP_SERVER_VERSION = "0.125.0"
+# Security floor for the native-tool isolation flags below. Older builds may
+# expose provider-native shell/MCP/browser surfaces that bypass Kestrel's
+# dynamic-tool dispatcher, hooks, approval queue, and audit log (#1965).
+MIN_CODEX_APP_SERVER_VERSION = "0.145.0-alpha.0"
+# New Codex minor releases can add native item/tool types. Refuse an unreviewed
+# protocol line until Kestrel updates its allow/deny inventory (#1965).
+MAX_CODEX_APP_SERVER_VERSION_EXCLUSIVE = "0.146.0-alpha.0"
+
+# Kestrel is the tool host. Codex is only the inference transport. Every
+# provider-native surface that can execute locally, load third-party code, or
+# discover an ambient host integration is disabled at process launch. These
+# names are stable in the 0.145+ feature registry guarded by the floor above.
+_CODEX_DISABLED_NATIVE_FEATURES = (
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "code_mode",
+    "code_mode_host",
+    "computer_use",
+    "hooks",
+    "in_app_browser",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+    "shell_snapshot",
+    "shell_tool",
+    "skill_mcp_dependency_install",
+    "tool_suggest",
+    "unified_exec",
+    "workspace_dependencies",
+)
 
 # Resolution order for the binary. It ships inside the Codex desktop app
 # bundle and is deliberately NOT on PATH (reference: codex-cli-path),
@@ -153,36 +184,53 @@ def _parse_user_agent_version(user_agent: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _strip_plugin_and_project_sections(toml_text: str) -> str:
-    """Return ``toml_text`` with ``[plugins.*]``, ``[marketplaces.*]``,
-    and ``[projects.*]`` sections removed; top-level scalar settings
-    (``model``, ``model_reasoning_effort``, ``notify``, …) and other
-    non-plugin tables are preserved verbatim.
+def _validated_codex_version(user_agent: str) -> str:
+    """Return a version inside Kestrel's reviewed security window.
 
-    Used to seed the isolated kestrel ``CODEX_HOME``'s ``config.toml``
-    from the user's real ``~/.codex/config.toml`` while:
-    1. dropping the plugins that hang codex's session_loop, and
-    2. replacing the trusted-projects list with kestrel's own entry.
-
-    Naive line-based scanner: TOML section headers are at column 0 in
-    practice (codex never indents headers), so we walk lines and drop
-    everything between a stripped header and the next one. Multi-line
-    arrays inside a stripped section are dropped with the section.
+    An unidentified build cannot prove that the native-tool disable flags and
+    protocol item inventory have the semantics this boundary relies on.
     """
-    out_lines: list[str] = []
-    skip = False
-    for line in toml_text.splitlines(keepends=True):
-        stripped = line.lstrip()
-        if stripped.startswith("["):
-            inner = stripped.lstrip("[").split("]", 1)[0]
-            head = inner.split(".", 1)[0].strip().strip('"').lower()
-            skip = head in ("plugins", "marketplaces", "projects")
-        if not skip:
-            out_lines.append(line)
-    body = "".join(out_lines)
-    # Trim trailing whitespace so the appended trusted-projects block
-    # lands on a clean line boundary.
-    return body.rstrip() + ("\n" if body.strip() else "")
+    detected = _parse_user_agent_version(user_agent)
+    if detected is None:
+        raise CodexAppServerError(
+            "codex app-server did not report a parseable version; refusing "
+            "to start without a verifiable native-tool security boundary."
+        )
+    version = _version_tuple(detected)
+    if (
+        version < _version_tuple(MIN_CODEX_APP_SERVER_VERSION)
+        or version >= _version_tuple(MAX_CODEX_APP_SERVER_VERSION_EXCLUSIVE)
+    ):
+        raise CodexAppServerError(
+            "codex app-server version outside Kestrel's reviewed security "
+            f"window [{MIN_CODEX_APP_SERVER_VERSION}, "
+            f"{MAX_CODEX_APP_SERVER_VERSION_EXCLUSIVE}); detected "
+            f"{detected}. Update Kestrel or install a reviewed Codex build."
+        )
+    return detected
+
+
+def _extract_safe_user_config_defaults(toml_text: str) -> str:
+    """Copy only inference-only defaults into Kestrel's Codex home.
+
+    The old section denylist retained ambient ``notify`` commands, hooks,
+    MCP servers, and future executable config by default. Any of those can
+    touch the host without entering Kestrel's tool dispatcher (#1965).
+    Security boundaries need an allowlist: model selection and reasoning
+    effort affect remote inference only; everything else is rebuilt below.
+    Invalid TOML and non-string values fail closed to no inherited defaults.
+    """
+    try:
+        parsed = tomllib.loads(toml_text)
+    except (tomllib.TOMLDecodeError, ValueError):
+        return ""
+
+    lines: list[str] = []
+    for key in ("model", "model_reasoning_effort"):
+        value = parsed.get(key)
+        if isinstance(value, str):
+            lines.append(f"{key} = {json.dumps(value)}")
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 class CodexAppServerClient:
@@ -330,12 +378,9 @@ class CodexAppServerClient:
                     bridged_file.symlink_to(user_file)
                 except OSError:
                     pass
-        # Minimal config.toml — trust the kestrel workspace + cwd so
-        # codex doesn't refuse to run, but ship NO ``[plugins.*]`` blocks
-        # so the user's globally-enabled MCP plugins
-        # (computer-use, codex_apps, etc.) stay un-mounted in our
-        # sessions. Kestrel runs its own computer-use feature; codex's
-        # bundled one would be a duplicate-mount anyway.
+        # Minimal config.toml — trust the kestrel workspace + cwd so Codex
+        # doesn't refuse to run, but inherit only inference-only defaults.
+        # Kestrel, not Codex, owns every local tool surface (#1965).
         # Rewrite every spawn so a cwd change (different KESTREL_CODEX_CWD
         # or process cwd) is reflected in the trusted-projects list —
         # otherwise codex rejects/blocks the workspace until the user
@@ -349,32 +394,44 @@ class CodexAppServerClient:
         # review #1394 P2.
         cwd_escaped = cwd_for_codex.replace("\\", "\\\\").replace('"', '\\"')
         bridged_config = kestrel_codex_home / "config.toml"
-        # Build the isolated config by COPYING the user's
-        # ~/.codex/config.toml with ``[plugins.*]``, ``[marketplaces.*]``,
-        # and ``[projects.*]`` sections stripped, then appending our
-        # own trusted-project block. This preserves the user's
-        # ``model``, ``model_reasoning_effort``, etc. defaults so the
-        # adapter's ``_model_param`` ``auto``/``default`` path still
-        # gets a configured default to fall through to — otherwise
-        # codex defaults to its own built-in choice and the user's
-        # configured default is lost. Codex review #1394 P2.
+        # This fixed block is redundant with the process flags and the
+        # per-thread config. The three layers deliberately fail closed if a
+        # future refactor drops one. ``tools_view_image`` is a top-level
+        # native filesystem reader; web search is provider-native network IO.
+        native_boundary_block = (
+            'web_search = "disabled"\n'
+            'tools_view_image = false\n\n'
+            '[features]\n'
+            + "".join(
+                f'{feature} = false\n'
+                for feature in _CODEX_DISABLED_NATIVE_FEATURES
+            )
+        )
         trusted_block = (
             f'\n[projects."{cwd_escaped}"]\n'
             f'trust_level = "trusted"\n'
         )
         user_config_path = user_codex_home / "config.toml"
         sanitized_body = ""
-        if not same_home and user_config_path.exists():
+        if user_config_path.exists():
             try:
-                sanitized_body = _strip_plugin_and_project_sections(
+                sanitized_body = _extract_safe_user_config_defaults(
                     user_config_path.read_text(encoding="utf-8")
                 )
             except OSError:
                 sanitized_body = ""
         try:
-            bridged_config.write_text(sanitized_body + trusted_block)
-        except OSError:
-            pass
+            if bridged_config.is_symlink():
+                bridged_config.unlink()
+            bridged_config.write_text(
+                sanitized_body + native_boundary_block + trusted_block,
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            raise CodexAppServerError(
+                "Cannot establish the isolated Codex native-tool boundary at "
+                f"{bridged_config}: {exc}"
+            ) from exc
         # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env ONLY
         # when ``_load_chatgpt_login_params()`` returns usable tokens —
         # not just on file presence. A stale/corrupt ``auth.json`` with
@@ -389,12 +446,9 @@ class CodexAppServerClient:
             spawn_env.pop("OPENAI_API_KEY", None)
             spawn_env.pop("CODEX_API_KEY", None)
         try:
-            # ``--disable apps``: codex's bundled ``codex_apps`` MCP
-            # is built-in and tries to fetch ChatGPT app metadata on
-            # every thread. For our session it consistently exceeds
-            # the 30s MCP startup_timeout, leaving session_loop
-            # blocked. Kestrel has its own app/tool surface — we
-            # don't need codex's bundled directory.
+            # Disable Codex-native execution/discovery at the command line,
+            # which has higher precedence than ordinary config. Dynamic tools
+            # advertised by Kestrel remain available through item/tool/call.
             #
             # ``limit=16 MiB``: codex emits JSON-RPC frames as single
             # newline-terminated lines on stdout. Streaming events for a
@@ -411,9 +465,12 @@ class CodexAppServerClient:
             # codex-rs internal frame budget; if anything ever exceeds
             # it we want a real protocol error, not a quiet crash. See
             # #1438.
+            codex_args = [self._binary]
+            for feature in _CODEX_DISABLED_NATIVE_FEATURES:
+                codex_args.extend(("--disable", feature))
+            codex_args.extend(("app-server", "--listen", "stdio://"))
             self._proc = await asyncio.create_subprocess_exec(
-                self._binary, "--disable", "apps",
-                "app-server", "--listen", "stdio://",
+                *codex_args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -452,15 +509,11 @@ class CodexAppServerClient:
             cancellation_token=cancellation_token,
         )
         ua = (result or {}).get("userAgent", "")
-        detected = _parse_user_agent_version(ua)
-        if detected and _version_tuple(detected) < _version_tuple(
-            MIN_CODEX_APP_SERVER_VERSION
-        ):
+        try:
+            _validated_codex_version(ua)
+        except CodexAppServerError:
             await self.aclose()
-            raise CodexAppServerError(
-                f"codex app-server {MIN_CODEX_APP_SERVER_VERSION}+ required, "
-                f"detected {detected}. Update the Codex app/CLI."
-            )
+            raise
         self.notify("initialized")
         # Match kestrel-claw's auth-bridge.ts: after initialize +
         # initialized notification, explicitly drive

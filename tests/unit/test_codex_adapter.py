@@ -893,8 +893,7 @@ class TestAdapterTextPath:
 
 
 class TestThreadStartParams:
-    """Things we MUST send on thread/start so the app-server's native
-    tools behave correctly (cwd anchoring, sandbox profile)."""
+    """Thread-level half of the Codex native-tool boundary (#1965)."""
 
     @pytest.mark.asyncio
     async def test_thread_start_carries_cwd(self):
@@ -922,50 +921,55 @@ class TestThreadStartParams:
         assert ts["cwd"] == "/agents/nellie/workspace"
 
     @pytest.mark.asyncio
-    async def test_thread_start_carries_on_request_approval_policy(self):
-        """#1734 (supersedes #1707's ``on-failure`` pin): codex 0.138
-        deprecated ``on-failure`` and recommends ``on-request`` for
-        interactive approvals. The model proactively requests
-        elevation for writes outside the workspace (per the GPT-5
-        overlay), codex emits
-        ``item/commandExecution/requestApproval``, the bridge routes
-        through Kestrel's BinaryPolicy → ApprovalQueue.
-
-        Wire format is kebab-case (verified against the codex binary:
-        ``approval_policy = "never"`` literal in surfaced error
-        strings).
-        """
+    async def test_thread_start_disables_native_approval(self):
+        """Native writes never elevate; Kestrel tools own approvals."""
         a = _adapter_with(_TEXT_TURN)
         await a.get_response(
             client="x", model="auto",
             messages=[{"role": "user", "content": "hi"}], session_id="s",
         )
         ts = [p for m, p in a._client.requests if m == "thread/start"][0]
-        assert ts.get("approval_policy") == "on-request", (
-            f"thread/start must set approval_policy=on-request (got "
-            f"{ts.get('approval_policy')!r}). Codex 0.138 deprecated "
-            f"on-failure; on-request is the recommended replacement."
+        assert ts.get("approval_policy") == "never", (
+            f"thread/start must set approval_policy=never (got "
+            f"{ts.get('approval_policy')!r}); accepting a native "
+            f"elevation bypasses Kestrel's dispatcher."
         )
 
     @pytest.mark.asyncio
-    async def test_thread_start_uses_workspace_write_sandbox(self):
-        """#1734: ``workspace-write`` lets codex write inside the
-        per-agent workspace dir (+ /tmp + $TMPDIR) without an approval
-        round-trip — closes the awkward "model has to retry on
-        seatbelt failure" dance for the common case (touch /tmp/x).
-        Writes outside the workspace still escalate through the
-        bridge → queue. Reads remain unrestricted."""
+    async def test_thread_start_uses_read_only_sandbox(self):
+        """Codex apply_patch remains advertised, so sandbox it read-only."""
         a = _adapter_with(_TEXT_TURN)
         await a.get_response(
             client="x", model="auto",
             messages=[{"role": "user", "content": "hi"}], session_id="s",
         )
         ts = [p for m, p in a._client.requests if m == "thread/start"][0]
-        assert ts.get("sandbox") == "workspace-write", (
-            f"thread/start must set sandbox=workspace-write (got "
-            f"{ts.get('sandbox')!r}). #1734 widened the sandbox to allow "
-            f"in-workspace writes without a queue round-trip."
+        assert ts.get("sandbox") == "read-only", (
+            f"thread/start must set sandbox=read-only (got "
+            f"{ts.get('sandbox')!r}); native fileChange must fail closed."
         )
+
+    @pytest.mark.asyncio
+    async def test_thread_start_redundantly_disables_native_surfaces(self):
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}], session_id="s",
+        )
+        ts = [p for m, p in a._client.requests if m == "thread/start"][0]
+        config = ts["config"]
+        for key in (
+            "features.shell_tool",
+            "features.unified_exec",
+            "features.computer_use",
+            "features.browser_use",
+            "features.plugins",
+            "features.hooks",
+            "features.multi_agent",
+        ):
+            assert config[key] is False
+        assert config["web_search"] == "disabled"
+        assert config["tools_view_image"] is False
 
     @pytest.mark.asyncio
     async def test_thread_start_cwd_defaults_to_agent_workspace(self, tmp_path):
@@ -1182,11 +1186,44 @@ class TestThreadStartParams:
         assert base == again
 
 
+class TestCodexNativeToolBoundary:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "item_type", ["commandExecution", "fileChange", "webSearch"],
+    )
+    async def test_native_tool_event_fails_turn(self, item_type):
+        events = [{
+            "method": "item/started",
+            "params": {"item": {"id": "native-1", "type": item_type}},
+        }]
+        a = _adapter_with(events)
+        with pytest.raises(
+            CodexAppServerError, match="forbidden provider-native tool",
+        ):
+            await a.get_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "go"}],
+                session_id="s",
+            )
+
+
 class TestToolActivityMarkers:
     """The chat-UI renders tool-activity cards from typed in-band TOOL
     sentinels (#1659, `\\x1eKESTREL:TOOL:{json}\\x1e`) — the codex inline
     tool loop must emit them itself or the chat surface goes opaque (what
     Nellie reported). Replaces the legacy 🔧/✓/❌ emoji markers."""
+
+    @pytest.fixture(autouse=True)
+    def _exercise_legacy_projection_without_runtime_guard(self, monkeypatch):
+        """Marker formatting remains covered for archived transcripts.
+
+        Live turns reject these native types in TestCodexNativeToolBoundary.
+        """
+        monkeypatch.setattr(
+            "kestrel_sovereign.llm.codex_adapter."
+            "_FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES",
+            frozenset(),
+        )
 
     @pytest.mark.asyncio
     async def test_native_shell_emits_start_and_complete_markers(self):
@@ -1909,9 +1946,7 @@ class TestToolExecutorBridge:
 
 
 class TestCodexApprovalBridge:
-    """#1575: bridge codex-native sandbox approval RPCs through
-    Kestrel's ApprovalQueue. The hardcoded decline default silently
-    blocked auto-mode-authorized gh/git/fs writes."""
+    """Native runtime declines plus legacy policy-helper regression tests."""
 
     def _agent_with_queue(self, *, approves: bool, with_cu: bool = True):
         """Build a SimpleNamespace agent whose SecurityFeature's
@@ -1948,6 +1983,17 @@ class TestCodexApprovalBridge:
             )
         agent = SimpleNamespace(features=features, did="did:test:agent")
         return agent, captured
+
+    @pytest.mark.asyncio
+    async def test_runtime_native_handler_always_declines(self):
+        handler = CodexAdapter._make_codex_native_decline_handler(
+            "commandExecution",
+        )
+        reply = await handler({
+            "command": "gh issue create --title bypass",
+            "cwd": "/tmp",
+        })
+        assert reply == {"decision": "decline"}
 
     @pytest.mark.asyncio
     async def test_allow_listed_binary_auto_accepts_without_queue(self):
