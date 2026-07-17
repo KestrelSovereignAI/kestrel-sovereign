@@ -73,7 +73,8 @@ def test_defaults(monkeypatch):
     monkeypatch.delenv("KESTREL_PHOENIX_GRPC_PORT", raising=False)
     assert ps.phoenix_port() == 6006
     assert ps.phoenix_grpc_port() == 4317
-    assert ps.phoenix_otlp_endpoint() == "http://127.0.0.1:4317"
+    # OTLP endpoint = the HTTP port (exporters are otlp-proto-http), NOT gRPC.
+    assert ps.phoenix_otlp_endpoint() == "http://127.0.0.1:6006"
 
 
 def test_port_overrides(monkeypatch):
@@ -81,7 +82,7 @@ def test_port_overrides(monkeypatch):
     monkeypatch.setenv("KESTREL_PHOENIX_GRPC_PORT", "5555")
     assert ps.phoenix_port() == 7007
     assert ps.phoenix_grpc_port() == 5555
-    assert ps.phoenix_otlp_endpoint() == "http://127.0.0.1:5555"
+    assert ps.phoenix_otlp_endpoint() == "http://127.0.0.1:7007"
 
 
 def test_enabled_requires_installed(monkeypatch):
@@ -131,11 +132,11 @@ def test_supervision_off_when_disabled_outside_pytest(monkeypatch):
 
 
 def test_autowire_sets_endpoint_when_unset(monkeypatch):
-    monkeypatch.delenv("KESTREL_PHOENIX_GRPC_PORT", raising=False)
+    monkeypatch.delenv("KESTREL_PHOENIX_PORT", raising=False)
     env = {}
     result = ps.autowire_otlp_endpoint(env)
-    assert result == "http://127.0.0.1:4317"
-    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:4317"
+    assert result == "http://127.0.0.1:6006"
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:6006"
 
 
 def test_autowire_respects_operator_value():
