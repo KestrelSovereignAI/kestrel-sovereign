@@ -568,6 +568,7 @@ async def lifespan(app: FastAPI):
     try:
         from kestrel_sovereign.phoenix_supervisor import (
             PhoenixSupervisor,
+            autowire_otel_project,
             autowire_otlp_endpoint,
             should_supervise_phoenix,
         )
@@ -585,6 +586,15 @@ async def lifespan(app: FastAPI):
                 logger.info(
                     "OTEL_EXPORTER_OTLP_ENDPOINT auto-set to local Phoenix (%s)",
                     endpoint,
+                )
+            # Group host + spawned-agent traces under a single Phoenix project
+            # (obs#32). Mutates os.environ so subprocess agents inherit it; the
+            # SDK's tracing bootstrap (>= 0.30.2) reads KESTREL_OTEL_PROJECT.
+            project = autowire_otel_project(os.environ)
+            if project:
+                logger.info(
+                    "KESTREL_OTEL_PROJECT auto-set to '%s' (fleet-scoped traces)",
+                    project,
                 )
             # Non-blocking first boot (#2589): Phoenix's first start (SQLite
             # schema creation) can exceed the launcher's health window. Bring it

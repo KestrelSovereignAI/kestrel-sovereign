@@ -145,6 +145,21 @@ def test_autowire_respects_operator_value():
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://collector:4317"
 
 
+def test_autowire_project_sets_when_unset():
+    # Default the fleet-scoped Phoenix project when the operator hasn't pinned one
+    # (obs#32) — host + spawned agents group under "kestrel-fleet" not "default".
+    env = {}
+    assert ps.autowire_otel_project(env) == "kestrel-fleet"
+    assert env["KESTREL_OTEL_PROJECT"] == "kestrel-fleet"
+    assert ps.DEFAULT_OTEL_PROJECT == "kestrel-fleet"
+
+
+def test_autowire_project_respects_operator_value():
+    env = {"KESTREL_OTEL_PROJECT": "my-project"}
+    assert ps.autowire_otel_project(env) is None
+    assert env["KESTREL_OTEL_PROJECT"] == "my-project"
+
+
 # ---------------------------------------------------------------------------
 # build_env
 # ---------------------------------------------------------------------------
@@ -167,6 +182,23 @@ def test_build_env_fallback_drops_root_path(tmp_path):
     sup = ps.PhoenixSupervisor(working_dir=tmp_path, root_path="")
     env = sup.build_env(base_env={"PHOENIX_HOST_ROOT_PATH": "/stale"})
     assert "PHOENIX_HOST_ROOT_PATH" not in env
+
+
+def test_build_env_disables_external_telemetry(tmp_path):
+    # The supervised child must have Phoenix's external telemetry pixels
+    # (FullStory + Scarf.sh) turned off so the sovereign backend never phones
+    # home and the embedded UI stops emitting ERR_BLOCKED_BY_CLIENT noise.
+    # PHOENIX_TELEMETRY_ENABLED parses only the literal "true"/"false".
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path, root_path="/phoenix")
+    env = sup.build_env(base_env={})
+    assert env["PHOENIX_TELEMETRY_ENABLED"] == "false"
+
+
+def test_build_env_telemetry_operator_override(tmp_path):
+    # setdefault: an operator who explicitly wants the pixels can opt back in.
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path, root_path="/phoenix")
+    env = sup.build_env(base_env={"PHOENIX_TELEMETRY_ENABLED": "true"})
+    assert env["PHOENIX_TELEMETRY_ENABLED"] == "true"
 
 
 # ---------------------------------------------------------------------------

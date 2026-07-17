@@ -63,6 +63,12 @@ dependencies = [
     # spans without importing a feature package (stays on the right side of the
     # core-never-imports-features boundary). Tracing is still a runtime no-op
     # unless an OTLP endpoint is configured.
+    # NOTE (obs#32): the host autowires KESTREL_OTEL_PROJECT=kestrel-fleet, which
+    # the SDK's tracing bootstrap reads to scope the Phoenix project. That reader
+    # lands in SDK 0.30.2; bump this floor to >=0.30.2 once it publishes (0.30.2
+    # is not on PyPI yet, so pinning it now makes the resolve unsatisfiable).
+    # Setting the env is forward-compatible — 0.30.1 ignores it, 0.30.2+ honours
+    # it — so the autowiring ships ahead of the floor bump.
     "kestrel-sovereign-sdk[tracing]>=0.30.1,<0.31",
     # Core web framework
     "fastapi==0.136.3",
