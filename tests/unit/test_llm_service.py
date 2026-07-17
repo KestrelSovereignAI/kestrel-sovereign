@@ -876,6 +876,219 @@ class TestMeteringAndCost:
         assert f(LLMResponse(raw=None)) is None
         assert f(LLMResponse(raw=SimpleNamespace(usage=None))) is None
 
+    @pytest.mark.asyncio
+    async def test_metering_callback_fires_on_nonstream_after_set_observability_context(
+        self, llm_service
+    ):
+        """#2569 — the exact non-stream interleaving that regressed in 0.46.1:
+        ``set_observability_context()`` then a non-stream generate must fire
+        the metering callback with companion_id/user_id populated."""
+        calls = []
+
+        async def meter(**kwargs):
+            calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        llm_service.set_observability_context(
+            session_id="conv-1", companion_id="companion-1", user_id="user-1"
+        )
+
+        out = await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert isinstance(out, str)
+        assert len(calls) == 1
+        assert calls[0]["companion_id"] == "companion-1"
+        assert calls[0]["user_id"] == "user-1"
+
+    @pytest.mark.asyncio
+    async def test_metering_callback_still_fires_on_stream_after_set_observability_context(
+        self, llm_service, mock_adapter
+    ):
+        """#2569 regression cover — the streaming path was unaffected by the
+        0.46.1 regression, so identity set via ``set_observability_context()``
+        must keep reaching the metering callback on the stream path too."""
+
+        async def usage_stream(**_kwargs):
+            yield "chunk"
+            yield LLMResponse(
+                content="chunk", input_tokens=8, output_tokens=5, total_tokens=13
+            )
+
+        mock_adapter.get_streaming_response_with_tools = usage_stream
+        llm_service._track_model_usage = AsyncMock()
+        calls = []
+
+        async def meter(**kwargs):
+            calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        llm_service.set_observability_context(
+            companion_id="stream-companion", user_id="stream-user"
+        )
+
+        items = [
+            item
+            async for item in llm_service.get_streaming_response(
+                system_prompt="system", user_prompt="hello"
+            )
+        ]
+
+        assert items == ["chunk"]
+        assert len(calls) == 1
+        assert calls[0]["companion_id"] == "stream-companion"
+        assert calls[0]["user_id"] == "stream-user"
+
+    @pytest.mark.asyncio
+    async def test_set_observability_context_survives_child_task_boundary(
+        self, llm_service
+    ):
+        """#2569 — the metering-callback regression's true root cause: the LLM
+        call is dispatched from a task that never inherited the setter's
+        ContextVar snapshot (a worker spawned before the set, a sibling task
+        tree, or a thread offload). Billing identity must still reach the
+        metering callback. ``session_id`` is the discriminator that survives
+        the boundary — Frinz threads it through as an explicit generation
+        argument (``process_input(session_id=...)`` -> ``generate_with_messages(
+        session_id=...)``) — so the resolver recovers this session's identity.
+        Pre-fix this no-ops because the worker task's ContextVar copy is empty
+        and nothing keyed the identity to the session that did propagate."""
+        calls = []
+
+        async def meter(**kwargs):
+            calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+        worker_ready = asyncio.Event()
+        identity_set = asyncio.Event()
+
+        async def worker():
+            # Spawned BEFORE the parent sets identity, so this task's
+            # ContextVar copy is the empty default — the exact interleaving
+            # that dropped companion_id/user_id on the non-stream path. Only
+            # ``session_id`` crosses the boundary (explicit generation arg).
+            worker_ready.set()
+            await identity_set.wait()
+            return await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "hi"}],
+                session_id="conv-boundary",
+            )
+
+        task = asyncio.create_task(worker())
+        await worker_ready.wait()
+        llm_service.set_observability_context(
+            session_id="conv-boundary",
+            companion_id="boundary-companion",
+            user_id="boundary-user",
+        )
+        identity_set.set()
+        await task
+
+        assert len(calls) == 1
+        assert calls[0]["companion_id"] == "boundary-companion"
+        assert calls[0]["user_id"] == "boundary-user"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_do_not_cross_attribute_on_fallback_path(
+        self, llm_service
+    ):
+        """#2569 / #2510 — the cross-task fallback must NOT bleed identity
+        between concurrent tenants. Two requests share one service; each sets
+        its own identity, then each dispatches an LLM call from a worker task
+        that never inherited its ContextVar (the fallback path). A shared
+        last-writer snapshot would meter BOTH to whichever request called
+        ``set`` last. Keyed on the ``session_id`` that threads through
+        explicitly, each request must be billed to its OWN companion/user."""
+        calls = []
+
+        async def meter(**kwargs):
+            calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+
+        both_ready = asyncio.Event()
+        both_set = asyncio.Event()
+        ready_count = {"n": 0}
+
+        async def worker(session_id):
+            # Spawned before EITHER request sets identity, so the ContextVar
+            # copy is empty and only session_id survives the boundary.
+            ready_count["n"] += 1
+            if ready_count["n"] == 2:
+                both_ready.set()
+            await both_set.wait()
+            return await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "hi"}],
+                session_id=session_id,
+            )
+
+        task_a = asyncio.create_task(worker("conv-A"))
+        task_b = asyncio.create_task(worker("conv-B"))
+        await both_ready.wait()
+
+        # Both requests install identity on the shared service; B is the
+        # last writer, which under a shared snapshot would capture A too.
+        llm_service.set_observability_context(
+            session_id="conv-A", companion_id="companion-A", user_id="user-A"
+        )
+        llm_service.set_observability_context(
+            session_id="conv-B", companion_id="companion-B", user_id="user-B"
+        )
+        both_set.set()
+        await asyncio.gather(task_a, task_b)
+
+        by_user = {c["user_id"]: c for c in calls}
+        assert set(by_user) == {"user-A", "user-B"}
+        assert by_user["user-A"]["companion_id"] == "companion-A"
+        assert by_user["user-B"]["companion_id"] == "companion-B"
+
+    @pytest.mark.asyncio
+    async def test_non_setting_call_does_not_inherit_prior_request_identity(
+        self, llm_service
+    ):
+        """#2569 / #2510 — a later call that never sets its own context and
+        dispatches from a non-inheriting task must NOT inherit a previous
+        request's identity (the stale-snapshot leak). With no session match,
+        the metering callback correctly no-ops instead of billing a random
+        prior user for a background audit / reflection / heartbeat call."""
+        calls = []
+
+        async def meter(**kwargs):
+            calls.append(kwargs)
+
+        llm_service.set_metering_callback(meter)
+
+        worker_ready = asyncio.Event()
+        prior_request_set = asyncio.Event()
+
+        async def background_worker():
+            # Spawned BEFORE the chat request sets identity, so this task's
+            # ContextVar copy is empty — a signal/heartbeat-driven background
+            # call never inherits a chat request's ambient identity.
+            worker_ready.set()
+            await prior_request_set.wait()
+            return await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "audit"}],
+                session_id="conv-background",
+            )
+
+        task = asyncio.create_task(background_worker())
+        await worker_ready.wait()
+
+        # A prior chat request set identity for its OWN session only.
+        llm_service.set_observability_context(
+            session_id="conv-earlier",
+            companion_id="companion-earlier",
+            user_id="user-earlier",
+        )
+        prior_request_set.set()
+        await task
+
+        # The background call's session isn't in the registry and its
+        # ContextVar is empty, so no identity resolves and metering no-ops.
+        assert calls == []
+
 
 class TestInvocationBoundary:
     """#2510 — successful provider paths finalize telemetry exactly once."""

@@ -10,6 +10,7 @@ explicit context they can pass through the invocation boundary.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -28,6 +29,9 @@ class LLMInvocationContext:
     correlation_id: Optional[str] = None
 
 
+_EMPTY_INVOCATION_CONTEXT = LLMInvocationContext()
+
+
 class LLMInvocationContextState:
     """Service-local ambient context with explicit lifetime management.
 
@@ -37,36 +41,117 @@ class LLMInvocationContextState:
     state objects.  ``scope`` is the preferred compatibility lane: child tasks
     inherit the request identity, while the parent is restored when the scope
     exits.
+
+    The ``ContextVar`` alone is *task-local*: an identity written by
+    :meth:`set` reaches the current task and any child task spawned *after*
+    the write, but never a task spawned *before* it, a sibling task tree, or a
+    thread offload.  #2569 — a downstream non-stream chat handler set identity
+    in its request task and then dispatched the LLM call through a task that
+    never inherited it, so the metering callback silently no-oped with
+    ``companion_id``/``user_id`` both ``None``.
+
+    The obvious "readable from anywhere" repair — a single last-writer
+    snapshot on the instance — is exactly the cross-request bleed #2510 was
+    filed to kill: two concurrent requests share one service, so B's ``set``
+    would silently re-bill A's tokens to B.  We refuse that.  Instead the
+    cross-task fallback is keyed on ``session_id``, the one discriminator that
+    *does* survive the boundary — it threads through as an explicit generation
+    argument (``generate_with_messages(session_id=...)``), not a ContextVar.
+    :meth:`set` records ``session_id -> context`` in a bounded LRU, and
+    :meth:`get_for_session` recovers the identity for *that* session only.  Two
+    concurrent requests carry distinct session ids, so neither can read the
+    other's identity, and a call that never set a context (background audit,
+    reflection) resolves nothing for its session and correctly no-ops.  The
+    registry is per-instance, so two services in one task never share identity;
+    the LRU bound ages out finished sessions without any caller-side cleanup.
     """
+
+    #: Cap on remembered ``session_id -> context`` entries.  Bounds memory and
+    #: ages out finished sessions; a *new* session never matches an old key, so
+    #: eviction can only lose recovery for a session that already went quiet.
+    _MAX_TRACKED_SESSIONS = 1024
 
     def __init__(self) -> None:
         self._ambient: ContextVar[LLMInvocationContext] = ContextVar(
             f"kestrel_llm_invocation_context_{id(self):x}",
-            default=LLMInvocationContext(),
+            default=_EMPTY_INVOCATION_CONTEXT,
         )
+        self._by_session: "OrderedDict[str, LLMInvocationContext]" = OrderedDict()
 
     def get(self) -> LLMInvocationContext:
-        """Return the current task's ambient identity."""
+        """Return the current task's ambient identity (task-local only)."""
 
         return self._ambient.get()
 
-    def set(self, context: LLMInvocationContext) -> Token[LLMInvocationContext]:
-        """Install ``context`` and return a token that can restore its parent."""
+    def get_for_session(
+        self, session_id: Optional[str]
+    ) -> Optional[LLMInvocationContext]:
+        """Recover the identity a prior :meth:`set` recorded for ``session_id``.
 
+        This is the cross-task compatibility lane: when the dispatching task
+        never inherited the setter's ContextVar, the resolver falls back to the
+        identity keyed on the session id that *did* thread through explicitly.
+        Returns ``None`` when nothing was recorded for the session, so a call
+        with no matching session identity no-ops instead of borrowing another
+        request's billing identity.
+        """
+
+        if not session_id:
+            return None
+        context = self._by_session.get(session_id)
+        if context is not None:
+            # Refresh recency so an active conversation isn't evicted mid-flight.
+            self._by_session.move_to_end(session_id)
+        return context
+
+    def set(self, context: LLMInvocationContext) -> Token[LLMInvocationContext]:
+        """Install ``context`` and return a token that can restore its parent.
+
+        When ``context`` carries a ``session_id``, also record it in the
+        per-session registry so a request's identity survives a downstream task
+        boundary *without* a process-wide last-writer snapshot.
+        """
+
+        if context.session_id:
+            self._remember_session(context)
         return self._ambient.set(context)
 
-    def reset(self) -> None:
-        """Clear sticky compatibility state for the current task."""
+    def _remember_session(self, context: LLMInvocationContext) -> None:
+        session_id = context.session_id
+        assert session_id is not None  # guarded by caller
+        self._by_session[session_id] = context
+        self._by_session.move_to_end(session_id)
+        while len(self._by_session) > self._MAX_TRACKED_SESSIONS:
+            self._by_session.popitem(last=False)
 
-        self._ambient.set(LLMInvocationContext())
+    def forget_session(self, session_id: Optional[str]) -> None:
+        """Drop the recorded identity for ``session_id`` (request teardown)."""
+
+        if session_id:
+            self._by_session.pop(session_id, None)
+
+    def reset(self) -> None:
+        """Clear the current task's ambient identity.
+
+        Task-local only: it resets *this* task's ContextVar and never touches
+        the shared per-session registry, so one request ending cannot wipe a
+        concurrent request's cross-task fallback identity.
+        """
+
+        self._ambient.set(_EMPTY_INVOCATION_CONTEXT)
 
     @contextmanager
     def scope(
         self, context: LLMInvocationContext
     ) -> Iterator[LLMInvocationContext]:
-        """Install ``context`` only for the dynamic extent of this scope."""
+        """Install ``context`` only for the dynamic extent of this scope.
 
-        token = self.set(context)
+        A scope is a bounded, task-local override: the ContextVar is restored
+        to its parent on exit and the per-session registry is left untouched,
+        so no recovery state can outlive the scope.
+        """
+
+        token = self._ambient.set(context)
         try:
             yield context
         finally:
