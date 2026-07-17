@@ -257,6 +257,10 @@ class PhoenixSupervisor:
         self._root_path_override = root_path
         self.root_path = root_path if root_path is not None else PHOENIX_ROOT_PATH
         self.process: Optional[subprocess.Popen] = None
+        # PID of an orphaned Phoenix this supervisor *adopted* rather than spawned
+        # (#2589). When set, ``self.process`` is ``None`` — there is no Popen
+        # handle for a child a previous, hard-killed host leaked.
+        self._adopted_pid: Optional[int] = None
         self._client: Optional[httpx.AsyncClient] = None
 
     # -- paths -----------------------------------------------------------
@@ -271,10 +275,197 @@ class PhoenixSupervisor:
     # -- state -----------------------------------------------------------
     @property
     def running(self) -> bool:
-        """True if the supervised process is alive."""
-        if self.process is None:
+        """True if the tracked process (spawned or adopted) is alive.
+
+        Process liveness only. The session-mint / UI health gate uses
+        :meth:`is_reachable` instead — health is *reachability*, not child
+        liveness (#2589): gating on a tracked child's ``poll()`` ties the mint to
+        a possibly-zombie process rather than whatever is actually serving the
+        port.
+        """
+        if self.process is not None:
+            return self.process.poll() is None
+        if self._adopted_pid is not None:
+            return self._pid_alive(self._adopted_pid)
+        return False
+
+    # -- reachability (health = can the iframe reach Phoenix) ------------
+    def is_healthy(self, timeout: float = 2.0) -> bool:
+        """Synchronous reachability probe of the Phoenix port (#2589).
+
+        ``True`` when Phoenix answers an HTTP request on its port, regardless of
+        whether *this* supervisor spawned it. This is what lets a restarted host
+        detect (and adopt) an orphaned child that is still serving the port.
+        """
+        url = f"http://{self.host}:{self.port}{self.root_path}/"
+        try:
+            resp = httpx.get(url, timeout=timeout, follow_redirects=False)
+            return resp.status_code < 500
+        except httpx.HTTPError:
             return False
-        return self.process.poll() is None
+
+    async def is_reachable(self, timeout: float = 2.0) -> bool:
+        """Async reachability probe — "can the iframe reach Phoenix" (#2589).
+
+        The mint endpoint (and any supervisor health) gates on this rather than
+        ``process.poll()`` so it tracks the process actually serving the port,
+        not the tracked-but-possibly-zombie child.
+        """
+        url = f"http://{self.host}:{self.port}{self.root_path}/"
+        try:
+            client = self._proxy_client()
+            resp = await client.get(url, timeout=timeout, follow_redirects=False)
+            return resp.status_code < 500
+        except httpx.HTTPError:
+            return False
+
+    # -- pid helpers (adopt-or-reap orphans across restarts) -------------
+    def _read_pid(self) -> Optional[int]:
+        """Read the tracked PID from the pidfile, or ``None`` if missing/invalid."""
+        try:
+            return int(self.pid_file.read_text().strip())
+        except (ValueError, OSError):
+            return None
+
+    def _write_pid(self, pid: int) -> None:
+        """Persist ``pid`` to the pidfile so a hard-killed host's successor can
+        reap or adopt the leak (mirrors ``ProcessManager`` pid tracking)."""
+        try:
+            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_file.write_text(str(pid))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _pid_alive(pid: Optional[int]) -> bool:
+        """Whether a process with ``pid`` is alive (best-effort, cross-platform)."""
+        if not pid:
+            return False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(0x1000, False, pid)
+                if handle:
+                    kernel32.CloseHandle(handle)
+                    return True
+                return False
+            except Exception:  # noqa: BLE001
+                return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _pids_listening_on_port(self) -> list[int]:
+        """Best-effort PIDs holding the Phoenix port (POSIX ``lsof``; [] elsewhere).
+
+        Lets adopt-or-reap discover the process that actually bound the port,
+        rather than trusting the pidfile alone — the pidfile can name a zombie
+        that lost the race for the port (the split-brain observed on #2589).
+        """
+        if sys.platform == "win32":
+            return []
+        try:
+            out = subprocess.run(
+                ["lsof", "-iTCP:%d" % self.port, "-sTCP:LISTEN", "-t", "-Pn"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return sorted({int(p) for p in out.stdout.split() if p.isdigit()})
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+            return []
+
+    def _terminate_pid(self, pid: int, *, timeout: float = 10.0) -> None:
+        """Reap a leaked/zombie Phoenix child by PID (SIGTERM, then SIGKILL)."""
+        logger.info("Reaping leaked Phoenix child (PID %s)", pid)
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    capture_output=True,
+                    check=False,
+                )
+                return
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            return
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._pid_alive(pid):
+                return
+            time.sleep(0.25)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+
+    def _adopt_or_reap(self) -> bool:
+        """Reconcile any Phoenix already bound to our port before spawning (#2589).
+
+        A hard host stop (launcher SIGKILL path) skips lifespan shutdown and
+        leaks the Phoenix child, which keeps serving the port across the restart.
+        Spawning a *second* child into the held port just idles a zombie, while
+        the mint/health gate can end up pointing at the wrong process (the
+        split-brain observed on #2589). So, before spawning:
+
+        * If the port already serves a healthy Phoenix, **adopt** it — track the
+          real listener by PID + pidfile and reap any *other* tracked child (the
+          zombie that lost the race for the port). Returns ``True`` so the caller
+          does **not** spawn a second child.
+        * Otherwise clear a stale pidfile and **reap** any non-serving child it
+          names (a bound-failed leak) so a fresh child can bind. Returns
+          ``False``.
+        """
+        prior_pid = self._read_pid()
+        if self.is_healthy():
+            listeners = self._pids_listening_on_port()
+            serving_pid = listeners[0] if listeners else prior_pid
+            # Reap any *other* Phoenix child we know about — the split-brain
+            # zombie that could not bind the port.
+            for pid in {prior_pid, *listeners}:
+                if pid and pid != serving_pid and self._pid_alive(pid):
+                    self._terminate_pid(pid)
+            if serving_pid and self._pid_alive(serving_pid):
+                self._adopted_pid = serving_pid
+                self.process = None
+                self._write_pid(serving_pid)
+                logger.info(
+                    "Adopted already-serving Phoenix (PID %s) on %s:%s — "
+                    "not spawning a second child.",
+                    serving_pid,
+                    self.host,
+                    self.port,
+                )
+            else:
+                # Healthy but the owning PID is unidentifiable (e.g. no lsof).
+                # Don't spawn a second child; reachability-based gating still
+                # serves the UI through the proxy.
+                self._adopted_pid = None
+                logger.info(
+                    "Phoenix already serving %s:%s (owner PID unknown) — "
+                    "not spawning a second child.",
+                    self.host,
+                    self.port,
+                )
+            return True
+
+        # Nothing healthy on the port. Reap a leaked/hung child the pidfile names
+        # (it could not bind and will never serve) so our fresh child can, then
+        # drop the stale pidfile.
+        if prior_pid and self._pid_alive(prior_pid):
+            logger.info(
+                "Reaping stale Phoenix child (PID %s) — not serving %s:%s.",
+                prior_pid,
+                self.host,
+                self.port,
+            )
+            self._terminate_pid(prior_pid)
+        self._clear_pid()
+        return False
 
     # -- launch ----------------------------------------------------------
     def build_command(self) -> list[str]:
@@ -328,6 +519,16 @@ class PhoenixSupervisor:
                 )
                 self.root_path = ""
 
+        # Adopt-or-reap: never spawn a second child into a port an orphaned
+        # Phoenix already holds (#2589 split-brain). Adopt a still-serving child,
+        # or reap a non-serving leak so our fresh child can bind. Never blocks
+        # host startup — a reconcile failure degrades to a normal spawn.
+        try:
+            if self._adopt_or_reap():
+                return True
+        except Exception as exc:  # noqa: BLE001 - reconcile must never block startup
+            logger.warning("Phoenix adopt-or-reap reconcile failed: %s", exc)
+
         try:
             self.working_dir.mkdir(parents=True, exist_ok=True)
             log_fd = os.open(
@@ -354,11 +555,9 @@ class PhoenixSupervisor:
             self.process = None
             return False
 
-        try:
-            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
-            self.pid_file.write_text(str(self.process.pid))
-        except OSError:
-            pass
+        # Freshly spawned: this supervisor owns a real Popen, not an adopted PID.
+        self._adopted_pid = None
+        self._write_pid(self.process.pid)
 
         logger.info(
             "Phoenix supervised on %s:%s (PID %s, root_path=%r, working_dir=%s)",
@@ -401,10 +600,16 @@ class PhoenixSupervisor:
         """Terminate Phoenix gracefully, escalating to SIGKILL after ``timeout``."""
         proc = self.process
         if proc is None:
+            # No Popen handle — but we may have ADOPTED an orphaned child by PID
+            # (#2589). Reap it so a graceful host shutdown leaves no orphan.
+            if self._adopted_pid is not None:
+                self._terminate_pid(self._adopted_pid, timeout=timeout)
+                self._adopted_pid = None
             self._clear_pid()
             return
         if proc.poll() is not None:
             self.process = None
+            self._adopted_pid = None
             self._clear_pid()
             return
 
@@ -435,6 +640,7 @@ class PhoenixSupervisor:
                 pass
 
         self.process = None
+        self._adopted_pid = None
         self._clear_pid()
         logger.info("Phoenix stopped")
 
@@ -562,8 +768,14 @@ async def proxy_to_phoenix(
     Auth is enforced upstream by the host's ``auth_middleware`` (session cookie,
     API key, or the minted embed cookie) — by the time we get here the caller is
     authorized. Returns a clear 503 when Phoenix is not supervised.
+
+    Gating is by *reachability*, not child liveness (#2589): an adopted orphan
+    has no local ``Popen`` handle, and during a non-blocking first boot Phoenix
+    may still be coming up. So we forward to the port and let the connection be
+    the reachability test — an unreachable Phoenix returns 503 ("not ready yet"),
+    not 502.
     """
-    if supervisor is None or not supervisor.running:
+    if supervisor is None:
         return _phoenix_disabled_response()
 
     client = supervisor._proxy_client()
@@ -582,11 +794,10 @@ async def proxy_to_phoenix(
         )
         upstream = await client.send(upstream_req, stream=True)
     except httpx.ConnectError:
+        # Not reachable yet (still starting on first boot, or crashed) — 503 so
+        # the console retries rather than treating it as a hard proxy error.
         logger.warning("Phoenix is unreachable at %s", target_url)
-        return JSONResponse(
-            status_code=502,
-            content={"detail": "Phoenix is unreachable"},
-        )
+        return _phoenix_disabled_response()
     except httpx.TimeoutException:
         return JSONResponse(
             status_code=504,

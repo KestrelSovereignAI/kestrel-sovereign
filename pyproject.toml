@@ -223,8 +223,19 @@ observability = [
 # this extra is the ONLY step needed to get traces flowing: on host start the
 # server supervises a local Phoenix subprocess (loopback-only, SQLite storage)
 # and auto-wires OTEL_EXPORTER_OTLP_ENDPOINT to it.
+# Bounds pinned (#2589): a fresh resolve of `arize-phoenix>=11,<20` under
+# sovereign's fastapi pin lands on phoenix 17.7.0, whose unbounded
+# `pydantic-ai-slim>=1.95` dep resolves to pydantic-ai 2.x — which renamed
+# `MCPServerStreamableHTTP` in 2.0 and makes `import phoenix` fail. Capping
+# `pydantic-ai-slim` below 2.0 is the load-bearing fix: arize-phoenix depends on
+# pydantic-ai-slim directly, and that package provides the importable
+# `pydantic_ai` module, so the extra imports cleanly with no operator manifest
+# pins. The meta `pydantic-ai` package is deliberately NOT listed here: it drags
+# in `pydantic-ai-slim[xai]` → `xai-sdk`, which requires `packaging<26` and so is
+# unsatisfiable against this project's `packaging==26.2` pin.
 phoenix = [
-    "arize-phoenix>=11,<20",
+    "arize-phoenix>=17.7,<18",
+    "pydantic-ai-slim[anthropic,bedrock,google,mcp,openai,ui]>=1.95,<2",
 ]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the
