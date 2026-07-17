@@ -675,15 +675,17 @@ class PhoenixSupervisor:
     def upstream_url(self, path: str, query: str = "") -> str:
         """Map an incoming ``/phoenix/{path}`` to the Phoenix upstream URL.
 
-        When Phoenix serves under ``PHOENIX_HOST_ROOT_PATH=/phoenix`` (the normal
-        case) the full ``/phoenix/...`` path is forwarded verbatim so Phoenix's
-        own routing matches. In the fallback (root-path serving) the ``/phoenix``
-        prefix is dropped.
+        ASGI ``root_path`` semantics: ``PHOENIX_HOST_ROOT_PATH`` tells Phoenix
+        to *generate* URLs under ``/phoenix`` (the SPA basename), but its
+        routing still matches the UNPREFIXED path — the reverse proxy is
+        expected to strip the prefix before forwarding. Forwarding the prefix
+        verbatim makes every asset/API path miss and fall back to the SPA
+        index (200 ``text/html`` for ``.js`` → the browser's strict-MIME
+        module errors). Verified live on 17.7.0: ``/assets/x.js`` → JS,
+        ``/phoenix/assets/x.js`` → index fallback.
         """
         rel = path.lstrip("/")
-        prefix = self.root_path or ""
-        full = f"{prefix}/{rel}" if prefix else f"/{rel}"
-        url = f"http://{self.host}:{self.port}{full}"
+        url = f"http://{self.host}:{self.port}/{rel}"
         if query:
             url = f"{url}?{query}"
         return url

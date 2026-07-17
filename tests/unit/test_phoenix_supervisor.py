@@ -387,13 +387,15 @@ async def test_is_reachable_false_when_down(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_upstream_url_with_root_path(tmp_path):
+def test_upstream_url_strips_prefix_even_with_root_path(tmp_path):
+    # ASGI root_path is for URL *generation* only — Phoenix's routing matches
+    # the unprefixed path, so the proxy always forwards stripped.
     sup = _running_supervisor(tmp_path, root_path="/phoenix")
     assert (
         sup.upstream_url("v1/traces", "a=1")
-        == "http://127.0.0.1:6006/phoenix/v1/traces?a=1"
+        == "http://127.0.0.1:6006/v1/traces?a=1"
     )
-    assert sup.upstream_url("") == "http://127.0.0.1:6006/phoenix/"
+    assert sup.upstream_url("") == "http://127.0.0.1:6006/"
 
 
 def test_upstream_url_fallback(tmp_path):
@@ -498,7 +500,7 @@ async def test_proxy_streams_upstream(tmp_path):
         body += chunk if isinstance(chunk, bytes) else chunk.encode()
     assert resp.status_code == 200
     assert b"phoenix" in body
-    assert captured["url"] == "http://127.0.0.1:6006/phoenix/"
+    assert captured["url"] == "http://127.0.0.1:6006/"
     await sup.aclose()
 
 
