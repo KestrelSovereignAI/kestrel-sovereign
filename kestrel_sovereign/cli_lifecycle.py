@@ -9,6 +9,7 @@ seams keep working unchanged.
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -17,7 +18,50 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
-from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+from kestrel_sovereign.multi_agent.process_manager import (
+    DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    ProcessManager,
+)
+
+
+def _positive_seconds(value: str) -> float:
+    """Argparse type for a strictly-positive duration in seconds."""
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return seconds
+
+
+def _startup_timeout(args) -> float:
+    """Resolve the shared lifecycle readiness timeout from parsed args."""
+    return float(
+        getattr(
+            args,
+            "startup_timeout",
+            DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+        )
+    )
+
+
+def _format_seconds(seconds: float) -> str:
+    return f"{seconds:g}s"
+
+
+def _add_startup_timeout_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the canonical readiness deadline to a lifecycle subcommand."""
+    parser.add_argument(
+        "--startup-timeout",
+        type=_positive_seconds,
+        default=DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Seconds to wait for /health after start/restart "
+            f"(default: {DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS:g})"
+        ),
+    )
 
 
 def _format_uptime(pid: int) -> str:
@@ -71,6 +115,7 @@ def cmd_start(args) -> int:
 
     multi_agent = cli.MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
     pm = ProcessManager(project_dir)
+    startup_timeout = _startup_timeout(args)
 
     if args.name:
         # Start a single agent by name
@@ -89,17 +134,37 @@ def cmd_start(args) -> int:
             print(f"   {e}")
             return 1
 
-        if pm.wait_for_health(agent_cfg.port, timeout=30):
+        if pm.wait_for_health(agent_cfg.port, timeout=startup_timeout):
             print("          \u2705")
         else:
             print("          \u274c")
+            log_file = ProcessManager.agent_log_file(
+                (project_dir / agent_cfg.data_dir).resolve()
+            )
+            print(
+                f"   {args.name} did not become healthy within "
+                f"{_format_seconds(startup_timeout)}; the process may still "
+                "be initializing."
+            )
+            print(f"   Check log: {log_file}")
             return 1
         return 0
 
-    return _start_inprocess_mode(project_dir, multi_agent, pm)
+    return _start_inprocess_mode(
+        project_dir,
+        multi_agent,
+        pm,
+        startup_timeout=startup_timeout,
+    )
 
 
-def _start_inprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) -> int:
+def _start_inprocess_mode(
+    project_dir: Path,
+    multi_agent,
+    pm: ProcessManager,
+    *,
+    startup_timeout: float = DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+) -> int:
     """Start all agents in a single server process (default mode)."""
     autostart = multi_agent.get_autostart_agents()
     manual = {
@@ -157,10 +222,15 @@ def _start_inprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) ->
     # after startup and runtime tracebacks vanish. See #1461.
     pm._spawn_detached(cmd, env, log_file, host_pid_file)
 
-    if pm.wait_for_health(multi_agent.host.port, timeout=30):
+    if pm.wait_for_health(multi_agent.host.port, timeout=startup_timeout):
         print("          \u2705")
     else:
         print("          \u274c")
+        print(
+            "   Server did not become healthy within "
+            f"{_format_seconds(startup_timeout)}; the process may still be "
+            "initializing."
+        )
         print(f"   Check log: {log_file}")
         return 1
 
@@ -1103,6 +1173,7 @@ def cmd_update(args) -> int:
             restart_args = argparse.Namespace(
                 name=target,
                 force=bool(getattr(args, "force", False)),
+                startup_timeout=_startup_timeout(args),
             )
             rc = cli.cmd_restart(restart_args)
             if rc != 0:
@@ -1234,6 +1305,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
     # kestrel start [name]
     start_p = subparsers.add_parser("start", help="Start host and/or agents")
     start_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
+    _add_startup_timeout_argument(start_p)
 
     # kestrel stop [name] [--force]
     stop_p = subparsers.add_parser("stop", help="Stop host and/or agents")
@@ -1250,6 +1322,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
         "--force", action="store_true",
         help="Force-kill existing processes during the stop phase",
     )
+    _add_startup_timeout_argument(restart_p)
 
     # kestrel update [agent]
     update_p = subparsers.add_parser(
@@ -1346,6 +1419,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
         "--force", action="store_true",
         help="Forwarded to `kestrel restart` (force-kill stale processes)",
     )
+    _add_startup_timeout_argument(update_p)
 
     # kestrel status
     subparsers.add_parser("status", help="Show status of host and agents")
@@ -1363,4 +1437,3 @@ def add_lifecycle_subparsers(subparsers) -> None:
 # them back) loads. Every `cli.<name>` reference above resolves at call time,
 # so binding `cli` here at end-of-module is safe.
 from kestrel_sovereign import cli  # noqa: E402
-
