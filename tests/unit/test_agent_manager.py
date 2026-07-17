@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
+from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -348,6 +349,44 @@ class TestLoadFromConfig:
         assert manager.get_agent("broken") is None
         broken.shutdown.assert_awaited_once()
         assert manager.init_failures == [("broken", failure)]
+
+    @pytest.mark.asyncio
+    async def test_identity_failure_keeps_healthy_peer_but_never_publishes_broken(
+        self,
+        caplog,
+    ):
+        """Fleet startup records a sanitized, non-invokable partial state."""
+        config = MultiAgentConfig(
+            agents={
+                "healthy": LocalAgentConfig(
+                    data_dir=Path("/tmp/healthy"), port=8801
+                ),
+                "broken": LocalAgentConfig(
+                    data_dir=Path("/tmp/broken"), port=8802
+                ),
+            }
+        )
+        manager = AgentManager(base_data_dir=Path("/tmp"))
+        healthy = _make_mock_agent("did:healthy")
+        failure = IdentityReadinessError(
+            "custody",
+            cause_type="DecryptionError",
+        )
+
+        async def initialize(name, _config):
+            if name == "broken":
+                raise failure
+            return healthy
+
+        manager._initialize_agent = initialize
+        loaded = await manager.load_from_config(config)
+
+        assert loaded == 1
+        assert manager.list_agents() == {"healthy": healthy}
+        assert manager.get_agent("broken") is None
+        assert manager.init_failures == [("broken", failure)]
+        assert "identity_custody" in caplog.text
+        assert "/tmp/broken" not in caplog.text
 
 
 class TestCreateAgent:

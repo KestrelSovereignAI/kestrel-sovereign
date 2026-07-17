@@ -179,6 +179,16 @@ Drop the produced `did.json` into the `agent-identities` repo (or wherever you s
 
 `KestrelAgent.__init__` detects the succession statement on disk, loads the hybrid keypair, and the agent starts producing hybrid signatures by default. Verify via:
 
+Identity loading is a readiness gate once any identity document or key artifact
+exists. A home with no identity material is still a valid pre-inception
+construction state. A home with material that cannot be decrypted, is partial or
+malformed, fails the hybrid private-to-public binding probe, or does not bind to
+the DID in the agent database is blocked instead of running as `identity=None`.
+`/health` returns HTTP 503 with a sanitized
+`identity_readiness_failures` record; it never includes key-storage paths or the
+underlying cryptographic exception message. Restore the correct custody key or
+complete identity package and restart the same home—do not re-incept it.
+
 ```bash
 curl -H "X-API-Key: $KEY" http://localhost:8888/api/agents/<name>/api/identity | python3 -m json.tool
 ```

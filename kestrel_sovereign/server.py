@@ -185,6 +185,28 @@ def _mandatory_feature_failure_record(
     }
 
 
+def _identity_readiness_failure_record(
+    agent_name: str,
+    error: Exception,
+) -> Optional[dict]:
+    """Return a health-safe record for a blocked identity root of trust."""
+    from kestrel_sovereign.identity.runtime_identity import (
+        IdentityReadinessError,
+    )
+
+    if not isinstance(error, IdentityReadinessError):
+        return None
+    return {
+        "agent": agent_name,
+        "state": "blocked",
+        "stage": error.stage,
+        "failure": error.failure,
+        "error_code": error.error_code,
+        "cause_type": error.cause_type,
+        "error": str(error),
+    }
+
+
 def _oauth_required() -> bool:
     """Return whether OAuth is the required auth mode.
 
@@ -534,6 +556,7 @@ async def lifespan(app: FastAPI):
     logger.info("Server starting up...")
     _set_startup_error(app, None)
     app.state.mandatory_feature_failures = []
+    app.state.identity_readiness_failures = []
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -651,6 +674,13 @@ async def lifespan(app: FastAPI):
                     record := _mandatory_feature_failure_record(name, exc)
                 ) is not None
             ]
+            app.state.identity_readiness_failures = [
+                record
+                for name, exc in init_failures
+                if (
+                    record := _identity_readiness_failure_record(name, exc)
+                ) is not None
+            ]
             if init_failures and loaded == 0:
                 # Every configured agent failed to initialize. Treat the
                 # whole host as broken so /health reports it.
@@ -676,13 +706,28 @@ async def lifespan(app: FastAPI):
                         f"to initialize — {type(exc).__name__}: {exc}"
                     )
         except Exception as e:
-            logger.error(f"Error during multi-agent startup: {e}", exc_info=True)
+            identity_record = _identity_readiness_failure_record("default", e)
+            if identity_record is not None:
+                logger.error(
+                    "Error during multi-agent startup: %s "
+                    "(code=%s, cause_type=%s)",
+                    e,
+                    identity_record["error_code"],
+                    identity_record["cause_type"],
+                )
+                app.state.identity_readiness_failures = [identity_record]
+            else:
+                logger.error(
+                    f"Error during multi-agent startup: {e}",
+                    exc_info=True,
+                )
             app.state.agent_manager = None
             app.state.agent = None
             _set_startup_error(app, e)
     else:
         # --- Single-agent mode (original behavior) ---
         app.state.agent_manager = None
+        llm_service = None
         try:
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
@@ -720,11 +765,30 @@ async def lifespan(app: FastAPI):
             await app.state.agent.initialize()
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
         except Exception as e:
-            logger.error(f"Error during startup: {e}", exc_info=True)
             app.state.agent = None
-            record = _mandatory_feature_failure_record("default", e)
-            if record is not None:
-                app.state.mandatory_feature_failures = [record]
+            mandatory_record = _mandatory_feature_failure_record("default", e)
+            identity_record = _identity_readiness_failure_record("default", e)
+            if identity_record is not None:
+                logger.error(
+                    "Error during startup: %s (code=%s, cause_type=%s)",
+                    e,
+                    identity_record["error_code"],
+                    identity_record["cause_type"],
+                )
+                app.state.identity_readiness_failures = [identity_record]
+                if llm_service is not None:
+                    try:
+                        await llm_service.close()
+                    except Exception as close_error:  # noqa: BLE001
+                        logger.warning(
+                            "Could not close LLM service after blocked identity "
+                            "startup (cause_type=%s)",
+                            type(close_error).__name__,
+                        )
+            else:
+                logger.error(f"Error during startup: {e}", exc_info=True)
+            if mandatory_record is not None:
+                app.state.mandatory_feature_failures = [mandatory_record]
             _set_startup_error(app, e)
 
     # Per-feature static asset mounts (#2043). Done BEFORE router mounting so the
@@ -1412,18 +1476,27 @@ def health_check(request: Request):
         "mandatory_feature_failures",
         [],
     )
-    if mandatory_failures:
+    identity_failures = getattr(
+        request.app.state,
+        "identity_readiness_failures",
+        [],
+    )
+    if mandatory_failures or identity_failures:
         manager = getattr(request.app.state, 'agent_manager', None)
         any_initialized = bool(agent) or bool(
             manager and manager.list_agents()
         )
+        content = {
+            "status": "unhealthy",
+            "agent_initialized": any_initialized,
+        }
+        if mandatory_failures:
+            content["mandatory_feature_failures"] = mandatory_failures
+        if identity_failures:
+            content["identity_readiness_failures"] = identity_failures
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "unhealthy",
-                "agent_initialized": any_initialized,
-                "mandatory_feature_failures": mandatory_failures,
-            },
+            content=content,
         )
     if agent:
         payload = {"status": "ok", "agent_initialized": True}

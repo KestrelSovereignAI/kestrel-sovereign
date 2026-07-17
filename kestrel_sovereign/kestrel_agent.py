@@ -438,77 +438,105 @@ class KestrelAgent(
         # notably ``multi_agent.agent_manager.spawn_agent`` — pre-ceremony agents
         # were silently broken there because nothing was setting this).
         #
-        # Identity loading is best-effort: during inception the keys may not
-        # be on disk yet, so failure logs a warning rather than killing
-        # construction. Callers needing the identity check ``self.identity
-        # is not None`` and fall back to legacy paths if it is.
+        # Construction before inception writes identity material is valid.
+        # Once any identity artifact exists, however, loading is a readiness
+        # gate: custody, completeness, cryptographic binding, and DID binding
+        # failures must never downgrade the running agent to ``identity=None``.
         self.identity = None
         self._private_key = None
         if self.storage_path and self.did:
-            legacy_key_id = self._derive_legacy_key_id(self.did)
             storage_dir = Path(self.storage_path).parent
-            has_legacy_doc = bool(
-                legacy_key_id and (storage_dir / f"{legacy_key_id}.json").exists()
+            legacy_docs = (
+                sorted(storage_dir.glob("kestrel_0x*.json"))
+                if storage_dir.is_dir()
+                else []
             )
-            # Born-hybrid agents (#2397) have no legacy material at all;
-            # their identity is the <slug>_did.json + hybrid keys written
-            # at inception. Detect by the DID document's presence.
-            has_born_hybrid_doc = (
-                not has_legacy_doc
-                and storage_dir.is_dir()
-                and any(storage_dir.glob("*_did.json"))
+            born_hybrid_docs = (
+                sorted(storage_dir.glob("*_did.json"))
+                if storage_dir.is_dir()
+                else []
             )
-            if has_legacy_doc or has_born_hybrid_doc:
-                try:
-                    from kestrel_sovereign.identity.runtime_identity import (
-                        load_agent_identity,
+            identity_artifacts_present = bool(
+                legacy_docs
+                or born_hybrid_docs
+                or (
+                    storage_dir.is_dir()
+                    and (
+                        any(storage_dir.glob("kestrel_0x*.key.enc"))
+                        or any(storage_dir.glob("kestrel_0x*.pem"))
+                        or any(storage_dir.glob("*_ed25519.key.enc"))
+                        or any(storage_dir.glob("*_mldsa65.bytes.enc"))
+                        or any(storage_dir.glob("*_archival_slhdsa*.bytes.enc"))
+                        or any((storage_dir / "successions").glob("*.json"))
                     )
+                )
+            )
+            if identity_artifacts_present:
+                from kestrel_sovereign.identity.runtime_identity import (
+                    IdentityReadinessError,
+                    load_agent_identity,
+                )
+
+                if not legacy_docs and not born_hybrid_docs:
+                    raise IdentityReadinessError(
+                        "integrity",
+                        cause_type="IdentityDocumentMissing",
+                    )
+                if (
+                    len(legacy_docs) > 1
+                    or len(born_hybrid_docs) > 1
+                    or (legacy_docs and born_hybrid_docs)
+                ):
+                    raise IdentityReadinessError(
+                        "integrity",
+                        cause_type="AmbiguousIdentityDocuments",
+                    )
+
+                legacy_key_id = legacy_docs[0].stem if legacy_docs else None
+                try:
                     loaded = load_agent_identity(
-                        legacy_key_id if has_legacy_doc else None,
+                        legacy_key_id,
                         storage_dir=storage_dir,
                     )
-                    # Bind the loaded identity to THIS agent's DID. The
-                    # born-hybrid loader returns whatever identity is in
-                    # the dir; without this check an inconsistent dir
-                    # (wrong restore, copied identity files) would have
-                    # the agent silently signing as someone else. Same
-                    # principle as signing._load_local_identity_for_did.
-                    if not has_legacy_doc and loaded.new_did != self.did:
-                        logging.warning(
-                            "Identity on disk is %s but this agent's DID "
-                            "is %s — refusing the mis-bound identity. "
-                            "Agent runs with self.identity=None.",
-                            loaded.new_did, self.did,
+                    bound_dids = {
+                        candidate
+                        for candidate in (loaded.legacy_did, loaded.new_did)
+                        if candidate
+                    }
+                    if self.did not in bound_dids:
+                        raise IdentityReadinessError(
+                            "binding",
+                            cause_type="ConfiguredDIDMismatch",
+                        )
+
+                    self.identity = loaded
+                    # Born-hybrid agents have no legacy keypair;
+                    # consumers of _private_key (e.g. wallet plumbing
+                    # in spawn) get None and already guard for it.
+                    if self.identity.legacy_keypair is not None:
+                        self._private_key = self.identity.legacy_keypair.private_key
+                    if self.identity.is_born_hybrid:
+                        logging.info(
+                            "Agent identity loaded as BORN-HYBRID: %s",
+                            self.identity.new_did,
+                        )
+                    elif self.identity.is_hybrid:
+                        logging.info(
+                            "Agent identity loaded as HYBRID: legacy=%s -> new=%s",
+                            self.identity.legacy_did, self.identity.new_did,
                         )
                     else:
-                        self.identity = loaded
-                        # Born-hybrid agents have no legacy keypair;
-                        # consumers of _private_key (e.g. wallet plumbing
-                        # in spawn) get None and already guard for it.
-                        if self.identity.legacy_keypair is not None:
-                            self._private_key = self.identity.legacy_keypair.private_key
-                        if self.identity.is_born_hybrid:
-                            logging.info(
-                                "Agent identity loaded as BORN-HYBRID: %s",
-                                self.identity.new_did,
-                            )
-                        elif self.identity.is_hybrid:
-                            logging.info(
-                                "Agent identity loaded as HYBRID: legacy=%s -> new=%s",
-                                self.identity.legacy_did, self.identity.new_did,
-                            )
-                        else:
-                            logging.info(
-                                "Agent identity loaded as legacy-only: %s",
-                                self.identity.legacy_did,
-                            )
+                        logging.info(
+                            "Agent identity loaded as legacy-only: %s",
+                            self.identity.legacy_did,
+                        )
+                except IdentityReadinessError:
+                    raise
                 except Exception as exc:
-                    logging.warning(
-                        "Could not load agent identity from %s: %s. "
-                        "Agent will run with self.identity=None; signing call "
-                        "sites will fall back to their existing legacy paths.",
-                        storage_dir, exc,
-                    )
+                    # Do not chain the detailed loader exception: it can carry
+                    # filesystem paths or secret-bearing crypto/provider text,
+                    # and generic startup traceback logging must remain safe.
+                    raise IdentityReadinessError.from_load_error(exc) from None
 
         # Determine database backend
         self._db_backend = db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")
