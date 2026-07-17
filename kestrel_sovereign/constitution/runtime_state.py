@@ -27,6 +27,10 @@ class ConstitutionRuntimeState:
     last_successful_audit_at: Optional[datetime]
     interaction_count: int
     updated_at: datetime
+    # Distinguishes an interrupted first-ever identity bootstrap from a legacy
+    # identity whose anchor is missing. Only the former may establish its
+    # initial anchor automatically before the mandatory full startup audit.
+    bootstrap_pending: bool = False
 
 
 class ConstitutionRuntimeStateStore:
@@ -91,6 +95,7 @@ class ConstitutionRuntimeStateStore:
                 last_successful_audit_at {timestamp_type},
                 interaction_count INTEGER NOT NULL DEFAULT 0
                     CHECK (interaction_count >= 0),
+                bootstrap_pending {boolean_type} NOT NULL,
                 schema_version INTEGER NOT NULL,
                 updated_at {timestamp_type} NOT NULL
             );
@@ -116,7 +121,8 @@ class ConstitutionRuntimeStateStore:
             SELECT agent_id, safe_mode, safe_mode_reason,
                    safe_mode_entered_at, safe_mode_exited_at,
                    safe_mode_exit_authorization, last_successful_audit_at,
-                   interaction_count, schema_version, updated_at
+                   interaction_count, bootstrap_pending, schema_version,
+                   updated_at
               FROM constitution_runtime_state
              WHERE agent_id = ?
             """,
@@ -124,7 +130,7 @@ class ConstitutionRuntimeStateStore:
         )
         if row is None:
             return None
-        if int(row[8]) != self.SCHEMA_VERSION:
+        if int(row[9]) != self.SCHEMA_VERSION:
             raise ValueError(
                 "Unsupported constitution runtime-state schema version"
             )
@@ -137,7 +143,8 @@ class ConstitutionRuntimeStateStore:
             safe_mode_exit_authorization=row[5],
             last_successful_audit_at=self._timestamp_value(row[6]),
             interaction_count=max(0, int(row[7])),
-            updated_at=self._timestamp_value(row[9]),
+            bootstrap_pending=bool(row[8]),
+            updated_at=self._timestamp_value(row[10]),
         )
 
     async def write(
@@ -158,6 +165,7 @@ class ConstitutionRuntimeStateStore:
             state.safe_mode_exit_authorization,
             self._timestamp_param(state.last_successful_audit_at),
             max(0, int(state.interaction_count)),
+            self._boolean_param(state.bootstrap_pending),
             self.SCHEMA_VERSION,
             self._timestamp_param(state.updated_at),
         )
@@ -168,8 +176,9 @@ class ConstitutionRuntimeStateStore:
                     (agent_id, safe_mode, safe_mode_reason,
                      safe_mode_entered_at, safe_mode_exited_at,
                      safe_mode_exit_authorization, last_successful_audit_at,
-                     interaction_count, schema_version, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     interaction_count, bootstrap_pending, schema_version,
+                     updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agent_id) DO UPDATE SET
                     safe_mode = excluded.safe_mode,
                     safe_mode_reason = excluded.safe_mode_reason,
@@ -178,6 +187,7 @@ class ConstitutionRuntimeStateStore:
                     safe_mode_exit_authorization = excluded.safe_mode_exit_authorization,
                     last_successful_audit_at = excluded.last_successful_audit_at,
                     interaction_count = excluded.interaction_count,
+                    bootstrap_pending = excluded.bootstrap_pending,
                     schema_version = excluded.schema_version,
                     updated_at = excluded.updated_at
                 """,

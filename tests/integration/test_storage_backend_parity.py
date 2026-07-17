@@ -50,6 +50,7 @@ async def test_constitution_runtime_state_round_trips_on_both_backends(db_backen
         last_successful_audit_at=last_audit_at,
         interaction_count=37,
         updated_at=entered_at,
+        bootstrap_pending=True,
     )
 
     writer = ConstitutionRuntimeStateStore(db_backend)
@@ -73,6 +74,7 @@ async def test_constitution_runtime_state_round_trips_on_both_backends(db_backen
     assert restored.safe_mode_entered_at == entered_at
     assert restored.last_successful_audit_at == last_audit_at
     assert restored.interaction_count == 37
+    assert restored.bootstrap_pending is True
     assert restored.safe_mode_entered_at.tzinfo == timezone.utc
     assert restored.last_successful_audit_at.tzinfo == timezone.utc
 

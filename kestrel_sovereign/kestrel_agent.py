@@ -1059,12 +1059,32 @@ class KestrelAgent(
             # Wrap storage with privacy-enforcing layer
             self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
+            # Distinguish a genuinely new identity from a legacy identity that
+            # merely lacks the new runtime-state row. Only a genuine first boot
+            # may establish its initial constitution anchor automatically; a
+            # lookup failure is treated as existing/unknown and therefore
+            # follows the fail-closed migration path.
+            early_agent_node = None
+            identity_lookup_succeeded = False
+            try:
+                early_agent_node = await self.storage.get_node(self.agent_id)
+                identity_lookup_succeeded = True
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "Could not load agent identity node for sync policy: %s",
+                    exc,
+                )
+
             # Safe Mode and periodic-audit deadlines are authoritative runtime
             # state. Restore them before features can emit startup cognition or
             # the server can report readiness. Legacy agents receive a due-now
             # migration record; the full verification runs later in this same
             # initialize call, after feature/spawn constraints are available.
-            await self._initialize_constitution_runtime_state()
+            await self._initialize_constitution_runtime_state(
+                is_new_identity=(
+                    identity_lookup_succeeded and early_agent_node is None
+                )
+            )
 
             # #2290 — re-apply any previously-verified shared embedding-space
             # pins from the persisted parity record. ``_verified_space_pins`` is
@@ -1081,11 +1101,6 @@ class KestrelAgent(
             except Exception as exc:  # noqa: BLE001
                 logging.debug("Embedding-space pin hydration skipped: %s", exc)
 
-            early_agent_node = None
-            try:
-                early_agent_node = await self.storage.get_node(self.agent_id)
-            except Exception as exc:  # noqa: BLE001
-                logging.warning("Could not load agent identity node for sync policy: %s", exc)
             if early_agent_node is not None:
                 self._is_test_instance = bool(
                     early_agent_node.properties.get("is_test_instance", False)

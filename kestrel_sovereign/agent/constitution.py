@@ -435,6 +435,7 @@ class ConstitutionMixin:
         self._safe_mode_exited_at = None
         self._safe_mode_exit_authorization = None
         self._constitution_state_migration_pending = False
+        self._constitution_bootstrap_pending = False
         self._constitution_state_load_error = None
         self._constitution_audit_pending = False
         self._constitution_state_persistence_pending = False
@@ -474,6 +475,7 @@ class ConstitutionMixin:
         safe_mode: Optional[bool] = None,
         last_successful_audit_at: Optional[datetime] = None,
         interaction_count: Optional[int] = None,
+        bootstrap_pending: Optional[bool] = None,
     ):
         """Build the database value from the current in-memory state."""
         from kestrel_sovereign.constitution.runtime_state import (
@@ -501,14 +503,24 @@ class ConstitutionMixin:
                 else interaction_count
             ),
             updated_at=now or self._constitution_now(),
+            bootstrap_pending=(
+                self._constitution_bootstrap_pending
+                if bootstrap_pending is None
+                else bootstrap_pending
+            ),
         )
 
-    async def _initialize_constitution_runtime_state(self) -> None:
+    async def _initialize_constitution_runtime_state(
+        self, *, is_new_identity: bool = False
+    ) -> None:
         """Restore Safe Mode and audit deadlines before the agent becomes ready.
 
-        A missing row is an explicit legacy migration: no successful audit is
-        invented.  The epoch sentinel makes a full audit due during this same
-        initialization before readiness can be reported.
+        A missing row for an existing identity is an explicit legacy migration:
+        no successful audit is invented. A truly new identity instead receives
+        a durable bootstrap marker so it can establish its first anchor and
+        immediately prove it through the same full verifier. Persisting that
+        distinction prevents a crash between node creation and verification
+        from turning a new identity into an unsafe legacy auto-anchor.
         """
         from kestrel_sovereign.constitution.runtime_state import (
             ConstitutionRuntimeStateStore,
@@ -545,13 +557,22 @@ class ConstitutionMixin:
             if state is None:
                 self._interaction_count = 0
                 self._last_audit_time = self._constitution_epoch()
-                self._constitution_state_migration_pending = True
+                self._constitution_bootstrap_pending = is_new_identity
+                self._constitution_state_migration_pending = not is_new_identity
                 self._constitution_audit_pending = True
                 now = self._constitution_now()
                 await store.write(
                     self._constitution_state_snapshot(now=now),
-                    event_type="legacy_state_migration_required",
-                    event_reason="full constitutional audit required before readiness",
+                    event_type=(
+                        "new_identity_bootstrap_required"
+                        if is_new_identity
+                        else "legacy_state_migration_required"
+                    ),
+                    event_reason=(
+                        "initial anchor and full audit required before readiness"
+                        if is_new_identity
+                        else "full constitutional audit required before readiness"
+                    ),
                 )
                 await persist_pending_entry(store)
                 return
@@ -567,14 +588,31 @@ class ConstitutionMixin:
                 state.last_successful_audit_at or self._constitution_epoch()
             )
             self._interaction_count = state.interaction_count
-            self._constitution_audit_pending = (
+            self._constitution_bootstrap_pending = state.bootstrap_pending
+            self._constitution_state_migration_pending = (
                 state.last_successful_audit_at is None
+                and not state.bootstrap_pending
+            )
+            self._constitution_audit_pending = (
+                state.bootstrap_pending
+                or state.last_successful_audit_at is None
                 or (
                     self._constitution_now() - state.last_successful_audit_at
                 ).total_seconds()
                 >= 24 * 3600
             )
             await persist_pending_entry(store)
+            # A completed runtime record paired with a missing identity node is
+            # deletion/corruption, not a second first boot. Only a persisted,
+            # still-pending bootstrap marker authorizes initial auto-anchoring.
+            if (
+                is_new_identity
+                and not state.bootstrap_pending
+                and not self._safe_mode
+            ):
+                await self.enter_safe_mode(
+                    "Agent identity node missing during constitutional restore"
+                )
             if self._safe_mode:
                 logging.critical(
                     "RESTORED DURABLE SAFE MODE for agent %s", self.agent_id
@@ -607,6 +645,7 @@ class ConstitutionMixin:
         safe_mode: Optional[bool] = None,
         last_successful_audit_at: Optional[datetime] = None,
         interaction_count: Optional[int] = None,
+        bootstrap_pending: Optional[bool] = None,
     ) -> bool:
         """Persist current state; pre-initialization test harnesses are no-ops."""
         store = vars(self).get("_constitution_state_store")
@@ -635,6 +674,7 @@ class ConstitutionMixin:
                     safe_mode=safe_mode,
                     last_successful_audit_at=last_successful_audit_at,
                     interaction_count=interaction_count,
+                    bootstrap_pending=bootstrap_pending,
                 ),
                 event_type=event_type,
                 event_reason=event_reason,
@@ -666,12 +706,14 @@ class ConstitutionMixin:
             event_reason=source,
             last_successful_audit_at=now,
             interaction_count=0,
+            bootstrap_pending=False,
         )
         if not persisted:
             return False
         self._last_audit_time = now
         self._interaction_count = 0
         self._constitution_state_migration_pending = False
+        self._constitution_bootstrap_pending = False
         self._constitution_audit_pending = False
         return True
 
@@ -735,6 +777,13 @@ class ConstitutionMixin:
         )
         if not due:
             return
+        if self._constitution_bootstrap_pending:
+            governing = await self._get_governing_constitution()
+            if governing.startswith("Error:"):
+                await self.enter_safe_mode(
+                    f"Startup constitution bootstrap failed: {governing}"
+                )
+                return
         is_valid, message = await self._verify_constitution_integrity()
         if is_valid:
             await self._record_successful_constitution_audit(
@@ -1230,6 +1279,7 @@ class ConstitutionMixin:
             safe_mode=False,
             last_successful_audit_at=now,
             interaction_count=0,
+            bootstrap_pending=False,
         )
         if not persisted:
             self._safe_mode_exited_at = old_exited_at
@@ -1240,6 +1290,7 @@ class ConstitutionMixin:
         self._last_audit_time = now
         self._interaction_count = 0
         self._constitution_state_migration_pending = False
+        self._constitution_bootstrap_pending = False
         self._constitution_audit_pending = False
         logging.warning(f"EXITING SAFE MODE. Authorization: {authorization or 'none provided'}")
         privacy_agent = getattr(self, "privacy_agent", None)

@@ -312,13 +312,15 @@ class _DurableConstitutionHarness:
     exit_safe_mode = KestrelAgent.exit_safe_mode
 
 
-async def _open_durable_harness(db_path, now):
+async def _open_durable_harness(db_path, now, *, is_new_identity=False):
     from kestrel_sovereign.storage import AsyncStorage
 
     storage = AsyncStorage(str(db_path))
     await storage.initialize()
     harness = _DurableConstitutionHarness(storage, now)
-    await harness._initialize_constitution_runtime_state()
+    await harness._initialize_constitution_runtime_state(
+        is_new_identity=is_new_identity
+    )
     return harness, storage
 
 
@@ -462,6 +464,42 @@ async def test_authorized_verified_exit_is_durable_and_audited(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_verified_exit_completes_bootstrap_and_latches_later_deletion(
+    tmp_path,
+):
+    """Recovery cannot leave bootstrap authority reusable after verification."""
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(
+        db_path, now, is_new_identity=True
+    )
+    await first.enter_safe_mode("first bootstrap verification failed")
+    first._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+
+    result = await first.exit_safe_mode(authorization="sovereign_api_key")
+    assert "deactivated" in result
+    assert first._constitution_bootstrap_pending is False
+    persisted = await first._constitution_state_store.load(first.agent_id)
+    assert persisted.bootstrap_pending is False
+    await storage.close()
+
+    # A missing identity node after that completed recovery is deletion, not a
+    # resumable first boot, and must durably re-enter Safe Mode.
+    restarted, storage = await _open_durable_harness(
+        db_path, now + timedelta(minutes=1), is_new_identity=True
+    )
+    try:
+        assert restarted._safe_mode is True
+        assert restarted._safe_mode_reason == (
+            "Agent identity node missing during constitutional restore"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_exit_refuses_to_clear_durable_safe_mode_when_audit_fails(tmp_path):
     db_path = tmp_path / "agent.db"
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
@@ -575,6 +613,87 @@ async def test_legacy_row_migration_requires_real_startup_audit(tmp_path):
         assert agent._constitution_state_migration_pending is False
         assert agent._constitution_audit_pending is False
         assert agent._last_audit_time == now
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_new_identity_bootstrap_anchors_then_full_audits(tmp_path):
+    """A first-ever identity is not misclassified as an anchor-loss attack."""
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(
+        tmp_path / "agent.db", now, is_new_identity=True
+    )
+    agent._get_governing_constitution = AsyncMock(
+        return_value="Kestrel Constitution"
+    )
+    agent._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+    try:
+        assert agent._constitution_bootstrap_pending is True
+        assert agent._constitution_state_migration_pending is False
+        assert agent._constitution_audit_pending is True
+
+        await agent._audit_constitution_on_startup()
+
+        agent._get_governing_constitution.assert_awaited_once()
+        agent._verify_constitution_integrity.assert_awaited_once()
+        assert agent._constitution_bootstrap_pending is False
+        assert agent._constitution_audit_pending is False
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert persisted.bootstrap_pending is False
+        assert persisted.last_successful_audit_at == now
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_new_identity_bootstrap_survives_restart(tmp_path):
+    """A crash before anchoring preserves first-identity bootstrap authority."""
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(
+        db_path, now, is_new_identity=True
+    )
+    assert first._constitution_bootstrap_pending is True
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(
+        db_path, now + timedelta(minutes=1)
+    )
+    try:
+        assert restarted._constitution_bootstrap_pending is True
+        assert restarted._constitution_state_migration_pending is False
+        assert restarted._constitution_audit_pending is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_identity_after_completed_bootstrap_fails_closed(tmp_path):
+    """Deleting a completed identity node cannot reauthorize auto-anchoring."""
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(db_path, now)
+    await first._record_successful_constitution_audit(
+        source="test", audited_at=now
+    )
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(
+        db_path, now + timedelta(minutes=1), is_new_identity=True
+    )
+    try:
+        assert restarted._constitution_bootstrap_pending is False
+        assert restarted._safe_mode is True
+        assert restarted._safe_mode_reason == (
+            "Agent identity node missing during constitutional restore"
+        )
+        persisted = await restarted._constitution_state_store.load(
+            restarted.agent_id
+        )
+        assert persisted.safe_mode is True
     finally:
         await storage.close()
 
