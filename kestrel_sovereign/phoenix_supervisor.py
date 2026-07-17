@@ -174,8 +174,15 @@ def phoenix_working_dir() -> Path:
 
 
 def phoenix_otlp_endpoint() -> str:
-    """The gRPC OTLP endpoint the host + agents export spans to."""
-    return f"http://{PHOENIX_BIND_HOST}:{phoenix_grpc_port()}"
+    """The OTLP/HTTP endpoint the host + agents export spans to.
+
+    Every Kestrel emitter uses ``opentelemetry-exporter-otlp-proto-http``
+    (POST ``{endpoint}/v1/traces``), which Phoenix serves on its main HTTP
+    port — NOT the gRPC collector port (4317). Pointing the HTTP exporter at
+    the gRPC port yields ``BadStatusLine`` errors (HTTP/2 frames in an
+    HTTP/1.1 response) and no spans.
+    """
+    return f"http://{PHOENIX_BIND_HOST}:{phoenix_port()}"
 
 
 def autowire_otlp_endpoint(env: Optional[dict] = None) -> Optional[str]:
