@@ -57,6 +57,13 @@ from kestrel_sovereign.features.talon.runtime import (
     sanitize_untrusted_env,
     write_talon_preference,
 )
+from kestrel_sovereign.features.talon.github_write import (
+    GithubWriteError,
+    build_github_write_requests,
+    extract_error_message,
+    parse_issue_number,
+    resolve_write_repo,
+)
 from kestrel_sovereign.features.talon.verification import (
     CommandExecution,
     TalonVerifier,
@@ -1796,6 +1803,311 @@ class TalonCoordinatorFeature(Feature):
             logger.warning(
                 f"Failed to write talon_file_and_claim outcome audit "
                 f"row (reason_code={reason_code}): {e}"
+            )
+
+    @tool(
+        name="talon_github_write",
+        description=(
+            "Bounded GitHub issue-write job for orchestration (#2581 — the "
+            "`github.write` / `issue.close` capability): close, reopen, "
+            "comment on, label, or update a GitHub issue after work "
+            "completes, closing the claim→work→close loop without a human "
+            "running `gh`. The GitHub token is used in-process for a single "
+            "authenticated REST call and is NEVER handed to a shell or the "
+            "read-only git/verify surface. Write targets are restricted to "
+            "the agent's own repo (GITHUB_SELF_REPO) plus GITHUB_FLEET_REPOS. "
+            "operation ∈ {close_issue, reopen_issue, comment, add_labels, "
+            "remove_labels, update_issue}."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!talon github-write",
+    )
+    async def talon_github_write(
+        self,
+        operation: str,
+        issue: int,
+        repo: str = "KestrelSovereignAI/kestrel-sovereign",
+        body: Optional[str] = None,
+        labels: Optional[str] = None,
+        title: Optional[str] = None,
+        state_reason: Optional[str] = None,
+    ) -> ToolResult:
+        """Perform a scoped, audited GitHub issue write.
+
+        This is the orchestration-side write path the read-only execution
+        surface lacked (#2581). Unlike ``talon_file_and_claim`` — which shells
+        out to ``gh issue create`` — this uses a single in-process REST call,
+        so the credential is never exposed to a shell or the untrusted
+        git/verify surface. The target repo is authorized against the write
+        allowlist (own repo + fleet) before any request is made, and the
+        outcome is written to the security audit log.
+
+        Args:
+            operation: One of ``close_issue``, ``reopen_issue``, ``comment``,
+                ``add_labels``, ``remove_labels``, ``update_issue``.
+            issue: Issue number (``123``, ``"#123"``, and ``"123"`` accepted).
+            repo: ``owner/name`` (``"self"`` resolves to ``GITHUB_SELF_REPO``).
+                Must be the agent's own repo or a ``GITHUB_FLEET_REPOS`` entry.
+            body: Comment text (``comment``) or new issue body (``update_issue``).
+            labels: Comma-separated label names (``add_labels`` / ``remove_labels``).
+            title: New issue title (``update_issue``).
+            state_reason: ``completed`` (default) or ``not_planned``
+                (``close_issue``).
+
+        Returns:
+            ``ToolResult.ok`` with ``{operation, repo, issue, results}`` on
+            success; ``failed`` on a validation, auth, or GitHub API error.
+        """
+        repo_resolved = self._resolve_repo(repo)
+        try:
+            target_repo = resolve_write_repo(repo_resolved)
+            issue_number = parse_issue_number(issue)
+            requests = build_github_write_requests(
+                operation,
+                target_repo,
+                issue_number,
+                body=body,
+                labels=labels,
+                title=title,
+                state_reason=state_reason,
+            )
+        except GithubWriteError as e:
+            await self._log_github_write_outcome(
+                operation=operation,
+                repo=repo_resolved,
+                issue=issue,
+                ok=False,
+                reason_code="INVALID_REQUEST",
+                detail=str(e),
+            )
+            return ToolResult.failed(
+                f"talon_github_write: INVALID_REQUEST — {e}",
+                data={
+                    "success": False,
+                    "operation": operation,
+                    "repo": repo_resolved,
+                    "issue": issue,
+                    "reason_code": "INVALID_REQUEST",
+                    "error": str(e),
+                },
+            )
+
+        token = (
+            os.environ.get("GH_TOKEN")
+            or os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GITHUB_PAT")
+        )
+        if not token:
+            await self._log_github_write_outcome(
+                operation=operation,
+                repo=target_repo,
+                issue=issue_number,
+                ok=False,
+                reason_code="NO_TOKEN",
+                detail="no GITHUB_TOKEN/GH_TOKEN/GITHUB_PAT in environment",
+            )
+            return ToolResult.failed(
+                "talon_github_write: NO_TOKEN — set GITHUB_TOKEN, GH_TOKEN, or "
+                "GITHUB_PAT in the kestrel-sovereign environment so the "
+                "bounded job can authenticate to GitHub.",
+                data={
+                    "success": False,
+                    "operation": operation,
+                    "repo": target_repo,
+                    "issue": issue_number,
+                    "reason_code": "NO_TOKEN",
+                },
+            )
+
+        results: List[Dict[str, Any]] = []
+        ok = True
+        for request in requests:
+            outcome = await self._github_api_write(request, token)
+            results.append(
+                {
+                    "summary": request.summary,
+                    "method": request.method,
+                    "status": outcome.get("status"),
+                    "ok": outcome.get("ok"),
+                    "error": outcome.get("error"),
+                }
+            )
+            if not outcome.get("ok"):
+                ok = False
+                break
+
+        summary_text = "; ".join(r["summary"] for r in results)
+        if ok:
+            await self._log_github_write_outcome(
+                operation=operation,
+                repo=target_repo,
+                issue=issue_number,
+                ok=True,
+                reason_code="OK",
+                detail=summary_text,
+            )
+            return ToolResult.ok(
+                confirmation=(
+                    f"{operation} on {target_repo}#{issue_number} succeeded "
+                    f"({summary_text})."
+                ),
+                data={
+                    "success": True,
+                    "operation": operation,
+                    "repo": target_repo,
+                    "issue": issue_number,
+                    "results": results,
+                },
+            )
+
+        failed = next((r for r in results if not r.get("ok")), results[-1])
+        await self._log_github_write_outcome(
+            operation=operation,
+            repo=target_repo,
+            issue=issue_number,
+            ok=False,
+            reason_code="GITHUB_API_ERROR",
+            detail=str(failed.get("error")),
+        )
+        return ToolResult.failed(
+            f"talon_github_write: GITHUB_API_ERROR — {operation} on "
+            f"{target_repo}#{issue_number} failed "
+            f"(HTTP {failed.get('status')}): {failed.get('error')}",
+            data={
+                "success": False,
+                "operation": operation,
+                "repo": target_repo,
+                "issue": issue_number,
+                "reason_code": "GITHUB_API_ERROR",
+                "results": results,
+            },
+        )
+
+    async def _github_api_write(
+        self, request, token: str, *, timeout: int = 30
+    ) -> Dict[str, Any]:
+        """Execute one GitHub write request in-process.
+
+        The token is used only for this authenticated REST call and never
+        leaves the process — no subprocess, no shell, no environment
+        inheritance. Runs the blocking ``urllib`` call in a worker thread so
+        the event loop is not blocked.
+        """
+        return await asyncio.to_thread(
+            self._github_api_write_sync, request, token, timeout
+        )
+
+    @staticmethod
+    def _github_api_write_sync(
+        request, token: str, timeout: int
+    ) -> Dict[str, Any]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "kestrel-talon-github-write",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        data = None
+        if request.payload is not None:
+            data = json.dumps(request.payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        http_request = urllib.request.Request(
+            request.url, data=data, headers=headers, method=request.method
+        )
+        try:
+            with urllib.request.urlopen(  # noqa: S310 - fixed api.github.com host
+                http_request, timeout=timeout
+            ) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                raw = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code in request.success_statuses:
+                return {"ok": True, "status": e.code, "response": None}
+            try:
+                detail = e.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 - error body may be unreadable
+                detail = ""
+            message = extract_error_message(detail) or str(e)
+            return {
+                "ok": False,
+                "status": e.code,
+                "error": redact_secrets(message)[:500],
+            }
+        except Exception as e:  # noqa: BLE001 - network/URL errors fail closed
+            return {
+                "ok": False,
+                "status": None,
+                "error": redact_secrets(str(e))[:500],
+            }
+
+        parsed = None
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                parsed = None
+        if status in request.success_statuses:
+            return {"ok": True, "status": status, "response": parsed}
+        return {
+            "ok": False,
+            "status": status,
+            "error": redact_secrets(
+                extract_error_message(raw) or f"HTTP {status}"
+            )[:500],
+        }
+
+    async def _log_github_write_outcome(
+        self,
+        *,
+        operation: str,
+        repo: str,
+        issue: Any,
+        ok: bool,
+        reason_code: str,
+        detail: str = "",
+    ) -> None:
+        """Append a GitHub-write outcome row to ``security_audit_log``.
+
+        Best-effort: a missing SecurityFeature must not crash the bounded
+        write — we log a warning instead so the mutation still returns.
+        """
+        security = self._get_security_feature()
+        store = getattr(security, "permission_store", None) if security else None
+        if store is None or not hasattr(store, "log_decision"):
+            logger.debug(
+                "talon_github_write outcome not audited "
+                "(SecurityFeature/permission_store unavailable): "
+                "operation=%s repo=%s issue=%s ok=%s reason=%s",
+                operation,
+                repo,
+                issue,
+                ok,
+                reason_code,
+            )
+            return
+        summary = {
+            "operation": operation,
+            "repo": repo,
+            "issue": issue,
+            "ok": ok,
+            "reason_code": reason_code,
+            "detail": detail,
+        }
+        try:
+            await store.log_decision(
+                feature_name="talon_feature",
+                tool_name="talon_github_write.outcome",
+                action="tool_outcome",
+                decision="github_write_ok" if ok else "github_write_failed",
+                user_choice=None,
+                args_summary=json.dumps(summary, default=str)[:1000],
+            )
+        except Exception as e:  # noqa: BLE001 — never break the caller
+            logger.warning(
+                "Failed to write talon_github_write outcome audit row "
+                "(reason_code=%s): %s",
+                reason_code,
+                e,
             )
 
     @tool(
