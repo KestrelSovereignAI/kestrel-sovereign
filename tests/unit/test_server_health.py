@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -355,3 +356,166 @@ def test_health_rejects_partially_loaded_fleet_with_identity_failure():
     assert payload["agent_initialized"] is True
     assert payload["identity_readiness_failures"][0]["agent"] == "broken"
     assert payload["identity_readiness_failures"][0]["failure"] == "binding"
+
+
+def test_health_reports_durable_constitution_safe_mode_as_restricted():
+    """An initialized but constitutionally restricted agent is not healthy."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._safe_mode_reason = "secret path /private/constitution must-not-leak"
+    agent._safe_mode_entered_at = datetime(
+        2026, 7, 17, 12, 0, tzinfo=timezone.utc
+    )
+    agent._constitution_state_load_error = None
+    agent._agent_name = "Kite"
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "restricted"
+    assert payload["agent_initialized"] is True
+    record = payload["constitution_safe_mode"][0]
+    assert record["agent"] == "Kite"
+    assert record["error_code"] == "constitution_safe_mode"
+    assert record["failure"] == "integrity_restriction"
+    assert "must-not-leak" not in response.text
+    assert "/private/constitution" not in response.text
+
+
+def test_health_rejects_fleet_when_one_loaded_agent_is_in_safe_mode():
+    """A normal peer cannot hide another loaded agent's restriction."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    healthy = MagicMock()
+    healthy._safe_mode = False
+    restricted = MagicMock()
+    restricted._safe_mode = True
+    restricted._safe_mode_entered_at = None
+    restricted._constitution_state_load_error = "DatabaseError"
+    manager = MagicMock()
+    manager.list_agents.return_value = {
+        "healthy": healthy,
+        "restricted": restricted,
+    }
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+            detailed = client.get("/health/detailed")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    assert response.status_code == 503
+    record = response.json()["constitution_safe_mode"][0]
+    assert record["agent"] == "restricted"
+    assert record["failure"] == "state_unavailable"
+    assert detailed.status_code == 503
+    assert detailed.json()["status"] == "restricted"
+
+
+def test_health_reports_startup_audit_pending_as_restricted():
+    from kestrel_sovereign.server import _constitution_safe_mode_record
+
+    agent = MagicMock()
+    agent._safe_mode = False
+    agent._constitution_audit_pending = True
+    agent._safe_mode_entered_at = None
+
+    record = _constitution_safe_mode_record("Kite", agent)
+
+    assert record["state"] == "audit_pending"
+    assert record["error_code"] == "constitution_audit_pending"
+    assert record["failure"] == "startup_audit_required"
+
+
+def test_detailed_health_cannot_report_healthy_during_safe_mode():
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+
+    agent = MagicMock()
+    agent._safe_mode = True
+    agent._safe_mode_entered_at = None
+    agent._constitution_state_load_error = None
+    agent._agent_name = "Kite"
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with TestClient(app) as client:
+            response = client.get("/health/detailed")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "restricted"

@@ -597,8 +597,10 @@ async def _run_shell(agent_dir: Path, args) -> int:
                     print("   The agent cannot access encrypted memories.")
                     print("   Please verify KESTREL_DATA_KEY and restart.")
                     print("   Use !quit to exit.")
-                    if hasattr(agent, '_safe_mode'):
-                        agent._safe_mode = True
+                    if hasattr(agent, 'enter_safe_mode'):
+                        await agent.enter_safe_mode(
+                            "Repeated encrypted-state decryption failures"
+                        )
 
     except KeyboardInterrupt:
         print("\nDeactivating agent...")

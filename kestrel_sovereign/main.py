@@ -133,8 +133,10 @@ async def main():
                     print("   Please verify KESTREL_DATA_KEY and restart.")
                     print("   Use !quit to exit.")
                     # Trigger safe mode in agent
-                    if hasattr(agent, '_safe_mode'):
-                        agent._safe_mode = True
+                    if hasattr(agent, 'enter_safe_mode'):
+                        await agent.enter_safe_mode(
+                            "Repeated encrypted-state decryption failures"
+                        )
 
     except KeyboardInterrupt:
         print("\nDeactivating agent...")
@@ -157,4 +159,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         # Handle double Ctrl+C gracefully
-        print("\nForced exit.") 
+        print("\nForced exit.")

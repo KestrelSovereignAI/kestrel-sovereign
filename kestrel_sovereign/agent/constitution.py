@@ -1,8 +1,10 @@
 """Constitution verification and integrity checking for Kestrel Agent."""
+import asyncio
 import logging
 import hashlib
 import os
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
 from datetime import datetime, timezone
@@ -427,7 +429,319 @@ class ConstitutionMixin:
     def _init_constitution_audit_tracking(self):
         """Initialize constitution audit tracking. Called by KestrelAgent.__init__."""
         self._interaction_count = 0
-        self._last_audit_time = datetime.now(timezone.utc)
+        self._last_audit_time = ConstitutionMixin._constitution_now(self)
+        self._safe_mode_reason = None
+        self._safe_mode_entered_at = None
+        self._safe_mode_exited_at = None
+        self._safe_mode_exit_authorization = None
+        self._constitution_state_migration_pending = False
+        self._constitution_state_load_error = None
+        self._constitution_audit_pending = False
+        self._constitution_state_persistence_pending = False
+
+    def _constitution_now(self) -> datetime:
+        """Return an aware UTC time, using the injected test clock if present."""
+        clock = vars(self).get("_constitution_clock")
+        now = clock() if callable(clock) else datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now.astimezone(timezone.utc)
+
+    @asynccontextmanager
+    async def _constitution_state_guard(self):
+        """Serialize state transitions, while allowing same-task nesting."""
+        lock = vars(self).get("_constitution_state_lock")
+        current_task = asyncio.current_task()
+        if lock is None or vars(self).get("_constitution_state_lock_owner") is current_task:
+            yield
+            return
+        async with lock:
+            self._constitution_state_lock_owner = current_task
+            try:
+                yield
+            finally:
+                self._constitution_state_lock_owner = None
+
+    @staticmethod
+    def _constitution_epoch() -> datetime:
+        """Sentinel used when no successful full audit has ever been recorded."""
+        return datetime.fromtimestamp(0, timezone.utc)
+
+    def _constitution_state_snapshot(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        safe_mode: Optional[bool] = None,
+        last_successful_audit_at: Optional[datetime] = None,
+        interaction_count: Optional[int] = None,
+    ):
+        """Build the database value from the current in-memory state."""
+        from kestrel_sovereign.constitution.runtime_state import (
+            ConstitutionRuntimeState,
+        )
+
+        audit_at = (
+            self._last_audit_time
+            if last_successful_audit_at is None
+            else last_successful_audit_at
+        )
+        if audit_at <= self._constitution_epoch():
+            audit_at = None
+        return ConstitutionRuntimeState(
+            agent_id=self.agent_id,
+            safe_mode=self._safe_mode if safe_mode is None else safe_mode,
+            safe_mode_reason=self._safe_mode_reason,
+            safe_mode_entered_at=self._safe_mode_entered_at,
+            safe_mode_exited_at=self._safe_mode_exited_at,
+            safe_mode_exit_authorization=self._safe_mode_exit_authorization,
+            last_successful_audit_at=audit_at,
+            interaction_count=(
+                self._interaction_count
+                if interaction_count is None
+                else interaction_count
+            ),
+            updated_at=now or self._constitution_now(),
+        )
+
+    async def _initialize_constitution_runtime_state(self) -> None:
+        """Restore Safe Mode and audit deadlines before the agent becomes ready.
+
+        A missing row is an explicit legacy migration: no successful audit is
+        invented.  The epoch sentinel makes a full audit due during this same
+        initialization before readiness can be reported.
+        """
+        from kestrel_sovereign.constitution.runtime_state import (
+            ConstitutionRuntimeStateStore,
+        )
+
+        pending_entry = bool(
+            vars(self).get("_constitution_state_persistence_pending")
+            and self._safe_mode
+        )
+        pending_reason = self._safe_mode_reason
+        pending_entered_at = self._safe_mode_entered_at
+
+        async def persist_pending_entry(store) -> None:
+            if not pending_entry:
+                return
+            self._safe_mode = True
+            self._safe_mode_reason = pending_reason
+            self._safe_mode_entered_at = pending_entered_at
+            self._safe_mode_exited_at = None
+            self._safe_mode_exit_authorization = None
+            now = self._constitution_now()
+            await store.write(
+                self._constitution_state_snapshot(now=now),
+                event_type="safe_mode_entered",
+                event_reason=pending_reason,
+            )
+            self._constitution_state_persistence_pending = False
+
+        try:
+            store = ConstitutionRuntimeStateStore(self._raw_storage._backend)
+            await store.initialize()
+            self._constitution_state_store = store
+            state = await store.load(self.agent_id)
+            if state is None:
+                self._interaction_count = 0
+                self._last_audit_time = self._constitution_epoch()
+                self._constitution_state_migration_pending = True
+                self._constitution_audit_pending = True
+                now = self._constitution_now()
+                await store.write(
+                    self._constitution_state_snapshot(now=now),
+                    event_type="legacy_state_migration_required",
+                    event_reason="full constitutional audit required before readiness",
+                )
+                await persist_pending_entry(store)
+                return
+
+            self._safe_mode = state.safe_mode
+            self._safe_mode_reason = state.safe_mode_reason
+            self._safe_mode_entered_at = state.safe_mode_entered_at
+            self._safe_mode_exited_at = state.safe_mode_exited_at
+            self._safe_mode_exit_authorization = (
+                state.safe_mode_exit_authorization
+            )
+            self._last_audit_time = (
+                state.last_successful_audit_at or self._constitution_epoch()
+            )
+            self._interaction_count = state.interaction_count
+            self._constitution_audit_pending = (
+                state.last_successful_audit_at is None
+                or (
+                    self._constitution_now() - state.last_successful_audit_at
+                ).total_seconds()
+                >= 24 * 3600
+            )
+            await persist_pending_entry(store)
+            if self._safe_mode:
+                logging.critical(
+                    "RESTORED DURABLE SAFE MODE for agent %s", self.agent_id
+                )
+        except Exception as exc:  # noqa: BLE001 - state failure must fail closed
+            self._mark_constitution_state_unavailable(exc)
+
+    def _mark_constitution_state_unavailable(self, exc: Exception) -> None:
+        """Keep cognition blocked when authoritative state cannot be trusted."""
+        now = self._constitution_now()
+        self._safe_mode = True
+        self._safe_mode_reason = "Constitution runtime state unavailable"
+        self._safe_mode_entered_at = (
+            getattr(self, "_safe_mode_entered_at", None) or now
+        )
+        self._constitution_state_load_error = type(exc).__name__
+        self._constitution_audit_pending = False
+        logging.critical(
+            "CONSTITUTION STATE unavailable; remaining in Safe Mode (%s)",
+            type(exc).__name__,
+        )
+
+    async def _persist_constitution_runtime_state(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        event_type: Optional[str] = None,
+        event_reason: Optional[str] = None,
+        event_authorization: Optional[str] = None,
+        safe_mode: Optional[bool] = None,
+        last_successful_audit_at: Optional[datetime] = None,
+        interaction_count: Optional[int] = None,
+    ) -> bool:
+        """Persist current state; pre-initialization test harnesses are no-ops."""
+        store = vars(self).get("_constitution_state_store")
+        if store is None:
+            # A lightweight ConstitutionMixin-only unit harness has no store
+            # slot at all. A real KestrelAgent has the slot from __init__; None
+            # there means initialization is still in flight, so buffer a
+            # fail-closed Safe Mode entry for immediate persistence once the DB
+            # connects instead of pretending the write succeeded.
+            if "_constitution_state_store" not in vars(self):
+                return vars(self).get("_constitution_state_load_error") is None
+            self._safe_mode = True
+            self._safe_mode_reason = (
+                self._safe_mode_reason
+                or "Constitution runtime state not initialized"
+            )
+            self._safe_mode_entered_at = (
+                self._safe_mode_entered_at or self._constitution_now()
+            )
+            self._constitution_state_persistence_pending = True
+            return False
+        try:
+            await store.write(
+                self._constitution_state_snapshot(
+                    now=now,
+                    safe_mode=safe_mode,
+                    last_successful_audit_at=last_successful_audit_at,
+                    interaction_count=interaction_count,
+                ),
+                event_type=event_type,
+                event_reason=event_reason,
+                event_authorization=event_authorization,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - never continue normally
+            self._mark_constitution_state_unavailable(exc)
+            return False
+
+    async def _record_successful_constitution_audit(
+        self, *, source: str, audited_at: Optional[datetime] = None
+    ) -> bool:
+        """Advance the deadline only after a complete verifier succeeds."""
+        async with ConstitutionMixin._constitution_state_guard(self):
+            return await ConstitutionMixin._record_successful_constitution_audit_locked(
+                self, source=source, audited_at=audited_at
+            )
+
+    async def _record_successful_constitution_audit_locked(
+        self, *, source: str, audited_at: Optional[datetime] = None
+    ) -> bool:
+        """Locked implementation for successful-audit persistence."""
+        now = audited_at or self._constitution_now()
+        persisted = await ConstitutionMixin._persist_constitution_runtime_state(
+            self,
+            now=now,
+            event_type="audit_succeeded",
+            event_reason=source,
+            last_successful_audit_at=now,
+            interaction_count=0,
+        )
+        if not persisted:
+            return False
+        self._last_audit_time = now
+        self._interaction_count = 0
+        self._constitution_state_migration_pending = False
+        self._constitution_audit_pending = False
+        return True
+
+    async def _begin_explicit_constitution_audit(self) -> bool:
+        """Persist a due marker before an operator-triggered full verifier.
+
+        If the verifier fails and the subsequent Safe Mode write encounters a
+        storage fault, the due marker still forces another full audit on the
+        next restart instead of leaving a recent-success timestamp that could
+        make the restarted process look normal.
+        """
+        async with ConstitutionMixin._constitution_state_guard(self):
+            due_count = max(self._interaction_count, self.AUDIT_INTERVAL)
+            persisted = await self._persist_constitution_runtime_state(
+                event_type="audit_started",
+                event_reason="explicit_verification",
+                interaction_count=due_count,
+            )
+            if persisted:
+                self._interaction_count = due_count
+            return persisted
+
+    async def _run_explicit_constitution_audit(
+        self,
+    ) -> tuple[Optional[bool], str, bool]:
+        """Run an explicit full audit as one serialized state transition."""
+        async with ConstitutionMixin._constitution_state_guard(self):
+            started = await self._begin_explicit_constitution_audit()
+            if not started:
+                return (
+                    None,
+                    "Durable constitutional audit marker unavailable",
+                    False,
+                )
+
+            is_valid, message = await self._verify_constitution_integrity()
+            self._constitution_verified = is_valid
+            if is_valid:
+                recorded = await (
+                    ConstitutionMixin._record_successful_constitution_audit_locked(
+                        self, source="explicit_verification"
+                    )
+                )
+                return is_valid, message, recorded
+
+            recorded = await ConstitutionMixin._enter_safe_mode_locked(
+                self, message
+            )
+            return is_valid, message, recorded
+
+    async def _audit_constitution_on_startup(self) -> None:
+        """Run a due/migration audit before initialization reports readiness."""
+        if self._constitution_state_load_error is not None:
+            return
+        now = self._constitution_now()
+        due = (
+            self._constitution_audit_pending
+            or self._constitution_state_migration_pending
+            or self._last_audit_time <= self._constitution_epoch()
+            or (now - self._last_audit_time).total_seconds() >= 24 * 3600
+        )
+        if not due:
+            return
+        is_valid, message = await self._verify_constitution_integrity()
+        if is_valid:
+            await self._record_successful_constitution_audit(
+                source="startup", audited_at=now
+            )
+            return
+        await self.enter_safe_mode(f"Startup constitution audit failed: {message}")
 
     async def _maybe_audit(self):
         """
@@ -439,12 +753,30 @@ class ConstitutionMixin:
 
         Called from process_input() and process_input_streaming().
         """
+        # Safe Mode is already restricted. Explicit diagnostic verification is
+        # available via !verify-constitution; blocked prompts do not consume or
+        # reset the persisted audit deadline.
+        if self._safe_mode or vars(self).get("_constitution_audit_pending", False):
+            return
+
         # Lazy initialization for backward compatibility
         if not hasattr(self, '_interaction_count') or not hasattr(self, '_last_audit_time'):
             self._init_constitution_audit_tracking()
 
+        guard = ConstitutionMixin._constitution_state_guard(self)
+        async with guard:
+            await ConstitutionMixin._maybe_audit_locked(self)
+
+    async def _maybe_audit_locked(self):
+        """Increment, persist, and (when due) perform the full audit."""
+        now = ConstitutionMixin._constitution_now(self)
         self._interaction_count += 1
-        hours_since_audit = (datetime.now(timezone.utc) - self._last_audit_time).total_seconds() / 3600
+        if not await ConstitutionMixin._persist_constitution_runtime_state(
+            self, now=now
+        ):
+            return
+
+        hours_since_audit = (now - self._last_audit_time).total_seconds() / 3600
 
         if self._interaction_count >= self.AUDIT_INTERVAL or hours_since_audit >= 24:
             logging.info(
@@ -458,10 +790,9 @@ class ConstitutionMixin:
                 await self.enter_safe_mode(f"Constitution audit failed: {message}")
             else:
                 logging.info(f"Constitution audit passed: {message}")
-
-            # Reset counters
-            self._interaction_count = 0
-            self._last_audit_time = datetime.now(timezone.utc)
+                await ConstitutionMixin._record_successful_constitution_audit_locked(
+                    self, source="periodic", audited_at=now
+                )
 
             # Notify audit anchor feature if available
             try:
@@ -811,7 +1142,12 @@ class ConstitutionMixin:
         return True, "Spawn mandate constraints verified"
 
     async def enter_safe_mode(self, reason: str):
-        """Enter safe mode when integrity checks fail."""
+        """Enter Safe Mode and durably record the security boundary."""
+        async with ConstitutionMixin._constitution_state_guard(self):
+            return await ConstitutionMixin._enter_safe_mode_locked(self, reason)
+
+    async def _enter_safe_mode_locked(self, reason: str) -> bool:
+        """Locked implementation of :meth:`enter_safe_mode`."""
         # Record agent consent before entering safe mode
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
         if consent:
@@ -823,22 +1159,107 @@ class ConstitutionMixin:
             except Exception:
                 pass  # Never block on consent failure -- safe mode is critical
 
+        now = self._constitution_now()
+        was_already_safe = self._safe_mode
         self._safe_mode = True
-        logging.critical(f"ENTERING SAFE MODE: {reason}")
-        await self.privacy_agent.add_conversation(
-            role="system",
-            content=f"SAFE MODE ACTIVATED: {reason}",
-            metadata={"event": "safe_mode", "reason": reason, "timestamp": self._get_timestamp()}
+        self._safe_mode_reason = reason
+        self._safe_mode_entered_at = (
+            (getattr(self, "_safe_mode_entered_at", None) or now)
+            if was_already_safe
+            else now
         )
+        self._safe_mode_exited_at = None
+        self._safe_mode_exit_authorization = None
+        self._constitution_audit_pending = False
+        persisted = await self._persist_constitution_runtime_state(
+            now=now,
+            event_type="safe_mode_entered",
+            event_reason=reason,
+            safe_mode=True,
+        )
+        logging.critical(f"ENTERING SAFE MODE: {reason}")
+        privacy_agent = getattr(self, "privacy_agent", None)
+        if privacy_agent is not None:
+            try:
+                await privacy_agent.add_conversation(
+                    role="system",
+                    content=f"SAFE MODE ACTIVATED: {reason}",
+                    metadata={
+                        "event": "safe_mode",
+                        "reason": reason,
+                        "timestamp": self._get_timestamp(),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - boundary is already durable
+                logging.warning(
+                    "Could not append Safe Mode conversation event: %s",
+                    type(exc).__name__,
+                )
+        return persisted
 
-    def exit_safe_mode(self, authorization: str = None):
-        """Exit safe mode. Requires explicit authorization."""
+    async def exit_safe_mode(self, authorization: str = None):
+        """Exit Safe Mode after explicit authority and a fresh full audit."""
+        async with ConstitutionMixin._constitution_state_guard(self):
+            return await ConstitutionMixin._exit_safe_mode_locked(
+                self, authorization
+            )
+
+    async def _exit_safe_mode_locked(self, authorization: str = None):
+        """Locked implementation of :meth:`exit_safe_mode`."""
         if not self._safe_mode:
             return "Not in safe mode."
+        if not authorization:
+            return "Safe Mode remains active: explicit Sovereign authorization is required."
+
+        is_valid, message = await self._verify_constitution_integrity()
+        if not is_valid:
+            await self.enter_safe_mode(f"Safe Mode exit verification failed: {message}")
+            return f"Safe Mode remains active: integrity verification failed: {message}"
+
+        now = self._constitution_now()
+        old_reason = self._safe_mode_reason
+        old_exited_at = self._safe_mode_exited_at
+        old_exit_authorization = self._safe_mode_exit_authorization
+        self._safe_mode_exited_at = now
+        self._safe_mode_exit_authorization = authorization
+        persisted = await self._persist_constitution_runtime_state(
+            now=now,
+            event_type="safe_mode_exited",
+            event_reason=old_reason,
+            event_authorization=authorization,
+            safe_mode=False,
+            last_successful_audit_at=now,
+            interaction_count=0,
+        )
+        if not persisted:
+            self._safe_mode_exited_at = old_exited_at
+            self._safe_mode_exit_authorization = old_exit_authorization
+            return "Safe Mode remains active: constitutional state could not be persisted."
 
         self._safe_mode = False
+        self._last_audit_time = now
+        self._interaction_count = 0
+        self._constitution_state_migration_pending = False
+        self._constitution_audit_pending = False
         logging.warning(f"EXITING SAFE MODE. Authorization: {authorization or 'none provided'}")
-        return "Safe mode deactivated. Please verify system integrity."
+        privacy_agent = getattr(self, "privacy_agent", None)
+        if privacy_agent is not None:
+            try:
+                await privacy_agent.add_conversation(
+                    role="system",
+                    content="SAFE MODE DEACTIVATED after successful integrity verification.",
+                    metadata={
+                        "event": "safe_mode_exit",
+                        "authorization": authorization,
+                        "timestamp": self._get_timestamp(),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - transition is already durable
+                logging.warning(
+                    "Could not append Safe Mode exit conversation event: %s",
+                    type(exc).__name__,
+                )
+        return "Safe mode deactivated after successful integrity verification."
 
     def _trusted_sovereign_did_document(
         self,
