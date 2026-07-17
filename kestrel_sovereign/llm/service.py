@@ -59,7 +59,7 @@ from kestrel_sovereign.kestrel_config.constants import (
     CLIENT_CLOSE_TIMEOUT,
 )
 from kestrel_sovereign.config import load_config, load_section
-from kestrel_sovereign.telemetry import optional_span
+from kestrel_sovereign import telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +327,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # invariant rationale.
         self._owner_agent_did: Optional[str] = None
 
+        # Human display name of the owning agent (``agent.agent_name``, set at
+        # registration). Populated via ``set_agent_display_name`` so LLM-call
+        # spans can carry ``kestrel.agent_name`` (issue #2573). Best-effort:
+        # None until the registrar wires it.
+        self._agent_display_name: Optional[str] = None
+
         # PayerPolicy NONE flag. Set to True by the agent-init layer when
         # the agent's policy slot for LLM is `PayerKind.NONE`. Phase 3b
         # adds the `_check_policy()` guard on every generation entry point
@@ -544,6 +550,91 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             )
             self._last_response_identity = state
         return state
+
+    def set_agent_display_name(self, name: Optional[str]) -> None:
+        """Record the owning agent's human display name for LLM-span attribution.
+
+        The registrar calls this once the agent's ``agent.agent_name`` is
+        resolved so LLM-call spans can carry ``kestrel.agent_name`` (issue
+        #2573). Best-effort: unset until wired, and never load-bearing.
+        """
+        self._agent_display_name = name or None
+
+    @staticmethod
+    def _llm_span_output_text(result: Any) -> Optional[str]:
+        """Best-effort ``output.value`` text for an LLM span from a call result.
+
+        A bare string is the response; an ``LLMResponse`` contributes its
+        ``content`` (``None`` for a pure tool call, which annotation then skips).
+        """
+        if result is None:
+            return None
+        if isinstance(result, LLMResponse):
+            return result.content
+        return result if isinstance(result, str) else str(result)
+
+    def _annotate_and_return(self, span, result: Any) -> Any:
+        """Stamp the served model / response onto ``span`` and pass ``result`` through.
+
+        The served route/model (post-fallback) is only known once the call
+        returns; it is read from the just-stamped response identity. Guarded so
+        annotation can never alter the value returned to the caller.
+        """
+        try:
+            if span is not None and span.is_recording():
+                served_model = None
+                try:
+                    served_model = (self.get_last_response_identity() or {}).get("model")
+                except Exception:  # noqa: BLE001 - identity read is best-effort
+                    served_model = None
+                telemetry.annotate_llm_response_span(
+                    span,
+                    output_text=self._llm_span_output_text(result),
+                    model_name=served_model,
+                    response=result if isinstance(result, LLMResponse) else None,
+                )
+        except Exception:  # noqa: BLE001 - instrumentation must never break the call
+            logger.debug("LLM span annotation failed", exc_info=True)
+        return result
+
+    @contextmanager
+    def _llm_request_span(
+        self,
+        method: str,
+        *,
+        system_prompt: Optional[str] = None,
+        user_prompt: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        model_override: Optional[str] = None,
+    ):
+        """Open the single OpenInference LLM span for one public entry call.
+
+        Centralizes the cheap tracing guard + prompt serialization + span open
+        shared by every public completion entry (``get_response``,
+        ``generate``, ``generate_with_messages``, ``get_response_with_model``).
+        Issue #2573, Q1: exactly ONE span per logical request — the
+        per-provider fallback loop underneath emits no span of its own, and
+        failed attempts land as events on THIS span
+        (:func:`telemetry.record_llm_attempt_failure`). Serialization is
+        skipped entirely when no exporter is configured, so an unset OTLP
+        endpoint costs only the guard.
+        """
+        span_input = (
+            telemetry.serialize_llm_input(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                messages=messages,
+            )
+            if telemetry.llm_tracing_enabled()
+            else None
+        )
+        with telemetry.llm_span(
+            f"llm.{method}",
+            input_value=span_input,
+            model_name=model_override,
+            agent_name=self._agent_display_name,
+        ) as span:
+            yield span
 
     def set_preference_persistence_callback(self, callback) -> None:
         """Set the persistence callback for model preference.
@@ -4085,17 +4176,24 @@ No other text or formatting.
 
         self._check_policy()
         frozen_context = self._resolve_invocation_context(invocation_context)
-        return await self._get_response_frozen(
+        with self._llm_request_span(
+            "get_response",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            force_local_only=force_local_only,
             model_override=model_override,
-            tools=tools,
-            response_format=response_format,
-            tool_executor=tool_executor,
-            cancel_token=cancel_token,
-            invocation_context=frozen_context,
-        )
+        ) as span:
+            result = await self._get_response_frozen(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                force_local_only=force_local_only,
+                model_override=model_override,
+                tools=tools,
+                response_format=response_format,
+                tool_executor=tool_executor,
+                cancel_token=cancel_token,
+                invocation_context=frozen_context,
+            )
+            return self._annotate_and_return(span, result)
 
     async def _get_response_frozen(
         self,
@@ -4174,32 +4272,23 @@ No other text or formatting.
                 provider_name = provider['name']
                 logger.info(f"Attempting provider: {provider_name}")
 
-                with optional_span("agent.llm_call", {
-                    "llm.method": "get_response",
-                    "llm.provider": provider_name,
-                    "llm.model": target_model or provider.get("model", ""),
-                }) as llm_span:
-                    result = await self._try_single_provider(
-                        provider=provider,
-                        target_model=target_model,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        tools=tools,
-                        response_format=response_format,
-                        force_local_only=force_local_only,
-                        tool_executor=tool_executor,
-                        cancel_token=cancel_token,
-                        explicit_selection=explicit_selection,
-                        invocation_context=invocation_context,
-                    )
-                    if llm_span and isinstance(result, LLMResponse):
-                        if result.input_tokens is not None:
-                            llm_span.set_attribute("llm.usage.prompt_tokens", result.input_tokens)
-                        if result.output_tokens is not None:
-                            llm_span.set_attribute("llm.usage.completion_tokens", result.output_tokens)
-                        if result.total_tokens is not None:
-                            llm_span.set_attribute("llm.usage.total_tokens", result.total_tokens)
-
+                # The single OpenInference LLM span is opened by the public
+                # entry method (issue #2573, Q1: one span per logical request).
+                # This per-provider loop is a fallback retry chain, not N
+                # logical calls, so it emits no span of its own.
+                result = await self._try_single_provider(
+                    provider=provider,
+                    target_model=target_model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    tools=tools,
+                    response_format=response_format,
+                    force_local_only=force_local_only,
+                    tool_executor=tool_executor,
+                    cancel_token=cancel_token,
+                    explicit_selection=explicit_selection,
+                    invocation_context=invocation_context,
+                )
                 logger.info(f"Success from {provider_name}")
                 return result
 
@@ -4216,6 +4305,9 @@ No other text or formatting.
             except LLMProviderError as e:
                 logger.warning(f"Provider {provider['name']} failed: {e}")
                 errors[provider['name']] = e
+                # Record the failed attempt as an event on the one
+                # logical-request span (opened by the public entry method).
+                telemetry.record_llm_attempt_failure(provider["name"], e)
 
                 if self._configured_routes_exhausted(
                     available_providers, provider_index, configured_vendors
@@ -4284,22 +4376,28 @@ No other text or formatting.
             logger.info(f"Getting response from model: {model_id}")
             messages = messages_for(provider_for_model["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
-            response = await self._run_provider_attempt(
-                provider_for_model["adapter"].get_response(
-                    client=provider_for_model["client"],
-                    model=model_id,
-                    messages=messages,
-                    extra_body=provider_cache_body(provider_for_model),
-                ),
-                provider_for_model["name"],
-                model_id,
-                path="get_response_with_model",
-                invocation_context=invocation_context,
+            with self._llm_request_span(
+                "get_response_with_model",
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-            )
-            logger.info(f"Success from {model_id}")
-            return response
+                model_override=model_id,
+            ) as span:
+                response = await self._run_provider_attempt(
+                    provider_for_model["adapter"].get_response(
+                        client=provider_for_model["client"],
+                        model=model_id,
+                        messages=messages,
+                        extra_body=provider_cache_body(provider_for_model),
+                    ),
+                    provider_for_model["name"],
+                    model_id,
+                    path="get_response_with_model",
+                    invocation_context=invocation_context,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+                logger.info(f"Success from {model_id}")
+                return self._annotate_and_return(span, response)
 
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
             logger.error(f"Model {model_id} API error: {e}", exc_info=True)
@@ -4418,12 +4516,12 @@ No other text or formatting.
         """
         self._check_policy()
         invocation_context = self._resolve_invocation_context(invocation_context)
-        with optional_span("agent.llm_call", {
-            "llm.method": "generate",
-            "llm.model": model_override or "",
-            "llm.force_local_only": force_local_only,
-            "llm.has_tools": tools is not None,
-        }) as llm_span:
+        with self._llm_request_span(
+            "generate",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model_override=model_override,
+        ) as span:
             # Try remote GPU first when active AND routing isn't pinned.
             # A persisted mandate or vendor-prefixed model_override must
             # beat the remote shortcut — see #734 and _remote_first_allowed.
@@ -4456,14 +4554,11 @@ No other text or formatting.
                         response_format=response_format,
                         force_local_only=force_local_only,
                     )
-                    if llm_span:
-                        llm_span.set_attribute("llm.provider", "remote_gpu")
-                        llm_span.set_attribute("llm.model_used", model)
                     if tools is not None or response_format is not None:
-                        return response
+                        return self._annotate_and_return(span, response)
                     if isinstance(response, LLMResponse):
-                        return response.content or ""
-                    return response
+                        return self._annotate_and_return(span, response.content or "")
+                    return self._annotate_and_return(span, response)
                 except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
                     self._last_remote_error = str(exc)
                     logger.warning(f"Remote GPU API error: {exc}, falling back to providers", exc_info=True)
@@ -4482,7 +4577,7 @@ No other text or formatting.
                     self._deactivate_remote_backend(reason=str(exc))
 
             # Fall back to standard provider chain
-            return await self._get_response_frozen(
+            result = await self._get_response_frozen(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 force_local_only=force_local_only,
@@ -4493,6 +4588,7 @@ No other text or formatting.
                 cancel_token=cancel_token,
                 invocation_context=invocation_context,
             )
+            return self._annotate_and_return(span, result)
 
     async def generate_with_messages(
         self,
@@ -4530,6 +4626,48 @@ No other text or formatting.
             invocation_context,
             session_id=session_id,
         )
+        with self._llm_request_span(
+            "generate_with_messages",
+            messages=messages,
+            model_override=model_override,
+        ) as span:
+            return await self._generate_with_messages_inner(
+                span,
+                messages=messages,
+                tools=tools,
+                response_format=response_format,
+                force_local_only=force_local_only,
+                model_override=model_override,
+                session_id=session_id,
+                keep_trailing_system=keep_trailing_system,
+                tool_executor=tool_executor,
+                cancel_token=cancel_token,
+                invocation_context=invocation_context,
+            )
+
+    async def _generate_with_messages_inner(
+        self,
+        span,
+        *,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        force_local_only: bool = False,
+        model_override: Optional[str] = None,
+        session_id: Optional[str] = None,
+        keep_trailing_system: bool = False,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        cancel_token: Optional[CancelToken] = None,
+        invocation_context: LLMInvocationContext,
+    ) -> Union[str, LLMResponse]:
+        """Body of :meth:`generate_with_messages`, run inside the request's LLM span.
+
+        Split out so the public entry opens exactly ONE OpenInference LLM span
+        (issue #2573, Q1) and this inner routine executes entirely inside it:
+        the provider loop's failed attempts attach to that span as events
+        (:func:`telemetry.record_llm_attempt_failure`), and each successful
+        return is annotated with the served model + response text.
+        """
         # Try remote GPU first when active AND routing isn't pinned — #734.
         if (
             self._backend == BackendType.REMOTE_GPU
@@ -4558,10 +4696,10 @@ No other text or formatting.
                     force_local_only=force_local_only,
                 )
                 if tools is not None or response_format is not None:
-                    return response
+                    return self._annotate_and_return(span, response)
                 if isinstance(response, LLMResponse):
-                    return response.content or ""
-                return response
+                    return self._annotate_and_return(span, response.content or "")
+                return self._annotate_and_return(span, response)
             except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as exc:
                 self._last_remote_error = str(exc)
                 logger.warning(f"Remote GPU API error: {exc}, falling back", exc_info=True)
@@ -4730,10 +4868,10 @@ No other text or formatting.
                     force_local_only=force_local_only,
                 )
                 if tools is not None or response_format is not None:
-                    return response
+                    return self._annotate_and_return(span, response)
                 if isinstance(response, LLMResponse):
-                    return response.content or ""
-                return response
+                    return self._annotate_and_return(span, response.content or "")
+                return self._annotate_and_return(span, response)
             except openai.BadRequestError as e:
                 # 400 = request problem (context too big, bad format, etc.)
                 # Don't fall back — the request itself is broken, not the provider.
