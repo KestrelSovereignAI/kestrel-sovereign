@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.identity.runtime_identity import IdentityReadinessError
 from kestrel_sovereign.spawn.delegated_wallet import (
     _default_currency_for,
     create_delegated_wallet,
@@ -316,10 +317,20 @@ class AgentManager:
         for (name, _), result in zip(pending, results):
             if isinstance(result, BaseException):
                 e = result
-                logger.error(
-                    f"Failed to load agent '{name}': {e}",
-                    exc_info=(type(e), e, e.__traceback__),
-                )
+                if isinstance(e, IdentityReadinessError):
+                    logger.error(
+                        "Failed to load agent '%s': %s "
+                        "(code=%s, cause_type=%s)",
+                        name,
+                        e,
+                        e.error_code,
+                        e.cause_type,
+                    )
+                else:
+                    logger.error(
+                        f"Failed to load agent '{name}': {e}",
+                        exc_info=(type(e), e, e.__traceback__),
+                    )
                 self._init_failures.append((name, e))
                 continue
             self._register_agent(name, result)
@@ -330,7 +341,8 @@ class AgentManager:
     def init_failures(self) -> list[tuple[str, Exception]]:
         """Read-only view of per-agent initialization failures from the last
         ``load_from_config`` call. Used by the FastAPI lifespan to surface
-        lifecycle errors (e.g. ``NoLLMProvidersError``) via ``/health``.
+        lifecycle errors (e.g. ``NoLLMProvidersError`` or an identity
+        readiness failure) via ``/health``.
         """
         return list(self._init_failures)
 

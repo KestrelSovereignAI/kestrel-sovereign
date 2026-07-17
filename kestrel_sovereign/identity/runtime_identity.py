@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -53,6 +54,7 @@ from kestrel_sovereign.security.crypto_suite import (
     ALG_ML_DSA_65,
     ALG_SLH_DSA_SHA2_128S,
     Keypair,
+    get_suite,
 )
 from kestrel_sovereign.security.key_storage import SecureKeyStorage
 
@@ -63,6 +65,79 @@ logger = logging.getLogger(__name__)
 class RuntimeIdentityError(Exception):
     """Raised on inconsistent on-disk identity state (e.g. succession
     statement exists but the hybrid key files don't, or vice versa)."""
+
+
+class IdentityReadinessError(RuntimeError):
+    """Public-safe failure raised when persisted identity cannot boot.
+
+    ``RuntimeIdentityError`` deliberately carries detailed operator context
+    such as filenames and malformed values.  That detail must not flow into
+    startup logs or ``/health`` because key-storage failures may also include
+    secret-bearing exception text.  This boundary error exposes only a stable
+    failure category and remediation while retaining the underlying exception
+    *type* (never its message) for sanitized audit logs.
+    """
+
+    _MESSAGES = {
+        "custody": (
+            "encrypted identity material is unavailable; restore the correct "
+            "identity custody key and restart without re-incepting"
+        ),
+        "integrity": (
+            "identity material is incomplete, malformed, or cryptographically "
+            "inconsistent; restore the complete identity package and restart "
+            "without re-incepting"
+        ),
+        "binding": (
+            "identity material does not bind to the configured agent DID; "
+            "restore the matching agent home and restart without re-incepting"
+        ),
+    }
+
+    def __init__(self, failure: str, *, cause_type: Optional[str] = None):
+        if failure not in self._MESSAGES:
+            raise ValueError(f"unknown identity readiness failure: {failure!r}")
+        self.failure = failure
+        self.error_code = f"identity_{failure}"
+        self.stage = "runtime-load"
+        raw_cause_type = cause_type or "IdentityStateError"
+        self.cause_type = (
+            "".join(
+                char
+                for char in raw_cause_type
+                if char.isalnum() or char in "._-"
+            )[:80]
+            or "IdentityStateError"
+        )
+        super().__init__(
+            f"Identity readiness blocked ({failure}): {self._MESSAGES[failure]}."
+        )
+
+    @classmethod
+    def from_load_error(cls, error: Exception) -> "IdentityReadinessError":
+        """Classify a detailed loader failure without copying its message."""
+        from kestrel_sovereign.security.exceptions import (
+            DecryptionError,
+            KeyStorageError,
+            MasterKeyNotConfiguredError,
+        )
+
+        if isinstance(error, FileNotFoundError):
+            failure = "integrity"
+        elif isinstance(
+            error,
+            (
+                DecryptionError,
+                KeyStorageError,
+                MasterKeyNotConfiguredError,
+                PermissionError,
+                OSError,
+            ),
+        ):
+            failure = "custody"
+        else:
+            failure = "integrity"
+        return cls(failure, cause_type=type(error).__name__)
 
 
 @dataclass(frozen=True)
@@ -137,6 +212,91 @@ class AgentIdentity:
         Legacy-only: the ``did:pkh``.
         """
         return self.new_did if self.is_hybrid else self.legacy_did
+
+
+def _validate_hybrid_key_binding(
+    hybrid: HybridKeypair,
+    verification_methods: list,
+    *,
+    expected_did: str,
+) -> None:
+    """Prove both local private halves match the DID's published keys.
+
+    Merely decrypting both files is not enough: a copied key bundle can be
+    structurally complete while belonging to another DID.  A deterministic
+    startup probe signs with each private half and verifies against the exact
+    public Multikey carried by the local DID document or succession statement.
+    """
+    from kestrel_sovereign.security.multikey import multibase_to_public_key
+
+    expected = {
+        hybrid.classical.suite_id: hybrid.classical,
+        hybrid.pq.suite_id: hybrid.pq,
+    }
+    public_by_alg: dict[str, object] = {}
+
+    for index, vm in enumerate(verification_methods):
+        if not isinstance(vm, Mapping):
+            raise RuntimeIdentityError(
+                f"verification method[{index}] is not an object"
+            )
+        vm_id = vm.get("id")
+        controller = vm.get("controller")
+        if (
+            not isinstance(vm_id, str)
+            or not vm_id.startswith(f"{expected_did}#")
+            or controller != expected_did
+        ):
+            raise RuntimeIdentityError(
+                f"verification method[{index}] is not controlled by "
+                f"the expected DID {expected_did!r}"
+            )
+        multibase = vm.get("publicKeyMultibase")
+        if not isinstance(multibase, str):
+            raise RuntimeIdentityError(
+                f"verification method[{index}] has no publicKeyMultibase"
+            )
+        try:
+            suite, public_key = multibase_to_public_key(multibase)
+        except Exception as exc:
+            raise RuntimeIdentityError(
+                f"verification method[{index}] cannot be decoded: "
+                f"{type(exc).__name__}"
+            ) from exc
+        # A DID document may legitimately advertise additional signing keys.
+        # They are outside this runtime hybrid pair, so leave them available to
+        # their own consumers while proving the required Ed25519 + ML-DSA halves.
+        if suite.alg_id not in expected:
+            continue
+        if suite.alg_id in public_by_alg:
+            raise RuntimeIdentityError(
+                f"multiple verification methods claim {suite.alg_id!r}"
+            )
+        public_by_alg[suite.alg_id] = public_key
+
+    missing = sorted(set(expected) - set(public_by_alg))
+    if missing:
+        raise RuntimeIdentityError(
+            f"hybrid identity is missing verification methods for {missing}"
+        )
+
+    probe = b"kestrel-runtime-identity-binding-v1"
+    for alg_id, keypair in expected.items():
+        suite = get_suite(alg_id)
+        try:
+            signature = suite.sign(probe, keypair.private_key)
+            matches = suite.verify(probe, signature, public_by_alg[alg_id])
+        except Exception as exc:
+            raise RuntimeIdentityError(
+                f"hybrid {alg_id} key binding probe failed: "
+                f"{type(exc).__name__}"
+            ) from exc
+        if not matches:
+            raise RuntimeIdentityError(
+                f"hybrid {alg_id} key binding probe failed: private key "
+                f"does not match the verification method controlled by "
+                f"{expected_did!r}"
+            )
 
 
 def _detect_hybrid_slug(storage_dir: Path) -> str:
@@ -393,6 +553,11 @@ def _load_hybrid_part(
     # over HTTPS. The runtime only needs the VMs (kid -> alg mapping)
     # to sign new artifacts.
     new_verification_methods = list(statement.successor_verification_methods)
+    _validate_hybrid_key_binding(
+        hybrid,
+        new_verification_methods,
+        expected_did=statement.successor_did,
+    )
     return hybrid, new_verification_methods, archival_kp
 
 
@@ -537,6 +702,12 @@ def _load_born_hybrid(
         for kid, suite, pub in parsed_vms
     ]
 
+    _validate_hybrid_key_binding(
+        hybrid,
+        signing_vms,
+        expected_did=new_did,
+    )
+
     logger.info(f"Loaded born-hybrid agent identity: {new_did}")
     return AgentIdentity(
         hybrid_keypair=hybrid,
@@ -660,6 +831,7 @@ def load_agent_identity(
 
 __all__ = [
     "AgentIdentity",
+    "IdentityReadinessError",
     "RuntimeIdentityError",
     "load_agent_identity",
 ]

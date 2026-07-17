@@ -239,3 +239,119 @@ def test_health_rejects_partially_loaded_fleet_with_mandatory_failure():
     assert response.status_code == 503
     assert response.json()["agent_initialized"] is True
     assert response.json()["mandatory_feature_failures"][0]["agent"] == "broken"
+
+
+def test_health_names_identity_custody_failure_without_leaking_detail():
+    """A blocked root of trust is explicit, stable, and public-safe."""
+    from server import app
+    from kestrel_sovereign.identity.runtime_identity import (
+        IdentityReadinessError,
+    )
+    from kestrel_sovereign.server import _identity_readiness_failure_record
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    try:
+        error = IdentityReadinessError(
+            "custody",
+            cause_type="DecryptionError",
+        )
+        error.__cause__ = RuntimeError(
+            "/private/agent KESTREL_DATA_KEY=must-not-leak"
+        )
+        record = _identity_readiness_failure_record("default", error)
+
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = None
+        app.state.startup_error = str(error)
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = [record]
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "unhealthy"
+    assert payload["agent_initialized"] is False
+    failure = payload["identity_readiness_failures"][0]
+    assert failure["state"] == "blocked"
+    assert failure["failure"] == "custody"
+    assert failure["error_code"] == "identity_custody"
+    assert failure["cause_type"] == "DecryptionError"
+    assert "/private/agent" not in response.text
+    assert "must-not-leak" not in response.text
+
+
+def test_health_rejects_partially_loaded_fleet_with_identity_failure():
+    """Healthy peers stay available but cannot hide a broken identity."""
+    from server import app
+    from kestrel_sovereign.identity.runtime_identity import (
+        IdentityReadinessError,
+    )
+    from kestrel_sovereign.server import _identity_readiness_failure_record
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    manager = MagicMock()
+    manager.list_agents.return_value = {"healthy": MagicMock()}
+    error = IdentityReadinessError("binding", cause_type="ConfiguredDIDMismatch")
+    app.router.lifespan_context = noop_lifespan
+    app.state.agent = None
+    app.state.agent_manager = manager
+    app.state.startup_error = None
+    app.state.mandatory_feature_failures = []
+    app.state.identity_readiness_failures = [
+        _identity_readiness_failure_record("broken", error)
+    ]
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["agent_initialized"] is True
+    assert payload["identity_readiness_failures"][0]["agent"] == "broken"
+    assert payload["identity_readiness_failures"][0]["failure"] == "binding"

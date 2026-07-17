@@ -20,6 +20,7 @@ import pytest
 
 from kestrel_sovereign.identity.runtime_identity import (
     AgentIdentity,
+    IdentityReadinessError,
     RuntimeIdentityError,
     load_agent_identity,
 )
@@ -31,6 +32,7 @@ from kestrel_sovereign.security.crypto_suite import (
     ALG_ED25519,
     ALG_ML_DSA_65,
     ALG_SLH_DSA_SHA2_128S,
+    Ed25519Suite,
     Secp256k1Suite,
 )
 from kestrel_sovereign.security.key_storage import SecureKeyStorage
@@ -180,6 +182,53 @@ def test_hybrid_agent_can_sign_and_self_verify(post_ceremony_agent_on_disk):
     )
     assert len(sigs) == 2
     assert {s["alg"] for s in sigs} == {ALG_ED25519, ALG_ML_DSA_65}
+
+
+def test_hybrid_loader_proves_private_keys_bind_to_successor_did(
+    post_ceremony_agent_on_disk,
+):
+    """A complete but copied private/public package is still invalid."""
+    storage_dir, key_id, *_ = post_ceremony_agent_on_disk
+    statement_path = next((storage_dir / "successions").glob("*.json"))
+    statement = json.loads(statement_path.read_text())
+
+    from kestrel_sovereign.security.multikey import public_key_to_multibase
+
+    replacement = Ed25519Suite().generate_keypair()
+    replacement_multibase = public_key_to_multibase(
+        Ed25519Suite(),
+        replacement.public_key,
+    )
+    for vm in statement["successor_verification_methods"]:
+        if vm["id"].endswith("#key-1"):
+            vm["publicKeyMultibase"] = replacement_multibase
+            break
+    statement_path.write_text(json.dumps(statement))
+
+    with pytest.raises(RuntimeIdentityError, match="private key does not match"):
+        load_agent_identity(key_id, storage_dir)
+
+
+def test_readiness_error_redacts_detailed_loader_message():
+    """The health/log boundary keeps category and type, never raw detail."""
+    from kestrel_sovereign.security.exceptions import DecryptionError
+
+    detailed = DecryptionError(
+        "wrong key at /private/agent; KESTREL_DATA_KEY=must-not-leak"
+    )
+    error = IdentityReadinessError.from_load_error(detailed)
+
+    assert error.failure == "custody"
+    assert error.error_code == "identity_custody"
+    assert error.cause_type == "DecryptionError"
+    assert "/private/agent" not in str(error)
+    assert "must-not-leak" not in str(error)
+
+    unsafe_type = IdentityReadinessError(
+        "integrity",
+        cause_type="ParserError /private/agent",
+    )
+    assert unsafe_type.cause_type == "ParserErrorprivateagent"
 
 
 # ---------------------------------------------------------------------------

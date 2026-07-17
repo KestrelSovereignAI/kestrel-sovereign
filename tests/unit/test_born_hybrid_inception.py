@@ -14,6 +14,7 @@ Covers the full birth-to-boot loop:
 import json
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -25,6 +26,7 @@ from kestrel_sovereign.inception_service import (
     slugify_agent_name,
 )
 from kestrel_sovereign.identity.runtime_identity import (
+    IdentityReadinessError,
     RuntimeIdentityError,
     load_agent_identity,
 )
@@ -45,6 +47,17 @@ def hybrid_env(monkeypatch):
     monkeypatch.setenv("KESTREL_DATA_KEY", TEST_DATA_KEY)
     monkeypatch.setenv(DID_WEB_DOMAIN_ENV, TEST_DOMAIN)
     monkeypatch.delenv(IDENTITY_METHOD_ENV, raising=False)
+
+
+def _construct_runtime_agent(did: str, storage_dir: Path):
+    """Construct through the production identity-readiness boundary."""
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    return KestrelAgent(
+        did=did,
+        storage_path=str(storage_dir / "kestrel_prime.db"),
+        llm_service=MagicMock(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +197,100 @@ async def test_born_hybrid_agent_loads_and_signs(tmp_path, hybrid_env):
     sigs = sign_hybrid(probe, ident.hybrid_keypair)
     result = verify_hybrid(probe, sigs, ident.new_verification_methods)
     assert result.ok, result.reason
+
+
+def test_runtime_construction_before_identity_material_exists(tmp_path):
+    """No documents or keys is the supported pre-inception state."""
+    agent = _construct_runtime_agent(
+        f"did:web:{TEST_DOMAIN}:not-incepted-yet",
+        tmp_path,
+    )
+    assert agent.identity is None
+    assert agent.is_hybrid is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_wrong_key_blocks_then_same_home_recovers(
+    tmp_path,
+    hybrid_env,
+    monkeypatch,
+):
+    """Real encrypted identity never downgrades and needs no reinception."""
+    creds = await create_kestrel_identity_async(
+        str(tmp_path),
+        CONSTITUTION,
+        agent_name="Custody Bird",
+    )
+    original_docs = sorted(path.name for path in tmp_path.glob("*_did.json"))
+
+    monkeypatch.setenv(
+        "KESTREL_DATA_KEY",
+        "wrong-master-key-that-must-not-appear-in-errors",
+    )
+    with pytest.raises(IdentityReadinessError) as exc_info:
+        _construct_runtime_agent(creds.agent_did, tmp_path)
+
+    error = exc_info.value
+    assert error.failure == "custody"
+    assert error.error_code == "identity_custody"
+    assert str(tmp_path) not in str(error)
+    assert "wrong-master-key" not in str(error)
+
+    monkeypatch.setenv("KESTREL_DATA_KEY", TEST_DATA_KEY)
+    recovered = _construct_runtime_agent(creds.agent_did, tmp_path)
+    assert recovered.identity is not None
+    assert recovered.is_hybrid is True
+    assert recovered.signing_did == creds.agent_did
+    assert sorted(path.name for path in tmp_path.glob("*_did.json")) == original_docs
+
+    with pytest.raises(IdentityReadinessError) as mismatch:
+        _construct_runtime_agent(
+            f"did:web:{TEST_DOMAIN}:different-agent",
+            tmp_path,
+        )
+    assert mismatch.value.failure == "binding"
+
+
+@pytest.mark.asyncio
+async def test_runtime_refuses_real_identity_missing_pq_half(tmp_path, hybrid_env):
+    creds = await create_kestrel_identity_async(
+        str(tmp_path),
+        CONSTITUTION,
+        agent_name="Partial Runtime Bird",
+    )
+    next(tmp_path.glob("*_mldsa65.bytes.enc")).unlink()
+
+    with pytest.raises(IdentityReadinessError) as exc_info:
+        _construct_runtime_agent(creds.agent_did, tmp_path)
+
+    assert exc_info.value.failure == "integrity"
+    assert exc_info.value.error_code == "identity_integrity"
+
+
+@pytest.mark.asyncio
+async def test_runtime_refuses_hybrid_key_not_bound_to_did(tmp_path, hybrid_env):
+    """A valid but foreign public half makes the package malformed."""
+    creds = await create_kestrel_identity_async(
+        str(tmp_path),
+        CONSTITUTION,
+        agent_name="Misbound Runtime Bird",
+    )
+    did_path = next(tmp_path.glob("*_did.json"))
+    did_document = json.loads(did_path.read_text())
+
+    from kestrel_sovereign.security.crypto_suite import Ed25519Suite
+    from kestrel_sovereign.security.multikey import public_key_to_multibase
+
+    replacement = Ed25519Suite().generate_keypair()
+    did_document["verificationMethod"][0]["publicKeyMultibase"] = (
+        public_key_to_multibase(Ed25519Suite(), replacement.public_key)
+    )
+    did_path.write_text(json.dumps(did_document))
+
+    with pytest.raises(IdentityReadinessError) as exc_info:
+        _construct_runtime_agent(creds.agent_did, tmp_path)
+
+    assert exc_info.value.failure == "integrity"
 
 
 @pytest.mark.asyncio
