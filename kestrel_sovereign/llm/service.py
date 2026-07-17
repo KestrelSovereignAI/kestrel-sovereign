@@ -3149,10 +3149,32 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
     ) -> LLMInvocationContext:
         """Capture one request identity before a provider call begins."""
 
-        return resolve_invocation_context(
+        state = self._context_state()
+        resolved = resolve_invocation_context(
             context,
-            ambient=self._context_state().get(),
+            ambient=state.get(),
             session_id=session_id,
+        )
+        if resolved.companion_id and resolved.user_id:
+            return resolved
+
+        # Cross-task compatibility (#2569): the LLM call may be dispatched from
+        # a task that never inherited the setter's ContextVar (a worker spawned
+        # before the request set its identity, a sibling task tree, or a thread
+        # offload), so the task-local ambient came back empty.  ``session_id``
+        # threads through explicitly as a generation argument, so recover this
+        # session's companion/user without a process-wide last-writer snapshot
+        # that would misattribute a concurrent tenant's billing identity.
+        session_context = state.get_for_session(resolved.session_id)
+        if session_context is None:
+            return resolved
+        return LLMInvocationContext(
+            session_id=resolved.session_id,
+            companion_id=resolved.companion_id or session_context.companion_id,
+            user_id=resolved.user_id or session_context.user_id,
+            correlation_id=(
+                resolved.correlation_id or session_context.correlation_id
+            ),
         )
 
     @staticmethod
