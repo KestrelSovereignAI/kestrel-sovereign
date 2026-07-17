@@ -161,7 +161,12 @@ Reading those rows back is the canonical way to reconstruct what happened.
 
 1. Open the agent's `kestrel.toml` (typically `agent_data/<name>/kestrel.toml`), set `[features.computer_use] enabled = true`, configure `allowed_paths` and `denied_binaries`.
 2. Open `kestrel_sovereign/data/KESTREL_CONSTITUTION.md`, find Amendment IX, change `[ ]` to `[x]` for the capabilities you want to grant.
-3. If the agent has been inception-anchored to a previous constitution hash, run `!reanchor-constitution <new_hash_prefix>` so identity records reflect the change.
+3. If the agent has been inception-anchored to a previous constitution hash,
+   create a Sovereign-signed artifact and run
+   `!reanchor-constitution /secure/constitution-reanchor.signed.json <new_hash_prefix>`
+   so identity records reflect the change. Configure the external root as
+   described in
+   [Sovereign Constitution Trust Root](security/SOVEREIGN_TRUST_ROOT.md).
 4. Set `agent.privacy_config.computer_access = True` for the session(s) where you want the feature available.
 5. The first tool call will trigger an approval prompt unless it's a read inside the allow-list.
 

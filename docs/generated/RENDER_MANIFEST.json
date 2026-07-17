@@ -1238,6 +1238,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/security/SOVEREIGN_TRUST_ROOT.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "current",
+      "title": "Sovereign Constitution Trust Root",
+      "type": "Security Runbook"
+    },
+    {
       "existing_code_refs": [
         "kestrel_sovereign/identity/rotation_ceremony.py",
         "kestrel_sovereign/identity/succession.py",

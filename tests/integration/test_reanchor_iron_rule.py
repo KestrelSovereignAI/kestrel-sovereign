@@ -37,12 +37,22 @@ proposed structured-anchor solution.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
+from kestrel_sovereign.constitution.amendment_artifact import (
+    build_legacy_signed_reanchor_artifact,
+    did_document_from_legacy_public_key,
+)
 from kestrel_sovereign.constitution.emancipation import EmancipationContract
+from kestrel_sovereign.constitution.resolver import (
+    resolve_governing_constitution_bytes,
+)
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
 from kestrel_sovereign.storage import AsyncStorage
 
@@ -61,6 +71,28 @@ SENTINEL_TERMS = (
     "IRON_RULE_SENTINEL_xQ3z9: This contract was signed at inception "
     "by the founding Sovereign and cannot be retroactively narrowed."
 )
+
+_SUITE = Secp256k1Suite()
+_ROOT_KEYPAIR = _SUITE.generate_keypair()
+_ROOT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000001118"
+
+
+def _write_reanchor_authority(tmp_path: Path, content: bytes) -> tuple[Path, Path]:
+    root_document = did_document_from_legacy_public_key(
+        _ROOT_DID,
+        _ROOT_KEYPAIR.public_key,
+    )
+    root_path = tmp_path / "sovereign-root.did.json"
+    root_path.write_text(json.dumps(root_document), encoding="utf-8")
+    artifact = build_legacy_signed_reanchor_artifact(
+        signer_did=_ROOT_DID,
+        constitution_sha256=hashlib.sha256(content).hexdigest(),
+        private_key=_ROOT_KEYPAIR.private_key,
+        reason="iron rule integration test",
+    )
+    artifact_path = tmp_path / "constitution-reanchor.signed.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    return artifact_path, root_path
 
 
 async def _read_anchored_constitution_bytes(db_path: Path) -> bytes:
@@ -328,11 +360,25 @@ async def test_reanchor_allows_dormant_to_active(tmp_path):
         toml,
         f'[emancipation]\nenabled = true\nterms = """{activation_terms}"""\n',
     )
+    candidate_contract = EmancipationContract(
+        enabled=True,
+        terms=activation_terms,
+    )
+    active_content = resolve_governing_constitution_bytes(
+        candidate_contract,
+        constitution_path=str(CANONICAL),
+    )
+    artifact_path, trust_root_path = _write_reanchor_authority(
+        tmp_path,
+        active_content,
+    )
 
     result = await reanchor_constitution(
         agent_name="DormantAgent", agent_dir=agent_dir,
         canonical_path=CANONICAL, force=True,
         kestrel_toml_path=toml,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
     )
 
     assert result.iron_rule_violation is None
@@ -379,10 +425,20 @@ async def test_reanchor_backfills_legacy_active_agent_without_sidecar(tmp_path):
         toml,
         f'[emancipation]\nenabled = true\nterms = """{SENTINEL_TERMS}"""\n',
     )
+    active_content = resolve_governing_constitution_bytes(
+        EmancipationContract(enabled=True, terms=SENTINEL_TERMS),
+        constitution_path=str(CANONICAL),
+    )
+    artifact_path, trust_root_path = _write_reanchor_authority(
+        tmp_path,
+        active_content,
+    )
     result = await reanchor_constitution(
         agent_name="RefusalAgent", agent_dir=agent_dir,
         canonical_path=CANONICAL, force=True,
         kestrel_toml_path=toml,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
     )
 
     assert result.error is None

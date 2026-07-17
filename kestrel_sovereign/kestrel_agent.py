@@ -305,6 +305,7 @@ class KestrelAgent(
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
         host_db=None,
+        sovereign_trust_root_path: Optional[str] = None,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -335,6 +336,11 @@ class KestrelAgent(
                        a host on Postgres supply the host db directly (e.g.
                        ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
                        lifecycle; the agent does not close it.
+            sovereign_trust_root_path: Optional operator-owned JSON DID-document
+                       path used to authorize constitution reanchor artifacts.
+                       When omitted, the shared resolver reads
+                       ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``. The graph database
+                       is never a trust-root source.
         """
         self.did = did
         self._privacy_mode = privacy_mode
@@ -346,6 +352,7 @@ class KestrelAgent(
         # on-disk host.db lookups during credential resolution at init.
         self._injected_payer_policy = payer_policy
         self._injected_host_db = host_db
+        self._sovereign_trust_root_path = sovereign_trust_root_path
 
         # Per-agent constitution overlay (#898). When ``<agent_dir>/CONSTITUTION.md``
         # exists, its text becomes ``self.constitution_text`` so feature-side

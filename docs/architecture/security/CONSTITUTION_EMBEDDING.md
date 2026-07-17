@@ -74,6 +74,12 @@ constitution_hash = storage.store_file(constitution_content, "KESTREL_CONSTITUTI
 > Restoring first-class custom sources via a tamper-bound, Sovereign-signed
 > source descriptor is tracked as a follow-up issue.
 
+> **Reanchor authority (#2499):** the public key authorizing a constitution
+> reanchor is pinned outside the graph database. Live and offline reanchor use
+> the same fail-closed resolver and detached-artifact verifier. See
+> [Sovereign Constitution Trust Root](SOVEREIGN_TRUST_ROOT.md) for storage,
+> rotation, recovery, and legacy migration.
+
 The hash is computed as SHA-256:
 ```
 constitution_hash = hashlib.sha256(constitution_content).hexdigest()
