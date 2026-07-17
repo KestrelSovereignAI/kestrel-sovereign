@@ -56,7 +56,14 @@ dependencies = [
     # "string"). The in-tree @tool decorator now re-exports the SDK's fixed copy.
     # 0.29.3 floor: SDK-owned agent/host UIContributions (including css) and
     # AppExtension; host scope remains consumed by the multi-agent runtime.
-    "kestrel-sovereign-sdk>=0.30.0,<0.31",
+    # 0.30.1 floor + [tracing] extra: ships kestrel_sdk.tracing (KestrelTracer,
+    # OpenInference span conventions) that the LLM-routing chokepoint spans
+    # import directly (#2573). The extra pulls opentelemetry-sdk +
+    # openinference-semantic-conventions, so core can emit OpenInference LLM
+    # spans without importing a feature package (stays on the right side of the
+    # core-never-imports-features boundary). Tracing is still a runtime no-op
+    # unless an OTLP endpoint is configured.
+    "kestrel-sovereign-sdk[tracing]>=0.30.1,<0.31",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -202,14 +209,15 @@ local = [
     "numpy==2.4.6",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
-# Prometheus support comes via the SDK's [metrics] extra; OpenTelemetry
-# is local to the framework's own tracing.
+# Prometheus support comes via the SDK's [metrics] extra; the [tracing] extra
+# (OpenInference LLM spans, #2573) is already pulled by the base dependency, so
+# this extra only adds the FastAPI auto-instrumentor + gRPC OTLP exporter on top.
 observability = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics]>=0.30.0,<0.31",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.30.1,<0.31",
 ]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the
