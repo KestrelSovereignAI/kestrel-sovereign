@@ -219,6 +219,13 @@ observability = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
     "kestrel-sovereign-sdk[metrics,tracing]>=0.30.1,<0.31",
 ]
+# Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
+# this extra is the ONLY step needed to get traces flowing: on host start the
+# server supervises a local Phoenix subprocess (loopback-only, SQLite storage)
+# and auto-wires OTEL_EXPORTER_OTLP_ENDPOINT to it.
+phoenix = [
+    "arize-phoenix>=11,<20",
+]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the
 # extracted kestrel-cloud-gcp / kestrel-cloud-vastai / kestrel-cloud-runpod

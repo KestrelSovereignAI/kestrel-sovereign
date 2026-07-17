@@ -473,6 +473,55 @@ async def lifespan(app: FastAPI):
     logger.info("Server starting up...")
     _set_startup_error(app, None)
 
+    # --- Host-supervised Phoenix trace backend (issue #2570) ---
+    # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
+    # in-process agents initialize and when subprocess agents inherit the env
+    # (INV-SOLO zero-config wiring). Fully degrades when arize-phoenix is not
+    # installed or KESTREL_PHOENIX_ENABLED=0 — the host is unaffected.
+    app.state.phoenix = None
+    try:
+        from kestrel_sovereign.phoenix_supervisor import (
+            PhoenixSupervisor,
+            autowire_otlp_endpoint,
+            should_supervise_phoenix,
+        )
+
+        if should_supervise_phoenix():
+            supervisor = PhoenixSupervisor()
+            # Don't block agent boot on the health wait — the exporter connects
+            # lazily and the UI proxy tolerates a still-starting Phoenix.
+            if supervisor.start(wait_for_health=False):
+                app.state.phoenix = supervisor
+                # Zero-config (INV-SOLO): default the OTLP endpoint to the local
+                # Phoenix collector for this process AND for env inherited by
+                # spawned agents, unless the operator already set it.
+                endpoint = autowire_otlp_endpoint(os.environ)
+                if endpoint:
+                    logger.info(
+                        "OTEL_EXPORTER_OTLP_ENDPOINT auto-set to local Phoenix (%s)",
+                        endpoint,
+                    )
+        else:
+            from kestrel_sovereign.phoenix_supervisor import (
+                _running_under_pytest,
+                phoenix_available,
+            )
+
+            if _running_under_pytest():
+                logger.info(
+                    "Phoenix supervision suppressed under pytest (installed=%s) — "
+                    "/phoenix returns 503.",
+                    phoenix_available(),
+                )
+            else:
+                logger.info(
+                    "Phoenix trace backend disabled (installed=%s) — /phoenix returns 503.",
+                    phoenix_available(),
+                )
+    except Exception as exc:  # noqa: BLE001 - Phoenix must never block startup
+        logger.warning("Phoenix supervision setup failed: %s", exc)
+        app.state.phoenix = None
+
     # Detect multi-agent mode
     multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
     multi_agent_path = resolve_multi_agent_path(os.environ)
@@ -704,6 +753,16 @@ async def lifespan(app: FastAPI):
             logger.debug("Agent shutdown cancelled")
         except Exception as e:
             logger.warning(f"Error during agent shutdown: {e}")
+
+    # Stop the supervised Phoenix subprocess (mirror of startup).
+    _phoenix = getattr(app.state, "phoenix", None)
+    if _phoenix is not None:
+        try:
+            await _phoenix.aclose()
+            _phoenix.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error stopping Phoenix: %s", exc)
+        app.state.phoenix = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -999,6 +1058,22 @@ async def auth_middleware(request: Request, call_next):
     if HOST_FEATURE_STATIC_ASSET_RE.match(request.url.path):
         return await call_next(request)
 
+    # Phoenix reverse-proxy embed auth (issue #2570). The console mints a
+    # short-lived, signed, HttpOnly cookie (scoped to /phoenix) via
+    # POST /api/host/phoenix/session — which itself requires standard host auth —
+    # then loads the iframe. The browser can attach that cookie but not the
+    # X-API-Key header. Accept it here IN ADDITION to the standard checks below,
+    # and ONLY for /phoenix paths, so it never widens auth for any other route.
+    # A logged-in console (session cookie / API key) can also reach /phoenix via
+    # the standard path, so absence of the embed cookie just falls through.
+    if request.url.path == "/phoenix" or request.url.path.startswith("/phoenix/"):
+        from kestrel_sovereign.phoenix_supervisor import verify_embed_cookie
+        from kestrel_sovereign.auth import CallerContext, AuthMethod
+
+        if verify_embed_cookie(request, _SESSION_SECRET):
+            request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
+            return await call_next(request)
+
     try:
         expected_key = get_api_key()
 
@@ -1109,9 +1184,14 @@ def _get_session_secret() -> str:
     return secret
 
 
+# Captured once so the Phoenix embed cookie (issue #2570) is signed and verified
+# with the SAME secret the session cookie uses — recomputing would return a fresh
+# random value on the ephemeral-secret path and break verification.
+_SESSION_SECRET = _get_session_secret()
+
 app.add_middleware(
     SessionMiddleware,
-    secret_key=_get_session_secret(),
+    secret_key=_SESSION_SECRET,
     session_cookie="kestrel_session",
     max_age=7 * 24 * 3600,  # 7 days
     same_site="lax",
@@ -1362,6 +1442,73 @@ async def host_csrf_token(request: Request):
     response = JSONResponse(content={"csrf_token": token})
     issue_csrf_cookie(response, token)
     return response
+
+
+# ---------------------------------------------------------------------------
+# Phoenix trace backend: embed-session mint + same-origin reverse proxy (#2570)
+# ---------------------------------------------------------------------------
+
+_PHOENIX_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+
+def _phoenix_supervisor(request: Request):
+    """Return the supervised Phoenix, or ``None`` when not enabled/running."""
+    return getattr(request.app.state, "phoenix", None)
+
+
+@app.post("/api/host/phoenix/session")
+async def phoenix_embed_session(request: Request):
+    """Mint the short-lived embed cookie for the Phoenix iframe (issue #2570).
+
+    Requires standard host auth (``X-API-Key`` or session) — already enforced by
+    ``auth_middleware`` before this handler runs. Returns an HttpOnly,
+    SameSite=Lax cookie scoped to ``/phoenix`` and never puts a credential in a
+    URL. The console calls this with headers, then loads ``/phoenix/``.
+    """
+    from kestrel_sovereign.phoenix_supervisor import (
+        EMBED_COOKIE_PATH,
+        EMBED_TTL_SECONDS,
+        issue_embed_cookie,
+    )
+
+    supervisor = _phoenix_supervisor(request)
+    if supervisor is None or not supervisor.running:
+        return _phoenix_not_enabled_json()
+
+    caller = getattr(request.state, "caller", None)
+    identity = getattr(caller, "identity", None) or "sovereign"
+    secure = os.environ.get("KESTREL_ENV", "development") == "production"
+
+    response = JSONResponse(
+        content={
+            "ok": True,
+            "embed_path": EMBED_COOKIE_PATH + "/",
+            "expires_in": EMBED_TTL_SECONDS,
+        }
+    )
+    issue_embed_cookie(response, _SESSION_SECRET, identity=identity, secure=secure)
+    return response
+
+
+def _phoenix_not_enabled_json() -> JSONResponse:
+    from kestrel_sovereign.phoenix_supervisor import _phoenix_disabled_response
+
+    return _phoenix_disabled_response()
+
+
+@app.api_route("/phoenix", methods=_PHOENIX_PROXY_METHODS)
+@app.api_route("/phoenix/{path:path}", methods=_PHOENIX_PROXY_METHODS)
+async def phoenix_proxy(request: Request, path: str = ""):
+    """Same-origin authenticated reverse proxy to the local Phoenix UI (#2570).
+
+    Auth (session cookie, API key, or the minted embed cookie) is enforced by
+    ``auth_middleware`` before this runs. Streams the response through so the UI
+    functions end-to-end. Returns a clear 503 when Phoenix is not supervised.
+    """
+    from kestrel_sovereign.phoenix_supervisor import proxy_to_phoenix
+
+    supervisor = _phoenix_supervisor(request)
+    return await proxy_to_phoenix(request, supervisor, path)
 
 
 if __name__ == "__main__":
