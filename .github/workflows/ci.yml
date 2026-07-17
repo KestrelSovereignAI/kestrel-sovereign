@@ -88,6 +88,11 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
 
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
       - name: Install dependencies
         run: uv sync
 
@@ -101,6 +106,12 @@ jobs:
         timeout-minutes: 10
         env:
           KESTREL_AUDIT_MODE: skip
+
+      - name: Run voice playback JavaScript tests
+        run: >-
+          node --test
+          tests/js/test_voice_playback.mjs
+          tests/js/test_voice_playback_worklet.mjs
 
   python-314-install-check:
     runs-on: ubuntu-latest

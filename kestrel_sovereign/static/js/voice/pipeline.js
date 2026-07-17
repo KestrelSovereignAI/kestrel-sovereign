@@ -117,6 +117,7 @@ export async function createPipelineClient({
         break;
 
       case 'response_done':
+        playback?.endOfStream?.();
         onEvent(makeEvent(Events.SPEAKING_STOPPED, {}));
         onEvent(makeEvent(Events.RESPONSE_DONE, {}));
         break;

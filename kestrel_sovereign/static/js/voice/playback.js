@@ -1,5 +1,5 @@
 /**
- * playback.js — Jitter-buffered PCM16 playback.
+ * playback.js — Lossless jitter-buffered PCM16 playback.
  *
  * Public API:
  *   const pb = createVoicePlayback({ sampleRate: 24000 });
@@ -10,9 +10,9 @@
  *   pb.isPlaying();
  *   pb.destroy();
  *
- * The worklet manages a ring buffer and accepts 'push' / 'flush' control
- * messages from main. Jitter-buffer pre-roll (30ms by default) smooths
- * network irregularity without adding perceptible latency.
+ * The worklet manages a lossless PCM chunk queue and accepts 'push' / 'end' /
+ * 'flush' control messages from main. Jitter-buffer pre-roll smooths network
+ * irregularity without imposing a fixed cap on provider delivery bursts.
  */
 
 const WORKLET_URL = '/static/js/voice/playback-worklet.js';
@@ -36,18 +36,14 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     numberOfInputs: 0,
     numberOfOutputs: 1,
     outputChannelCount: [1],
+    processorOptions: {
+      preRollSamples: Math.floor((preRollMs / 1000) * sampleRate),
+      underflowSamples: Math.floor(sampleRate / 5),
+    },
   });
   const gain = ctx.createGain();
   node.connect(gain);
   gain.connect(ctx.destination);
-
-  // Pre-roll: hold the first N ms of audio before connecting so short initial
-  // chunks don't stutter. We implement this by buffering on main until
-  // enough samples have arrived, then flushing them to the worklet at once.
-  const preRollSamples = Math.floor((preRollMs / 1000) * sampleRate);
-  let preRollBuffer = [];
-  let preRollFilled = false;
-  let preRollCount = 0;
 
   let playing = false;
   let underflowCount = 0;
@@ -63,12 +59,8 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     if (!msg) return;
     if (msg.type === 'underflow') {
       underflowCount++;
+    } else if (msg.type === 'drained') {
       playing = false;
-      // Each response gets its own pre-roll. Once the worklet drains, the
-      // next response starts from a fresh jitter-buffer boundary.
-      preRollBuffer = [];
-      preRollFilled = false;
-      preRollCount = 0;
       resolveIdleWaiters();
     }
   };
@@ -83,26 +75,10 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     enqueue(uint8) {
       if (!uint8 || uint8.byteLength === 0) return;
       playing = true;
-      if (!preRollFilled) {
-        preRollBuffer.push(uint8);
-        preRollCount += uint8.byteLength / 2; // 2 bytes per Int16 sample
-        if (preRollCount >= preRollSamples) {
-          for (const c of preRollBuffer) pushToWorklet(c);
-          preRollBuffer = [];
-          preRollFilled = true;
-        }
-      } else {
-        pushToWorklet(uint8);
-      }
+      pushToWorklet(uint8);
     },
     endOfStream() {
-      // A short utterance may never reach the normal pre-roll threshold.
-      // Release it when the provider says the response is complete.
-      if (!preRollFilled && preRollBuffer.length) {
-        for (const chunk of preRollBuffer) pushToWorklet(chunk);
-        preRollBuffer = [];
-        preRollFilled = true;
-      }
+      node.port.postMessage({ type: 'end' });
       if (!playing) resolveIdleWaiters();
     },
     whenIdle() {
@@ -110,9 +86,6 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
       return new Promise((resolve) => idleWaiters.add(resolve));
     },
     flush() {
-      preRollBuffer = [];
-      preRollFilled = false;
-      preRollCount = 0;
       playing = false;
       node.port.postMessage({ type: 'flush' });
       resolveIdleWaiters();
