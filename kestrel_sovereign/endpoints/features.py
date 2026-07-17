@@ -19,6 +19,7 @@ from kestrel_sovereign.feature_registry import (
     get_registry,
     get_skills_for_package,
 )
+from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.ui_capabilities import (
     active_feature_class_names,
     compute_feature_capabilities,
@@ -404,6 +405,19 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     agent = get_agent(request)
     loaded = _get_loaded_features_or_404(agent, name)
+    mandatory = sorted(
+        class_name
+        for class_name, _feature in loaded
+        if class_name in MANDATORY_FEATURES
+    )
+    if mandatory:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Mandatory sovereignty features cannot be disabled: "
+                + ", ".join(mandatory)
+            ),
+        )
 
     # Unregister hooks from the agent's HooksManager
     hooks_manager = getattr(agent, "hooks_manager", None)

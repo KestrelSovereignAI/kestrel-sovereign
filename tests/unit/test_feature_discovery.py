@@ -2,10 +2,13 @@
 Tests for the Feature Discovery module.
 """
 
-import pytest
+import importlib
 import os
+
+import pytest
 from unittest.mock import Mock, patch, MagicMock
 from kestrel_sovereign.features import (
+    MandatoryFeatureReadinessError,
     discover_features,
     discover_feature_class_by_name,
     resolve_feature_canonical_name,
@@ -143,15 +146,19 @@ class TestDiscoverFeatures:
 
     def test_disabled_features_not_loaded(self, mock_agent):
         """Test that disabled features are not loaded."""
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
         # Get all features first
         all_features = discover_features(mock_agent)
         all_names = {f.__class__.__name__ for f in all_features}
-        
-        if not all_names:
-            pytest.skip("No features discovered to test")
-        
-        # Pick one to disable
-        feature_to_disable = list(all_names)[0]
+
+        optional_names = sorted(all_names - MANDATORY_FEATURES)
+        if not optional_names:
+            pytest.skip("No optional features discovered to test")
+
+        # Mandatory disable attempts now fail closed; this test covers the
+        # still-supported optional disable path.
+        feature_to_disable = optional_names[0]
         
         with patch.dict(os.environ, {DISABLED_FEATURES_ENV: feature_to_disable}):
             filtered_features = discover_features(mock_agent)
@@ -188,9 +195,12 @@ service = "isolated_service"
              patch("kestrel_sovereign.feature_registry.importlib.metadata.entry_points", return_value=_IsolatedEntryPoints([ep])):
             features = discover_features(mock_agent)
 
-        assert len(features) == 1
-        assert features[0].name == "HeavyFeature"
-        assert features[0].runtime.runtime == "isolated-venv"
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        names = {feature.name for feature in features}
+        assert names == set(MANDATORY_FEATURES) | {"HeavyFeature"}
+        proxy = next(feature for feature in features if feature.name == "HeavyFeature")
+        assert proxy.runtime.runtime == "isolated-venv"
         assert ep.loaded is False
 
 
@@ -290,15 +300,13 @@ class TestFeatureProfiles:
         # Allow only non-mandatory features
         allowed = {"BootstrapFeature"}
         filtered = discover_features(mock_agent, allowed_features=allowed)
+        filtered_name_list = [f.__class__.__name__ for f in filtered]
         filtered_names = {f.__class__.__name__ for f in filtered}
 
-        # All discoverable mandatory features should be present
-        all_features = discover_features(mock_agent)
-        all_names = {f.__class__.__name__ for f in all_features}
-        expected_mandatory = MANDATORY_FEATURES & all_names
-
-        for mandatory in expected_mandatory:
+        # Every declared mandatory feature is a hard discovery postcondition.
+        for mandatory in MANDATORY_FEATURES:
             assert mandatory in filtered_names, f"Mandatory feature {mandatory} missing"
+            assert filtered_name_list.count(mandatory) == 1
 
     def test_none_allowed_features_loads_all(self, mock_agent):
         """Test that None allowed_features loads everything (backward compat)."""
@@ -318,11 +326,105 @@ class TestFeatureProfiles:
         filtered_names = {f.__class__.__name__ for f in filtered}
 
         # Should only contain mandatory features
-        all_features = discover_features(mock_agent)
-        all_names = {f.__class__.__name__ for f in all_features}
-        expected = MANDATORY_FEATURES & all_names
+        assert filtered_names == MANDATORY_FEATURES
 
-        assert filtered_names == expected
+
+class TestMandatoryFeatureReadiness:
+    """The sovereignty foundation fails closed at discovery."""
+
+    @pytest.fixture
+    def mock_agent(self):
+        agent = Mock()
+        agent.storage = Mock()
+        agent.llm_service = Mock()
+        return agent
+
+    @pytest.mark.parametrize(
+        "feature_name",
+        [
+            "ConstitutionFeature",
+            "IdentityFeature",
+            "PeersFeature",
+            "SecurityFeature",
+            "WaitFeature",
+        ],
+    )
+    def test_mandatory_feature_cannot_be_host_disabled(
+        self, mock_agent, feature_name
+    ):
+        with patch.dict(
+            os.environ,
+            {DISABLED_FEATURES_ENV: feature_name},
+            clear=False,
+        ), pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            discover_features(mock_agent)
+
+        error = exc_info.value
+        assert error.feature_name == feature_name
+        assert error.stage == "configuration"
+        assert feature_name in str(error)
+
+    @pytest.mark.parametrize(
+        ("feature_name", "module_path"),
+        [
+            ("IdentityFeature", "kestrel_sovereign.features.identity.feature"),
+            ("SecurityFeature", "kestrel_sovereign.features.security.feature"),
+            ("PeersFeature", "kestrel_sovereign.features.peers.feature"),
+            ("ConstitutionFeature", "kestrel_sovereign.features.constitution"),
+            ("WaitFeature", "kestrel_sovereign.features.wait.feature"),
+        ],
+    )
+    def test_mandatory_import_failure_is_typed_and_sanitized(
+        self, mock_agent, feature_name, module_path
+    ):
+        real_import = importlib.import_module
+
+        def import_with_failure(name, package=None):
+            if name == module_path:
+                raise ImportError("secret-token=must-not-reach-health")
+            return real_import(name, package)
+
+        with patch(
+            "kestrel_sovereign.features.importlib.import_module",
+            side_effect=import_with_failure,
+        ), pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            discover_features(mock_agent)
+
+        error = exc_info.value
+        assert error.feature_name == feature_name
+        assert error.stage == "import"
+        assert "secret-token" not in str(error)
+        assert "secret-token" in str(error.__cause__)
+
+    @pytest.mark.parametrize(
+        "feature_name",
+        [
+            "ConstitutionFeature",
+            "IdentityFeature",
+            "PeersFeature",
+            "SecurityFeature",
+            "WaitFeature",
+        ],
+    )
+    def test_mandatory_constructor_failure_is_typed_and_sanitized(
+        self, mock_agent, feature_name
+    ):
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURE_MODULES
+
+        module = importlib.import_module(MANDATORY_FEATURE_MODULES[feature_name])
+        feature_class = getattr(module, feature_name)
+        with patch.object(
+            feature_class,
+            "__init__",
+            side_effect=RuntimeError("api-key=must-not-reach-health"),
+        ), pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            discover_features(mock_agent)
+
+        error = exc_info.value
+        assert error.feature_name == feature_name
+        assert error.stage == "construction"
+        assert "api-key" not in str(error)
+        assert "api-key" in str(error.__cause__)
 
 
 class TestEntryPointDiscovery:

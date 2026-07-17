@@ -19,7 +19,12 @@ from pathlib import Path
 from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.extensions.app_extension import AppExtension
 from kestrel_sovereign.features.privacy import PrivacyAgent
-from kestrel_sovereign.features import discover_features, get_feature_by_name
+from kestrel_sovereign.features import (
+    MandatoryFeatureReadinessError,
+    discover_features,
+    get_feature_by_name,
+    verify_mandatory_feature_set,
+)
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.a2a.task_manager import TaskManager
@@ -1590,14 +1595,32 @@ class KestrelAgent(
             # runtime feature_remove survives restart for bootstrap-less agents
             # too. Mandatory features are never in this set.
             disabled_features = await self._disabled_feature_names()
-            for feature in discover_features(self, allowed_features=effective_features):
+            discovered_features = discover_features(
+                self, allowed_features=effective_features
+            )
+            for feature in discovered_features:
                 if feature.name in disabled_features:
                     continue
                 await self._register_feature(feature)
+            verify_mandatory_feature_set(
+                self.features,
+                stage="agent readiness",
+            )
 
             # Notify all features that discovery is complete (cross-feature wiring)
             for feature in self.features.values():
-                await feature.post_all_features_loaded(self)
+                try:
+                    await feature.post_all_features_loaded(self)
+                except Exception as exc:
+                    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+                    if type(feature).__name__ in MANDATORY_FEATURES:
+                        raise MandatoryFeatureReadinessError(
+                            type(feature).__name__,
+                            "post-load wiring",
+                            "could not finish cross-feature wiring",
+                        ) from exc
+                    raise
             logging.info("post_all_features_loaded called for all features")
 
             # Feature references resolved lazily via properties
@@ -2390,6 +2413,15 @@ class KestrelAgent(
         or ``"disabled"``. No-op if the store isn't initialized (e.g. a bare
         test agent).
         """
+        if kind == "feature" and state == "disabled":
+            from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+            if name in MANDATORY_FEATURES:
+                raise MandatoryFeatureReadinessError(
+                    name,
+                    "persistent enablement",
+                    "cannot be disabled",
+                )
         store = getattr(self, "_feature_enablement_store", None)
         if store is None:
             return
@@ -2414,38 +2446,86 @@ class KestrelAgent(
 
     async def _register_feature(self, feature: Feature):
         """Register a feature with A2A TaskManager for unified command routing."""
-        await feature.initialize()
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        feature_class_name = type(feature).__name__
+        mandatory = feature_class_name in MANDATORY_FEATURES
+        try:
+            await feature.initialize()
+        except Exception as exc:
+            if mandatory:
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    "initialization",
+                    "could not initialize",
+                ) from exc
+            raise
         self.features[feature.name] = feature
 
         # Auto-register hooks from get_hooks() with the agent's HooksManager
-        if self.hooks_manager:
-            for hook in feature.get_hooks():
-                self.hooks_manager.register(hook)
-                logging.info(f"Auto-registered hook '{hook.name}' from feature '{feature.name}'")
+        try:
+            if self.hooks_manager:
+                for hook in feature.get_hooks():
+                    self.hooks_manager.register(hook)
+                    logging.info(
+                        f"Auto-registered hook '{hook.name}' from feature "
+                        f"'{feature.name}'"
+                    )
+        except Exception as exc:
+            if mandatory:
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    "registration",
+                    "could not register its hooks",
+                ) from exc
+            raise
 
         # Call on_enable lifecycle hook
-        await feature.on_enable()
+        try:
+            await feature.on_enable()
+        except Exception as exc:
+            if mandatory:
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    "enablement",
+                    "could not be enabled",
+                ) from exc
+            raise
 
-        # Get command prefixes for routing
-        command_prefixes = {}
-        for tool in feature.get_tools():
-            if tool.schema.command_prefix:
-                command_prefixes[tool.schema.command_prefix] = tool.name
-            logging.info(f"Registered tool '{tool.name}' from feature '{feature.name}'")
+        try:
+            # Get command prefixes for routing
+            command_prefixes = {}
+            for tool in feature.get_tools():
+                if tool.schema.command_prefix:
+                    command_prefixes[tool.schema.command_prefix] = tool.name
+                logging.info(
+                    f"Registered tool '{tool.name}' from feature '{feature.name}'"
+                )
 
-        # Register with A2A TaskManager (unified routing)
-        if self.task_manager:
-            agent_card = feature.get_agent_card()
-            self.task_manager.register_agent(
-                agent_card=agent_card,
-                handler=feature,
-                command_prefixes=command_prefixes,
-            )
-            logging.info(f"Registered A2A agent '{agent_card.name}' with {len(agent_card.skills)} skills")
+            # Register with A2A TaskManager (unified routing)
+            if self.task_manager:
+                agent_card = feature.get_agent_card()
+                self.task_manager.register_agent(
+                    agent_card=agent_card,
+                    handler=feature,
+                    command_prefixes=command_prefixes,
+                )
+                logging.info(
+                    f"Registered A2A agent '{agent_card.name}' with "
+                    f"{len(agent_card.skills)} skills"
+                )
 
-            # Wire task_manager into features that need it
-            if hasattr(feature, 'set_task_manager'):
-                feature.set_task_manager(self.task_manager)
+                # Wire task_manager into features that need it
+                if hasattr(feature, 'set_task_manager'):
+                    feature.set_task_manager(self.task_manager)
+        except Exception as exc:
+            if mandatory:
+                raise MandatoryFeatureReadinessError(
+                    feature_class_name,
+                    "registration",
+                    "could not register its tools",
+                ) from exc
+            raise
 
     def _promote_startup_feature_tools(self) -> None:
         """Promote direct tools for features that opt into startup exposure.
@@ -2468,6 +2548,16 @@ class KestrelAgent(
         if not feature:
             logging.warning(f"Cannot disable unknown feature: {feature_name}")
             return
+
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        feature_class_name = type(feature).__name__
+        if feature_class_name in MANDATORY_FEATURES:
+            raise MandatoryFeatureReadinessError(
+                feature_class_name,
+                "runtime disable",
+                "cannot be disabled",
+            )
 
         feature_key = next(
             (key for key, value in self.features.items() if value is feature),

@@ -341,6 +341,31 @@ class TestEnableFeature:
 
 
 class TestDisableFeature:
+    @pytest.mark.parametrize(
+        "feature_name",
+        [
+            "ConstitutionFeature",
+            "IdentityFeature",
+            "PeersFeature",
+            "SecurityFeature",
+            "WaitFeature",
+        ],
+    )
+    def test_mandatory_feature_disable_is_rejected_before_lifecycle(
+        self, feature_name
+    ):
+        feature = _make_feature(name=feature_name)
+        agent = _make_agent(features={feature_name: feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            response = client.post(f"/api/features/{feature_name}/disable")
+
+        assert response.status_code == 409
+        assert feature_name in response.json()["detail"]
+        feature.on_disable.assert_not_awaited()
+        assert feature.enabled is True
+
     def test_disable_calls_on_disable(self):
         feature = _make_feature()
         agent = _make_agent(features={"TestFeature": feature})

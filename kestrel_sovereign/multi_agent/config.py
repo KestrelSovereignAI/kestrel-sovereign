@@ -24,18 +24,23 @@ DEFAULT_AGENT_START_PORT = 8801
 MULTI_AGENT_CONFIG_FILENAME = "multi_agent.toml"
 AGENT_DATA_DIR = "agent_data"
 
-# Features that must always be loaded for sovereignty guarantees.
-# These cannot be removed from any agent's feature profile.
-MANDATORY_FEATURES = frozenset({
-    "IdentityFeature",
-    "SecurityFeature",
-    "PeersFeature",
-    "ConstitutionFeature",
+# Canonical modules for the features that form every agent's sovereignty
+# foundation. Discovery imports these modules explicitly and fails closed, so
+# an import/constructor failure cannot be mistaken for an optional capability
+# degrading gracefully. Derive the public name set from this mapping: keeping
+# two independent lists is exactly how a new mandatory feature could become
+# documented but unenforced.
+MANDATORY_FEATURE_MODULES = {
+    "IdentityFeature": "kestrel_sovereign.features.identity.feature",
+    "SecurityFeature": "kestrel_sovereign.features.security.feature",
+    "PeersFeature": "kestrel_sovereign.features.peers.feature",
+    "ConstitutionFeature": "kestrel_sovereign.features.constitution",
     # The single generic `wait` tool lives in its own mandatory feature so it
     # is always present — independent of optional features like Tasks/Talon
     # that register waitable providers (#1860 clean cutover).
-    "WaitFeature",
-})
+    "WaitFeature": "kestrel_sovereign.features.wait.feature",
+}
+MANDATORY_FEATURES = frozenset(MANDATORY_FEATURE_MODULES)
 
 
 class HostConfig(BaseModel):
@@ -73,7 +78,7 @@ class LocalAgentConfig(BaseModel):
         description=(
             "Allowed feature class names for this agent. "
             "If None, all discovered features are loaded (backward compatible). "
-            "Mandatory features (Identity, Security, Peers, Constitution) "
+            "Mandatory features (Identity, Security, Peers, Constitution, Wait) "
             "are always loaded regardless of this list."
         ),
     )

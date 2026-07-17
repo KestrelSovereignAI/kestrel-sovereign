@@ -18,11 +18,15 @@ def test_health_returns_503_when_agent_missing():
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
     original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
 
     app.router.lifespan_context = noop_lifespan
     app.state.agent = None
     app.state.agent_manager = None
     app.state.startup_error = "agent init failed"
+    app.state.mandatory_feature_failures = []
 
     try:
         with TestClient(app) as client:
@@ -32,6 +36,7 @@ def test_health_returns_503_when_agent_missing():
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
         app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 503
     assert response.json()["status"] == "unhealthy"
@@ -49,6 +54,9 @@ def test_health_detailed_uses_health_feature_from_feature_dict():
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
     original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
 
     app.router.lifespan_context = noop_lifespan
 
@@ -64,6 +72,7 @@ def test_health_detailed_uses_health_feature_from_feature_dict():
     app.state.agent = agent
     app.state.agent_manager = None
     app.state.startup_error = None
+    app.state.mandatory_feature_failures = []
 
     try:
         with TestClient(app) as client:
@@ -73,6 +82,7 @@ def test_health_detailed_uses_health_feature_from_feature_dict():
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
         app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
@@ -91,6 +101,9 @@ def test_health_surfaces_llm_reachability():
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
     original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
 
     app.router.lifespan_context = noop_lifespan
 
@@ -106,6 +119,7 @@ def test_health_surfaces_llm_reachability():
     app.state.agent = agent
     app.state.agent_manager = None
     app.state.startup_error = None
+    app.state.mandatory_feature_failures = []
 
     try:
         with TestClient(app) as client:
@@ -115,6 +129,113 @@ def test_health_surfaces_llm_reachability():
         app.state.agent = original_agent
         app.state.agent_manager = original_manager
         app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 200
     assert response.json()["llm_reachability"][0]["name"] == "ollama:local"
+
+
+def test_health_names_mandatory_failure_without_leaking_cause():
+    """Readiness diagnostics expose the class/stage, never dependency secrets."""
+    from server import app
+    from kestrel_sovereign.features import MandatoryFeatureReadinessError
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+
+    try:
+        try:
+            raise RuntimeError("ANTHROPIC_API_KEY=must-not-leak")
+        except RuntimeError as cause:
+            error = MandatoryFeatureReadinessError(
+                "SecurityFeature",
+                "initialization",
+                "could not initialize",
+            )
+            error.__cause__ = cause
+
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = None
+        app.state.startup_error = str(error)
+        app.state.mandatory_feature_failures = [
+            {
+                "agent": "default",
+                "feature": error.feature_name,
+                "stage": error.stage,
+                "error": str(error),
+            }
+        ]
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["status"] == "unhealthy"
+    failure = payload["mandatory_feature_failures"][0]
+    assert failure["feature"] == "SecurityFeature"
+    assert "SecurityFeature" in failure["error"]
+    assert "ANTHROPIC_API_KEY" not in failure["error"]
+    assert "must-not-leak" not in failure["error"]
+
+
+def test_health_rejects_partially_loaded_fleet_with_mandatory_failure():
+    """One good agent must not hide another configured agent's security gap."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+
+    manager = MagicMock()
+    manager.list_agents.return_value = {"secure": MagicMock()}
+    app.router.lifespan_context = noop_lifespan
+    app.state.agent = None
+    app.state.agent_manager = manager
+    app.state.startup_error = None
+    app.state.mandatory_feature_failures = [
+        {
+            "agent": "broken",
+            "feature": "SecurityFeature",
+            "stage": "initialization",
+            "error": "Mandatory feature 'SecurityFeature' could not initialize",
+        }
+    ]
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+
+    assert response.status_code == 503
+    assert response.json()["agent_initialized"] is True
+    assert response.json()["mandatory_feature_failures"][0]["agent"] == "broken"
