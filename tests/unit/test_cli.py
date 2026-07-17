@@ -26,6 +26,12 @@ from kestrel_sovereign.cli import (
     _agent_http_timeout,
     _DEFAULT_ASK_READ_TIMEOUT,
 )
+from kestrel_sovereign.cli_lifecycle import _start_inprocess_mode
+from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+from kestrel_sovereign.multi_agent.process_manager import (
+    DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    ProcessManager,
+)
 
 
 class TestAgentHttpTimeout:
@@ -62,9 +68,6 @@ class TestAgentHttpTimeout:
     def test_ask_timeout_flag_defaults_none(self):
         args = build_parser().parse_args(["ask", "kite", "hi"])
         assert args.timeout is None
-from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
-
 # -----------------------------------------------------------------------
 # Argument parsing tests
 # -----------------------------------------------------------------------
@@ -97,6 +100,35 @@ class TestArgumentParsing:
         args = parser.parse_args(["start", "claw"])
         assert args.command == "start"
         assert args.name == "claw"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["start", "claw"],
+            ["restart", "claw"],
+            ["update", "claw"],
+        ],
+    )
+    def test_lifecycle_startup_timeout_default(self, command):
+        args = build_parser().parse_args(command)
+        assert args.startup_timeout == DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["start", "claw"],
+            ["restart", "claw"],
+            ["update", "claw"],
+        ],
+    )
+    def test_lifecycle_startup_timeout_override(self, command):
+        args = build_parser().parse_args(command + ["--startup-timeout", "75.5"])
+        assert args.startup_timeout == 75.5
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "not-a-number"])
+    def test_lifecycle_startup_timeout_rejects_invalid_values(self, value):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["start", "claw", "--startup-timeout", value])
 
     def test_stop_no_name(self):
         """'stop' with no name should parse successfully."""
@@ -572,6 +604,70 @@ class TestCmdStart:
             rc = cmd_start(args)
 
         assert rc == 1
+
+    def test_start_single_uses_timeout_and_reports_log(
+        self, multi_agent_env, capsys
+    ):
+        """A slow agent gets the requested deadline and an actionable error."""
+        args = build_parser().parse_args(
+            ["start", "claw", "--startup-timeout", "42"]
+        )
+
+        with patch(
+            "kestrel_sovereign.cli._get_project_dir",
+            return_value=multi_agent_env,
+        ), patch.object(ProcessManager, "start_agent"), patch.object(
+            ProcessManager,
+            "wait_for_health",
+            return_value=False,
+        ) as wait_for_health:
+            rc = cmd_start(args)
+
+        assert rc == 1
+        wait_for_health.assert_called_once_with(18801, timeout=42.0)
+        output = capsys.readouterr().out
+        assert "claw did not become healthy within 42s" in output
+        assert str(multi_agent_env / "agent_data" / "claw" / "agent.log") in output
+
+    def test_start_all_forwards_timeout_to_inprocess_mode(
+        self, multi_agent_env
+    ):
+        args = build_parser().parse_args(["start", "--startup-timeout", "42"])
+
+        with patch(
+            "kestrel_sovereign.cli._get_project_dir",
+            return_value=multi_agent_env,
+        ), patch(
+            "kestrel_sovereign.cli_lifecycle._start_inprocess_mode",
+            return_value=0,
+        ) as start_inprocess:
+            rc = cmd_start(args)
+
+        assert rc == 0
+        assert start_inprocess.call_args.kwargs["startup_timeout"] == 42.0
+
+    def test_start_all_uses_timeout_and_reports_host_log(
+        self, multi_agent_env, capsys
+    ):
+        multi_agent = MultiAgentConfig.load(multi_agent_env / "multi_agent.toml")
+        pm = MagicMock(spec=ProcessManager)
+        pm.read_pid.return_value = None
+        pm.is_port_in_use.return_value = False
+        pm._load_env.return_value = {}
+        pm.wait_for_health.return_value = False
+
+        rc = _start_inprocess_mode(
+            multi_agent_env,
+            multi_agent,
+            pm,
+            startup_timeout=42.0,
+        )
+
+        assert rc == 1
+        pm.wait_for_health.assert_called_once_with(18888, timeout=42.0)
+        output = capsys.readouterr().out
+        assert "Server did not become healthy within 42s" in output
+        assert str(multi_agent_env / "logs" / "host.log") in output
 
 
 # -----------------------------------------------------------------------

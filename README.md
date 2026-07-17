@@ -162,6 +162,7 @@ kestrel restart                        # bring agents back so they see the new i
 ```bash
 kestrel update                       # pull + install + reconcile + feature sync + restart all agents
 kestrel update Emma                  # same, but only restart the named agent
+kestrel update Emma --startup-timeout 300 # allow extra time for feature-heavy startup
 kestrel update --dry-run             # preview the steps (incl. the reconcile plan) without mutating
 kestrel update --no-pull --no-install # only reconcile + feature sync + restart (e.g. after a manual checkout)
 kestrel update --no-features         # skip BOTH the reconcile and `feature sync` steps
@@ -173,6 +174,13 @@ kestrel update --no-uv-sync          # force `uv pip install -e .` for the insta
 kestrel update --no-deps             # pass --no-deps to `uv pip install` for the fast path
 kestrel update --continue-on-error   # proceed past a reconcile/sync error to the restart
 ```
+
+`kestrel start`, `kestrel restart`, and `kestrel update` share one readiness
+deadline while waiting for the server's `/health` endpoint. Use
+`--startup-timeout SECONDS` on any of those commands when a deployment needs a
+different deadline; each command's `--help` reports the current default. A
+timeout does not kill the process—the error names the log to inspect because
+initialization may still be in progress.
 
 **Reconcile step — host venv ⇆ agent allowlists.** Between the install and `feature sync` steps, `kestrel update` reconciles the host venv against `union(all [agents.*].features) + the mandatory features`. The per-agent `features` allowlist is a *filter*, not an *installer*: naming a feature class an agent doesn't have installed just makes it silently never load. Reconcile closes that gap — it resolves each required class to its package (live entry-points + in-tree bundled classes first, the static feature registry as fallback), then **installs** any that are missing and **updates** the rest. A class that no installed package, bundled feature, or catalogued package provides is a hard error (no blind fallback) — fix the allowlist or add the package to the registry.
 

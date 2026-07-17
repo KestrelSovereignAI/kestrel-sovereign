@@ -30,6 +30,12 @@ from kestrel_sovereign.multi_agent.config import (
 
 logger = logging.getLogger(__name__)
 
+# Feature discovery, provider catalog loading, and embedding-route validation
+# can legitimately take longer than the old 30-second lifecycle window. Keep
+# one default for every CLI start/restart/update path; callers may still pass a
+# shorter or longer operator-selected timeout explicitly.
+DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS = 120.0
+
 
 @dataclass
 class AgentProcess:
@@ -188,7 +194,10 @@ class ProcessManager:
             return False
 
     @staticmethod
-    def wait_for_health(port: int, timeout: int = 30) -> bool:
+    def wait_for_health(
+        port: int,
+        timeout: float = DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    ) -> bool:
         """Wait for a server's /health endpoint to respond 200."""
         import urllib.request
         import urllib.error

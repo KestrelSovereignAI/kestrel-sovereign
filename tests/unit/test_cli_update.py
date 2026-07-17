@@ -99,6 +99,25 @@ def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir):
     ]
 
 
+def test_update_forwards_startup_timeout_to_restart(stub_project_dir):
+    """The update wrapper must preserve the operator's readiness deadline."""
+    seen = []
+
+    with patch.object(cli, "cmd_restart", lambda args: seen.append(args) or 0):
+        rc = cli.cmd_update(
+            _ns(
+                pull=False,
+                install=False,
+                features=False,
+                startup_timeout=75.5,
+            )
+        )
+
+    assert rc == 0
+    assert len(seen) == 1
+    assert seen[0].startup_timeout == 75.5
+
+
 def test_update_runs_feature_sync_before_reconcile(stub_project_dir):
     """feature sync MUST run before reconcile.
 
