@@ -632,7 +632,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             f"llm.{method}",
             input_value=span_input,
             model_name=model_override,
-            agent_name=self._agent_display_name,
+            # getattr: tests construct LLMService via __new__ (skipping __init__,
+            # see test_discovery_hang_regression), so the attribute may not exist.
+            agent_name=getattr(self, "_agent_display_name", None),
         ) as span:
             yield span
 
