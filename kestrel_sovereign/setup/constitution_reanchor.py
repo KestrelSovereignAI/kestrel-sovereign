@@ -3,8 +3,9 @@
 Drift detection ships in :mod:`kestrel_sovereign.doctor`. This module is
 the writer side: when an agent's anchored ``constitution_hash`` no longer
 matches the canonical file on disk, this helper updates **all five**
-DB locations in a single AsyncStorage session, plus a timestamped
-file-level backup so a botched run is recoverable.
+governance locations in a single AsyncStorage transaction, stores the verified
+authorization artifact, and takes a timestamped file-level backup so a botched
+run is recoverable.
 
 The five places inception writes the constitution to (per
 ``inception_service.py:388``):
@@ -45,8 +46,17 @@ from kestrel_sovereign.constitution.emancipation import (
     contract_to_json,
     parse_emancipation_block,
 )
+from kestrel_sovereign.constitution.amendment_artifact import (
+    AmendmentArtifactError,
+    AmendmentArtifactVerification,
+    load_verified_reanchor_artifact,
+)
 from kestrel_sovereign.constitution.resolver import (
     resolve_governing_constitution_bytes,
+)
+from kestrel_sovereign.constitution.trust_root import (
+    SovereignTrustRootError,
+    load_sovereign_trust_root,
 )
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
 
@@ -86,6 +96,8 @@ async def reanchor_constitution(
     force: bool,
     authorization: str = "kestrel constitution reanchor",
     kestrel_toml_path: Path | None = None,
+    amendment_artifact_path: Path | None = None,
+    sovereign_trust_root_path: Path | None = None,
 ) -> ReanchorResult:
     """Reanchor one agent to the current canonical constitution.
 
@@ -124,6 +136,12 @@ async def reanchor_constitution(
             block is parsed and Iron-Rule-checked against the agent's
             anchored contract. When None, no comparison is made and the
             anchored contract is preserved as-is.
+        amendment_artifact_path: Detached Sovereign-signed reanchor artifact.
+            Required before any forced write, including an emancipation
+            sidecar backfill.
+        sovereign_trust_root_path: Optional explicit operator-owned JSON DID
+            document. The shared resolver also reads
+            ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH`` and rejects conflicts.
     """
     db_path = agent_dir / "kestrel_prime.db"
     if not db_path.exists():
@@ -292,6 +310,50 @@ async def reanchor_constitution(
             drift_unforced=True,
         )
 
+    # Authorization is a pre-write gate. The graph DB is the object being
+    # protected, so neither its root properties nor any material derived from
+    # them is consulted here (#2499). Complete root resolution, artifact IO,
+    # and signature verification before even taking the backup.
+    if amendment_artifact_path is None:
+        return ReanchorResult(
+            agent_name=agent_name,
+            db_path=db_path,
+            canonical_path=canonical_path,
+            old_hash=old_hash,
+            new_hash=new_hash,
+            backup_path=None,
+            error=(
+                "A Sovereign-signed amendment artifact is required for a "
+                "forced reanchor. Pass --signed-artifact and configure the "
+                "external Sovereign trust root."
+            ),
+        )
+
+    try:
+        trusted_did_document = load_sovereign_trust_root(
+            explicit_path=sovereign_trust_root_path,
+            agent_dids={agent_did},
+        )
+        (
+            amendment_artifact_bytes,
+            amendment_artifact,
+            amendment_verification,
+        ) = load_verified_reanchor_artifact(
+            amendment_artifact_path,
+            trusted_did_document=trusted_did_document,
+            expected_constitution_sha256=new_hash,
+        )
+    except (SovereignTrustRootError, AmendmentArtifactError) as exc:
+        return ReanchorResult(
+            agent_name=agent_name,
+            db_path=db_path,
+            canonical_path=canonical_path,
+            old_hash=old_hash,
+            new_hash=new_hash,
+            backup_path=None,
+            error=str(exc),
+        )
+
     backup_path = _backup_db(db_path)
     logger.info("Backed up agent DB to %s before reanchor", backup_path)
 
@@ -315,6 +377,10 @@ async def reanchor_constitution(
             canonical_path=canonical_path,
             authorization=authorization,
             emancipation_contract_json=contract_json_to_write,
+            amendment_artifact_path=amendment_artifact_path,
+            amendment_artifact_bytes=amendment_artifact_bytes,
+            amendment_artifact=amendment_artifact,
+            amendment_verification=amendment_verification,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
         logger.exception("Reanchor failed; backup retained at %s", backup_path)
@@ -370,9 +436,13 @@ async def _write_reanchor(
     new_content: bytes,
     canonical_path: Path,
     authorization: str,
-    emancipation_contract_json: dict | None = None,
+    emancipation_contract_json: dict | None,
+    amendment_artifact_path: Path,
+    amendment_artifact_bytes: bytes,
+    amendment_artifact: dict,
+    amendment_verification: AmendmentArtifactVerification,
 ) -> None:
-    """Apply the five-location reanchor atomically.
+    """Apply the five governance locations plus authorization atomically.
 
     Wrapped in ``storage.db.transaction()``: every mutation below is
     a single SQLite transaction with automatic rollback on exception.
@@ -415,6 +485,19 @@ async def _write_reanchor(
                     f"File store hash mismatch: stored {stored_hash}, expected {new_hash}"
                 )
 
+            artifact_hash = await storage.files.store_file(
+                amendment_artifact_bytes,
+                "KESTREL_CONSTITUTION.reanchor.signed.json",
+            )
+            expected_artifact_hash = hashlib.sha256(
+                amendment_artifact_bytes
+            ).hexdigest()
+            if artifact_hash != expected_artifact_hash:
+                raise RuntimeError(
+                    "Artifact store hash mismatch: stored "
+                    f"{artifact_hash}, expected {expected_artifact_hash}"
+                )
+
             # 2. Document graph node for the new constitution.
             await storage.graph.add_node(
                 GraphNode(
@@ -425,6 +508,24 @@ async def _write_reanchor(
                         "hash": new_hash,
                         "type": "Constitution",
                         "created_at": _now_iso(),
+                    },
+                )
+            )
+            await storage.graph.add_node(
+                GraphNode(
+                    node_id=artifact_hash,
+                    node_type="constitution_amendment_artifact",
+                    label="Signed Constitution Reanchor Artifact",
+                    properties={
+                        "hash": artifact_hash,
+                        "type": "SignedConstitutionAmendment",
+                        "artifact_type": amendment_artifact.get("artifact_type"),
+                        "constitution_hash": new_hash,
+                        "signer": amendment_verification.signer,
+                        "source_path": str(amendment_artifact_path),
+                        "created_at": amendment_artifact.get("created_at"),
+                        "anchored_at": _now_iso(),
+                        "verification": amendment_verification.reason,
                     },
                 )
             )
@@ -454,6 +555,10 @@ async def _write_reanchor(
                 "new_hash": new_hash,
                 "source_path": str(canonical_path),
                 "authorization": authorization,
+                "signed_artifact_hash": artifact_hash,
+                "signed_artifact_path": str(amendment_artifact_path),
+                "signed_artifact_signer": amendment_verification.signer,
+                "signed_artifact_verification": amendment_verification.reason,
             }
             # Anchor (or refresh) the structured contract receipt.
             # Idempotent for the unchanged-active case; performs the

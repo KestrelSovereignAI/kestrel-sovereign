@@ -2,7 +2,7 @@
 
 These tests mock out the async reanchor helper — they assert on the
 *CLI behaviour* (argument parsing, exit codes, messaging, refusal
-gates). The real five-location DB rewrite is exercised end-to-end in
+gates). The real governance rewrite and authorization record are exercised in
 ``tests/integration/test_constitution_reanchor_e2e.py``.
 """
 
@@ -70,6 +70,16 @@ def test_reanchor_accepts_constitution_path_override():
         "--constitution-path", "/tmp/custom.md",
     ])
     assert args.constitution_path == "/tmp/custom.md"
+
+
+def test_reanchor_parses_external_authority_paths():
+    args = _parse([
+        "constitution", "reanchor", "--agent-name", "Test", "--force",
+        "--signed-artifact", "/secure/reanchor.signed.json",
+        "--trust-root", "/secure/sovereign-root.did.json",
+    ])
+    assert args.signed_artifact == "/secure/reanchor.signed.json"
+    assert args.trust_root == "/secure/sovereign-root.did.json"
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +227,43 @@ def test_reanchor_helper_error_propagates(reanchor_env, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "Cannot read canonical constitution" in err
+
+
+def test_reanchor_passes_authority_paths_to_shared_helper(reanchor_env):
+    args = _parse([
+        "constitution", "reanchor", "--agent-name", "Test", "--force",
+        "--signed-artifact", "/secure/reanchor.signed.json",
+        "--trust-root", "/secure/sovereign-root.did.json",
+    ])
+    result = ReanchorResult(
+        agent_name="Test",
+        db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+        canonical_path=Path("/fake/canonical.md"),
+        old_hash="a" * 64,
+        new_hash="a" * 64,
+        backup_path=None,
+        unchanged=True,
+    )
+    captured = {}
+
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+        return result
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 0
+
+    assert captured["amendment_artifact_path"] == Path(
+        "/secure/reanchor.signed.json"
+    )
+    assert captured["sovereign_trust_root_path"] == Path(
+        "/secure/sovereign-root.did.json"
+    )
 
 
 # ---------------------------------------------------------------------------

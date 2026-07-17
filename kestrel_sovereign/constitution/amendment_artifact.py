@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -23,6 +24,7 @@ from kestrel_sovereign.security.verify_policy import VerifyPolicy
 
 ARTIFACT_TYPE = "kestrel.constitution.reanchor.v1"
 ARTIFACT_VERSION = 1
+MAX_REANCHOR_ARTIFACT_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,10 @@ class AmendmentArtifactVerification:
     reason: str
     signer: str = ""
     constitution_sha256: str = ""
+
+
+class AmendmentArtifactError(ValueError):
+    """A detached reanchor artifact cannot be read or verified."""
 
 
 def canonical_amendment_bytes(artifact: Mapping[str, Any]) -> bytes:
@@ -234,6 +240,56 @@ def verify_reanchor_artifact(
         signer,
         constitution_sha256,
     )
+
+
+def load_verified_reanchor_artifact(
+    artifact_path: str | Path,
+    *,
+    trusted_did_document: Mapping[str, Any],
+    expected_constitution_sha256: str,
+) -> tuple[bytes, dict[str, Any], AmendmentArtifactVerification]:
+    """Read and verify one detached artifact without mutating any state.
+
+    Runtime chat reanchor and the offline CLI both use this function so their
+    authorization semantics cannot drift.  Callers must complete this
+    preflight before taking a backup or opening a write transaction.
+    """
+
+    path = Path(artifact_path)
+    try:
+        with path.open("rb") as artifact_file:
+            artifact_bytes = artifact_file.read(MAX_REANCHOR_ARTIFACT_BYTES + 1)
+        if len(artifact_bytes) > MAX_REANCHOR_ARTIFACT_BYTES:
+            raise AmendmentArtifactError(
+                f"Signed amendment artifact {path} exceeds the "
+                f"{MAX_REANCHOR_ARTIFACT_BYTES}-byte maximum."
+            )
+        artifact = json.loads(artifact_bytes.decode("utf-8"))
+    except AmendmentArtifactError:
+        raise
+    except FileNotFoundError as exc:
+        raise AmendmentArtifactError(
+            f"Signed amendment artifact not found: {path}"
+        ) from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AmendmentArtifactError(
+            f"Failed to read signed amendment artifact {path}: {exc}"
+        ) from exc
+    if not isinstance(artifact, dict):
+        raise AmendmentArtifactError(
+            f"Signed amendment artifact {path} must contain one JSON object."
+        )
+
+    verification = verify_reanchor_artifact(
+        artifact,
+        trusted_did_document=trusted_did_document,
+        expected_constitution_sha256=expected_constitution_sha256,
+    )
+    if not verification.ok:
+        raise AmendmentArtifactError(
+            f"Signed amendment verification failed: {verification.reason}"
+        )
+    return artifact_bytes, artifact, verification
 
 
 def did_document_from_legacy_public_key(

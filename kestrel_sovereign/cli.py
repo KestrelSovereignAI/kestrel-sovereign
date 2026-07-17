@@ -927,6 +927,12 @@ def cmd_constitution_reanchor(args) -> int:
             force=args.force,
             authorization=f"kestrel constitution reanchor (cli, {args.agent_name})",
             kestrel_toml_path=project_dir / "kestrel.toml",
+            amendment_artifact_path=(
+                Path(args.signed_artifact) if args.signed_artifact else None
+            ),
+            sovereign_trust_root_path=(
+                Path(args.trust_root) if args.trust_root else None
+            ),
         )
     )
 
@@ -1776,6 +1782,21 @@ def build_parser() -> argparse.ArgumentParser:
     reanchor_p.add_argument(
         "--constitution-path", default=None,
         help="Override the canonical constitution path (defaults to package's KESTREL_CONSTITUTION.md)",
+    )
+    reanchor_p.add_argument(
+        "--signed-artifact", default=None,
+        help=(
+            "Detached Sovereign-signed reanchor artifact. Required with "
+            "--force; drift-only inspection does not require it."
+        ),
+    )
+    reanchor_p.add_argument(
+        "--trust-root", default=None,
+        help=(
+            "Operator-owned JSON DID document used to verify the artifact. "
+            "Defaults to KESTREL_SOVEREIGN_TRUST_ROOT_PATH; conflicting "
+            "sources fail closed."
+        ),
     )
 
     anchor_overlay_p = constitution_sub.add_parser(

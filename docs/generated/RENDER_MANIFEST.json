@@ -738,9 +738,13 @@
         "kestrel_sovereign/data/KESTREL_CONSTITUTION.md",
         "kestrel_sovereign/features/compute/executors/docker_executor.py"
       ],
-      "findings": [],
+      "findings": [
+        "missing_local_links"
+      ],
       "missing_code_refs": [],
-      "missing_links": [],
+      "missing_links": [
+        "security/SOVEREIGN_TRUST_ROOT.md"
+      ],
       "path": "docs/architecture/computer_use.md",
       "privacy": "public",
       "render": "internal",
@@ -991,9 +995,13 @@
       "existing_code_refs": [
         "tests/integration/test_constitution_embedding.py"
       ],
-      "findings": [],
+      "findings": [
+        "missing_local_links"
+      ],
       "missing_code_refs": [],
-      "missing_links": [],
+      "missing_links": [
+        "SOVEREIGN_TRUST_ROOT.md"
+      ],
       "path": "docs/architecture/security/CONSTITUTION_EMBEDDING.md",
       "privacy": "public",
       "render": "internal",
@@ -1236,6 +1244,18 @@
       "status": "needs-revalidation",
       "title": "Serialization Compatibility Matrix",
       "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/security/SOVEREIGN_TRUST_ROOT.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "current",
+      "title": "Sovereign Constitution Trust Root",
+      "type": "Security Runbook"
     },
     {
       "existing_code_refs": [

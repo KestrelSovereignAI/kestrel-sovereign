@@ -1,6 +1,6 @@
 """End-to-end test for ``kestrel constitution reanchor``.
 
-Real DB. Real inception. Real five-location update. The unit tests
+Real DB. Real inception. Real governance update plus signed authorization. The unit tests
 mock the helper; this exercises the full path so we catch any
 mismatch between the helper's intent and the storage layer's actual
 behaviour.
@@ -26,11 +26,17 @@ as the existing ``test_constitution_embedding.py`` suite. Marked
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.constitution.amendment_artifact import (
+    build_legacy_signed_reanchor_artifact,
+    did_document_from_legacy_public_key,
+)
+from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
 from kestrel_sovereign.storage import AsyncStorage
 
@@ -61,6 +67,43 @@ Calibrated uncertainty (added in v2).
 
 This is version 2. The agent must reanchor to pick this up.
 """ * 5
+
+_SUITE = Secp256k1Suite()
+_ROOT_KEYPAIR = _SUITE.generate_keypair()
+_ROOT_DID = "did:pkh:eip155:1:0x0000000000000000000000000000000000002499"
+_ROOT_DID_DOCUMENT = did_document_from_legacy_public_key(
+    _ROOT_DID,
+    _ROOT_KEYPAIR.public_key,
+)
+
+
+def _write_authority_files(
+    tmp_path: Path,
+    constitution_content: bytes,
+    *,
+    did: str = _ROOT_DID,
+    keypair=_ROOT_KEYPAIR,
+    did_document=None,
+) -> tuple[Path, Path]:
+    """Write an operator root pin and matching detached artifact."""
+    constitution_hash = hashlib.sha256(constitution_content).hexdigest()
+    root_path = tmp_path / f"{did.rsplit(':', 1)[-1]}-root.did.json"
+    root_path.write_text(
+        json.dumps(
+            did_document
+            or did_document_from_legacy_public_key(did, keypair.public_key)
+        ),
+        encoding="utf-8",
+    )
+    artifact = build_legacy_signed_reanchor_artifact(
+        signer_did=did,
+        constitution_sha256=constitution_hash,
+        private_key=keypair.private_key,
+        reason="integration test",
+    )
+    artifact_path = tmp_path / f"{did.rsplit(':', 1)[-1]}-reanchor.signed.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    return artifact_path, root_path
 
 
 @pytest.mark.asyncio
@@ -102,6 +145,11 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     constitution_path.write_bytes(CONSTITUTION_V2)
     v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
     assert v2_hash != v1_hash
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V2,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
 
     # ---- 4. Reanchor with force ----
     result = await reanchor_constitution(
@@ -110,6 +158,8 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
         canonical_path=constitution_path,
         force=True,
         authorization="integration-test",
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
     )
     assert result.reanchored, f"reanchor failed: {result.error}"
     assert result.old_hash == v1_hash
@@ -227,19 +277,30 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
 
     constitution_path.write_bytes(CONSTITUTION_V2)
     pre = await _snapshot(db_path, creds.agent_did)
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V2,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
 
     # Boom: make the last write inside the transaction raise.
-    # `_now_iso` is called twice in `_write_reanchor` — once for the
-    # new document node's `created_at` (early) and once for the audit
+    # `_now_iso` is called three times in `_write_reanchor` — for the
+    # new document node, the signed artifact node, and finally the audit
     # record's `timestamp` (right before the final agent-node update).
-    # Using a side_effect that succeeds the first call and raises
-    # the second targets the *last* mutation specifically — so all
+    # Using a side_effect that succeeds twice and raises on the third
+    # targets the *last* mutation specifically — so all
     # earlier writes have happened and rollback has real work to do.
     real_now = __import__(
         "kestrel_sovereign.setup.constitution_reanchor",
         fromlist=["_now_iso"],
     )._now_iso
-    boom = mock.Mock(side_effect=[real_now(), RuntimeError("simulated mid-write failure")])
+    boom = mock.Mock(
+        side_effect=[
+            real_now(),
+            real_now(),
+            RuntimeError("simulated mid-write failure"),
+        ]
+    )
 
     with mock.patch(
         "kestrel_sovereign.setup.constitution_reanchor._now_iso",
@@ -250,6 +311,8 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
             agent_dir=agent_dir,
             canonical_path=constitution_path,
             force=True,
+            amendment_artifact_path=artifact_path,
+            sovereign_trust_root_path=trust_root_path,
         )
 
     # The helper must report the failure clearly.
@@ -299,6 +362,79 @@ async def test_reanchor_drift_unforced_does_not_write(tmp_path, monkeypatch):
     assert pre == post
 
 
+@pytest.mark.asyncio
+async def test_db_injected_root_and_hash_leave_real_db_unchanged(
+    tmp_path, monkeypatch,
+):
+    """A self-consistent attacker root in graph properties has no authority."""
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "CompromisedAgent"
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="CompromisedAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+
+    attacker_keypair = _SUITE.generate_keypair()
+    attacker_did = (
+        "did:pkh:eip155:1:0x000000000000000000000000000000000000bad0"
+    )
+    attacker_doc = did_document_from_legacy_public_key(
+        attacker_did,
+        attacker_keypair.public_key,
+    )
+    async with AsyncStorage(str(db_path)) as storage:
+        agent = await storage.graph.get_node(creds.agent_did)
+        agent.properties.update(
+            {
+                "constitution_hash": "attacker-overwrote-constitution-hash",
+                "sovereign_root_did_document": attacker_doc,
+                "trusted_sovereign_did_document": attacker_doc,
+                "sovereign_root_did": attacker_did,
+                "sovereign_root_public_key_hex": attacker_doc["publicKey"][0][
+                    "publicKeyHex"
+                ],
+            }
+        )
+        await storage.graph.add_node(agent)
+
+    attacker_artifact, _ = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V2,
+        did=attacker_did,
+        keypair=attacker_keypair,
+        did_document=attacker_doc,
+    )
+    _, legitimate_root = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V2,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+    pre = await _snapshot(db_path, creds.agent_did)
+
+    result = await reanchor_constitution(
+        agent_name="CompromisedAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=attacker_artifact,
+        sovereign_trust_root_path=legitimate_root,
+    )
+
+    assert result.error is not None
+    assert "not trusted Sovereign DID" in result.error
+    assert result.backup_path is None
+    assert list(agent_dir.glob("*.backup-*")) == []
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post == pre
+
+
 # ---------------------------------------------------------------------------
 # Snapshot helper
 # ---------------------------------------------------------------------------
@@ -329,6 +465,7 @@ async def _snapshot(db_path: Path, agent_did: str) -> dict:
             chunks_for[h] = len(chunks)
 
         return {
+            "agent_properties": agent.properties,
             "agent_constitution_hash": agent.properties.get("constitution_hash"),
             "agent_audit": agent.properties.get("constitution_reanchor"),
             "document_node_ids": document_node_ids,
