@@ -2312,7 +2312,7 @@ dependencies = [
     { name = "iniconfig" },
     { name = "itsdangerous" },
     { name = "kestrel-llms", extra = ["all"] },
-    { name = "kestrel-sovereign-sdk" },
+    { name = "kestrel-sovereign-sdk", extra = ["tracing"] },
     { name = "networkx" },
     { name = "numpy" },
     { name = "ollama" },
@@ -2354,7 +2354,7 @@ all-features = [
     { name = "azure-mgmt-appcontainers" },
     { name = "diffusers" },
     { name = "google-cloud-run" },
-    { name = "kestrel-sovereign-sdk", extra = ["metrics"] },
+    { name = "kestrel-sovereign-sdk", extra = ["metrics", "tracing"] },
     { name = "numpy" },
     { name = "ollama" },
     { name = "opentelemetry-api" },
@@ -2393,7 +2393,7 @@ full = [
     { name = "azure-mgmt-appcontainers" },
     { name = "diffusers" },
     { name = "google-cloud-run" },
-    { name = "kestrel-sovereign-sdk", extra = ["metrics"] },
+    { name = "kestrel-sovereign-sdk", extra = ["metrics", "tracing"] },
     { name = "numpy" },
     { name = "ollama" },
     { name = "opentelemetry-api" },
@@ -2436,7 +2436,7 @@ ml = [
     { name = "transformers" },
 ]
 observability = [
-    { name = "kestrel-sovereign-sdk", extra = ["metrics"] },
+    { name = "kestrel-sovereign-sdk", extra = ["metrics", "tracing"] },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-instrumentation-fastapi" },
@@ -2513,8 +2513,8 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["search"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
-    { name = "kestrel-sovereign-sdk", specifier = ">=0.30.0,<0.31" },
-    { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'observability'", specifier = ">=0.30.0,<0.31" },
+    { name = "kestrel-sovereign-sdk", extras = ["metrics", "tracing"], marker = "extra == 'observability'", specifier = ">=0.30.1,<0.31" },
+    { name = "kestrel-sovereign-sdk", extras = ["tracing"], specifier = ">=0.30.1,<0.31" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
     { name = "numpy", marker = "extra == 'local'", specifier = "==2.4.6" },
@@ -2592,19 +2592,24 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.30.0"
+version = "0.30.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/91/2e/89ead5260508517bf53db039bd39dd50c19f6bb0655b1247329173590fd3/kestrel_sovereign_sdk-0.30.0.tar.gz", hash = "sha256:e3fc5853d45d0c20e91e9bd850fcee8901be9206262ddaa6dfecb3f84c9bc398", size = 120807, upload-time = "2026-07-13T17:17:31.513Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/3e/f246e38d527260983c6c1813814e8103635c97fc10a65fb33a286e69fc9a/kestrel_sovereign_sdk-0.30.1.tar.gz", hash = "sha256:97292c8801ecf0cbd6e7f76e10ba78dde732efd078161aef2d1fdeba8777d4fb", size = 126202, upload-time = "2026-07-17T14:36:56.525Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8d/bb/1fb200567c059ad134d2da9b04d833cce199ce93e48136611b8452d48622/kestrel_sovereign_sdk-0.30.0-py3-none-any.whl", hash = "sha256:e03da151e01031ea01403240f8c68a99ce1e67112bc5acd4cb29ff63c0b8ec62", size = 152217, upload-time = "2026-07-13T17:17:29.866Z" },
+    { url = "https://files.pythonhosted.org/packages/04/15/13c05ebd224a51b8c5afdac879a06db3a891a39b4b0884dedb7c4dc32015/kestrel_sovereign_sdk-0.30.1-py3-none-any.whl", hash = "sha256:a44544c80bfdd7aeea3beb4eab37c6413b10d9dc4c5adb8aee20dd1588d94241", size = 157988, upload-time = "2026-07-17T14:36:55.044Z" },
 ]
 
 [package.optional-dependencies]
 metrics = [
     { name = "prometheus-client" },
+]
+tracing = [
+    { name = "openinference-semantic-conventions" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
 ]
 
 [[package]]
@@ -3183,6 +3188,15 @@ wheels = [
 ]
 
 [[package]]
+name = "openinference-semantic-conventions"
+version = "0.1.30"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/51/8ba1182ee86fc79793d5ff2d11e7fdcda10ded2d01f3e46ca6fcf0568213/openinference_semantic_conventions-0.1.30.tar.gz", hash = "sha256:81fece76e09c83789e35c393b8b30523481eeabf1008745b955631a53e3221d9", size = 13391, upload-time = "2026-05-22T21:10:44.065Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/76/5b7e78cf0de38589b821bbe8e9c29c59a6e76edfb980488d0854cbb90f7c/openinference_semantic_conventions-0.1.30-py3-none-any.whl", hash = "sha256:36d946d3f95f699b7c4b12324ae9c1f02d6c7750df11eece56aa159cff430b3d", size = 10911, upload-time = "2026-05-22T21:10:43.04Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.38.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3223,6 +3237,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a2/c0/43222f5b97dc10812bc4f0abc5dc7cd0a2525a91b5151d26c9e2e958f52e/opentelemetry_exporter_otlp_proto_grpc-1.38.0.tar.gz", hash = "sha256:2473935e9eac71f401de6101d37d6f3f0f1831db92b953c7dcc912536158ebd6", size = 24676, upload-time = "2025-10-16T08:35:53.83Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/28/f0/bd831afbdba74ca2ce3982142a2fad707f8c487e8a3b6fef01f1d5945d1b/opentelemetry_exporter_otlp_proto_grpc-1.38.0-py3-none-any.whl", hash = "sha256:7c49fd9b4bd0dbe9ba13d91f764c2d20b0025649a6e4ac35792fb8d84d764bc7", size = 19695, upload-time = "2025-10-16T08:35:35.053Z" },
+]
+
+[[package]]
+name = "opentelemetry-exporter-otlp-proto-http"
+version = "1.38.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-common" },
+    { name = "opentelemetry-proto" },
+    { name = "opentelemetry-sdk" },
+    { name = "requests" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/0a/debcdfb029fbd1ccd1563f7c287b89a6f7bef3b2902ade56797bfd020854/opentelemetry_exporter_otlp_proto_http-1.38.0.tar.gz", hash = "sha256:f16bd44baf15cbe07633c5112ffc68229d0edbeac7b37610be0b2def4e21e90b", size = 17282, upload-time = "2025-10-16T08:35:54.422Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/77/154004c99fb9f291f74aa0822a2f5bbf565a72d8126b3a1b63ed8e5f83c7/opentelemetry_exporter_otlp_proto_http-1.38.0-py3-none-any.whl", hash = "sha256:84b937305edfc563f08ec69b9cb2298be8188371217e867c1854d77198d0825b", size = 19579, upload-time = "2025-10-16T08:35:36.269Z" },
 ]
 
 [[package]]
