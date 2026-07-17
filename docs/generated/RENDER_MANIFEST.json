@@ -738,13 +738,9 @@
         "kestrel_sovereign/data/KESTREL_CONSTITUTION.md",
         "kestrel_sovereign/features/compute/executors/docker_executor.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "security/SOVEREIGN_TRUST_ROOT.md"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/computer_use.md",
       "privacy": "public",
       "render": "internal",
@@ -995,13 +991,9 @@
       "existing_code_refs": [
         "tests/integration/test_constitution_embedding.py"
       ],
-      "findings": [
-        "missing_local_links"
-      ],
+      "findings": [],
       "missing_code_refs": [],
-      "missing_links": [
-        "SOVEREIGN_TRUST_ROOT.md"
-      ],
+      "missing_links": [],
       "path": "docs/architecture/security/CONSTITUTION_EMBEDDING.md",
       "privacy": "public",
       "render": "internal",
