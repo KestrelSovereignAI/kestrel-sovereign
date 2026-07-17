@@ -27,8 +27,13 @@
 
 // @ts-check
 const { test, expect } = require('@playwright/test');
+const path = require('path');
 
 const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
+const REALTIME_CLIENT_PATH = path.resolve(
+  __dirname,
+  '../../kestrel_sovereign/static/js/voice/realtime.js',
+);
 
 // ---------------------------------------------------------------------------
 // Browser-side stubs — installed before page scripts run.
@@ -438,6 +443,84 @@ test.describe('Voice UI shell', () => {
     expect(messages[0].cls).toContain('user-message');
     expect(messages[1].text).toContain('Agent answer first.');
     expect(messages[1].cls).toContain('agent-message');
+  });
+
+  test('xAI cumulative transcript completions update one user bubble until VAD finalizes', async ({ page }) => {
+    // Keep this browser regression hermetic when it is pointed at an already
+    // running Kestrel server: execute the realtime client from this checkout.
+    await page.route('**/js/voice/realtime.js*', (route) =>
+      route.fulfill({ path: REALTIME_CLIENT_PATH, contentType: 'text/javascript' }),
+    );
+    await installRoutes(page, { sessionBody: MOCK_XAI_REALTIME_SESSION });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    await page.locator('#voice-toggle-btn').click();
+    await expect.poll(() => page.evaluate(() => window.__voiceStub.recorded.wsOpens)).toBe(1);
+    await page.evaluate(() => {
+      window.__voiceStub.pushWs(JSON.stringify({
+        type: 'session.created',
+        session: { id: 'sess_xai_stub', model: 'grok-voice-realtime-stub' },
+      }));
+    });
+    await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
+    const initialMessageCount = await page.locator('.message').count();
+
+    await page.evaluate(() => {
+      const push = (event) => window.__voiceStub.pushWs(JSON.stringify(event));
+      const item_id = 'xai-user-item-1';
+      push({ type: 'input_audio_buffer.speech_started', item_id });
+      for (const transcript of [
+        'Hey, am I',
+        "Hey, Emma, we're trying to",
+        "Hey, Emma, we're trying the xAI voice now.",
+        "Hey, Emma, we're trying the xAI voice now. How's it going?",
+      ]) {
+        push({
+          type: 'conversation.item.input_audio_transcription.updated',
+          item_id,
+          transcript,
+        });
+        // xAI currently emits this interim `completed` snapshot after each
+        // cumulative update, before VAD has stopped the utterance.
+        push({
+          type: 'conversation.item.input_audio_transcription.completed',
+          item_id,
+          transcript,
+        });
+      }
+    });
+
+    await expect(page.locator('.message')).toHaveCount(initialMessageCount + 1, { timeout: 5000 });
+    await expect(page.locator('.message').last()).toHaveText(
+      "Hey, Emma, we're trying the xAI voice now. How's it going?",
+    );
+
+    await page.evaluate(() => {
+      const push = (event) => window.__voiceStub.pushWs(JSON.stringify(event));
+      const item_id = 'xai-user-item-1';
+      const transcript = "Hey, Emma, we're trying the xAI voice now. How's it going?";
+      push({ type: 'input_audio_buffer.speech_stopped', item_id });
+      push({ type: 'input_audio_buffer.committed', item_id });
+      push({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id,
+        transcript,
+      });
+      // A repeated final for the same provider item must remain idempotent.
+      push({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id,
+        transcript,
+      });
+    });
+
+    await expect(page.locator('.message')).toHaveCount(initialMessageCount + 1, { timeout: 5000 });
+    await expect(page.locator('.message').last()).toHaveText(
+      "Hey, Emma, we're trying the xAI voice now. How's it going?",
+    );
+    await expect(page.locator('#chat-container')).not.toContainText('Transcribing...');
   });
 
   test('Realtime path removes stale transcribing placeholder when speech restarts', async ({ page }) => {

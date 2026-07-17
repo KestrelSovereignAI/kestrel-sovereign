@@ -8,6 +8,7 @@ import {
   base64ToBytes,
   buildRealtimeToolsSessionUpdate,
   bytesToBase64,
+  createUserTranscriptTracker,
   normalizeToolBatchResults,
   responseAllowsToolDispatch,
   resolveRealtimeSDPEndpoint,
@@ -34,6 +35,59 @@ test('PCM chunks round trip through provider WebSocket base64 encoding', () => {
 test('incremental and cumulative provider transcripts share one UI contract', () => {
   assert.equal(applyTranscriptUpdate('hello', ' world', false), 'hello world');
   assert.equal(applyTranscriptUpdate('hello wurld', 'hello world', true), 'hello world');
+});
+
+test('xAI interim completed snapshots remain one cumulative turn until VAD stops', () => {
+  const tracker = createUserTranscriptTracker();
+  const itemId = 'xai-user-item-1';
+  tracker.speechStarted();
+
+  const corrections = [
+    'Hey, am I',
+    "Hey, Emma, we're trying to",
+    "Hey, Emma, we're trying the xAI voice now.",
+    "Hey, Emma, we're trying the xAI voice now. How's it going?",
+  ];
+  for (const text of corrections) {
+    assert.deepEqual(
+      tracker.update(text, { cumulative: true, itemId }),
+      { state: 'delta', text, item_id: itemId },
+    );
+    assert.equal(
+      tracker.complete(text, { itemId, vendor: 'xai' }),
+      null,
+      'an unchanged pre-stop completed snapshot is not a final turn',
+    );
+  }
+
+  const completedCorrection = `${corrections.at(-1)} Great.`;
+  assert.deepEqual(
+    tracker.complete(completedCorrection, { itemId, vendor: 'xai' }),
+    { state: 'delta', text: completedCorrection, item_id: itemId },
+    'a pre-stop completed correction still updates the active bubble',
+  );
+
+  tracker.speechStopped(itemId);
+  tracker.committed(itemId);
+  assert.deepEqual(
+    tracker.complete(completedCorrection, { itemId, vendor: 'xai' }),
+    { state: 'final', text: completedCorrection, item_id: itemId },
+  );
+  assert.equal(
+    tracker.complete(completedCorrection, { itemId, vendor: 'xai' }),
+    null,
+    'a repeated final for one provider item is idempotent',
+  );
+});
+
+test('OpenAI completed transcript remains final without xAI VAD gating', () => {
+  const tracker = createUserTranscriptTracker();
+  tracker.speechStarted();
+  tracker.update('hello', { itemId: 'openai-item-1' });
+  assert.deepEqual(
+    tracker.complete('hello', { itemId: 'openai-item-1', vendor: 'openai' }),
+    { state: 'final', text: 'hello', item_id: 'openai-item-1' },
+  );
 });
 
 test('partial batch responses still produce one result per requested tool', () => {

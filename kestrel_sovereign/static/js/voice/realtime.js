@@ -69,6 +69,52 @@ export function applyTranscriptUpdate(current, text, cumulative = false) {
   return cumulative ? (text || '') : `${current || ''}${text || ''}`;
 }
 
+export function createUserTranscriptTracker() {
+  let cumulativeText = '';
+  const stoppedItemIds = new Set();
+  const finalizedItemIds = new Set();
+  let stoppedItemWithoutId = false;
+
+  return {
+    speechStarted() {
+      stoppedItemWithoutId = false;
+    },
+    speechStopped(itemId = '') {
+      if (itemId) stoppedItemIds.add(itemId);
+      else stoppedItemWithoutId = true;
+    },
+    committed(itemId = '') {
+      if (itemId) stoppedItemIds.add(itemId);
+      else stoppedItemWithoutId = true;
+    },
+    update(text, { cumulative = false, itemId = '' } = {}) {
+      cumulativeText = applyTranscriptUpdate(cumulativeText, text, cumulative);
+      return { state: 'delta', text: cumulativeText, item_id: itemId };
+    },
+    complete(text, { itemId = '', vendor = '' } = {}) {
+      if (itemId && finalizedItemIds.has(itemId)) return null;
+      const speechStopped = itemId
+        ? stoppedItemIds.has(itemId)
+        : stoppedItemWithoutId;
+      if (vendor === 'xai' && !speechStopped) {
+        const nextText = applyTranscriptUpdate(cumulativeText, text, true);
+        if (nextText === cumulativeText) return null;
+        cumulativeText = nextText;
+        return { state: 'delta', text: cumulativeText, item_id: itemId };
+      }
+
+      const finalText = text || cumulativeText;
+      if (itemId) {
+        finalizedItemIds.add(itemId);
+        stoppedItemIds.delete(itemId);
+      }
+      stoppedItemWithoutId = false;
+      cumulativeText = '';
+      return { state: 'final', text: finalText, item_id: itemId };
+    },
+  };
+}
+
 export function normalizeToolBatchResults(calls = [], results = []) {
   const byId = new Map(
     (Array.isArray(results) ? results : [])
@@ -150,7 +196,7 @@ export async function createRealtimeClient({
   const pendingPersists = new Set();   // in-flight /transcript POST promises
   let pendingToolEvents = [];          // tool cards to attach to next assistant turn
   let pendingToolCalls = [];           // collected until response.done
-  let cumulativeUserTranscript = '';
+  const userTranscriptTracker = createUserTranscriptTracker();
   let earlyAudioChunks = [];
   let earlyAudioBytes = 0;
   const maxEarlyAudioBytes = 24000 * 2 * 2; // two seconds of mono PCM16
@@ -289,39 +335,69 @@ export async function createRealtimeClient({
         // A barge-in abandons the prior response. Completed arguments from
         // that interrupted response must not execute or bleed into the next.
         pendingToolCalls = [];
+        userTranscriptTracker.speechStarted();
         playback?.flush?.();
         onEvent(makeEvent(Events.LISTENING_STARTED, {}));
         break;
       case 'input_audio_buffer.speech_stopped':
+        userTranscriptTracker.speechStopped(raw.item_id ?? '');
         onEvent(makeEvent(Events.LISTENING_STOPPED, {}));
         break;
-
-      case 'conversation.item.input_audio_transcription.delta':
-        cumulativeUserTranscript = applyTranscriptUpdate(
-          cumulativeUserTranscript, raw.delta ?? '', false,
-        );
-        onEvent(makeEvent(Events.USER_TRANSCRIPT_DELTA, {
-          text: cumulativeUserTranscript,
-          is_final: false,
-        }));
+      case 'input_audio_buffer.committed':
+        userTranscriptTracker.committed(raw.item_id ?? '');
         break;
-      case 'conversation.item.input_audio_transcription.updated': {
-        cumulativeUserTranscript = applyTranscriptUpdate(
-          cumulativeUserTranscript, raw.transcript ?? '', true,
-        );
+
+      case 'conversation.item.input_audio_transcription.delta': {
+        const transcript = userTranscriptTracker.update(raw.delta ?? '', {
+          cumulative: false,
+          itemId: raw.item_id ?? '',
+        });
         onEvent(makeEvent(Events.USER_TRANSCRIPT_DELTA, {
-          text: cumulativeUserTranscript,
+          text: transcript.text,
           is_final: false,
+          item_id: transcript.item_id,
         }));
         break;
       }
-      case 'conversation.item.input_audio_transcription.completed':
-        onEvent(makeEvent(Events.USER_TRANSCRIPT_FINAL, {
-          text: raw.transcript ?? '',
+      case 'conversation.item.input_audio_transcription.updated': {
+        const transcript = userTranscriptTracker.update(raw.transcript ?? '', {
+          cumulative: true,
+          itemId: raw.item_id ?? '',
+        });
+        onEvent(makeEvent(Events.USER_TRANSCRIPT_DELTA, {
+          text: transcript.text,
+          is_final: false,
+          item_id: transcript.item_id,
         }));
-        persistTurn('user', raw.transcript ?? '', raw.item_id);
-        cumulativeUserTranscript = '';
         break;
+      }
+      case 'conversation.item.input_audio_transcription.completed': {
+        const itemId = raw.item_id ?? '';
+        // xAI emits several cumulative `updated -> completed` snapshots for
+        // one item while VAD still considers the user to be speaking. Only
+        // the completed event after speech_stopped/committed is final. Treat
+        // earlier snapshots as corrections to the active bubble; finalizing
+        // each one produces a stack of progressively longer chat messages.
+        const transcript = userTranscriptTracker.complete(raw.transcript ?? '', {
+          itemId,
+          vendor: session?.vendor ?? '',
+        });
+        if (!transcript) break;
+        if (transcript.state === 'delta') {
+          onEvent(makeEvent(Events.USER_TRANSCRIPT_DELTA, {
+            text: transcript.text,
+            is_final: false,
+            item_id: transcript.item_id,
+          }));
+        } else {
+          onEvent(makeEvent(Events.USER_TRANSCRIPT_FINAL, {
+            text: transcript.text,
+            item_id: transcript.item_id,
+          }));
+          persistTurn('user', transcript.text, transcript.item_id);
+        }
+        break;
+      }
 
       case 'response.created':
         onEvent(makeEvent(Events.SPEAKING_STARTED, {}));
