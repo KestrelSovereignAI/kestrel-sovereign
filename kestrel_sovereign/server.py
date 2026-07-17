@@ -466,6 +466,50 @@ def _apply_platform_host_port(config, env) -> None:
         config.host.port = int(platform_port)
 
 
+# Total budget for Phoenix to become reachable after the host starts (#2589).
+# The host is already serving by the time this runs; this only bounds how long
+# the background task keeps (re)trying before it gives up and leaves /phoenix
+# returning 503 until Phoenix recovers.
+_PHOENIX_STARTUP_BUDGET_SECONDS = 180.0
+
+
+async def _supervise_phoenix_startup(supervisor) -> None:
+    """Bring Phoenix up in the background so host boot never blocks on it (#2589).
+
+    Runs ``supervisor.start`` (adopt-or-reap + spawn) off the event loop, then
+    polls reachability. It only re-invokes ``start`` if the child process died
+    outright — a still-starting child (creating its SQLite schema on first boot)
+    reports ``running`` and is left alone. Adopt-or-reap makes re-invocation
+    safe: a healthy orphan is adopted rather than duplicated.
+    """
+    import asyncio
+    import time as _time
+
+    try:
+        # Initial adopt-or-reap + spawn, off the event loop (subprocess launch +
+        # a short reachability probe).
+        await asyncio.to_thread(supervisor.start, wait_for_health=False)
+        deadline = _time.monotonic() + _PHOENIX_STARTUP_BUDGET_SECONDS
+        while _time.monotonic() < deadline:
+            if await supervisor.is_reachable():
+                logger.info("Phoenix trace backend is reachable.")
+                return
+            if not supervisor.running:
+                # The child exited before binding — try a fresh (re)start.
+                logger.info("Phoenix child not running yet — restarting.")
+                await asyncio.to_thread(supervisor.start, wait_for_health=False)
+            await asyncio.sleep(2.0)
+        logger.warning(
+            "Phoenix did not become reachable within %.0fs — /phoenix returns "
+            "503 until it recovers.",
+            _PHOENIX_STARTUP_BUDGET_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - Phoenix must never crash the host
+        logger.warning("Phoenix background supervision error: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the application's lifespan."""
@@ -479,6 +523,7 @@ async def lifespan(app: FastAPI):
     # (INV-SOLO zero-config wiring). Fully degrades when arize-phoenix is not
     # installed or KESTREL_PHOENIX_ENABLED=0 — the host is unaffected.
     app.state.phoenix = None
+    app.state.phoenix_task = None
     try:
         from kestrel_sovereign.phoenix_supervisor import (
             PhoenixSupervisor,
@@ -488,19 +533,25 @@ async def lifespan(app: FastAPI):
 
         if should_supervise_phoenix():
             supervisor = PhoenixSupervisor()
-            # Don't block agent boot on the health wait — the exporter connects
-            # lazily and the UI proxy tolerates a still-starting Phoenix.
-            if supervisor.start(wait_for_health=False):
-                app.state.phoenix = supervisor
-                # Zero-config (INV-SOLO): default the OTLP endpoint to the local
-                # Phoenix collector for this process AND for env inherited by
-                # spawned agents, unless the operator already set it.
-                endpoint = autowire_otlp_endpoint(os.environ)
-                if endpoint:
-                    logger.info(
-                        "OTEL_EXPORTER_OTLP_ENDPOINT auto-set to local Phoenix (%s)",
-                        endpoint,
-                    )
+            # Track the supervisor immediately so /phoenix + the mint can gate on
+            # reachability (503 until Phoenix answers). Zero-config (INV-SOLO):
+            # default the OTLP endpoint to the local Phoenix collector for this
+            # process AND for env inherited by spawned agents, unless the operator
+            # already set it.
+            app.state.phoenix = supervisor
+            endpoint = autowire_otlp_endpoint(os.environ)
+            if endpoint:
+                logger.info(
+                    "OTEL_EXPORTER_OTLP_ENDPOINT auto-set to local Phoenix (%s)",
+                    endpoint,
+                )
+            # Non-blocking first boot (#2589): Phoenix's first start (SQLite
+            # schema creation) can exceed the launcher's health window. Bring it
+            # up in the BACKGROUND (adopt-or-reap + retry) so the host's own
+            # /health never waits on Phoenix; /phoenix returns 503 until ready.
+            app.state.phoenix_task = asyncio.create_task(
+                _supervise_phoenix_startup(supervisor)
+            )
         else:
             from kestrel_sovereign.phoenix_supervisor import (
                 _running_under_pytest,
@@ -755,6 +806,14 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Error during agent shutdown: {e}")
 
     # Stop the supervised Phoenix subprocess (mirror of startup).
+    _phoenix_task = getattr(app.state, "phoenix_task", None)
+    if _phoenix_task is not None:
+        _phoenix_task.cancel()
+        try:
+            await _phoenix_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        app.state.phoenix_task = None
     _phoenix = getattr(app.state, "phoenix", None)
     if _phoenix is not None:
         try:
@@ -1472,7 +1531,11 @@ async def phoenix_embed_session(request: Request):
     )
 
     supervisor = _phoenix_supervisor(request)
-    if supervisor is None or not supervisor.running:
+    # Health is reachability, not child liveness (#2589): probe the Phoenix port
+    # so the mint tracks whatever is actually serving it, not a possibly-zombie
+    # tracked child. 503 until Phoenix answers (e.g. during first-boot schema
+    # creation).
+    if supervisor is None or not await supervisor.is_reachable():
         return _phoenix_not_enabled_json()
 
     caller = getattr(request.state, "caller", None)

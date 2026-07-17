@@ -179,6 +179,8 @@ def test_start_and_stop_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
     monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+    # No Phoenix already serving the port → adopt-or-reap falls through to spawn.
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
 
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
     # A pinned root_path was NOT given → resolved from supports_host_root_path.
@@ -203,6 +205,7 @@ def test_start_falls_back_when_root_path_unsupported(tmp_path, monkeypatch):
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
     monkeypatch.setattr(ps, "supports_host_root_path", lambda: False)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
 
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx")
     sup._root_path_override = None
@@ -223,6 +226,160 @@ def test_start_skips_when_disabled(tmp_path, monkeypatch):
     assert sup.start(wait_for_health=False) is False
     assert sup.running is False
     assert called["popen"] is False
+
+
+# ---------------------------------------------------------------------------
+# Adopt-or-reap orphans across restarts (#2589)
+# ---------------------------------------------------------------------------
+
+
+def test_adopt_existing_healthy_phoenix(tmp_path, monkeypatch):
+    """A hard-killed host leaks a still-serving child; the successor ADOPTS it
+    instead of spawning a second child into the held port (#2589)."""
+    _StubPopen.instances.clear()
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
+    monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+    # A healthy Phoenix already holds the port, owned by PID 9999.
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pids_listening_on_port", lambda self: [9999]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: bool(pid))
+    )
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
+    sup._root_path_override = None
+
+    assert sup.start(wait_for_health=False) is True
+    # Adopted, not spawned — no subprocess launched.
+    assert _StubPopen.instances == []
+    assert sup._adopted_pid == 9999
+    assert sup.process is None
+    # Tracked as running via the adopted PID (liveness), reachable via the port.
+    assert sup.running is True
+    # Pidfile now points at the adopted process so the NEXT successor can reap it.
+    assert sup.pid_file.read_text() == "9999"
+
+
+def test_adopt_reaps_split_brain_zombie(tmp_path, monkeypatch):
+    """Port served by the real listener (100) while the pidfile names a different
+    live PID (200) — the zombie that lost the race. Adopt 100, reap 200 (#2589)."""
+    _StubPopen.instances.clear()
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
+    monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pids_listening_on_port", lambda self: [100]
+    )
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid in (100, 200))
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor,
+        "_terminate_pid",
+        lambda self, pid, **k: reaped.append(pid),
+    )
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
+    sup._root_path_override = None
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup.pid_file.write_text("200")
+
+    assert sup.start(wait_for_health=False) is True
+    assert sup._adopted_pid == 100
+    assert reaped == [200]  # the zombie was reaped
+    assert _StubPopen.instances == []  # no second child spawned
+    assert sup.pid_file.read_text() == "100"
+
+
+def test_reap_stale_child_then_spawn(tmp_path, monkeypatch):
+    """Port not serving, but the pidfile names a live (hung/bound-failed) child.
+    Reap it so a fresh child can bind, then spawn (#2589)."""
+    _StubPopen.instances.clear()
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
+    monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 5150)
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor,
+        "_terminate_pid",
+        lambda self, pid, **k: reaped.append(pid),
+    )
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
+    sup._root_path_override = None
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup.pid_file.write_text("5150")  # leaked child from a hard-killed host
+
+    assert sup.start(wait_for_health=False) is True
+    assert reaped == [5150]  # stale child reaped
+    assert len(_StubPopen.instances) == 1  # then a fresh child spawned
+    assert sup._adopted_pid is None
+    assert sup.pid_file.read_text() == "4321"  # fresh child's PID
+
+
+def test_running_and_stop_track_adopted_pid(tmp_path, monkeypatch):
+    """``running`` reflects an adopted PID with no Popen handle, and ``stop``
+    reaps it so a graceful shutdown leaves no orphan (#2589)."""
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor, "_pid_alive", staticmethod(lambda pid: pid == 777)
+    )
+    reaped: list = []
+    monkeypatch.setattr(
+        ps.PhoenixSupervisor,
+        "_terminate_pid",
+        lambda self, pid, **k: reaped.append(pid),
+    )
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
+    sup.working_dir.mkdir(parents=True, exist_ok=True)
+    sup._adopted_pid = 777
+    sup.pid_file.write_text("777")
+
+    assert sup.process is None
+    assert sup.running is True  # tracked purely via the adopted PID
+
+    sup.stop()
+    assert reaped == [777]
+    assert sup._adopted_pid is None
+    assert not sup.pid_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Reachability = health (#2589)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_is_reachable_true(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    sup = _running_supervisor(
+        tmp_path, root_path="/phoenix", transport=httpx.MockTransport(handler)
+    )
+    assert await sup.is_reachable() is True
+    await sup.aclose()
+
+
+@pytest.mark.asyncio
+async def test_is_reachable_false_when_down(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("phoenix still starting")
+
+    sup = _running_supervisor(
+        tmp_path, root_path="/phoenix", transport=httpx.MockTransport(handler)
+    )
+    assert await sup.is_reachable() is False
+    await sup.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +583,30 @@ def test_real_lifespan_never_spawns_phoenix_under_pytest(monkeypatch):
         r = client.get("/phoenix/", headers={"X-API-Key": "test-key-123"})
     # Phoenix was never supervised → the proxy reports it disabled.
     assert getattr(app.state, "phoenix", None) is None
+    assert r.status_code == 503
+
+
+def test_mint_503_when_phoenix_unreachable(tmp_path, monkeypatch):
+    """Health is reachability, not child liveness (#2589): a tracked supervisor
+    whose Phoenix is not answering the port must mint 503, not 200 — this is the
+    zombie split-brain the mint used to gate on."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("phoenix still starting")
+
+    # Supervisor is tracked and its process reports alive (running is True), but
+    # the port is unreachable — the old `not supervisor.running` gate would mint.
+    sup = _running_supervisor(
+        tmp_path, root_path="/phoenix", transport=httpx.MockTransport(handler)
+    )
+    assert sup.running is True
+    app = _client_with_state(sup, monkeypatch)
+
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/host/phoenix/session", headers={"X-API-Key": "test-key-123"}
+        )
     assert r.status_code == 503
 
 
