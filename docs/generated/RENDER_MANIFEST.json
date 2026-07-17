@@ -1878,6 +1878,33 @@
       "type": "Audit Ledger"
     },
     {
+      "existing_code_refs": [
+        "README.md",
+        "deploy_config.toml",
+        "docker/cloudrun_entrypoint.sh",
+        "kestrel_sovereign/agent/constitution.py",
+        "kestrel_sovereign/features/__init__.py",
+        "kestrel_sovereign/features/deploy/providers/cloudrun.py",
+        "kestrel_sovereign/features/identity/feature.py",
+        "kestrel_sovereign/features/peers/feature.py",
+        "kestrel_sovereign/kestrel_agent.py",
+        "kestrel_sovereign/llm/codex_adapter.py",
+        "kestrel_sovereign/multi_agent/config.py",
+        "kestrel_sovereign/server.py",
+        "server.py",
+        "tests/unit/test_a2a_sign_on_send.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/audit/TOP_10_FRAMEWORK_PROBLEMS_2026_07.md",
+      "privacy": "internal",
+      "render": "internal",
+      "status": "active",
+      "title": "Top 10 Kestrel Sovereign Framework Problems - July 2026",
+      "type": "Audit Report"
+    },
+    {
       "existing_code_refs": [],
       "findings": [],
       "missing_code_refs": [],

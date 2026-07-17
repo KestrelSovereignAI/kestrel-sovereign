@@ -36,6 +36,7 @@ Worktree strategy lives in `docs/audit/worktree-plan.md`.
 
 Current documentation audit:
 
+- [`TOP_10_FRAMEWORK_PROBLEMS_2026_07.md`](TOP_10_FRAMEWORK_PROBLEMS_2026_07.md) - July 2026 ranked audit of the ten highest-risk open framework problems, with code evidence, GitHub issues, and verification gates.
 - [`DOCUMENTATION_AUDIT_5_2026.md`](DOCUMENTATION_AUDIT_5_2026.md) - May 2026 audit ledger for package extraction, context, memory, storage, LLM, signals, Talon, cloud, generated docs, and public-doc hygiene.
 - [`documentation-2026-05/`](documentation-2026-05/) - working audit workspace with shared context, lane briefs, subagent reports, stale-artifact review, and execution order.
 - [`OKF_MIGRATION_PLAN.md`](OKF_MIGRATION_PLAN.md) - plan and implementation ledger for converting Kestrel docs to OKF and wiring documentation freshness into Talon/Flight/Eye workflows.
