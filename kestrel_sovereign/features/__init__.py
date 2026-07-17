@@ -11,8 +11,9 @@ import importlib.metadata
 import inspect
 import logging
 import os
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Type, Optional, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Set, Type
 
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
@@ -36,6 +37,116 @@ FEATURE_ENTRY_POINT_GROUP = "kestrel_sovereign.features"
 
 class DuplicateFeatureEntryPointError(RuntimeError):
     """Raised when multiple distributions claim one external feature class."""
+
+
+class MandatoryFeatureReadinessError(RuntimeError):
+    """A sovereignty feature could not satisfy the readiness contract.
+
+    The public message is assembled only from controlled class, stage, and
+    problem labels. The underlying exception remains available as ``__cause__``
+    for protected logs, while ``/health`` can safely expose ``str(error)``
+    without copying credentials or paths out of a dependency exception.
+    """
+
+    _SAFE_STAGES = frozenset({
+        "agent readiness",
+        "configuration",
+        "construction",
+        "discovery",
+        "enablement",
+        "import",
+        "initialization",
+        "persistent enablement",
+        "post-load wiring",
+        "registration",
+        "runtime disable",
+    })
+    _SAFE_PROBLEMS = frozenset({
+        "cannot be disabled",
+        "could not be constructed",
+        "could not be enabled",
+        "could not be imported",
+        "could not be inspected",
+        "could not finish cross-feature wiring",
+        "could not initialize",
+        "could not register its hooks",
+        "could not register its tools",
+        "does not export its canonical class",
+        "has a non-canonical runtime name",
+        "is explicitly disabled",
+        "is missing",
+        "is not registered under its canonical name",
+        "was loaded more than once",
+    })
+
+    def __init__(self, feature_name: str, stage: str, problem: str) -> None:
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        self.feature_name = (
+            feature_name
+            if feature_name in MANDATORY_FEATURES
+            else "unknown mandatory feature"
+        )
+        self.stage = stage if stage in self._SAFE_STAGES else "readiness"
+        self.problem = problem if problem in self._SAFE_PROBLEMS else "failed"
+        super().__init__(
+            f"Mandatory feature '{self.feature_name}' {self.problem} during "
+            f"{self.stage}; "
+            "agent readiness refused. Repair the kestrel-sovereign "
+            "installation or remove the invalid disable configuration, then "
+            "restart the agent."
+        )
+
+
+def verify_mandatory_feature_set(
+    features: Iterable[Feature] | Mapping[str, Feature],
+    *,
+    stage: str,
+) -> None:
+    """Require one canonical instance of every sovereignty feature.
+
+    Discovery and the fully registered agent both call this postcondition. The
+    second check is deliberate: tests, embedders, and future loaders may replace
+    ``discover_features``, and registration keys come from mutable instance
+    state rather than the class name.
+    """
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+    feature_mapping = features if isinstance(features, Mapping) else None
+    instances = list(
+        feature_mapping.values() if feature_mapping is not None else features
+    )
+    counts = Counter(type(feature).__name__ for feature in instances)
+
+    for feature_name in sorted(MANDATORY_FEATURES):
+        count = counts[feature_name]
+        if count == 0:
+            raise MandatoryFeatureReadinessError(
+                feature_name, stage, "is missing"
+            )
+        if count != 1:
+            raise MandatoryFeatureReadinessError(
+                feature_name, stage, "was loaded more than once"
+            )
+
+        instance = next(
+            feature
+            for feature in instances
+            if type(feature).__name__ == feature_name
+        )
+        if getattr(instance, "name", feature_name) != feature_name:
+            raise MandatoryFeatureReadinessError(
+                feature_name, stage, "has a non-canonical runtime name"
+            )
+        if (
+            feature_mapping is not None
+            and feature_mapping.get(feature_name) is not instance
+        ):
+            raise MandatoryFeatureReadinessError(
+                feature_name,
+                stage,
+                "is not registered under its canonical name",
+            )
 
 
 def _reject_duplicate_feature_entry_points(feature_eps) -> None:
@@ -439,9 +550,19 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
     Returns:
         List of instantiated Feature objects
     """
-    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+    from kestrel_sovereign.multi_agent.config import (
+        MANDATORY_FEATURE_MODULES,
+        MANDATORY_FEATURES,
+    )
 
     disabled = get_disabled_features()
+    disabled_mandatory = sorted(disabled & MANDATORY_FEATURES)
+    if disabled_mandatory:
+        raise MandatoryFeatureReadinessError(
+            disabled_mandatory[0],
+            "configuration",
+            "is explicitly disabled",
+        )
     features = []
     discovered_names = set()
 
@@ -461,7 +582,12 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
 
         return True
 
-    def _try_add(feature_class: Type[Feature], source: str) -> None:
+    def _try_add(
+        feature_class: Type[Feature],
+        source: str,
+        *,
+        mandatory: bool = False,
+    ) -> None:
         """Attempt to instantiate and add a feature class."""
         class_name = feature_class.__name__
 
@@ -472,9 +598,17 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         # methods that live on the sovereign Feature base, so the orchestrator
         # would silently skip them. Inject the dispatch cluster so in-tree and
         # external features are dispatchable identically. No-op for in-tree.
-        feature_class = ensure_subagent_dispatch(feature_class)
-
-        feature = feature_class(agent)
+        try:
+            feature_class = ensure_subagent_dispatch(feature_class)
+            feature = feature_class(agent)
+        except Exception as exc:
+            if mandatory:
+                raise MandatoryFeatureReadinessError(
+                    class_name,
+                    "construction",
+                    "could not be constructed",
+                ) from exc
+            raise
         features.append(feature)
         discovered_names.add(class_name)
         logger.info(f"Discovered feature: {class_name} from {source}")
@@ -490,7 +624,39 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         discovered_names.add(class_name)
         logger.info(f"Discovered isolated feature: {class_name} from {source}")
 
-    # Phase 1: Local features (priority — these win on duplicates)
+    # Phase 0: import the sovereignty foundation explicitly and fail closed.
+    # Generic directory discovery is intentionally best-effort for optional
+    # features and therefore cannot own this invariant: it logs import errors
+    # and omits those modules before the main loop ever sees them.
+    for expected_name, module_path in MANDATORY_FEATURE_MODULES.items():
+        try:
+            module = importlib.import_module(module_path)
+        except Exception as exc:
+            raise MandatoryFeatureReadinessError(
+                expected_name,
+                "import",
+                "could not be imported",
+            ) from exc
+
+        try:
+            feature_class = find_feature_class(module)
+        except Exception as exc:
+            raise MandatoryFeatureReadinessError(
+                expected_name,
+                "discovery",
+                "could not be inspected",
+            ) from exc
+        if feature_class is None or feature_class.__name__ != expected_name:
+            raise MandatoryFeatureReadinessError(
+                expected_name,
+                "discovery",
+                "does not export its canonical class",
+            )
+        _try_add(feature_class, f"mandatory:{module_path}", mandatory=True)
+
+    # Phase 1: Local optional features. Mandatory modules appear in this list
+    # too, but ``discovered_names`` guarantees their strict Phase 0 instances
+    # win and appear exactly once.
     for module_path in discover_feature_modules():
         try:
             module = importlib.import_module(module_path)
@@ -524,6 +690,7 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         except Exception as e:
             logger.error(f"Error loading entry_point feature {class_name}: {e}")
 
+    verify_mandatory_feature_set(features, stage="discovery")
     return features
 
 

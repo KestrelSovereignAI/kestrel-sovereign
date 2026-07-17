@@ -168,6 +168,23 @@ def _set_startup_error(app: FastAPI, error: Optional[Exception]) -> None:
     app.state.startup_error = str(error) if error else None
 
 
+def _mandatory_feature_failure_record(
+    agent_name: str,
+    error: Exception,
+) -> Optional[dict]:
+    """Return a health-safe record for a typed sovereignty boot failure."""
+    from kestrel_sovereign.features import MandatoryFeatureReadinessError
+
+    if not isinstance(error, MandatoryFeatureReadinessError):
+        return None
+    return {
+        "agent": agent_name,
+        "feature": error.feature_name,
+        "stage": error.stage,
+        "error": str(error),
+    }
+
+
 def _oauth_required() -> bool:
     """Return whether OAuth is the required auth mode.
 
@@ -472,6 +489,7 @@ async def lifespan(app: FastAPI):
     import asyncio
     logger.info("Server starting up...")
     _set_startup_error(app, None)
+    app.state.mandatory_feature_failures = []
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -575,6 +593,13 @@ async def lifespan(app: FastAPI):
             # — without this, a multi-agent host whose providers all failed
             # would report healthy startup while every agent was mute.
             init_failures = manager.init_failures
+            app.state.mandatory_feature_failures = [
+                record
+                for name, exc in init_failures
+                if (
+                    record := _mandatory_feature_failure_record(name, exc)
+                ) is not None
+            ]
             if init_failures and loaded == 0:
                 # Every configured agent failed to initialize. Treat the
                 # whole host as broken so /health reports it.
@@ -646,6 +671,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error during startup: {e}", exc_info=True)
             app.state.agent = None
+            record = _mandatory_feature_failure_record("default", e)
+            if record is not None:
+                app.state.mandatory_feature_failures = [record]
             _set_startup_error(app, e)
 
     # Per-feature static asset mounts (#2043). Done BEFORE router mounting so the
@@ -1320,6 +1348,24 @@ def health_check(request: Request):
     """A simple health check endpoint."""
     startup_error = getattr(request.app.state, "startup_error", None)
     agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
+    mandatory_failures = getattr(
+        request.app.state,
+        "mandatory_feature_failures",
+        [],
+    )
+    if mandatory_failures:
+        manager = getattr(request.app.state, 'agent_manager', None)
+        any_initialized = bool(agent) or bool(
+            manager and manager.list_agents()
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "agent_initialized": any_initialized,
+                "mandatory_feature_failures": mandatory_failures,
+            },
+        )
     if agent:
         payload = {"status": "ok", "agent_initialized": True}
         llm_service = getattr(agent, "llm_service", None)

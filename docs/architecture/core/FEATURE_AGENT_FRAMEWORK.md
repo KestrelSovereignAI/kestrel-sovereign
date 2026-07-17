@@ -144,6 +144,33 @@ This architecture allows for:
 - **Scalability:** New capabilities can be added simply by creating a new Feature class.
 - **Command Routing:** Features can register their own `!` commands directly.
 
+### 6.4 Mandatory sovereignty readiness
+
+Five bundled features are part of the agent's readiness contract, not optional
+capabilities: `ConstitutionFeature`, `IdentityFeature`, `PeersFeature`,
+`SecurityFeature`, and `WaitFeature`. Their canonical class-to-module mapping
+lives in `multi_agent/config.py`; `MANDATORY_FEATURES` is derived from that map
+so discovery and configuration cannot drift into separate definitions.
+
+The runtime enforces this contract at two boundaries:
+
+1. Discovery imports and constructs each canonical mandatory class explicitly.
+   A host disable, import error, missing/wrong export, or constructor failure
+   raises `MandatoryFeatureReadinessError` instead of being logged and skipped.
+2. `KestrelAgent` verifies that every mandatory class initialized, enabled, and
+   registered exactly once under its canonical name before it can become ready.
+
+Bootstrap allowlists and spawn ceilings may restrict optional capabilities, but
+mandatory features are always added outside those ceilings. Persistent deltas,
+the internal lifecycle API, the Feature Store API, and `kestrel feature disable`
+all reject attempts to disable a mandatory class before changing state.
+
+`MandatoryFeatureReadinessError` keeps the dependency exception as its private
+cause for protected logs, while its public string contains only the controlled
+feature name and lifecycle stage. `/health` returns HTTP 503 with that sanitized
+record, including for a partially loaded multi-agent fleet, so one healthy agent
+cannot hide a configured peer that failed its sovereignty foundation.
+
 ## 7. Status Update (November 2025)
 
 The Feature Agent framework is now the standard architecture for all agent capabilities.
@@ -162,4 +189,3 @@ The Feature Agent framework is now the standard architecture for all agent capab
 - The legacy `tools/` directory now only contains infrastructure (`base.py`, `registry.py`).
 - All tool implementations have been migrated to `features/`.
 - `AgentToolMixin` and `kestrel_agent_tools.py` have been removed.
-

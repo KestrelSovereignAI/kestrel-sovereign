@@ -14,6 +14,7 @@ from kestrel_sovereign.feature_registry import (
     FeatureStatus,
     SkillInfo,
 )
+from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +276,33 @@ class TestFeatureEnableDisable:
         assert "DeployFeature" in saved
         assert "ComputeFeature" in saved
         assert "Disabled" in capsys.readouterr().out
+
+    @patch("kestrel_sovereign.cli._set_toml_disabled_features")
+    @patch("kestrel_sovereign.cli._get_toml_disabled_features", return_value=[])
+    @patch("kestrel_sovereign.feature_registry.load_registry")
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    def test_disable_rejects_mandatory_feature_without_writing(
+        self, mock_load, mock_get, mock_set, feature_name, capsys
+    ):
+        from kestrel_sovereign.cli import cmd_feature_disable
+
+        registry = _make_registry()
+        registry["mandatory-under-test"] = FeaturePackageInfo(
+            name="mandatory-under-test",
+            package="kestrel-sovereign",
+            git="https://github.com/example/ks.git",
+            features=[feature_name],
+            description="Mandatory feature under test",
+            tags=["core"],
+            icon="shield",
+            core=True,
+        )
+        mock_load.return_value = registry
+        result = cmd_feature_disable(_make_args(name="mandatory-under-test"))
+
+        assert result == 1
+        assert feature_name in capsys.readouterr().out
+        mock_set.assert_not_called()
 
     @patch("kestrel_sovereign.cli._get_toml_disabled_features", return_value=["DeployFeature", "ComputeFeature"])
     @patch("kestrel_sovereign.feature_registry.load_registry")

@@ -13,6 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
+from kestrel_sovereign.features import MandatoryFeatureReadinessError
+from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.features.privacy.feature import PrivacyTransitionDecision
 
@@ -21,6 +24,96 @@ def _no_confirm_evaluate():
     # evaluate_transition mock for non-destructive transitions (never
     # PUBLIC→EPHEMERAL): the agent applies rather than staging pending.
     return MagicMock(side_effect=lambda m: PrivacyTransitionDecision(target=m, requires_confirmation=False))
+
+
+def _mandatory_feature_double(
+    feature_name: str,
+    *,
+    fail_stage: str | None = None,
+) -> Feature:
+    """Build a real Feature subtype whose class name is a mandatory name."""
+
+    async def initialize(self):
+        if fail_stage == "initialization":
+            raise RuntimeError("secret-init-detail")
+
+    async def on_enable(self):
+        if fail_stage == "enablement":
+            raise RuntimeError("secret-enable-detail")
+
+    def get_hooks(self):
+        if fail_stage == "hook registration":
+            raise RuntimeError("secret-hook-detail")
+        return []
+
+    def get_tools(self):
+        if fail_stage == "tool registration":
+            raise RuntimeError("secret-tool-detail")
+        return []
+
+    async def post_all_features_loaded(self, agent):
+        if fail_stage == "post-load wiring":
+            raise RuntimeError("secret-post-load-detail")
+
+    feature_class = type(
+        feature_name,
+        (Feature,),
+        {
+            "initialize": initialize,
+            "on_enable": on_enable,
+            "get_hooks": get_hooks,
+            "get_tools": get_tools,
+            "post_all_features_loaded": post_all_features_loaded,
+            "tool_description": property(lambda self: "mandatory test double"),
+        },
+    )
+    return feature_class(MagicMock())
+
+
+async def _initialize_with_features(
+    agent: KestrelAgent,
+    features: list[Feature],
+) -> None:
+    """Drive the real initialize boundary with controlled feature doubles."""
+    with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage:
+        with patch(
+            "kestrel_sovereign.kestrel_agent.discover_features",
+            return_value=features,
+        ):
+            with patch(
+                "kestrel_sovereign.kestrel_agent.MemorySystem"
+            ) as MockMemorySystem:
+                with patch(
+                    "kestrel_sovereign.kestrel_agent.TaskManager"
+                ) as MockTaskManager:
+                    mock_storage = AsyncMock()
+                    mock_storage.initialize = AsyncMock()
+                    mock_storage.get_node = AsyncMock(return_value=None)
+                    mock_storage.add_node = AsyncMock()
+                    mock_storage.db = MagicMock()
+                    MockStorage.return_value = mock_storage
+
+                    mock_memory_system = AsyncMock()
+                    mock_memory_system.initialize = AsyncMock()
+                    mock_memory_system.retriever = MagicMock()
+                    mock_memory_system.consolidator = MagicMock()
+                    MockMemorySystem.return_value = mock_memory_system
+
+                    mock_task_manager = AsyncMock()
+                    mock_task_manager.initialize = AsyncMock()
+                    mock_task_manager.register_agent = MagicMock()
+                    MockTaskManager.return_value = mock_task_manager
+
+                    await agent.initialize()
+
+
+async def _shutdown_feature_init_test_agent(agent: KestrelAgent) -> None:
+    """Close resources constructed before the mocked TaskManager owns them."""
+    await agent.shutdown()
+    observability_store = getattr(agent, "observability_store", None)
+    backend = getattr(observability_store, "backend", None)
+    if backend is not None:
+        await backend.close()
 
 
 # =============================================================================
@@ -1716,7 +1809,8 @@ class TestInitialize:
         )
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]), \
+                 patch('kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set'):
                 with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
                     with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
                         mock_storage_instance = AsyncMock()
@@ -1757,7 +1851,8 @@ class TestInitialize:
         )
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]), \
+                 patch('kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set'):
                 with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
                     with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
                         mock_storage_instance = AsyncMock()
@@ -1792,7 +1887,8 @@ class TestInitialize:
         )
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]), \
+                 patch('kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set'):
                 with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
                     with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
                         mock_storage = AsyncMock()
@@ -1828,7 +1924,8 @@ class TestInitialize:
         )
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]):
+            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[]), \
+                 patch('kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set'):
                 with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
                     with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
                         mock_storage = AsyncMock()
@@ -1873,9 +1970,18 @@ class TestInitialize:
         mock_feature.get_hooks.return_value = []
         mock_feature.get_tools.return_value = []
         mock_feature.get_agent_card.return_value = MagicMock(name="TestFeature", skills=[])
+        mandatory_features = [
+            _mandatory_feature_double(name)
+            for name in sorted(MANDATORY_FEATURES)
+        ]
+        for feature in mandatory_features:
+            feature.agent = agent
 
         with patch('kestrel_sovereign.kestrel_agent.AsyncStorage') as MockStorage:
-            with patch('kestrel_sovereign.kestrel_agent.discover_features', return_value=[mock_feature]):
+            with patch(
+                'kestrel_sovereign.kestrel_agent.discover_features',
+                return_value=[*mandatory_features, mock_feature],
+            ):
                 with patch('kestrel_sovereign.kestrel_agent.MemorySystem') as MockMemorySystem:
                     with patch('kestrel_sovereign.kestrel_agent.TaskManager') as MockTaskManager:
                         mock_storage = AsyncMock()
@@ -1902,6 +2008,193 @@ class TestInitialize:
                         assert "TestFeature" in agent.features
                         assert agent.features["TestFeature"] is mock_feature
                         mock_feature.initialize.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    async def test_mandatory_initialize_failure_is_typed_and_sanitized(
+        self, feature_name
+    ):
+        agent = KestrelAgent(did="did:test:mandatory-init")
+        feature = _mandatory_feature_double(
+            feature_name,
+            fail_stage="initialization",
+        )
+
+        with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            await agent._register_feature(feature)
+
+        error = exc_info.value
+        assert error.feature_name == feature_name
+        assert error.stage == "initialization"
+        assert "secret-init-detail" not in str(error)
+        assert "secret-init-detail" in str(error.__cause__)
+        assert feature_name not in agent.features
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    async def test_mandatory_enable_failure_is_typed_and_sanitized(
+        self, feature_name
+    ):
+        agent = KestrelAgent(did="did:test:mandatory-enable")
+        feature = _mandatory_feature_double(
+            feature_name,
+            fail_stage="enablement",
+        )
+
+        with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            await agent._register_feature(feature)
+
+        error = exc_info.value
+        assert error.feature_name == feature_name
+        assert error.stage == "enablement"
+        assert "secret-enable-detail" not in str(error)
+        assert "secret-enable-detail" in str(error.__cause__)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    @pytest.mark.parametrize(
+        ("fail_stage", "expected_problem", "secret"),
+        [
+            (
+                "hook registration",
+                "could not register its hooks",
+                "secret-hook-detail",
+            ),
+            (
+                "tool registration",
+                "could not register its tools",
+                "secret-tool-detail",
+            ),
+        ],
+    )
+    async def test_mandatory_registration_failure_is_typed_and_sanitized(
+        self,
+        feature_name,
+        fail_stage,
+        expected_problem,
+        secret,
+    ):
+        agent = KestrelAgent(did="did:test:mandatory-registration")
+        feature = _mandatory_feature_double(
+            feature_name,
+            fail_stage=fail_stage,
+        )
+
+        with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            await agent._register_feature(feature)
+
+        error = exc_info.value
+        assert error.feature_name == feature_name
+        assert error.stage == "registration"
+        assert error.problem == expected_problem
+        assert secret not in str(error)
+        assert secret in str(error.__cause__)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    async def test_mandatory_post_load_failure_is_typed_and_sanitized(
+        self,
+        feature_name,
+        tmp_path,
+    ):
+        agent = KestrelAgent(
+            did="did:test:mandatory-post-load",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        mandatory_features = [
+            _mandatory_feature_double(
+                name,
+                fail_stage=(
+                    "post-load wiring" if name == feature_name else None
+                ),
+            )
+            for name in sorted(MANDATORY_FEATURES)
+        ]
+        for feature in mandatory_features:
+            feature.agent = agent
+
+        try:
+            with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+                await _initialize_with_features(agent, mandatory_features)
+
+            error = exc_info.value
+            assert error.feature_name == feature_name
+            assert error.stage == "post-load wiring"
+            assert error.problem == "could not finish cross-feature wiring"
+            assert "secret-post-load-detail" not in str(error)
+            assert "secret-post-load-detail" in str(error.__cause__)
+        finally:
+            await _shutdown_feature_init_test_agent(agent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    async def test_agent_readiness_rejects_noncanonical_registration_key(
+        self,
+        feature_name,
+        tmp_path,
+    ):
+        agent = KestrelAgent(
+            did="did:test:mandatory-registration-set",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        mandatory_features = [
+            _mandatory_feature_double(name)
+            for name in sorted(MANDATORY_FEATURES)
+        ]
+        for feature in mandatory_features:
+            feature.agent = agent
+            if type(feature).__name__ == feature_name:
+                feature.name = f"Renamed{feature_name}"
+
+        try:
+            with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+                await _initialize_with_features(agent, mandatory_features)
+
+            error = exc_info.value
+            assert error.feature_name == feature_name
+            assert error.stage == "agent readiness"
+            assert error.problem == "has a non-canonical runtime name"
+        finally:
+            await _shutdown_feature_init_test_agent(agent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    async def test_mandatory_feature_cannot_be_disabled_at_runtime(
+        self, feature_name
+    ):
+        agent = KestrelAgent(did="did:test:mandatory-runtime")
+        feature = _mandatory_feature_double(feature_name)
+        feature.on_disable = AsyncMock()
+        feature.shutdown = AsyncMock()
+        agent.features = {feature_name: feature}
+
+        with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            await agent._disable_feature(feature_name)
+
+        assert exc_info.value.feature_name == feature_name
+        assert agent.features == {feature_name: feature}
+        feature.on_disable.assert_not_awaited()
+        feature.shutdown.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feature_name", sorted(MANDATORY_FEATURES))
+    async def test_mandatory_feature_cannot_persist_disabled_delta(
+        self, feature_name
+    ):
+        agent = KestrelAgent(did="did:test:mandatory-delta")
+        store = AsyncMock()
+        agent._feature_enablement_store = store
+
+        with pytest.raises(MandatoryFeatureReadinessError) as exc_info:
+            await agent.persist_feature_enablement(
+                "feature",
+                feature_name,
+                "disabled",
+                actor="test",
+            )
+
+        assert exc_info.value.feature_name == feature_name
+        store.set_state.assert_not_awaited()
 
 
 # =============================================================================

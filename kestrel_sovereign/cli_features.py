@@ -917,6 +917,15 @@ def cmd_feature_disable(args) -> int:
         return 1
 
     info = registry[pkg_name]
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+    mandatory = sorted(set(info.features) & MANDATORY_FEATURES)
+    if mandatory:
+        print(
+            "Cannot disable mandatory sovereignty feature(s): "
+            + ", ".join(mandatory)
+        )
+        return 1
     project_dir = cli._get_project_dir()
     disabled = cli._get_toml_disabled_features(project_dir)
 

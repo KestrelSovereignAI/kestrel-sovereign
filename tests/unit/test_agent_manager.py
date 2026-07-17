@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 
+from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -306,6 +307,47 @@ class TestLoadFromConfig:
 
         assert loaded == 0
         assert manager.init_failures == []
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_mandatory_failure_never_publishes_partial_agent(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did
+    ):
+        config = MultiAgentConfig(
+            agents={
+                "secure": LocalAgentConfig(
+                    data_dir=Path("/tmp/secure"), port=8801
+                ),
+                "broken": LocalAgentConfig(
+                    data_dir=Path("/tmp/broken"), port=8802
+                ),
+            }
+        )
+        mock_get_did.side_effect = ["did:secure", "did:broken"]
+        secure = _make_mock_agent("did:secure")
+        broken = _make_mock_agent("did:broken")
+        failure = MandatoryFeatureReadinessError(
+            "SecurityFeature",
+            "initialization",
+            "could not initialize",
+        )
+        broken.initialize.side_effect = failure
+        mock_agent_cls.side_effect = [secure, broken]
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            manager = AgentManager(base_data_dir=Path("/tmp"))
+            loaded = await manager.load_from_config(config)
+
+        assert loaded == 1
+        assert manager.list_agents() == {"secure": secure}
+        assert manager.get_agent("broken") is None
+        broken.shutdown.assert_awaited_once()
+        assert manager.init_failures == [("broken", failure)]
 
 
 class TestCreateAgent:
