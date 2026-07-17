@@ -28,9 +28,10 @@ mid-turn, expects an inline reply, then resumes. We bridge that to
 kestrel's existing security-gated tool dispatcher via a per-turn
 ``tool_executor`` callback: every call still fires kestrel's
 ``PRE_TOOL_USE``/``POST_TOOL_USE`` hooks, ``SecurityHook``, the approval
-queue, and denied-tool stripping — exactly as today. The adapter does
-no execution itself; it just relays the call into kestrel's hooked
-executor and the result back to the app-server.
+queue, and denied-tool stripping. Codex-native shell, filesystem,
+browser, plugin, MCP, and hook execution is disabled; native mutation
+escalations are unconditionally declined. The adapter therefore relays
+host actions only through Kestrel's hooked executor (#1965).
 """
 from __future__ import annotations
 
@@ -65,6 +66,7 @@ from .codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
     CodexAppServerTransportError,
+    _CODEX_DISABLED_NATIVE_FEATURES,
 )
 from .codex_reasoning import (
     normalize_codex_reasoning_effort,
@@ -555,23 +557,27 @@ _TOOL_ITEM_TYPES = frozenset({
 # These item types resolve to an inline kestrel tool-call (via the
 # ``item/tool/call`` server→client RPC). They MUST be tracked in
 # ``executed_tool_calls`` so the orchestrator can fold them into the
-# persisted chat-history breadcrumbs. Other tool item types
-# (commandExecution, fileChange, webSearch) run INSIDE the app-server's
-# native sandbox — kestrel's hook stack never sees them, so they appear
-# only as on-screen markers, never as executed_tool_calls entries.
+# persisted chat-history breadcrumbs.
 _KESTREL_DISPATCHED_TOOL_ITEM_TYPES = frozenset({
     "dynamicToolCall", "mcpToolCall", "functionCall", "function_call",
     "toolCall", "customToolCall",
 })
 
+# Any one of these means the process/thread controls below drifted and Codex
+# regained a provider-native tool path. Fail the turn loudly instead of
+# rendering an unaudited side effect as ordinary activity (#1965).
+_FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES = frozenset({
+    "commandExecution", "fileChange", "webSearch",
+})
 
-# Codex thread/start sandbox + approval profile (#1734).
+
+# Codex thread/start sandbox + approval profile (#1965).
 # Constants so the same values feed both the params block AND the
 # thread fingerprint — without them as a single source of truth a
 # silent edit to one but not the other would let a session reuse a
 # cached thread whose boundary no longer matches.
-_CODEX_SANDBOX = "workspace-write"
-_CODEX_APPROVAL_POLICY = "on-request"
+_CODEX_SANDBOX = "read-only"
+_CODEX_APPROVAL_POLICY = "never"
 
 
 def _item_display_label(item: Dict[str, Any]) -> str:
@@ -942,29 +948,28 @@ class CodexAdapter(LLMAdapter):
         # produces user-denial wording from the rewritten typed
         # block.
         self._agent_for_audit: Any = None
-        # Codex approval bridge (#1575) state. Registered ONCE per
-        # (adapter, agent, app_client) — not per turn — so concurrent
-        # turns can't race on registration/unregistration of the
-        # shared (method, None) key. Re-bind to a new agent OR to a
-        # fresh CodexAppServerClient (post-aclose) will unregister +
-        # re-register (codex review #1575 round 3 P2).
+        # Native approval handlers are registered once per (agent, app), but
+        # unlike the pre-#1965 bridge they can only decline. Tracking the
+        # binding keeps concurrent turns from racing on global handler keys.
         self._codex_bridge_for_agent: Any = None
         self._codex_bridge_for_app: Any = None
         self._codex_bridge_unregisters: List[Callable[[], None]] = []
-
     def attach_agent_for_audit(self, agent: Any) -> None:
         """Bind the running agent so failure-result rewrite can pull
         recent ``SecurityFeature.permission_store.get_audit_log`` rows
         (#1563). Optional — see ``_recent_security_decisions``.
         Idempotent; safe to call before every turn.
 
-        Re-binding to a different agent drops any previously-registered
-        codex approval bridge so the next turn rewires for the new
-        agent (#1575).
+        Native Codex approvals are always declined; this reference is for
+        Kestrel dynamic-tool failure classification and decline telemetry.
         """
         if self._agent_for_audit is not agent:
             self._teardown_codex_approval_bridge()
         self._agent_for_audit = agent
+        if self._client is not None and hasattr(
+            self._client, "attach_audit_agent"
+        ):
+            self._client.attach_audit_agent(agent)
 
     def _resolve_agent_workspace_dir(self) -> Optional[str]:
         """Return the per-agent workspace dir for codex's ``cwd`` (#1734).
@@ -1122,15 +1127,12 @@ class CodexAdapter(LLMAdapter):
         return str(Path.cwd())
 
     def _teardown_codex_approval_bridge(self) -> None:
-        """Drop bridge handlers registered against a prior (agent, app)."""
-        for _unreg in self._codex_bridge_unregisters:
+        """Drop hard-decline handlers bound to a prior (agent, app)."""
+        for unregister in self._codex_bridge_unregisters:
             try:
-                _unreg()
+                unregister()
             except Exception:  # noqa: BLE001
                 pass
-        # Also detach the audit agent (#1581) so default-decline
-        # records don't keep routing to a stale agent's DB after
-        # rebind.
         prior_app = self._codex_bridge_for_app
         if prior_app is not None and hasattr(prior_app, "attach_audit_agent"):
             try:
@@ -1141,20 +1143,29 @@ class CodexAdapter(LLMAdapter):
         self._codex_bridge_for_agent = None
         self._codex_bridge_for_app = None
 
+    @staticmethod
+    def _make_codex_native_decline_handler(
+        kind: str,
+    ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
+        """Return an unconditional decline for a provider-native action."""
+        async def handler(_params: Dict[str, Any]) -> Dict[str, Any]:
+            logger.warning(
+                "Declining forbidden Codex-native %s escalation; use a "
+                "Kestrel dynamic tool so policy and audit gates run",
+                kind,
+            )
+            return {"decision": "decline"}
+
+        return handler
+
     def _ensure_codex_approval_bridge(
         self, app: "CodexAppServerClient",
     ) -> None:
-        """Register the codex sandbox-approval bridge handlers exactly
-        once per (adapter, agent, app_client). Idempotent: subsequent
-        calls for the same triple are no-ops.
+        """Install hard-decline handlers for native mutation requests.
 
-        Lives outside the per-turn ``unregisters`` list so two
-        concurrent turns can't race on the same (method, None) key —
-        a later turn's unregister would otherwise tear down the bridge
-        while an earlier turn was still in flight (codex review #1575
-        round 2 P2). Re-keys on agent OR app-client change so a
-        post-``aclose`` reconnect doesn't reuse a dead-handler binding
-        (round 3 P2).
+        The method name is retained for compatibility with existing adapter
+        lifecycle tests, but this is no longer an approval bridge: it cannot
+        accept a native action under any Kestrel policy or auto-mode setting.
         """
         agent = self._agent_for_audit
         if agent is None:
@@ -1164,30 +1175,20 @@ class CodexAdapter(LLMAdapter):
             and self._codex_bridge_for_app is app
         ):
             return
-        # Agent or app-client changed → clean reset.
         self._teardown_codex_approval_bridge()
-        for _kind in ("commandExecution", "fileChange"):
-            _method = f"item/{_kind}/requestApproval"
+        for kind in ("commandExecution", "fileChange"):
+            method = f"item/{kind}/requestApproval"
             self._codex_bridge_unregisters.append(
                 app.register_server_request_handler(
-                    _method,
-                    self._make_codex_approval_handler(agent, _kind),
+                    method,
+                    self._make_codex_native_decline_handler(kind),
                     thread_id=None,
                 )
             )
         self._codex_bridge_for_agent = agent
         self._codex_bridge_for_app = app
-        # #1581: piggyback the audit-agent attach so default-decline
-        # RPCs (the _DEFAULT_APPROVAL_REPLIES path that the bridge
-        # intentionally doesn't cover) also surface as typed events
-        # in the agent's next-turn operational block.
         if hasattr(app, "attach_audit_agent"):
-            try:
-                app.attach_audit_agent(agent)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "codex_app_server attach_audit_agent failed: %s", exc,
-                )
+            app.attach_audit_agent(agent)
 
     async def _recent_security_decisions(self, limit: int = 50) -> list:
         """Pull recent audit rows for the pre-response classifier.
@@ -1238,7 +1239,8 @@ class CodexAdapter(LLMAdapter):
             tool_streaming_mode=ToolStreamingMode.INLINE_EXECUTOR,
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
             notes=(
-                "Codex app-server tools are executed through dynamic tool events.",
+                "Host actions execute only through Kestrel dynamic tool events.",
+                "Codex-native executable tool surfaces are disabled.",
                 "OpenAI image_url parts are translated to app-server image inputs.",
             ),
         )
@@ -1247,6 +1249,8 @@ class CodexAdapter(LLMAdapter):
     def _app_server(self) -> CodexAppServerClient:
         if self._client is None:
             self._client = CodexAppServerClient()
+            if hasattr(self._client, "attach_audit_agent"):
+                self._client.attach_audit_agent(self._agent_for_audit)
         return self._client
 
     @staticmethod
@@ -1288,6 +1292,32 @@ class CodexAdapter(LLMAdapter):
             raise CodexAppServerError(
                 "codex config/read returned a non-object config; update the "
                 "Codex app/CLI before starting a turn."
+            )
+        features = effective_config.get("features") or {}
+        if not isinstance(features, dict):
+            raise CodexAppServerError(
+                "codex config/read returned non-object feature settings; "
+                "refusing to start without a verifiable native-tool boundary."
+            )
+        enabled_native = sorted(
+            feature for feature in _CODEX_DISABLED_NATIVE_FEATURES
+            if features.get(feature) is True
+        )
+        ambient_execution = sorted(
+            key for key in ("hooks", "mcp_servers", "notify")
+            if effective_config.get(key)
+        )
+        web_search = effective_config.get("web_search")
+        if web_search not in (None, "disabled"):
+            ambient_execution.append(f"web_search={web_search}")
+        if effective_config.get("tools_view_image") is True:
+            ambient_execution.append("tools_view_image")
+        if enabled_native or ambient_execution:
+            unsafe = enabled_native + ambient_execution
+            raise CodexAppServerError(
+                "Codex native-tool isolation was overridden by effective "
+                f"configuration ({', '.join(unsafe)}); refusing openai:plan "
+                "because host actions must use Kestrel dynamic tools."
             )
         configured_model = effective_config.get("model")
         if configured_model is not None and not isinstance(configured_model, str):
@@ -1438,31 +1468,14 @@ class CodexAdapter(LLMAdapter):
             # ``persistExtendedHistory`` mirrors what claw asks for so
             # multi-turn sessions retain the full prior context server-side.
             params: Dict[str, Any] = {
-                # #1734: ``workspace-write`` allows codex's native shell
-                # to write inside the per-agent workspace dir (plus
-                # ``/tmp`` and ``$TMPDIR``) without an approval round
-                # trip. Reads everywhere still work. Writes outside the
-                # workspace are blocked by the sandbox and the model
-                # must explicitly request elevation (see the GPT-5
-                # overlay's proactive-elevation clause) — codex emits
-                # ``item/commandExecution/requestApproval``, which
-                # routes through Kestrel's bridge (#1575) →
-                # BinaryPolicy (#1702) → ApprovalQueue.
-                #
-                # The workspace is scoped via ``cwd`` to
-                # ``<agent_data>/workspace/`` (resolved above), NOT the
-                # host process cwd, so an agent can't silently edit
-                # her own host source / kestrel.toml / bootstrap
-                # files.
+                # #1965: Codex is an inference transport, not Kestrel's tool
+                # host. Read-only blocks its still-advertised apply_patch tool;
+                # process + thread feature controls remove native shell,
+                # browser, plugin, MCP, hook, and computer-use surfaces.
                 "sandbox": _CODEX_SANDBOX,
-                # #1734 (also #1707): use ``on-request`` — codex 0.138's
-                # current recommendation. The deprecated ``on-failure``
-                # value still works in 0.138 but is silently mapped
-                # to ``on-request`` semantics, so naming it directly
-                # avoids surprise when the deprecation lands.
-                # ``unless-trusted`` is cyber-policy-specific
-                # (``TrustedAccessForCyber``); ``never`` disables
-                # elevation entirely.
+                # Native elevation must never be accepted. Authorized host
+                # actions are Kestrel dynamic tools and use Kestrel's own
+                # policy/approval/audit pipeline instead.
                 "approval_policy": _CODEX_APPROVAL_POLICY,
                 "cwd": cwd,
                 "experimentalRawEvents": True,
@@ -1476,6 +1489,25 @@ class CodexAdapter(LLMAdapter):
                 "config": {
                     "features.code_mode": False,
                     "features.code_mode_only": False,
+                    "features.shell_tool": False,
+                    "features.unified_exec": False,
+                    "features.shell_snapshot": False,
+                    "features.computer_use": False,
+                    "features.browser_use": False,
+                    "features.browser_use_external": False,
+                    "features.browser_use_full_cdp_access": False,
+                    "features.in_app_browser": False,
+                    "features.apps": False,
+                    "features.plugins": False,
+                    "features.remote_plugin": False,
+                    "features.hooks": False,
+                    "features.multi_agent": False,
+                    "features.code_mode_host": False,
+                    "features.skill_mcp_dependency_install": False,
+                    "features.tool_suggest": False,
+                    "features.workspace_dependencies": False,
+                    "web_search": "disabled",
+                    "tools_view_image": False,
                 },
             }
             # #1844 Stage 2: optionally raise codex's own auto-compaction
@@ -2041,7 +2073,13 @@ class CodexAdapter(LLMAdapter):
     def _make_codex_approval_handler(
         self, agent: Any, kind: str,
     ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
-        """Bridge codex's sandbox-approval RPCs through Kestrel's
+        """Legacy policy evaluator; runtime registration is forbidden.
+
+        Kept temporarily as a private compatibility seam for the historical
+        policy regression suite. ``_ensure_codex_approval_bridge`` registers
+        :meth:`_make_codex_native_decline_handler`, never this handler.
+
+        Previously this bridged codex's sandbox-approval RPCs through Kestrel's
         :class:`ApprovalQueue` (#1575).
 
         ``kind`` is ``"commandExecution"`` or ``"fileChange"``. The
@@ -2753,20 +2791,10 @@ class CodexAdapter(LLMAdapter):
                 thread_id=thread_id,
             ))
 
-        # #1575: bridge codex's own sandbox-approval RPCs through
-        # Kestrel's ApprovalQueue when an agent is attached. Without
-        # this, the app-server's native commandExecution/fileChange
-        # approval requests are answered with the hardcoded decline
-        # default in ``_DEFAULT_APPROVAL_REPLIES`` regardless of
-        # auto-mode — silently denying gh / git / fs writes the
-        # Sovereign actually authorized.
-        #
-        # Once-per-adapter registration: codex's approval params don't
-        # reliably carry ``threadId`` (round 1 P1), so the handler is
-        # global, AND registering it per-turn would let a later
-        # turn's unregister tear it down while an earlier turn was
-        # still in flight (round 2 P2). The lifetime is the
-        # (adapter, agent) pair.
+        # Defense in depth: explicit native approval handlers always decline,
+        # even if Codex emits a request despite approval_policy=never. They
+        # cannot consult auto-mode or accept; authorized host actions use the
+        # Kestrel dynamic-tool handler above.
         self._ensure_codex_approval_bridge(app)
 
         sink = app.open_turn_sink(thread_id)
@@ -2920,6 +2948,13 @@ class CodexAdapter(LLMAdapter):
                     item = p.get("item") or {}
                     itype = item.get("type") or ""
                     iid = item.get("id") or item.get("callId") or ""
+                    if itype in _FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES:
+                        raise CodexAppServerError(
+                            "Codex emitted forbidden provider-native tool "
+                            f"{itype!r}; aborting openai:plan because the "
+                            "action did not enter Kestrel's security/audit "
+                            "dispatcher."
+                        )
                     # Only dedupe when the protocol gives us an id;
                     # falling back to ``""`` would collapse every
                     # id-less item into one dedupe slot and silently
@@ -2959,6 +2994,13 @@ class CodexAdapter(LLMAdapter):
                     item = p.get("item") or {}
                     itype = item.get("type")
                     iid = item.get("id") or item.get("callId") or ""
+                    if itype in _FORBIDDEN_CODEX_NATIVE_TOOL_ITEM_TYPES:
+                        raise CodexAppServerError(
+                            "Codex completed forbidden provider-native tool "
+                            f"{itype!r}; failing openai:plan because the "
+                            "action bypassed Kestrel's security/audit "
+                            "dispatcher."
+                        )
                     if itype == "agentMessage":
                         final_text = item.get("text") or final_text
                     elif itype in _TOOL_ITEM_TYPES:
@@ -3002,13 +3044,11 @@ class CodexAdapter(LLMAdapter):
                             # ``text_parts``; markers stay on the wire,
                             # not in LLMResponse.content.
                             yield {"text": line}
-                        # The kestrel-dispatched subset additionally
-                        # surfaces ToolCallStarted for the honesty-layer
-                        # revising sentinel + populates the executed_log
-                        # the orchestrator folds into chat history. The
-                        # codex-native subset (shell/patch/web) stays
-                        # marker-only — those execute inside the
-                        # app-server and have no kestrel-side audit row.
+                        # Kestrel-dispatched tools additionally surface
+                        # ToolCallStarted for the honesty-layer revising
+                        # sentinel + populate the executed_log folded into
+                        # chat history. Provider-native types were rejected
+                        # above and can never reach this marker path.
                         if itype in _KESTREL_DISPATCHED_TOOL_ITEM_TYPES:
                             # See dedupe carve-out above. The
                             # ``ToolCallStarted`` honesty-layer signal

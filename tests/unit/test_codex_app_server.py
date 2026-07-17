@@ -9,11 +9,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from kestrel_sovereign.llm.codex_app_server import (
+    MAX_CODEX_APP_SERVER_VERSION_EXCLUSIVE,
     MIN_CODEX_APP_SERVER_VERSION,
     CodexAppServerClient,
     CodexAppServerConnectionClosed,
     CodexAppServerError,
+    _CODEX_DISABLED_NATIVE_FEATURES,
+    _extract_safe_user_config_defaults,
     _parse_user_agent_version,
+    _validated_codex_version,
     _version_tuple,
     resolve_codex_binary,
 )
@@ -35,9 +39,56 @@ class TestVersionGate:
         assert _version_tuple("0.131.0-alpha.9") < _version_tuple("0.131.0")
 
     def test_alpha_still_clears_lower_floor(self):
-        assert _version_tuple("0.131.0-alpha.9") >= _version_tuple(
+        assert _version_tuple("0.145.0-alpha.18") >= _version_tuple(
             MIN_CODEX_APP_SERVER_VERSION
         )
+
+    @pytest.mark.parametrize("user_agent", ["", "garbage", "codex/unknown"])
+    def test_unparseable_version_fails_closed(self, user_agent):
+        with pytest.raises(CodexAppServerError, match="parseable version"):
+            _validated_codex_version(user_agent)
+
+    @pytest.mark.parametrize(
+        "user_agent",
+        ["codex/0.144.9", "codex/0.146.0-alpha.1", "codex/0.146.0"],
+    )
+    def test_version_outside_reviewed_window_fails_closed(self, user_agent):
+        with pytest.raises(CodexAppServerError, match="reviewed security window"):
+            _validated_codex_version(user_agent)
+
+    def test_current_reviewed_build_is_accepted(self):
+        assert _validated_codex_version(
+            "codex/0.145.0-alpha.18 (Mac OS; arm64)"
+        ) == "0.145.0-alpha.18"
+        assert MAX_CODEX_APP_SERVER_VERSION_EXCLUSIVE.startswith("0.146.")
+
+
+class TestIsolatedConfigBoundary:
+    def test_inherits_only_inference_defaults(self):
+        source = """
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+notify = ["/tmp/native-side-effect"]
+
+[hooks.PreToolUse]
+matcher = "Bash"
+
+[mcp_servers.host]
+command = "/tmp/host-server"
+
+[features]
+shell_tool = true
+"""
+        assert _extract_safe_user_config_defaults(source) == (
+            'model = "gpt-5.6-sol"\n'
+            'model_reasoning_effort = "xhigh"\n'
+        )
+
+    def test_invalid_or_mistyped_defaults_fail_closed(self):
+        assert _extract_safe_user_config_defaults("not = [valid") == ""
+        assert _extract_safe_user_config_defaults(
+            "model = 123\nmodel_reasoning_effort = true\n"
+        ) == ""
 
 
 class TestBinaryResolution:
@@ -628,6 +679,76 @@ class TestInvoluntaryExitRecovery:
             "next request doesn't see the OLD process's exit reported"
         )
         # cleanup tasks created by _spawn
+        if c._reader_task:
+            c._reader_task.cancel()
+        if c._stderr_task:
+            c._stderr_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_spawn_enforces_native_tool_boundary(
+        self, monkeypatch, tmp_path,
+    ):
+        """Ambient Codex config must not become an alternate host runtime."""
+        import asyncio
+
+        runtime_home = tmp_path / "home"
+        source_home = tmp_path / "source-codex"
+        runtime_home.mkdir()
+        source_home.mkdir()
+        (source_home / "config.toml").write_text(
+            'model = "gpt-5.6-sol"\n'
+            'model_reasoning_effort = "high"\n'
+            'notify = ["/tmp/escaped"]\n\n'
+            '[mcp_servers.host]\ncommand = "/tmp/escaped"\n\n'
+            '[[hooks.PreToolUse]]\nmatcher = "Bash"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(runtime_home))
+        monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c._binary = "/usr/bin/true"
+        c._closed_error = None
+        c._pending = {}
+        c._turn_sinks = {}
+        c._stderr_tail = []
+        captured = {}
+        fake_proc = MagicMock()
+        fake_proc.stdout = _AsyncIterableMock([])
+        fake_proc.stderr = _AsyncIterableMock([])
+        fake_proc.stdin = MagicMock()
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return fake_proc
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+        )
+        await c._spawn()
+
+        args = list(captured["args"])
+        for feature in _CODEX_DISABLED_NATIVE_FEATURES:
+            positions = [
+                i for i, value in enumerate(args[:-1])
+                if value == "--disable" and args[i + 1] == feature
+            ]
+            assert positions, f"spawn did not disable native feature {feature}"
+
+        managed_config = (
+            runtime_home / ".kestrel" / "codex-home" / "config.toml"
+        ).read_text(encoding="utf-8")
+        assert 'model = "gpt-5.6-sol"' in managed_config
+        assert 'model_reasoning_effort = "high"' in managed_config
+        assert "notify" not in managed_config
+        assert "mcp_servers" not in managed_config
+        assert "[[hooks" not in managed_config
+        assert 'web_search = "disabled"' in managed_config
+        assert "tools_view_image = false" in managed_config
+        for feature in _CODEX_DISABLED_NATIVE_FEATURES:
+            assert f"{feature} = false" in managed_config
+
         if c._reader_task:
             c._reader_task.cancel()
         if c._stderr_task:
