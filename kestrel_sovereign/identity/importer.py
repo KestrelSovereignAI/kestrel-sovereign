@@ -10,7 +10,6 @@ Usage:
     importer = IdentityImporter(db, target_agent_id)
     result = await importer.import_package(package)
 """
-import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -25,7 +24,6 @@ from .access_grant import (
 )
 from .identity_package import (
     AgentIdentityPackage,
-    MigrationRecord,
     SubstrateType,
     create_migration_id,
 )
@@ -44,7 +42,7 @@ class ImportResult:
     agent_id: str
     errors: List[str]
     warnings: List[str]
-    stats: Dict[str, int]
+    stats: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -92,6 +90,18 @@ class IdentityImporter:
         "agent_identity_resource",
     })
 
+    # Exact agent-scoped row inventory owned by replace mode. Graph-backed
+    # relationships and skills are cleared separately so shared nodes survive.
+    REPLACE_ROW_TABLES = (
+        "memory_episodes",
+        "saved_items",
+        "temporal_patterns",
+        "reflection_insights",
+        "wallet_transactions",
+        "wallet_state",
+    )
+    MERGE_MODES = frozenset({"replace", "merge", "skip_existing"})
+
     def __init__(
         self,
         db: "AsyncDatabase",
@@ -115,7 +125,7 @@ class IdentityImporter:
         self.storage_dir = Path(storage_dir) if storage_dir is not None else None
         self.errors: List[str] = []
         self.warnings: List[str] = []
-        self.stats: Dict[str, int] = {}
+        self.stats: Dict[str, Any] = {}
 
     async def import_serialized(
         self,
@@ -319,40 +329,75 @@ class IdentityImporter:
             # Reached only when allow_unsigned=True (else we returned above).
             self.warnings.append("Importing unsigned package (allow_unsigned=True)")
 
-        # 2. Check merge mode
+        # 2. Check merge mode and package shape before any mutation.
+        if merge_mode not in self.MERGE_MODES:
+            self.errors.append(
+                "Invalid merge mode; expected replace, merge, or skip_existing"
+            )
+            return self._build_result(False, agent_id)
+
         if merge_mode == "skip_existing":
             existing = await self._check_existing_data(agent_id)
             if existing:
                 self.warnings.append("Skipping import - existing data found")
                 return self._build_result(True, agent_id)
 
+        try:
+            self._validate_package_components(package)
+        except ValueError as e:
+            self.errors.append(f"Identity package validation failed: {e}")
+            return self._build_result(False, agent_id)
+
         # 3. Begin import
         migration_id = create_migration_id()
 
+        component = "transaction setup"
         try:
-            # Clear existing data if replace mode
-            if merge_mode == "replace":
-                await self._clear_existing_data(agent_id)
+            # Both backends bind every write in this block to one transaction.
+            # Helpers must not commit or suppress required-row failures.
+            async with self.db.transaction():
+                if merge_mode == "replace":
+                    component = "replace cleanup"
+                    await self._clear_existing_data(agent_id)
 
-            # Import each component
-            await self._import_episodes(agent_id, package.episodes)
-            await self._import_saved_items(agent_id, package.saved_items)
-            await self._import_temporal_patterns(agent_id, package.temporal_patterns)
-            await self._import_reflection_insights(agent_id, package.reflection_insights)
-            await self._import_relationships(agent_id, package.relationships)
-            await self._import_skills(agent_id, package.skills)
-            await self._import_wallet_state(agent_id, package)
-
-            # Record the migration
-            await self._record_migration(agent_id, package, migration_id)
+                component = "memory episodes"
+                await self._import_episodes(agent_id, package.episodes)
+                component = "saved items"
+                await self._import_saved_items(agent_id, package.saved_items)
+                component = "temporal patterns"
+                await self._import_temporal_patterns(
+                    agent_id, package.temporal_patterns
+                )
+                component = "reflection insights"
+                await self._import_reflection_insights(
+                    agent_id, package.reflection_insights
+                )
+                component = "relationships"
+                await self._import_relationships(agent_id, package.relationships)
+                component = "skills"
+                await self._import_skills(agent_id, package.skills)
+                component = "wallet"
+                await self._import_wallet_state(agent_id, package)
+                component = "migration evidence"
+                await self._record_migration(agent_id, package, migration_id)
 
             logger.info(f"Import complete: {self.stats}")
             return self._build_result(True, agent_id, migration_id)
 
         except Exception as e:
-            self.errors.append(f"Import failed: {str(e)}")
-            logger.error(f"Import failed: {e}", exc_info=True)
-            return self._build_result(False, agent_id, migration_id)
+            # Attempted counts describe rolled-back writes, not evidence.
+            self.stats = {}
+            self.errors.append(
+                f"Identity import failed during {component}; "
+                "all database changes were rolled back"
+            )
+            logger.error(
+                "Identity import failed during %s: %s",
+                component,
+                e,
+                exc_info=True,
+            )
+            return self._build_result(False, agent_id)
 
     def _build_result(self, success: bool, agent_id: str, migration_id: str = "") -> ImportResult:
         """Build an ImportResult."""
@@ -387,166 +432,323 @@ class IdentityImporter:
             return False
 
     async def _check_existing_data(self, agent_id: str) -> bool:
-        """Check if there's existing data for this agent."""
+        """Check the importer-owned inventory for existing agent state."""
+        for table in self.REPLACE_ROW_TABLES:
+            row = await self.db.fetchone(
+                f"SELECT COUNT(*) FROM {table} WHERE agent_id = ?",
+                (agent_id,),
+            )
+            if row and row[0] > 0:
+                return True
+
         row = await self.db.fetchone(
-            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
-            (agent_id,)
+            """SELECT COUNT(*)
+               FROM graph_edges ge
+               JOIN graph_nodes gn ON gn.node_id = ge.target_id
+               WHERE ge.source_id = ?
+                 AND (gn.node_type = 'user'
+                      OR (gn.node_type = 'skill' AND ge.label = 'has_skill'))""",
+            (agent_id,),
         )
-        return row and row[0] > 0
+        return bool(row and row[0] > 0)
+
+    @staticmethod
+    def _record_dict(record: Any, component: str, index: int) -> Dict[str, Any]:
+        if hasattr(record, "to_dict"):
+            record = record.to_dict()
+        if not isinstance(record, dict):
+            raise ValueError(f"{component}[{index}] must be an object")
+        return record
+
+    def _validate_records(
+        self,
+        component: str,
+        records: List[Any],
+        required_fields: tuple[str, ...],
+        unique_fields: tuple[str, ...],
+    ) -> None:
+        seen: set[tuple[Any, ...]] = set()
+        for index, raw_record in enumerate(records):
+            record = self._record_dict(raw_record, component, index)
+            for field in required_fields:
+                value = record.get(field)
+                empty_required_string = (
+                    isinstance(value, str)
+                    and not value.strip()
+                    and not (component == "saved_items" and field == "content")
+                )
+                if value is None or empty_required_string:
+                    raise ValueError(
+                        f"{component}[{index}] is missing required field {field!r}"
+                    )
+            if unique_fields:
+                identity = tuple(record.get(field) for field in unique_fields)
+                if identity in seen:
+                    fields = ", ".join(unique_fields)
+                    raise ValueError(
+                        f"{component}[{index}] duplicates an earlier {fields} value"
+                    )
+                seen.add(identity)
+
+    def _validate_package_components(self, package: AgentIdentityPackage) -> None:
+        """Reject malformed required records before destructive work begins."""
+        specifications = (
+            ("episodes", package.episodes, ("id", "title"), ("id",)),
+            (
+                "saved_items",
+                package.saved_items,
+                ("id", "item_type", "name", "content"),
+                ("id",),
+            ),
+            (
+                "temporal_patterns",
+                package.temporal_patterns,
+                ("id", "pattern_type", "description"),
+                ("id",),
+            ),
+            (
+                "reflection_insights",
+                package.reflection_insights,
+                ("id", "insight_type", "title"),
+                ("id",),
+            ),
+            (
+                "relationships",
+                package.relationships,
+                ("user_id",),
+                ("user_id", "relationship_type"),
+            ),
+            (
+                "skills",
+                package.skills,
+                ("skill_id", "skill_name"),
+                ("skill_id",),
+            ),
+            (
+                "wallet_transaction_history",
+                package.wallet_transaction_history,
+                ("amount",),
+                (),
+            ),
+        )
+        for component, records, required, unique in specifications:
+            if not isinstance(records, list):
+                raise ValueError(f"{component} must be a list")
+            self._validate_records(component, records, required, unique)
+
+    def _timestamp_param(self, value: Any, field: str) -> Any:
+        """Validate a package timestamp and shape it for the active backend."""
+        if value in (None, ""):
+            return None
+        original = value
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as e:
+                raise ValueError(
+                    f"{field} is not a valid ISO-8601 timestamp"
+                ) from e
+        else:
+            raise ValueError(f"{field} is not a valid timestamp")
+
+        if self.db.backend_type == "postgres":
+            return parsed
+        return original if isinstance(original, str) else parsed.isoformat()
 
     async def _clear_existing_data(self, agent_id: str):
-        """Clear existing data for this agent (replace mode)."""
-        tables = [
-            "memory_episodes",
-            "saved_items",
-            "temporal_patterns",
-            "reflection_insights",
-        ]
-        for table in tables:
-            try:
+        """Clear the exact importer-owned inventory for replace mode."""
+        for table in self.REPLACE_ROW_TABLES:
+            await self.db.execute(
+                f"DELETE FROM {table} WHERE agent_id = ?",
+                (agent_id,),
+            )
+
+        await self._clear_graph_component(agent_id, "user")
+        await self._clear_graph_component(agent_id, "skill", label="has_skill")
+
+    async def _clear_graph_component(
+        self,
+        agent_id: str,
+        node_type: str,
+        *,
+        label: Optional[str] = None,
+    ) -> None:
+        """Remove this agent's component edges and reclaim orphaned nodes."""
+        query = (
+            "SELECT DISTINCT gn.node_id FROM graph_nodes gn "
+            "JOIN graph_edges ge ON gn.node_id = ge.target_id "
+            "WHERE ge.source_id = ? AND gn.node_type = ?"
+        )
+        query_params: tuple[Any, ...] = (agent_id, node_type)
+        if label is not None:
+            query += " AND ge.label = ?"
+            query_params += (label,)
+        rows = await self.db.fetchall(query, query_params)
+
+        for row in rows:
+            node_id = row[0]
+            delete_sql = (
+                "DELETE FROM graph_edges WHERE source_id = ? AND target_id = ?"
+            )
+            delete_params: tuple[Any, ...] = (agent_id, node_id)
+            if label is not None:
+                delete_sql += " AND label = ?"
+                delete_params += (label,)
+            await self.db.execute(delete_sql, delete_params)
+
+            remaining = await self.db.fetchone(
+                "SELECT COUNT(*) FROM graph_edges "
+                "WHERE source_id = ? OR target_id = ?",
+                (node_id, node_id),
+            )
+            if not remaining or remaining[0] == 0:
                 await self.db.execute(
-                    f"DELETE FROM {table} WHERE agent_id = ?",
-                    (agent_id,)
+                    "DELETE FROM graph_nodes WHERE node_id = ? AND node_type = ?",
+                    (node_id, node_type),
                 )
-            except Exception as e:
-                logger.warning(f"Could not clear {table}: {e}")
 
     async def _import_episodes(self, agent_id: str, episodes: List[Dict[str, Any]]):
         """Import memory episodes."""
         count = 0
-        for ep in episodes:
-            try:
-                # Generate new ID to avoid conflicts when importing to same DB
-                new_id = f"{agent_id[:20]}_{ep.get('id', '')}"
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO memory_episodes
-                       (id, agent_id, title, summary, timespan_start, timespan_end,
-                        key_message_ids, emotional_arc, created_at, importance,
-                        access_count)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_id,
-                        agent_id,
-                        ep.get("title"),
-                        ep.get("summary"),
+        for index, ep in enumerate(episodes):
+            new_id = f"{agent_id[:20]}_{ep['id']}"
+            await self.db.execute(
+                """INSERT OR REPLACE INTO memory_episodes
+                   (id, agent_id, title, summary, timespan_start, timespan_end,
+                    key_message_ids, emotional_arc, created_at, importance,
+                    access_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_id,
+                    agent_id,
+                    ep["title"],
+                    ep.get("summary"),
+                    self._timestamp_param(
                         ep.get("timespan_start"),
+                        f"episodes[{index}].timespan_start",
+                    ),
+                    self._timestamp_param(
                         ep.get("timespan_end"),
-                        json.dumps(ep.get("key_message_ids", [])),
-                        ep.get("emotional_arc"),
+                        f"episodes[{index}].timespan_end",
+                    ),
+                    json.dumps(ep.get("key_message_ids", [])),
+                    ep.get("emotional_arc"),
+                    self._timestamp_param(
                         ep.get("created_at"),
-                        ep.get("importance", 0.5),
-                        ep.get("access_count", 0),
-                    )
+                        f"episodes[{index}].created_at",
+                    ),
+                    ep.get("importance", 0.5),
+                    ep.get("access_count", 0),
                 )
-                count += 1
-            except Exception as e:
-                self.warnings.append(f"Failed to import episode {ep.get('id')}: {e}")
+            )
+            count += 1
 
-        await self.db.commit()
         self.stats["episodes_imported"] = count
         logger.info(f"Imported {count} memory episodes")
 
     async def _import_saved_items(self, agent_id: str, items: List[Dict[str, Any]]):
         """Import saved items."""
         count = 0
-        for item in items:
-            try:
-                # Generate new ID to avoid conflicts when importing to same DB
-                new_id = f"{agent_id[:20]}_{item.get('id', '')}"
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO saved_items
-                       (id, agent_id, item_type, name, summary, content, content_hash,
-                        ipfs_cid, source_type, source_ref, schema_id, tags, metadata,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_id,
-                        agent_id,
-                        item.get("item_type"),
-                        item.get("name"),
-                        item.get("summary"),
-                        item.get("content"),
-                        item.get("content_hash"),
-                        item.get("ipfs_cid"),
-                        item.get("source_type"),
-                        item.get("source_ref"),
-                        item.get("schema_id"),
-                        json.dumps(item.get("tags", [])),
-                        json.dumps(item.get("metadata", {})),
+        for index, item in enumerate(items):
+            new_id = f"{agent_id[:20]}_{item['id']}"
+            await self.db.execute(
+                """INSERT OR REPLACE INTO saved_items
+                   (id, agent_id, item_type, name, summary, content, content_hash,
+                    ipfs_cid, source_type, source_ref, schema_id, tags, metadata,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_id,
+                    agent_id,
+                    item["item_type"],
+                    item["name"],
+                    item.get("summary"),
+                    item["content"],
+                    item.get("content_hash"),
+                    item.get("ipfs_cid"),
+                    item.get("source_type"),
+                    item.get("source_ref"),
+                    item.get("schema_id"),
+                    json.dumps(item.get("tags", [])),
+                    json.dumps(item.get("metadata", {})),
+                    self._timestamp_param(
                         item.get("created_at"),
+                        f"saved_items[{index}].created_at",
+                    ),
+                    self._timestamp_param(
                         item.get("updated_at"),
-                    )
+                        f"saved_items[{index}].updated_at",
+                    ),
                 )
-                count += 1
-            except Exception as e:
-                self.warnings.append(f"Failed to import saved item {item.get('id')}: {e}")
+            )
+            count += 1
 
-        await self.db.commit()
         self.stats["saved_items_imported"] = count
         logger.info(f"Imported {count} saved items")
 
     async def _import_temporal_patterns(self, agent_id: str, patterns: List[Dict[str, Any]]):
         """Import temporal patterns."""
         count = 0
-        for pattern in patterns:
-            try:
-                # Generate new ID to avoid conflicts when importing to same DB
-                new_id = f"{agent_id[:20]}_{pattern.get('id', '')}"
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO temporal_patterns
-                       (id, agent_id, pattern_type, description, trigger_conditions,
-                        confidence, observations, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_id,
-                        agent_id,
-                        pattern.get("pattern_type"),
-                        pattern.get("description"),
-                        json.dumps(pattern.get("trigger_conditions", {})),
-                        pattern.get("confidence", 0.0),
-                        pattern.get("observations", 0),
+        for index, pattern in enumerate(patterns):
+            new_id = f"{agent_id[:20]}_{pattern['id']}"
+            await self.db.execute(
+                """INSERT OR REPLACE INTO temporal_patterns
+                   (id, agent_id, pattern_type, description, trigger_conditions,
+                    confidence, observations, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_id,
+                    agent_id,
+                    pattern["pattern_type"],
+                    pattern["description"],
+                    json.dumps(pattern.get("trigger_conditions", {})),
+                    pattern.get("confidence", 0.0),
+                    pattern.get("observations", 0),
+                    self._timestamp_param(
                         pattern.get("created_at"),
+                        f"temporal_patterns[{index}].created_at",
+                    ),
+                    self._timestamp_param(
                         pattern.get("updated_at"),
-                    )
+                        f"temporal_patterns[{index}].updated_at",
+                    ),
                 )
-                count += 1
-            except Exception as e:
-                self.warnings.append(f"Failed to import pattern {pattern.get('id')}: {e}")
+            )
+            count += 1
 
-        await self.db.commit()
         self.stats["temporal_patterns_imported"] = count
         logger.info(f"Imported {count} temporal patterns")
 
     async def _import_reflection_insights(self, agent_id: str, insights: List[Dict[str, Any]]):
         """Import reflection insights."""
         count = 0
-        for insight in insights:
-            try:
-                # Generate new ID to avoid conflicts when importing to same DB
-                new_id = f"{agent_id[:20]}_{insight.get('id', '')}"
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO reflection_insights
-                       (id, agent_id, type, title, description, evidence, confidence,
-                        actionable, suggested_action, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_id,
-                        agent_id,
-                        insight.get("insight_type"),  # maps to 'type' column
-                        insight.get("title", "Imported Insight"),
-                        insight.get("description", ""),
-                        json.dumps(insight.get("evidence", [])),
-                        insight.get("confidence", 0.5),
-                        1 if insight.get("actionable") else 0,
-                        insight.get("suggested_action"),
+        for index, insight in enumerate(insights):
+            new_id = f"{agent_id[:20]}_{insight['id']}"
+            await self.db.execute(
+                """INSERT OR REPLACE INTO reflection_insights
+                   (id, agent_id, type, title, description, evidence, confidence,
+                    actionable, suggested_action, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_id,
+                    agent_id,
+                    insight["insight_type"],  # maps to 'type' column
+                    insight["title"],
+                    insight.get("description", ""),
+                    json.dumps(insight.get("evidence", [])),
+                    insight.get("confidence", 0.5),
+                    1 if insight.get("actionable") else 0,
+                    insight.get("suggested_action"),
+                    self._timestamp_param(
                         insight.get("created_at"),
-                    )
+                        f"reflection_insights[{index}].created_at",
+                    ),
                 )
-                count += 1
-            except Exception as e:
-                self.warnings.append(f"Failed to import insight {insight.get('id')}: {e}")
+            )
+            count += 1
 
-        await self.db.commit()
         self.stats["reflection_insights_imported"] = count
         logger.info(f"Imported {count} reflection insights")
 
@@ -588,48 +790,37 @@ class IdentityImporter:
         count = 0
         for rel in relationships:
             rel_dict = rel.to_dict() if hasattr(rel, 'to_dict') else rel
-            try:
-                # Create user node. F186: namespace the package-supplied id
-                # so it can't overwrite arbitrary graph_nodes rows.
-                raw_user_id = rel_dict.get("user_id")
-                if not raw_user_id:
-                    self.warnings.append("Skipping relationship with no user_id")
-                    continue
-                user_id = self._namespace_node_id(agent_id, raw_user_id)
-                if await self._node_is_protected(agent_id, user_id):
-                    self.warnings.append(
-                        f"Refused to import relationship: node id {user_id!r} "
-                        "collides with a reserved/identity node"
-                    )
-                    continue
-                properties = json.dumps({
-                    "first_interaction": rel_dict.get("first_interaction"),
-                    "last_interaction": rel_dict.get("last_interaction"),
-                    "interaction_count": rel_dict.get("interaction_count", 0),
-                    "notes": rel_dict.get("relationship_notes", ""),
-                    "trust_level": rel_dict.get("trust_level", 0.5),
-                    "preferences": rel_dict.get("preferences_learned", {}),
-                })
-
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO graph_nodes
-                       (node_id, node_type, label, properties)
-                       VALUES (?, 'user', ?, ?)""",
-                    (user_id, f"User {str(raw_user_id)[:8]}", properties)
+            # Create user node. F186: namespace the package-supplied id.
+            raw_user_id = rel_dict["user_id"]
+            user_id = self._namespace_node_id(agent_id, raw_user_id)
+            if await self._node_is_protected(agent_id, user_id):
+                raise ValueError(
+                    "relationship node collides with a reserved identity node"
                 )
+            properties = json.dumps({
+                "first_interaction": rel_dict.get("first_interaction"),
+                "last_interaction": rel_dict.get("last_interaction"),
+                "interaction_count": rel_dict.get("interaction_count", 0),
+                "notes": rel_dict.get("relationship_notes", ""),
+                "trust_level": rel_dict.get("trust_level", 0.5),
+                "preferences": rel_dict.get("preferences_learned", {}),
+            })
 
-                # Create edge
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO graph_edges
-                       (source_id, target_id, label, properties)
-                       VALUES (?, ?, ?, '{}')""",
-                    (agent_id, user_id, rel_dict.get("relationship_type", "knows"))
-                )
-                count += 1
-            except Exception as e:
-                self.warnings.append(f"Failed to import relationship: {e}")
+            await self.db.execute(
+                """INSERT OR REPLACE INTO graph_nodes
+                   (node_id, node_type, label, properties)
+                   VALUES (?, 'user', ?, ?)""",
+                (user_id, f"User {str(raw_user_id)[:8]}", properties)
+            )
 
-        await self.db.commit()
+            await self.db.execute(
+                """INSERT OR REPLACE INTO graph_edges
+                   (source_id, target_id, label, properties)
+                   VALUES (?, ?, ?, '{}')""",
+                (agent_id, user_id, rel_dict.get("relationship_type", "knows"))
+            )
+            count += 1
+
         self.stats["relationships_imported"] = count
         logger.info(f"Imported {count} relationships")
 
@@ -638,84 +829,112 @@ class IdentityImporter:
         count = 0
         for skill in skills:
             skill_dict = skill.to_dict() if hasattr(skill, 'to_dict') else skill
-            try:
-                # F186: namespace the package-supplied skill id so it can't
-                # overwrite arbitrary graph_nodes rows.
-                raw_skill_id = skill_dict.get("skill_id")
-                if not raw_skill_id:
-                    self.warnings.append("Skipping skill with no skill_id")
-                    continue
-                skill_id = self._namespace_node_id(agent_id, raw_skill_id)
-                if await self._node_is_protected(agent_id, skill_id):
-                    self.warnings.append(
-                        f"Refused to import skill: node id {skill_id!r} "
-                        "collides with a reserved/identity node"
-                    )
-                    continue
-                properties = json.dumps({
-                    "type": skill_dict.get("skill_type"),
-                    "proficiency": skill_dict.get("proficiency", 0.5),
-                    "times_used": skill_dict.get("times_used", 0),
-                    "last_used": skill_dict.get("last_used"),
-                    "config": skill_dict.get("configuration", {}),
-                })
-
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO graph_nodes
-                       (node_id, node_type, label, properties)
-                       VALUES (?, 'skill', ?, ?)""",
-                    (skill_id, skill_dict.get("skill_name"), properties)
+            raw_skill_id = skill_dict["skill_id"]
+            skill_id = self._namespace_node_id(agent_id, raw_skill_id)
+            if await self._node_is_protected(agent_id, skill_id):
+                raise ValueError(
+                    "skill node collides with a reserved identity node"
                 )
+            properties = json.dumps({
+                "type": skill_dict.get("skill_type"),
+                "proficiency": skill_dict.get("proficiency", 0.5),
+                "times_used": skill_dict.get("times_used", 0),
+                "last_used": skill_dict.get("last_used"),
+                "config": skill_dict.get("configuration", {}),
+            })
 
-                # Create edge
-                await self.db.execute(
-                    """INSERT OR REPLACE INTO graph_edges
-                       (source_id, target_id, label, properties)
-                       VALUES (?, ?, 'has_skill', '{}')""",
-                    (agent_id, skill_id)
-                )
-                count += 1
-            except Exception as e:
-                self.warnings.append(f"Failed to import skill: {e}")
+            await self.db.execute(
+                """INSERT OR REPLACE INTO graph_nodes
+                   (node_id, node_type, label, properties)
+                   VALUES (?, 'skill', ?, ?)""",
+                (skill_id, skill_dict["skill_name"], properties)
+            )
 
-        await self.db.commit()
+            await self.db.execute(
+                """INSERT OR REPLACE INTO graph_edges
+                   (source_id, target_id, label, properties)
+                   VALUES (?, ?, 'has_skill', '{}')""",
+                (agent_id, skill_id)
+            )
+            count += 1
+
         self.stats["skills_imported"] = count
         logger.info(f"Imported {count} skills")
 
     async def _import_wallet_state(self, agent_id: str, package: AgentIdentityPackage):
         """Import wallet state."""
-        try:
-            # Insert or update wallet balance (main_balance column in schema)
-            await self.db.execute(
-                """INSERT OR REPLACE INTO wallet_state
-                   (agent_id, main_balance, audit_balance, updated_at)
-                   VALUES (?, ?, ?, ?)""",
-                (agent_id, package.wallet_balance, "0.0", datetime.now(timezone.utc).isoformat())
+        # Transaction ids are backend-local surrogate keys; signed fields are
+        # portable and receive fresh row ids on the target backend.
+        await self.db.execute(
+            """INSERT OR REPLACE INTO wallet_state
+               (agent_id, main_balance, audit_balance, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                agent_id,
+                package.wallet_balance,
+                "0.0",
+                self._timestamp_param(
+                    datetime.now(timezone.utc), "wallet_state.updated_at"
+                ),
             )
+        )
 
-            # Import transaction history
-            for tx in package.wallet_transaction_history:
-                try:
-                    await self.db.execute(
-                        """INSERT INTO wallet_transactions
-                           (id, agent_id, amount, memo, created_at)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (
-                            tx.get("id"),
-                            agent_id,
-                            tx.get("amount"),
-                            tx.get("memo"),
-                            tx.get("created_at"),
-                        )
-                    )
-                except Exception:
-                    pass  # Skip duplicate transactions
+        imported = 0
+        skipped = 0
+        for index, tx in enumerate(package.wallet_transaction_history):
+            created_at = self._timestamp_param(
+                tx.get("created_at"),
+                f"wallet_transaction_history[{index}].created_at",
+            )
+            memo = tx.get("memo")
+            duplicate_sql = (
+                "SELECT COUNT(*) FROM wallet_transactions "
+                "WHERE agent_id = ? AND amount = ? "
+                "AND COALESCE(memo, '') = ?"
+            )
+            duplicate_params: tuple[Any, ...] = (
+                agent_id,
+                str(tx["amount"]),
+                "" if memo is None else str(memo),
+            )
+            if created_at is None:
+                duplicate_sql += " AND created_at IS NULL"
+            else:
+                duplicate_sql += " AND created_at = ?"
+                duplicate_params += (created_at,)
+            existing = await self.db.fetchone(
+                duplicate_sql,
+                duplicate_params,
+            )
+            if existing and existing[0] > 0:
+                skipped += 1
+                continue
 
-            await self.db.commit()
-            self.stats["wallet_imported"] = True
-            logger.info(f"Imported wallet state (balance: {package.wallet_balance})")
-        except Exception as e:
-            self.warnings.append(f"Failed to import wallet state: {e}")
+            await self.db.execute(
+                """INSERT INTO wallet_transactions
+                   (agent_id, transaction_type, currency, amount, memo,
+                    new_balance, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    agent_id,
+                    tx.get("transaction_type", "imported"),
+                    tx.get("currency", "FIL"),
+                    str(tx["amount"]),
+                    memo,
+                    str(tx.get("new_balance", package.wallet_balance)),
+                    created_at,
+                )
+            )
+            imported += 1
+
+        if skipped:
+            self.warnings.append(
+                f"Skipped {skipped} wallet transaction(s) already present"
+            )
+        self.stats["wallet_imported"] = True
+        self.stats["wallet_transactions_imported"] = imported
+        self.stats["wallet_transactions_skipped_existing"] = skipped
+        logger.info(f"Imported wallet state (balance: {package.wallet_balance})")
 
     async def _record_migration(
         self,
@@ -736,27 +955,21 @@ class IdentityImporter:
             "stats": self.stats,
         })
 
-        try:
-            # Create migration record node
-            await self.db.execute(
-                """INSERT INTO graph_nodes
-                   (node_id, node_type, label, properties)
-                   VALUES (?, 'migration_record', ?, ?)""",
-                (migration_id, f"Migration {migration_id[:8]}", properties)
-            )
+        # Audit evidence is load-bearing: failure aborts the whole import.
+        await self.db.execute(
+            """INSERT INTO graph_nodes
+               (node_id, node_type, label, properties)
+               VALUES (?, 'migration_record', ?, ?)""",
+            (migration_id, f"Migration {migration_id[:8]}", properties)
+        )
 
-            # Link to agent
-            await self.db.execute(
-                """INSERT INTO graph_edges
-                   (source_id, target_id, label, properties)
-                   VALUES (?, ?, 'migrated_via', '{}')""",
-                (agent_id, migration_id)
-            )
-
-            await self.db.commit()
-            logger.info(f"Recorded migration: {migration_id}")
-        except Exception as e:
-            self.warnings.append(f"Failed to record migration: {e}")
+        await self.db.execute(
+            """INSERT INTO graph_edges
+               (source_id, target_id, label, properties)
+               VALUES (?, ?, 'migrated_via', '{}')""",
+            (agent_id, migration_id)
+        )
+        logger.info(f"Recorded migration: {migration_id}")
 
 
 async def import_identity(
