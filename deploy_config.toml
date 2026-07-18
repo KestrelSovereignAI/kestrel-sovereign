@@ -35,8 +35,9 @@ provider = "cloudrun"
 service_name = "kestrel-dev"
 region = "us-central1"
 deployment_mode = "multi_agent"
+persistence_mode = "ephemeral_demo"
 min_instances = 1
-max_instances = 10
+max_instances = 1
 memory = "2Gi"
 cpu = 2
 port = 8080
@@ -48,6 +49,7 @@ KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
+KESTREL_DEPLOYMENT_PERSISTENCE = "ephemeral_demo"
 KESTREL_AGENTS = "Kestrel,kestrel-demo"
 KESTREL_REQUIRE_OAUTH = "true"
 # ``${KESTREL_ALLOWED_EMAILS}`` is expanded by DeployManagerCore._expand_env_vars
@@ -72,18 +74,18 @@ GITHUB_APP_ID = "github-app-id:latest"
 GITHUB_APP_PRIVATE_KEY = "github-app-private-key:latest"
 GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 
-# Production Profile - Cloud Run (single-agent image, always warm, auto-scales)
+# Production Profile - Cloud Run (durable single-agent, always warm, auto-scales)
 #
-# Mirrors legacy scripts/cloudrun/deploy_prod.sh. The prod profile uses the
-# single-agent image (``kestrel``) but sets KESTREL_MULTI_AGENT=true to run
-# the host inside the single-agent container — that's what the bash did.
-# deployment_mode therefore stays ``"agent"`` (the default) so the image
-# reference resolves to ``gcr.io/<project>/kestrel:<tag>``.
+# The container filesystem is disposable. Production restores one encrypted,
+# version-pinned identity bundle from Secret Manager and keeps coherent state
+# in PostgreSQL. The profile stays single-agent until per-agent custody and
+# database bindings exist for the multi-agent host.
 [profiles.prod]
 name = "Cloud Run Production"
 provider = "cloudrun"
 service_name = "kestrel-prod"
 region = "us-central1"
+persistence_mode = "durable_sovereign"
 min_instances = 1
 max_instances = 100
 memory = "2Gi"
@@ -95,16 +97,19 @@ concurrency = 80
 [profiles.prod.env_vars]
 KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "production"
-KESTREL_DB_BACKEND = "sqlite"
+KESTREL_DB_BACKEND = "postgres"
 KESTREL_DB_PATH = "/app/agent_data"
-KESTREL_MULTI_AGENT = "true"
+KESTREL_DEPLOYMENT_PERSISTENCE = "durable_sovereign"
+KESTREL_EXPECTED_DID = "${KESTREL_PROD_EXPECTED_DID}"
 KESTREL_REQUIRE_OAUTH = "true"
 KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
 [profiles.prod.secrets]
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
-KESTREL_DATA_KEY = "kestrel-data-key:latest"
+KESTREL_DATABASE_URL = "kestrel-prod-database-url:1"
+KESTREL_DATA_KEY = "kestrel-data-key:1"
+KESTREL_IDENTITY_BUNDLE = "kestrel-prod-identity-bundle:1"
 GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"
 GOOGLE_CLIENT_SECRET = "kestrel-google-client-secret:latest"
 KESTREL_SESSION_SECRET = "kestrel-session-secret:latest"
@@ -125,8 +130,9 @@ provider = "cloudrun"
 service_name = "kestrel-multi-agent-dev"
 region = "us-central1"
 deployment_mode = "multi_agent"
+persistence_mode = "ephemeral_demo"
 min_instances = 0
-max_instances = 10
+max_instances = 1
 memory = "4Gi"
 cpu = 4
 port = 8080
@@ -137,6 +143,7 @@ concurrency = 80
 KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
+KESTREL_DEPLOYMENT_PERSISTENCE = "ephemeral_demo"
 KESTREL_HOST_AUTOSTART = "true"
 KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 
@@ -159,6 +166,7 @@ provider = "cloudrun"
 service_name = "kestrel-multi-agent-prod"
 region = "us-central1"
 deployment_mode = "multi_agent"
+persistence_mode = "durable_sovereign"
 min_instances = 1
 max_instances = 100
 memory = "4Gi"
@@ -170,7 +178,8 @@ concurrency = 80
 [profiles.multi-agent-prod.env_vars]
 KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "production"
-KESTREL_DB_BACKEND = "sqlite"
+KESTREL_DB_BACKEND = "postgres"
+KESTREL_DEPLOYMENT_PERSISTENCE = "durable_sovereign"
 KESTREL_HOST_AUTOSTART = "true"
 
 [profiles.multi-agent-prod.secrets]
@@ -190,8 +199,9 @@ provider = "azure"
 service_name = "kestrel-multi-agent-dev"
 region = "eastus2"
 deployment_mode = "multi_agent"
+persistence_mode = "ephemeral_demo"
 min_instances = 0
-max_instances = 10
+max_instances = 1
 memory = "4Gi"
 cpu = 4
 port = 8080
@@ -202,6 +212,7 @@ concurrency = 80
 KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
+KESTREL_DEPLOYMENT_PERSISTENCE = "ephemeral_demo"
 KESTREL_HOST_AUTOSTART = "true"
 
 [profiles.azure-multi-agent-dev.secrets]
@@ -216,8 +227,9 @@ name = "Azure Container Apps Development"
 provider = "azure"
 service_name = "kestrel-dev"
 region = "eastus2"
+persistence_mode = "ephemeral_demo"
 min_instances = 0
-max_instances = 10
+max_instances = 1
 memory = "2Gi"
 cpu = 2
 port = 8080
@@ -229,6 +241,7 @@ KESTREL_DID_WEB_DOMAIN = "agents.kestrelsovereign.com"
 KESTREL_ENV = "development"
 KESTREL_DB_BACKEND = "sqlite"
 KESTREL_DB_PATH = "/app/agent_data"
+KESTREL_DEPLOYMENT_PERSISTENCE = "ephemeral_demo"
 
 [profiles.azure-dev.secrets]
 OPENAI_API_KEY = "${OPENAI_API_KEY}"

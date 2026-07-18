@@ -19,24 +19,44 @@ from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def get_agent_did_async(storage_dir: str) -> str:
+async def get_agent_did_async(
+    storage_dir: str,
+    *,
+    db_backend: str | None = None,
+    database_url: str | None = None,
+) -> str:
     """
     Retrieves the agent's DID from async storage.
     This function is critical for server startup and agent initialization.
 
     Args:
-        storage_dir: Directory containing the agent database (not the file path itself).
-                    The database file is expected to be 'kestrel_prime.db' inside this directory.
+        storage_dir: Directory containing local identity files and, for SQLite,
+            ``kestrel_prime.db``.
+        db_backend: Explicit storage backend. Defaults to KESTREL_DB_BACKEND.
+        database_url: PostgreSQL DSN. Defaults to KESTREL_DATABASE_URL.
     """
-    # Construct full database file path from directory
-    db_path = os.path.join(storage_dir, "kestrel_prime.db")
-    storage = AsyncStorage(db_path)
+    backend = (db_backend or os.environ.get("KESTREL_DB_BACKEND", "sqlite")).lower()
+    if backend == "postgres":
+        dsn = database_url or os.environ.get("KESTREL_DATABASE_URL")
+        if not dsn:
+            raise ValueError(
+                "KESTREL_DATABASE_URL is required when KESTREL_DB_BACKEND=postgres"
+            )
+        storage = AsyncStorage(backend="postgres", dsn=dsn)
+    else:
+        db_path = os.path.join(storage_dir, "kestrel_prime.db")
+        storage = AsyncStorage(db_path)
     await storage.initialize()
     try:
         agent_nodes = await storage.get_nodes_by_type("agent")
         if not agent_nodes:
             raise ValueError("No agent found in the database. Please run inception service first.")
         if len(agent_nodes) > 1:
+            if backend == "postgres":
+                raise ValueError(
+                    "Durable single-agent PostgreSQL custody requires exactly "
+                    "one agent node; use a dedicated database"
+                )
             logging.warning(f"Multiple agents found, using the first one: {agent_nodes[0].node_id}")
         return agent_nodes[0].node_id
     finally:

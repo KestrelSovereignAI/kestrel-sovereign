@@ -6,6 +6,7 @@ Tests the Cloud Run provider with mocked google-cloud-run SDK.
 
 import asyncio
 import os
+from dataclasses import replace
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -46,15 +47,17 @@ def deployment_profile():
         service_name="kestrel-dev",
         region="us-central1",
         min_instances=0,
-        max_instances=10,
+        max_instances=1,
         memory="2Gi",
         cpu=2,
         port=8080,
         timeout=300,
         concurrency=80,
+        persistence_mode="ephemeral_demo",
         env_vars={
             "KESTREL_ENV": "development",
             "KESTREL_DB_BACKEND": "sqlite",
+            "KESTREL_DEPLOYMENT_PERSISTENCE": "ephemeral_demo",
         },
         secrets={
             "OPENAI_API_KEY": "kestrel-openai-key:latest",
@@ -147,6 +150,55 @@ class TestCloudRunProviderDeploy:
             b.role == "roles/run.invoker" and "allUsers" in b.members
             for b in policy.bindings
         )
+
+    @pytest.mark.asyncio
+    async def test_rejects_unspecified_disposable_persistence(
+        self, deployment_profile
+    ):
+        """Direct provider callers cannot bypass the persistence contract."""
+        unsafe = replace(
+            deployment_profile,
+            persistence_mode="unspecified",
+            env_vars={"KESTREL_ENV": "development", "KESTREL_DB_BACKEND": "sqlite"},
+        )
+        provider = CloudRunProvider(project_id="test-project")
+
+        with pytest.raises(DeployManagerError, match="explicitly set persistence_mode"):
+            await provider.deploy(
+                image="gcr.io/test-project/kestrel:immutable",
+                service_name="kestrel-dev",
+                profile=unsafe,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_override_that_downgrades_durable_postgres(
+        self, deployment_profile
+    ):
+        durable = replace(
+            deployment_profile,
+            persistence_mode="durable_sovereign",
+            max_instances=100,
+            env_vars={
+                "KESTREL_ENV": "production",
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DEPLOYMENT_PERSISTENCE": "durable_sovereign",
+                "KESTREL_EXPECTED_DID": "did:web:agents.example.com:kestrel",
+            },
+            secrets={
+                "KESTREL_DATABASE_URL": "database-url:4",
+                "KESTREL_DATA_KEY": "data-key:7",
+                "KESTREL_IDENTITY_BUNDLE": "identity-bundle:9",
+            },
+        )
+        provider = CloudRunProvider(project_id="test-project")
+
+        with pytest.raises(DeployManagerError, match="requires KESTREL_DB_BACKEND=postgres"):
+            await provider.deploy(
+                image="gcr.io/test-project/kestrel:immutable",
+                service_name="kestrel-prod",
+                profile=durable,
+                env_vars={"KESTREL_DB_BACKEND": "sqlite"},
+            )
 
     @pytest.mark.asyncio
     async def test_deploy_update_existing(self, mock_services_client, deployment_profile):

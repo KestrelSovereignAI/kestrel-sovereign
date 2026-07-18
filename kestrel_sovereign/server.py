@@ -786,7 +786,11 @@ async def lifespan(app: FastAPI):
                 logger.info("Using PostgreSQL backend for Kestrel")
                 storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
                 db_path = os.path.join(storage_dir, "kestrel_prime.db")
-                agent_did = await get_agent_did_async(storage_dir)
+                agent_did = await get_agent_did_async(
+                    storage_dir,
+                    db_backend="postgres",
+                    database_url=database_url,
+                )
                 verify_identity_isolation(agent_did)
                 llm_service = LLMService()
                 app.state.agent = KestrelAgent(

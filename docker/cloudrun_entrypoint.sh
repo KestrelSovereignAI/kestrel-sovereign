@@ -1,8 +1,8 @@
 #!/bin/bash
 # Cloud Run entrypoint for Kestrel Agent
-# Bootstraps identity on first start, then runs uvicorn
+# Restores durable identity or bootstraps an explicit demo, then runs uvicorn
 
-set -e
+set -euo pipefail
 
 # Strip surrounding quotes from all env vars.
 # Docker's --env-file includes quotes literally, breaking API keys and secrets.
@@ -15,11 +15,8 @@ while IFS='=' read -r key val; do
     fi
 done < <(env)
 
-# Single-agent Cloud Run: bootstrap DID + database in KESTREL_DB_PATH
-# directly. kestrel_sovereign/server.py's lifespan calls
-# get_agent_did_async(KESTREL_DB_PATH) and opens
-# "${KESTREL_DB_PATH}/kestrel_prime.db", so the entrypoint must
-# write identity in the same dir.
+# Single-agent Cloud Run keeps key custody under KESTREL_DB_PATH. Durable mode
+# reads DID/state from PostgreSQL; demo mode keeps its disposable SQLite there.
 #
 # (Earlier this script used a "${KESTREL_DB_PATH}/${KESTREL_AGENT_NAME}"
 # subdir to align with the multi_agent image's auto-discovery layout —
@@ -27,27 +24,55 @@ done < <(env)
 # DID one level deeper than the lifespan reads. Reproduced + fixed in #1029.)
 AGENT_DIR="${KESTREL_DB_PATH:-/app/agent_data}"
 PORT="${PORT:-8080}"
+PERSISTENCE_MODE="${KESTREL_DEPLOYMENT_PERSISTENCE:-}"
 
-# Bootstrap agent identity if none exists
-mkdir -p "$AGENT_DIR"
-if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null && ! ls "$AGENT_DIR"/*_did.json &>/dev/null; then
-    echo "No agent identity found. Creating new Kestrel agent in ${AGENT_DIR}..."
-    /app/.venv/bin/python -c "
-import sys; sys.path.insert(0, '/app')
+case "$PERSISTENCE_MODE" in
+    durable_sovereign)
+        if [ "${KESTREL_DB_BACKEND:-}" != "postgres" ]; then
+            echo "FATAL: durable_sovereign requires PostgreSQL; refusing disposable local state." >&2
+            exit 1
+        fi
+        if [ -z "${KESTREL_DATABASE_URL:-}" ] || [ -z "${KESTREL_DATA_KEY:-}" ] || [ -z "${KESTREL_EXPECTED_DID:-}" ] || [ -z "${KESTREL_IDENTITY_BUNDLE:-}" ]; then
+            echo "FATAL: durable sovereign custody or database binding is unavailable; refusing to re-incept." >&2
+            exit 1
+        fi
+        /app/.venv/bin/python -m kestrel_sovereign.identity.custody_bundle \
+            restore-env --agent-dir "$AGENT_DIR" --expected-did "$KESTREL_EXPECTED_DID"
+        # Secret Manager injected the bundle only for bootstrap. The serving
+        # process retains the data-key/DB credentials it needs, but never the
+        # portable identity package.
+        unset KESTREL_IDENTITY_BUNDLE
+        ;;
+    ephemeral_demo)
+        if [ "${KESTREL_ENV:-}" = "production" ] || [ "${KESTREL_ENV:-}" = "prod" ]; then
+            echo "FATAL: ephemeral_demo identity cannot run as production." >&2
+            exit 1
+        fi
+        mkdir -p "$AGENT_DIR"
+        if ! ls "$AGENT_DIR"/kestrel_*.json &>/dev/null && ! ls "$AGENT_DIR"/*_did.json &>/dev/null; then
+            echo "No demo identity found. Creating a disposable test/demo identity..."
+            export KESTREL_BOOTSTRAP_AGENT_DIR="$AGENT_DIR"
+            /app/.venv/bin/python - <<'PY'
+import os
 from kestrel_sovereign.inception_service import create_kestrel_identity
-# Do NOT pass a constitution_path. Inception defaults to the shared
-# governing-constitution resolver's authoritative packaged source
-# (config.CONSTITUTION_PATH = kestrel_sovereign/data/KESTREL_CONSTITUTION.md)
-# — the EXACT bytes the periodic integrity audit later recomputes (#2463).
-# Passing the docs copy (docs/principles/KESTREL_CONSTITUTION.md carries OKF
-# YAML frontmatter) would incept a hash the audit can never match, so fresh
-# container agents would self-brick into Safe Mode on their first audit.
-creds = create_kestrel_identity('$AGENT_DIR')
-print(f'Agent created: {creds.agent_did}')
-"
-else
-    echo "Agent identity found in $AGENT_DIR"
-fi
+
+creds = create_kestrel_identity(
+    os.environ["KESTREL_BOOTSTRAP_AGENT_DIR"],
+    is_test_instance=True,
+    is_demo=True,
+)
+print(f"Disposable demo agent created: {creds.agent_did}")
+PY
+            unset KESTREL_BOOTSTRAP_AGENT_DIR
+        else
+            echo "Disposable demo identity found in $AGENT_DIR"
+        fi
+        ;;
+    *)
+        echo "FATAL: set KESTREL_DEPLOYMENT_PERSISTENCE to durable_sovereign or ephemeral_demo." >&2
+        exit 1
+        ;;
+esac
 
 # Start the server
 exec /app/.venv/bin/uvicorn kestrel_sovereign.server:app --host 0.0.0.0 --port "$PORT"

@@ -34,6 +34,7 @@ from .providers.azure_container import AzureContainerProvider
 from .providers._health import probe_http_health
 from .providers.base import DeployProvider
 from .providers.cloudrun import CloudRunProvider
+from .persistence import validate_cloudrun_persistence
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,7 @@ class DeployManagerCore:
                     timeout=int(data.get("timeout", 300)),
                     concurrency=int(data.get("concurrency", 80)),
                     deployment_mode=deployment_mode,
+                    persistence_mode=data.get("persistence_mode", "unspecified"),
                     dockerfile=data.get("dockerfile", default_dockerfile),
                     env_vars=expanded_env,
                     secrets=expanded_secrets,
@@ -524,6 +526,12 @@ class DeployManagerCore:
             # scripts errored on missing env via ``${VAR:?...}``;
             # mirror that here. Codex review on PR #1064.
             self._validate_no_unresolved_placeholders(profile_name, profile)
+
+            # Cloud Run's writable filesystem is disposable.  Validate the
+            # declared identity/state lifetime before creating a session or
+            # contacting the provider; the provider repeats this check for
+            # callers that bypass DeployManagerCore.
+            validate_cloudrun_persistence(profile)
 
             # Refuse to deploy a moving-alias tag on Cloud Run. Admin v2
             # ``update_service`` compares the new template against the

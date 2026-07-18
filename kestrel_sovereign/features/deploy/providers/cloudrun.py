@@ -7,9 +7,11 @@ Implements deployment to Google Cloud Run using the google-cloud-run SDK.
 import asyncio
 import logging
 import os
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 from ..models import DeployManagerError, DeploymentProfile
+from ..persistence import validate_cloudrun_persistence
 from .base import DeployProvider
 
 logger = logging.getLogger(__name__)
@@ -157,6 +159,18 @@ class CloudRunProvider(DeployProvider):
         Programmatizes scripts/cloudrun/deploy_dev.sh and deploy_prod.sh.
         """
         try:
+            # Validate the effective values, including direct-call overrides.
+            # Otherwise a caller could validate a durable profile and then
+            # replace its PostgreSQL/persistence env with local SQLite here.
+            all_env_vars = {**profile.env_vars, **(env_vars or {})}
+            all_secrets = {**profile.secrets, **(secrets or {})}
+            effective_profile = replace(
+                profile,
+                env_vars=all_env_vars,
+                secrets=all_secrets,
+            )
+            validate_cloudrun_persistence(effective_profile)
+
             from google.api_core.exceptions import NotFound
             from google.cloud.run_v2 import Service
             from google.cloud.run_v2.types import (
@@ -187,12 +201,10 @@ class CloudRunProvider(DeployProvider):
 
             # Build environment variables
             env_list = []
-            all_env_vars = {**profile.env_vars, **(env_vars or {})}
             for key, value in all_env_vars.items():
                 env_list.append(EnvVar(name=key, value=value))
 
             # Build secret references (mounted as environment variables from Secret Manager)
-            all_secrets = {**profile.secrets, **(secrets or {})}
             for key, secret_ref in all_secrets.items():
                 # secret_ref format: "secret-name:version" (e.g., "kestrel-openai-key:latest")
                 env_list.append(

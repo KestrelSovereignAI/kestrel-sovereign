@@ -48,6 +48,11 @@ class DeploymentProfile:
     timeout: int = 300  # seconds
     concurrency: int = 80
     deployment_mode: str = "agent"  # "agent" (single agent) or "multi_agent" (multi-agent host)
+    # Cloud Run must make the identity/state lifetime explicit.  The provider
+    # rejects its default ``unspecified`` value; it remains the dataclass
+    # default so non-Cloud-Run providers keep their existing configuration
+    # contract.
+    persistence_mode: str = "unspecified"
     dockerfile: str = "docker/Dockerfile.cloudrun"
     env_vars: Dict[str, str] = field(default_factory=dict)
     secrets: Dict[str, str] = field(default_factory=dict)
@@ -65,6 +70,16 @@ class DeploymentProfile:
     def is_multi_agent(self) -> bool:
         """Whether this profile deploys a multi-agent multi_agent host."""
         return self.deployment_mode == "multi_agent"
+
+    @property
+    def is_ephemeral_demo(self) -> bool:
+        """Whether the profile deliberately creates disposable demo identity."""
+        return self.persistence_mode == "ephemeral_demo"
+
+    @property
+    def is_durable_sovereign(self) -> bool:
+        """Whether the profile promises durable sovereign continuity."""
+        return self.persistence_mode == "durable_sovereign"
 
 
 @dataclass
@@ -96,6 +111,7 @@ class DeploymentSession:
             "last_updated": self.last_updated.isoformat() if self.last_updated else None,
             "error_message": self.error_message,
             "deployment_mode": self.profile.deployment_mode,
+            "persistence_mode": self.profile.persistence_mode,
             "is_scale_to_zero": self.profile.is_scale_to_zero,
             "min_instances": self.profile.min_instances,
             "max_instances": self.profile.max_instances,

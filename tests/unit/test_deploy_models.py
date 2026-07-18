@@ -60,6 +60,9 @@ class TestDeploymentProfile:
         assert profile.port == 8080
         assert profile.timeout == 300
         assert profile.concurrency == 80
+        assert profile.persistence_mode == "unspecified"
+        assert profile.is_ephemeral_demo is False
+        assert profile.is_durable_sovereign is False
         assert profile.env_vars == {}
         assert profile.secrets == {}
 
@@ -145,6 +148,26 @@ class TestDeploymentProfile:
         assert profile.memory == "4Gi"
         assert profile.cpu == 4
 
+    def test_persistence_modes(self):
+        """Persistence mode properties expose the deployment contract."""
+        ephemeral = DeploymentProfile(
+            provider=DeployProviderType.CLOUD_RUN,
+            service_name="kestrel-demo",
+            region="us-central1",
+            persistence_mode="ephemeral_demo",
+        )
+        durable = DeploymentProfile(
+            provider=DeployProviderType.CLOUD_RUN,
+            service_name="kestrel-prod",
+            region="us-central1",
+            persistence_mode="durable_sovereign",
+        )
+
+        assert ephemeral.is_ephemeral_demo is True
+        assert ephemeral.is_durable_sovereign is False
+        assert durable.is_ephemeral_demo is False
+        assert durable.is_durable_sovereign is True
+
     def test_session_to_dict_includes_deployment_mode(self):
         """Test that session to_dict includes deployment_mode."""
         profile = DeploymentProfile(
@@ -162,6 +185,7 @@ class TestDeploymentProfile:
         )
         result = session.to_dict()
         assert result["deployment_mode"] == "multi_agent"
+        assert result["persistence_mode"] == "unspecified"
 
     def test_provider_specific_fields(self):
         """Test provider-specific fields."""
