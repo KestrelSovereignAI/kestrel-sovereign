@@ -757,38 +757,51 @@ class IdentityFeature(Feature):
     async def assess_substrate(self) -> ToolResult:
         """Assess current substrate capabilities."""
         try:
-            from kestrel_sovereign.config import load_config
-            from kestrel_sovereign.identity import SubstrateType
+            from kestrel_sovereign.identity import (
+                SubstrateType,
+                discover_substrate_capabilities,
+                resolve_active_substrate,
+            )
+            from kestrel_sovereign.identity.substrate_adapter import Capability
 
-            config = load_config()
-            llm_config = config.get("llm", {})
+            resolution = resolve_active_substrate(
+                getattr(self.agent, "llm_service", None)
+            )
+            substrate = resolution.substrate
+            provider = resolution.provider_selector or "unknown"
+            model = resolution.model or "unknown"
 
-            # Detect substrate
-            provider = llm_config.get("default_provider", "unknown")
-            model = llm_config.get("default_model", "unknown")
-
-            # Map to substrate type
-            if "anthropic" in provider.lower() or "claude" in provider.lower():
-                substrate = SubstrateType.ANTHROPIC_CLAUDE.value
-            elif "openai" in provider.lower():
-                substrate = SubstrateType.OPENAI_GPT.value
-            elif "gemini" in provider.lower() or "google" in provider.lower():
-                substrate = SubstrateType.GOOGLE_GEMINI.value
-            elif "ollama" in provider.lower():
-                substrate = SubstrateType.OLLAMA_LOCAL.value
-            elif "openrouter" in provider.lower():
-                substrate = SubstrateType.OPENROUTER.value
+            if (
+                substrate == SubstrateType.UNKNOWN.value
+                or not resolution.capability_profile_known
+            ):
+                capabilities = {
+                    "tool_use": "Unknown",
+                    "vision": "Unknown",
+                    "long_context": "Unknown",
+                    "streaming": "Unknown",
+                    "function_calling": "Unknown",
+                }
+                capability_details = {}
             else:
-                substrate = SubstrateType.UNKNOWN.value
-
-            # Assess capabilities
-            capabilities = {
-                "tool_use": "Yes" if "claude" in model.lower() or "gpt-4" in model.lower() else "Unknown",
-                "vision": "Yes" if "vision" in model.lower() or "4o" in model.lower() else "Unknown",
-                "long_context": "128K+" if "claude" in model.lower() else "Unknown",
-                "streaming": "Yes",
-                "function_calling": "Yes" if substrate != SubstrateType.UNKNOWN.value else "Unknown",
-            }
+                capability_map = discover_substrate_capabilities(substrate, model)
+                tool_use = capability_map.has(Capability.TOOL_USE)
+                capabilities = {
+                    "tool_use": "Yes" if tool_use else "No",
+                    "vision": (
+                        "Yes" if capability_map.has(Capability.VISION) else "No"
+                    ),
+                    "long_context": (
+                        f"{capability_map.context_limit // 1000}K"
+                        if capability_map.has(Capability.LONG_CONTEXT)
+                        else "No"
+                    ),
+                    "streaming": (
+                        "Yes" if capability_map.has(Capability.STREAMING) else "No"
+                    ),
+                    "function_calling": "Yes" if tool_use else "No",
+                }
+                capability_details = capability_map.to_dict()
         except Exception as e:
             logger.error(f"Substrate assessment failed: {e}", exc_info=True)
             return ToolResult.failed(f"Substrate assessment failed: {str(e)}")
@@ -803,8 +816,12 @@ class IdentityFeature(Feature):
         data = {
             "substrate_type": substrate,
             "provider": provider,
+            "vendor": resolution.vendor,
+            "route": resolution.route,
             "model": model,
             "capabilities": dict(capabilities),
+            "capability_details": capability_details,
+            "resolution_reason": resolution.reason,
             "agent_did_prefix": self.agent.agent_id[:30],
         }
 
@@ -814,11 +831,20 @@ class IdentityFeature(Feature):
         # decisions made on this assessment will be brittle. Surface
         # as PARTIAL so the LLM cannot claim "assessed substrate"
         # without mentioning the unknowns.
-        if substrate == SubstrateType.UNKNOWN.value:
+        if (
+            substrate == SubstrateType.UNKNOWN.value
+            or not resolution.capability_profile_known
+        ):
+            uncertainty = (
+                "substrate is UNKNOWN"
+                if substrate == SubstrateType.UNKNOWN.value
+                else f"substrate family {substrate!r} has no capability profile"
+            )
             return ToolResult.partial(
                 confirmation=confirmation_text,
                 error=(
-                    f"substrate is UNKNOWN (provider={provider!r}); "
+                    f"{uncertainty} (provider={provider!r}, "
+                    f"reason={resolution.reason!r}); "
                     "capability assessment is best-effort and downstream "
                     "migration decisions should treat it as untrusted"
                 ),

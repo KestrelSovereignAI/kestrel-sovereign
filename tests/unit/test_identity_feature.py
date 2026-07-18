@@ -29,6 +29,7 @@ def _make_feature(db=None):
     agent.did = agent.agent_id
     agent.storage = MagicMock()
     agent.storage._raw_storage = MagicMock()
+    agent.llm_service = None
     if db is not None:
         agent.storage._raw_storage.db = db
         agent.storage.db = db
@@ -117,14 +118,22 @@ async def test_migration_history_malformed_row_partial():
 @pytest.mark.asyncio
 async def test_assess_substrate_unknown_is_partial(monkeypatch):
     """Substrate UNKNOWN surfaces as PARTIAL with a 'best-effort' caveat."""
-    from kestrel_sovereign import config as config_mod
-
-    def fake_load_config():
-        return {"llm": {"default_provider": "some_random_provider", "default_model": "??"}}
-
-    monkeypatch.setattr(config_mod, "load_config", fake_load_config)
-
     feat = _make_feature()
+    adapter = MagicMock()
+    adapter.substrate_type.return_value = None
+    feat.agent.llm_service = MagicMock()
+    feat.agent.llm_service.get_model_preference.return_value = {
+        "vendor": "some_random_provider",
+        "route": "api",
+        "model": "??",
+    }
+    feat.agent.llm_service.providers = [{
+        "name": "some_random_provider:api",
+        "vendor": "some_random_provider",
+        "route": "api",
+        "model": "??",
+        "adapter": adapter,
+    }]
     result = await feat.assess_substrate()
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["substrate_type"] == "unknown"
@@ -498,16 +507,56 @@ async def test_feature_export_signs_with_runtime_agent_key_directory(monkeypatch
 @pytest.mark.asyncio
 async def test_assess_substrate_anthropic_is_ok(monkeypatch):
     """Known substrate → OK, no PARTIAL caveat."""
-    from kestrel_sovereign import config as config_mod
-
-    def fake_load_config():
-        return {"llm": {"default_provider": "anthropic", "default_model": "claude-opus-4"}}
-
-    monkeypatch.setattr(config_mod, "load_config", fake_load_config)
-
     feat = _make_feature()
+    adapter = MagicMock()
+    adapter.substrate_type.return_value = "claude"
+    feat.agent.llm_service = MagicMock()
+    feat.agent.llm_service.get_model_preference.return_value = {
+        "vendor": "anthropic",
+        "route": "api",
+        "model": "claude-opus-4",
+    }
+    feat.agent.llm_service.providers = [{
+        "name": "anthropic:api",
+        "vendor": "anthropic",
+        "route": "api",
+        "model": "claude-opus-4",
+        "adapter": adapter,
+    }]
     result = await feat.assess_substrate()
     assert result.status is ToolResultStatus.OK
     # SubstrateType uses colon-separated values
     assert "anthropic" in result.data["substrate_type"].lower()
     assert result.data["substrate_type"] != "unknown"
+    assert result.data["provider"] == "anthropic:api"
+    assert result.data["model"] == "claude-opus-4"
+    assert result.data["capabilities"]["tool_use"] == "Yes"
+
+
+@pytest.mark.asyncio
+async def test_assess_substrate_plugin_family_is_recognized_but_unprofiled():
+    """Plugin metadata is preserved without inventing capability certainty."""
+
+    feat = _make_feature()
+    adapter = MagicMock()
+    adapter.substrate_type.return_value = "kimi"
+    feat.agent.llm_service = MagicMock()
+    feat.agent.llm_service.get_model_preference.return_value = {
+        "vendor": "moonshot",
+        "route": "api",
+        "model": "kimi-k2",
+    }
+    feat.agent.llm_service.providers = [{
+        "name": "moonshot:api",
+        "vendor": "moonshot",
+        "route": "api",
+        "model": "kimi-k2",
+        "adapter": adapter,
+    }]
+
+    result = await feat.assess_substrate()
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["substrate_type"] == "kimi"
+    assert set(result.data["capabilities"].values()) == {"Unknown"}
+    assert "no capability profile" in result.error
