@@ -549,6 +549,15 @@ async def _write_reanchor(
                 raise RuntimeError("Agent node disappeared mid-reanchor")
             agent = agent_nodes[0]
             agent.properties["constitution_hash"] = new_hash
+            from kestrel_sovereign.constitution.genesis_audit import (
+                supersede_genesis_audit,
+            )
+
+            supersede_genesis_audit(
+                agent.properties,
+                constitution_hash=new_hash,
+                provenance="setup:constitution_reanchor",
+            )
             agent.properties["constitution_reanchor"] = {
                 "timestamp": _now_iso(),
                 "old_hash": old_hash,

@@ -182,6 +182,7 @@ def _build_mock_agent(*, cancel_on_call: int = None):
     agent._is_cancelled_state = state
 
     agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     agent.hooks_manager = None

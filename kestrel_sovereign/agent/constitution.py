@@ -1534,6 +1534,20 @@ class ConstitutionMixin:
         await self._anchor_constitution_governance(stored_hash)
 
         agent_node.properties["constitution_hash"] = stored_hash
+        # A signed reanchor changes the bytes governed by the genesis receipt.
+        # Preserve the completed receipt as history, then require a fresh audit
+        # bound to the new hash. The reanchor command itself remains available;
+        # the next ordinary cognition turn completes this explicit pending state.
+        from kestrel_sovereign.constitution.genesis_audit import (
+            supersede_genesis_audit,
+        )
+
+        supersede_genesis_audit(
+            agent_node.properties,
+            constitution_hash=stored_hash,
+            provenance="runtime:constitution_reanchor",
+            recorded_at=self._get_timestamp(),
+        )
         agent_node.properties["constitution_reanchor"] = {
             "timestamp": self._get_timestamp(),
             "old_hash": old_hash,
@@ -1677,75 +1691,296 @@ class ConstitutionMixin:
         except Exception as e:
             return f"Error: Could not retrieve constitution for hash {constitution_hash}. Reason: {e}"
 
-    async def perform_genesis_audit(self) -> bool:
-        """Performs a self-audit of the agent's own constitution upon creation."""
-        logging.info(f"Agent {self.agent_id} performing genesis self-audit...")
+    async def _persist_genesis_audit_completion(
+        self,
+        agent_node: GraphNode,
+        record: dict,
+    ) -> None:
+        """Atomically persist the node receipt and conversation witness."""
+        agent_node.properties["genesis_audit"] = record
+        status = record["status"]
+        content = (
+            f"Genesis audit {status}. Risk level: {record['risk_level']}. "
+            f"{record.get('reasoning', '')}"
+        )
 
-        constitution = await self._get_governing_constitution()
-        if "Error:" in constitution:
-            logging.error(f"Cannot perform genesis audit: {constitution}")
-            raise ValueError(f"Genesis audit failed: Cannot load constitution. {constitution}")
-
-        audit_prompt = f"""
-You are performing a genesis audit on a new AI agent's constitution.
-
-Constitution to audit:
----
-{constitution}
----
-
-Evaluate for:
-1. Safety: Prevents harm?
-2. Sovereignty: Respects user autonomy?
-3. Clarity: Unambiguous and enforceable?
-4. Integrity: Prevents self-modification?
-5. Ethics: Aligns with ethical principles?
-
-Flag as HIGH RISK (level 3):
-- Provisions allowing harm
-- Backdoors or override mechanisms
-- Ambiguous language enabling bad-faith interpretation
-- Self-amendment without governance
-- Privacy violations
-
-Return JSON with:
-- "risk_level": 1 (low), 2 (medium), or 3 (high)
-- "reasoning": One sentence explanation
-"""
-
-        try:
-            audit_result = await self.get_audit_response(audit_prompt)
-        except Exception as e:
-            logging.error(f"Genesis audit LLM call failed: {e}")
-            raise ValueError(f"Genesis audit failed due to LLM error: {e}")
-
-        logging.info(f"GENESIS AUDIT RESULT: {audit_result}")
-        risk_level = audit_result.get("risk_level", 3) if audit_result else 3
-
-        if risk_level >= 3:
-            reason = audit_result.get("reasoning", "No reasoning provided.") if audit_result else "Audit returned None"
-            logging.error(f"GENESIS AUDIT FAILURE! Risk level {risk_level}. Reason: {reason}")
-            raise ValueError(
-                f"Agent creation aborted due to failed genesis audit.\n"
-                f"Risk Level: {risk_level}\n"
-                f"Reason: {reason}"
+        async def _write() -> None:
+            await self.storage.add_node(agent_node)
+            await self.privacy_agent.add_conversation(
+                role="system",
+                content=content,
+                metadata={"event": "genesis_audit", "result": record},
             )
 
-        logging.info(f"Genesis self-audit passed with risk level {risk_level}.")
+        db = getattr(getattr(self, "_raw_storage", None), "db", None)
+        if db is None:
+            await _write()
+            return
+        async with db.transaction():
+            await _write()
 
+    async def _persist_genesis_audit_pending_attempt(
+        self,
+        agent_node: GraphNode,
+        *,
+        code: str,
+        provenance: str,
+    ) -> None:
+        """Keep an unavailable auditor retryable without leaking diagnostics."""
+        from kestrel_sovereign.constitution.genesis_audit import (
+            pending_genesis_audit,
+            utc_timestamp,
+        )
+
+        constitution_hash = agent_node.properties.get("constitution_hash")
+        existing = agent_node.properties.get("genesis_audit")
+        if not isinstance(existing, dict) or existing.get("status") != "pending":
+            existing = pending_genesis_audit(
+                constitution_hash,
+                provenance="runtime:deferred",
+            )
+        existing["last_attempt_at"] = utc_timestamp()
+        existing["last_attempt_provenance"] = provenance
+        existing["last_error"] = code
+        existing["audited"] = False
+        agent_node.properties["genesis_audit"] = existing
+        await self.storage.add_node(agent_node)
+
+    async def perform_genesis_audit(
+        self,
+        *,
+        provenance: str = "runtime:explicit",
+    ) -> bool:
+        """Complete the durable genesis audit once, without silent overwrite."""
+        from kestrel_sovereign.constitution.genesis_audit import (
+            GENESIS_AUDIT_FAILED,
+            GENESIS_AUDIT_PASSED,
+            GENESIS_AUDIT_PENDING,
+            GenesisAuditError,
+            GenesisAuditPendingError,
+            GenesisAuditRejectedError,
+            evaluate_genesis_constitution,
+            validate_completed_genesis_audit,
+        )
+
+        logging.info("Agent %s performing genesis self-audit", self.agent_id)
         agent_node = await self.storage.get_node(self.agent_id)
-        if agent_node:
-            agent_node.properties["genesis_audit"] = {
-                "timestamp": self._get_timestamp(),
-                "risk_level": risk_level,
-                "reasoning": audit_result.get("reasoning", ""),
-                "constitution_hash": agent_node.properties.get("constitution_hash")
-            }
-            await self.storage.add_node(agent_node)
+        if agent_node is None:
+            raise GenesisAuditError("Genesis audit failed: agent node is missing.")
 
-        await self.privacy_agent.add_conversation(
-            role="system",
-            content=f"Genesis audit passed. Risk level: {risk_level}. {audit_result.get('reasoning', '')}",
-            metadata={"event": "genesis_audit", "result": audit_result}
+        constitution_hash = agent_node.properties.get("constitution_hash")
+        if not constitution_hash:
+            raise GenesisAuditError(
+                "Genesis audit failed: governing constitution hash is missing."
+            )
+
+        existing = agent_node.properties.get("genesis_audit")
+        if isinstance(existing, dict):
+            status = existing.get("status")
+            # Pre-#2470 completed receipts had no explicit status but did carry
+            # timestamp/risk/hash. Upgrade that durable evidence in place and
+            # never call the auditor again merely because the schema evolved.
+            legacy_risk = existing.get("risk_level")
+            if (
+                status is None
+                and existing.get("timestamp")
+                and legacy_risk in (1, 2, 3)
+                and existing.get("constitution_hash") == constitution_hash
+            ):
+                status = (
+                    GENESIS_AUDIT_FAILED
+                    if legacy_risk >= 3
+                    else GENESIS_AUDIT_PASSED
+                )
+                existing.update(
+                    {
+                        "status": status,
+                        "completed_at": existing["timestamp"],
+                        "provenance": "runtime:migrated_legacy_receipt",
+                        "audited": True,
+                    }
+                )
+                agent_node.properties["genesis_audit"] = existing
+                await self.storage.add_node(agent_node)
+            if status not in (
+                GENESIS_AUDIT_PENDING,
+                GENESIS_AUDIT_PASSED,
+                GENESIS_AUDIT_FAILED,
+            ):
+                raise GenesisAuditError("Genesis audit state is malformed.")
+            if status in (GENESIS_AUDIT_PASSED, GENESIS_AUDIT_FAILED):
+                status = validate_completed_genesis_audit(
+                    existing, constitution_hash
+                )
+                if status == GENESIS_AUDIT_PASSED:
+                    return True
+                raise GenesisAuditRejectedError(existing)
+
+        # Audit the exact stored bytes named by constitution_hash. The ordinary
+        # prompt path may append runtime-only extension/mandate constraints;
+        # those are not part of this content-addressed governing receipt.
+        try:
+            constitution = await self.storage.retrieve_file(constitution_hash)
+        except Exception:
+            constitution = None
+        if not isinstance(constitution, (bytes, str)):
+            await self._persist_genesis_audit_pending_attempt(
+                agent_node,
+                code="constitution_unavailable",
+                provenance=provenance,
+            )
+            raise GenesisAuditPendingError("constitution_unavailable")
+        constitution_bytes = (
+            constitution
+            if isinstance(constitution, bytes)
+            else constitution.encode("utf-8")
+        )
+        if hashlib.sha256(constitution_bytes).hexdigest() != constitution_hash:
+            await self._persist_genesis_audit_pending_attempt(
+                agent_node,
+                code="constitution_hash_mismatch",
+                provenance=provenance,
+            )
+            raise GenesisAuditError(
+                "Genesis audit failed: stored governing bytes do not match "
+                "the anchored constitution hash."
+            )
+
+        try:
+            record = await evaluate_genesis_constitution(
+                constitution_bytes,
+                constitution_hash=constitution_hash,
+                auditor=self.get_audit_response,
+                provenance=provenance,
+            )
+        except GenesisAuditPendingError as exc:
+            await self._persist_genesis_audit_pending_attempt(
+                agent_node,
+                code=exc.code,
+                provenance=provenance,
+            )
+            raise
+        except GenesisAuditRejectedError as exc:
+            await self._persist_genesis_audit_completion(agent_node, exc.record)
+            logging.error(
+                "Genesis audit rejected governing constitution for %s at risk %s",
+                self.agent_id,
+                exc.record.get("risk_level"),
+            )
+            raise
+
+        await self._persist_genesis_audit_completion(agent_node, record)
+        logging.info(
+            "Genesis self-audit passed for %s at risk %s",
+            self.agent_id,
+            record["risk_level"],
         )
         return True
+
+    async def _ensure_genesis_audit_ready(self) -> bool:
+        """Serialize deferred first-turn audits and refuse all early cognition."""
+        from kestrel_sovereign.constitution.genesis_audit import (
+            GENESIS_AUDIT_FAILED,
+            GENESIS_AUDIT_PASSED,
+            GenesisAuditError,
+            GenesisAuditRejectedError,
+            pending_genesis_audit,
+            validate_completed_genesis_audit,
+        )
+
+        agent_node = await self.storage.get_node(self.agent_id)
+        if agent_node is None:
+            raise GenesisAuditError("Genesis audit readiness has no agent node.")
+
+        record = agent_node.properties.get("genesis_audit")
+        if record is None:
+            # Migrate every pre-#2470 identity. Missing birth metadata is not a
+            # safe test signal: a production caller can construct KestrelAgent
+            # directly too. Tests/demos must inject or stub the real lifecycle
+            # explicitly instead of gaining a production fail-open path.
+            constitution_hash = agent_node.properties.get("constitution_hash")
+            if not constitution_hash:
+                raise GenesisAuditError(
+                    "Genesis audit readiness has no governing constitution hash."
+                )
+            record = pending_genesis_audit(
+                constitution_hash,
+                provenance="runtime:migrated_legacy_identity",
+            )
+            agent_node.properties["genesis_audit"] = record
+            await self.storage.add_node(agent_node)
+
+        if not isinstance(record, dict):
+            raise GenesisAuditError("Genesis audit state is malformed.")
+        status = record.get("status")
+        if status in (GENESIS_AUDIT_PASSED, GENESIS_AUDIT_FAILED):
+            status = validate_completed_genesis_audit(
+                record,
+                agent_node.properties.get("constitution_hash"),
+            )
+        if status == GENESIS_AUDIT_PASSED:
+            return True
+        if status == GENESIS_AUDIT_FAILED:
+            raise GenesisAuditRejectedError(record)
+
+        lock = getattr(self, "_genesis_audit_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._genesis_audit_lock = lock
+        async with lock:
+            # A concurrent first turn may have completed while this caller
+            # waited. perform_genesis_audit re-reads and refuses overwrite too.
+            return await self.perform_genesis_audit(
+                provenance="runtime:first_cognition",
+            )
+
+    async def _genesis_audit_cognition_block(self, user_input: str) -> str | None:
+        """Return a user-facing block message, or ``None`` when ready.
+
+        Only non-cognitive recovery/diagnostic commands bypass the gate. Unknown
+        commands and ``!continue`` can fall through to an LLM turn, so they must
+        complete genesis just like ordinary text.
+        """
+        recovery_commands = {
+            "!status",
+            "!help",
+            "!verify-constitution",
+            "!reanchor-constitution",
+            "!safe-mode",
+            "!get-privacy-mode",
+            "!privacy-status",
+            "!bootstrap-status",
+        }
+        command = user_input.split(maxsplit=1)[0] if user_input else ""
+        if command in recovery_commands:
+            return None
+
+        from kestrel_sovereign.constitution.genesis_audit import (
+            GenesisAuditError,
+            GenesisAuditPendingError,
+            GenesisAuditRejectedError,
+        )
+
+        try:
+            await self._ensure_genesis_audit_ready()
+        except GenesisAuditPendingError:
+            return (
+                "⏳ GENESIS AUDIT PENDING\n\n"
+                "This agent cannot begin cognition until an audit-capable LLM "
+                "verifies its governing constitution. No cognition request was "
+                "sent. Configure an auditor and retry this turn."
+            )
+        except GenesisAuditRejectedError as exc:
+            return (
+                "🚨 GENESIS AUDIT FAILED\n\n"
+                "The governing constitution was rejected, so cognition remains "
+                f"blocked. {exc.record.get('reasoning', 'No reason recorded.')}"
+            )
+        except GenesisAuditError:
+            logging.exception("Genesis audit readiness failed closed")
+            return (
+                "🚨 GENESIS AUDIT BLOCKED\n\n"
+                "The durable genesis-audit receipt is missing or inconsistent. "
+                "No cognition request was sent; inspect the agent's audit state."
+            )
+        return None

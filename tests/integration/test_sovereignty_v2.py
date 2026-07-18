@@ -120,6 +120,12 @@ async def test_agent_export_command(temp_db, skip_bootstrap):
     """Test the agent !export-sovereignty command works with new async API."""
     agent = KestrelAgent("did:test:agent", storage_path=temp_db, llm_service=MockLLMService())
     await agent.initialize()
+    from tests.shared.genesis_audit import complete_deterministic_genesis_audit
+
+    await complete_deterministic_genesis_audit(
+        agent,
+        provenance="test:sovereignty_v2",
+    )
     agent.wallet = MockWallet()
 
     # Skip bootstrap to test commands directly

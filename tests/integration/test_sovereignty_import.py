@@ -20,6 +20,7 @@ from kestrel_sovereign.storage.sovereign_adapter import SovereignStorageAdapter
 from kestrel_sovereign.filecoin_adapter import StorageTier
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
+from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
 
 @pytest.fixture
@@ -232,6 +233,10 @@ async def test_agent_command_import(temp_db, llm_service, skip_bootstrap):
     # Use new KestrelAgent API: storage_path instead of storage object
     agent = KestrelAgent("did:test:import_cmd", storage_path=temp_db, llm_service=llm_service)
     await agent.initialize()
+    await complete_deterministic_genesis_audit(
+        agent,
+        provenance="test:sovereignty_import",
+    )
 
     # Skip bootstrap to test commands directly
     await skip_bootstrap(agent)

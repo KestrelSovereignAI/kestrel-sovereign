@@ -21,6 +21,7 @@ from kestrel_sovereign.features.model import ModelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
+from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
 
 # Test model (supports tools, available locally)
@@ -79,6 +80,10 @@ async def kestrel_agent(llm_service, temp_db):
 
     # Initialize async storage
     await agent.initialize()
+    await complete_deterministic_genesis_audit(
+        agent,
+        provenance="test:agent_tools_e2e",
+    )
 
     # Skip bootstrap for test agents - mark as complete
     if agent.bootstrap_service:

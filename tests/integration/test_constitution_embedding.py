@@ -289,43 +289,30 @@ async def test_agent_can_access_constitution_via_kestrel_agent(tmp_path):
 
 @pytest.mark.anyio
 @pytest.mark.asyncio
-async def test_genesis_audit_bypassed_temporarily(tmp_path):
-    """
-    Verify that genesis self-audit is currently bypassed for testing.
-
-    TODO: This test documents the current state. Once LLM service is refactored,
-    this should be updated to test actual genesis audit functionality.
-    """
+async def test_genesis_audit_runs_inside_inception(tmp_path):
+    """A deterministic test auditor still crosses the real creation boundary."""
     output_dir = tmp_path / "test_agent"
 
-    credentials = await create_kestrel_identity_async(str(output_dir))
-
-    from kestrel_sovereign.llm.service import LLMService
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-
-    llm_service = LLMService()
-
-    agent = KestrelAgent(
-        did=credentials.agent_did,
-        storage_path=credentials.db_path,
-        llm_service=llm_service
-    )
-    await agent.initialize()
-
-    # Mock the audit to pass for testing
-    original_get_audit_response = agent.get_audit_response
-
     async def mock_audit_pass(prompt):
+        assert "Kestrel Constitution" in prompt
         return {"risk_level": 1, "reasoning": "Constitution meets all safety and ethical requirements"}
 
-    agent.get_audit_response = mock_audit_pass
+    credentials = await create_kestrel_identity_async(
+        str(output_dir),
+        genesis_auditor=mock_audit_pass,
+        genesis_audit_provenance="test:constitution_embedding_fixture",
+    )
 
-    try:
-        # Genesis audit should complete (even if bypassed)
-        result = await agent.perform_genesis_audit()
-        assert result is True, "Genesis audit should return True"
-        # Check that audit event was logged
-        history = await agent.storage.get_conversation_history(limit=10)
+    async with Storage(
+        credentials.db_path, agent_id=credentials.agent_did
+    ) as storage:
+        node = await storage.get_node(credentials.agent_did)
+        receipt = node.properties["genesis_audit"]
+        assert receipt["status"] == "passed"
+        assert receipt["provenance"] == "test:constitution_embedding_fixture"
+        assert receipt["constitution_hash"] == node.properties["constitution_hash"]
+
+        history = await storage.get_conversation_history(limit=10)
         audit_events = []
         for h in history:
             metadata = h.get("metadata", {})
@@ -336,12 +323,7 @@ async def test_genesis_audit_bypassed_temporarily(tmp_path):
                     metadata = {}
             if metadata.get("event") == "genesis_audit":
                 audit_events.append(h)
-        assert len(audit_events) >= 1, "Genesis audit event should be logged"
-
-    finally:
-        # Restore original method
-        agent.get_audit_response = original_get_audit_response
-        await agent.shutdown()
+        assert len(audit_events) == 1, "Genesis audit event should be logged once"
 
 
 @pytest.mark.anyio

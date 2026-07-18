@@ -121,6 +121,29 @@ async def test_invalid_identity_method_leaves_no_db(tmp_path, hybrid_env):
     assert not (tmp_path / "kestrel_prime.db").exists()
 
 
+@pytest.mark.asyncio
+async def test_genesis_rejection_cleans_born_hybrid_keys_and_db(
+    tmp_path, hybrid_env
+):
+    """Risk level 3 rolls back all five born-hybrid identity artifacts."""
+
+    async def reject(_prompt):
+        return {"risk_level": 3, "reasoning": "Rejected hybrid fixture."}
+
+    with pytest.raises(ValueError, match="Risk Level: 3"):
+        await create_kestrel_identity_async(
+            str(tmp_path),
+            CONSTITUTION,
+            agent_name="Rejected Hybrid",
+            did_web_slug="rejected-hybrid",
+            genesis_auditor=reject,
+            genesis_audit_provenance="test:hybrid_risk3",
+        )
+
+    assert not (tmp_path / "kestrel_prime.db").exists()
+    assert list(tmp_path.glob("rejected-hybrid*")) == []
+
+
 # ---------------------------------------------------------------------------
 # Birth: inception mints born-hybrid by default
 # ---------------------------------------------------------------------------

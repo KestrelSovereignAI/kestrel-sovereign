@@ -113,6 +113,7 @@ def _make_streaming_agent():
     agent._cached_features_prompt = ""
     agent.extension = None
     agent.observability_store = _ObservabilityStore()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent._maybe_audit = AsyncMock(return_value=None)
     agent._get_governing_constitution = AsyncMock(return_value="constitution")
     agent.check_solvency = AsyncMock(return_value="gpt-5-mini")

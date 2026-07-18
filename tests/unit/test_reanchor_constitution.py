@@ -174,6 +174,16 @@ async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path):
 async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     """Re-anchor stores new constitution when expected hash matches."""
     agent, node = _make_agent(stored_hash="oldhash", safe_mode=False)
+    old_receipt = {
+        "status": "passed",
+        "completed_at": "2026-04-05T00:00:00Z",
+        "risk_level": 1,
+        "reasoning": "Original governing bytes passed.",
+        "constitution_hash": "oldhash",
+        "provenance": "test:original",
+        "audited": True,
+    }
+    node.properties["genesis_audit"] = old_receipt
     agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
     artifact_path = _write_artifact(tmp_path)
 
@@ -196,6 +206,16 @@ async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path):
     assert node.properties["constitution_reanchor"]["expected_hash_prefix"] == FAKE_HASH[:8]
     assert node.properties["constitution_reanchor"]["signed_artifact_hash"] == FAKE_HASH
     assert node.properties["constitution_reanchor"]["signed_artifact_signer"] == ROOT_DID
+    assert node.properties["genesis_audit"] == {
+        "status": "pending",
+        "recorded_at": "2026-04-06T00:00:00Z",
+        "constitution_hash": FAKE_HASH,
+        "provenance": "runtime:constitution_reanchor",
+        "audited": False,
+    }
+    history = node.properties["genesis_audit_history"]
+    assert history[-1]["receipt"] == old_receipt
+    assert history[-1]["superseded_by_constitution_hash"] == FAKE_HASH
     assert agent.storage.store_file.call_count == 2
     agent.storage.store_file.assert_any_call(FAKE_CONSTITUTION, "KESTREL_CONSTITUTION.md")
     agent.privacy_agent.add_conversation.assert_called_once()

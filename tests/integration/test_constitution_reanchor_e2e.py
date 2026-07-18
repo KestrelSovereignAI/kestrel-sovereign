@@ -136,6 +136,8 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     # ---- 2. Snapshot pre-state ----
     pre = await _snapshot(db_path, agent_did)
     assert pre["agent_constitution_hash"] == v1_hash
+    assert pre["genesis_audit"]["status"] == "pending"
+    assert pre["genesis_audit"]["constitution_hash"] == v1_hash
     assert pre["governed_by_targets"] == [v1_hash]
     assert pre["document_node_ids"] == [v1_hash]
     assert pre["file_exists"][v1_hash] is True
@@ -190,6 +192,12 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     assert audit["source_path"] == str(constitution_path)
     assert audit["authorization"] == "integration-test"
     assert "timestamp" in audit
+    assert post["genesis_audit"]["status"] == "pending"
+    assert post["genesis_audit"]["constitution_hash"] == v2_hash
+    assert post["genesis_audit"]["provenance"] == "setup:constitution_reanchor"
+    assert post["genesis_audit_history"][-1]["receipt"][
+        "constitution_hash"
+    ] == v1_hash
 
     # 2. governed_by edge: now points at v2 only.
     assert v2_hash in post["governed_by_targets"]
@@ -468,6 +476,10 @@ async def _snapshot(db_path: Path, agent_did: str) -> dict:
             "agent_properties": agent.properties,
             "agent_constitution_hash": agent.properties.get("constitution_hash"),
             "agent_audit": agent.properties.get("constitution_reanchor"),
+            "genesis_audit": agent.properties.get("genesis_audit"),
+            "genesis_audit_history": agent.properties.get(
+                "genesis_audit_history"
+            ),
             "document_node_ids": document_node_ids,
             "governed_by_targets": governed_by_targets,
             "file_exists": file_exists,

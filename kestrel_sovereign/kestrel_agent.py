@@ -2992,15 +2992,34 @@ Expected Duration: {expected_duration}
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
+        # USER_BYOK credentials are a non-cognitive readiness input. Refresh
+        # them before the genesis gate so a Sovereign can supply the auditor's
+        # passphrase on the very first turn.
+        await self._maybe_refresh_user_byok_resolver(user_passphrase)
+
+        # A restart signal can reach process_input before initialize() creates
+        # storage/context. There is no durable receipt to inspect yet, so keep
+        # the existing retryable pre-init deferral instead of crashing inside
+        # the genesis gate or returning a terminal user-facing block.
+        if getattr(self, "storage", None) is None:
+            raise RuntimeError(
+                "agent not fully initialized: context_manager and storage "
+                "unavailable; deferring turn for retry until initialize() completes"
+            )
+
+        # GENESIS READINESS: no bootstrap, context build, or provider cognition
+        # may precede the durable audit receipt. The shared helper also covers
+        # streaming and serializes concurrent first turns (#2470).
+        genesis_block = await self._genesis_audit_cognition_block(user_input)
+        if genesis_block is not None:
+            return genesis_block
+
         # Reset context stats on session change
         if hasattr(self, 'context_stats') and session_id:
             self.context_stats.check_session(session_id)
 
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
-
-        # USER_BYOK: Refresh LLM resolver with per-request passphrase
-        await self._maybe_refresh_user_byok_resolver(user_passphrase)
 
         # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands.
         # ``process_input`` can receive a restart signal while initialize() is

@@ -13,6 +13,7 @@ import sqlite3
 import os
 from pathlib import Path
 from tests.shared import no_llm_credentials
+from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 pytestmark = [pytest.mark.adversarial, pytest.mark.integration]
 
@@ -222,8 +223,16 @@ class TestCrossUserIsolation:
         # Omit constitution_path so inception anchors the packaged governing
         # source; passing the docs copy is now refused as non-authoritative
         # (#2463).
-        credentials_a = await create_kestrel_identity_async(str(agent_a_dir))
-        credentials_b = await create_kestrel_identity_async(str(agent_b_dir))
+        credentials_a = await create_kestrel_identity_async(
+            str(agent_a_dir),
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:adversarial_agent_a",
+        )
+        credentials_b = await create_kestrel_identity_async(
+            str(agent_b_dir),
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:adversarial_agent_b",
+        )
 
         # Find databases
         db_a = list(agent_a_dir.glob("*.db"))[0]
@@ -300,7 +309,11 @@ class TestPrivacyModeEnforcement:
         from kestrel_sovereign.privacy import PrivacyMode
         from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
-        credentials = await create_kestrel_identity_async(str(temp_dir))
+        credentials = await create_kestrel_identity_async(
+            str(temp_dir),
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:adversarial_ephemeral",
+        )
         db_files = list(temp_dir.glob("*.db"))
         db_path = str(db_files[0]) if db_files else str(temp_dir / "test.db")
 

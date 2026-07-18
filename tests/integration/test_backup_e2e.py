@@ -16,6 +16,7 @@ from kestrel_sovereign.inception_service import create_kestrel_identity_async
 import kestrel_sovereign.storage as storage_pkg
 import tempfile
 import os
+from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 
 @pytest.fixture(scope="function")
@@ -44,7 +45,11 @@ async def async_client(monkeypatch):
         monkeypatch.setattr(storage_pkg, "get_default_agent_data_dir", lambda: agent_dir)
 
         # Create agent identity in that directory (use async version since we're in async context)
-        _ = await create_kestrel_identity_async(agent_dir)
+        _ = await create_kestrel_identity_async(
+            agent_dir,
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:backup_e2e_fixture",
+        )
 
         # Use LifespanManager to properly handle app startup/shutdown
         async with LifespanManager(app) as manager:

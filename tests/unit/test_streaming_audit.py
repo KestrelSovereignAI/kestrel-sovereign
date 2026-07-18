@@ -19,6 +19,7 @@ class TestStreamingBasics:
 
         mock_agent = MagicMock()
         mock_agent._maybe_audit = AsyncMock()
+        mock_agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
         mock_agent.process_input = AsyncMock(return_value="Command executed successfully")
         mock_agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(mock_agent)
 
@@ -29,6 +30,24 @@ class TestStreamingBasics:
         mock_agent._maybe_audit.assert_called_once()
         mock_agent.process_input.assert_called_once_with("!help", None, session_id=None, caller=None)
         assert "Command executed" in "".join(chunks)
+
+    @pytest.mark.asyncio
+    async def test_preinitialization_streaming_defers_before_genesis_gate(self):
+        """Streaming matches the retryable pre-init behavior of process_input."""
+        from kestrel_sovereign.agent.streaming import StreamingMixin
+
+        mock_agent = MagicMock()
+        mock_agent.storage = None
+        mock_agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+        mock_agent.process_input_streaming = (
+            StreamingMixin.process_input_streaming.__get__(mock_agent)
+        )
+
+        with pytest.raises(RuntimeError, match="agent not fully initialized"):
+            async for _chunk in mock_agent.process_input_streaming("hello"):
+                pass
+
+        mock_agent._genesis_audit_cognition_block.assert_not_called()
 
 
 class TestRealStreaming:

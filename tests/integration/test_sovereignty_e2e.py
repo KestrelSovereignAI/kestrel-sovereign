@@ -22,6 +22,7 @@ from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
 
 @pytest.fixture
@@ -125,11 +126,16 @@ async def test_agent_command_integration(temp_db, llm_service, monkeypatch):
     # Monkeypatch FilecoinAdapter to simulate no IPFS (force local fallback)
     from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
     original_check = FilecoinAdapter.ipfs_is_available
+    agent = None
 
     try:
         # Use new KestrelAgent API: storage_path instead of storage object
         agent = KestrelAgent("did:test:agent", storage_path=temp_db, llm_service=llm_service)
         await agent.initialize()
+        await complete_deterministic_genesis_audit(
+            agent,
+            provenance="test:sovereignty_e2e",
+        )
 
         # Skip bootstrap for test agents
         from tests.integration.conftest import complete_bootstrap, grant_permissions
@@ -161,4 +167,6 @@ async def test_agent_command_integration(temp_db, llm_service, monkeypatch):
 
         print(f"✅ Agent Command Output:\n{result}")
     finally:
+        if agent is not None:
+            await agent.shutdown()
         FilecoinAdapter.ipfs_is_available = original_check

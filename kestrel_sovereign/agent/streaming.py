@@ -599,6 +599,22 @@ class StreamingMixin:
                 ``register_active_request`` call and races between
                 overlapping streams can otherwise misroute events.
         """
+        # Match process_input's retryable pre-initialization behavior. Without
+        # storage there is no durable genesis receipt to inspect yet.
+        if getattr(self, "storage", None) is None:
+            raise RuntimeError(
+                "agent not fully initialized: context_manager and storage "
+                "unavailable; deferring turn for retry until initialize() completes"
+            )
+
+        # Same pre-cognition lifecycle boundary as process_input. Run before
+        # periodic checks, turn locks, context construction, and streaming LLM
+        # setup so two simultaneous first turns cannot outrun the audit.
+        genesis_block = await self._genesis_audit_cognition_block(user_input)
+        if genesis_block is not None:
+            yield genesis_block
+            return
+
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
 

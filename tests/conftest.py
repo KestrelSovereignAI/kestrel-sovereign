@@ -501,8 +501,20 @@ async def async_kestrel_agent(temp_dir: Path, monkeypatch):
     # Prevent real OpenRouter key creation during tests - keys leak and cost money
     monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
 
-    # Create agent identity (use async version since we're in async context)
-    credentials = await create_kestrel_identity_async(str(temp_dir))
+    # Create through the real genesis boundary with deterministic test
+    # provenance. Test agents must not bypass or depend on a developer's live
+    # provider configuration (#2470).
+    async def deterministic_genesis_auditor(_prompt):
+        return {
+            "risk_level": 1,
+            "reasoning": "Deterministic shared test-fixture auditor.",
+        }
+
+    credentials = await create_kestrel_identity_async(
+        str(temp_dir),
+        genesis_auditor=deterministic_genesis_auditor,
+        genesis_audit_provenance="test:async_kestrel_agent_fixture",
+    )
 
     # Initialize storage and agent
     db_files = list(temp_dir.glob("*.db"))
