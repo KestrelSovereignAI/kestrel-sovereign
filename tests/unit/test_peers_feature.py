@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
@@ -120,6 +119,10 @@ def _make_a2a_feature(name="emma"):
     agent = MagicMock()
     agent._agent_name = name
     agent.did = f"did:test:{name}"
+    # This fixture models the intentional pre-ceremony compatibility tier.
+    # MagicMock would otherwise synthesize a truthy ``identity.is_hybrid`` and
+    # incorrectly present itself as a loaded hybrid signer (#2475).
+    agent.identity = None
     agent._provide_causation_chain = MagicMock(return_value=None)
     agent._get_current_turn_id = MagicMock(return_value=None)
     agent.pending_a2a_questions = MagicMock()

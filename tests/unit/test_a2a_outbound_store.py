@@ -321,6 +321,41 @@ async def test_dispatch_transport_failure_writes_audit_row_with_error(
 
 
 @pytest.mark.asyncio
+async def test_hybrid_signing_failure_writes_sanitized_audit_without_http(
+    tmp_path,
+):
+    """A failed signature is an honest failed dispatch, not unsigned I/O."""
+    feature, db = await _make_feature(tmp_path)
+    feature.agent.identity = SimpleNamespace(
+        is_hybrid=True,
+        hybrid_keypair=object(),
+        signing_did="did:web:example.com:agent:emma",
+        new_verification_methods=[{"id": "did:web:example.com:agent:emma#key-1"}],
+    )
+    client_factory = MagicMock()
+    with (
+        patch(
+            "kestrel_sovereign.a2a.envelope_signing.sign_envelope",
+            side_effect=RuntimeError("secret provider diagnostic"),
+        ),
+        patch(
+            "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+            client_factory,
+        ),
+    ):
+        result = await feature.send_a2a_task("claw", "sensitive handoff")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["error_type"] == "a2a_signing_failed"
+    client_factory.assert_not_called()
+    rows = await list_outbound_tasks(db, agent_id="emma")
+    assert len(rows) == 1
+    assert rows[0].terminal_state == "dispatch_failed"
+    assert rows[0].error == "signing_failed:hybrid_signer_error"
+    assert "secret provider diagnostic" not in (rows[0].error or "")
+
+
+@pytest.mark.asyncio
 async def test_get_peer_task_result_stamps_terminal_state(tmp_path):
     """When the agent fetches a peer's result and the peer reports a
     terminal lifecycle state, the sender-side audit row's
