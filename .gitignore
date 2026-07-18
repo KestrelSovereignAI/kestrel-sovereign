@@ -101,6 +101,7 @@ feedback/
 # Runtime
 *.pid
 *.log
+/phoenix/
 .kestrel/
 trusted_agents/
 

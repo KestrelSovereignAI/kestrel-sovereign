@@ -9,8 +9,8 @@ bounded health wait after spawn.
 Three responsibilities live here so ``server.py`` stays thin:
 
 1. :class:`PhoenixSupervisor` — spawn/stop the ``phoenix serve`` subprocess bound
-   to ``127.0.0.1`` only (sovereign; never exposed). SQLite storage lives under
-   the host's data-dir convention (:func:`kestrel_sovereign.paths.project_dir`).
+   to ``127.0.0.1`` only (sovereign; never exposed). SQLite storage lives in a
+   dedicated private host-data directory, never an implicit source checkout.
 2. Embed session cookie — :func:`issue_embed_cookie` / :func:`verify_embed_cookie`
    mint and validate a short-lived, signed, ``HttpOnly`` ``SameSite=Lax`` cookie
    scoped to ``/phoenix``. This is what lets the console iframe load the Phoenix
@@ -27,12 +27,16 @@ line, ``/phoenix/`` returns a clear 503. Opt out even when installed with
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import logging
 import os
+import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -57,6 +61,15 @@ DEFAULT_PHOENIX_GRPC_PORT = 4317
 
 #: Sub-path the UI is served under for same-origin embedding.
 PHOENIX_ROOT_PATH = "/phoenix"
+
+#: Explicit operator override for the trace-store working directory. This is
+#: deliberately separate from Phoenix's own environment variables: Kestrel is
+#: the custody owner and must validate the directory before it starts Phoenix.
+PHOENIX_WORKING_DIR_ENV = "KESTREL_PHOENIX_WORKING_DIR"
+
+PRIVATE_DIRECTORY_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_CHILD_UMASK = 0o077
 
 #: Default Phoenix project the host + every agent it spawns group their traces
 #: under when the operator hasn't pinned one — a single ``kestrel-fleet`` project
@@ -168,16 +181,47 @@ def phoenix_grpc_port() -> int:
         return DEFAULT_PHOENIX_GRPC_PORT
 
 
-def phoenix_working_dir() -> Path:
-    """Directory Phoenix stores its SQLite DB in, under the data-dir convention.
+def _absolute_without_following_leaf(path: Path) -> Path:
+    """Return an absolute normalized path without resolving a leaf symlink."""
+    return Path(os.path.abspath(path.expanduser()))
 
-    Uses :func:`kestrel_sovereign.paths.project_dir` (KESTREL_HOME / marker
-    walk-up / ``~/.kestrel``) so the trace store lives alongside the agents'
-    data, not in a scratch CWD.
+
+def phoenix_host_data_root() -> Path:
+    """Private host-runtime root used for Phoenix when no override is set.
+
+    An explicit ``KESTREL_HOME`` is an operator custody decision and is
+    honoured. Without one, source-checkout discovery is intentionally ignored:
+    trace data belongs under ``~/.kestrel/host-data``, never in a repository
+    merely because Kestrel was launched from that repository.
     """
+    explicit_home = os.environ.get("KESTREL_HOME")
+    base = (
+        Path(explicit_home).expanduser()
+        if explicit_home
+        else Path.home() / ".kestrel"
+    )
+    return _absolute_without_following_leaf(base / "host-data")
+
+
+def phoenix_working_dir() -> Path:
+    """Resolve the validated Phoenix working-directory destination.
+
+    ``KESTREL_PHOENIX_WORKING_DIR`` is the explicit per-service override.
+    Otherwise the store is isolated under :func:`phoenix_host_data_root`.
+    Resolution has no filesystem side effects; :meth:`PhoenixSupervisor.prepare_storage`
+    owns secure creation, hardening, and migration.
+    """
+    override = os.environ.get(PHOENIX_WORKING_DIR_ENV)
+    if override:
+        return _absolute_without_following_leaf(Path(override))
+    return phoenix_host_data_root() / "phoenix"
+
+
+def legacy_phoenix_working_dir() -> Path:
+    """Return the pre-#2609 project-relative trace-store location."""
     from kestrel_sovereign.paths import project_dir
 
-    return project_dir() / "phoenix"
+    return _absolute_without_following_leaf(project_dir() / "phoenix")
 
 
 def phoenix_otlp_endpoint() -> str:
@@ -247,6 +291,174 @@ def supports_host_root_path() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Private storage custody
+# ---------------------------------------------------------------------------
+
+
+class PhoenixStorageError(RuntimeError):
+    """Phoenix tracing cannot start because local custody is not secure."""
+
+
+def _path_exists(path: Path) -> bool:
+    """Existence check that also detects broken symlinks."""
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create or validate one real directory, then enforce mode ``0700``."""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        try:
+            path.mkdir(parents=True, mode=PRIVATE_DIRECTORY_MODE, exist_ok=False)
+            st = path.lstat()
+        except FileExistsError:
+            # A concurrent host may have created it. Validate the object it won
+            # the race with rather than accepting it via ``exist_ok=True``.
+            st = path.lstat()
+        except OSError as exc:
+            raise PhoenixStorageError(
+                f"cannot create private Phoenix directory {path}: {exc}"
+            ) from exc
+    except OSError as exc:
+        raise PhoenixStorageError(
+            f"cannot inspect Phoenix directory {path}: {exc}"
+        ) from exc
+
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise PhoenixStorageError(
+            f"Phoenix custody path must be a real directory, not a link or "
+            f"special file: {path}"
+        )
+    try:
+        path.chmod(PRIVATE_DIRECTORY_MODE)
+    except OSError as exc:
+        raise PhoenixStorageError(
+            f"cannot restrict Phoenix directory {path} to mode 0700: {exc}"
+        ) from exc
+
+
+def _secure_storage_tree(root: Path) -> None:
+    """Reject links/special files and restrict an existing store recursively."""
+    if not _path_exists(root):
+        return
+    _ensure_private_directory(root)
+    try:
+        entries = list(os.scandir(root))
+    except OSError as exc:
+        raise PhoenixStorageError(
+            f"cannot enumerate Phoenix storage {root}: {exc}"
+        ) from exc
+
+    for entry in entries:
+        path = Path(entry.path)
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise PhoenixStorageError(
+                f"cannot inspect Phoenix storage entry {path}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise PhoenixStorageError(
+                f"Phoenix storage contains a symbolic link; refusing custody: {path}"
+            )
+        if stat.S_ISDIR(st.st_mode):
+            _secure_storage_tree(path)
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            raise PhoenixStorageError(
+                f"Phoenix storage contains a special file; refusing custody: {path}"
+            )
+        if st.st_nlink != 1:
+            raise PhoenixStorageError(
+                f"Phoenix storage file has {st.st_nlink} hard links; exclusive "
+                f"custody cannot be established: {path}"
+            )
+        try:
+            path.chmod(PRIVATE_FILE_MODE)
+        except OSError as exc:
+            raise PhoenixStorageError(
+                f"cannot restrict Phoenix file {path} to mode 0600: {exc}"
+            ) from exc
+
+
+def _read_pid_file(path: Path) -> Optional[int]:
+    try:
+        return int(path.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _copy_store_across_filesystems(source: Path, destination: Path) -> None:
+    """Copy a stopped, already-hardened store through a private staging dir."""
+    try:
+        staging = Path(
+            tempfile.mkdtemp(prefix=".phoenix-migrate-", dir=destination.parent)
+        )
+        staging.chmod(PRIVATE_DIRECTORY_MODE)
+    except OSError as exc:
+        raise PhoenixStorageError(
+            f"cannot create private Phoenix migration staging directory: {exc}"
+        ) from exc
+
+    try:
+        for entry in source.iterdir():
+            target = staging / entry.name
+            if entry.is_dir():
+                shutil.copytree(entry, target, copy_function=shutil.copy2)
+            else:
+                shutil.copy2(entry, target)
+        _secure_storage_tree(staging)
+        os.replace(staging, destination)
+        _secure_storage_tree(destination)
+        shutil.rmtree(source)
+    except (OSError, shutil.Error) as exc:
+        try:
+            if _path_exists(staging):
+                shutil.rmtree(staging)
+        except OSError:
+            pass
+        raise PhoenixStorageError(
+            f"cannot safely migrate Phoenix storage from {source} to "
+            f"{destination}: {exc}"
+        ) from exc
+
+
+def _open_private_file(path: Path, flags: int) -> int:
+    """Open a non-link regular file and make it private before returning."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags | nofollow, PRIVATE_FILE_MODE)
+    except OSError as exc:
+        raise PhoenixStorageError(
+            f"cannot open private Phoenix file {path}: {exc}"
+        ) from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PhoenixStorageError(
+                f"Phoenix custody file is not regular: {path}"
+            )
+        if st.st_nlink != 1:
+            raise PhoenixStorageError(
+                f"Phoenix custody file has {st.st_nlink} hard links; exclusive "
+                f"custody cannot be established: {path}"
+            )
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+        else:  # pragma: no cover - Windows has no POSIX mode enforcement
+            path.chmod(PRIVATE_FILE_MODE)
+        return fd
+    except (OSError, PhoenixStorageError):
+        os.close(fd)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Supervisor
 # ---------------------------------------------------------------------------
 
@@ -273,9 +485,15 @@ class PhoenixSupervisor:
         self.host = host
         self.port = port if port is not None else phoenix_port()
         self.grpc_port = grpc_port if grpc_port is not None else phoenix_grpc_port()
-        self.working_dir = (
-            Path(working_dir) if working_dir is not None else phoenix_working_dir()
+        self._uses_default_working_dir = (
+            working_dir is None and not os.environ.get(PHOENIX_WORKING_DIR_ENV)
         )
+        self.working_dir = (
+            _absolute_without_following_leaf(Path(working_dir))
+            if working_dir is not None
+            else phoenix_working_dir()
+        )
+        self._storage_prepared = False
         # ``None`` means "auto-detect from the installed Phoenix". Resolved on
         # start() so tests can force a value.
         self._root_path_override = root_path
@@ -295,6 +513,74 @@ class PhoenixSupervisor:
     @property
     def log_file(self) -> Path:
         return self.working_dir / "phoenix.log"
+
+    # -- storage custody -------------------------------------------------
+    def prepare_storage(self) -> None:
+        """Secure the trace store before OTLP wiring or Phoenix launch.
+
+        New stores are created as ``0700``. Existing stores are recursively
+        hardened before any new sensitive bytes can be written. Supervisors
+        using the default resolver also migrate the legacy project-relative
+        ``phoenix/`` directory when the destination is unambiguous and stopped.
+
+        Raises:
+            PhoenixStorageError: custody cannot be established safely. Callers
+                must leave tracing disabled in this case.
+        """
+        if self._storage_prepared:
+            return
+
+        if self._uses_default_working_dir:
+            _ensure_private_directory(self.working_dir.parent)
+            self._migrate_legacy_storage()
+
+        _ensure_private_directory(self.working_dir)
+        _secure_storage_tree(self.working_dir)
+        self._storage_prepared = True
+
+    def _migrate_legacy_storage(self) -> None:
+        legacy = legacy_phoenix_working_dir()
+        if legacy == self.working_dir or not _path_exists(legacy):
+            return
+
+        # First contain the disclosure in place. If anything after this point
+        # fails, the legacy data is still private even though tracing remains
+        # disabled until the operator resolves the migration error.
+        _secure_storage_tree(legacy)
+
+        legacy_pid = _read_pid_file(legacy / "phoenix.pid")
+        if legacy_pid and self._pid_alive(legacy_pid):
+            raise PhoenixStorageError(
+                f"legacy Phoenix store {legacy} belongs to live PID {legacy_pid}; "
+                "stop that Phoenix process, then restart Kestrel to migrate it"
+            )
+
+        if _path_exists(self.working_dir):
+            _secure_storage_tree(self.working_dir)
+            raise PhoenixStorageError(
+                f"both legacy Phoenix storage {legacy} and destination "
+                f"{self.working_dir} contain state; tracing is disabled to avoid "
+                "an unsafe database merge. Back up both directories, choose the "
+                "authoritative store, then remove or relocate the other."
+            )
+
+        try:
+            os.replace(legacy, self.working_dir)
+            _secure_storage_tree(self.working_dir)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise PhoenixStorageError(
+                    f"cannot migrate Phoenix storage from {legacy} to "
+                    f"{self.working_dir}: {exc}"
+                ) from exc
+            _copy_store_across_filesystems(legacy, self.working_dir)
+
+        logger.warning(
+            "Migrated legacy Phoenix trace storage from %s to private host-data "
+            "directory %s.",
+            legacy,
+            self.working_dir,
+        )
 
     # -- state -----------------------------------------------------------
     @property
@@ -354,11 +640,20 @@ class PhoenixSupervisor:
     def _write_pid(self, pid: int) -> None:
         """Persist ``pid`` to the pidfile so a hard-killed host's successor can
         reap or adopt the leak (mirrors ``ProcessManager`` pid tracking)."""
+        self.prepare_storage()
+        fd = _open_private_file(
+            self.pid_file,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        )
         try:
-            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
-            self.pid_file.write_text(str(pid))
-        except OSError:
-            pass
+            os.write(fd, str(pid).encode("ascii"))
+            os.fsync(fd)
+        except OSError as exc:
+            raise PhoenixStorageError(
+                f"cannot persist private Phoenix PID file {self.pid_file}: {exc}"
+            ) from exc
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _pid_alive(pid: Optional[int]) -> bool:
@@ -539,6 +834,16 @@ class PhoenixSupervisor:
             )
             return False
 
+        try:
+            self.prepare_storage()
+        except PhoenixStorageError as exc:
+            logger.error(
+                "Phoenix tracing disabled because private storage custody could "
+                "not be established: %s",
+                exc,
+            )
+            return False
+
         # Resolve the effective root-path against the installed Phoenix unless a
         # value was pinned by the caller/tests.
         if self._root_path_override is None:
@@ -559,15 +864,19 @@ class PhoenixSupervisor:
         try:
             if self._adopt_or_reap():
                 return True
+        except PhoenixStorageError as exc:
+            logger.error(
+                "Phoenix tracing disabled because private PID custody failed: %s",
+                exc,
+            )
+            return False
         except Exception as exc:  # noqa: BLE001 - reconcile must never block startup
             logger.warning("Phoenix adopt-or-reap reconcile failed: %s", exc)
 
         try:
-            self.working_dir.mkdir(parents=True, exist_ok=True)
-            log_fd = os.open(
+            log_fd = _open_private_file(
                 self.log_file,
                 os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o644,
             )
             try:
                 kwargs: dict = dict(
@@ -580,17 +889,47 @@ class PhoenixSupervisor:
                     kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
                 else:
                     kwargs["start_new_session"] = True
+                    # Popen applies this in the child before exec. Phoenix's DB,
+                    # WAL, SHM, and any future files are private from their first
+                    # inode; no post-write repair window exists.
+                    kwargs["umask"] = PRIVATE_CHILD_UMASK
                 self.process = subprocess.Popen(self.build_command(), **kwargs)
             finally:
                 os.close(log_fd)
-        except Exception as exc:  # noqa: BLE001 - never block host startup
+        except (
+            OSError,
+            ValueError,
+            PhoenixStorageError,
+            subprocess.SubprocessError,
+        ) as exc:
             logger.warning("Failed to launch Phoenix subprocess: %s", exc)
             self.process = None
             return False
 
         # Freshly spawned: this supervisor owns a real Popen, not an adopted PID.
         self._adopted_pid = None
-        self._write_pid(self.process.pid)
+        try:
+            self._write_pid(self.process.pid)
+        except PhoenixStorageError as exc:
+            logger.error(
+                "Phoenix tracing disabled because its PID file could not be "
+                "secured: %s",
+                exc,
+            )
+            proc = self.process
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            except (OSError, subprocess.SubprocessError):
+                pass
+            self.process = None
+            return False
 
         logger.info(
             "Phoenix supervised on %s:%s (PID %s, root_path=%r, working_dir=%s)",
@@ -863,17 +1202,21 @@ async def proxy_to_phoenix(
 __all__ = [
     "PHOENIX_BIND_HOST",
     "PHOENIX_ROOT_PATH",
+    "PHOENIX_WORKING_DIR_ENV",
     "DEFAULT_OTEL_PROJECT",
     "EMBED_COOKIE_NAME",
     "EMBED_COOKIE_PATH",
     "EMBED_TTL_SECONDS",
     "PhoenixSupervisor",
+    "PhoenixStorageError",
     "phoenix_available",
     "phoenix_enabled",
     "should_supervise_phoenix",
     "phoenix_port",
     "phoenix_grpc_port",
     "phoenix_working_dir",
+    "phoenix_host_data_root",
+    "legacy_phoenix_working_dir",
     "phoenix_otlp_endpoint",
     "autowire_otlp_endpoint",
     "autowire_otel_project",

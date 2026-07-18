@@ -625,6 +625,11 @@ async def lifespan(app: FastAPI):
 
         if should_supervise_phoenix():
             supervisor = PhoenixSupervisor()
+            # Privacy gate (#2609): establish/migrate private trace custody
+            # before advertising a local OTLP collector to the host or agents.
+            # A failure leaves app.state.phoenix unset and the endpoint unwired,
+            # so tracing is clearly disabled rather than writing insecurely.
+            await asyncio.to_thread(supervisor.prepare_storage)
             # Track the supervisor immediately so /phoenix + the mint can gate on
             # reachability (503 until Phoenix answers). Zero-config (INV-SOLO):
             # default the OTLP endpoint to the local Phoenix collector for this

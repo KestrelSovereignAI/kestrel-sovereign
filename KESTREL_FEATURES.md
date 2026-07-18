@@ -621,7 +621,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - `GET /api/host/ui/contributions`
 - `GET /health`
 - `GET /health/detailed`
-- `/phoenix` and `/phoenix/{path}` — same-origin authenticated reverse proxy to the host-supervised Phoenix trace UI (embed-session cookie; all methods)
+- `/phoenix` and `/phoenix/{path}` — same-origin authenticated reverse proxy to the host-supervised Phoenix trace UI (embed-session cookie; all methods). Trace files use the private custody and migration contract in [`docs/architecture/security/PHOENIX_TRACE_CUSTODY.md`](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
 
 ### Router families mounted by `kestrel_sovereign/server.py`
 
