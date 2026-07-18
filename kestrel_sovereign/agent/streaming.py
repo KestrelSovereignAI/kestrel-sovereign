@@ -692,12 +692,15 @@ class StreamingMixin:
         # PART sentinels after the command result, mirroring the normal path.
         if user_input.startswith("!"):
             with part_collector():
+                # Preserve the pre-existing positional call shape
+                # (test_streaming_audit asserts it) — invocation_context
+                # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
                 result = await self.process_input(
                     user_input,
-                    invocation_context=invocation_context,
-                    model_override=model_override,
+                    model_override,
                     session_id=session_id,
                     caller=caller,
+                    invocation_context=invocation_context,
                 )
                 yield result
                 for part in drain_parts():
