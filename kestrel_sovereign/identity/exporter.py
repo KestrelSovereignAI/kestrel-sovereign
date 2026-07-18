@@ -582,7 +582,9 @@ class IdentityExporter:
         history = []
         if include_history:
             rows = await self.db.fetchall(
-                """SELECT id, amount, memo, created_at FROM wallet_transactions
+                """SELECT id, transaction_type, currency, amount, memo,
+                          new_balance, created_at
+                   FROM wallet_transactions
                    WHERE agent_id = ?
                    ORDER BY created_at DESC LIMIT 100""",
                 (self.agent_id,)
@@ -590,9 +592,12 @@ class IdentityExporter:
             for row in rows:
                 history.append({
                     "id": row[0],
-                    "amount": str(row[1]),
-                    "memo": row[2],
-                    "created_at": row[3],
+                    "transaction_type": row[1],
+                    "currency": row[2],
+                    "amount": str(row[3]),
+                    "memo": row[4],
+                    "new_balance": str(row[5]),
+                    "created_at": row[6],
                 })
 
         return balance, history

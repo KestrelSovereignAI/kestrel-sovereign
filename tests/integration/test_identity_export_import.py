@@ -139,11 +139,14 @@ async def test_db():
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS wallet_transactions (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT,
-                amount TEXT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                transaction_type TEXT NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'FIL',
+                amount TEXT NOT NULL,
                 memo TEXT,
-                created_at TEXT
+                new_balance TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.commit()
@@ -212,6 +215,14 @@ async def populated_db(test_db):
         """INSERT INTO wallet_state (agent_id, main_balance, audit_balance, updated_at)
            VALUES (?, ?, ?, ?)""",
         (agent_id, "500.50", "0.0", "2025-01-01T00:00:00Z")
+    )
+    await test_db.execute(
+        """INSERT INTO wallet_transactions
+           (agent_id, transaction_type, currency, amount, memo,
+            new_balance, created_at)
+           VALUES (?, 'deposit', 'FIL', '25.50', 'portable tx',
+                   '500.50', '2025-01-01T00:00:00Z')""",
+        (agent_id,)
     )
 
     await test_db.commit()
@@ -503,6 +514,16 @@ class TestIdentityExporter:
         package = await exporter.export(include_wallet_history=True)
 
         assert package.wallet_balance == "500.50"
+        assert len(package.wallet_transaction_history) == 1
+        assert package.wallet_transaction_history[0] == {
+            "id": 1,
+            "transaction_type": "deposit",
+            "currency": "FIL",
+            "amount": "25.50",
+            "memo": "portable tx",
+            "new_balance": "500.50",
+            "created_at": "2025-01-01T00:00:00Z",
+        }
 
     @pytest.mark.asyncio
     async def test_export_personality_extraction(self, populated_db):

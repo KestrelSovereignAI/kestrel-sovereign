@@ -154,10 +154,11 @@ async def test_skill_refuses_reserved_node_collision(graph_db):
     await graph_db.commit()
 
     importer = IdentityImporter(graph_db, target_agent_id=agent_did)
-    await importer._import_skills(
-        agent_did,
-        [{"skill_id": raw_skill_id, "skill_name": "Hijack"}],
-    )
+    with pytest.raises(ValueError, match="reserved identity node"):
+        await importer._import_skills(
+            agent_did,
+            [{"skill_id": raw_skill_id, "skill_name": "Hijack"}],
+        )
 
     # Reserved node untouched, skill refused.
     row = await graph_db.fetchone(
@@ -166,8 +167,4 @@ async def test_skill_refuses_reserved_node_collision(graph_db):
     )
     assert row[0] == "migration_record"
     assert json.loads(row[1]) == {"protected": True}
-    assert importer.stats.get("skills_imported") == 0
-    assert any(
-        "reserved" in w.lower() or "collides" in w.lower()
-        for w in importer.warnings
-    )
+    assert "skills_imported" not in importer.stats
