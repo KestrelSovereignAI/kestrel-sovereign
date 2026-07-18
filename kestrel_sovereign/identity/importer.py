@@ -327,9 +327,14 @@ class IdentityImporter:
 
         if has_signature:
             if verify_signature:
-                sig_valid = await self._verify_signature(
-                    package, identity_trust_policy
-                )
+                if identity_trust_policy is None:
+                    # Preserve the historical bound-method call shape for
+                    # integrations that override or instrument this hook.
+                    sig_valid = await self._verify_signature(package)
+                else:
+                    sig_valid = await self._verify_signature(
+                        package, identity_trust_policy
+                    )
                 if not sig_valid:
                     self.errors.append("DID signature verification failed")
                     return self._build_result(False, agent_id)
