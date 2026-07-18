@@ -87,6 +87,9 @@
   - [`kestrel_sovereign/storage/__init__.py`](kestrel_sovereign/storage/__init__.py)
   - [`kestrel_sovereign/storage/async_storage.py`](kestrel_sovereign/storage/async_storage.py)
   - [`kestrel_sovereign/storage/`](kestrel_sovereign/storage)
+  - Fleet/host feature SQLite state follows the private placement, migration,
+    and database-separation contract in
+    [`docs/architecture/security/HOST_RUNTIME_STORAGE_CUSTODY.md`](docs/architecture/security/HOST_RUNTIME_STORAGE_CUSTODY.md).
 - Memory systems:
   - [`kestrel_sovereign/agent/memory_manager.py`](kestrel_sovereign/agent/memory_manager.py)
   - [`kestrel_sovereign/features/memory/`](kestrel_sovereign/features/memory)

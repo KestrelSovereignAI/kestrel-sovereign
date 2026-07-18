@@ -164,34 +164,44 @@ async def build_host_context(
 
     The host is not an agent, so it owns a dedicated host backend (SQLite by
     default) distinct from any agent DB. ``db_path`` overrides the default
-    location (``$KESTREL_HOST_DB_PATH`` or ``kestrel_host.db`` under the project
-    dir). Failure to open the backend degrades gracefully to a context with a
+    location (``$KESTREL_HOST_DB_PATH`` or the private host-data root). Failure
+    to secure or open the backend degrades gracefully to a context with a
     ``None`` db/session_factory — the host still starts and host features whose
     routers/UI don't need a store keep working.
     """
     db = None
     session_factory: Optional[FleetSessionFactory] = None
     try:
-        import os
-        from pathlib import Path
-
+        from kestrel_sovereign.host_features.storage import (
+            prepare_host_database,
+            validate_sqlite_family_private,
+        )
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
 
-        resolved = (
-            db_path
-            or os.environ.get("KESTREL_HOST_DB_PATH")
-        )
-        if not resolved:
-            from kestrel_sovereign.paths import project_dir
-
-            resolved = str((project_dir() / "kestrel_host.db").resolve())
-
-        db = await AsyncDatabase.sqlite(resolved)
+        resolved = prepare_host_database(db_path)
+        db = await AsyncDatabase.sqlite(str(resolved))
+        validate_sqlite_family_private(resolved)
         inner = make_session_factory(db)
         session_factory = FleetSessionFactory(inner)
-        logger.info("Host backend opened at %s (fleet tenant=%s)", resolved, FLEET_TENANT_ID)
+        logger.info(
+            "Host backend opened at %s (fleet tenant=%s)", resolved, FLEET_TENANT_ID
+        )
     except Exception as exc:  # noqa: BLE001 - host must start even without a store
+        if session_factory is not None:
+            try:
+                await session_factory.close()
+            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
+                logger.warning(
+                    "Could not close partial host session factory: %s", close_exc
+                )
+        if db is not None and hasattr(db, "close"):
+            try:
+                await db.close()
+            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
+                logger.warning("Could not close partial host backend: %s", close_exc)
+        session_factory = None
+        db = None
         logger.warning("Could not open host backend/session factory: %s", exc)
 
     return SovereignHostContext(

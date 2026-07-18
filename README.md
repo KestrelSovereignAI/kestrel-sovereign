@@ -107,6 +107,15 @@ with `umask 077` so DB sidecars are private at creation. An insecure or
 ambiguous legacy store disables local tracing before the OTLP endpoint is
 auto-wired. See [Phoenix trace custody](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
 
+Fleet-wide host-feature state uses the same private host-data root, in
+`host-features.db`, rather than writing `kestrel_host.db` into whichever source
+checkout launched the host. The directory is `0700`; the database and its
+SQLite WAL/SHM/journal family are `0600` from creation. An explicit
+`KESTREL_HOST_DB_PATH` remains supported when its parent is a dedicated `0700`
+directory. This feature-state database is intentionally separate from the
+payment/key vault at `agent_data/host.db`; Kestrel never falls back or copies
+between them. See [Host runtime storage custody](docs/architecture/security/HOST_RUNTIME_STORAGE_CUSTODY.md).
+
 Your agent is now running. Two ports to know about, depending on which start form you used:
 
 | Command | Listens on | Why |

@@ -46,6 +46,16 @@ import itsdangerous
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
+from kestrel_sovereign.private_storage import (
+    PRIVATE_DIRECTORY_MODE,
+    PRIVATE_FILE_MODE,
+    PrivateStorageError as PhoenixStorageError,
+    absolute_without_following_leaf as _absolute_without_following_leaf,
+    ensure_private_directory as _ensure_private_directory,
+    open_private_file as _open_private_file,
+    path_exists as _path_exists,
+)
+
 logger = logging.getLogger(__name__)
 
 # Phoenix is bound to loopback ONLY. It is sovereign infrastructure — the trace
@@ -67,8 +77,6 @@ PHOENIX_ROOT_PATH = "/phoenix"
 #: the custody owner and must validate the directory before it starts Phoenix.
 PHOENIX_WORKING_DIR_ENV = "KESTREL_PHOENIX_WORKING_DIR"
 
-PRIVATE_DIRECTORY_MODE = 0o700
-PRIVATE_FILE_MODE = 0o600
 PRIVATE_CHILD_UMASK = 0o077
 
 #: Default Phoenix project the host + every agent it spawns group their traces
@@ -181,11 +189,6 @@ def phoenix_grpc_port() -> int:
         return DEFAULT_PHOENIX_GRPC_PORT
 
 
-def _absolute_without_following_leaf(path: Path) -> Path:
-    """Return an absolute normalized path without resolving a leaf symlink."""
-    return Path(os.path.abspath(path.expanduser()))
-
-
 def phoenix_host_data_root() -> Path:
     """Private host-runtime root used for Phoenix when no override is set.
 
@@ -194,13 +197,9 @@ def phoenix_host_data_root() -> Path:
     trace data belongs under ``~/.kestrel/host-data``, never in a repository
     merely because Kestrel was launched from that repository.
     """
-    explicit_home = os.environ.get("KESTREL_HOME")
-    base = (
-        Path(explicit_home).expanduser()
-        if explicit_home
-        else Path.home() / ".kestrel"
-    )
-    return _absolute_without_following_leaf(base / "host-data")
+    from kestrel_sovereign.paths import host_data_dir
+
+    return host_data_dir()
 
 
 def phoenix_working_dir() -> Path:
@@ -295,53 +294,6 @@ def supports_host_root_path() -> bool:
 # ---------------------------------------------------------------------------
 
 
-class PhoenixStorageError(RuntimeError):
-    """Phoenix tracing cannot start because local custody is not secure."""
-
-
-def _path_exists(path: Path) -> bool:
-    """Existence check that also detects broken symlinks."""
-    try:
-        path.lstat()
-        return True
-    except FileNotFoundError:
-        return False
-
-
-def _ensure_private_directory(path: Path) -> None:
-    """Create or validate one real directory, then enforce mode ``0700``."""
-    try:
-        st = path.lstat()
-    except FileNotFoundError:
-        try:
-            path.mkdir(parents=True, mode=PRIVATE_DIRECTORY_MODE, exist_ok=False)
-            st = path.lstat()
-        except FileExistsError:
-            # A concurrent host may have created it. Validate the object it won
-            # the race with rather than accepting it via ``exist_ok=True``.
-            st = path.lstat()
-        except OSError as exc:
-            raise PhoenixStorageError(
-                f"cannot create private Phoenix directory {path}: {exc}"
-            ) from exc
-    except OSError as exc:
-        raise PhoenixStorageError(
-            f"cannot inspect Phoenix directory {path}: {exc}"
-        ) from exc
-
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise PhoenixStorageError(
-            f"Phoenix custody path must be a real directory, not a link or "
-            f"special file: {path}"
-        )
-    try:
-        path.chmod(PRIVATE_DIRECTORY_MODE)
-    except OSError as exc:
-        raise PhoenixStorageError(
-            f"cannot restrict Phoenix directory {path} to mode 0700: {exc}"
-        ) from exc
-
-
 def _secure_storage_tree(root: Path) -> None:
     """Reject links/special files and restrict an existing store recursively."""
     if not _path_exists(root):
@@ -426,36 +378,6 @@ def _copy_store_across_filesystems(source: Path, destination: Path) -> None:
             f"cannot safely migrate Phoenix storage from {source} to "
             f"{destination}: {exc}"
         ) from exc
-
-
-def _open_private_file(path: Path, flags: int) -> int:
-    """Open a non-link regular file and make it private before returning."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags | nofollow, PRIVATE_FILE_MODE)
-    except OSError as exc:
-        raise PhoenixStorageError(
-            f"cannot open private Phoenix file {path}: {exc}"
-        ) from exc
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise PhoenixStorageError(
-                f"Phoenix custody file is not regular: {path}"
-            )
-        if st.st_nlink != 1:
-            raise PhoenixStorageError(
-                f"Phoenix custody file has {st.st_nlink} hard links; exclusive "
-                f"custody cannot be established: {path}"
-            )
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, PRIVATE_FILE_MODE)
-        else:  # pragma: no cover - Windows has no POSIX mode enforcement
-            path.chmod(PRIVATE_FILE_MODE)
-        return fd
-    except (OSError, PhoenixStorageError):
-        os.close(fd)
-        raise
 
 
 # ---------------------------------------------------------------------------
