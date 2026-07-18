@@ -98,6 +98,28 @@ class TestLocalAgentConfig:
         assert config.data_dir == Path("agent_data/claw")
         assert not config.data_dir.is_absolute()
 
+    def test_relative_identity_export_dir_resolves_below_agent_root(self, tmp_path):
+        config = LocalAgentConfig(
+            data_dir="agent_data/claw",
+            identity_export_dir="exports",
+            port=8801,
+        )
+
+        assert config.identity_export_dir == Path("exports")
+        assert config.resolve_identity_export_dir(tmp_path) == (
+            tmp_path / "agent_data" / "claw" / "exports"
+        ).resolve()
+
+    def test_absolute_identity_export_dir_is_preserved(self, tmp_path):
+        override = tmp_path / "custody" / "claw"
+        config = LocalAgentConfig(
+            data_dir="agent_data/claw",
+            identity_export_dir=override,
+            port=8801,
+        )
+
+        assert config.resolve_identity_export_dir(tmp_path) == override.resolve()
+
     def test_validate_runtime_missing_dir(self, tmp_path):
         """Test runtime validation catches non-existent data_dir."""
         config = LocalAgentConfig(
@@ -528,6 +550,27 @@ class TestMultiAgentConfigSave:
         assert "test" in loaded.agents
         assert loaded.agents["test"].port == 8801
         assert loaded.agents["test"].autostart is False
+
+    def test_save_preserves_per_agent_identity_export_override(
+        self,
+        tmp_path,
+        temp_agent_dir,
+    ):
+        config = MultiAgentConfig(
+            agents={
+                "test": LocalAgentConfig(
+                    data_dir=temp_agent_dir,
+                    identity_export_dir=Path("continuity"),
+                    port=8801,
+                )
+            }
+        )
+
+        config_path = tmp_path / "multi_agent.toml"
+        config.save(config_path)
+        loaded = MultiAgentConfig.from_file(config_path)
+
+        assert loaded.agents["test"].identity_export_dir == Path("continuity")
 
     def test_save_with_remote_agents(self, tmp_path):
         """Test saving config with remote agents."""

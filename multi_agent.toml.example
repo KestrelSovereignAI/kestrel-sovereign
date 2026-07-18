@@ -28,6 +28,8 @@ bind = "0.0.0.0"
 # - data_dir: Path to agent's directory (contains kestrel_prime.db)
 # - port: Unique port for this agent's API
 # - autostart: Whether to start when the host starts (default: true)
+# - identity_export_dir: Optional export directory. Relative paths are resolved
+#   below this agent's data_dir.
 
 [agents.claw]
 # Path to agent's data directory (relative or absolute)
@@ -38,6 +40,9 @@ port = 8801
 
 # Start this agent when the host starts (default: true)
 autostart = true
+
+# Optional: keep continuity packages in agent_data/claw/exports.
+# identity_export_dir = "exports"
 
 # Optional: Per-agent feature profile.
 # Lists which feature classes this agent should load.

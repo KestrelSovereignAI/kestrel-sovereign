@@ -203,6 +203,65 @@ class TestLoadFromConfig:
         partial.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_in_process_agent_receives_resolved_identity_export_override(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        mock_get_did.return_value = "did:claw"
+        mock_agent = _make_mock_agent("did:claw")
+        mock_agent_cls.return_value = mock_agent
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            identity_export_dir=Path("continuity"),
+            port=8801,
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("claw", config)
+
+        assert mock_agent_cls.call_args.kwargs["identity_export_dir"] == (
+            tmp_path / "agent_data" / "claw" / "continuity"
+        ).resolve()
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager._get_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_in_process_agent_defaults_export_binding_to_its_data_root(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        mock_get_did.return_value = "did:claw"
+        mock_agent_cls.return_value = _make_mock_agent("did:claw")
+        manager = AgentManager(base_data_dir=tmp_path)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            port=8801,
+        )
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent("claw", config)
+
+        agent_root = (tmp_path / "agent_data" / "claw").resolve()
+        assert mock_agent_cls.call_args.kwargs["identity_export_dir"] == agent_root
+
+    @pytest.mark.asyncio
     @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
     @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")

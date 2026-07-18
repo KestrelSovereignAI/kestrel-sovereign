@@ -71,6 +71,18 @@ def _runtime_agent_data_dir(agent: Any) -> Optional[Path]:
     return None
 
 
+def _runtime_identity_export_dir(agent: Any) -> Path:
+    """Resolve the export root from this agent's own runtime binding."""
+
+    per_agent_override = vars(agent).get("identity_export_dir")
+    if not isinstance(per_agent_override, (str, os.PathLike)):
+        per_agent_override = None
+    return identity_export_directory(
+        agent_data_dir=_runtime_agent_data_dir(agent),
+        per_agent_override=per_agent_override,
+    )
+
+
 class IdentityFeature(Feature):
     """
     Feature for managing agent identity portability.
@@ -278,10 +290,10 @@ class IdentityFeature(Feature):
                 fallback_filepath: Optional[Path] = None
                 if tier_downgraded:
                     try:
-                        storage_dir = identity_export_directory()
+                        storage_dir = _runtime_identity_export_dir(self.agent)
                         filename = _unique_export_filename()
                         fallback_filepath = storage_dir / filename
-                        write_protected_identity_export(
+                        fallback_filepath = write_protected_identity_export(
                             fallback_filepath,
                             package_json,
                             allowed_destination_roots=(storage_dir,),
@@ -358,11 +370,11 @@ class IdentityFeature(Feature):
                 }
             else:
                 # Save to local file
-                storage_dir = identity_export_directory()
+                storage_dir = _runtime_identity_export_dir(self.agent)
                 filename = _unique_export_filename()
                 filepath = storage_dir / filename
 
-                write_protected_identity_export(
+                filepath = write_protected_identity_export(
                     filepath,
                     package_json,
                     allowed_destination_roots=(storage_dir,),

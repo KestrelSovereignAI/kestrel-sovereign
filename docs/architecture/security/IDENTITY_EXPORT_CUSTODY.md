@@ -32,6 +32,22 @@ The tool still returns the generated `identity_*.json` import path. A tier
 downgrade returns the same restorable local path and remains a partial result
 because the requested remote tier was unavailable.
 
+The returned path is absolute and bound to the active agent. Runtime placement
+uses the following precedence:
+
+1. the agent's `identity_export_dir` from `multi_agent.toml`;
+2. the process manager's internal `KESTREL_IDENTITY_EXPORT_DIR` child binding;
+3. the intentional standalone `KESTREL_DATA_DIR` override;
+4. the active agent data root (`storage_path` / `KESTREL_DB_PATH`); and
+5. the historical `agent_data` fallback when no runtime binding exists.
+
+A relative `identity_export_dir` is resolved below that agent's `data_dir`, so
+the same relative value on two agents still produces two distinct custody
+roots. Process-managed children receive their resolved root in
+`KESTREL_IDENTITY_EXPORT_DIR`; a host-level `KESTREL_DATA_DIR` is not copied
+into every child as a shared export destination or repurposed for unrelated
+storage consumers.
+
 `sign_and_export(..., replace_existing=True)` is the only replacement seam.
 Replacement must be explicit and is accepted only when the destination:
 

@@ -379,7 +379,7 @@ async def test_export_identity_falsy_nonstring_tier_is_failed(bad_tier):
     assert "local" in result.error and "ipfs" in result.error
 
 
-def _mock_local_export(monkeypatch, tmp_path):
+def _mock_local_export(monkeypatch, tmp_path, *, configure_export_root=True):
     """Wire up IdentityExporter + sign so a local export reaches disk."""
     fake_pkg = MagicMock()
     fake_pkg.did = "did:test:export-agent"
@@ -398,7 +398,11 @@ def _mock_local_export(monkeypatch, tmp_path):
         "kestrel_sovereign.identity.IdentityExporter",
         lambda **kwargs: MagicMock(export=AsyncMock(return_value=fake_pkg)),
     )
-    monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path / "exports"))
+    if configure_export_root:
+        monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path / "exports"))
+    else:
+        monkeypatch.delenv("KESTREL_DATA_DIR", raising=False)
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
     return fake_pkg
 
 
@@ -420,6 +424,52 @@ async def test_export_identity_valid_tier_resolves(monkeypatch, tmp_path):
     assert export_path.exists()
     assert stat.S_IMODE(export_path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(export_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_two_in_process_agents_export_under_distinct_runtime_roots(
+    monkeypatch,
+    tmp_path,
+):
+    """One host process must not collapse two agents into a shared CWD path."""
+
+    _mock_local_export(monkeypatch, tmp_path, configure_export_root=False)
+    monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path / "shared-parent-root"))
+    roots = [tmp_path / "agent_data" / "claw", tmp_path / "agent_data" / "emma"]
+    results = []
+    for name, root in zip(("claw", "emma"), roots):
+        feature = _make_feature(db=MagicMock())
+        feature.agent.agent_id = f"did:test:{name}"
+        feature.agent.storage_path = str(root / "kestrel_prime.db")
+        # AgentManager binds this even when multi_agent.toml has no explicit
+        # override, so an ambient host KESTREL_DATA_DIR cannot collapse roots.
+        feature.agent.identity_export_dir = root.resolve()
+        results.append(await feature.export_identity(storage_tier="local", sign=False))
+
+    paths = [Path(result.data["file_path"]) for result in results]
+    assert all(result.status is ToolResultStatus.OK for result in results)
+    assert [path.parent for path in paths] == [root.resolve() for root in roots]
+    assert all(path.is_absolute() and path.exists() for path in paths)
+    assert paths[0].parent != paths[1].parent
+
+
+@pytest.mark.asyncio
+async def test_per_agent_export_override_wins_in_process(monkeypatch, tmp_path):
+    _mock_local_export(monkeypatch, tmp_path, configure_export_root=False)
+    feature = _make_feature(db=MagicMock())
+    feature.agent.agent_id = "did:test:claw"
+    feature.agent.storage_path = str(
+        tmp_path / "agent_data" / "claw" / "kestrel_prime.db"
+    )
+    override = tmp_path / "private-exports" / "claw"
+    feature.agent.identity_export_dir = override
+
+    result = await feature.export_identity(storage_tier="local", sign=False)
+
+    export_path = Path(result.data["file_path"])
+    assert result.status is ToolResultStatus.OK
+    assert export_path.parent == override.resolve()
+    assert export_path.is_absolute()
 
 
 @pytest.mark.asyncio

@@ -73,6 +73,13 @@ class LocalAgentConfig(BaseModel):
         default=True,
         description="Start this agent when the host starts",
     )
+    identity_export_dir: Optional[Path] = Field(
+        default=None,
+        description=(
+            "Optional per-agent identity export directory. Relative paths "
+            "are resolved below this agent's data_dir."
+        ),
+    )
     features: Optional[List[str]] = Field(
         default=None,
         description=(
@@ -89,6 +96,36 @@ class LocalAgentConfig(BaseModel):
         """Convert string to Path (preserves relative paths)."""
         return Path(v)
 
+    @field_validator("identity_export_dir", mode="before")
+    @classmethod
+    def coerce_identity_export_dir(
+        cls,
+        value: Optional[Union[str, Path]],
+    ) -> Optional[Path]:
+        """Convert an optional export override while preserving relativity."""
+
+        return None if value is None else Path(value)
+
+    def resolve_data_dir(self, base_dir: Optional[Path] = None) -> Path:
+        """Resolve this agent's data root using the runtime project base."""
+
+        if base_dir is None:
+            return self.data_dir.expanduser().resolve()
+        return (base_dir / self.data_dir.expanduser()).resolve()
+
+    def resolve_identity_export_dir(
+        self,
+        base_dir: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """Resolve the optional override, relative to this agent's data root."""
+
+        if self.identity_export_dir is None:
+            return None
+        configured = self.identity_export_dir.expanduser()
+        if configured.is_absolute():
+            return configured.resolve()
+        return (self.resolve_data_dir(base_dir) / configured).resolve()
+
     def validate_runtime(self, base_dir: Optional[Path] = None) -> list[str]:
         """Validate that data_dir exists and contains a database.
 
@@ -104,10 +141,7 @@ class LocalAgentConfig(BaseModel):
             List of error messages (empty if valid).
         """
         errors = []
-        if base_dir is not None:
-            resolved = (base_dir / self.data_dir).resolve()
-        else:
-            resolved = self.data_dir.resolve()
+        resolved = self.resolve_data_dir(base_dir)
         if not resolved.exists():
             errors.append(f"Agent data directory does not exist: {resolved}")
         elif not resolved.is_dir():
@@ -356,6 +390,8 @@ class MultiAgentConfig(BaseModel):
                 # #2358: the create-agent endpoint rewrites the whole file).
                 if agent.features is not None:
                     entry["features"] = list(agent.features)
+                if agent.identity_export_dir is not None:
+                    entry["identity_export_dir"] = str(agent.identity_export_dir)
                 data["agents"][name] = entry
             elif isinstance(agent, RemoteAgentConfig):
                 data["agents"][name] = {
