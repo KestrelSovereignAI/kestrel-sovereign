@@ -101,3 +101,19 @@ operator can investigate without Kestrel reading or disclosing the artifact.
 
 Existing exports remain importable after permission hardening; package bytes and
 the returned import pathname do not change.
+
+## Import and verification intake
+
+`!identity import` and `!identity verify` share one bounded package loader. A
+local source must be an operator-owned regular file whose group/other write bits
+are clear; legacy read-only modes such as `0644` remain accepted. Kestrel opens
+the final path entry with no-follow and nonblocking flags, validates the opened
+descriptor, and reads at most 64 MiB on a worker thread. Links, directories,
+FIFOs, sockets, devices, ownership mismatches, writable files, path-swap races,
+invalid UTF-8, and oversized packages fail before parsing or mutation.
+
+CID sources use the same 64 MiB decoded-package ceiling. The Filecoin/IPFS
+adapter bounds local-cache and streamed network input as well as decompression
+and decrypted output, preventing a compressed response from bypassing the
+limit. Expected intake failures return source metadata and a sanitized reason;
+they do not log or echo package bytes.

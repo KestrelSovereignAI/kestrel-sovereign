@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
+from kestrel_sovereign.filecoin_adapter import (
+    ContentRetrievalLimitError,
+    FilecoinAdapter,
+)
 from kestrel_sovereign.storage.providers.base import StorageTier
 
 
@@ -104,6 +107,89 @@ class TestFilecoinIntegrity:
         # Retrieving by the uppercase key works on ALL filesystems: the sha256
         # lookup key is normalized to lowercase before the cache lookup.
         assert adapter.retrieve_content(up) == b"casing matters"
+
+    def test_bounded_retrieve_accepts_content_at_limit(self, tmp_path):
+        adapter = FilecoinAdapter(cache_dir=str(tmp_path / "cache"))
+        payload = b"x" * 128
+        result = adapter.store_content(payload, storage_tier=StorageTier.LOCAL_ONLY)
+
+        assert adapter.retrieve_content(
+            result.content_hash,
+            max_output_bytes=len(payload),
+        ) == payload
+
+    def test_bounded_retrieve_rejects_decompression_over_limit(self, tmp_path):
+        adapter = FilecoinAdapter(cache_dir=str(tmp_path / "cache"))
+        payload = b"x" * 1024
+        result = adapter.store_content(payload, storage_tier=StorageTier.LOCAL_ONLY)
+
+        with pytest.raises(ContentRetrievalLimitError, match="output limit"):
+            adapter.retrieve_content(result.content_hash, max_output_bytes=32)
+
+    def test_bounded_retrieve_caps_cache_read_before_decompression(self, tmp_path):
+        adapter = FilecoinAdapter(cache_dir=str(tmp_path / "cache"))
+        cache_key = "QmOversizedCache"
+        # max_output=4 permits at most 64 KiB + 8 encoded bytes.
+        encoded_limit = 4 * 2 + 64 * 1024
+        (adapter.cache_dir / f"{cache_key}.cache").write_bytes(
+            b"x" * (encoded_limit + 1)
+        )
+
+        with pytest.raises(ContentRetrievalLimitError, match="input limit"):
+            adapter.retrieve_content(cache_key, max_output_bytes=4)
+
+    def test_bounded_ipfs_read_stops_when_stream_crosses_limit(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        adapter = FilecoinAdapter(cache_dir=str(tmp_path / "cache"))
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def close(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                yield b"1234"
+                yield b"5678"
+
+        import kestrel_sovereign.filecoin_adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module.requests, "post", lambda *a, **k: Response())
+
+        with pytest.raises(ContentRetrievalLimitError, match="input limit"):
+            adapter._retrieve_ipfs("QmOversized", max_bytes=6)
+
+    def test_encrypted_retrieve_enforces_final_plaintext_limit(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from cryptography.fernet import Fernet
+
+        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+        adapter = FilecoinAdapter(cache_dir=str(tmp_path / "cache"))
+        payload = b"encrypted identity package"
+        result = adapter.store_content(
+            payload,
+            storage_tier=StorageTier.LOCAL_ONLY,
+            encrypt=True,
+        )
+
+        assert adapter.retrieve_content(
+            result.content_hash,
+            key_hash=result.encryption_key_hash,
+            max_output_bytes=len(payload),
+        ) == payload
+        with pytest.raises(ContentRetrievalLimitError, match="output limit"):
+            adapter.retrieve_content(
+                result.content_hash,
+                key_hash=result.encryption_key_hash,
+                max_output_bytes=len(payload) - 1,
+            )
 
 
 # ---------------------------------------------------------------------------
