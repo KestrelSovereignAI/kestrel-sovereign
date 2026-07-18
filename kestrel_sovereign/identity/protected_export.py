@@ -27,6 +27,11 @@ from typing import Iterable, Mapping, Sequence
 
 IDENTITY_EXPORT_PATTERN = "identity_*.json"
 IDENTITY_EXPORT_DIR_ENV = "KESTREL_IDENTITY_EXPORT_DIR"
+_IDENTITY_EXPORT_PATH_ENV_VARS = (
+    IDENTITY_EXPORT_DIR_ENV,
+    "KESTREL_DATA_DIR",
+    "AGENT_DATA_DIR",
+)
 _TEMP_PREFIX = ".identity-export-"
 _TEMP_SUFFIX = ".tmp"
 
@@ -125,6 +130,48 @@ def configured_identity_export_roots(
             roots.append(absolute)
             seen.add(key)
     return tuple(roots)
+
+
+def effective_identity_export_roots(
+    project_dir: Path | str,
+    *,
+    process_env: Mapping[str, str] | None = None,
+    additional_roots: Iterable[Path | str] = (),
+) -> tuple[Path, ...]:
+    """Resolve the roots used by identity-export diagnostics and hardening.
+
+    The target project's ``.env`` is read first, then relevant values from the
+    live process environment replace it.  This matches runtime
+    ``load_dotenv(override=False)`` semantics: an exported variable is
+    authoritative even when its value is empty.  Only identity-placement
+    variables are copied into the effective mapping, so unrelated credentials
+    and package contents never enter this diagnostic boundary.
+
+    Doctor and ``identity harden-exports`` intentionally share this entry
+    point.  Relative values are resolved by
+    :func:`configured_identity_export_roots` against the same absolute project
+    directory in both paths.
+    """
+
+    from kestrel_sovereign.setup.env_file import read_env
+
+    base = _absolute_path(project_dir)
+    dotenv_env = read_env(base / ".env")
+    live_env = os.environ if process_env is None else process_env
+    effective_env = {
+        name: dotenv_env[name]
+        for name in _IDENTITY_EXPORT_PATH_ENV_VARS
+        if name in dotenv_env
+    }
+    for name in _IDENTITY_EXPORT_PATH_ENV_VARS:
+        if name in live_env:
+            effective_env[name] = live_env[name]
+
+    return configured_identity_export_roots(
+        base,
+        env=effective_env,
+        additional_roots=additional_roots,
+    )
 
 
 def _configured_agent_export_roots(project_dir: Path) -> tuple[Path, ...]:
@@ -730,6 +777,7 @@ __all__ = [
     "LegacyIdentityExportHardeningResult",
     "audit_legacy_identity_exports",
     "configured_identity_export_roots",
+    "effective_identity_export_roots",
     "harden_legacy_identity_exports",
     "identity_export_directory",
     "write_protected_identity_export",

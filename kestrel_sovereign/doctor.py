@@ -36,7 +36,7 @@ from pathlib import Path
 from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.identity.protected_export import (
     audit_legacy_identity_exports,
-    configured_identity_export_roots,
+    effective_identity_export_roots,
 )
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig
 from kestrel_sovereign.setup.env_file import read_env
@@ -74,19 +74,18 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_llm(config, env, toml_path, report)
     _check_multi_agent(multi_agent_path, project_dir, report)
     _check_constitution_drift(multi_agent_path, project_dir, report)
-    _check_legacy_identity_exports(project_dir, env, report)
+    _check_legacy_identity_exports(project_dir, report)
 
     return report
 
 
 def _check_legacy_identity_exports(
     project_dir: Path,
-    env: dict,
     report: DoctorReport,
 ) -> None:
     """Report unsafe legacy exports without reading sensitive package bytes."""
 
-    roots = configured_identity_export_roots(project_dir, env=env)
+    roots = effective_identity_export_roots(project_dir)
     findings = audit_legacy_identity_exports(roots)
     if not findings:
         return
