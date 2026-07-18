@@ -202,12 +202,19 @@ class AgentManager:
         """Publish one fully initialized agent to the co-hosted fleet."""
         self._agents[name] = agent
         self._agent_names[agent.agent_id] = name
-        # Expose the human display name on the agent object itself so the
+        # Publish the registered routing key as the human display name so the
         # observability emitter (and any other consumer) attributes events to
         # the real agent name instead of falling back to "unknown" (#2461).
-        # `agent_name` is a plain instance attribute — unlike `agent_id`/`did`,
-        # which are properties — so a direct set is safe.
-        agent.agent_name = name
+        # This is the authoritative override: ``KestrelAgent.__init__`` and
+        # ``initialize()`` already stamp progressively better floors (#2602), and
+        # ``_set_display_name`` also mirrors the name onto the owning LLMService
+        # so LLM-call spans carry ``kestrel.agent_name`` (#2573). Guarded via
+        # ``getattr`` because a few unit-test doubles stand in for a real agent.
+        setter = getattr(agent, "_set_display_name", None)
+        if callable(setter):
+            setter(name)
+        else:
+            agent.agent_name = name
         # Fleet-idleness (#F235): give EVERY agent — including ones created or
         # spawned after startup — a live view of all co-hosted agents, so
         # RestartCoordinator can gate a whole-host restart on the whole fleet
