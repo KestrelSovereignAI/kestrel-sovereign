@@ -262,6 +262,7 @@ jobs:
         env:
           GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
           KESTREL_ALLOWED_EMAILS: ${{ secrets.KESTREL_ALLOWED_EMAILS }}
+          KESTREL_PROD_EXPECTED_DID: ${{ secrets.KESTREL_PROD_EXPECTED_DID }}
         run: uv run kestrel deploy prod --tag ${{ needs.build.outputs.tag }}
 
       - name: Show prod URL

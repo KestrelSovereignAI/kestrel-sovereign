@@ -71,5 +71,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
-# Bootstrap identity on first start, then run uvicorn
+# Restore durable identity or bootstrap an explicit disposable demo, then serve
 CMD ["/app/docker/cloudrun_entrypoint.sh"]

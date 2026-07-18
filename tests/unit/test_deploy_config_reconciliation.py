@@ -162,15 +162,16 @@ def test_dev_profile_uses_multi_agent_image(live_config):
 
 
 def test_prod_profile_has_bash_parity_secrets(live_config):
-    """``[profiles.prod.secrets]`` must cover the OAuth secrets the
-    legacy ``deploy_prod.sh`` set."""
+    """Prod keeps OAuth secrets and adds pinned durable custody."""
     manager = DeployManager(config=live_config)
     prod = manager.get_profile("prod")
 
     expected = {
         "OPENAI_API_KEY",
         "KESTREL_API_KEY",
+        "KESTREL_DATABASE_URL",
         "KESTREL_DATA_KEY",
+        "KESTREL_IDENTITY_BUNDLE",
         "GOOGLE_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET",
         "KESTREL_SESSION_SECRET",
@@ -185,10 +186,7 @@ def test_prod_profile_has_bash_parity_secrets(live_config):
 
 
 def test_prod_profile_has_bash_parity_env_vars(live_config):
-    """``[profiles.prod.env_vars]`` must include ``KESTREL_MULTI_AGENT``,
-    ``KESTREL_REQUIRE_OAUTH``, and ``KESTREL_ALLOWED_EMAILS`` —
-    enabling the multi-agent host inside the single-agent image (the
-    legacy ``deploy_prod.sh`` shape)."""
+    """Prod declares the durable single-agent runtime contract."""
     manager = DeployManager(config=live_config)
     prod = manager.get_profile("prod")
 
@@ -196,7 +194,8 @@ def test_prod_profile_has_bash_parity_env_vars(live_config):
         "KESTREL_ENV",
         "KESTREL_DB_BACKEND",
         "KESTREL_DB_PATH",
-        "KESTREL_MULTI_AGENT",
+        "KESTREL_DEPLOYMENT_PERSISTENCE",
+        "KESTREL_EXPECTED_DID",
         "KESTREL_REQUIRE_OAUTH",
         "KESTREL_ALLOWED_EMAILS",
     }
@@ -207,19 +206,19 @@ def test_prod_profile_has_bash_parity_env_vars(live_config):
         f"[profiles.prod.env_vars] missing keys vs legacy "
         f"scripts/cloudrun/deploy_prod.sh: {sorted(missing)}."
     )
+    assert "KESTREL_MULTI_AGENT" not in actual
+    assert prod.env_vars["KESTREL_DB_BACKEND"] == "postgres"
 
 
 def test_prod_profile_uses_single_agent_image(live_config):
-    """Prod uses the single-agent ``kestrel`` image (matches deploy_prod.sh
-    IMAGE_NAME=kestrel) but runs the host via ``KESTREL_MULTI_AGENT=true``
-    in env."""
+    """Durable prod uses the single-agent ``kestrel`` image."""
     manager = DeployManager(config=live_config)
     prod = manager.get_profile("prod")
 
     assert not prod.is_multi_agent, (
         "deploy_config.toml [profiles.prod] must NOT set "
-        "deployment_mode = \"multi_agent\" — prod uses the single-agent "
-        "kestrel image with KESTREL_MULTI_AGENT=true in env."
+        "deployment_mode = \"multi_agent\" — durable multi-agent custody "
+        "is not implemented."
     )
 
     ref = manager.build_image_reference("prod", "v1.2.3")
@@ -274,6 +273,91 @@ def test_all_cloudrun_profiles_target_same_provider(live_config):
             f"[profiles.{name}] must use provider = \"cloudrun\"; got "
             f"{profile.provider}."
         )
+
+
+def test_cloudrun_profiles_declare_honest_persistence(live_config):
+    """Live Cloud Run profiles cannot imply durable local container state."""
+    from kestrel_sovereign.features.deploy.persistence import (
+        validate_cloudrun_persistence,
+    )
+    from kestrel_sovereign.features.deploy.models import DeployManagerError
+
+    manager = DeployManager(config=live_config)
+    for name in ("dev", "multi-agent-dev"):
+        profile = manager.get_profile(name)
+        assert profile.is_ephemeral_demo
+        assert profile.max_instances == 1
+        validate_cloudrun_persistence(profile)
+
+    prod = manager.get_profile("prod")
+    assert prod.is_durable_sovereign
+    assert prod.env_vars["KESTREL_DB_BACKEND"] == "postgres"
+    assert not prod.is_multi_agent
+    for key in (
+        "KESTREL_DATABASE_URL",
+        "KESTREL_DATA_KEY",
+        "KESTREL_IDENTITY_BUNDLE",
+    ):
+        name, version = prod.secrets[key].rsplit(":", 1)
+        assert name
+        assert version.isdigit(), f"{key} must use an immutable numeric version"
+
+    # The checked-in value is an operator placeholder until deploy time.
+    assert prod.env_vars["KESTREL_EXPECTED_DID"] == "${KESTREL_PROD_EXPECTED_DID}"
+
+    multi_prod = manager.get_profile("multi-agent-prod")
+    with pytest.raises(DeployManagerError, match="single-agent profiles only"):
+        validate_cloudrun_persistence(multi_prod)
+
+
+@pytest.mark.asyncio
+async def test_prod_deploy_accepts_resolved_durable_custody(
+    live_config, monkeypatch
+):
+    """A resolved DID plus pinned custody reaches the provider offline."""
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "ops@example.com")
+    monkeypatch.setenv(
+        "KESTREL_PROD_EXPECTED_DID",
+        "did:web:agents.kestrelsovereign.com:kestrel",
+    )
+    manager = DeployManager(config=live_config)
+    stub = _install_offline_stubs(manager, monkeypatch)
+
+    result = await manager.deploy_profile("prod", tag="v1.2.3")
+
+    assert result["success"] is True
+    assert len(stub.deploy_calls) == 1
+    deployed = stub.deploy_calls[0]["profile"]
+    assert deployed.env_vars["KESTREL_EXPECTED_DID"].startswith("did:web:")
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_unsafe_local_cloudrun_before_provider(monkeypatch):
+    """Manager-level deployment fails before a disposable profile is sent."""
+    config = {
+        "manager": {"gcp_project_id": "test-project"},
+        "profiles": {
+            "unsafe": {
+                "provider": "cloudrun",
+                "service_name": "unsafe-prod",
+                "region": "us-central1",
+                "min_instances": 1,
+                "max_instances": 10,
+                "env_vars": {
+                    "KESTREL_ENV": "production",
+                    "KESTREL_DB_BACKEND": "sqlite",
+                },
+            }
+        },
+    }
+    manager = DeployManager(config=config)
+    stub = _install_offline_stubs(manager, monkeypatch)
+
+    result = await manager.deploy_profile("unsafe", tag="immutable")
+
+    assert result["success"] is False
+    assert "explicitly set persistence_mode" in result["error"]
+    assert stub.deploy_calls == []
 
 
 def test_kestrel_allowed_emails_expansion(live_config, monkeypatch):

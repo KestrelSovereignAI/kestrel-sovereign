@@ -50,6 +50,112 @@ Required:
 - `KESTREL_ALLOWED_EMAILS` — comma-separated list of authorized Google accounts; expanded into `[profiles.*.env_vars]` via `${KESTREL_ALLOWED_EMAILS}` placeholders.
 - `GITHUB_TOKEN` (build only) — env-first, falls back to `gh auth token`. Needed for Dockerfiles that install private deps.
 
+Production also requires `KESTREL_PROD_EXPECTED_DID`. It is the exact active
+signing DID provisioned during the custody ceremony below; the deploy manager
+rejects an unset, unresolved, or non-DID value.
+
+## Cloud Run identity and state lifetime
+
+Cloud Run's writable filesystem is in-memory and disposable: files written by
+one instance do not survive that instance and are not shared with another
+instance. Kestrel profiles therefore declare one of two explicit contracts:
+
+| Mode | Allowed use | Identity and state |
+|---|---|---|
+| `ephemeral_demo` | Development/test only, exactly one maximum instance | May mint a new test/demo DID after a cold start; SQLite and memory are intentionally disposable |
+| `durable_sovereign` | Single-agent production | Restores one encrypted, pinned identity bundle; PostgreSQL is the authoritative store for DID, constitution anchor, audit records, and memory |
+
+The checked-in `dev` and `multi-agent-dev` profiles are explicit ephemeral
+demos and cap `max_instances` at 1. They are not sovereign production
+deployments. `prod` is durable and may scale horizontally because every
+instance restores the same cryptographically verified signing identity and
+uses the same transactional PostgreSQL database. `multi-agent-prod` is
+intentionally refused until Kestrel can bind a separate custody bundle and
+database identity to every hosted agent.
+
+Do not put SQLite on a Cloud Storage mount. Object storage does not provide the
+filesystem locking/transaction semantics SQLite requires. See Google's
+[Cloud Run runtime contract](https://docs.cloud.google.com/run/docs/container-contract),
+[Cloud Run limits](https://docs.cloud.google.com/run/quotas), and
+[Secret Manager integration](https://docs.cloud.google.com/run/docs/configuring/services/secrets).
+
+### Production custody ceremony
+
+Perform this from an isolated operator host against a new, dedicated
+PostgreSQL database. Keep the output directory and bundle outside the source
+tree. The same `KESTREL_DATA_KEY` must protect the identity at ceremony and at
+runtime.
+
+```bash
+export KESTREL_DATABASE_URL='postgresql://...'
+export KESTREL_DATA_KEY='...'
+export KESTREL_DID_WEB_DOMAIN='agents.kestrelsovereign.com'
+export KESTREL_CEREMONY_DIR="$(mktemp -d)"
+
+uv run python - <<'PY'
+import asyncio
+import os
+
+from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+async def provision():
+    db = await AsyncDatabase.postgres(os.environ["KESTREL_DATABASE_URL"])
+    try:
+        credentials = await create_kestrel_identity_async(
+            output_dir=os.environ["KESTREL_CEREMONY_DIR"],
+            database=db,
+            agent_name="Kestrel Production",
+            did_web_slug="kestrel",
+        )
+        print(credentials.agent_did)
+    finally:
+        await db.close()
+
+asyncio.run(provision())
+PY
+
+# Set this to the DID printed above. The bundle command verifies the encrypted
+# private keys against that DID before exporting anything.
+export KESTREL_PROD_EXPECTED_DID='did:web:agents.kestrelsovereign.com:kestrel'
+uv run python -m kestrel_sovereign.identity.custody_bundle create \
+  --agent-dir "$KESTREL_CEREMONY_DIR" \
+  --expected-did "$KESTREL_PROD_EXPECTED_DID" \
+  --output "$KESTREL_CEREMONY_DIR/custody.json"
+```
+
+Upload the database URL, data key, and `custody.json` as separate Secret
+Manager secrets. Grant the Cloud Run runtime service account
+`roles/secretmanager.secretAccessor` only on those required secrets. Secret
+Manager access is visible in Cloud Audit Logs; never print the bundle/data key
+or bake either into an image. The three custody references in
+`deploy_config.toml` must use immutable numeric versions such as `:7`, never
+`:latest`: two instances in one revision must not resolve different keys or
+bundles. Cloud Run environment values have a 32 KiB limit, which the bundle
+export enforces.
+
+After adding a new secret version, update all three numeric references and
+deploy a new immutable image tag. A revision whose database, data key, bundle,
+or expected DID is missing/mismatched fails startup and never re-incepts.
+
+### Continuity and recovery check
+
+Before shifting traffic, record the DID, both active verification methods,
+the PostgreSQL agent node's `constitution_hash`, and a non-sensitive sentinel
+memory. Then:
+
+1. Start more than one instance and send concurrent requests.
+2. Roll a new revision and allow the old instances to terminate.
+3. Confirm every response uses the recorded DID and verification methods.
+4. Confirm the constitution hash and sentinel memory are unchanged.
+5. Remove custody access from a canary revision and confirm that revision
+   fails readiness instead of minting a replacement DID.
+
+Recovery means restoring the exact pinned database, identity bundle, and data
+key versions, then redeploying with the recorded expected DID. If any one of
+those artifacts is unavailable, stop: creating a new identity is replacement,
+not recovery.
+
 ## Typical dev deploy flow
 
 ```bash
