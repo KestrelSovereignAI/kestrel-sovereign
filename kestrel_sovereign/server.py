@@ -4,6 +4,7 @@ A FastAPI server to expose Kestrel agent functionality as a service.
 """
 import os
 import secrets
+from datetime import datetime
 from typing import Optional
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, Security, status
@@ -205,6 +206,55 @@ def _identity_readiness_failure_record(
         "cause_type": error.cause_type,
         "error": str(error),
     }
+
+
+def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
+    """Return a public-safe readiness record for a restricted agent."""
+    safe_mode = getattr(agent, "_safe_mode", False) is True
+    audit_pending = getattr(agent, "_constitution_audit_pending", False) is True
+    if not safe_mode and not audit_pending:
+        return None
+    record = {
+        "agent": agent_name,
+        "state": "safe_mode" if safe_mode else "audit_pending",
+        "error_code": (
+            "constitution_safe_mode"
+            if safe_mode
+            else "constitution_audit_pending"
+        ),
+    }
+    entered_at = getattr(agent, "_safe_mode_entered_at", None)
+    if isinstance(entered_at, datetime):
+        record["entered_at"] = entered_at.isoformat()
+    if audit_pending and not safe_mode:
+        record["failure"] = "startup_audit_required"
+    elif getattr(agent, "_constitution_state_load_error", None):
+        record["failure"] = "state_unavailable"
+    else:
+        record["failure"] = "integrity_restriction"
+    return record
+
+
+def _constitution_safe_mode_records(agent, manager) -> list[dict]:
+    """Collect restricted agents without leaking stored integrity reasons."""
+    records: list[dict] = []
+    seen: set[int] = set()
+    if agent is not None:
+        seen.add(id(agent))
+        record = _constitution_safe_mode_record(
+            getattr(agent, "_agent_name", None) or "default", agent
+        )
+        if record is not None:
+            records.append(record)
+    if manager is not None:
+        for name, managed_agent in manager.list_agents().items():
+            if id(managed_agent) in seen:
+                continue
+            seen.add(id(managed_agent))
+            record = _constitution_safe_mode_record(name, managed_agent)
+            if record is not None:
+                records.append(record)
+    return records
 
 
 def _oauth_required() -> bool:
@@ -1481,19 +1531,26 @@ def health_check(request: Request):
         "identity_readiness_failures",
         [],
     )
-    if mandatory_failures or identity_failures:
-        manager = getattr(request.app.state, 'agent_manager', None)
+    manager = getattr(request.app.state, 'agent_manager', None)
+    constitution_safe_mode = _constitution_safe_mode_records(agent, manager)
+    if mandatory_failures or identity_failures or constitution_safe_mode:
         any_initialized = bool(agent) or bool(
             manager and manager.list_agents()
         )
         content = {
-            "status": "unhealthy",
+            "status": (
+                "unhealthy"
+                if mandatory_failures or identity_failures
+                else "restricted"
+            ),
             "agent_initialized": any_initialized,
         }
         if mandatory_failures:
             content["mandatory_feature_failures"] = mandatory_failures
         if identity_failures:
             content["identity_readiness_failures"] = identity_failures
+        if constitution_safe_mode:
+            content["constitution_safe_mode"] = constitution_safe_mode
         return JSONResponse(
             status_code=503,
             content=content,
@@ -1506,7 +1563,6 @@ def health_check(request: Request):
             payload["llm_reachability"] = reachability
         return payload
     # In multi-agent mode, check if any agents are loaded
-    manager = getattr(request.app.state, 'agent_manager', None)
     if manager and manager.list_agents():
         return {"status": "ok", "agent_initialized": True}
     payload = {"status": "unhealthy" if startup_error else "degraded", "agent_initialized": False}
@@ -1523,6 +1579,17 @@ async def health_detailed(request: Request):
     memory system, disk space, and context budget.
     """
     agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
+    manager = getattr(request.app.state, "agent_manager", None)
+    safe_mode_records = _constitution_safe_mode_records(agent, manager)
+    if safe_mode_records:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "restricted",
+                "constitution_safe_mode": safe_mode_records,
+                "checks": [],
+            },
+        )
     if not agent:
         return {"status": "unhealthy", "error": "No agent available", "checks": []}
 

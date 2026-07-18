@@ -419,9 +419,60 @@ class CommandHandler:
     
     async def _cmd_verify_constitution(self, user_input: str) -> str:
         """Handle !verify-constitution command."""
+        runner = getattr(
+            self.agent, "_run_explicit_constitution_audit", None
+        )
+        if inspect.ismethod(runner):
+            is_valid, message, recorded = await runner()
+            if is_valid is None:
+                return (
+                    "🚨 Constitution verification could not start because its "
+                    "durable audit marker was unavailable. Agent remains in "
+                    "SAFE MODE."
+                )
+            if is_valid and not recorded:
+                return (
+                    "🚨 Constitution verified, but the durable audit state "
+                    "could not be recorded. Agent remains in SAFE MODE."
+                )
+            if is_valid:
+                return f"✅ {message}"
+            return (
+                f"🚨 {message}\n\nAgent has entered SAFE MODE. "
+                "Contact administrator."
+            )
+
+        # Compatibility path for lightweight command-handler test doubles that
+        # expose the older individual methods rather than the real agent's
+        # serialized audit runner.
+        starter = getattr(
+            self.agent, "_begin_explicit_constitution_audit", None
+        )
+        if starter is not None:
+            started = starter()
+            if inspect.isawaitable(started):
+                started = await started
+            if started is False:
+                return (
+                    "🚨 Constitution verification could not start because its "
+                    "durable audit marker was unavailable. Agent remains in "
+                    "SAFE MODE."
+                )
         is_valid, message = await self.agent._verify_constitution_integrity()
         self.agent._constitution_verified = is_valid
         if is_valid:
+            recorder = getattr(
+                self.agent, "_record_successful_constitution_audit", None
+            )
+            if recorder is not None:
+                recorded = recorder(source="explicit_verification")
+                if inspect.isawaitable(recorded):
+                    recorded = await recorded
+                if recorded is False:
+                    return (
+                        "🚨 Constitution verified, but the durable audit state "
+                        "could not be recorded. Agent remains in SAFE MODE."
+                    )
             return f"✅ {message}"
         else:
             await self.agent.enter_safe_mode(message)
@@ -447,14 +498,19 @@ class CommandHandler:
             return f"🚨 {result}"
         return f"✅ {result}"
 
-    def _cmd_safe_mode(self, user_input: str) -> str:
+    async def _cmd_safe_mode(self, user_input: str) -> str:
         """Handle !safe-mode command."""
         parts = user_input.split()
         if len(parts) > 1 and parts[1].lower() == "exit":
             # Caller identity already verified by SOVEREIGN_COMMANDS gate in handle()
-            return self.agent.exit_safe_mode(authorization="sovereign_api_key")
+            result = self.agent.exit_safe_mode(authorization="sovereign_api_key")
+            if inspect.isawaitable(result):
+                return await result
+            return result
         if self.agent._safe_mode:
             return "🚨 SAFE MODE ACTIVE: Agent functionality restricted due to integrity failure."
+        if getattr(self.agent, "_constitution_audit_pending", False):
+            return "🚨 STARTUP AUDIT PENDING: Normal cognition remains restricted."
         return "✅ Normal operation mode. No integrity issues detected."
     
     # !constitution command now handled by ConstitutionFeature via tool registry

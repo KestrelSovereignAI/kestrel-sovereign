@@ -649,6 +649,11 @@ class KestrelAgent(
         # in `process_input`/`process_input_streaming` — registered signal
         # sources are forbidden from declaring it (registry enforces).
         self._lock_manager = OrderedLockManager()
+        # Serializes constitutional deadline increments/audits. The durable
+        # store itself is initialized after the primary DB connects.
+        self._constitution_state_lock = asyncio.Lock()
+        self._constitution_state_lock_owner = None
+        self._constitution_state_store = None
 
         # Session state
         self._session_briefed = False
@@ -1054,6 +1059,33 @@ class KestrelAgent(
             # Wrap storage with privacy-enforcing layer
             self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
+            # Distinguish a genuinely new identity from a legacy identity that
+            # merely lacks the new runtime-state row. Only a genuine first boot
+            # may establish its initial constitution anchor automatically; a
+            # lookup failure is treated as existing/unknown and therefore
+            # follows the fail-closed migration path.
+            early_agent_node = None
+            identity_lookup_succeeded = False
+            try:
+                early_agent_node = await self.storage.get_node(self.agent_id)
+                identity_lookup_succeeded = True
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "Could not load agent identity node for sync policy: %s",
+                    exc,
+                )
+
+            # Safe Mode and periodic-audit deadlines are authoritative runtime
+            # state. Restore them before features can emit startup cognition or
+            # the server can report readiness. Legacy agents receive a due-now
+            # migration record; the full verification runs later in this same
+            # initialize call, after feature/spawn constraints are available.
+            await self._initialize_constitution_runtime_state(
+                is_new_identity=(
+                    identity_lookup_succeeded and early_agent_node is None
+                )
+            )
+
             # #2290 — re-apply any previously-verified shared embedding-space
             # pins from the persisted parity record. ``_verified_space_pins`` is
             # process-local, so without this a restart would silently drop the
@@ -1069,11 +1101,6 @@ class KestrelAgent(
             except Exception as exc:  # noqa: BLE001
                 logging.debug("Embedding-space pin hydration skipped: %s", exc)
 
-            early_agent_node = None
-            try:
-                early_agent_node = await self.storage.get_node(self.agent_id)
-            except Exception as exc:  # noqa: BLE001
-                logging.warning("Could not load agent identity node for sync policy: %s", exc)
             if early_agent_node is not None:
                 self._is_test_instance = bool(
                     early_agent_node.properties.get("is_test_instance", False)
@@ -1658,7 +1685,6 @@ class KestrelAgent(
             self.conversations = {}
             self.extension = None
             self._session_briefed = False
-            self._safe_mode = False
             self._constitution_verified = False
             logging.info("State initialized")
 
@@ -1687,6 +1713,12 @@ class KestrelAgent(
                 )
                 await self.storage.add_node(agent_node)
                 logging.info("Agent node created")
+
+            # A missing durable row or an audit older than 24 hours must be
+            # resolved before initialize() can make this agent visible as
+            # ready. A failure enters durable Safe Mode; a success advances the
+            # deadline but never auto-clears an already-restored Safe Mode.
+            await self._audit_constitution_on_startup()
 
             # Load prompts from external files (fallback to embedded defaults)
             self.prompt_template = _load_prompt_file(
@@ -2970,8 +3002,14 @@ Expected Duration: {expected_duration}
         # USER_BYOK: Refresh LLM resolver with per-request passphrase
         await self._maybe_refresh_user_byok_resolver(user_passphrase)
 
-        # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands
-        if self._safe_mode:
+        # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands.
+        # ``process_input`` can receive a restart signal while initialize() is
+        # still constructing the agent, so absent flags are not restrictions.
+        safe_mode = getattr(self, "_safe_mode", False) is True
+        audit_pending = (
+            getattr(self, "_constitution_audit_pending", False) is True
+        )
+        if safe_mode or audit_pending:
             safe_mode_commands = ["!safe-mode", "!verify-constitution", "!reanchor-constitution", "!status", "!help"]
             if user_input.startswith("!"):
                 cmd = user_input.split()[0]
@@ -2983,9 +3021,14 @@ Expected Duration: {expected_duration}
                         "Please contact your administrator to resolve the integrity issue."
                     )
             else:
+                restriction = (
+                    "a required startup integrity audit"
+                    if audit_pending
+                    else "an integrity failure"
+                )
                 return (
                     "🚨 SAFE MODE ACTIVE\\n\\n"
-                    "The agent cannot process queries due to an integrity failure.\\n"
+                    f"The agent cannot process queries due to {restriction}.\\n"
                     "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
                     "Normal operation will resume once integrity is restored."
                 )

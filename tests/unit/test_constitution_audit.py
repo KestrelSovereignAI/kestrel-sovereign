@@ -258,6 +258,447 @@ async def test_audit_lazy_initialization():
 
 
 # ---------------------------------------------------------------------------
+# Durable constitutional runtime state (#2464)
+# ---------------------------------------------------------------------------
+
+
+class _DurableConstitutionHarness:
+    """Small real-mixin harness backed by the production SQLite store."""
+
+    AUDIT_INTERVAL = KestrelAgent.AUDIT_INTERVAL
+
+    def __init__(self, storage, now: datetime):
+        from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+        self.agent_id = "did:web:test:durable-constitution"
+        self._raw_storage = storage
+        self._constitution_clock = lambda: now
+        self._safe_mode = False
+        self._constitution_state_store = None
+        self._constitution_state_lock = asyncio.Lock()
+        self.features = {}
+        self.privacy_agent = MagicMock()
+        self.privacy_agent.add_conversation = AsyncMock()
+        ConstitutionMixin._init_constitution_audit_tracking(self)
+
+    def _get_timestamp(self):
+        return self._constitution_clock().isoformat()
+
+    _constitution_now = KestrelAgent._constitution_now
+    _constitution_epoch = staticmethod(KestrelAgent._constitution_epoch)
+    _constitution_state_snapshot = KestrelAgent._constitution_state_snapshot
+    _initialize_constitution_runtime_state = (
+        KestrelAgent._initialize_constitution_runtime_state
+    )
+    _mark_constitution_state_unavailable = (
+        KestrelAgent._mark_constitution_state_unavailable
+    )
+    _persist_constitution_runtime_state = (
+        KestrelAgent._persist_constitution_runtime_state
+    )
+    _record_successful_constitution_audit = (
+        KestrelAgent._record_successful_constitution_audit
+    )
+    _begin_explicit_constitution_audit = (
+        KestrelAgent._begin_explicit_constitution_audit
+    )
+    _run_explicit_constitution_audit = (
+        KestrelAgent._run_explicit_constitution_audit
+    )
+    _audit_constitution_on_startup = KestrelAgent._audit_constitution_on_startup
+    _maybe_audit = KestrelAgent._maybe_audit
+    _maybe_audit_locked = KestrelAgent._maybe_audit_locked
+    enter_safe_mode = KestrelAgent.enter_safe_mode
+    exit_safe_mode = KestrelAgent.exit_safe_mode
+
+
+async def _open_durable_harness(db_path, now, *, is_new_identity=False):
+    from kestrel_sovereign.storage import AsyncStorage
+
+    storage = AsyncStorage(str(db_path))
+    await storage.initialize()
+    harness = _DurableConstitutionHarness(storage, now)
+    await harness._initialize_constitution_runtime_state(
+        is_new_identity=is_new_identity
+    )
+    return harness, storage
+
+
+@pytest.mark.asyncio
+async def test_preinitialization_safe_mode_entry_is_buffered_then_persisted(tmp_path):
+    """A startup signal cannot fall through the DB-connect timing window."""
+    from kestrel_sovereign.storage import AsyncStorage
+
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "agent.db"))
+    await storage.initialize()
+    agent = _DurableConstitutionHarness(storage, now)
+
+    await agent.enter_safe_mode("pre-initialization integrity failure")
+    assert agent._safe_mode is True
+    assert agent._constitution_state_persistence_pending is True
+
+    await agent._initialize_constitution_runtime_state()
+    try:
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert persisted.safe_mode is True
+        assert persisted.safe_mode_reason == "pre-initialization integrity failure"
+        assert agent._constitution_state_persistence_pending is False
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_audit_is_one_serialized_durable_transition(tmp_path):
+    from kestrel_sovereign.command_handler import CommandHandler
+
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(tmp_path / "agent.db", now)
+    agent._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+    try:
+        result = await CommandHandler(agent).handle("!verify-constitution")
+        assert result == "✅ Constitution integrity verified"
+        assert agent._interaction_count == 0
+        events = await agent._constitution_state_store.list_events(agent.agent_id)
+        assert [event["event_type"] for event in events[-2:]] == [
+            "audit_started",
+            "audit_succeeded",
+        ]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
+    """Integrity failure -> close/reopen -> normal cognition stays blocked."""
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(db_path, now)
+    await first._record_successful_constitution_audit(source="test", audited_at=now)
+    await first.enter_safe_mode("governing bytes changed")
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(
+        db_path, now + timedelta(minutes=5)
+    )
+    try:
+        assert restarted._safe_mode is True
+        assert restarted._safe_mode_reason == "governing bytes changed"
+        assert restarted._safe_mode_entered_at == now
+
+        # Exercise the production process-input boundary up to its Safe Mode
+        # return. No context manager/LLM exists on this harness, proving it did
+        # not get past the restriction.
+        restarted._maybe_refresh_user_byok_resolver = AsyncMock()
+        response = await KestrelAgent.process_input(restarted, "normal prompt")
+        assert "SAFE MODE ACTIVE" in response
+        restarted._maybe_refresh_user_byok_resolver.assert_awaited_once()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("safe_mode", "audit_pending", "expected_reason"),
+    [
+        (True, False, "integrity failure"),
+        (False, True, "required startup integrity audit"),
+    ],
+)
+async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
+    safe_mode, audit_pending, expected_reason
+):
+    """The primary streamed chat path must not bypass restored restriction."""
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    agent = MagicMock()
+    agent._safe_mode = safe_mode
+    agent._constitution_audit_pending = audit_pending
+    agent._maybe_audit = AsyncMock()
+    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
+        agent
+    )
+
+    chunks = [chunk async for chunk in agent.process_input_streaming("normal prompt")]
+
+    assert len(chunks) == 1
+    assert "SAFE MODE ACTIVE" in chunks[0]
+    assert expected_reason in chunks[0]
+    agent._maybe_audit.assert_awaited_once()
+    agent._turn_lifecycle.assert_not_called()
+    agent._process_input_streaming_traced_locked.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_authorized_verified_exit_is_durable_and_audited(tmp_path):
+    """Recovery writes state + authorization atomically and survives restart."""
+    db_path = tmp_path / "agent.db"
+    entered_at = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(db_path, entered_at)
+    await first.enter_safe_mode("integrity failure")
+    first._constitution_clock = lambda: entered_at + timedelta(minutes=10)
+    first._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+
+    result = await first.exit_safe_mode(authorization="sovereign_api_key")
+    assert "deactivated" in result
+    assert first._safe_mode is False
+    first._verify_constitution_integrity.assert_awaited_once()
+    events = await first._constitution_state_store.list_events(first.agent_id)
+    assert events[-1]["event_type"] == "safe_mode_exited"
+    assert events[-1]["authorization"] == "sovereign_api_key"
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(
+        db_path, entered_at + timedelta(minutes=20)
+    )
+    try:
+        assert restarted._safe_mode is False
+        assert restarted._safe_mode_exit_authorization == "sovereign_api_key"
+        assert restarted._last_audit_time == entered_at + timedelta(minutes=10)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_verified_exit_completes_bootstrap_and_latches_later_deletion(
+    tmp_path,
+):
+    """Recovery cannot leave bootstrap authority reusable after verification."""
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(
+        db_path, now, is_new_identity=True
+    )
+    await first.enter_safe_mode("first bootstrap verification failed")
+    first._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+
+    result = await first.exit_safe_mode(authorization="sovereign_api_key")
+    assert "deactivated" in result
+    assert first._constitution_bootstrap_pending is False
+    persisted = await first._constitution_state_store.load(first.agent_id)
+    assert persisted.bootstrap_pending is False
+    await storage.close()
+
+    # A missing identity node after that completed recovery is deletion, not a
+    # resumable first boot, and must durably re-enter Safe Mode.
+    restarted, storage = await _open_durable_harness(
+        db_path, now + timedelta(minutes=1), is_new_identity=True
+    )
+    try:
+        assert restarted._safe_mode is True
+        assert restarted._safe_mode_reason == (
+            "Agent identity node missing during constitutional restore"
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exit_refuses_to_clear_durable_safe_mode_when_audit_fails(tmp_path):
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(db_path, now)
+    await first.enter_safe_mode("integrity failure")
+    first._verify_constitution_integrity = AsyncMock(
+        return_value=(False, "still modified")
+    )
+
+    result = await first.exit_safe_mode(authorization="sovereign_api_key")
+    assert "remains active" in result
+    assert first._safe_mode is True
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(db_path, now)
+    try:
+        assert restarted._safe_mode is True
+        assert "still modified" in restarted._safe_mode_reason
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_overdue_audit_remains_due_across_restart_with_injected_clock(tmp_path):
+    """No sleeps: a 25-hour-old success triggers a startup full audit."""
+    db_path = tmp_path / "agent.db"
+    last_success = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(db_path, last_success)
+    await first._record_successful_constitution_audit(
+        source="test", audited_at=last_success
+    )
+    await storage.close()
+
+    restart_time = last_success + timedelta(hours=25)
+    restarted, storage = await _open_durable_harness(db_path, restart_time)
+    restarted._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+    try:
+        await restarted._audit_constitution_on_startup()
+        restarted._verify_constitution_integrity.assert_awaited_once()
+        assert restarted._last_audit_time == restart_time
+        assert restarted._interaction_count == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_interaction_deadline_survives_restart_and_audits_next_turn(tmp_path):
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(db_path, now)
+    await first._record_successful_constitution_audit(source="test", audited_at=now)
+    first._interaction_count = first.AUDIT_INTERVAL - 1
+    await first._persist_constitution_runtime_state(now=now)
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(db_path, now)
+    restarted._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+    try:
+        await restarted._maybe_audit()
+        restarted._verify_constitution_integrity.assert_awaited_once()
+        assert restarted._interaction_count == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_audit_never_advances_last_successful_deadline(tmp_path):
+    db_path = tmp_path / "agent.db"
+    last_success = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    now = last_success + timedelta(hours=1)
+    first, storage = await _open_durable_harness(db_path, now)
+    await first._record_successful_constitution_audit(
+        source="test", audited_at=last_success
+    )
+    first._interaction_count = first.AUDIT_INTERVAL - 1
+    first._verify_constitution_integrity = AsyncMock(
+        return_value=(False, "governing bytes changed")
+    )
+
+    await first._maybe_audit()
+    assert first._safe_mode is True
+    assert first._last_audit_time == last_success
+    persisted = await first._constitution_state_store.load(first.agent_id)
+    assert persisted.last_successful_audit_at == last_success
+    assert persisted.interaction_count == first.AUDIT_INTERVAL
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_row_migration_requires_real_startup_audit(tmp_path):
+    """No row does not fabricate a successful audit timestamp."""
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(tmp_path / "agent.db", now)
+    agent._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+    try:
+        assert agent._constitution_state_migration_pending is True
+        assert agent._constitution_audit_pending is True
+        assert agent._last_audit_time == agent._constitution_epoch()
+        agent._maybe_refresh_user_byok_resolver = AsyncMock()
+        blocked = await KestrelAgent.process_input(agent, "startup signal")
+        assert "required startup integrity audit" in blocked
+        agent._verify_constitution_integrity.assert_not_awaited()
+        await agent._audit_constitution_on_startup()
+        agent._verify_constitution_integrity.assert_awaited_once()
+        assert agent._constitution_state_migration_pending is False
+        assert agent._constitution_audit_pending is False
+        assert agent._last_audit_time == now
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_new_identity_bootstrap_anchors_then_full_audits(tmp_path):
+    """A first-ever identity is not misclassified as an anchor-loss attack."""
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    agent, storage = await _open_durable_harness(
+        tmp_path / "agent.db", now, is_new_identity=True
+    )
+    agent._get_governing_constitution = AsyncMock(
+        return_value="Kestrel Constitution"
+    )
+    agent._verify_constitution_integrity = AsyncMock(
+        return_value=(True, "Constitution integrity verified")
+    )
+    try:
+        assert agent._constitution_bootstrap_pending is True
+        assert agent._constitution_state_migration_pending is False
+        assert agent._constitution_audit_pending is True
+
+        await agent._audit_constitution_on_startup()
+
+        agent._get_governing_constitution.assert_awaited_once()
+        agent._verify_constitution_integrity.assert_awaited_once()
+        assert agent._constitution_bootstrap_pending is False
+        assert agent._constitution_audit_pending is False
+        persisted = await agent._constitution_state_store.load(agent.agent_id)
+        assert persisted.bootstrap_pending is False
+        assert persisted.last_successful_audit_at == now
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_new_identity_bootstrap_survives_restart(tmp_path):
+    """A crash before anchoring preserves first-identity bootstrap authority."""
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(
+        db_path, now, is_new_identity=True
+    )
+    assert first._constitution_bootstrap_pending is True
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(
+        db_path, now + timedelta(minutes=1)
+    )
+    try:
+        assert restarted._constitution_bootstrap_pending is True
+        assert restarted._constitution_state_migration_pending is False
+        assert restarted._constitution_audit_pending is True
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_identity_after_completed_bootstrap_fails_closed(tmp_path):
+    """Deleting a completed identity node cannot reauthorize auto-anchoring."""
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    first, storage = await _open_durable_harness(db_path, now)
+    await first._record_successful_constitution_audit(
+        source="test", audited_at=now
+    )
+    await storage.close()
+
+    restarted, storage = await _open_durable_harness(
+        db_path, now + timedelta(minutes=1), is_new_identity=True
+    )
+    try:
+        assert restarted._constitution_bootstrap_pending is False
+        assert restarted._safe_mode is True
+        assert restarted._safe_mode_reason == (
+            "Agent identity node missing during constitutional restore"
+        )
+        persisted = await restarted._constitution_state_store.load(
+            restarted.agent_id
+        )
+        assert persisted.safe_mode is True
+    finally:
+        await storage.close()
+
+
+# ---------------------------------------------------------------------------
 # Governing-constitution resolver (#2463)
 #
 # These tests exercise the real single-source resolver and real hashes — the

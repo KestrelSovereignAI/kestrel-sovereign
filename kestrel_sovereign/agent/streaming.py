@@ -602,6 +602,29 @@ class StreamingMixin:
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
 
+        # The streaming endpoint is the primary chat path and must enforce the
+        # same constitutional boundary as process_input. Commands delegate
+        # below so Sovereign recovery remains available; ordinary cognition is
+        # refused before a turn lock, context build, or LLM stream can start.
+        safe_mode = getattr(self, "_safe_mode", False) is True
+        audit_pending = (
+            getattr(self, "_constitution_audit_pending", False) is True
+        )
+        if (safe_mode or audit_pending) and not user_input.startswith("!"):
+            restriction = (
+                "a required startup integrity audit"
+                if audit_pending
+                else "an integrity failure"
+            )
+            yield (
+                "🚨 SAFE MODE ACTIVE\n\n"
+                f"The agent cannot process queries due to {restriction}.\n"
+                "Use !safe-mode to check status or !verify-constitution to "
+                "re-verify.\n\n"
+                "Normal operation will resume once integrity is restored."
+            )
+            return
+
         # Commands are not streamable - delegate to non-streaming handler.
         # #1894: the delegate runs OUTSIDE the per-turn ``part_collector()``
         # bound on the normal streaming path below, so a ``!todo add/update/

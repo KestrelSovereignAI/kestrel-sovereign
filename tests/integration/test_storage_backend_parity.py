@@ -1,7 +1,7 @@
 """SQLite/PostgreSQL semantic parity contracts for storage seams."""
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -26,6 +26,57 @@ from kestrel_sovereign.features.webhooks.feature import WebhookFeature
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_constitution_runtime_state_round_trips_on_both_backends(db_backend):
+    """Safe Mode and UTC audit deadlines survive the SQLite/Postgres codecs."""
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeState,
+        ConstitutionRuntimeStateStore,
+    )
+
+    agent_id = f"did:test:{uuid4()}"
+    entered_at = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    last_audit_at = entered_at - timedelta(hours=2)
+    state = ConstitutionRuntimeState(
+        agent_id=agent_id,
+        safe_mode=True,
+        safe_mode_reason="backend parity probe",
+        safe_mode_entered_at=entered_at,
+        safe_mode_exited_at=None,
+        safe_mode_exit_authorization=None,
+        last_successful_audit_at=last_audit_at,
+        interaction_count=37,
+        updated_at=entered_at,
+        bootstrap_pending=True,
+    )
+
+    writer = ConstitutionRuntimeStateStore(db_backend)
+    await writer.initialize()
+    await writer.write(
+        state,
+        event_type="safe_mode_entered",
+        event_reason=state.safe_mode_reason,
+    )
+
+    # A new store instance represents the restart-side reader while reusing the
+    # fixture-managed connection/pool. On CI the parametrized Postgres case runs
+    # against the pgvector service and exercises asyncpg's datetime codec.
+    reader = ConstitutionRuntimeStateStore(db_backend)
+    await reader.initialize()
+    restored = await reader.load(agent_id)
+
+    assert restored is not None
+    assert restored.safe_mode is True
+    assert restored.safe_mode_reason == state.safe_mode_reason
+    assert restored.safe_mode_entered_at == entered_at
+    assert restored.last_successful_audit_at == last_audit_at
+    assert restored.interaction_count == 37
+    assert restored.bootstrap_pending is True
+    assert restored.safe_mode_entered_at.tzinfo == timezone.utc
+    assert restored.last_successful_audit_at.tzinfo == timezone.utc
 
 
 def _project_rows(rows):
