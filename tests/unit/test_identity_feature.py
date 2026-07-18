@@ -155,6 +155,27 @@ def test_unique_export_filename_does_not_collide():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["import_identity", "verify_identity"])
+async def test_identity_intake_tools_reject_symlink_without_leaking_target(
+    tool_name,
+    tmp_path,
+):
+    marker = "identity-target-content-must-not-leak"
+    target = tmp_path / "outside.json"
+    target.write_text(marker, encoding="utf-8")
+    source = tmp_path / "identity_link.json"
+    source.symlink_to(target)
+    feat = _make_feature()
+
+    result = await getattr(feat, tool_name)(str(source))
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "intake failed" in result.error.lower()
+    assert "regular file" in result.error.lower()
+    assert marker not in result.error
+
+
+@pytest.mark.asyncio
 async def test_import_identity_forwards_allow_unsigned(monkeypatch, tmp_path):
     """#2112 F185: the import tool exposes allow_unsigned and forwards it, so an
     unsigned export (which the tool's own remediation advice tells the user to

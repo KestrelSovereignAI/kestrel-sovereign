@@ -33,6 +33,48 @@ from kestrel_sovereign.storage.providers.base import StorageTier, StorageResult
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+_RETRIEVAL_ENVELOPE_ALLOWANCE = 64 * 1024
+_RETRIEVAL_CHUNK_BYTES = 64 * 1024
+
+
+class ContentRetrievalLimitError(ValueError):
+    """A bounded storage retrieval exceeded its configured byte ceiling."""
+
+
+def _encoded_retrieval_limit(max_output_bytes: Optional[int]) -> Optional[int]:
+    """Bound compressed/encrypted bytes needed for a decoded output ceiling."""
+
+    if max_output_bytes is None:
+        return None
+    if (
+        isinstance(max_output_bytes, bool)
+        or not isinstance(max_output_bytes, int)
+        or max_output_bytes <= 0
+    ):
+        raise ValueError("max_output_bytes must be a positive integer")
+    # AEAD envelopes can be larger than their plaintext.  Two times the final
+    # ceiling plus a small fixed allowance keeps that intermediate bounded
+    # without rejecting normal Fernet/AES envelopes near the caller's limit.
+    return max_output_bytes * 2 + _RETRIEVAL_ENVELOPE_ALLOWANCE
+
+
+def _decompress_retrieved_content(
+    content: bytes,
+    *,
+    max_bytes: Optional[int],
+) -> bytes:
+    if max_bytes is None:
+        return zlib.decompress(content)
+    decompressor = zlib.decompressobj()
+    decoded = decompressor.decompress(content, max_bytes + 1)
+    if len(decoded) > max_bytes:
+        raise ContentRetrievalLimitError(
+            "retrieved content exceeds configured output limit"
+        )
+    if not decompressor.eof:
+        raise zlib.error("compressed content is incomplete or invalid")
+    return decoded
+
 
 def _looks_like_sha256(value: str) -> bool:
     """True iff ``value`` is a 64-char lowercase-hex SHA-256 digest.
@@ -263,7 +305,9 @@ class FilecoinAdapter:
     def retrieve_content(self, 
                          content_hash: str, 
                          ipfs_cid: Optional[str] = None, 
-                         key_hash: Optional[str] = None) -> bytes:
+                         key_hash: Optional[str] = None,
+                         *,
+                         max_output_bytes: Optional[int] = None) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
         
@@ -271,6 +315,9 @@ class FilecoinAdapter:
             content_hash: SHA256 hash of original content
             ipfs_cid: IPFS Content ID (if available)
             key_hash: Hash of the encrypted key, if content is encrypted.
+            max_output_bytes: Optional hard ceiling for the fully decoded
+                result. Cache/network reads and decompression intermediates are
+                bounded as well when supplied.
             
         Returns:
             Original content bytes
@@ -282,33 +329,50 @@ class FilecoinAdapter:
         # case-sensitive and pass through unchanged (#1725 codex r3).
         if _looks_like_sha256(content_hash):
             content_hash = content_hash.lower()
+        encoded_limit = _encoded_retrieval_limit(max_output_bytes)
 
         # Try local cache first
         try:
             from_ipfs = False
-            retrieved_content = self._retrieve_local_cache(content_hash)
+            retrieved_content = self._retrieve_local_cache(
+                content_hash,
+                max_bytes=encoded_limit,
+            )
             if retrieved_content:
                 logging.info(f"📂 Retrieved from cache: {content_hash[:16]}...")
             else:
                 # Try IPFS if CID available
                 if ipfs_cid:
                     try:
-                        retrieved_content = self._retrieve_ipfs(ipfs_cid)
+                        retrieved_content = self._retrieve_ipfs(
+                            ipfs_cid,
+                            max_bytes=encoded_limit,
+                        )
                         if retrieved_content:
                             from_ipfs = True
                             logging.info(f"📡 Retrieved from IPFS: {content_hash[:16]}...")
+                    except ContentRetrievalLimitError:
+                        raise
                     except Exception as e:
                         logging.error(f"IPFS retrieval failed for {ipfs_cid}: {e}")
 
             if not retrieved_content:
                 raise ValueError(f"Content not found: {content_hash}")
 
-            decompressed_content = zlib.decompress(retrieved_content)
+            decompressed_content = _decompress_retrieved_content(
+                retrieved_content,
+                max_bytes=encoded_limit if key_hash else max_output_bytes,
+            )
 
             if key_hash:
                 result = self._decrypt_content(decompressed_content, key_hash)
             else:
                 result = decompressed_content
+
+            if max_output_bytes is not None and len(result) > max_output_bytes:
+                raise ContentRetrievalLimitError(
+                    "retrieved content exceeds configured output limit"
+                )
 
             # Integrity check (#1725): when the lookup key is a genuine SHA-256
             # content hash, the retrieved bytes — especially from an untrusted
@@ -611,12 +675,22 @@ class FilecoinAdapter:
         with open(meta_file, 'w') as f:
             json.dump(meta, f)
     
-    def _retrieve_local_cache(self, content_hash: str) -> Optional[bytes]:
+    def _retrieve_local_cache(
+        self,
+        content_hash: str,
+        *,
+        max_bytes: Optional[int] = None,
+    ) -> Optional[bytes]:
         """Retrieve content from local cache"""
         cache_file = self.cache_dir / f"{content_hash}.cache"
         if cache_file.exists():
             with open(cache_file, 'rb') as f:
-                return f.read()
+                content = f.read() if max_bytes is None else f.read(max_bytes + 1)
+            if max_bytes is not None and len(content) > max_bytes:
+                raise ContentRetrievalLimitError(
+                    "cached content exceeds configured input limit"
+                )
+            return content
         return None
     
     def _store_ipfs(
@@ -651,18 +725,55 @@ class FilecoinAdapter:
             logging.error(f"IPFS storage error: {e}")
             raise
     
-    def _retrieve_ipfs(self, cid: str) -> bytes:
+    def _retrieve_ipfs(
+        self,
+        cid: str,
+        *,
+        max_bytes: Optional[int] = None,
+    ) -> bytes:
         """Retrieve content from IPFS by CID"""
         try:
             response = requests.post(
                 f"{self.ipfs_api_url}/api/v0/cat",
                 params={'arg': cid},
-                timeout=HTTP_TIMEOUT_DEFAULT
+                timeout=HTTP_TIMEOUT_DEFAULT,
+                stream=max_bytes is not None,
             )
             
             if response.status_code == 200:
-                return response.content
+                if max_bytes is None:
+                    return response.content
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        parsed_length = int(content_length)
+                    except (TypeError, ValueError):
+                        parsed_length = None
+                    if parsed_length is not None and parsed_length > max_bytes:
+                        response.close()
+                        raise ContentRetrievalLimitError(
+                            "IPFS response exceeds configured input limit"
+                        )
+                chunks: list[bytes] = []
+                total = 0
+                try:
+                    for chunk in response.iter_content(
+                        chunk_size=_RETRIEVAL_CHUNK_BYTES
+                    ):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ContentRetrievalLimitError(
+                                "IPFS response exceeds configured input limit"
+                            )
+                        chunks.append(chunk)
+                finally:
+                    response.close()
+                return b''.join(chunks)
             else:
+                if max_bytes is not None:
+                    response.close()
                 raise Exception(f"IPFS retrieval failed: {response.status_code}")
                 
         except Exception as e:

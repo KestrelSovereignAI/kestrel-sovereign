@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.identity.package_intake import (
+    IdentityPackageIntakeError,
+    load_identity_package_source,
+)
 from kestrel_sovereign.identity.protected_export import (
     identity_export_directory,
     write_protected_identity_export,
@@ -496,32 +500,12 @@ class IdentityFeature(Feature):
             )
 
         try:
-            from kestrel_sovereign.identity import (
-                AgentIdentityPackage,
-                IdentityImporter,
-            )
-            from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
+            from kestrel_sovereign.identity import IdentityImporter
 
-            # Load package
-            if source.startswith("Qm") or source.startswith("bafy"):
-                # IPFS CID — decrypt with key_hash when the export was
-                # encrypted (F187). retrieve_content(key_hash=...) already
-                # applies decryption.
-                adapter = FilecoinAdapter()
-                content = await asyncio.to_thread(
-                    adapter.retrieve_content, source,
-                    ipfs_cid=source, key_hash=key_hash,
-                )
-                package_json = content.decode('utf-8')
-            elif Path(source).exists():
-                # Local file
-                with open(source, 'r', encoding='utf-8') as f:
-                    package_json = f.read()
-            else:
-                return ToolResult.failed(
-                    f"Source not found: {source}",
-                    data={"source": source},
-                )
+            package_json = await load_identity_package_source(
+                source,
+                key_hash=key_hash,
+            )
 
             # Parse package (unseal first if it's a hybrid-KEM capsule)
             try:
@@ -563,6 +547,11 @@ class IdentityFeature(Feature):
                 verify_signature=verify_signature,
                 merge_mode=merge_mode,
                 allow_unsigned=allow_unsigned,
+            )
+        except IdentityPackageIntakeError as e:
+            return ToolResult.failed(
+                f"Identity package intake failed: {e}",
+                data={"source": source},
             )
         except Exception as e:
             logger.error(f"Identity import failed: {e}", exc_info=True)
@@ -637,28 +626,12 @@ class IdentityFeature(Feature):
                 Ignored for local file sources.
         """
         try:
-            from kestrel_sovereign.identity import (
-                AgentIdentityPackage,
-                verify_package_signature,
-            )
-            from kestrel_sovereign.filecoin_adapter import FilecoinAdapter
+            from kestrel_sovereign.identity import verify_package_signature
 
-            # Load package
-            if source.startswith("Qm") or source.startswith("bafy"):
-                adapter = FilecoinAdapter()
-                content = await asyncio.to_thread(
-                    adapter.retrieve_content, source,
-                    ipfs_cid=source, key_hash=key_hash,
-                )
-                package_json = content.decode('utf-8')
-            elif Path(source).exists():
-                with open(source, 'r', encoding='utf-8') as f:
-                    package_json = f.read()
-            else:
-                return ToolResult.failed(
-                    f"Source not found: {source}",
-                    data={"source": source},
-                )
+            package_json = await load_identity_package_source(
+                source,
+                key_hash=key_hash,
+            )
 
             # Parse package (unseal first if it's a hybrid-KEM capsule)
             try:
@@ -695,6 +668,11 @@ class IdentityFeature(Feature):
                     _runtime_agent_data_dir(self.agent),
                 )
                 sig_status = "VALID" if is_valid else f"INVALID: {msg}"
+        except IdentityPackageIntakeError as e:
+            return ToolResult.failed(
+                f"Identity package intake failed: {e}",
+                data={"source": source},
+            )
         except Exception as e:
             logger.error(f"Identity verification failed: {e}", exc_info=True)
             return ToolResult.failed(f"Identity verification failed: {str(e)}")
