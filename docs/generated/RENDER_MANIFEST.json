@@ -1072,6 +1072,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/security/HEALTH_ENDPOINT_AUTHORIZATION.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Health Endpoint Authorization",
+      "type": "Security Guide"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/security/HOST_RUNTIME_STORAGE_CUSTODY.md",
       "privacy": "public",
       "render": "public",
@@ -1592,7 +1604,7 @@
       "path": "docs/audit/AUTH_SURFACE_MATRIX.md",
       "privacy": "public",
       "render": "internal",
-      "status": "needs-revalidation",
+      "status": "active",
       "title": "Auth Surface Matrix",
       "type": "Audit Ledger"
     },

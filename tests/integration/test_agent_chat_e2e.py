@@ -85,7 +85,7 @@ def test_health_endpoint(client: TestClient):
 
     assert response.status_code == 200
     data = response.json()
-    # Check required fields; llm_reachability is optional (added in #1265)
+    # Public readiness deliberately exposes only aggregate probe fields (#2611).
     assert data["status"] == "ok"
     assert data["agent_initialized"] is True
 

@@ -622,8 +622,8 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - `GET /api/host/csrf`
 - `POST /api/host/phoenix/session`
 - `GET /api/host/ui/contributions`
-- `GET /health`
-- `GET /health/detailed`
+- `GET /health` — public aggregate readiness only (`status` and `agent_initialized`)
+- `GET /health/detailed` — authenticated operator diagnostics (API key, JWT, or OAuth session)
 - `/phoenix` and `/phoenix/{path}` — same-origin authenticated reverse proxy to the host-supervised Phoenix trace UI (embed-session cookie; all methods). Trace files use the private custody and migration contract in [`docs/architecture/security/PHOENIX_TRACE_CUSTODY.md`](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
 
 ### Router families mounted by `kestrel_sovereign/server.py`
@@ -1025,7 +1025,6 @@ The route surface is not just public versus protected. The current live classes 
 
 - `Public`
   - `/health`
-  - `/health/detailed`
   - `/favicon.ico`
 - `Public-Localhost`
   - `/api/auth/key` when bootstrap is enabled
@@ -1034,6 +1033,7 @@ The route surface is not just public versus protected. The current live classes 
   - `/auth/callback`
   - `/auth/logout`
 - `APIKeyOrSession`
+  - `/health/detailed`
   - most protected `/agent/*` and `/api/*` routes via `kestrel_sovereign/server.py` auth middleware
 - `APIKeyOrSession+SSEQuery`
   - SSE paths that also allow `?api_key=`:
