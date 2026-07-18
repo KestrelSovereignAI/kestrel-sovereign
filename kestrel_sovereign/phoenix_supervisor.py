@@ -58,6 +58,13 @@ DEFAULT_PHOENIX_GRPC_PORT = 4317
 #: Sub-path the UI is served under for same-origin embedding.
 PHOENIX_ROOT_PATH = "/phoenix"
 
+#: Default Phoenix project the host + every agent it spawns group their traces
+#: under when the operator hasn't pinned one — a single ``kestrel-fleet`` project
+#: instead of Phoenix's ``default`` (obs#32). The SDK's tracing bootstrap reads
+#: ``KESTREL_OTEL_PROJECT`` (SDK >= 0.30.2); autowiring it here on ``os.environ``
+#: means the host process AND subprocess agents that inherit the env pick it up.
+DEFAULT_OTEL_PROJECT = "kestrel-fleet"
+
 # --- Embed session cookie ------------------------------------------------
 #: Cookie the console mints via ``POST /api/host/phoenix/session`` and the
 #: browser then auto-attaches to iframe ``/phoenix`` requests.
@@ -200,6 +207,23 @@ def autowire_otlp_endpoint(env: Optional[dict] = None) -> Optional[str]:
     endpoint = phoenix_otlp_endpoint()
     target["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
     return endpoint
+
+
+def autowire_otel_project(env: Optional[dict] = None) -> Optional[str]:
+    """Zero-config wiring (INV-SOLO): default ``KESTREL_OTEL_PROJECT``.
+
+    Group the host's own traces and every span its spawned agents emit under a
+    single ``kestrel-fleet`` Phoenix project rather than Phoenix's ``default``,
+    but ONLY when the operator has not already pinned a project. Mutates ``env``
+    in place (defaults to ``os.environ``, so both this process and env inherited
+    by spawned agents pick it up) and returns the project it set, or ``None``
+    when it left an operator-provided value untouched.
+    """
+    target = env if env is not None else os.environ
+    if target.get("KESTREL_OTEL_PROJECT"):
+        return None
+    target["KESTREL_OTEL_PROJECT"] = DEFAULT_OTEL_PROJECT
+    return DEFAULT_OTEL_PROJECT
 
 
 def supports_host_root_path() -> bool:
@@ -485,6 +509,15 @@ class PhoenixSupervisor:
             f"sqlite:///{self.working_dir / 'phoenix.db'}",
         )
         env.setdefault("PYTHONUNBUFFERED", "1")
+        # Disable Phoenix's external telemetry pixels (FullStory + Scarf.sh).
+        # The UI otherwise loads a scarf.sh tracking pixel that phones home and
+        # trips ad/tracker blockers, so the embedded console logs
+        # ERR_BLOCKED_BY_CLIENT noise. ``PHOENIX_TELEMETRY_ENABLED`` is the
+        # master toggle (phoenix.config.get_env_telemetry_enabled) — verified in
+        # the installed 17.x config; it MUST be the literal "true"/"false"
+        # Phoenix parses, anything else asserts at Phoenix startup. ``setdefault``
+        # so an operator who wants the pixels can still opt back in explicitly.
+        env.setdefault("PHOENIX_TELEMETRY_ENABLED", "false")
         if self.root_path:
             env["PHOENIX_HOST_ROOT_PATH"] = self.root_path
         else:
@@ -830,6 +863,7 @@ async def proxy_to_phoenix(
 __all__ = [
     "PHOENIX_BIND_HOST",
     "PHOENIX_ROOT_PATH",
+    "DEFAULT_OTEL_PROJECT",
     "EMBED_COOKIE_NAME",
     "EMBED_COOKIE_PATH",
     "EMBED_TTL_SECONDS",
@@ -842,6 +876,7 @@ __all__ = [
     "phoenix_working_dir",
     "phoenix_otlp_endpoint",
     "autowire_otlp_endpoint",
+    "autowire_otel_project",
     "supports_host_root_path",
     "mint_embed_token",
     "issue_embed_cookie",
