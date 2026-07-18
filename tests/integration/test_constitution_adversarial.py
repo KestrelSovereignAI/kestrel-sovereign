@@ -222,8 +222,8 @@ class TestCrossUserIsolation:
         # Omit constitution_path so inception anchors the packaged governing
         # source; passing the docs copy is now refused as non-authoritative
         # (#2463).
-        await create_kestrel_identity_async(str(agent_a_dir))
-        await create_kestrel_identity_async(str(agent_b_dir))
+        credentials_a = await create_kestrel_identity_async(str(agent_a_dir))
+        credentials_b = await create_kestrel_identity_async(str(agent_b_dir))
 
         # Find databases
         db_a = list(agent_a_dir.glob("*.db"))[0]
@@ -238,18 +238,20 @@ class TestCrossUserIsolation:
         # forbidden shape; use distinct services here.
         llm_service_a = LLMService()
         llm_service_b = LLMService()
+        agent_a = None
+        agent_b = None
 
         try:
             # Create agents
             agent_a = KestrelAgent(
-                did="did:test:user_a",
+                did=credentials_a.agent_did,
                 storage_path=str(db_a),
                 llm_service=llm_service_a
             )
             await agent_a.initialize()
 
             agent_b = KestrelAgent(
-                did="did:test:user_b",
+                did=credentials_b.agent_did,
                 storage_path=str(db_b),
                 llm_service=llm_service_b
             )
@@ -271,8 +273,10 @@ class TestCrossUserIsolation:
             )
 
         finally:
-            await agent_a.shutdown()
-            await agent_b.shutdown()
+            if agent_a is not None:
+                await agent_a.shutdown()
+            if agent_b is not None:
+                await agent_b.shutdown()
             await llm_service_a.close()
             await llm_service_b.close()
 
@@ -296,7 +300,7 @@ class TestPrivacyModeEnforcement:
         from kestrel_sovereign.privacy import PrivacyMode
         from kestrel_sovereign.inception_service import create_kestrel_identity_async
 
-        await create_kestrel_identity_async(str(temp_dir))
+        credentials = await create_kestrel_identity_async(str(temp_dir))
         db_files = list(temp_dir.glob("*.db"))
         db_path = str(db_files[0]) if db_files else str(temp_dir / "test.db")
 
@@ -304,7 +308,7 @@ class TestPrivacyModeEnforcement:
 
         try:
             agent = KestrelAgent(
-                did="did:test:ephemeral",
+                did=credentials.agent_did,
                 storage_path=db_path,
                 llm_service=llm_service,
                 privacy_mode=PrivacyMode.EPHEMERAL

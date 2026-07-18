@@ -43,6 +43,10 @@ pytestmark = pytest.mark.skipif(
     reason="Requires GCP credentials (GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_PROJECT or GCP_PROJECT_ID)"
 )
 
+# Keep credentialed live tests on a currently served stable model while
+# allowing operators to exercise a different deployment explicitly.
+LIVE_MODEL = os.environ.get("KESTREL_VERTEX_TEST_MODEL", "gemini-2.5-flash")
+
 
 # ============================================================================
 # Fixtures
@@ -333,7 +337,7 @@ class TestGeneration:
 
         response = await adapter.get_response(
             client=None,  # Use internal client
-            model="gemini-2.0-flash-001",  # Use available model
+            model=LIVE_MODEL,
             messages=messages
         )
 
@@ -351,7 +355,7 @@ class TestGeneration:
 
         response = await adapter.get_response(
             client=None,
-            model="gemini-2.0-flash-001",
+            model=LIVE_MODEL,
             messages=messages
         )
 
@@ -369,7 +373,7 @@ class TestGeneration:
 
         response = await adapter.get_response(
             client=None,
-            model="gemini-2.0-flash-001",
+            model=LIVE_MODEL,
             messages=messages,
             temperature=0.9
         )
@@ -386,7 +390,7 @@ class TestGeneration:
 
         response = await adapter.get_response(
             client=None,
-            model="gemini-2.0-flash-001",
+            model=LIVE_MODEL,
             messages=messages,
             max_tokens=50
         )
@@ -403,7 +407,7 @@ class TestGeneration:
         # Test with flash model (fast)
         response_flash = await adapter.get_response(
             client=None,
-            model="gemini-2.0-flash-001",
+            model=LIVE_MODEL,
             messages=messages
         )
         assert response_flash.content is not None
@@ -437,7 +441,7 @@ class TestStreaming:
         chunks = []
         async for chunk in adapter.get_streaming_response(
             client=None,
-            model="gemini-2.0-flash-001",
+            model=LIVE_MODEL,
             messages=messages
         ):
             chunks.append(chunk)
@@ -458,7 +462,7 @@ class TestStreaming:
         chunks = []
         async for chunk in adapter.get_streaming_response(
             client=None,
-            model="gemini-2.0-flash-001",
+            model=LIVE_MODEL,
             messages=messages
         ):
             chunks.append(chunk)
@@ -485,7 +489,7 @@ class TestVision:
 
         response = await adapter.get_response(
             client=None,
-            model="gemini-2.0-flash-001",  # Vision-capable model
+            model=LIVE_MODEL,
             messages=messages
         )
 
@@ -507,7 +511,7 @@ class TestVision:
 
         response = await adapter.get_response(
             client=None,
-            model="gemini-2.0-flash-001",
+            model=LIVE_MODEL,
             messages=messages
         )
 
@@ -565,7 +569,7 @@ class TestErrorHandling:
         with pytest.raises(Exception):
             await adapter.get_response(
                 client=None,
-                model="gemini-2.0-flash-001",
+                model=LIVE_MODEL,
                 messages=[]
             )
 
