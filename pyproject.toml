@@ -69,15 +69,21 @@ dependencies = [
     "uvicorn==0.48.0",
     "pydantic==2.13.4",
     # HTTP clients
-    "aiohttp>=3.13.3",
+    # >=3.14.1 fixes request-smuggling, parser, and decompression advisories
+    # present in the 3.13/3.14.0 lines (#2546).
+    "aiohttp>=3.14.1",
     "httpx>=0.27.0",
-    "requests>=2.32.5",
+    # >=2.33.0 fixes unsafe .netrc credential handling (#2546).
+    "requests>=2.33.0",
     # Cloud LLM providers
     # >=2.0.0 required for the GA Realtime API surface
     # (``client.realtime`` replaces the deprecated ``client.beta.realtime``;
     # see kestrel-voice-openai #16).  Bounded below 3 because we haven't
     # validated against a hypothetical major bump.
     "openai>=2.0.0,<3",
+    # google-generativeai reaches httplib2 through google-api-python-client;
+    # >=0.32.0 fixes proxy-bypass request smuggling on that core path.
+    "httplib2>=0.32.0",
     # Ollama client (lightweight API client, connects to host Ollama)
     "ollama>=0.6.1",
     # Database
@@ -137,7 +143,8 @@ dependencies = [
     # range.
     "soupsieve>=2.8.4",
     # PDF text extraction for the read_attachment tool (#1662, pure-python)
-    "pypdf>=5.1.0",
+    # >=6.13.3 bounds FlateDecode decompression work on malicious PDFs.
+    "pypdf>=6.13.3",
     # Graph operations (lightweight)
     "networkx==3.6.1",
     # Misc
@@ -184,7 +191,8 @@ Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussio
 [project.optional-dependencies]
 # Test dependencies (not needed in production)
 test = [
-    "pytest>=8.0.0",
+    # >=9.0.3 fixes unsafe temporary-file handling in pytest's debugger.
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.1.0",
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",
@@ -192,11 +200,18 @@ test = [
 ]
 # ML/training dependencies (adds ~2GB+ for torch, diffusers, etc.)
 ml = [
-    "torch>=2.9.1",
-    "torchvision>=0.24.1",
-    "torchaudio>=2.9.1",
-    "diffusers>=0.36.0",
-    "transformers>=4.57.1",
+    # Torch 2.13 fixes the remaining resource-exhaustion advisories. Keep
+    # torchvision on the matching release line. Torchaudio is intentionally
+    # absent: Kestrel's ML surface is image training, and torchaudio's latest
+    # release pins an older vulnerable Torch without serving a Kestrel import.
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    # These floors close unsafe remote-code/model-loading trust boundaries.
+    "diffusers>=0.38.0",
+    "transformers>=5.5.0,<6",
+    # Torch imports setuptools on supported interpreters; keep the transitive
+    # toolchain past its path-traversal advisory.
+    "setuptools>=83.0.0",
     "accelerate>=1.12.0",
     "peft>=0.18.1",
     "safetensors>=0.7.0",
@@ -206,6 +221,7 @@ local = [
     "ollama>=0.6.1",
     "sentence-transformers==5.5.1",
     "spacy>=3.7.0",
+    "setuptools>=83.0.0",
     "numpy==2.4.6",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
@@ -249,7 +265,8 @@ cloud = [
 ]
 # Feature: Wallet (web3, Stripe, CBOR for CAR files)
 wallet = [
-    "web3>=7.0.0",
+    # >=7.15.0 fixes WebSocket subscription response misattribution.
+    "web3>=7.15.0",
     "stripe>=10.0.0",
 ]
 # Feature: Delivery (email/SMS notifications)
@@ -312,7 +329,7 @@ dev = [
 
 # Mirror of [project.optional-dependencies.test] for uv sync compatibility
 test = [
-    "pytest>=8.0.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.1.0",
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",

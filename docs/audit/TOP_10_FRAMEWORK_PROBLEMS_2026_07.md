@@ -44,7 +44,7 @@ issues and concrete verification gates.
 | 4 | Critical | Unreadable hybrid identity silently downgrades to `identity=None` | Present but invalid root-of-trust material must fail readiness | [#2469](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2469) |
 | 5 | Critical | Safe Mode and audit deadlines reset on restart | Process lifecycle cannot erase a constitutional integrity failure | [#2464](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2464) |
 | 6 | Critical | Cloud Run production identity/state is disposable and divergent | One deployed agent must retain one DID and coherent durable state | [#2472](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2472) |
-| 7 | High | The locked dependency graph still has six high-severity alerts | Published runtime/extras must not install known high-risk code paths | [#2546](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2546) |
+| 7 | High | The locked dependency graph still has four high-severity alerts | Published runtime/extras must not install known high-risk code paths | [#2546](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2546) |
 | 8 | High | Hybrid A2A signing failure falls back to unsigned delivery | An identified hybrid sender must never silently shed authentication | [#2475](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2475) |
 | 9 | High | The promised genesis audit has no production caller | No new agent should reach its first cognition turn without its creation audit | [#2470](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2470) |
 | 10 | High | Local identity exports are world-readable and non-atomic by default | A continuity package must remain private and complete on disk | [#2505](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/2505) |
@@ -201,14 +201,15 @@ instances, require the same DID, both hybrid key fingerprints, constitution
 hash, and memory sentinel. Removing durable custody must make deployment or
 startup fail.
 
-## 7. The locked dependency graph has six high-severity alerts
+## 7. The locked dependency graph has four high-severity alerts
 
-The live GitHub Dependabot census on 2026-07-17 reports 40 open alerts in
-`uv.lock`: 6 high, 21 medium, and 13 low. The six high alerts cover two
-Transformers remote-code-execution advisories, two Starlette request/Windows
-path vulnerabilities, and two Diffusers remote-code trust-boundary bypasses.
-There are no remaining critical alerts; issue #2546's older 79-alert/critical
-snapshot must not be repeated as current evidence.
+The live GitHub Dependabot census after the #2472 merge on 2026-07-17 reports
+32 open alerts in `uv.lock`: 4 high, 16 medium, and 12 low. The four high
+alerts cover two Transformers remote-code-execution advisories and two
+Diffusers remote-code trust-boundary bypasses. The earlier same-day census of
+40 included Starlette alerts that the merged FastAPI/Starlette upgrade has
+since cleared. There are no remaining critical alerts; issue #2546's older
+79-alert/critical snapshot must not be repeated as current evidence.
 
 The census is reproducible against the repository's live security state with:
 
@@ -219,14 +220,15 @@ gh api --paginate \
     map({severity: .[0].security_advisory.severity, count: length})'
 ```
 
-The dated result was `high=6`, `medium=21`, `low=13`, with no `critical`
-group. Re-running the command later is expected to show the then-current state;
-the audit preserves the 2026-07-17 baseline for comparison.
+The latest dated result was `high=4`, `medium=16`, `low=12`, with no
+`critical` group. Re-running the command later is expected to show the
+then-current state; the audit preserves the pre-remediation baseline for
+comparison.
 
-Transformers and Diffusers are optional ML/local surfaces, but Starlette is on
-the core FastAPI runtime path. The absence of a zero-baseline dependency-review
-gate lets vulnerable versions remain publishable even after declared floors
-are tightened.
+Transformers and Diffusers are optional ML/local surfaces, but published
+extras remain supported attack surface. The absence of a zero-baseline
+dependency-review gate lets vulnerable versions remain publishable even after
+declared floors are tightened.
 
 Remediation needs narrow compatible upgrade waves, clean-install and supported
 Python matrices, and explicit time-bounded exceptions where upstream has no
