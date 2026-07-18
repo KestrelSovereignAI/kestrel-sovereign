@@ -171,6 +171,36 @@ def test_format_report_says_not_ready_when_blocked(tmp_path):
     assert "❌" in text
 
 
+def test_doctor_reports_legacy_identity_export_permissions_without_reading(tmp_path):
+    _seed_ready(tmp_path)
+    export_root = tmp_path / "agent_data"
+    legacy = export_root / "identity_legacy.json"
+    secret = "doctor-must-not-echo-or-parse-this-secret"
+    legacy.write_text(secret, encoding="utf-8")
+    legacy.chmod(0o644)
+
+    report = diagnose(tmp_path)
+
+    warning = next(message for message in report.warn if "identity-export" in message)
+    assert "metadata-only" in warning
+    assert "harden-exports" in warning
+    assert secret not in warning
+    assert legacy.read_text(encoding="utf-8") == secret
+
+
+def test_doctor_accepts_private_identity_export_metadata(tmp_path):
+    _seed_ready(tmp_path)
+    export_root = tmp_path / "agent_data"
+    export_root.chmod(0o700)
+    private = export_root / "identity_private.json"
+    private.write_text("private", encoding="utf-8")
+    private.chmod(0o600)
+
+    report = diagnose(tmp_path)
+
+    assert not any("identity-export" in message for message in report.warn)
+
+
 # ---------------------------------------------------------------------------
 # Constitution drift detection
 #

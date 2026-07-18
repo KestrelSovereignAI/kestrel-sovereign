@@ -97,6 +97,7 @@ class IdentityImporter:
         db: "AsyncDatabase",
         target_agent_id: Optional[str] = None,
         target_substrate: Optional[str] = None,
+        storage_dir: Optional[Path] = None,
     ):
         """
         Initialize the importer.
@@ -105,10 +106,13 @@ class IdentityImporter:
             db: Database connection
             target_agent_id: The agent ID to import into. If None, uses DID from package.
             target_substrate: The substrate being imported to
+            storage_dir: Runtime agent-data directory containing the trusted
+                identity keys used to verify package signatures.
         """
         self.db = db
         self.target_agent_id = target_agent_id
         self.target_substrate = target_substrate or SubstrateType.UNKNOWN.value
+        self.storage_dir = Path(storage_dir) if storage_dir is not None else None
         self.errors: List[str] = []
         self.warnings: List[str] = []
         self.stats: Dict[str, int] = {}
@@ -372,7 +376,7 @@ class IdentityImporter:
         """
         try:
             from kestrel_sovereign.identity.signing import verify_package_signature
-            ok, msg = verify_package_signature(package)
+            ok, msg = verify_package_signature(package, self.storage_dir)
             if not ok:
                 self.warnings.append(f"Signature verification failed: {msg}")
                 return False

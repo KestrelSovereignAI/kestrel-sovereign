@@ -71,6 +71,30 @@ async def test_unsigned_allowed_with_allow_unsigned_true(graph_db):
     assert result.success is True
 
 
+@pytest.mark.asyncio
+async def test_signature_verification_uses_runtime_trust_anchor(
+    graph_db,
+    monkeypatch,
+    tmp_path,
+):
+    """Multi-agent imports resolve keys beside that agent's database."""
+
+    import kestrel_sovereign.identity.signing as signing
+
+    observed = []
+
+    def verify_with_observed_root(package, storage_dir):
+        observed.append(storage_dir)
+        return True, "verified"
+
+    monkeypatch.setattr(signing, "verify_package_signature", verify_with_observed_root)
+    package = _unsigned_package()
+    importer = IdentityImporter(graph_db, storage_dir=tmp_path / "runtime-agent")
+
+    assert await importer._verify_signature(package) is True
+    assert observed == [tmp_path / "runtime-agent"]
+
+
 # ---------------------------------------------------------------------------
 # F186
 # ---------------------------------------------------------------------------

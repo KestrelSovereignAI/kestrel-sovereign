@@ -1072,6 +1072,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md",
+      "privacy": "",
+      "render": "public",
+      "status": "active",
+      "title": "Identity Export Custody",
+      "type": "Security Architecture"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/security/IDENTITY_PACKAGE_PRIVACY.md",
       "privacy": "public",
       "render": "public",

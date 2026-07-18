@@ -247,12 +247,16 @@ class IdentityExporter:
 
         # Try to load constitution from files table
         if constitution_hash:
-            row = await self.db.fetchone(
-                "SELECT content FROM files WHERE content_hash = ?",
-                (constitution_hash,)
-            )
-            if row and row[0]:
-                text = row[0].decode('utf-8') if isinstance(row[0], bytes) else row[0]
+            # Use the canonical file-store accessor rather than selecting the
+            # BLOB directly. Files are encrypted at rest when KESTREL_DATA_KEY
+            # is configured; the raw SQL path exported ciphertext as the
+            # constitution text and produced a package that could never pass
+            # its own constitution check on import (#2505 live Kite gate).
+            from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+
+            content = await AsyncFileStore(self.db).retrieve_file(constitution_hash)
+            if content is not None:
+                text = content.decode("utf-8")
                 return {"hash": constitution_hash, "text": text}
 
         # Fallback: load from default location
