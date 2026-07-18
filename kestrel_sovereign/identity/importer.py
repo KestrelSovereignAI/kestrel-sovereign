@@ -29,6 +29,7 @@ from .identity_package import (
 )
 
 if TYPE_CHECKING:
+    from kestrel_sovereign.identity.portable_trust import IdentityTrustPolicy
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
@@ -187,6 +188,7 @@ class IdentityImporter:
         ] = None,
         grant_did_web_resolver: Optional[Callable[[str], Any]] = None,
         revoked_grant_ids: Optional[Iterable[str]] = None,
+        identity_trust_policy: Optional["IdentityTrustPolicy"] = None,
     ) -> ImportResult:
         """
         Import agent identity from a package.
@@ -238,6 +240,10 @@ class IdentityImporter:
                 grant payload itself (an in-grant flag would be
                 unsigned and spoofable). Ignored when ``grant`` is
                 ``None``.
+            identity_trust_policy: Receiver-owned root-key pins, succession
+                revocations, and optional archival requirements for portable
+                verification. Self-certifying did:pkh/did:key roots need no
+                explicit pin; did:web roots always require pinned methods.
 
         Returns:
             ImportResult with success status and statistics
@@ -321,7 +327,14 @@ class IdentityImporter:
 
         if has_signature:
             if verify_signature:
-                sig_valid = await self._verify_signature(package)
+                if identity_trust_policy is None:
+                    # Preserve the historical bound-method call shape for
+                    # integrations that override or instrument this hook.
+                    sig_valid = await self._verify_signature(package)
+                else:
+                    sig_valid = await self._verify_signature(
+                        package, identity_trust_policy
+                    )
                 if not sig_valid:
                     self.errors.append("DID signature verification failed")
                     return self._build_result(False, agent_id)
@@ -410,7 +423,11 @@ class IdentityImporter:
             stats=self.stats.copy(),
         )
 
-    async def _verify_signature(self, package: AgentIdentityPackage) -> bool:
+    async def _verify_signature(
+        self,
+        package: AgentIdentityPackage,
+        trust_policy: Optional["IdentityTrustPolicy"] = None,
+    ) -> bool:
         """Verify the package's signature via the canonical verifier.
 
         Routes through ``verify_package_signature`` so both legacy
@@ -421,10 +438,16 @@ class IdentityImporter:
         """
         try:
             from kestrel_sovereign.identity.signing import verify_package_signature
-            ok, msg = verify_package_signature(package, self.storage_dir)
+            if trust_policy is None:
+                ok, msg = verify_package_signature(package, self.storage_dir)
+            else:
+                ok, msg = verify_package_signature(
+                    package, self.storage_dir, trust_policy=trust_policy
+                )
             if not ok:
                 self.warnings.append(f"Signature verification failed: {msg}")
                 return False
+            self.stats["signature_verification"] = msg
             return True
         except Exception as e:
             logger.warning(f"Signature verification failed: {e}")

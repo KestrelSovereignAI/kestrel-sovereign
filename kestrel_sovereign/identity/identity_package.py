@@ -37,12 +37,16 @@ logger = logging.getLogger(__name__)
 #     — W3C Multikey verification methods, the standards-aligned shape
 #     used by ``did:web`` and ``did:key`` documents.
 #
-# Reader supports BOTH v1 ("1.0.0") and v2 ("2.0.0") on input. v1 packages
+# #2608 adds the optional, content-bound ``identity_trust`` succession bundle
+# and advances the writer to 2.1.0. Readers accept every ``2.*`` package;
+# pre-2.1 artifacts omit the field and retain their original canonical hash.
+#
+# Reader supports BOTH v1 ("1.0.0") and v2 on input. v1 packages
 # are translated to a synthetic v2 in memory: the legacy ``signature`` hex
 # becomes the sole entry in ``signatures`` tagged ``ecdsa-secp256k1-sha256``,
 # and a synthetic verification method is materialized from the DID document
 # when available. Writer always emits v2.
-IDENTITY_PACKAGE_VERSION = "2.0.0"
+IDENTITY_PACKAGE_VERSION = "2.1.0"
 IDENTITY_PACKAGE_VERSION_LEGACY = "1.0.0"
 
 # Default suite for legacy v1 signatures (every existing v1 package was
@@ -306,6 +310,11 @@ class AgentIdentityPackage:
     # resolve a public key from its kid without an external DID resolution.
     verification_methods: List[Dict[str, str]] = field(default_factory=list)
 
+    # Public trust material for fresh-target verification. This is emitted
+    # only when present so pre-#2608 v2 packages retain their canonical hash.
+    # New packages bind it into the v2 content hash.
+    identity_trust: Optional[Dict[str, Any]] = None
+
     def __post_init__(self):
         """Set defaults after initialization."""
         if not self.export_timestamp:
@@ -313,7 +322,7 @@ class AgentIdentityPackage:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for JSON serialization."""
-        return {
+        data = {
             # Core identity
             "did": self.did,
             "agent_name": self.agent_name,
@@ -372,6 +381,9 @@ class AgentIdentityPackage:
             "signatures": list(self.signatures),
             "verification_methods": list(self.verification_methods),
         }
+        if self.identity_trust is not None:
+            data["identity_trust"] = self.identity_trust
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AgentIdentityPackage":
@@ -442,6 +454,7 @@ class AgentIdentityPackage:
             signature=legacy_signature,
             signatures=signatures,
             verification_methods=verification_methods,
+            identity_trust=data.get("identity_trust"),
         )
 
     def compute_content_hash(self) -> str:
@@ -451,8 +464,8 @@ class AgentIdentityPackage:
         Excludes ``content_hash`` and the active signature shape to
         avoid a circular dependency. The exact key set in the hashed
         payload is **version-dependent** — v1 packages already on disk
-        were signed over a JSON shape that did not contain ``signatures``
-        or ``verification_methods`` keys at all (those fields didn't
+        were signed over a JSON shape that did not contain ``signatures``,
+        ``verification_methods``, or ``identity_trust`` keys (those fields didn't
         exist), so emitting them with empty defaults would change the
         canonical bytes and break ``verify_content_hash`` on every
         legacy artifact.
@@ -461,14 +474,13 @@ class AgentIdentityPackage:
 
         - **v1** (``package_version == "1.0.0"``): pop ``content_hash``,
           ``signature``, AND the v2-only fields ``signatures`` and
-          ``verification_methods``. The remaining shape is byte-stable
+          ``verification_methods`` and ``identity_trust``. The remaining shape is byte-stable
           with the original v1 canonicalization.
         - **v2** (``package_version`` starts with ``"2."``): pop
           ``content_hash``, ``signature``, and ``signatures``. Keep
-          ``verification_methods`` — they carry public keys that the
-          signature must authenticate; excluding them would let an
-          attacker swap public keys post-sign without invalidating the
-          signature.
+          ``verification_methods`` and the optional ``identity_trust`` — they
+          carry public authorization material that the signature must
+          authenticate; excluding them would allow post-sign substitution.
 
         ``signature`` (the legacy single-hex field) is popped under
         both versions so a v1 package whose ``signature`` field is
@@ -482,11 +494,12 @@ class AgentIdentityPackage:
             # v2: signatures excluded; verification_methods bound.
             data.pop("signatures", None)
         else:
-            # v1: neither v2-only field existed at sign time. Pop both
+            # v1: none of the v2-only fields existed at sign time.
             # so the canonical bytes match what the original signer
             # produced.
             data.pop("signatures", None)
             data.pop("verification_methods", None)
+            data.pop("identity_trust", None)
 
         content = json.dumps(data, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(content.encode("utf-8")).hexdigest()

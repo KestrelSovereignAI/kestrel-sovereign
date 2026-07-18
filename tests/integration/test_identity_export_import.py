@@ -551,6 +551,42 @@ class TestIdentityExporter:
 class TestIdentityImporter:
     """Tests for IdentityImporter class."""
 
+    @pytest.mark.asyncio
+    async def test_chain_bound_hybrid_imports_into_fresh_target_without_custody(
+        self, test_db, post_ceremony_material, tmp_path,
+    ):
+        """Source A's public chain verifies before target B mutates state."""
+        from kestrel_sovereign.identity.signing import sign_package
+
+        constitution_text = "# Portable Constitution"
+        package = AgentIdentityPackage(
+            did=post_ceremony_material.legacy_did,
+            agent_name="Portable Bird",
+            created_at="2026-07-18T00:00:00+00:00",
+            constitution_hash=hashlib.sha256(
+                constitution_text.encode("utf-8")
+            ).hexdigest(),
+            constitution_text=constitution_text,
+            export_timestamp="2026-07-18T00:00:00+00:00",
+            source_substrate=SubstrateType.ANTHROPIC_CLAUDE.value,
+        )
+        sign_package(package, storage_dir=post_ceremony_material.storage_dir)
+        target_keys = tmp_path / "empty-target-keys"
+        target_keys.mkdir()
+        importer = IdentityImporter(
+            test_db,
+            target_agent_id="did:web:target.example:restored",
+            storage_dir=target_keys,
+        )
+
+        result = await importer.import_package(package, merge_mode="merge")
+
+        assert result.success, result.errors
+        evidence = result.stats["signature_verification"]
+        assert "portable" in evidence
+        assert f"trust_root={post_ceremony_material.legacy_did}" in evidence
+        assert package.identity_trust["successions"][0]["statement_id"] in evidence
+
     @pytest.fixture
     def sample_package(self):
         """Create a sample package for import testing."""

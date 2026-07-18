@@ -23,6 +23,11 @@ from kestrel_sovereign.identity.rotation_ceremony import run_rotation_ceremony
 from kestrel_sovereign.identity.signing import (
     sign_package, verify_package_signature,
 )
+from kestrel_sovereign.identity.portable_trust import IdentityTrustPolicy
+from kestrel_sovereign.identity.succession import (
+    SuccessionStatement,
+    compute_statement_id,
+)
 from kestrel_sovereign.inception_service import (
     public_key_to_ethereum_address,
 )
@@ -103,6 +108,18 @@ def test_legacy_agent_signs_v1_only(legacy_agent_dir):
     assert ok, msg
 
 
+def test_legacy_agent_remains_verifiable_on_fresh_target(
+    legacy_agent_dir, tmp_path,
+):
+    storage_dir, _, legacy_did, _ = legacy_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    target_dir = tmp_path / "empty-legacy-target"
+    target_dir.mkdir()
+    ok, msg = verify_package_signature(signed, storage_dir=target_dir)
+    assert ok, msg
+    assert f"trust_root={legacy_did}" in msg
+
+
 def test_legacy_tamper_detected(legacy_agent_dir):
     storage_dir, _, legacy_did, _ = legacy_agent_dir
     pkg = _make_package(legacy_did)
@@ -142,6 +159,129 @@ def test_hybrid_round_trip_verifies(post_ceremony_agent_dir):
     ok, msg = verify_package_signature(signed, storage_dir=storage_dir)
     assert ok, msg
     assert "hybrid" in msg.lower()
+
+
+def test_hybrid_package_verifies_on_fresh_target(post_ceremony_agent_dir, tmp_path):
+    """A chain-bound export needs no source private custody on target B."""
+    storage_dir, _, legacy_did, _, new_did = post_ceremony_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    target_dir = tmp_path / "empty-target"
+    target_dir.mkdir()
+
+    ok, msg = verify_package_signature(signed, storage_dir=target_dir)
+
+    assert ok, msg
+    assert f"trust_root={legacy_did}" in msg
+    statement_id = signed.identity_trust["successions"][0]["statement_id"]
+    assert statement_id in msg
+    assert signed.verification_methods[0]["controller"] == new_did
+    serialized = signed.to_json()
+    assert "private_key" not in serialized
+    assert ".key.enc" not in serialized
+
+
+def test_portable_hybrid_round_trip_survives_serialization(
+    post_ceremony_agent_dir, tmp_path,
+):
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    reloaded = AgentIdentityPackage.from_json(signed.to_json())
+    target_dir = tmp_path / "new-host"
+    target_dir.mkdir()
+    ok, msg = verify_package_signature(reloaded, storage_dir=target_dir)
+    assert ok, msg
+
+
+def test_portable_hybrid_revoked_link_fails_closed(
+    post_ceremony_agent_dir, tmp_path,
+):
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    statement = signed.identity_trust["successions"][0]
+    revoked_id = compute_statement_id(SuccessionStatement.from_dict(statement))
+    target_dir = tmp_path / "empty-target"
+    target_dir.mkdir()
+
+    ok, msg = verify_package_signature(
+        signed,
+        storage_dir=target_dir,
+        trust_policy=IdentityTrustPolicy.create(
+            revoked_succession_ids=[revoked_id]
+        ),
+    )
+
+    assert not ok
+    assert "revoked" in msg.lower()
+
+
+def test_portable_hybrid_wrong_policy_root_fails_closed(
+    post_ceremony_agent_dir, tmp_path,
+):
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    target_dir = tmp_path / "empty-target"
+    target_dir.mkdir()
+    ok, msg = verify_package_signature(
+        signed,
+        storage_dir=target_dir,
+        trust_policy=IdentityTrustPolicy.create(
+            trusted_root_did="did:pkh:eip155:1:0x0000000000000000000000000000000000000000"
+        ),
+    )
+    assert not ok
+    assert "root mismatch" in msg.lower()
+
+
+def test_portable_hybrid_tampered_chain_fails_closed(
+    post_ceremony_agent_dir, tmp_path,
+):
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    signed.identity_trust["successions"][0]["reason"] = "attacker rewrite"
+    target_dir = tmp_path / "empty-target"
+    target_dir.mkdir()
+    ok, msg = verify_package_signature(signed, storage_dir=target_dir)
+    assert not ok
+    assert "content hash mismatch" in msg.lower()
+
+
+def test_portable_hybrid_substituted_signer_vm_fails_closed(
+    post_ceremony_agent_dir, tmp_path,
+):
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    attacker = Secp256k1Suite().generate_keypair()
+    attacker_vm = build_verification_methods(
+        legacy_did, [(Secp256k1Suite(), attacker.public_key)]
+    )[0]
+    signed.identity_trust["successions"][0][
+        "successor_verification_methods"
+    ][0]["publicKeyMultibase"] = attacker_vm["publicKeyMultibase"]
+    target_dir = tmp_path / "empty-target"
+    target_dir.mkdir()
+    ok, msg = verify_package_signature(signed, storage_dir=target_dir)
+    assert not ok
+    assert "content hash mismatch" in msg.lower()
+
+
+def test_portable_hybrid_malformed_vm_returns_rejection_not_exception(
+    post_ceremony_agent_dir, tmp_path,
+):
+    """Hash-consistent hostile structure must preserve the tuple contract."""
+    storage_dir, _, legacy_did, _, _ = post_ceremony_agent_dir
+    signed = sign_package(_make_package(legacy_did), storage_dir=storage_dir)
+    signed.verification_methods.append({})
+    # An attacker can always recompute this public digest. The stale crypto
+    # signatures still cannot verify, but malformed structure must not crash
+    # direct verify_package_signature callers before that rejection.
+    signed.content_hash = signed.compute_content_hash()
+    target_dir = tmp_path / "empty-target"
+    target_dir.mkdir()
+
+    ok, msg = verify_package_signature(signed, storage_dir=target_dir)
+
+    assert not ok
+    assert "failed closed" in msg.lower()
 
 
 def test_hybrid_tamper_detected(post_ceremony_agent_dir):
