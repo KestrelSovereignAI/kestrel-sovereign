@@ -602,14 +602,13 @@ class StreamingMixin:
     async def process_input_streaming(
         self,
         user_input: str,
-        *,
-        invocation_context: Optional[LLMInvocationContext] = None,
         model_override: str = None,
         audit_before_streaming: bool = False,
         session_id: str = None,
         caller=None,
         request_id: Optional[str] = None,
         attachments: Optional[list] = None,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
@@ -1195,6 +1194,7 @@ class StreamingMixin:
                 session_id=session_id,
                 request_id=request_id,
                 images=eager_images or None,
+                invocation_context=resolved_context,
             ):
                 if isinstance(chunk, ThinkingDelta):
                     yield _build_thinking_sentinel(chunk)

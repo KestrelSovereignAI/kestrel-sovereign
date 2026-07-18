@@ -2971,7 +2971,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, *, invocation_context: Optional[LLMInvocationContext] = None, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -3825,6 +3825,7 @@ Expected Duration: {expected_duration}
             user_message=prompt,  # Pass original user message for subagent context
             session_id=session_id,
             tool_results=stop_tool_results,
+            invocation_context=resolved_context,
         )
 
         # Fire POST_RESPONSE hooks (e.g., response audit)
