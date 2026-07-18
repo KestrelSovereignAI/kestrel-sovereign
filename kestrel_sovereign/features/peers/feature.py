@@ -92,6 +92,19 @@ class OutboundArtifactValidationError(ValueError):
         self.code = code
 
 
+class OutboundSigningError(RuntimeError):
+    """A loaded hybrid identity could not authenticate an A2A envelope.
+
+    The public ``code`` is deliberately coarse: callers and the outbound audit
+    need an honest failure reason, but neither surface should receive provider
+    exception text that could disclose signing implementation details.
+    """
+
+    def __init__(self, code: str):
+        super().__init__("hybrid A2A envelope signing failed")
+        self.code = code
+
+
 def _normalize_outbound_artifact(item: Any, default_index: int) -> Dict[str, Any]:
     """Normalize one sender-supplied artifact into an A2A artifact wire
     dict (the shape the recipient's ``/tasks/send`` endpoint validates
@@ -306,7 +319,7 @@ class PeersFeature(Feature):
         sess_id: str,
         message: str,
     ) -> None:
-        """Sign the outbound A2A envelope if this agent has a hybrid identity (#1706).
+        """Sign the outbound A2A envelope for a loaded hybrid identity.
 
         Sets ``metadata["sender"]`` to the signing DID — the *verified*
         identifier — and attaches ``metadata["signature"]`` (hybrid Ed25519 +
@@ -314,8 +327,9 @@ class PeersFeature(Feature):
         timestamp). The kids are derived from the agent's published verification
         methods so the recipient's verifier can match them. Non-hybrid
         (pre-ceremony) agents send unsigned — the recipient allows that under
-        the same-host boundary (back-compat). Best-effort: a signing failure
-        falls back to sending unsigned rather than breaking dispatch.
+        the same-host boundary (back-compat). Once a hybrid identity is loaded,
+        missing material or any signer error raises ``OutboundSigningError`` so
+        the caller can abort before constructing an HTTP client (#2475).
         """
         identity = getattr(self.agent, "identity", None)
         if identity is None or not getattr(identity, "is_hybrid", False):
@@ -324,7 +338,7 @@ class PeersFeature(Feature):
         signing_did = getattr(identity, "signing_did", None)
         vms = getattr(identity, "new_verification_methods", None)
         if not keypair or not signing_did or not vms:
-            return
+            raise OutboundSigningError("missing_hybrid_signing_material")
         try:
             from datetime import datetime, timezone
             from kestrel_sovereign.a2a.envelope_signing import (
@@ -354,8 +368,12 @@ class PeersFeature(Feature):
             # The signed DID is the verified identifier the recipient binds to.
             md["sender"] = signing_did
             md["signature"] = block
-        except Exception as exc:  # noqa: BLE001 - never break dispatch on signing
-            logger.warning("A2A sign-on-send failed; sending unsigned: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - fail closed at trust boundary
+            logger.error(
+                "A2A sign-on-send failed for loaded hybrid identity (%s)",
+                type(exc).__name__,
+            )
+            raise OutboundSigningError("hybrid_signer_error") from exc
 
     @tool(
         name="list_peers",
@@ -669,9 +687,26 @@ class PeersFeature(Feature):
         # Cryptographic sender authentication (#1706): if this agent has a
         # hybrid identity, sign the envelope so the recipient can verify it
         # (#1673). Non-hybrid agents send unsigned — back-compat.
-        self._maybe_sign_outbound(
-            payload, task_id=task_id, sess_id=sess_id, message=message,
-        )
+        try:
+            self._maybe_sign_outbound(
+                payload, task_id=task_id, sess_id=sess_id, message=message,
+            )
+        except OutboundSigningError as exc:
+            # A loaded hybrid agent is never permitted to shed authentication.
+            # Record only a stable, non-secret code, and return before an HTTP
+            # client exists so retries cannot reuse an unsigned payload (#2475).
+            await _persist_outbound(error=f"signing_failed:{exc.code}")
+            return None, None, ToolResult.failed(
+                "A2A dispatch aborted because hybrid envelope signing failed; "
+                "no network request was sent",
+                data={
+                    "sent": False,
+                    "recipient": recipient,
+                    "task_id": task_id,
+                    "error_type": "a2a_signing_failed",
+                    "error_code": exc.code,
+                },
+            )
 
         try:
             async with httpx.AsyncClient() as client:
