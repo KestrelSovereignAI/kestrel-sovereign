@@ -6,9 +6,11 @@ from pathlib import Path
 
 from kestrel_sovereign.identity.protected_export import (
     configured_identity_export_roots,
+    effective_identity_export_roots,
     identity_export_directory,
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
+from kestrel_sovereign.setup.env_file import write_env
 
 
 def test_runtime_agent_data_directory_is_the_default(tmp_path):
@@ -97,3 +99,70 @@ def test_doctor_roots_include_each_agent_and_configured_override(tmp_path):
     assert (tmp_path / "agent_data" / "claw").resolve() in roots
     assert (tmp_path / "agent_data" / "claw" / "continuity").resolve() in roots
     assert (tmp_path / "agent_data" / "emma").resolve() in roots
+
+
+def test_effective_roots_use_dotenv_when_process_path_is_unset(tmp_path):
+    write_env(tmp_path / ".env", {"KESTREL_DATA_DIR": "dotenv-exports"})
+
+    roots = effective_identity_export_roots(tmp_path, process_env={})
+
+    assert (tmp_path / "dotenv-exports").resolve() in roots
+
+
+def test_effective_roots_use_process_environment_without_dotenv(tmp_path):
+    roots = effective_identity_export_roots(
+        tmp_path,
+        process_env={"KESTREL_DATA_DIR": "live-exports"},
+    )
+
+    assert (tmp_path / "live-exports").resolve() in roots
+
+
+def test_effective_roots_process_environment_overrides_dotenv(tmp_path):
+    write_env(tmp_path / ".env", {"KESTREL_DATA_DIR": "dotenv-exports"})
+
+    roots = effective_identity_export_roots(
+        tmp_path,
+        process_env={"KESTREL_DATA_DIR": "live-exports"},
+    )
+
+    assert (tmp_path / "live-exports").resolve() in roots
+    assert (tmp_path / "dotenv-exports").resolve() not in roots
+
+
+def test_effective_roots_empty_process_value_suppresses_dotenv(tmp_path):
+    write_env(tmp_path / ".env", {"KESTREL_DATA_DIR": "dotenv-exports"})
+
+    roots = effective_identity_export_roots(
+        tmp_path,
+        process_env={"KESTREL_DATA_DIR": ""},
+    )
+
+    assert roots == ((tmp_path / "agent_data").resolve(),)
+
+
+def test_effective_roots_support_legacy_agent_data_dir(tmp_path):
+    roots = effective_identity_export_roots(
+        tmp_path,
+        process_env={"AGENT_DATA_DIR": "legacy-exports"},
+    )
+
+    assert (tmp_path / "legacy-exports").resolve() in roots
+
+
+def test_effective_roots_unset_case_is_the_project_default(tmp_path):
+    roots = effective_identity_export_roots(tmp_path, process_env={})
+
+    assert roots == ((tmp_path / "agent_data").resolve(),)
+
+
+def test_effective_roots_resolve_relative_values_against_absolute_project(tmp_path):
+    nested_project = tmp_path / "nested" / "project"
+    nested_project.mkdir(parents=True)
+
+    roots = effective_identity_export_roots(
+        nested_project,
+        process_env={"KESTREL_IDENTITY_EXPORT_DIR": "relative/exports"},
+    )
+
+    assert (nested_project / "relative" / "exports").resolve() in roots

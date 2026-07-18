@@ -80,6 +80,13 @@ configured data roots. It reports unsafe root/file modes, links, non-regular
 entries, and ownership problems as a warning. It reports counts and roots, not
 package contents.
 
+Doctor and `identity harden-exports` resolve the exact same root list. They read
+identity-placement values from the target project's `.env`, then overlay the
+live process environment so an exported `KESTREL_IDENTITY_EXPORT_DIR`,
+`KESTREL_DATA_DIR`, or legacy `AGENT_DATA_DIR` wins. Relative values in either
+source resolve against the target project directory. Other environment values,
+including credentials, are not copied into this metadata-only resolver.
+
 To remediate eligible entries:
 
 ```bash

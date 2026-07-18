@@ -6,7 +6,10 @@ import stat
 from types import SimpleNamespace
 
 from kestrel_sovereign import cli
+from kestrel_sovereign import doctor
+from kestrel_sovereign.identity import protected_export
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
+from kestrel_sovereign.setup.env_file import write_env
 
 
 def test_identity_harden_exports_command_is_registered():
@@ -125,3 +128,48 @@ def test_identity_harden_exports_does_not_chmod_agent_root_without_exports(
 
     assert exit_code == 0
     assert stat.S_IMODE(agent_root.stat().st_mode) == 0o755
+
+
+def test_doctor_and_hardener_use_identical_effective_roots(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    secret = "must-not-appear-in-diagnostics"
+    write_env(
+        tmp_path / ".env",
+        {
+            "KESTREL_DATA_DIR": "dotenv-exports",
+            "KESTREL_DATA_KEY": secret,
+        },
+    )
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
+    monkeypatch.delenv("KESTREL_IDENTITY_EXPORT_DIR", raising=False)
+    monkeypatch.delenv("AGENT_DATA_DIR", raising=False)
+    monkeypatch.setenv("KESTREL_DATA_DIR", "live-exports")
+    captured = {}
+
+    def capture_doctor(roots):
+        captured["doctor"] = tuple(roots)
+        return []
+
+    def capture_hardener(roots):
+        captured["hardener"] = tuple(roots)
+        return protected_export.LegacyIdentityExportHardeningResult()
+
+    monkeypatch.setattr(doctor, "audit_legacy_identity_exports", capture_doctor)
+    monkeypatch.setattr(
+        protected_export,
+        "harden_legacy_identity_exports",
+        capture_hardener,
+    )
+
+    doctor._check_legacy_identity_exports(tmp_path, doctor.DoctorReport())
+    exit_code = cli.cmd_identity(SimpleNamespace(identity_command="harden-exports"))
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert captured["doctor"] == captured["hardener"]
+    assert (tmp_path / "live-exports").resolve() in captured["doctor"]
+    assert (tmp_path / "dotenv-exports").resolve() not in captured["doctor"]
+    assert secret not in output

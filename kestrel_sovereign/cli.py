@@ -644,15 +644,12 @@ def cmd_identity(args) -> int:
 
     from kestrel_sovereign.identity.protected_export import (
         IdentityExportSecurityError,
-        configured_identity_export_roots,
+        effective_identity_export_roots,
         harden_legacy_identity_exports,
     )
-    from kestrel_sovereign.setup.env_file import read_env
 
     project_dir = _get_project_dir()
-    configured_env = read_env(project_dir / ".env")
-    configured_env.update(os.environ)
-    roots = configured_identity_export_roots(project_dir, env=configured_env)
+    roots = effective_identity_export_roots(project_dir)
     try:
         result = harden_legacy_identity_exports(roots)
     except IdentityExportSecurityError as exc:
