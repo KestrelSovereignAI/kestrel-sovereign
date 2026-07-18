@@ -268,6 +268,11 @@ TOOL_ALLOWLIST = (
 # ---------------------------------------------------------------------------
 # Talon dispatch / write tools — the orchestrator never claims or dispatches
 # directly; it commissions all code changes through fleet_coding_pipeline.
+# ``talon_github_write`` (#2581) is the coordinator's bounded GitHub issue-write
+# job (close/reopen/comment/label/update): a mutation that pushes state back to
+# GitHub, so it belongs in the denied set — the orchestrator reads fleet repos
+# but never mutates them directly; issue lifecycle writes flow through the
+# fleet_coding_pipeline run, not a direct orchestrator call.
 TALON_DISPATCH_TOOLS = frozenset(
     {
         "talon_claim",
@@ -277,6 +282,7 @@ TALON_DISPATCH_TOOLS = frozenset(
         "talon_verify",
         "talon_setup_workspace",
         "talon_schedule_work_rescue",
+        "talon_github_write",
         "talon_pause",
         "talon_resume",
     }

@@ -70,13 +70,15 @@ def test_allowlist_denies_write_edit_and_talon_dispatch_tools():
         assert fo.is_tool_denied(tool), f"{tool} must be denied"
         assert not fo.is_tool_allowed(tool)
 
-    # Talon claim/dispatch tools are denied.
+    # Talon claim/dispatch tools are denied — including the #2581 bounded
+    # GitHub issue-write job, which mutates GitHub state directly.
     for tool in (
         "talon_claim",
         "talon_file_and_claim",
         "talon_batch",
         "talon_setup_workspace",
         "talon_schedule_work_rescue",
+        "talon_github_write",
     ):
         assert fo.is_tool_denied(tool), f"{tool} must be denied"
 
