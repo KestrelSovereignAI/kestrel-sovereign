@@ -311,6 +311,7 @@ class KestrelAgent(
         payer_policy=None,
         host_db=None,
         sovereign_trust_root_path: Optional[str] = None,
+        identity_export_dir: Optional[Path] = None,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -346,6 +347,9 @@ class KestrelAgent(
                        When omitted, the shared resolver reads
                        ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``. The graph database
                        is never a trust-root source.
+            identity_export_dir: Optional per-agent local identity export
+                       directory. Multi-agent hosts resolve this before agent
+                       construction so it never depends on process CWD.
         """
         self.did = did
         self._privacy_mode = privacy_mode
@@ -358,6 +362,7 @@ class KestrelAgent(
         self._injected_payer_policy = payer_policy
         self._injected_host_db = host_db
         self._sovereign_trust_root_path = sovereign_trust_root_path
+        self.identity_export_dir = identity_export_dir
 
         # Per-agent constitution overlay (#898). When ``<agent_dir>/CONSTITUTION.md``
         # exists, its text becomes ``self.constitution_text`` so feature-side

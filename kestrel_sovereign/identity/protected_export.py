@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 IDENTITY_EXPORT_PATTERN = "identity_*.json"
+IDENTITY_EXPORT_DIR_ENV = "KESTREL_IDENTITY_EXPORT_DIR"
 _TEMP_PREFIX = ".identity-export-"
 _TEMP_SUFFIX = ".tmp"
 
@@ -55,12 +56,35 @@ class LegacyIdentityExportHardeningResult:
 
 def identity_export_directory(
     *,
+    agent_data_dir: Path | str | None = None,
+    per_agent_override: Path | str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Path:
-    """Return the one local export directory used by the identity feature."""
+    """Return the absolute, agent-bound local identity export directory.
+
+    ``per_agent_override`` is the strongest signal because an in-process host
+    cannot represent distinct agent settings with one process environment.
+    ``KESTREL_IDENTITY_EXPORT_DIR`` carries a process-managed child's resolved
+    binding without overloading unrelated data-placement settings.
+    ``KESTREL_DATA_DIR`` remains the intentional standalone legacy override.
+    Without an override, exports follow the active agent's data root instead of
+    falling into a process-CWD-relative shared directory.
+
+    ``KESTREL_DB_PATH`` is retained as the direct single-agent fallback for
+    callers that do not have an agent object.  The historical ``agent_data``
+    default is used only when no runtime identity/storage binding exists.
+    """
 
     environ = os.environ if env is None else env
-    return Path(environ.get("KESTREL_DATA_DIR", "agent_data")).expanduser()
+    candidate = (
+        per_agent_override
+        or environ.get(IDENTITY_EXPORT_DIR_ENV)
+        or environ.get("KESTREL_DATA_DIR")
+        or agent_data_dir
+        or environ.get("KESTREL_DB_PATH")
+        or "agent_data"
+    )
+    return _absolute_path(candidate)
 
 
 def configured_identity_export_roots(
@@ -80,10 +104,13 @@ def configured_identity_export_roots(
     environ = os.environ if env is None else env
     candidates: list[Path | str] = []
     candidates.append("agent_data")
+    if environ.get(IDENTITY_EXPORT_DIR_ENV):
+        candidates.append(environ[IDENTITY_EXPORT_DIR_ENV])
     if environ.get("KESTREL_DATA_DIR"):
         candidates.append(environ["KESTREL_DATA_DIR"])
     if environ.get("AGENT_DATA_DIR"):
         candidates.append(environ["AGENT_DATA_DIR"])
+    candidates.extend(_configured_agent_export_roots(base))
     candidates.extend(additional_roots)
 
     roots: list[Path] = []
@@ -97,6 +124,33 @@ def configured_identity_export_roots(
         if key not in seen:
             roots.append(absolute)
             seen.add(key)
+    return tuple(roots)
+
+
+def _configured_agent_export_roots(project_dir: Path) -> tuple[Path, ...]:
+    """Return agent-bound roots declared by a valid multi-agent registry."""
+
+    from kestrel_sovereign.multi_agent.config import (
+        MULTI_AGENT_CONFIG_FILENAME,
+        MultiAgentConfig,
+    )
+
+    config_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
+    if not config_path.is_file():
+        return ()
+    try:
+        config = MultiAgentConfig.from_file(config_path)
+    except (OSError, ValueError):
+        # Doctor reports an invalid registry through its dedicated config
+        # check. Custody remediation must not guess roots from malformed data.
+        return ()
+
+    roots: list[Path] = []
+    for agent in config.get_local_agents().values():
+        roots.append(agent.resolve_data_dir(project_dir))
+        override = agent.resolve_identity_export_dir(project_dir)
+        if override is not None:
+            roots.append(override)
     return tuple(roots)
 
 
@@ -283,8 +337,14 @@ def harden_legacy_identity_exports(
                 refused += 1
                 continue
             try:
-                os.fchmod(directory_fd, 0o700)
                 names = _identity_export_names(directory_fd)
+            except OSError:
+                refused += 1
+                continue
+            if not names:
+                continue
+            try:
+                os.fchmod(directory_fd, 0o700)
             except OSError:
                 refused += 1
                 continue
@@ -665,6 +725,7 @@ def _unlink_if_same_identity(
 __all__ = [
     "IDENTITY_EXPORT_PATTERN",
     "IdentityExportSecurityError",
+    "IDENTITY_EXPORT_DIR_ENV",
     "LegacyIdentityExportFinding",
     "LegacyIdentityExportHardeningResult",
     "audit_legacy_identity_exports",

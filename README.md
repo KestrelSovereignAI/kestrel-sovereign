@@ -83,10 +83,13 @@ uv run kestrel start MyAgent    # if you ran step 5 (works regardless of autosta
 
 If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
 
-Local identity exports are plaintext continuity packages and are published under
-`KESTREL_DATA_DIR` (default `agent_data`) with a private `0700` directory and
-`0600` file, using an atomic no-clobber write. `kestrel doctor` reports legacy
-exports with unsafe metadata without reading their contents; run
+Local identity exports are plaintext continuity packages. By default they are
+published under the active agent's own data directory; standalone operators can
+override that root with `KESTREL_DATA_DIR`, and multi-agent operators can set
+`identity_export_dir` on an individual agent. Relative per-agent overrides are
+resolved below that agent's `data_dir`. The destination is a private `0700`
+directory with `0600` files and an atomic no-clobber write. `kestrel doctor`
+reports legacy exports with unsafe metadata without reading their contents; run
 `uv run kestrel identity harden-exports` to restrict eligible operator-owned
 legacy packages. See [Identity export custody](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md).
 

@@ -217,8 +217,8 @@ class TestStartAgent:
         assert "--port" in cmd
         assert "8801" in cmd
 
-    def test_start_agent_sets_env_vars(self, pm, project_dir):
-        """Start sets KESTREL_DB_PATH, PORT, KESTREL_SERVE_UI in env."""
+    def test_start_agent_sets_agent_bound_env_vars(self, pm, project_dir):
+        """Child storage and export roots both bind to this agent."""
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -230,9 +230,74 @@ class TestStartAgent:
             pm.start_agent("claw", cfg)
 
         env = mock_popen.call_args[1]["env"]
-        assert "KESTREL_DB_PATH" in env
+        expected_root = (project_dir / "agent_data" / "claw").resolve()
+        assert env["KESTREL_DB_PATH"] == str(expected_root)
+        assert env["KESTREL_IDENTITY_EXPORT_DIR"] == str(expected_root)
+        assert "KESTREL_DATA_DIR" not in env
         assert env["PORT"] == "8801"
         assert env["KESTREL_SERVE_UI"] == "false"
+
+    def test_start_agent_resolves_explicit_export_override_below_data_dir(
+        self,
+        pm,
+        project_dir,
+    ):
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"),
+            identity_export_dir=Path("continuity"),
+            port=8801,
+        )
+        mock_process = MagicMock(pid=12345)
+
+        with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+            pm.start_agent("claw", cfg)
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["KESTREL_IDENTITY_EXPORT_DIR"] == str(
+            (project_dir / "agent_data" / "claw" / "continuity").resolve()
+        )
+
+    def test_two_children_do_not_inherit_one_shared_parent_export_root(
+        self,
+        pm,
+        project_dir,
+    ):
+        configs = {
+            "claw": LocalAgentConfig(
+                data_dir=Path("agent_data/claw"),
+                port=8801,
+            ),
+            "testbot": LocalAgentConfig(
+                data_dir=Path("agent_data/testbot"),
+                port=8802,
+            ),
+        }
+        processes = [MagicMock(pid=12345), MagicMock(pid=12346)]
+
+        with (
+            patch.object(
+                pm,
+                "_load_env",
+                return_value={"KESTREL_DATA_DIR": "/shared-parent-root"},
+            ),
+            patch("subprocess.Popen", side_effect=processes) as mock_popen,
+        ):
+            for name, config in configs.items():
+                pm.start_agent(name, config)
+
+        export_roots = [
+            call.kwargs["env"]["KESTREL_IDENTITY_EXPORT_DIR"]
+            for call in mock_popen.call_args_list
+        ]
+        assert export_roots == [
+            str((project_dir / "agent_data" / name).resolve())
+            for name in configs
+        ]
+        assert len(set(export_roots)) == 2
+        assert {
+            call.kwargs["env"]["KESTREL_DATA_DIR"]
+            for call in mock_popen.call_args_list
+        } == {"/shared-parent-root"}
 
     def test_start_agent_port_in_use_raises(self, pm, project_dir):
         """Start raises RuntimeError if port is already in use."""

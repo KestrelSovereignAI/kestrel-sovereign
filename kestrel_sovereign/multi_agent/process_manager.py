@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from kestrel_sovereign.identity.protected_export import IDENTITY_EXPORT_DIR_ENV
 from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     MultiAgentConfig,
@@ -441,7 +442,8 @@ class ProcessManager:
             RuntimeError: If agent can't be started (port in use, already
                           running, validation error).
         """
-        resolved_dir = (self.project_dir / config.data_dir).resolve()
+        resolved_dir = config.resolve_data_dir(self.project_dir)
+        identity_export_dir = config.resolve_identity_export_dir(self.project_dir)
         pid_file = self.agent_pid_file(resolved_dir)
         log_file = self.agent_log_file(resolved_dir)
 
@@ -478,6 +480,10 @@ class ProcessManager:
         # Build env
         env = self._load_env()
         env["KESTREL_DB_PATH"] = str(resolved_dir)
+        # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
+        # the resolved custody root in a dedicated child-only variable so
+        # unrelated KESTREL_DATA_DIR consumers retain their existing meaning.
+        env[IDENTITY_EXPORT_DIR_ENV] = str(identity_export_dir or resolved_dir)
         env["PORT"] = str(config.port)
         env["KESTREL_SERVE_UI"] = "true" if standalone else "false"
         env["KESTREL_HOST_URL"] = f"http://localhost:{host_port}"

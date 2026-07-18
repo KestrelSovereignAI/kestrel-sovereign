@@ -6,6 +6,7 @@ import stat
 from types import SimpleNamespace
 
 from kestrel_sovereign import cli
+from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 
 
 def test_identity_harden_exports_command_is_registered():
@@ -62,3 +63,65 @@ def test_identity_harden_exports_refuses_link_without_touching_target(
     assert "refused=1" in output
     assert "outside-secret" not in output
     assert outside.read_text(encoding="utf-8") == "outside-secret"
+
+
+def test_identity_harden_exports_includes_per_agent_configured_root(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
+    monkeypatch.delenv("KESTREL_DATA_DIR", raising=False)
+    monkeypatch.delenv("AGENT_DATA_DIR", raising=False)
+    agent_root = tmp_path / "agent_data" / "claw"
+    export_root = agent_root / "continuity"
+    export_root.mkdir(parents=True, mode=0o755)
+    package = export_root / "identity_agent_bound.json"
+    package.write_text("continuity-secret", encoding="utf-8")
+    package.chmod(0o644)
+    MultiAgentConfig(
+        agents={
+            "claw": LocalAgentConfig(
+                data_dir="agent_data/claw",
+                identity_export_dir="continuity",
+                port=8801,
+            )
+        }
+    ).save(tmp_path / "multi_agent.toml")
+
+    exit_code = cli.cmd_identity(SimpleNamespace(identity_command="harden-exports"))
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "hardened=1" in output
+    assert stat.S_IMODE(export_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(package.stat().st_mode) == 0o600
+    assert package.read_text(encoding="utf-8") == "continuity-secret"
+
+
+def test_identity_harden_exports_does_not_chmod_agent_root_without_exports(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
+    monkeypatch.delenv("KESTREL_DATA_DIR", raising=False)
+    monkeypatch.delenv("AGENT_DATA_DIR", raising=False)
+    agent_root = tmp_path / "agent_data" / "claw"
+    agent_root.mkdir(parents=True, mode=0o755)
+    agent_root.chmod(0o755)
+    (agent_root / "kestrel_prime.db").touch()
+    MultiAgentConfig(
+        agents={
+            "claw": LocalAgentConfig(
+                data_dir="agent_data/claw",
+                port=8801,
+            )
+        }
+    ).save(tmp_path / "multi_agent.toml")
+
+    exit_code = cli.cmd_identity(SimpleNamespace(identity_command="harden-exports"))
+    capsys.readouterr()
+
+    assert exit_code == 0
+    assert stat.S_IMODE(agent_root.stat().st_mode) == 0o755

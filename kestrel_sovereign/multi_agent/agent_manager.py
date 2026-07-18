@@ -116,7 +116,10 @@ class AgentManager:
         Raises:
             ValueError: If agent data directory is invalid.
         """
-        resolved_dir = (self._base_data_dir / config.data_dir).resolve()
+        resolved_dir = config.resolve_data_dir(self._base_data_dir)
+        identity_export_dir = (
+            config.resolve_identity_export_dir(self._base_data_dir) or resolved_dir
+        )
 
         # Validate the data directory
         errors = config.validate_runtime(base_dir=self._base_data_dir)
@@ -148,6 +151,7 @@ class AgentManager:
                     database_url=database_url,
                     db_backend="postgres",
                     allowed_features=allowed_features,
+                    identity_export_dir=identity_export_dir,
                 )
             else:
                 agent = KestrelAgent(
@@ -155,6 +159,7 @@ class AgentManager:
                     storage_path=db_path,
                     llm_service=llm_service,
                     allowed_features=allowed_features,
+                    identity_export_dir=identity_export_dir,
                 )
 
             await agent.initialize()
