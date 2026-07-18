@@ -182,6 +182,10 @@ def sign_package(
             from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
             vms = agent_identity.new_verification_methods or []
             package.verification_methods = list(vms)
+            from kestrel_sovereign.identity.portable_trust import (
+                build_identity_trust_bundle,
+            )
+            package.identity_trust = build_identity_trust_bundle(agent_identity)
 
             content_hash = package.compute_content_hash()
             package.content_hash = content_hash
@@ -214,7 +218,17 @@ def sign_package(
             )
             return package
 
-        # Legacy path: single ECDSA signature, hex-encoded.
+        # Legacy path: single ECDSA signature, hex-encoded.  A normally
+        # provisioned identity also carries its self-certifying public trust
+        # root, allowing a fresh target to verify without private custody.
+        if agent_identity is not None:
+            from kestrel_sovereign.identity.portable_trust import (
+                build_identity_trust_bundle,
+            )
+            package.identity_trust = build_identity_trust_bundle(agent_identity)
+            package.verification_methods = list(
+                package.identity_trust["root_verification_methods"]
+            )
         content_hash = package.compute_content_hash()
         package.content_hash = content_hash
 
@@ -235,6 +249,7 @@ def sign_package(
 def verify_package_signature(
     package: AgentIdentityPackage,
     storage_dir: Optional[Path] = None,
+    trust_policy=None,
 ) -> Tuple[bool, str]:
     """
     Verify the signature on an identity package.
@@ -247,15 +262,19 @@ def verify_package_signature(
     2. **v2 hybrid signatures** — if ``package.signatures`` is non-empty,
        use it as the authoritative form. Both ed25519 AND ml-dsa-65
        must be present and verify (HYBRID_REQUIRED on identity-package
-       signing). Verification methods come from ``package.verification_methods``
-       embedded in the package itself; no external fetch needed.
+       signing). Local custody is preferred; on a fresh target the embedded
+       methods are accepted only through chain-bound portable trust evidence.
     3. **Legacy v1 fallback** — if ``signatures`` is empty, fall back to
        ``package.signature`` (single ECDSA hex over content_hash) for
        v1 packages that predate the v2 array.
+    4. **Portable fallback** — a missing local identity can be replaced by a
+       self-certifying root plus signed succession chain, or by an explicitly
+       receiver-pinned did:web root. Self-declared did:web keys are rejected.
 
     Args:
         package: The identity package to verify
         storage_dir: Directory containing the agent's DID document
+        trust_policy: Optional receiver-owned root pins and revocations.
 
     Returns:
         Tuple of (is_valid, message)
@@ -284,7 +303,7 @@ def verify_package_signature(
         for s in (package.signatures or [])
     )
     if has_hybrid_sig:
-        return _verify_v2_signatures(package, storage_dir)
+        return _verify_v2_signatures(package, storage_dir, trust_policy)
 
     # Step 3: legacy v1 fallback
     if not package.signature:
@@ -309,8 +328,15 @@ def verify_package_signature(
         return False, "Invalid signature"
 
     except FileNotFoundError:
-        # Try to verify using public key from DID document
-        return _verify_with_did_document(package, storage_dir)
+        # Prefer a same-host DID document for old packages.  New packages can
+        # fall back to their chain-bound public evidence on an empty target.
+        local_result = _verify_with_did_document(package, storage_dir)
+        if local_result[0] or not package.identity_trust:
+            return local_result
+        from kestrel_sovereign.identity.portable_trust import (
+            verify_portable_package,
+        )
+        return verify_portable_package(package, trust_policy)
     except Exception as e:
         return False, f"Verification failed: {e}"
 
@@ -318,6 +344,7 @@ def verify_package_signature(
 def _verify_v2_signatures(
     package: AgentIdentityPackage,
     storage_dir: Optional[Path] = None,
+    trust_policy=None,
 ) -> Tuple[bool, str]:
     """Verify the v2 ``signatures`` array on a hybrid identity package.
 
@@ -347,27 +374,21 @@ def _verify_v2_signatures(
     # legacy ECDSA path uses — the receiver's local custody IS the
     # trust anchor. We never trust the package's self-supplied VMs.
     #
-    # Cross-substrate import (Agent A exports → Agent B imports
-    # without local custody) is a future extension that requires the
-    # package to carry a SIGNED SUCCESSION CHAIN binding package.did
-    # to the new did:web identity, and the receiver to walk that
-    # chain via verify_artifact_against_chain. The naive shortcut of
-    # fetching whatever did:web URI the package claims is unsafe:
-    # an attacker can publish their own did:web, claim it as the
-    # successor of any victim DID, and self-validate. Until the
-    # in-package chain shape is implemented, this path requires
-    # local custody and rejects cross-substrate cleanly.
+    # If local custody is absent, #2608's portable verifier walks the
+    # package's signed succession chain from a self-certifying or explicitly
+    # pinned root. It never treats an arbitrary did:web fetch as authority.
     try:
         anchor = _load_local_identity_for_did(package.did, storage_dir)
     except FileNotFoundError:
+        if package.identity_trust:
+            from kestrel_sovereign.identity.portable_trust import (
+                verify_portable_package,
+            )
+            return verify_portable_package(package, trust_policy)
         return False, (
             f"Cannot verify v2 hybrid package: no local identity "
-            f"for {package.did!r}. Cross-substrate import of hybrid "
-            f"packages requires the receiver to have local key "
-            f"custody for the claimed agent (a trusted root anchor). "
-            f"Inter-substrate transfer over an untrusted network "
-            f"will land in a follow-up that ships a chain-bound "
-            f"package format."
+            f"for {package.did!r} and the package has no chain-bound "
+            f"portable trust evidence."
         )
     except Exception as e:
         return False, f"Failed to load trusted identity: {e}"

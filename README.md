@@ -91,7 +91,12 @@ resolved below that agent's `data_dir`. The destination is a private `0700`
 directory with `0600` files and an atomic no-clobber write. `kestrel doctor`
 reports legacy exports with unsafe metadata without reading their contents; run
 `uv run kestrel identity harden-exports` to restrict eligible operator-owned
-legacy packages. See [Identity export custody](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md).
+legacy packages. New exports also carry public, signed succession evidence so a
+self-certifying `did:pkh`/`did:key` root can be verified on a fresh target
+without copying private source custody. Born-hybrid `did:web` roots require a
+receiver-owned public-key pin; package-declared or arbitrary network DID
+documents are never trusted. See
+[Identity export custody and fresh-target trust](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md).
 
 Your agent is now running. Two ports to know about, depending on which start form you used:
 

@@ -552,6 +552,98 @@ async def test_identity_package_verify_rejects_wrong_local_agent(tmp_path, hybri
     assert "custody" in msg or "not" in msg
 
 
+@pytest.mark.asyncio
+async def test_born_hybrid_portable_verify_requires_receiver_key_pin(
+    tmp_path, hybrid_env,
+):
+    """A package-declared did:web document is evidence, not authority."""
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.portable_trust import IdentityTrustPolicy
+    from kestrel_sovereign.identity.signing import (
+        sign_package, verify_package_signature,
+    )
+
+    source_dir = tmp_path / "source"
+    target_dir = tmp_path / "fresh-target"
+    source_dir.mkdir()
+    target_dir.mkdir()
+    creds = await create_kestrel_identity_async(
+        str(source_dir), CONSTITUTION, agent_name="Pinnedbird",
+    )
+    package = AgentIdentityPackage(
+        did=creds.agent_did,
+        agent_name="Pinnedbird",
+        created_at="2026-07-11T00:00:00Z",
+        constitution_hash="abc123",
+        constitution_text="# Test",
+    )
+    signed = sign_package(package, storage_dir=source_dir)
+
+    ok, msg = verify_package_signature(signed, storage_dir=target_dir)
+    assert not ok
+    assert "self-declared" in msg
+
+    policy = IdentityTrustPolicy.create(
+        trusted_root_did=creds.agent_did,
+        trusted_root_verification_methods=signed.identity_trust[
+            "root_verification_methods"
+        ],
+    )
+    ok, msg = verify_package_signature(
+        signed, storage_dir=target_dir, trust_policy=policy
+    )
+    assert ok, msg
+    assert f"trust_root={creds.agent_did}" in msg
+
+
+@pytest.mark.asyncio
+async def test_born_hybrid_portable_verify_rejects_substituted_policy_pin(
+    tmp_path, hybrid_env,
+):
+    from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+    from kestrel_sovereign.identity.did_web import build_verification_methods
+    from kestrel_sovereign.identity.identity_package import AgentIdentityPackage
+    from kestrel_sovereign.identity.portable_trust import IdentityTrustPolicy
+    from kestrel_sovereign.identity.signing import sign_package, verify_package_signature
+    from kestrel_sovereign.security.crypto_suite import get_suite
+
+    source_dir = tmp_path / "source"
+    target_dir = tmp_path / "fresh-target"
+    source_dir.mkdir()
+    target_dir.mkdir()
+    creds = await create_kestrel_identity_async(
+        str(source_dir), CONSTITUTION, agent_name="Pinnedbird",
+    )
+    signed = sign_package(
+        AgentIdentityPackage(
+            did=creds.agent_did,
+            agent_name="Pinnedbird",
+            created_at="2026-07-11T00:00:00Z",
+            constitution_hash="abc123",
+            constitution_text="# Test",
+        ),
+        storage_dir=source_dir,
+    )
+    attacker = generate_hybrid_keypair()
+    attacker_vms = build_verification_methods(
+        creds.agent_did,
+        [
+            (get_suite(attacker.classical.suite_id), attacker.classical.public_key),
+            (get_suite(attacker.pq.suite_id), attacker.pq.public_key),
+        ],
+    )
+    ok, msg = verify_package_signature(
+        signed,
+        storage_dir=target_dir,
+        trust_policy=IdentityTrustPolicy.create(
+            trusted_root_did=creds.agent_did,
+            trusted_root_verification_methods=attacker_vms,
+        ),
+    )
+    assert not ok
+    assert "policy pin" in msg.lower()
+
+
 def test_sign_mandate_refuses_keyless_parent():
     from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 

@@ -117,3 +117,51 @@ adapter bounds local-cache and streamed network input as well as decompression
 and decrypted output, preventing a compressed response from bypassing the
 limit. Expected intake failures return source metadata and a sanitized reason;
 they do not log or echo package bytes.
+
+## Fresh-target signature trust
+
+New signed exports carry an `identity_trust` bundle containing public
+verification methods and the ordered, signed succession statements needed to
+identify the current signer. It contains no private keys. The bundle is part of
+the v2 content hash, so changing a link or public key invalidates the package
+signature as well as the link's own predecessor/successor signatures.
+
+Verification still needs a trust bootstrap. Kestrel applies these rules:
+
+1. A `did:pkh` or `did:key` root is self-certifying. The verifier proves that
+   every root Multikey derives the DID, then walks the signed chain offline.
+2. A root `did:web` is not self-certifying. A fresh receiver must supply an
+   `IdentityTrustPolicy` whose `trusted_root_verification_methods` exactly pin
+   the root keys. Repeating only the DID is insufficient.
+3. Arbitrary network resolution and package-declared `did:web` methods are
+   never trust anchors. A package cannot make its own keys authoritative.
+4. Succession revocations come from the receiver's
+   `revoked_succession_ids`. They are intentionally not carried as an
+   authoritative package field because a compromised exporter could omit its
+   own revocation.
+
+Self-certification answers “which key controls this DID,” not “is this the DID
+the operator intended to restore.” Receivers that expect a specific agent
+should set `trusted_root_did` even for `did:pkh` / `did:key`; a mismatch then
+fails before import. For a chain-less compromised root, exclude it by pinning
+the expected root/allowlist. `revoked_succession_ids` applies only to actual
+succession statements and is not a root-DID denylist.
+
+For the ordinary legacy-to-hybrid rotation, the package DID remains the
+self-certifying legacy `did:pkh` root while the active Ed25519 + ML-DSA-65
+successor signs the package. A package copied from source directory A therefore
+verifies and imports in an empty target directory B without copying source
+private custody or using the network. Verification output reports
+`trust_root=<did>` and the exact `chain_evidence=<statement ids>` used.
+
+Born-hybrid `did:web` agents have no self-certifying predecessor. Their packages
+remain portable, but the root key pin must travel through a separate trusted
+operator channel. Applications may pass `IdentityTrustPolicy` directly to
+`verify_package_signature` / `IdentityImporter.import_package`; the identity
+feature tools accept the equivalent `identity_trust_policy` object. Archival
+SLH-DSA enforcement is optional receiver policy and requires its public-key pin.
+
+Packages written before this format remain compatible with same-host local-key
+or local-DID-document verification. They cannot acquire a safe portable trust
+chain retroactively; re-export them from the source host after upgrading when a
+fresh-target disaster-recovery artifact is required.

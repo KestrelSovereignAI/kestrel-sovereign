@@ -84,6 +84,11 @@ from .substrate_resolution import (
     resolve_active_substrate,
 )
 
+from .portable_trust import (
+    IdentityTrustPolicy,
+    PORTABLE_TRUST_VERSION,
+)
+
 from .continuity_verifier import (
     ContinuityVerifier,
     ChallengeGenerator,
@@ -159,6 +164,8 @@ __all__ = [
     "generate_migration_prompt",
     "SubstrateResolution",
     "resolve_active_substrate",
+    "IdentityTrustPolicy",
+    "PORTABLE_TRUST_VERSION",
     # Continuity Verification
     "ContinuityVerifier",
     "ChallengeGenerator",

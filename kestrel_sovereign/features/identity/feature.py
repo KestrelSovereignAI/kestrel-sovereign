@@ -87,6 +87,60 @@ def _runtime_identity_export_dir(agent: Any) -> Path:
     )
 
 
+def _parse_identity_trust_policy(raw: Optional[Dict[str, Any]]):
+    """Validate a tool-supplied receiver trust policy.
+
+    The package never supplies this object.  It must come from the receiving
+    operator (typically a pinned root registry and revocation feed).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("identity_trust_policy must be an object")
+    allowed = {
+        "trusted_root_did",
+        "trusted_root_verification_methods",
+        "revoked_succession_ids",
+        "require_archival",
+        "trusted_archival_multibase",
+    }
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(
+            f"identity_trust_policy has unknown fields: {sorted(unknown)}"
+        )
+    root_did = raw.get("trusted_root_did")
+    if root_did is not None and not isinstance(root_did, str):
+        raise ValueError("identity_trust_policy.trusted_root_did must be a string")
+    root_vms = raw.get("trusted_root_verification_methods", [])
+    if not isinstance(root_vms, list) or any(not isinstance(vm, dict) for vm in root_vms):
+        raise ValueError(
+            "identity_trust_policy.trusted_root_verification_methods "
+            "must be an array of objects"
+        )
+    revoked = raw.get("revoked_succession_ids", [])
+    if not isinstance(revoked, list) or any(not isinstance(item, str) for item in revoked):
+        raise ValueError(
+            "identity_trust_policy.revoked_succession_ids must be an array of strings"
+        )
+    require_archival = raw.get("require_archival", False)
+    if not isinstance(require_archival, bool):
+        raise ValueError("identity_trust_policy.require_archival must be a boolean")
+    archival_pin = raw.get("trusted_archival_multibase")
+    if archival_pin is not None and not isinstance(archival_pin, str):
+        raise ValueError(
+            "identity_trust_policy.trusted_archival_multibase must be a string"
+        )
+    from kestrel_sovereign.identity.portable_trust import IdentityTrustPolicy
+    return IdentityTrustPolicy.create(
+        trusted_root_did=root_did,
+        trusted_root_verification_methods=root_vms,
+        revoked_succession_ids=revoked,
+        require_archival=require_archival,
+        trusted_archival_multibase=archival_pin,
+    )
+
+
 class IdentityFeature(Feature):
     """
     Feature for managing agent identity portability.
@@ -462,6 +516,7 @@ class IdentityFeature(Feature):
         merge_mode: str = "merge",
         key_hash: Optional[str] = None,
         allow_unsigned: bool = False,
+        identity_trust_policy: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         """
         Import agent identity from a package.
@@ -481,6 +536,11 @@ class IdentityFeature(Feature):
                 the importer rejects unsigned packages by default. Pass True to
                 restore such an export. Default False — an unsigned package is an
                 integrity risk, so this is opt-in and warned on.
+            identity_trust_policy: Receiver-owned root key pins, succession
+                revocations, and optional archival requirements. Required for
+                fresh-target did:web roots; never copy this from the package.
+                Set trusted_root_did for any DID method when the import must
+                be bound to one specific expected agent.
         """
         if not isinstance(verify_signature, bool):
             return ToolResult.failed(
@@ -501,6 +561,8 @@ class IdentityFeature(Feature):
 
         try:
             from kestrel_sovereign.identity import IdentityImporter
+
+            trust_policy = _parse_identity_trust_policy(identity_trust_policy)
 
             package_json = await load_identity_package_source(
                 source,
@@ -547,6 +609,7 @@ class IdentityFeature(Feature):
                 verify_signature=verify_signature,
                 merge_mode=merge_mode,
                 allow_unsigned=allow_unsigned,
+                identity_trust_policy=trust_policy,
             )
         except IdentityPackageIntakeError as e:
             return ToolResult.failed(
@@ -615,7 +678,12 @@ class IdentityFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!identity verify"
     )
-    async def verify_identity(self, source: str, key_hash: Optional[str] = None) -> ToolResult:
+    async def verify_identity(
+        self,
+        source: str,
+        key_hash: Optional[str] = None,
+        identity_trust_policy: Optional[Dict[str, Any]] = None,
+    ) -> ToolResult:
         """
         Verify an identity package.
 
@@ -624,9 +692,13 @@ class IdentityFeature(Feature):
             key_hash: Encryption key hash for an ENCRYPTED CID export (F187),
                 required to decrypt a package uploaded to IPFS/Filecoin.
                 Ignored for local file sources.
+            identity_trust_policy: Receiver-owned root key pins, succession
+                revocations, and optional archival requirements.
         """
         try:
             from kestrel_sovereign.identity import verify_package_signature
+
+            trust_policy = _parse_identity_trust_policy(identity_trust_policy)
 
             package_json = await load_identity_package_source(
                 source,
@@ -663,11 +735,17 @@ class IdentityFeature(Feature):
             # by design for post-ceremony agents.
             sig_status = "UNSIGNED"
             if package.signature or package.signatures:
-                is_valid, msg = verify_package_signature(
-                    package,
-                    _runtime_agent_data_dir(self.agent),
-                )
-                sig_status = "VALID" if is_valid else f"INVALID: {msg}"
+                if trust_policy is None:
+                    is_valid, msg = verify_package_signature(
+                        package, _runtime_agent_data_dir(self.agent)
+                    )
+                else:
+                    is_valid, msg = verify_package_signature(
+                        package,
+                        _runtime_agent_data_dir(self.agent),
+                        trust_policy=trust_policy,
+                    )
+                sig_status = f"VALID: {msg}" if is_valid else f"INVALID: {msg}"
         except IdentityPackageIntakeError as e:
             return ToolResult.failed(
                 f"Identity package intake failed: {e}",
