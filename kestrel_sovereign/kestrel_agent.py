@@ -11,6 +11,7 @@ from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.security.encryption import DecryptionError
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.config import TRUSTED_AGENTS_DIR
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from typing import Optional, Dict, List, Any, Union
@@ -36,7 +37,10 @@ from kestrel_sovereign.a2a.stores import (
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
-from kestrel_sovereign.agent.streaming import StreamingMixin
+from kestrel_sovereign.agent.streaming import (
+    StreamingMixin,
+    resolve_turn_invocation_context,
+)
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin, ContextStats
@@ -2967,13 +2971,25 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
 
+        ``invocation_context`` is the modern identity-passing path (immutable,
+        per-request). Prefer it in new consumers; the legacy
+        ``LLMService.set_observability_context`` state remains as a fallback.
+        When supplied, its fields win over the ambient state; an explicit
+        ``session_id`` still fills the context's ``session_id`` slot when the
+        caller-supplied context left it empty (see #2614 and
+        :func:`resolve_turn_invocation_context`).
+
         Args:
             user_input: The user's message
+            invocation_context: Optional immutable per-request correlation
+                identity (session/companion/user) for metering + telemetry.
+                Takes precedence over ``set_observability_context`` ambient
+                state; ``None`` falls back to that legacy path unchanged.
             model_override: Optional model to use (e.g., "openai/gpt-5", "ollama/llama3.2")
             session_id: Optional session ID to load conversation context from a specific session
             include_memories: Whether to include cross-session memory retrieval (default True).
@@ -3127,6 +3143,7 @@ Expected Duration: {expected_duration}
                     system_prompt_budget_bytes=system_prompt_budget_bytes,
                     anchored_doctrine=anchored_doctrine,
                     signal_wake=signal_wake,
+                    invocation_context=invocation_context,
                 )
 
     def _assemble_post_build_system_prompt(
@@ -3404,6 +3421,7 @@ Expected Duration: {expected_duration}
         system_prompt_budget_bytes: Optional[int] = None,
         anchored_doctrine=None,
         signal_wake: Optional[dict] = None,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> str:
         """Inner process_input logic wrapped in an OTEL span.
 
@@ -3732,6 +3750,14 @@ Expected Duration: {expected_duration}
         # adapters (anthropic, openai:api) ignore the callable, so passing
         # it unconditionally is safe and keeps the non-streaming path
         # parity with the streaming path (orchestrator_engine:1836).
+        # #2614: resolve the per-request correlation identity for THIS turn.
+        # Explicit ``invocation_context`` wins; otherwise fall back to the
+        # legacy ``set_observability_context`` ambient state, with the explicit
+        # ``session_id`` filling an empty session slot. Shared helper so the
+        # streaming path agrees on precedence.
+        resolved_context = resolve_turn_invocation_context(
+            self.llm_service, invocation_context, session_id
+        )
         response = await self.llm_service.generate_with_messages(
             messages=messages,
             force_local_only=force_local_only,
@@ -3740,6 +3766,7 @@ Expected Duration: {expected_duration}
             session_id=session_id,
             keep_trailing_system=operator_turn.keep_trailing_system,
             tool_executor=self._make_inline_tool_executor(session_id or ""),
+            invocation_context=resolved_context,
         )
 
         # Log LLM response timing
@@ -3798,6 +3825,7 @@ Expected Duration: {expected_duration}
             user_message=prompt,  # Pass original user message for subagent context
             session_id=session_id,
             tool_results=stop_tool_results,
+            invocation_context=resolved_context,
         )
 
         # Fire POST_RESPONSE hooks (e.g., response audit)

@@ -8,11 +8,19 @@ NO mock-returns-mock tests - each test verifies real logic.
 import pytest
 import asyncio
 import contextlib
+import inspect
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
+from kestrel_sovereign.agent.streaming import (
+    StreamingMixin,
+    resolve_turn_invocation_context,
+)
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
@@ -2229,3 +2237,210 @@ class TestPayerPolicyInjection:
         """No injection + no on-disk host.db → None (resolver falls back to agent db)."""
         agent = KestrelAgent(did="did:test:no-hostdb", storage_path=None)
         assert await agent._resolve_host_db() is None
+
+
+class TestInvocationContextThreading:
+    """#2614 — invocation_context threading through the agent layer.
+
+    The precedence rule under test (from resolve_turn_invocation_context):
+      1. explicit ``invocation_context`` wins;
+      2. else fall back to ``LLMService.set_observability_context`` ambient;
+      3. explicit ``session_id`` fills an empty session slot either way.
+    """
+
+    def _fresh_service(self):
+        """Real LLMService with the resolver + ambient state; no network."""
+        return LLMService.__new__(LLMService)
+
+    def _init_service_state(self, svc):
+        # __new__ skips __init__, so hand-initialize the pieces the resolver
+        # touches. Nothing else about the service is exercised here.
+        from kestrel_sovereign.llm.invocation_context import (
+            LLMInvocationContextState,
+        )
+        svc._invocation_context_state = LLMInvocationContextState()
+        svc._metering_callback = None
+        svc._metering_callback_accepts_cost = False
+
+    def test_explicit_context_wins_over_ambient(self):
+        svc = self._fresh_service()
+        self._init_service_state(svc)
+        svc.set_observability_context(companion_id="C_amb", user_id="U_amb")
+
+        explicit = LLMInvocationContext(companion_id="C_new", user_id="U_new")
+        resolved = resolve_turn_invocation_context(svc, explicit, session_id=None)
+
+        assert resolved.companion_id == "C_new"
+        assert resolved.user_id == "U_new"
+
+    def test_none_falls_back_to_ambient(self):
+        svc = self._fresh_service()
+        self._init_service_state(svc)
+        svc.set_observability_context(companion_id="C_amb", user_id="U_amb")
+
+        resolved = resolve_turn_invocation_context(svc, None, session_id=None)
+
+        assert resolved.companion_id == "C_amb"
+        assert resolved.user_id == "U_amb"
+
+    def test_explicit_session_id_fills_empty_slot(self):
+        svc = self._fresh_service()
+        self._init_service_state(svc)
+
+        explicit = LLMInvocationContext(companion_id="C", user_id="U")
+        resolved = resolve_turn_invocation_context(svc, explicit, session_id="S")
+
+        assert resolved.session_id == "S"
+        assert resolved.companion_id == "C"
+        assert resolved.user_id == "U"
+
+    def test_agent_arg_session_id_wins_over_context_session_id(self):
+        """The agent-argument ``session_id`` is authoritative when present.
+
+        Documents the pre-existing resolver contract: ``session_id`` kwarg is
+        placed FIRST in ``_first_defined(...)``, so it wins over any
+        ``context.session_id`` the caller also supplied. Callers who want the
+        context's session to survive must pass ``session_id=None`` to the
+        agent entry point.
+        """
+        svc = self._fresh_service()
+        self._init_service_state(svc)
+
+        explicit = LLMInvocationContext(
+            session_id="from_context", companion_id="C", user_id="U",
+        )
+        resolved = resolve_turn_invocation_context(
+            svc, explicit, session_id="from_agent_arg",
+        )
+
+        assert resolved.session_id == "from_agent_arg"
+
+    def test_minimal_service_double_still_resolves(self):
+        """A test double without ``_resolve_invocation_context`` still works.
+
+        Guards the fallback branch in resolve_turn_invocation_context so a
+        stripped-down service (used by other unit tests) doesn't blow up.
+        """
+        double = SimpleNamespace()  # no _resolve_invocation_context attr
+        explicit = LLMInvocationContext(companion_id="C", user_id="U")
+        resolved = resolve_turn_invocation_context(double, explicit, session_id="S")
+
+        assert resolved.session_id == "S"
+        assert resolved.companion_id == "C"
+        assert resolved.user_id == "U"
+
+    def test_ambient_wins_over_no_context_no_session_id(self):
+        """No explicit context, no session_id → resolver returns ambient as-is."""
+        svc = self._fresh_service()
+        self._init_service_state(svc)
+        svc.set_observability_context(
+            session_id="S_amb", companion_id="C_amb", user_id="U_amb",
+        )
+
+        resolved = resolve_turn_invocation_context(svc, None, session_id=None)
+
+        assert resolved.session_id == "S_amb"
+        assert resolved.companion_id == "C_amb"
+        assert resolved.user_id == "U_amb"
+
+
+class TestInvocationContextEndToEndThreading:
+    """#2614 — end-to-end: explicit invocation_context reaches EVERY LLM call.
+
+    Codex round-1 P0: talon's initial cut only wired the first LLM call.
+    The tool-loop continuation, streaming-continuation, and repair paths
+    all lost the context — metering silently no-op'd for callers on the
+    modern (explicit-context) path because there was no ambient fallback.
+
+    These tests spy on ``LLMService.generate_with_messages`` /
+    ``stream_with_tool_detection`` invocation_context kwarg across every
+    call in a turn.
+    """
+
+    def test_orchestrator_response_threads_context_into_continuation(
+        self,
+    ):
+        """Tool-loop continuation must receive the same explicit context."""
+        import asyncio as _asyncio
+        from kestrel_sovereign.llm.adapter import LLMResponse
+
+        seen_contexts = []
+
+        class _StubService:
+            async def generate_with_messages(self, **kwargs):
+                seen_contexts.append(kwargs.get("invocation_context"))
+                # Return a terminal string so the loop exits after one call.
+                return "final answer"
+
+        agent = KestrelAgent.__new__(KestrelAgent)
+        agent.llm_service = _StubService()
+        agent._make_inline_tool_executor = lambda sid: None
+        agent._visible_features_by_tool_name = lambda: {}
+        agent._visible_known_tool_names = lambda: set()
+        agent._execute_tool_batch = _AsyncMockCallable()
+        agent._build_all_tools = lambda: []
+        agent._prune_orchestrator_messages = lambda m, t: m
+
+        # A single tool_calls-carrying response that triggers ONE continuation.
+        tc = MagicMock(id="tc1", name="dummy_tool", arguments={})
+        first_response = LLMResponse(content=None, tool_calls=[tc])
+
+        explicit_ctx = LLMInvocationContext(companion_id="C", user_id="U")
+        _asyncio.run(agent._handle_orchestrator_response(
+            response=first_response,
+            feature_tools=[],
+            system_prompt="sys",
+            force_local_only=False,
+            effective_model="test-model",
+            max_iterations=2,
+            user_message="hi",
+            session_id="S",
+            invocation_context=explicit_ctx,
+        ))
+
+        assert seen_contexts, "continuation call was never made"
+        assert seen_contexts[0] is explicit_ctx, (
+            "continuation LLM call lost the explicit invocation_context"
+        )
+
+    def test_process_input_accepts_positional_model_override(self):
+        """Backwards-compat: positional model_override must still work.
+
+        Codex round-1 P1: talon's initial cut used ``*, invocation_context``
+        which broke ``agent.process_input(\"hi\", \"gpt-4\", \"session\")``.
+        """
+        import inspect as _inspect
+        sig = _inspect.signature(KestrelAgent.process_input)
+        params = list(sig.parameters.values())
+        # user_input, model_override must both be positional (POSITIONAL_OR_KEYWORD)
+        assert params[1].name == "user_input"
+        assert params[1].kind == _inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert params[2].name == "model_override"
+        assert params[2].kind == _inspect.Parameter.POSITIONAL_OR_KEYWORD
+        # invocation_context lives at the end as an optional kwarg
+        ctx_param = sig.parameters.get("invocation_context")
+        assert ctx_param is not None
+        assert ctx_param.default is None
+
+    def test_process_input_streaming_accepts_positional_model_override(self):
+        """Same backwards-compat cover for the streaming entry point."""
+        import inspect as _inspect
+        from kestrel_sovereign.agent.streaming import StreamingMixin
+        sig = _inspect.signature(StreamingMixin.process_input_streaming)
+        params = list(sig.parameters.values())
+        assert params[1].name == "user_input"
+        assert params[1].kind == _inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert params[2].name == "model_override"
+        assert params[2].kind == _inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ctx_param = sig.parameters.get("invocation_context")
+        assert ctx_param is not None
+        assert ctx_param.default is None
+
+
+class _AsyncMockCallable:
+    """Trivial async no-op used to stub agent hooks in end-to-end tests."""
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))

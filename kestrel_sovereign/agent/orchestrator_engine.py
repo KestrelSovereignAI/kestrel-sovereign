@@ -486,6 +486,7 @@ class OrchestratorEngineMixin:
         *,
         streaming: bool = False,
         request_id: Optional[str] = None,
+        invocation_context=None,
     ) -> Union[str, LLMResponse]:
         """Give the model one more step when it narrates continuing but emits no tool call."""
         content = response.content or ""
@@ -496,6 +497,11 @@ class OrchestratorEngineMixin:
             "[ORCHESTRATOR%s] Model signaled continuation without tool_calls; issuing one repair turn",
             "-STREAM" if streaming else "",
         )
+        # #2614: propagate the caller's explicit invocation_context (if any)
+        # so the repair turn's metering/tracing sees the same correlation
+        # identity as the original turn. Without this, an explicit-context
+        # caller loses companion/user attribution on repair calls (there is
+        # no ambient set_observability_context state to recover from).
         return await self.llm_service.generate_with_messages(
             messages=OrchestratorEngineMixin._append_missing_tool_call_repair(messages, content),
             tools=tools or None,
@@ -507,6 +513,7 @@ class OrchestratorEngineMixin:
                 (lambda: self.is_request_cancelled(request_id))
                 if request_id else None
             ),
+            invocation_context=invocation_context,
         )
 
     async def _execute_tool_with_hooks(
@@ -2087,6 +2094,7 @@ class OrchestratorEngineMixin:
         user_message: str = None,
         session_id: Optional[str] = None,
         tool_results: Optional[list] = None,
+        invocation_context=None,
     ) -> str:
         """
         Handle the orchestrator's response, executing any tool calls.
@@ -2179,6 +2187,9 @@ class OrchestratorEngineMixin:
             messages = self._prune_orchestrator_messages(messages, all_tools)
 
             logging.info(f"[ORCHESTRATOR] Calling LLM with {len(messages)} messages, {len(all_tools)} tools")
+            # #2614: propagate the caller's explicit invocation_context (if
+            # any) so each tool-loop continuation keeps the original turn's
+            # correlation identity for metering/tracing.
             response = await self.llm_service.generate_with_messages(
                 messages=messages,
                 tools=all_tools or None,
@@ -2186,6 +2197,7 @@ class OrchestratorEngineMixin:
                 model_override=effective_model,
                 session_id=session_id,
                 tool_executor=self._make_inline_tool_executor(session_id),
+                invocation_context=invocation_context,
             )
 
             if isinstance(response, str):
@@ -2319,6 +2331,7 @@ class OrchestratorEngineMixin:
         session_id: Optional[str] = None,
         request_id: Optional[str] = None,
         images: Optional[list] = None,
+        invocation_context=None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -2359,6 +2372,7 @@ class OrchestratorEngineMixin:
                     session_id=session_id,
                     streaming=True,
                     request_id=request_id,
+                    invocation_context=invocation_context,
                 )
                 if isinstance(response, str):
                     yield response
@@ -2545,6 +2559,7 @@ class OrchestratorEngineMixin:
                         model_override=effective_model,
                         session_id=session_id,
                         tool_executor=self._make_inline_tool_executor(session_id),
+                        invocation_context=invocation_context,
                         # #1662: keep the pasted image visible to the model that
                         # synthesizes the post-tool answer. The fold targets the
                         # genuine prompt turn (tool_result turns are skipped), so
@@ -2648,6 +2663,7 @@ class OrchestratorEngineMixin:
                         session_id=session_id,
                         streaming=True,
                         request_id=request_id,
+                        invocation_context=invocation_context,
                     )
                     if isinstance(response, str):
                         yield response
