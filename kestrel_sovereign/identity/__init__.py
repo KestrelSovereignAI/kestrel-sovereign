@@ -79,6 +79,11 @@ from .substrate_adapter import (
     generate_migration_prompt,
 )
 
+from .substrate_resolution import (
+    SubstrateResolution,
+    resolve_active_substrate,
+)
+
 from .continuity_verifier import (
     ContinuityVerifier,
     ChallengeGenerator,
@@ -152,6 +157,8 @@ __all__ = [
     "CapabilityGap",
     "discover_substrate_capabilities",
     "generate_migration_prompt",
+    "SubstrateResolution",
+    "resolve_active_substrate",
     # Continuity Verification
     "ContinuityVerifier",
     "ChallengeGenerator",
