@@ -98,6 +98,15 @@ receiver-owned public-key pin; package-declared or arbitrary network DID
 documents are never trusted. See
 [Identity export custody and fresh-target trust](docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md).
 
+When the optional Phoenix trace backend is installed, its prompts, model
+outputs, tool data, and SQLite state are kept in a private host-data directory:
+`$KESTREL_PHOENIX_WORKING_DIR` when explicitly set, otherwise
+`$KESTREL_HOME/host-data/phoenix` or `~/.kestrel/host-data/phoenix`. Kestrel
+creates directories as `0700`, supervisor files as `0600`, and launches Phoenix
+with `umask 077` so DB sidecars are private at creation. An insecure or
+ambiguous legacy store disables local tracing before the OTLP endpoint is
+auto-wired. See [Phoenix trace custody](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
+
 Your agent is now running. Two ports to know about, depending on which start form you used:
 
 | Command | Listens on | Why |

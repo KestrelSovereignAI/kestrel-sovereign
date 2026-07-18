@@ -4,13 +4,21 @@ No real Phoenix is needed: the subprocess is stubbed and the reverse proxy is
 driven through an ``httpx.MockTransport`` upstream.
 """
 
+import errno
+import os
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign import phoenix_supervisor as ps
+
+
+def _mode(path):
+    return path.stat().st_mode & 0o777
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +134,59 @@ def test_supervision_off_when_disabled_outside_pytest(monkeypatch):
     assert ps.should_supervise_phoenix() is False
 
 
+def test_default_working_dir_is_outside_source_checkout(tmp_path, monkeypatch):
+    source = tmp_path / "source-checkout"
+    (source / "kestrel_sovereign").mkdir(parents=True)
+    (source / "kestrel_sovereign" / "__init__.py").write_text("")
+    fake_home = tmp_path / "operator-home"
+    fake_home.mkdir()
+    monkeypatch.chdir(source)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("KESTREL_HOME", raising=False)
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+
+    assert ps.phoenix_working_dir() == (
+        fake_home / ".kestrel" / "host-data" / "phoenix"
+    ).resolve()
+    assert source not in ps.phoenix_working_dir().parents
+
+
+def test_working_dir_honours_explicit_home_and_override(tmp_path, monkeypatch):
+    explicit_home = tmp_path / "explicit-home"
+    monkeypatch.setenv("KESTREL_HOME", str(explicit_home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+    assert ps.phoenix_working_dir() == (
+        explicit_home / "host-data" / "phoenix"
+    ).resolve()
+
+    override = tmp_path / "dedicated-phoenix-volume"
+    monkeypatch.setenv(ps.PHOENIX_WORKING_DIR_ENV, str(override))
+    assert ps.phoenix_working_dir() == override.resolve()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode contract")
+def test_explicit_working_dir_override_does_not_restrict_parent_or_migrate(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "kestrel-home"
+    legacy = home / "phoenix"
+    legacy.mkdir(parents=True)
+    (legacy / "phoenix.db").write_text("legacy")
+    shared_parent = tmp_path / "shared-volume"
+    shared_parent.mkdir(mode=0o755)
+    override = shared_parent / "phoenix"
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.setenv(ps.PHOENIX_WORKING_DIR_ENV, str(override))
+
+    supervisor = ps.PhoenixSupervisor()
+    supervisor.prepare_storage()
+
+    assert supervisor.working_dir == override.resolve()
+    assert _mode(override) == 0o700
+    assert _mode(shared_parent) == 0o755
+    assert legacy.exists()
+
+
 # ---------------------------------------------------------------------------
 # OTLP autowiring (INV-SOLO)
 # ---------------------------------------------------------------------------
@@ -204,6 +265,254 @@ def test_build_env_telemetry_operator_override(tmp_path):
 # ---------------------------------------------------------------------------
 # Subprocess lifecycle (stubbed process)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode contract")
+def test_prepare_storage_hardens_existing_tree(tmp_path):
+    working_dir = tmp_path / "phx"
+    nested = working_dir / "nested"
+    nested.mkdir(parents=True)
+    files = [
+        working_dir / "phoenix.log",
+        working_dir / "phoenix.db",
+        working_dir / "phoenix.db-wal",
+        working_dir / "phoenix.db-shm",
+        working_dir / "phoenix.pid",
+        nested / "trace-cache",
+    ]
+    for path in files:
+        path.write_text("sensitive")
+        path.chmod(0o666)
+    working_dir.chmod(0o777)
+    nested.chmod(0o777)
+
+    ps.PhoenixSupervisor(working_dir=working_dir).prepare_storage()
+
+    assert _mode(working_dir) == 0o700
+    assert _mode(nested) == 0o700
+    assert all(_mode(path) == 0o600 for path in files)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode contract")
+def test_prepare_storage_migrates_legacy_project_store(tmp_path, monkeypatch):
+    home = tmp_path / "kestrel-home"
+    legacy = home / "phoenix"
+    legacy.mkdir(parents=True)
+    for name in (
+        "phoenix.log",
+        "phoenix.db",
+        "phoenix.db-wal",
+        "phoenix.db-shm",
+    ):
+        path = legacy / name
+        path.write_text(name)
+        path.chmod(0o644)
+    legacy.chmod(0o755)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+
+    sup = ps.PhoenixSupervisor()
+    sup.prepare_storage()
+
+    assert not legacy.exists()
+    assert sup.working_dir == (home / "host-data" / "phoenix").resolve()
+    assert _mode(sup.working_dir.parent) == 0o700
+    assert _mode(sup.working_dir) == 0o700
+    assert all(
+        _mode(sup.working_dir / name) == 0o600
+        for name in ("phoenix.log", "phoenix.db", "phoenix.db-wal", "phoenix.db-shm")
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode contract")
+def test_prepare_storage_cross_filesystem_migration_uses_private_staging(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "kestrel-home"
+    legacy = home / "phoenix"
+    legacy.mkdir(parents=True)
+    (legacy / "phoenix.db").write_text("history")
+    (legacy / "phoenix.db").chmod(0o644)
+    legacy.chmod(0o755)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+    real_replace = ps.os.replace
+
+    def _replace_with_one_cross_device_failure(source, destination):
+        if Path(source) == legacy:
+            raise OSError(errno.EXDEV, "cross-device link")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(ps.os, "replace", _replace_with_one_cross_device_failure)
+    sup = ps.PhoenixSupervisor()
+    sup.prepare_storage()
+
+    assert not legacy.exists()
+    assert (sup.working_dir / "phoenix.db").read_text() == "history"
+    assert _mode(sup.working_dir) == 0o700
+    assert _mode(sup.working_dir / "phoenix.db") == 0o600
+    assert not list(sup.working_dir.parent.glob(".phoenix-migrate-*"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode contract")
+def test_prepare_storage_fails_closed_when_legacy_and_destination_both_exist(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "kestrel-home"
+    legacy = home / "phoenix"
+    destination = home / "host-data" / "phoenix"
+    legacy.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (legacy / "phoenix.db").write_text("legacy")
+    (destination / "phoenix.db").write_text("new")
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+
+    with pytest.raises(ps.PhoenixStorageError, match="both legacy Phoenix storage"):
+        ps.PhoenixSupervisor().prepare_storage()
+
+    # Disclosure is contained before the ambiguous migration is rejected.
+    assert _mode(legacy) == 0o700
+    assert _mode(legacy / "phoenix.db") == 0o600
+    assert _mode(destination) == 0o700
+    assert _mode(destination / "phoenix.db") == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX PID contract")
+def test_prepare_storage_contains_but_does_not_move_live_legacy_store(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "kestrel-home"
+    legacy = home / "phoenix"
+    legacy.mkdir(parents=True)
+    (legacy / "phoenix.db").write_text("live")
+    (legacy / "phoenix.pid").write_text(str(os.getpid()))
+    legacy.chmod(0o755)
+    (legacy / "phoenix.db").chmod(0o644)
+    (legacy / "phoenix.pid").chmod(0o644)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
+
+    with pytest.raises(ps.PhoenixStorageError, match="belongs to live PID"):
+        ps.PhoenixSupervisor().prepare_storage()
+
+    assert legacy.exists()
+    assert _mode(legacy) == 0o700
+    assert _mode(legacy / "phoenix.db") == 0o600
+    assert _mode(legacy / "phoenix.pid") == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink contract")
+def test_prepare_storage_rejects_symlinked_content(tmp_path):
+    working_dir = tmp_path / "phx"
+    outside = tmp_path / "outside"
+    working_dir.mkdir()
+    outside.write_text("do not follow")
+    (working_dir / "phoenix.db").symlink_to(outside)
+
+    with pytest.raises(ps.PhoenixStorageError, match="symbolic link"):
+        ps.PhoenixSupervisor(working_dir=working_dir).prepare_storage()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX hard-link contract")
+def test_prepare_storage_rejects_multiply_linked_content(tmp_path):
+    working_dir = tmp_path / "phx"
+    working_dir.mkdir()
+    outside = tmp_path / "outside-copy"
+    (working_dir / "phoenix.db").write_text("shared trace data")
+    os.link(working_dir / "phoenix.db", outside)
+
+    with pytest.raises(ps.PhoenixStorageError, match="hard links"):
+        ps.PhoenixSupervisor(working_dir=working_dir).prepare_storage()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink contract")
+def test_prepare_storage_rejects_symlinked_working_directory(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    working_dir = tmp_path / "phx"
+    working_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ps.PhoenixStorageError, match="real directory"):
+        ps.PhoenixSupervisor(working_dir=working_dir).prepare_storage()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX umask contract")
+def test_child_created_database_sidecars_are_private_under_permissive_umask(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
+    working_dir = tmp_path / "phx"
+    sup = ps.PhoenixSupervisor(working_dir=working_dir, root_path="/phoenix")
+    child_code = (
+        "import os; from pathlib import Path; "
+        "p=Path(os.environ['PHOENIX_WORKING_DIR']); "
+        "[(p / n).write_text('sensitive') for n in "
+        "('phoenix.db','phoenix.db-wal','phoenix.db-shm')]"
+    )
+    monkeypatch.setattr(
+        sup, "build_command", lambda: [sys.executable, "-c", child_code]
+    )
+
+    previous_umask = os.umask(0)
+    try:
+        assert sup.start(wait_for_health=False) is True
+    finally:
+        os.umask(previous_umask)
+    sup.process.wait(timeout=10)
+
+    assert _mode(working_dir) == 0o700
+    for name in (
+        "phoenix.log",
+        "phoenix.pid",
+        "phoenix.db",
+        "phoenix.db-wal",
+        "phoenix.db-shm",
+    ):
+        assert _mode(working_dir / name) == 0o600
+    sup.stop()
+
+
+def test_start_disables_tracing_when_storage_cannot_be_secured(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(
+        ps,
+        "_secure_storage_tree",
+        lambda _path: (_ for _ in ()).throw(ps.PhoenixStorageError("denied")),
+    )
+    spawned = []
+    monkeypatch.setattr(ps.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx")
+    assert sup.start(wait_for_health=False) is False
+    assert spawned == []
+    assert sup.process is None
+
+
+def test_start_reaps_child_when_private_pid_file_cannot_be_written(
+    tmp_path, monkeypatch,
+):
+    _StubPopen.instances.clear()
+    monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
+    monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
+    monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
+    monkeypatch.setattr(
+        ps,
+        "_open_private_file",
+        lambda *a, **k: (_ for _ in ()).throw(ps.PhoenixStorageError("denied"))
+        if Path(a[0]).name == "phoenix.pid"
+        else os.open(a[0], a[1], 0o600),
+    )
+
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", root_path="/phoenix")
+    assert sup.start(wait_for_health=False) is False
+
+    child = _StubPopen.instances[-1]
+    assert child.poll() is not None
+    assert sup.process is None
 
 
 def test_start_and_stop_lifecycle(tmp_path, monkeypatch):
@@ -618,6 +927,30 @@ def test_real_lifespan_never_spawns_phoenix_under_pytest(monkeypatch):
     # Phoenix was never supervised → the proxy reports it disabled.
     assert getattr(app.state, "phoenix", None) is None
     assert r.status_code == 503
+
+
+def test_real_lifespan_does_not_autowire_otlp_before_storage_preflight(
+    monkeypatch,
+):
+    """A custody failure disables tracing before agents inherit an endpoint."""
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setattr(ps, "should_supervise_phoenix", lambda: True)
+
+    def _deny_custody(_self):
+        raise ps.PhoenixStorageError("test custody denial")
+
+    monkeypatch.setattr(ps.PhoenixSupervisor, "prepare_storage", _deny_custody)
+    from server import app
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/phoenix/", headers={"X-API-Key": "test-key-123"}
+        )
+
+    assert response.status_code == 503
+    assert getattr(app.state, "phoenix", None) is None
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in os.environ
 
 
 def test_mint_503_when_phoenix_unreachable(tmp_path, monkeypatch):

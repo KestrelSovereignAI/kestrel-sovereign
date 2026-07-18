@@ -1130,6 +1130,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/security/PHOENIX_TRACE_CUSTODY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Phoenix Trace Custody",
+      "type": "Security Guide"
+    },
+    {
       "existing_code_refs": [
         "kestrel_sovereign/features/compute/script_signer.py",
         "kestrel_sovereign/security/hybrid_kem.py",
