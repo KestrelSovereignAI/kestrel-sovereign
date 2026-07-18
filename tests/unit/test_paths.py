@@ -73,6 +73,20 @@ def test_kestrel_sovereign_source_dir_is_a_marker(tmp_path, monkeypatch):
     assert paths.project_dir() == tmp_path.resolve()
 
 
+def test_host_data_dir_ignores_source_checkout(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    (source / "kestrel_sovereign").mkdir(parents=True)
+    (source / "kestrel_sovereign" / "__init__.py").write_text("")
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.chdir(source)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("KESTREL_HOME", raising=False)
+
+    assert paths.host_data_dir() == (home / ".kestrel" / "host-data").absolute()
+    assert source not in paths.host_data_dir().parents
+
+
 def test_pip_install_with_no_markers_falls_back_to_home_kestrel(
     tmp_path, monkeypatch
 ):

@@ -1,13 +1,17 @@
 """Project-root and package-root resolution.
 
-Two questions, two answers:
+Three questions, three answers:
 
   1. **Where does the user's data live?** — agent DBs, ``multi_agent.toml``,
      ``kestrel.toml``, ``.env``, ``logs/``. Answered by :func:`project_dir`.
   2. **Where do bundled package assets live?** — prompts, templates,
      themes, the constitution markdown. Answered by :func:`package_dir`.
+  3. **Where does implicit host-runtime state live?** — supervised services,
+     fleet/host feature state, and other data that must not appear merely
+     because Kestrel launched from a clone. Answered by :func:`host_data_dir`.
 
-The historical answer for both was the same: ``Path(__file__).parent.parent``.
+The historical answer for the first two was the same:
+``Path(__file__).parent.parent``.
 That worked when ``kestrel-sovereign`` was always run from a source clone
 because the package and the project happened to share a parent. After
 ``pip install kestrel-sovereign``, the package lives in
@@ -85,6 +89,24 @@ def project_dir() -> Path:
     cwd = Path.cwd()
     explicit_home = os.environ.get("KESTREL_HOME")
     return _resolve_cached(explicit_home, str(cwd))
+
+
+def host_data_dir() -> Path:
+    """Resolve the dedicated host-runtime root without source discovery.
+
+    An explicit ``KESTREL_HOME`` is an operator custody decision and remains
+    authoritative. Without it, host runtime belongs under
+    ``~/.kestrel/host-data`` even when the current directory is a source clone.
+    Resolution has no filesystem side effects; each storage owner must securely
+    create and validate the returned directory before writing.
+    """
+    explicit_home = os.environ.get("KESTREL_HOME")
+    base = (
+        Path(explicit_home).expanduser()
+        if explicit_home
+        else Path.home() / ".kestrel"
+    )
+    return Path(os.path.abspath(base / "host-data"))
 
 
 @lru_cache(maxsize=64)

@@ -95,7 +95,13 @@ generated_images/
 logs/
 feedback/
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 *.capsule
 
 # Runtime

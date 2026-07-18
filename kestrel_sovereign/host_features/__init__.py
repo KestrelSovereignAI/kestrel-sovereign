@@ -40,6 +40,13 @@ from .runtime import (
     stop_host_features,
     unmount_host_features,
 )
+from .storage import (
+    HOST_DB_PATH_ENV,
+    HOST_FEATURE_DB_FILENAME,
+    HostStorageError,
+    host_database_path,
+    prepare_host_database,
+)
 from .ui import compute_host_ui_manifest, host_feature_static_mounts
 
 __all__ = [
@@ -60,6 +67,11 @@ __all__ = [
     "start_host_features",
     "stop_host_features",
     "unmount_host_features",
+    "HOST_DB_PATH_ENV",
+    "HOST_FEATURE_DB_FILENAME",
+    "HostStorageError",
+    "host_database_path",
+    "prepare_host_database",
     "compute_host_ui_manifest",
     "host_feature_static_mounts",
 ]

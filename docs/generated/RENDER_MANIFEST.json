@@ -1072,6 +1072,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/security/HOST_RUNTIME_STORAGE_CUSTODY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Host Runtime Storage Custody",
+      "type": "Security Guide"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/security/IDENTITY_EXPORT_CUSTODY.md",
       "privacy": "",
       "render": "public",
