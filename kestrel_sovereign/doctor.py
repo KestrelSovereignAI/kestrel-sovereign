@@ -17,6 +17,9 @@ Checks performed:
     matches the SHA256 of the canonical KESTREL_CONSTITUTION.md.
     Drift here means the agent is silently governing itself by an
     older constitution than what's on disk — see ``_check_constitution_drift``.
+  - Legacy local identity exports are inspected by metadata only. Unsafe
+    directory/file modes, links, and non-regular entries are reported without
+    opening or parsing package contents.
 
 This is deliberately minimal. We avoid reaching out to Ollama / OpenAI
 — that's flaky in CI and out of scope for "is the config sane?"
@@ -31,6 +34,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
+from kestrel_sovereign.identity.protected_export import (
+    audit_legacy_identity_exports,
+    configured_identity_export_roots,
+)
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
@@ -67,8 +74,29 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_llm(config, env, toml_path, report)
     _check_multi_agent(multi_agent_path, project_dir, report)
     _check_constitution_drift(multi_agent_path, project_dir, report)
+    _check_legacy_identity_exports(project_dir, env, report)
 
     return report
+
+
+def _check_legacy_identity_exports(
+    project_dir: Path,
+    env: dict,
+    report: DoctorReport,
+) -> None:
+    """Report unsafe legacy exports without reading sensitive package bytes."""
+
+    roots = configured_identity_export_roots(project_dir, env=env)
+    findings = audit_legacy_identity_exports(roots)
+    if not findings:
+        return
+    affected_roots = len({finding.root for finding in findings})
+    report.warn.append(
+        f"{len(findings)} unsafe legacy identity-export filesystem finding(s) "
+        f"under {affected_roots} configured data root(s). This metadata-only "
+        "check did not read package contents. Run `kestrel identity "
+        "harden-exports` to restrict eligible operator-owned exports to 0600."
+    )
 
 
 def format_report(report: DoctorReport) -> str:

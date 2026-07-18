@@ -15,6 +15,7 @@ Commands:
     kestrel create <name>          # inception: generate DID, create agent folder, add to multi_agent.toml
     kestrel shell <name>           # interactive CLI chat (what main.py does today)
     kestrel health                 # run health check
+    kestrel identity harden-exports  # privatize eligible legacy identity exports
     kestrel config <agent_dir>     # show/edit agent config
     kestrel deploy <profile>       # deploy agent to Cloud Run / Azure Container Apps
     kestrel verify-install [TESTS...]  # run the 5-test clean-install matrix in throwaway venvs
@@ -632,6 +633,40 @@ def cmd_doctor(args) -> int:
     report = diagnose(project_dir)
     print(format_report(report))
     return 0 if report.ready else 1
+
+
+def cmd_identity(args) -> int:
+    """Dispatch local identity-custody maintenance commands."""
+
+    if args.identity_command != "harden-exports":
+        print("Usage: kestrel identity harden-exports")
+        return 1
+
+    from kestrel_sovereign.identity.protected_export import (
+        IdentityExportSecurityError,
+        configured_identity_export_roots,
+        harden_legacy_identity_exports,
+    )
+    from kestrel_sovereign.setup.env_file import read_env
+
+    project_dir = _get_project_dir()
+    configured_env = read_env(project_dir / ".env")
+    configured_env.update(os.environ)
+    roots = configured_identity_export_roots(project_dir, env=configured_env)
+    try:
+        result = harden_legacy_identity_exports(roots)
+    except IdentityExportSecurityError as exc:
+        print(f"Identity export permission hardening refused: {exc}")
+        return 1
+    print(
+        "Identity export permission hardening: "
+        f"hardened={result.hardened}, "
+        f"already_private={result.already_private}, "
+        f"refused={result.refused}, "
+        f"missing_roots={result.missing_roots}. "
+        "Package contents were not read."
+    )
+    return 1 if result.refused else 0
 
 
 def cmd_storage(args) -> int:
@@ -1603,6 +1638,17 @@ def build_parser() -> argparse.ArgumentParser:
     # kestrel doctor
     subparsers.add_parser("doctor", help="Diagnose readiness; no changes")
 
+    # kestrel identity harden-exports
+    identity_p = subparsers.add_parser(
+        "identity",
+        help="Maintain private local identity-export custody",
+    )
+    identity_sub = identity_p.add_subparsers(dest="identity_command")
+    identity_sub.add_parser(
+        "harden-exports",
+        help="Set eligible legacy identity export directories/files to 0700/0600",
+    )
+
     # kestrel storage {health}
     storage_p = subparsers.add_parser(
         "storage", help="Storage health and operations"
@@ -1951,6 +1997,7 @@ def main() -> int:
         "ask": cmd_ask,
         "health": cmd_health,
         "doctor": cmd_doctor,
+        "identity": cmd_identity,
         "storage": cmd_storage,
         "auth": cmd_auth,
         "tool-dispatches": cmd_tool_log,

@@ -11,6 +11,9 @@ ToolResult shape and the honesty edges introduced by the migration:
 
 from __future__ import annotations
 
+import asyncio
+import os
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -183,16 +186,20 @@ async def test_import_identity_forwards_allow_unsigned(monkeypatch, tmp_path):
         return fake_result
 
     fake_importer = MM(import_package=AsyncMock(side_effect=_fake_import_package))
+    importer_factory = MM(return_value=fake_importer)
     monkeypatch.setattr(
-        identity_mod, "IdentityImporter", MM(return_value=fake_importer),
+        identity_mod, "IdentityImporter", importer_factory,
     )
     # resolve_feature_database must return a truthy db.
     import kestrel_sovereign.features.identity.feature as feat_mod
     monkeypatch.setattr(feat_mod, "resolve_feature_database", lambda agent: MM())
 
     feat = _make_feature()
+    agent_dir = tmp_path / "runtime-agent"
+    feat.agent.storage_path = str(agent_dir / "kestrel_prime.db")
     await feat.import_identity(str(pkg_path), allow_unsigned=True)
     assert captured.get("allow_unsigned") is True, captured
+    assert importer_factory.call_args.kwargs["storage_dir"] == agent_dir
 
     captured.clear()
     await feat.import_identity(str(pkg_path))  # default
@@ -301,8 +308,13 @@ async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
     # (else it fails cleanly rather than uploading plaintext).
     from cryptography.fernet import Fernet
     monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
-    monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path))
-    result = await feat.export_identity(storage_tier="ipfs", sign=False)
+    export_root = tmp_path / "exports"
+    monkeypatch.setenv("KESTREL_DATA_DIR", str(export_root))
+    previous_umask = os.umask(0)
+    try:
+        result = await feat.export_identity(storage_tier="ipfs", sign=False)
+    finally:
+        os.umask(previous_umask)
 
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["tier_downgraded"] is True
@@ -315,7 +327,10 @@ async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path):
     # JSON file the user can actually feed to !identity import — so
     # the data dict has a fallback_file_path AND the file exists.
     assert result.data["fallback_file_path"] is not None
-    assert Path(result.data["fallback_file_path"]).exists()
+    fallback_path = Path(result.data["fallback_file_path"])
+    assert fallback_path.exists()
+    assert stat.S_IMODE(export_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(fallback_path.stat().st_mode) == 0o600
     # Confirmation now points at the importable file
     assert "use `!identity import" in result.confirmation.lower()
     # Error half still names the failure mode + restore path
@@ -374,7 +389,7 @@ def _mock_local_export(monkeypatch, tmp_path):
         "kestrel_sovereign.identity.IdentityExporter",
         lambda **kwargs: MagicMock(export=AsyncMock(return_value=fake_pkg)),
     )
-    monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KESTREL_DATA_DIR", str(tmp_path / "exports"))
     return fake_pkg
 
 
@@ -385,10 +400,17 @@ async def test_export_identity_valid_tier_resolves(monkeypatch, tmp_path):
     feat.agent.agent_id = "did:test:export-agent"
     _mock_local_export(monkeypatch, tmp_path)
 
-    result = await feat.export_identity(storage_tier="local", sign=False)
+    previous_umask = os.umask(0)
+    try:
+        result = await feat.export_identity(storage_tier="local", sign=False)
+    finally:
+        os.umask(previous_umask)
     assert result.status is ToolResultStatus.OK
     assert result.data["storage_tier"] == "local"
-    assert Path(result.data["file_path"]).exists()
+    export_path = Path(result.data["file_path"])
+    assert export_path.exists()
+    assert stat.S_IMODE(export_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(export_path.stat().st_mode) == 0o600
 
 
 @pytest.mark.asyncio
@@ -401,6 +423,76 @@ async def test_export_identity_omitted_tier_keeps_local_default(monkeypatch, tmp
     result = await feat.export_identity(sign=False)
     assert result.status is ToolResultStatus.OK
     assert result.data["storage_tier"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_export_identity_refuses_existing_link_destination(monkeypatch, tmp_path):
+    """Generated local exports never follow or replace a pre-existing link."""
+
+    feat = _make_feature(db=MagicMock())
+    feat.agent.agent_id = "did:test:export-agent"
+    _mock_local_export(monkeypatch, tmp_path)
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside", encoding="utf-8")
+    (export_root / "identity_fixed.json").symlink_to(outside)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.identity.feature._unique_export_filename",
+        lambda: "identity_fixed.json",
+    )
+
+    result = await feat.export_identity(storage_tier="local", sign=False)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert outside.read_text(encoding="utf-8") == "outside"
+    assert (export_root / "identity_fixed.json").is_symlink()
+    assert list(export_root.glob(".identity-export-*")) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_feature_exports_have_distinct_private_files(monkeypatch, tmp_path):
+    feat = _make_feature(db=MagicMock())
+    feat.agent.agent_id = "did:test:export-agent"
+    _mock_local_export(monkeypatch, tmp_path)
+
+    results = await asyncio.gather(
+        *(feat.export_identity(storage_tier="local", sign=False) for _ in range(24))
+    )
+
+    assert all(result.status is ToolResultStatus.OK for result in results)
+    paths = [Path(result.data["file_path"]) for result in results]
+    assert len(set(paths)) == len(paths)
+    assert all(path.exists() for path in paths)
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths)
+    assert stat.S_IMODE(paths[0].parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_feature_export_signs_with_runtime_agent_key_directory(monkeypatch, tmp_path):
+    """The live feature must not look for signing keys under the process CWD."""
+
+    feat = _make_feature(db=MagicMock())
+    feat.agent.agent_id = "did:test:export-agent"
+    agent_dir = tmp_path / "agent"
+    feat.agent.storage_path = str(agent_dir / "kestrel_prime.db")
+    fake_package = _mock_local_export(monkeypatch, tmp_path)
+    observed = []
+
+    def record_signing_directory(package, storage_dir):
+        observed.append(storage_dir)
+        return package
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.identity.sign_package",
+        record_signing_directory,
+    )
+
+    result = await feat.export_identity(storage_tier="local", sign=True)
+
+    assert result.status is ToolResultStatus.OK
+    assert observed == [agent_dir]
+    assert fake_package.to_json.called
 
 
 @pytest.mark.asyncio

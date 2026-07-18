@@ -4,6 +4,7 @@ Integration tests for Identity Export/Import functionality.
 
 Tests the full export and import cycle with a real database.
 """
+import hashlib
 import json
 import pytest
 import pytest_asyncio
@@ -21,6 +22,7 @@ from kestrel_sovereign.identity import (
     SubstrateType,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 
 
 @pytest_asyncio.fixture
@@ -219,6 +221,46 @@ async def populated_db(test_db):
 
 class TestIdentityExporter:
     """Tests for IdentityExporter class."""
+
+    @pytest.mark.asyncio
+    async def test_constitution_export_uses_decrypted_file_store(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Encrypted-at-rest constitution bytes remain import-verifiable."""
+
+        from cryptography.fernet import Fernet
+
+        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode("ascii"))
+        db = await AsyncDatabase.sqlite(str(tmp_path / "encrypted-export.db"))
+        try:
+            constitution = b"# Encrypted governing constitution\n"
+            constitution_hash = await AsyncFileStore(db).store_file(
+                constitution,
+                "KESTREL_CONSTITUTION.md",
+            )
+            agent_id = "did:test:encrypted-export"
+            await db.execute(
+                """INSERT INTO graph_nodes
+                   (node_id, node_type, label, properties)
+                   VALUES (?, 'agent', 'Encrypted', ?)""",
+                (
+                    agent_id,
+                    json.dumps({"constitution_hash": constitution_hash}),
+                ),
+            )
+            await db.commit()
+
+            exported = await IdentityExporter(db, agent_id)._get_constitution()
+
+            assert exported["hash"] == constitution_hash
+            assert hashlib.sha256(exported["text"].encode("utf-8")).hexdigest() == (
+                constitution_hash
+            )
+            assert exported["text"] == constitution.decode("utf-8")
+        finally:
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_relationship_export_strips_own_namespace_for_roundtrip(self, test_db):

@@ -25,6 +25,10 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.exceptions import InvalidSignature
 
 from .identity_package import AgentIdentityPackage
+from .protected_export import (
+    configured_identity_export_roots,
+    write_protected_identity_export,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +529,8 @@ async def sign_and_export(
     package: AgentIdentityPackage,
     storage_dir: Optional[Path] = None,
     output_path: Optional[Path] = None,
+    *,
+    replace_existing: bool = False,
 ) -> str:
     """
     Sign a package and export to JSON.
@@ -533,6 +539,9 @@ async def sign_and_export(
         package: The identity package to sign and export
         storage_dir: Directory containing the agent's keys
         output_path: Optional path to write JSON file
+        replace_existing: Explicitly replace an existing generated identity
+            export. Replacement is accepted only for an operator-owned regular
+            ``identity_*.json`` under a configured data root. Defaults to False.
 
     Returns:
         JSON string of signed package
@@ -545,8 +554,17 @@ async def sign_and_export(
 
     # Write to file if path provided
     if output_path:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(json_str)
+        allowed_roots = configured_identity_export_roots(
+            Path.cwd(),
+            additional_roots=((storage_dir,) if storage_dir is not None else ()),
+        )
+        write_protected_identity_export(
+            output_path,
+            json_str,
+            replace_existing=replace_existing,
+            allowed_destination_roots=allowed_roots,
+            allowed_replacement_roots=allowed_roots,
+        )
         logger.info(f"Exported signed package to {output_path}")
 
     return json_str

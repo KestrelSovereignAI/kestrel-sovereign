@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.identity.protected_export import (
+    identity_export_directory,
+    write_protected_identity_export,
+)
 from kestrel_sovereign.identity.sealed_export import SealedExportError
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -52,6 +56,19 @@ def _unique_export_filename() -> str:
         f"identity_{now.strftime('%Y%m%d_%H%M%S')}_"
         f"{now.microsecond:06d}_{uuid.uuid4().hex[:8]}.json"
     )
+
+
+def _runtime_agent_data_dir(agent: Any) -> Optional[Path]:
+    """Return the real per-agent key/data directory when one is configured.
+
+    ``vars`` deliberately avoids synthesizing a fake ``storage_path`` on
+    MagicMock-backed test agents. Live multi-agent instances expose the DB path
+    explicitly, and their identity keys live alongside it.
+    """
+    storage_path = vars(agent).get("storage_path")
+    if isinstance(storage_path, (str, os.PathLike)):
+        return Path(storage_path).parent
+    return None
 
 
 class IdentityFeature(Feature):
@@ -89,8 +106,7 @@ class IdentityFeature(Feature):
         # Let open_identity_export discover the KEM slug from the local
         # key files (robust to multi-segment did:web and did:pkh agents)
         # — the DID tail is not a reliable slug.
-        storage_path = getattr(self.agent, "storage_path", None)
-        storage_dir = Path(storage_path).parent if storage_path else None
+        storage_dir = _runtime_agent_data_dir(self.agent)
         return open_identity_export(package_json, storage_dir=storage_dir)
 
     @tool(
@@ -161,10 +177,14 @@ class IdentityFeature(Feature):
             if db is None:
                 return ToolResult.failed("Export failed: database not available")
 
+            agent_data_dir = _runtime_agent_data_dir(self.agent)
+
             # Export identity
             exporter = IdentityExporter(
                 db=db,
                 agent_id=self.agent.agent_id,
+                agent_data_dir=agent_data_dir,
+                agent=self.agent,
             )
             package = await exporter.export(include_wallet_history=include_wallet)
 
@@ -175,7 +195,7 @@ class IdentityFeature(Feature):
             sign_failure: Optional[str] = None
             if sign:
                 try:
-                    package = sign_package(package)
+                    package = sign_package(package, agent_data_dir)
                 except Exception as e:
                     logger.warning(f"Could not sign package: {e}")
                     sign_failure = str(e)
@@ -258,12 +278,14 @@ class IdentityFeature(Feature):
                 fallback_filepath: Optional[Path] = None
                 if tier_downgraded:
                     try:
-                        storage_dir = Path(os.environ.get("KESTREL_DATA_DIR", "agent_data"))
-                        storage_dir.mkdir(exist_ok=True)
+                        storage_dir = identity_export_directory()
                         filename = _unique_export_filename()
                         fallback_filepath = storage_dir / filename
-                        with open(fallback_filepath, 'w', encoding='utf-8') as f:
-                            f.write(package_json)
+                        write_protected_identity_export(
+                            fallback_filepath,
+                            package_json,
+                            allowed_destination_roots=(storage_dir,),
+                        )
                     except Exception as e:
                         # If even the fallback write fails, leave
                         # fallback_filepath=None — the PARTIAL
@@ -336,13 +358,15 @@ class IdentityFeature(Feature):
                 }
             else:
                 # Save to local file
-                storage_dir = Path(os.environ.get("KESTREL_DATA_DIR", "agent_data"))
-                storage_dir.mkdir(exist_ok=True)
+                storage_dir = identity_export_directory()
                 filename = _unique_export_filename()
                 filepath = storage_dir / filename
 
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(package_json)
+                write_protected_identity_export(
+                    filepath,
+                    package_json,
+                    allowed_destination_roots=(storage_dir,),
+                )
 
                 confirmation = (
                     f"Exported identity package: DID={summary['did'][:30]}..., "
@@ -520,6 +544,7 @@ class IdentityFeature(Feature):
             importer = IdentityImporter(
                 db=db,
                 target_agent_id=self.agent.agent_id,
+                storage_dir=_runtime_agent_data_dir(self.agent),
             )
             result = await importer.import_package(
                 package,
@@ -653,7 +678,10 @@ class IdentityFeature(Feature):
             # by design for post-ceremony agents.
             sig_status = "UNSIGNED"
             if package.signature or package.signatures:
-                is_valid, msg = verify_package_signature(package)
+                is_valid, msg = verify_package_signature(
+                    package,
+                    _runtime_agent_data_dir(self.agent),
+                )
                 sig_status = "VALID" if is_valid else f"INVALID: {msg}"
         except Exception as e:
             logger.error(f"Identity verification failed: {e}", exc_info=True)
