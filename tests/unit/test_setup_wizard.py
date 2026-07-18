@@ -13,6 +13,7 @@ from kestrel_sovereign.setup.env_file import read_env, write_env
 from kestrel_sovereign.setup.prompts import StubPrompter
 from kestrel_sovereign.setup.toml_file import read_toml
 from kestrel_sovereign.setup.wizard import run_wizard
+from kestrel_sovereign.setup.steps import agent as agent_step
 
 
 class _FakeCreds:
@@ -75,6 +76,48 @@ def test_wizard_quickstart_full_run(tmp_path, monkeypatch):
     # Agent created and registered
     multi_agent_path = tmp_path / "multi_agent.toml"
     assert multi_agent_path.exists()
+
+
+def test_configured_setup_injects_auditor_into_real_inception_boundary(
+    tmp_path, monkeypatch
+):
+    """A credentialed setup lane audits before create_agent can return."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    write_env(tmp_path / ".env", {"OPENAI_API_KEY": "test-key"})
+    (tmp_path / "kestrel.toml").write_text(
+        """
+[llm]
+route_priority = ["openai:api"]
+
+[llm.vendors.openai.routes.api]
+adapter = "OpenAIAdapter"
+api_key_env = "OPENAI_API_KEY"
+model = "test-model"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    async def capture_inception(**kwargs):
+        captured.update(kwargs)
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "kestrel_prime.db").write_bytes(b"")
+        return _FakeCreds()
+
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+        side_effect=capture_inception,
+    ):
+        agent_step.create_agent(
+            name="Audited",
+            project_dir=tmp_path,
+            agent_data_root=tmp_path / "agent_data",
+        )
+
+    assert callable(captured["genesis_auditor"])
+    assert captured["genesis_audit_provenance"] == "setup:configured_llm"
 
 
 def test_wizard_idempotent_second_run_is_noop(tmp_path, monkeypatch):

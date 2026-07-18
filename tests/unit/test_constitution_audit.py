@@ -272,6 +272,7 @@ class _DurableConstitutionHarness:
 
         self.agent_id = "did:web:test:durable-constitution"
         self._raw_storage = storage
+        self.storage = storage
         self._constitution_clock = lambda: now
         self._safe_mode = False
         self._constitution_state_store = None
@@ -279,6 +280,7 @@ class _DurableConstitutionHarness:
         self.features = {}
         self.privacy_agent = MagicMock()
         self.privacy_agent.add_conversation = AsyncMock()
+        self._genesis_audit_cognition_block = AsyncMock(return_value=None)
         ConstitutionMixin._init_constitution_audit_tracking(self)
 
     def _get_timestamp(self):
@@ -417,6 +419,7 @@ async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
     agent._safe_mode = safe_mode
     agent._constitution_audit_pending = audit_pending
     agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
         agent
     )

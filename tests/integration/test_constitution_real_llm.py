@@ -21,6 +21,7 @@ sys.path.insert(0, str(project_root))
 from server import app, get_api_key
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign import storage
+from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 import tempfile
 
 
@@ -47,7 +48,11 @@ async def client(monkeypatch):
         monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
 
         # Now, create the identity in that directory
-        await create_kestrel_identity_async(agent_dir)
+        await create_kestrel_identity_async(
+            agent_dir,
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:constitution_real_llm_fixture",
+        )
 
         # Track threads before TestClient starts
         threads_before = set(threading.enumerate())

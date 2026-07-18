@@ -726,14 +726,32 @@ The main `Storage` class in `storage/__init__.py` acts as a facade, providing a 
 
 ### Genesis Self-Audit
 
-To ensure the integrity of all new agents, Kestrel implements a "genesis self-audit." When a new agent is created via `inception_service.py`:
+Every incepted agent carries a structured `genesis_audit` receipt bound to the
+SHA-256 hash of the same governing constitution bytes resolved and anchored by
+the production constitution resolver.
 
-1.  The agent's foundational files (keys, database) are created.
-2.  The `KESTREL_CONSTITUTION.md` is stored as the agent's first memory.
-3.  The agent is instantiated and its very first action is to perform an integrity audit on its own constitution.
-4.  If the audit returns a high risk level, the creation process is aborted, and all generated files are cleaned up, preventing the existence of a non-compliant agent.
+- **Configured `kestrel setup` / `kestrel create`:** when an audit-capable LLM route
+  is currently usable, inception runs the audit before returning success. A
+  risk-level-3 result, malformed result, or attempted-auditor failure aborts
+  creation and removes the new database and identity/key artifacts. A pass is
+  stored both on the agent node and as a `genesis_audit` conversation event.
+- **LLM-less or programmatic creation:** when no auditor is supplied, inception
+  records an explicit `pending` receipt; it never invents a pass. Both streaming
+  and non-streaming chat paths hard-gate the first cognition request, complete
+  the audit once a configured auditor is available, and admit the turn only
+  after the durable `passed` receipt exists.
+- **Concurrency and restart:** simultaneous first turns share one serialized
+  audit. A completed `passed` or `failed` receipt survives restart, is bound to
+  its constitution hash, and is never silently rerun or overwritten. A signed
+  constitution reanchor archives that receipt as history and creates a new
+  hash-bound `pending` receipt before cognition can resume.
+- **Tests and demos:** deterministic auditors may be injected, but their
+  provenance is recorded in the same production receipt and event; there is no
+  lifecycle bypass.
 
-This process guarantees that every agent in the ecosystem starts from a foundation of verifiable integrity.
+Diagnostic/recovery commands remain available while an audit is pending. Normal
+cognition returns a clear pending/failed response without sending the user's
+turn to an LLM.
 
 ## 🔄 Next Steps
 

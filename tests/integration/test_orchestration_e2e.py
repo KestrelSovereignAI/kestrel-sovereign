@@ -19,6 +19,7 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from tests.shared import no_llm_credentials, no_docker
+from tests.shared.genesis_audit import complete_deterministic_genesis_audit
 
 
 def _mcp_available() -> bool:
@@ -53,6 +54,10 @@ async def kestrel_agent(temp_db):
 
     # Initialize async storage
     await agent.initialize()
+    await complete_deterministic_genesis_audit(
+        agent,
+        provenance="test:orchestration_e2e",
+    )
 
     # Skip bootstrap for test agents
     from tests.integration.conftest import complete_bootstrap
@@ -186,4 +191,3 @@ async def test_orchestrator_natural_language_tool_use(kestrel_agent):
             "Local LLM did not invoke ModelManagerTool via NL. "
             f"Response head: {response[:300]!r}"
         )
-

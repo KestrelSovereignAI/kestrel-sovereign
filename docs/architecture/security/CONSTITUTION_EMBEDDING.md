@@ -330,7 +330,8 @@ The test suite in `tests/integration/test_constitution_embedding.py` verifies:
 4. **test_did_format_validation**: DID follows W3C spec
 5. **test_constitution_content_hash_deterministic**: Hash is consistent
 6. **test_agent_can_access_constitution_via_kestrel_agent**: Runtime integration
-7. **test_genesis_audit_bypassed_temporarily**: Audit runs on inception
+7. **test_genesis_audit_runs_inside_inception**: A deterministic auditor crosses
+   the real inception boundary and writes a hash-bound receipt plus event
 8. **test_constitution_encryption_if_key_set**: Encryption support
 9. **test_multiple_agents_same_constitution**: Content addressing works
 10. **test_constitution_required_for_inception**: Validation on startup
@@ -338,6 +339,33 @@ The test suite in `tests/integration/test_constitution_embedding.py` verifies:
 12. **test_constitution_node_timestamp**: UTC timestamps
 
 All tests run as async with `pytest-anyio` and verify the complete constitution embedding lifecycle.
+
+## Genesis audit readiness
+
+Inception owns the durable state transition:
+
+1. Resolve governing bytes through
+   `constitution.resolver.resolve_governing_constitution_bytes`.
+2. If setup supplied a usable configured auditor, evaluate those exact bytes
+   before storing the constitution. Only risk levels 1–2 may continue. Any
+   rejection or audit infrastructure failure uses inception cleanup and returns
+   no agent/config success.
+3. If no auditor was supplied (an intentional lazy/programmatic path), write a
+   hash-bound `genesis_audit.status = "pending"` receipt on the agent node.
+4. Before bootstrap or context/provider cognition, both `process_input` and
+   `process_input_streaming` enter the same serialized readiness gate. An
+   unavailable auditor leaves a sanitized, retryable pending attempt; a valid
+   result writes `passed` and the conversation event atomically; risk level 3
+   writes durable `failed` and permanently blocks cognition.
+5. A completed receipt is idempotent across concurrent turns and restart.
+   Ordinary runtime never replaces a receipt whose hash differs from the current
+   anchor. An explicitly authorized, signed reanchor archives the old receipt in
+   `genesis_audit_history` and writes a new hash-bound `pending` receipt so the
+   amended bytes must pass a fresh audit before cognition resumes.
+
+Test/demo callers use `genesis_auditor=` plus
+`genesis_audit_provenance=` to inject deterministic behavior through this same
+lifecycle. Omitting an auditor is deferred operation, not a test bypass.
 
 ## Cryptographic Security
 

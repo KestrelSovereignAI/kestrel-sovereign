@@ -12,6 +12,7 @@ import pytest
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
+from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 # Load .env from project root FIRST (before importing server)
 project_root = Path(__file__).parent.parent.parent
@@ -46,8 +47,14 @@ def client(monkeypatch):
         # Monkeypatch the function that returns the default data directory
         monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
 
-        # Now, create the identity in that directory
-        create_kestrel_identity(agent_dir)
+        # Cross the real eager genesis boundary deterministically. The chat
+        # assertions below still use the configured live LLM, but identity
+        # readiness must not depend on or bypass developer-provider state.
+        create_kestrel_identity(
+            agent_dir,
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:agent_chat_e2e_fixture",
+        )
 
         # Track threads before TestClient starts
         threads_before = set(threading.enumerate())

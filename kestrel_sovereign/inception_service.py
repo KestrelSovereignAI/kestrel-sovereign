@@ -33,6 +33,7 @@ from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kestrel_sovereign.constitution.emancipation import EmancipationContract
+    from kestrel_sovereign.constitution.genesis_audit import GenesisAuditor
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
 import asyncio
@@ -583,6 +584,8 @@ async def create_kestrel_identity_async(
     identity_method: Optional[str] = None,
     did_web_domain: Optional[str] = None,
     did_web_slug: Optional[str] = None,
+    genesis_auditor: Optional["GenesisAuditor"] = None,
+    genesis_audit_provenance: Optional[str] = None,
 ) -> AgentCredentials:
     """
     Generates a new Kestrel identity, including cryptographic keys, a W3C DID,
@@ -619,6 +622,13 @@ async def create_kestrel_identity_async(
                        constitution captures exactly what was authored.
                        When None or dormant, the canonical (dormant)
                        text is anchored unchanged.
+        genesis_auditor: Optional async constitution auditor. When present,
+                       inception requires a completed low/medium-risk result
+                       before returning success. When absent, inception records
+                       an explicit pending state that gates first cognition.
+        genesis_audit_provenance: Stable description of the auditor. Test and
+                       demo callers should identify deterministic injected
+                       auditors rather than bypassing the lifecycle.
     """
     # Generate test cycle ID if needed
     if is_test_instance and not test_cycle_id:
@@ -761,7 +771,10 @@ async def create_kestrel_identity_async(
         if not key_path.exists():
             # Fallback path for plaintext
             key_path = Path(output_dir) / f"{key_id}.pem"
-        identity_paths = [key_path]
+        # Include the DID document in every post-mint rollback. Previously the
+        # constitution cleanup removed only the private key and could strand a
+        # partial public identity after an audit/anchor failure (#2470).
+        identity_paths = [key_path, Path(output_dir) / f"{key_id}.json"]
         logging.info(f"Saved keys to {key_path}")
 
     # 3. Anchor the Kestrel Constitution as the first document
@@ -806,7 +819,55 @@ async def create_kestrel_identity_async(
                 "Amendment VIII activated for this agent — anchoring "
                 "Sovereign-authored Emancipation Contract."
             )
+
+        # Genesis audit lifecycle (#2470). Evaluate the exact bytes returned by
+        # the one governing resolver (#2463), before any constitution or graph
+        # row is committed. A level-3 result or attempted-auditor failure falls
+        # through the existing inception cleanup, so no key or local database
+        # survives. Lazy/programmatic creation is explicit: it records pending
+        # and the runtime must complete the audit before first cognition.
+        from kestrel_sovereign.constitution.genesis_audit import (
+            evaluate_genesis_constitution,
+            pending_genesis_audit,
+        )
+
+        if genesis_audit_provenance:
+            audit_provenance = genesis_audit_provenance
+        elif genesis_auditor is not None and is_test_instance:
+            audit_provenance = "test:injected_auditor"
+        elif genesis_auditor is not None and is_demo:
+            audit_provenance = "demo:injected_auditor"
+        elif genesis_auditor is not None:
+            audit_provenance = "inception:configured_llm"
+        else:
+            audit_provenance = "inception:deferred_no_auditor"
+
+        import hashlib
+
+        governing_bytes = (
+            constitution_content
+            if isinstance(constitution_content, bytes)
+            else constitution_content.encode("utf-8")
+        )
+        expected_constitution_hash = hashlib.sha256(governing_bytes).hexdigest()
+        if genesis_auditor is None:
+            genesis_audit = pending_genesis_audit(
+                expected_constitution_hash,
+                provenance=audit_provenance,
+            )
+        else:
+            genesis_audit = await evaluate_genesis_constitution(
+                governing_bytes,
+                constitution_hash=expected_constitution_hash,
+                auditor=genesis_auditor,
+                provenance=audit_provenance,
+            )
+
         constitution_hash = await files.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
+        if constitution_hash != genesis_audit["constitution_hash"]:
+            raise RuntimeError(
+                "Genesis audit constitution hash did not match stored governing bytes."
+            )
         logging.info(f"Stored Kestrel Constitution with hash: {constitution_hash}")
     except FileNotFoundError:
         logging.error(f"FATAL: Constitution file not found at {constitution_path}")
@@ -852,6 +913,7 @@ async def create_kestrel_identity_async(
             ),
         ),
         "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
+        "genesis_audit": genesis_audit,
     }
 
     # #1118: Anchor the Sovereign-authored Emancipation Contract as a JSON
@@ -890,6 +952,25 @@ async def create_kestrel_identity_async(
 
     # 6. Link the agent to its constitution
     await graph.add_edge(agent_node.node_id, constitution_node.node_id, "governed_by")
+
+    # A completed audit has two durable witnesses: the structured node receipt
+    # and a conversation/audit event. Pending is already explicit on the node
+    # and intentionally emits no misleading completion event.
+    if genesis_audit.get("status") == "passed":
+        from kestrel_sovereign.storage.async_conversation_store import (
+            AsyncConversationStore,
+        )
+
+        conversation = AsyncConversationStore(db, agent_id=agent_did)
+        await conversation.add_conversation(
+            role="system",
+            content=(
+                "Genesis audit passed. "
+                f"Risk level: {genesis_audit['risk_level']}. "
+                f"{genesis_audit.get('reasoning', '')}"
+            ),
+            metadata={"event": "genesis_audit", "result": genesis_audit},
+        )
 
     # 6b. If spawned by a parent, record the delegation relationship
     if parent_did:
@@ -987,6 +1068,8 @@ def create_kestrel_identity(
     identity_method: Optional[str] = None,
     did_web_domain: Optional[str] = None,
     did_web_slug: Optional[str] = None,
+    genesis_auditor: Optional["GenesisAuditor"] = None,
+    genesis_audit_provenance: Optional[str] = None,
 ) -> AgentCredentials:
     """
     Sync wrapper for create_kestrel_identity_async.
@@ -1012,6 +1095,8 @@ def create_kestrel_identity(
         identity_method=identity_method,
         did_web_domain=did_web_domain,
         did_web_slug=did_web_slug,
+        genesis_auditor=genesis_auditor,
+        genesis_audit_provenance=genesis_audit_provenance,
     ))
 
 

@@ -66,6 +66,7 @@ def _build_streaming_mock_agent(*, stop_captured: list, hooks_present: bool = Tr
     agent._cached_features_prompt = ""
     agent.is_request_cancelled = MagicMock(return_value=False)
     agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     agent._get_governing_constitution = AsyncMock(return_value="")

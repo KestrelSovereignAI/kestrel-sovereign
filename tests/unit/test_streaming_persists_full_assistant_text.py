@@ -59,6 +59,7 @@ async def test_streaming_persists_post_tool_content_and_pre_tool_metadata():
     mock_agent.is_request_cancelled = MagicMock(return_value=False)
     mock_agent.emit_event = AsyncMock()
     mock_agent._maybe_audit = AsyncMock()
+    mock_agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     mock_agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     mock_agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     mock_agent.hooks_manager = None  # skip USER_PROMPT_SUBMIT hook
@@ -202,6 +203,7 @@ async def test_streaming_no_tool_calls_persists_full_response_unchanged():
     mock_agent._cached_features_prompt = ""
     mock_agent.is_request_cancelled = MagicMock(return_value=False)
     mock_agent._maybe_audit = AsyncMock()
+    mock_agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     mock_agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     mock_agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     mock_agent.hooks_manager = None  # skip USER_PROMPT_SUBMIT hook

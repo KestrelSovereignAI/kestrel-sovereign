@@ -4143,24 +4143,48 @@ No other text or formatting.
 
             if errors:
                 joined = "; ".join(f"{name}: {error}" for name, error in errors.items())
-                return {"risk_level": 3, "reasoning": f"Audit provider failed: {joined}"}
+                return {
+                    "risk_level": 3,
+                    "reasoning": f"Audit provider failed: {joined}",
+                    "audited": False,
+                }
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse audit JSON: {e}")
-            return {"risk_level": 3, "reasoning": "Audit model returned malformed JSON."}
+            return {
+                "risk_level": 3,
+                "reasoning": "Audit model returned malformed JSON.",
+                "audited": False,
+            }
         except LLMProviderError as e:
             logger.error(f"Audit provider failed: {e}")
-            return {"risk_level": 3, "reasoning": f"Audit provider failed: {e}"}
+            return {
+                "risk_level": 3,
+                "reasoning": f"Audit provider failed: {e}",
+                "audited": False,
+            }
         except (ValueError, KeyError, AttributeError, TypeError) as e:
             logger.error(f"Data validation error in audit: {e}", exc_info=True)
-            return {"risk_level": 3, "reasoning": f"Audit failed: {e}"}
+            return {
+                "risk_level": 3,
+                "reasoning": f"Audit failed: {e}",
+                "audited": False,
+            }
         except (openai.APIError, openai.APIConnectionError, httpx.HTTPError, ConnectionError, TimeoutError) as e:
             logger.error(f"Network/API error in audit: {e}", exc_info=True)
-            return {"risk_level": 3, "reasoning": f"Audit failed: {e}"}
+            return {
+                "risk_level": 3,
+                "reasoning": f"Audit failed: {e}",
+                "audited": False,
+            }
         except Exception as e:
             logger.error(f"Unexpected audit error: {e}", exc_info=True)
-            return {"risk_level": 3, "reasoning": f"Audit failed: {e}"}
+            return {
+                "risk_level": 3,
+                "reasoning": f"Audit failed: {e}",
+                "audited": False,
+            }
 
     async def get_response(
         self,

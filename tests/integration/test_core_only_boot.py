@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from server import app
 from kestrel_sovereign.inception_service import create_kestrel_identity
 from kestrel_sovereign import storage
+from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 
 # Non-core features to disable. Core features that should remain:
@@ -70,7 +71,11 @@ def client(monkeypatch):
         test_api_key = "test-core-only-key-12345"
         monkeypatch.setenv("KESTREL_API_KEY", test_api_key)
 
-        create_kestrel_identity(agent_dir)
+        create_kestrel_identity(
+            agent_dir,
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:core_only_boot_fixture",
+        )
 
         threads_before = set(threading.enumerate())
 

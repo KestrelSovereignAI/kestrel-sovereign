@@ -371,13 +371,23 @@ export async function loadIdentity(expectedAgent = API.getHostAgent()) {
 
         if (identity.genesis_audit) {
             const auditEl = document.getElementById('genesis-audit');
+            const audit = identity.genesis_audit;
+            const legacyRisk = Number(audit.risk_level || 0);
+            const status = audit.status || (legacyRisk === 3
+                ? 'failed'
+                : (legacyRisk ? 'passed' : 'unknown'));
+            const detail = status === 'pending'
+                ? 'Waiting for an audit-capable LLM; cognition is blocked.'
+                : (audit.reasoning || audit.summary || 'No issues found');
             auditEl.innerHTML = `
                 <div class="identity-card" style="margin-top: 1rem;">
                     <h3 style="margin: 0 0 1rem 0;">Genesis Audit</h3>
                     <div style="display: grid; gap: 0.5rem; font-size: 0.875rem;">
-                        <div><strong>Risk Level:</strong> ${identity.genesis_audit.risk_level}</div>
-                        <div><strong>Summary:</strong> ${identity.genesis_audit.summary || 'No issues found'}</div>
-                        ${identity.genesis_audit.findings ? `<div><strong>Findings:</strong> ${JSON.stringify(identity.genesis_audit.findings)}</div>` : ''}
+                        <div><strong>Status:</strong> ${escapeHtml(status)}</div>
+                        ${audit.risk_level ? `<div><strong>Risk Level:</strong> ${escapeHtml(audit.risk_level)}</div>` : ''}
+                        <div><strong>Summary:</strong> ${escapeHtml(detail)}</div>
+                        ${audit.provenance ? `<div><strong>Provenance:</strong> ${escapeHtml(audit.provenance)}</div>` : ''}
+                        ${audit.findings ? `<div><strong>Findings:</strong> ${escapeHtml(JSON.stringify(audit.findings))}</div>` : ''}
                     </div>
                 </div>
             `;

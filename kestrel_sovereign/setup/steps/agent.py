@@ -59,6 +59,8 @@ def create_agent(
     port: int | None = None,
     emancipation_contract: EmancipationContract | None = None,
     is_test_instance: bool = False,
+    genesis_auditor=None,
+    genesis_audit_provenance: str | None = None,
 ) -> CreateAgentResult:
     """Idempotent agent creation: incept if needed, then register in multi_agent.
 
@@ -90,11 +92,18 @@ def create_agent(
     already_existed = db_path.exists()
     if not already_existed:
         agent_dir.mkdir(parents=True, exist_ok=True)
+        if genesis_auditor is None and _configured_genesis_auditor_available(
+            project_dir
+        ):
+            genesis_auditor = _build_configured_genesis_auditor(project_dir)
+            genesis_audit_provenance = "setup:configured_llm"
         creds = _run_inception(
             agent_dir,
             name,
             emancipation_contract,
             is_test_instance=is_test_instance,
+            genesis_auditor=genesis_auditor,
+            genesis_audit_provenance=genesis_audit_provenance,
         )
         did = creds.agent_did
 
@@ -329,6 +338,8 @@ def _run_inception(
     emancipation_contract: EmancipationContract | None,
     *,
     is_test_instance: bool = False,
+    genesis_auditor=None,
+    genesis_audit_provenance: str | None = None,
 ):
     """Call into inception_service. Imported lazily — heavy module."""
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
@@ -340,8 +351,94 @@ def _run_inception(
             agent_name=name,
             emancipation_contract=emancipation_contract,
             is_test_instance=is_test_instance,
+            genesis_auditor=genesis_auditor,
+            genesis_audit_provenance=genesis_audit_provenance,
         )
     )
+
+
+def _configured_genesis_auditor_available(project_dir: Path) -> bool:
+    """Return whether the configured route set has a usable audit lane.
+
+    A declared route is not enough: the stock config declares Ollama even on
+    hosts where it is absent. Cloud routes require a persisted/exported
+    credential; Ollama must answer its normal reachability probe. If neither is
+    currently usable, inception records ``pending`` and first cognition remains
+    gated until the operator configures one.
+    """
+    import os
+
+    from kestrel_sovereign.setup.env_file import read_env
+    from kestrel_sovereign.setup.steps import llm as llm_step
+
+    config = read_toml(project_dir / "kestrel.toml")
+    llm_config = config.get("llm") or {}
+    vendors = llm_config.get("vendors") or {}
+    persisted_env = read_env(project_dir / ".env")
+
+    for route_id in llm_config.get("route_priority", []) or []:
+        vendor_key, separator, route_key = str(route_id).partition(":")
+        if not separator:
+            continue
+        route = (
+            ((vendors.get(vendor_key) or {}).get("routes") or {}).get(route_key)
+            or {}
+        )
+        accepted = llm_step.accepted_credential_envs(route_id, route)
+        if accepted:
+            if any(os.environ.get(name) or persisted_env.get(name) for name in accepted):
+                return True
+            continue
+        adapter = str(route.get("adapter", ""))
+        if adapter == "OllamaAdapter":
+            if llm_step._is_ollama_reachable(
+                str(route.get("host") or "http://localhost:11434")
+            ):
+                return True
+            continue
+        # A credential-free non-Ollama route is explicitly configured and does
+        # not expose a generic reachability probe; let the attempted audit be
+        # the authoritative fail-closed check.
+        if route:
+            return True
+    return False
+
+
+def _build_configured_genesis_auditor(project_dir: Path):
+    """Build a one-shot auditor using the target home's configured LLM lane."""
+
+    async def _audit(prompt: str):
+        # The setup wizard may have written a credential to .env moments ago.
+        # Load that target deliberately; inception_service itself must remain
+        # free of import-time/current-directory dotenv behavior (#2468).
+        import os
+
+        from kestrel_sovereign.cli import _load_target_env
+        from kestrel_sovereign.llm.service import LLMService
+        from kestrel_sovereign.paths import reset_cache
+
+        _load_target_env(project_dir)
+        # LLMService resolves kestrel.toml during its synchronous constructor.
+        # Pin that instant to the explicit create_agent target, then restore the
+        # host environment before the first await so concurrent agents cannot
+        # observe a process-global KESTREL_HOME detour.
+        previous_home = os.environ.get("KESTREL_HOME")
+        os.environ["KESTREL_HOME"] = str(project_dir)
+        reset_cache()
+        try:
+            service = LLMService()
+        finally:
+            if previous_home is None:
+                os.environ.pop("KESTREL_HOME", None)
+            else:
+                os.environ["KESTREL_HOME"] = previous_home
+            reset_cache()
+        try:
+            return await service.get_audit_response(prompt)
+        finally:
+            await service.close()
+
+    return _audit
 
 
 def _load_emancipation_contract(ctx: SetupContext) -> EmancipationContract | None:
