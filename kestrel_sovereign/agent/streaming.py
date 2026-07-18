@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import time
+from dataclasses import replace
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
@@ -18,11 +19,45 @@ from kestrel_sovereign.agent.parts import (
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
 )
 from kestrel_sovereign.telemetry import start_span, end_span
+
+
+def resolve_turn_invocation_context(
+    llm_service,
+    invocation_context: Optional[LLMInvocationContext],
+    session_id: Optional[str],
+) -> LLMInvocationContext:
+    """Resolve the correlation identity for one agent turn's LLM call (#2614).
+
+    ``invocation_context`` is the modern immutable per-request path: when the
+    caller supplies it, its fields win. When it is ``None`` the legacy
+    ``LLMService.set_observability_context`` ambient state is the fallback, so
+    consumers that have not migrated keep working unchanged. Either way an
+    explicit ``session_id`` fills an empty session slot so stateful adapters and
+    per-session metering stay correlated with the turn.
+
+    The service's own ``_resolve_invocation_context`` is the canonical resolver
+    (explicit → ambient → per-session fallback); delegate to it when present so
+    the agent and service never disagree on precedence. A minimal service double
+    without that resolver falls back to the explicit context merged with the
+    session id.
+    """
+    resolver = getattr(llm_service, "_resolve_invocation_context", None)
+    if resolver is not None:
+        return resolver(invocation_context, session_id=session_id)
+    resolved = (
+        invocation_context
+        if invocation_context is not None
+        else LLMInvocationContext()
+    )
+    if session_id and not resolved.session_id:
+        resolved = replace(resolved, session_id=session_id)
+    return resolved
 
 
 # Wave 5E in-band revising sentinel — kestrel-sovereign #1086.
@@ -567,6 +602,8 @@ class StreamingMixin:
     async def process_input_streaming(
         self,
         user_input: str,
+        *,
+        invocation_context: Optional[LLMInvocationContext] = None,
         model_override: str = None,
         audit_before_streaming: bool = False,
         session_id: str = None,
@@ -576,6 +613,11 @@ class StreamingMixin:
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
+
+        ``invocation_context`` is the modern identity-passing path (immutable,
+        per-request). Prefer it in new consumers; the legacy
+        ``LLMService.set_observability_context`` state remains as a fallback.
+        See :func:`resolve_turn_invocation_context` for the precedence rule.
 
         Uses single-call streaming with tool detection pattern:
         1. Build context and feature tools (same as process_input)
@@ -651,7 +693,13 @@ class StreamingMixin:
         # PART sentinels after the command result, mirroring the normal path.
         if user_input.startswith("!"):
             with part_collector():
-                result = await self.process_input(user_input, model_override, session_id=session_id, caller=caller)
+                result = await self.process_input(
+                    user_input,
+                    invocation_context=invocation_context,
+                    model_override=model_override,
+                    session_id=session_id,
+                    caller=caller,
+                )
                 yield result
                 for part in drain_parts():
                     sentinel = build_part_sentinel(part)
@@ -685,6 +733,7 @@ class StreamingMixin:
                         async for chunk in self._process_input_streaming_traced_locked(
                             user_input, model_override, session_id, _otel_span,
                             request_id=request_id, attachments=attachments,
+                            invocation_context=invocation_context,
                         ):
                             yield chunk
         except Exception as exc:
@@ -697,6 +746,7 @@ class StreamingMixin:
     async def _process_input_streaming_traced_locked(
         self, user_input, model_override, session_id, _otel_span,
         request_id: Optional[str] = None, attachments: Optional[list] = None,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ):
         """Inner streaming logic wrapped in an OTEL span.
 
@@ -958,6 +1008,15 @@ class StreamingMixin:
             if request_id else None
         )
 
+        # #2614: resolve the per-request correlation identity for THIS turn.
+        # Explicit ``invocation_context`` wins; otherwise fall back to the
+        # legacy ``set_observability_context`` ambient state, with the explicit
+        # ``session_id`` filling an empty session slot. Same helper as the
+        # non-streaming path so both agree on precedence.
+        resolved_context = resolve_turn_invocation_context(
+            self.llm_service, invocation_context, session_id
+        )
+
         async for item in self.llm_service.stream_with_tool_detection(
             messages=messages,
             tools=feature_tools if feature_tools else None,
@@ -969,6 +1028,7 @@ class StreamingMixin:
             images=eager_images or None,
             keep_trailing_system=operator_turn.keep_trailing_system,
             cancel_token=cancel_token,
+            invocation_context=resolved_context,
         ):
             # #1256: Honor stop-button cancellation INSIDE the agent
             # loop, not just at the HTTP response layer. Before this

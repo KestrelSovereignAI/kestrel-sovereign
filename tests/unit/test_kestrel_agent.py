@@ -8,11 +8,19 @@ NO mock-returns-mock tests - each test verifies real logic.
 import pytest
 import asyncio
 import contextlib
+import inspect
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from decimal import Decimal
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent, _load_prompt_file
+from kestrel_sovereign.agent.streaming import (
+    StreamingMixin,
+    resolve_turn_invocation_context,
+)
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
