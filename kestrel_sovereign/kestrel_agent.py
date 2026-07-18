@@ -358,6 +358,19 @@ class KestrelAgent(
         self.did = did
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
+        # Human display name for observability span attribution (#2602). Set to
+        # a best-effort floor at construction so EVERY agent object carries the
+        # attribute from birth — no construction path (fleet load, spawn /
+        # inception, scheduler-context, single-agent host, CLI/REPL) can produce
+        # an unnamed object whose LLM spans fall back to the emitter's
+        # "unknown". ``initialize()`` (graph-node name) and
+        # ``AgentManager._register_agent`` (registered routing key) override this
+        # with progressively more authoritative names. Mirrored onto the owning
+        # LLMService once it exists (below) so LLM-call spans are attributed from
+        # the very first call (#2573).
+        self.agent_name: str = self._derive_construction_display_name(
+            did, storage_path
+        )
         self._allowed_features = allowed_features
         self._sync_enabled = _resolve_sync_enabled(sync_enabled)
         # Optional injected payer-policy + host db for multi-tenant embedding
@@ -570,6 +583,11 @@ class KestrelAgent(
         # the invariant is enforced for them and silently waived for fakes.
         if hasattr(self.llm_service, "attach_to_agent"):
             self.llm_service.attach_to_agent(did)
+        # Mirror the construction-time display name onto the LLMService so LLM
+        # spans are attributed from the very first call — including the genesis
+        # audit and feature-init calls that run inside initialize() before the
+        # registrar's authoritative stamp lands (#2602 / #2573).
+        self._set_display_name(self.agent_name)
         # #1563: give every stateful adapter (currently just
         # CodexAdapter) a reference to this agent so the failure-
         # result rewrite can cross-reference the SecurityFeature's
@@ -686,6 +704,70 @@ class KestrelAgent(
 
         # Initialize constitution audit tracking
         self._init_constitution_audit_tracking()
+
+    @staticmethod
+    def _derive_construction_display_name(
+        did: str, storage_path: Optional[str]
+    ) -> str:
+        """Best-effort human display name known at construction time (#2602).
+
+        The authoritative name is resolved later — the agent's graph node in
+        ``initialize()`` and the registered routing key in
+        ``AgentManager._register_agent`` — so this is only the construction-time
+        floor: an agent that emits a span before either runs is still attributed
+        to a real name rather than the observability emitter's "unknown"
+        fallback. Resolution order: the agent directory's ``[agent] name`` from
+        ``kestrel.toml`` (the config name), then the data-directory name, then a
+        DID label as a last resort. Never returns an empty string.
+        """
+        if storage_path:
+            agent_dir = Path(storage_path).parent
+            toml_path = agent_dir / "kestrel.toml"
+            if toml_path.exists():
+                try:
+                    try:
+                        import tomllib  # type: ignore[import-not-found]
+                    except ImportError:
+                        import tomli as tomllib  # type: ignore[import-not-found]
+                    with open(toml_path, "rb") as f:
+                        configured = tomllib.load(f).get("agent", {}).get("name")
+                    if configured:
+                        return str(configured)
+                except Exception:  # noqa: BLE001 - best-effort floor only
+                    logging.debug(
+                        "Failed to read [agent] name from %s", toml_path,
+                        exc_info=True,
+                    )
+            dir_name = agent_dir.name
+            if dir_name and dir_name not in (".", "..", "/"):
+                return dir_name
+        return did or "Unnamed Agent"
+
+    def _set_display_name(self, name: Optional[str]) -> None:
+        """Publish the human display name used for observability attribution.
+
+        Sets ``self.agent_name`` — the plain instance attribute the
+        observability emitter reads — and mirrors it onto the owning
+        ``LLMService`` so LLM-call spans carry ``kestrel.agent_name`` (#2573)
+        instead of the emitter's "unknown" fallback (#2602). Called at three
+        points, each overriding the last: ``__init__`` (construction-time floor
+        from config / data-dir), ``initialize()`` (authoritative name from the
+        agent's graph node), and ``AgentManager._register_agent`` (the
+        registered routing key). A falsy ``name`` is ignored so a later, less
+        specific resolution never blanks out an already-good name.
+        """
+        if not name:
+            return
+        self.agent_name = name
+        llm = getattr(self, "llm_service", None)
+        if llm is not None and hasattr(llm, "set_agent_display_name"):
+            try:
+                llm.set_agent_display_name(name)
+            except Exception:  # noqa: BLE001 - attribution must never break init
+                logging.debug(
+                    "Failed to mirror agent display name to LLMService",
+                    exc_info=True,
+                )
 
     def register_constitution_receipt_tool(
         self, *, canary: str, signal_id: str
@@ -1600,6 +1682,14 @@ class KestrelAgent(
                 self._agent_name = _agent_node.properties.get("name", "Unnamed Agent")
             else:
                 self._agent_name = "Unnamed Agent"
+            # Upgrade the observability display name from the construction-time
+            # floor to the authoritative graph-node name (#2602), so every span
+            # emitted for the rest of initialize() — genesis audit, feature init
+            # — and by non-fleet agents (single-agent host, CLI/REPL) that never
+            # reach the registrar carries the real name. ``_register_agent``
+            # overrides this with the registered routing key for fleet members.
+            if _agent_node:
+                self._set_display_name(self._agent_name)
 
             # Verify the per-agent constitution overlay against its anchor BEFORE
             # feature discovery (#1722). ComputerUseFeature.initialize() reads
