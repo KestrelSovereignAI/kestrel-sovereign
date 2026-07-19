@@ -98,7 +98,12 @@ class MockLLMService:
         return MockResponse()
 
     async def generate_with_messages(self, messages, **kwargs):
-        """Mock generate_with_messages (same as generate)."""
+        """Mock generate_with_messages (same as generate); records kwargs.
+
+        Test suite uses ``self.last_kwargs`` to assert callers thread through
+        keyword-only args like ``invocation_context`` (#2624).
+        """
+        self.last_kwargs = kwargs
         return await self.generate(messages)
 
 
@@ -898,3 +903,37 @@ class TestInitialAgentDescription:
 
         for name in ["Steve", "Kestrel Agent", "Eldercare Companion"]:
             assert _initial_agent_description(name) != "Constitutional AI Agent with sovereign memory"
+
+
+class TestInvocationContextThreading:
+    """#2624 — process_discovery_message must thread invocation_context to
+    generate_with_messages so the metering callback attributes companion/user
+    on discovery-phase turns (they burn real tokens; they must be billable)."""
+
+    @pytest.mark.asyncio
+    async def test_process_discovery_message_threads_invocation_context(
+        self, bootstrap_service, mock_llm,
+    ):
+        from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
+        ctx = LLMInvocationContext(session_id="S", companion_id="C", user_id="U")
+
+        await bootstrap_service.process_discovery_message(
+            "Hi, I'm Alice!", invocation_context=ctx,
+        )
+
+        assert mock_llm.last_kwargs is not None, "generate_with_messages must be called"
+        assert mock_llm.last_kwargs.get("invocation_context") is ctx, (
+            "invocation_context must be threaded to generate_with_messages so the "
+            "metering callback sees populated companion/user on discovery turns"
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_discovery_message_defaults_invocation_context_to_none(
+        self, bootstrap_service, mock_llm,
+    ):
+        """Backwards compat: existing callers that don't pass invocation_context
+        must continue to work (kwarg has a None default)."""
+        await bootstrap_service.process_discovery_message("Hi, I'm Alice!")
+
+        assert mock_llm.last_kwargs is not None
+        assert mock_llm.last_kwargs.get("invocation_context") is None
