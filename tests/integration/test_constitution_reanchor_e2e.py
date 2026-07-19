@@ -27,10 +27,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.constitution.amendment_artifact import (
     build_legacy_signed_reanchor_artifact,
@@ -38,7 +42,7 @@ from kestrel_sovereign.constitution.amendment_artifact import (
 )
 from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
 from kestrel_sovereign.setup.constitution_reanchor import reanchor_constitution
-from kestrel_sovereign.storage import AsyncStorage
+from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 
 
 CONSTITUTION_V1 = b"""# Kestrel Constitution (Test V1)
@@ -75,6 +79,16 @@ _ROOT_DID_DOCUMENT = did_document_from_legacy_public_key(
     _ROOT_DID,
     _ROOT_KEYPAIR.public_key,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_trust_root(monkeypatch):
+    """These tests pass explicit per-test trust-root paths. An operator
+    machine's pinned ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH`` (loaded from the
+    checkout's ``.env`` by conftest) would conflict with them and fail every
+    forced run with an ambiguity error, so drop it for the test's duration.
+    """
+    monkeypatch.delenv("KESTREL_SOVEREIGN_TRUST_ROOT_PATH", raising=False)
 
 
 def _write_authority_files(
@@ -222,6 +236,208 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     # 5. RAG chunks: indexed for v2, deleted for v1.
     assert post["chunks_for"][v2_hash] > 0, "RAG must be re-indexed for the new content"
     assert post["chunks_for"][v1_hash] == 0, "old RAG chunks must be cleared"
+
+
+@pytest.mark.asyncio
+async def test_reanchor_prunes_dangling_governed_by_edges(tmp_path, monkeypatch):
+    """#2617: property/edge drift state — the delete must target ALL
+    non-target edges, not the (nonexistent) property-derived one.
+
+    Live incident shape: agent property said hash X, the actual
+    ``governed_by`` edge pointed at hash Y. The pre-fix reanchor deleted
+    edge(agent, X) — which didn't exist — and left Y dangling next to the
+    new edge, giving the agent two governing constitutions.
+    """
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+
+    # Reproduce the drift state: property points at a hash that has NO
+    # matching edge; the real edge still points at v1.
+    phantom_hash = "9" * 64
+    async with AsyncStorage(str(db_path)) as storage:
+        agent = await storage.graph.get_node(creds.agent_did)
+        agent.properties["constitution_hash"] = phantom_hash
+        await storage.graph.add_node(agent)
+
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V2,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+    )
+    assert result.reanchored, f"reanchor failed: {result.error}"
+    assert result.old_hash == phantom_hash
+    assert result.new_hash == v2_hash
+    assert result.governance_edge_drift is True
+    assert result.stale_edge_targets == (v1_hash,)
+
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post["governed_by_targets"] == [v2_hash], (
+        "after reanchor the agent must have EXACTLY one governed_by edge "
+        "— the dangling pre-drift edge must be pruned (#2617)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reanchor_unchanged_force_prunes_stale_edges(tmp_path, monkeypatch):
+    """#2617 one-shot cleanup: anchor already current, dangling edge exists.
+
+    A forced run with a verified signed artifact for the CURRENT hash must
+    enter the prune-only write path (backup + transaction), delete the
+    dangling edge, and report it — without touching the anchor.
+    """
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+
+    # Dangling governance edge left behind by a pre-fix reanchor.
+    stale_hash = "5" * 64
+    async with AsyncStorage(str(db_path)) as storage:
+        await storage.graph.add_edge(creds.agent_did, stale_hash, "governed_by")
+
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V1,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+    )
+    assert result.error is None
+    # A same-hash governance repair is modeled as a reanchored result with
+    # old_hash == new_hash and governance_edge_drift set (#2616 semantics).
+    assert result.reanchored
+    assert result.old_hash == v1_hash
+    assert result.new_hash == v1_hash
+    assert result.governance_edge_drift is True
+    assert result.stale_edge_targets == (stale_hash,)
+    assert result.backup_path is not None and result.backup_path.exists(), (
+        "prune-only write must still take the file-level backup"
+    )
+
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post["governed_by_targets"] == [v1_hash]
+    assert post["agent_constitution_hash"] == v1_hash
+
+
+@pytest.mark.asyncio
+async def test_reanchor_unchanged_stale_edges_unforced_reports_drift(
+    tmp_path, monkeypatch,
+):
+    """Dry run over a current anchor + dangling edge reports drift, no write."""
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+
+    stale_hash = "5" * 64
+    async with AsyncStorage(str(db_path)) as storage:
+        await storage.graph.add_edge(creds.agent_did, stale_hash, "governed_by")
+
+    pre = await _snapshot(db_path, creds.agent_did)
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+    assert result.drift_unforced
+    assert result.governance_edge_drift is True
+    assert result.stale_edge_targets == (stale_hash,)
+    assert result.backup_path is None
+
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post == pre, "unforced run must not write"
+
+
+@pytest.mark.asyncio
+async def test_reanchor_unchanged_stale_edges_force_requires_artifact(
+    tmp_path, monkeypatch,
+):
+    """The prune-only path sits behind the SAME signed-artifact gate."""
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+
+    stale_hash = "5" * 64
+    async with AsyncStorage(str(db_path)) as storage:
+        await storage.graph.add_edge(creds.agent_did, stale_hash, "governed_by")
+
+    pre = await _snapshot(db_path, creds.agent_did)
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=None,
+    )
+    assert result.error is not None
+    assert "signed" in result.error.lower()
+    assert result.backup_path is None
+    assert list(agent_dir.glob("*.backup-*")) == []
+
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post == pre, "refused prune must not write"
 
 
 @pytest.mark.asyncio
@@ -627,3 +843,220 @@ async def _snapshot(db_path: Path, agent_did: str) -> dict:
             "file_exists": file_exists,
             "chunks_for": chunks_for,
         }
+
+
+# ---------------------------------------------------------------------------
+# Runtime (!reanchor-constitution) path against REAL storage (#2617)
+#
+# The unit suite mocks the storage facade, which hides two production
+# behaviours: facade calls auto-commit one mutation at a time (so only a
+# real transaction proves rollback), and graph add_node is a
+# full-properties upsert (so only a real DB proves the document node's
+# inception metadata survives an "unchanged" cleanup).
+# ---------------------------------------------------------------------------
+
+
+class _RuntimeAgentHarness(ConstitutionMixin):
+    """Real ConstitutionMixin over real privacy-wrapped storage.
+
+    Provides only the collaborators the reanchor path touches; every
+    constitution code path is the production mixin under test.
+    """
+
+    def __init__(self, storage, agent_did, trust_root_path):
+        self.storage = storage
+        self.agent_id = agent_did
+        self.identity = None
+        self.extension = None
+        self._safe_mode = False
+        self._sovereign_trust_root_path = trust_root_path
+        self.privacy_agent = SimpleNamespace(add_conversation=AsyncMock())
+
+    def _get_timestamp(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+
+async def _incept_runtime_agent(tmp_path, monkeypatch):
+    """Incept a real agent on CONSTITUTION_V1; return (creds, db_path,
+    constitution_path)."""
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    return creds, agent_dir / "kestrel_prime.db", constitution_path
+
+
+@pytest.mark.asyncio
+async def test_runtime_reanchor_rolls_back_on_midprune_failure(
+    tmp_path, monkeypatch,
+):
+    """A failure after the edge add but mid-prune must roll back the new
+    constitution blob, the artifact blob + node, the document node, and the
+    new edge — and leave the agent pointer untouched — instead of durably
+    committing the exact property/edge drift this command exists to repair.
+    """
+    creds, db_path, constitution_path = await _incept_runtime_agent(
+        tmp_path, monkeypatch
+    )
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    v2_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V2,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+
+    pre = await _snapshot(db_path, creds.agent_did)
+
+    async with AsyncStorage(str(db_path)) as raw_storage:
+        storage = PrivacyEnforcingStorage(raw_storage)
+        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+
+        async def _failing_delete(source_id, target_id, label):
+            raise RuntimeError("injected mid-prune failure")
+
+        storage.delete_edge = _failing_delete
+
+        result = await agent.reanchor_constitution(
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "error" in result.lower()
+    assert "rolled back" in result.lower()
+
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post == pre, "failed reanchor must leave NO observable change"
+    async with AsyncStorage(str(db_path)) as check:
+        assert not await check.files.file_exists(v2_hash), (
+            "the new constitution blob must roll back with the transaction"
+        )
+
+    # Same command without the injected failure: the identical storage
+    # state converges to exactly one governed_by edge on the new anchor.
+    async with AsyncStorage(str(db_path)) as raw_storage:
+        storage = PrivacyEnforcingStorage(raw_storage)
+        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+        result = await agent.reanchor_constitution(
+            amendment_artifact_path=str(artifact_path),
+        )
+    assert "re-anchored successfully" in result.lower()
+    healed = await _snapshot(db_path, creds.agent_did)
+    assert healed["agent_constitution_hash"] == v2_hash
+    assert healed["governed_by_targets"] == [v2_hash]
+
+
+@pytest.mark.asyncio
+async def test_runtime_unchanged_cleanup_rolls_back_on_midprune_failure(
+    tmp_path, monkeypatch,
+):
+    """The prune-only cleanup is atomic: with two stale edges and a failure
+    on the SECOND delete, the first delete must also roll back — per-call
+    auto-commit would durably remove it and leave a half-pruned edge set.
+    """
+    creds, db_path, constitution_path = await _incept_runtime_agent(
+        tmp_path, monkeypatch
+    )
+    stale_a = "5" * 64
+    stale_b = "6" * 64
+    async with AsyncStorage(str(db_path)) as storage:
+        await storage.graph.add_edge(creds.agent_did, stale_a, "governed_by")
+        await storage.graph.add_edge(creds.agent_did, stale_b, "governed_by")
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V1,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+
+    pre = await _snapshot(db_path, creds.agent_did)
+
+    async with AsyncStorage(str(db_path)) as raw_storage:
+        storage = PrivacyEnforcingStorage(raw_storage)
+        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+
+        real_delete = storage.delete_edge
+        deleted_targets = []
+
+        async def _fail_on_second(source_id, target_id, label):
+            deleted_targets.append(target_id)
+            if len(deleted_targets) >= 2:
+                raise RuntimeError("injected mid-prune failure")
+            await real_delete(source_id, target_id, label)
+
+        storage.delete_edge = _fail_on_second
+
+        result = await agent.reanchor_constitution(
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "error" in result.lower()
+    assert "rolled back" in result.lower()
+    assert len(deleted_targets) == 2, (
+        "one edge must actually have been deleted before the injected failure"
+    )
+
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post == pre, (
+        "mid-prune failure must roll back the already-deleted edge too"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_unchanged_cleanup_preserves_document_node(
+    tmp_path, monkeypatch,
+):
+    """#2617 P2: the prune-only cleanup converges edges WITHOUT rewriting
+    the anchored constitution's document node. add_node is a full-properties
+    upsert, so a rewrite would strip the inception metadata (created_at)
+    from a constitution that has not changed.
+    """
+    creds, db_path, constitution_path = await _incept_runtime_agent(
+        tmp_path, monkeypatch
+    )
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    stale_hash = "5" * 64
+    async with AsyncStorage(str(db_path)) as storage:
+        await storage.graph.add_edge(
+            creds.agent_did, stale_hash, "governed_by"
+        )
+        pre_doc = await storage.graph.get_node(v1_hash)
+    assert pre_doc is not None
+    assert "created_at" in pre_doc.properties
+    pre_doc_properties = json.dumps(pre_doc.properties, sort_keys=True)
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V1,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+
+    pre = await _snapshot(db_path, creds.agent_did)
+
+    async with AsyncStorage(str(db_path)) as raw_storage:
+        storage = PrivacyEnforcingStorage(raw_storage)
+        agent = _RuntimeAgentHarness(storage, creds.agent_did, trust_root_path)
+        result = await agent.reanchor_constitution(
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "already anchored" in result.lower()
+    assert "pruned 1 stale governed_by edge(s)" in result.lower()
+
+    async with AsyncStorage(str(db_path)) as storage:
+        post_doc = await storage.graph.get_node(v1_hash)
+    assert (
+        json.dumps(post_doc.properties, sort_keys=True) == pre_doc_properties
+    ), "an unchanged constitution's document node must survive byte-for-byte"
+    assert "anchored_at" not in post_doc.properties
+
+    post = await _snapshot(db_path, creds.agent_did)
+    assert post["governed_by_targets"] == [v1_hash]
+    assert post["agent_constitution_hash"] == v1_hash
+    # Edge convergence must not touch the genesis receipt.
+    assert post["genesis_audit"] == pre["genesis_audit"]
+    assert post["genesis_audit_history"] == pre["genesis_audit_history"]

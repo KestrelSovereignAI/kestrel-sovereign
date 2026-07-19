@@ -17,6 +17,7 @@ check privacy mode, the storage layer will enforce it.
 import json
 import logging
 import warnings
+from contextlib import asynccontextmanager
 
 from kestrel_sovereign.storage.session_grouping import summarize_sessions
 from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING, Union
@@ -650,6 +651,22 @@ class PrivacyEnforcingStorage:
     async def add_edge(self, source_id: str, target_id: str, label: str, properties: Optional[Dict] = None):
         """Add a graph edge. Structural, not PII-sensitive."""
         await self._storage.add_edge(source_id, target_id, label, properties)
+
+    async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
+        """Remove a graph edge. Structural, not PII-sensitive."""
+        await self._storage.delete_edge(source_id, target_id, label)
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Atomic write unit over the underlying storage.
+
+        The transaction scope itself grants no extra write permission —
+        every operation inside it still goes through this wrapper's
+        privacy checks individually. It only guarantees that the writes
+        which ARE permitted commit or roll back together.
+        """
+        async with self._storage.transaction():
+            yield
 
     async def delete_node(self, node_id: str) -> None:
         """Delete a graph node and its edges. Structural operation."""

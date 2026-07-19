@@ -14,6 +14,7 @@ import logging
 import tarfile
 import tempfile
 import shutil
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, UTC
 from typing import Dict, Optional, List, Any, Union
 
@@ -235,7 +236,24 @@ class AsyncStorage:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
-    
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Run the enclosed storage operations as one atomic write unit.
+
+        Delegates to the backend's transaction context manager: every write
+        inside the ``async with`` block commits together or rolls back
+        together. Without this, each facade call auto-commits individually,
+        so a failure mid-sequence leaves partially-applied state. Both
+        backends are re-entrant for the SAME asyncio task, so nested
+        ``transaction()`` scopes (e.g. a helper opening its own around a
+        caller's outer one) join the outer transaction.
+        """
+        if not self._initialized:
+            await self.initialize()
+        async with self.db.transaction():
+            yield
+
     # --- File Operations ---
     
     async def store_file(self, content: bytes, original_name: str, 
@@ -775,6 +793,12 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         await self.graph.add_edge(source_id, target_id, label, properties)
+
+    async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
+        """Remove a specific edge by its (source, target, label) triple."""
+        if not self._initialized:
+            await self.initialize()
+        await self.graph.delete_edge(source_id, target_id, label)
 
     async def delete_node(self, node_id: str) -> None:
         """Delete a node and its edges from the knowledge graph."""

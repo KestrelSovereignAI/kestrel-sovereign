@@ -1355,8 +1355,11 @@ class ConstitutionMixin:
                 dids.add(doc_id)
         return dids
 
-    async def _anchor_constitution_governance(self, constitution_hash: str) -> None:
-        """Ensure the constitution document node + ``governed_by`` edge exist.
+    async def _anchor_constitution_governance(
+        self, constitution_hash: str
+    ) -> list[str]:
+        """Ensure the constitution document node + ``governed_by`` edge exist,
+        and that NO other ``governed_by`` edge survives.
 
         Inception creates a ``document`` node keyed by the constitution content
         hash and links ``agent --governed_by--> constitution`` (issue #2463's
@@ -1366,21 +1369,57 @@ class ConstitutionMixin:
         fail closed on a legitimately re-anchored agent. This mirrors the
         inception wiring so the byte-selection seam and its governance edge stay
         in lockstep.
+
+        Anchoring also prunes every ``governed_by`` edge whose target is not
+        ``constitution_hash`` (#2617): without this, each runtime reanchor
+        accumulated a dangling edge to the previous constitution — exactly the
+        inconsistent governance state the integrity audit exists to prevent.
+        The new edge is added BEFORE the prune so the agent never has zero
+        governing edges. Returns the pruned edge targets.
+
+        The whole sequence runs in one storage transaction: the underlying
+        graph calls otherwise auto-commit one mutation at a time, and a
+        failure between the edge add and the prune would commit exactly the
+        multi-edge drift state this method exists to remove. The document
+        node is created only when MISSING — ``add_node`` is a full-properties
+        upsert, so rewriting an existing node would strip its inception
+        metadata (``created_at``) from a constitution that hasn't changed.
         """
-        constitution_node = GraphNode(
-            node_id=constitution_hash,
-            node_type="document",
-            label="KESTREL_CONSTITUTION",
-            properties={
-                "hash": constitution_hash,
-                "type": "Constitution",
-                "anchored_at": self._get_timestamp(),
-            },
-        )
-        await self.storage.add_node(constitution_node)  # upsert
-        await self.storage.add_edge(
-            self.agent_id, constitution_hash, "governed_by"
-        )
+        pruned: list[str] = []
+        async with self.storage.transaction():
+            if await self.storage.get_node(constitution_hash) is None:
+                constitution_node = GraphNode(
+                    node_id=constitution_hash,
+                    node_type="document",
+                    label="KESTREL_CONSTITUTION",
+                    properties={
+                        "hash": constitution_hash,
+                        "type": "Constitution",
+                        "created_at": self._get_timestamp(),
+                    },
+                )
+                await self.storage.add_node(constitution_node)
+            await self.storage.add_edge(
+                self.agent_id, constitution_hash, "governed_by"
+            )
+            edges = await self.storage.get_edges_from(self.agent_id)
+            for edge in edges or []:
+                if (
+                    getattr(edge, "label", None) == "governed_by"
+                    and getattr(edge, "target_id", None) != constitution_hash
+                ):
+                    await self.storage.delete_edge(
+                        self.agent_id, edge.target_id, "governed_by"
+                    )
+                    pruned.append(edge.target_id)
+        if pruned:
+            logging.warning(
+                "Pruned %d stale governed_by edge(s) while anchoring %s: %s",
+                len(pruned),
+                constitution_hash[:16],
+                ", ".join(t[:16] for t in pruned),
+            )
+        return pruned
 
     async def reanchor_constitution(
         self,
@@ -1499,68 +1538,115 @@ class ConstitutionMixin:
             return f"Error: {exc}"
 
         if new_hash == old_hash:
+            # The signed artifact for this exact hash verified above, so
+            # converging the governance edges is inside the same
+            # authorization envelope (#2617): re-assert the anchored edge
+            # and prune any dangling governed_by edges left by pre-fix
+            # reanchors, instead of leaving them for the audit to trip on.
+            # The helper runs its edge convergence in one transaction, so a
+            # mid-prune failure rolls back rather than committing a partial
+            # edge set.
+            try:
+                pruned = await self._anchor_constitution_governance(new_hash)
+            except Exception as e:
+                return (
+                    f"Error: Governance edge cleanup failed and was rolled "
+                    f"back; no changes were committed: {e}"
+                )
+            stale_pruned = [t for t in (pruned or []) if t != old_hash]
+            if stale_pruned:
+                return (
+                    f"Constitution already anchored to current version. "
+                    f"Hash: {new_hash[:16]}...\n"
+                    f"  Pruned {len(stale_pruned)} stale governed_by "
+                    f"edge(s): "
+                    + ", ".join(f"{t[:16]}..." for t in stale_pruned)
+                )
             return f"Constitution already anchored to current version. Hash: {new_hash[:16]}..."
 
-        try:
-            stored_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
-            artifact_hash = await self.storage.store_file(
-                amendment_artifact_bytes,
-                "KESTREL_CONSTITUTION.reanchor.signed.json",
-            )
-        except Exception as e:
-            return f"Error: Failed to store constitution: {e}"
-
-        artifact_node = GraphNode(
-            node_id=artifact_hash,
-            node_type="constitution_amendment_artifact",
-            label="Signed Constitution Reanchor Artifact",
-            properties={
-                "hash": artifact_hash,
-                "type": "SignedConstitutionAmendment",
-                "artifact_type": amendment_artifact.get("artifact_type"),
-                "constitution_hash": stored_hash,
-                "signer": verification.signer,
-                "source_path": artifact_path_used,
-                "created_at": amendment_artifact.get("created_at"),
-                "anchored_at": self._get_timestamp(),
-                "verification": verification.reason,
-            },
-        )
-        await self.storage.add_node(artifact_node)
-
-        # Maintain the governance document node + governed_by edge for the new
-        # anchor so the periodic integrity audit's edge proof (#2463) still holds
-        # after a legitimate reanchor.
-        await self._anchor_constitution_governance(stored_hash)
-
-        agent_node.properties["constitution_hash"] = stored_hash
-        # A signed reanchor changes the bytes governed by the genesis receipt.
-        # Preserve the completed receipt as history, then require a fresh audit
-        # bound to the new hash. The reanchor command itself remains available;
-        # the next ordinary cognition turn completes this explicit pending state.
         from kestrel_sovereign.constitution.genesis_audit import (
             supersede_genesis_audit,
         )
 
-        supersede_genesis_audit(
-            agent_node.properties,
-            constitution_hash=stored_hash,
-            provenance="runtime:constitution_reanchor",
-            recorded_at=self._get_timestamp(),
-        )
-        agent_node.properties["constitution_reanchor"] = {
-            "timestamp": self._get_timestamp(),
-            "old_hash": old_hash,
-            "new_hash": stored_hash,
-            "path": constitution_path_used,
-            "signed_artifact_hash": artifact_hash,
-            "signed_artifact_path": artifact_path_used,
-            "signed_artifact_signer": verification.signer,
-            "signed_artifact_verification": verification.reason,
-            "authorization": authorization or "unspecified",
-            "expected_hash_prefix": expected_hash,
-        }
-        await self.storage.add_node(agent_node)
+        # Every mutation below — the new constitution blob, the artifact
+        # blob + node, the governed_by edge convergence, the superseded
+        # genesis receipt, and the agent's constitution_hash pointer — is
+        # one transaction. The storage facade otherwise auto-commits each
+        # call, so a failure after the edge prune but before the agent-node
+        # update would durably commit the property/edge disagreement this
+        # very command exists to repair, and a concurrent integrity audit
+        # could observe it.
+        try:
+            async with self.storage.transaction():
+                stored_hash = await self.storage.store_file(
+                    constitution_content, "KESTREL_CONSTITUTION.md"
+                )
+                artifact_hash = await self.storage.store_file(
+                    amendment_artifact_bytes,
+                    "KESTREL_CONSTITUTION.reanchor.signed.json",
+                )
+
+                artifact_node = GraphNode(
+                    node_id=artifact_hash,
+                    node_type="constitution_amendment_artifact",
+                    label="Signed Constitution Reanchor Artifact",
+                    properties={
+                        "hash": artifact_hash,
+                        "type": "SignedConstitutionAmendment",
+                        "artifact_type": amendment_artifact.get("artifact_type"),
+                        "constitution_hash": stored_hash,
+                        "signer": verification.signer,
+                        "source_path": artifact_path_used,
+                        "created_at": amendment_artifact.get("created_at"),
+                        "anchored_at": self._get_timestamp(),
+                        "verification": verification.reason,
+                    },
+                )
+                await self.storage.add_node(artifact_node)
+
+                # Maintain the governance document node + governed_by edge
+                # for the new anchor so the periodic integrity audit's edge
+                # proof (#2463) still holds after a legitimate reanchor.
+                # This also prunes every non-target governed_by edge — the
+                # old anchor's edge plus any dangling ones (#2617). Its own
+                # transaction scope joins this outer one (same task).
+                pruned_edges = await self._anchor_constitution_governance(
+                    stored_hash
+                )
+                stale_pruned = [
+                    t for t in (pruned_edges or []) if t != old_hash
+                ]
+
+                agent_node.properties["constitution_hash"] = stored_hash
+                # A signed reanchor changes the bytes governed by the genesis
+                # receipt. Preserve the completed receipt as history, then
+                # require a fresh audit bound to the new hash. The reanchor
+                # command itself remains available; the next ordinary
+                # cognition turn completes this explicit pending state.
+                supersede_genesis_audit(
+                    agent_node.properties,
+                    constitution_hash=stored_hash,
+                    provenance="runtime:constitution_reanchor",
+                    recorded_at=self._get_timestamp(),
+                )
+                agent_node.properties["constitution_reanchor"] = {
+                    "timestamp": self._get_timestamp(),
+                    "old_hash": old_hash,
+                    "new_hash": stored_hash,
+                    "path": constitution_path_used,
+                    "signed_artifact_hash": artifact_hash,
+                    "signed_artifact_path": artifact_path_used,
+                    "signed_artifact_signer": verification.signer,
+                    "signed_artifact_verification": verification.reason,
+                    "authorization": authorization or "unspecified",
+                    "expected_hash_prefix": expected_hash,
+                }
+                await self.storage.add_node(agent_node)
+        except Exception as e:
+            return (
+                f"Error: Reanchor failed mid-write and was rolled back; "
+                f"no changes were committed: {e}"
+            )
 
         logging.warning(
             f"CONSTITUTION RE-ANCHORED by {authorization or 'unspecified'}: "
@@ -1586,6 +1672,13 @@ class ConstitutionMixin:
         if self._safe_mode:
             safe_mode_note = "\n\n  Agent remains in SAFE MODE. Run !safe-mode exit to resume operation."
 
+        stale_note = ""
+        if stale_pruned:
+            stale_note = (
+                f"\n  Pruned stale governed_by edge(s): "
+                + ", ".join(f"{t[:16]}..." for t in stale_pruned)
+            )
+
         return (
             f"Constitution re-anchored successfully.\n"
             f"  Old hash: {old_hash[:16]}...\n"
@@ -1593,6 +1686,7 @@ class ConstitutionMixin:
             f"  Source:   {constitution_path_used}\n"
             f"  Artifact: {artifact_hash[:16]}... signed by {verification.signer}\n"
             f"  Auth:     {authorization or 'unspecified'}"
+            f"{stale_note}"
             f"{safe_mode_note}"
         )
 
@@ -1640,12 +1734,16 @@ class ConstitutionMixin:
                 return f"Error: Cannot resolve authoritative governing constitution: {e}"
 
             try:
-                constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
-                # Mirror inception's governance wiring so the integrity audit's
-                # edge proof (#2463) holds for a lazily-anchored legacy agent.
-                await self._anchor_constitution_governance(constitution_hash)
-                agent_node.properties["constitution_hash"] = constitution_hash
-                await self.storage.add_node(agent_node)
+                # One transaction: blob + governance edges + agent pointer
+                # land together or not at all — a partial lazy anchor would
+                # be the same property/edge drift #2617 repairs.
+                async with self.storage.transaction():
+                    constitution_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
+                    # Mirror inception's governance wiring so the integrity audit's
+                    # edge proof (#2463) holds for a lazily-anchored legacy agent.
+                    await self._anchor_constitution_governance(constitution_hash)
+                    agent_node.properties["constitution_hash"] = constitution_hash
+                    await self.storage.add_node(agent_node)
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
             except Exception as e:
                 return f"Error: Failed to anchor constitution: {e}"
