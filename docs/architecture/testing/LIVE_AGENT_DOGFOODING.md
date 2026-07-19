@@ -116,6 +116,11 @@ object (e.g. `kestrel restart <name>`) does **not** reload changed module code.
      <worktree>/.venv/bin/python -m uvicorn kestrel_sovereign.server:app \
      --host 0.0.0.0 --port 8777 >> <test-log> 2>&1 &
    ```
+   This runbook deliberately invokes Uvicorn directly so the test host is
+   byte-identical to Kestrel's managed process launcher. For a human-operated
+   direct server, use the validated
+   [`python -m kestrel_sovereign.server` contract](../core/SERVER_LAUNCH_CONTRACT.md)
+   instead; it rejects unsupported arguments and makes bind precedence explicit.
 4. **Wait for ready** (poll `/api/auth/key`, then `ask("Reply READY")`) and re-verify the module
    origin from step 1.
 

@@ -2,18 +2,22 @@
 """
 A FastAPI server to expose Kestrel agent functionality as a service.
 """
+import argparse
+import logging
 import os
+import re
 import secrets
+from collections.abc import Mapping, Sequence
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
 from pathlib import Path
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from contextlib import asynccontextmanager
-import logging
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
@@ -23,8 +27,6 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
-
-import re
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -543,14 +545,24 @@ def _host_config_mapping(config) -> dict:
     return mapping
 
 
-def _apply_platform_host_port(config, env) -> None:
-    """Keep the host config aligned with the platform-selected listen port.
+_SERVER_HOST_ENV = "KESTREL_SERVER_HOST"
+_SERVER_PORT_ENV = "PORT"
 
-    Cloud Run and Azure Container Apps inject ``PORT`` and uvicorn binds that
-    value.  Host features receive the same effective port through
-    ``HostContext`` rather than the stale value from ``multi_agent.toml``.
+
+def _apply_platform_host_port(config, env) -> None:
+    """Keep host metadata aligned with the effective listen address.
+
+    The packaged module CLI writes its resolved host and port to the environment
+    before Uvicorn starts. Cloud Run and Azure Container Apps inject ``PORT``
+    while their entrypoints pass the matching value to Uvicorn. Host features
+    therefore receive the effective socket address through ``HostContext``
+    rather than stale values from ``multi_agent.toml``.
     """
-    platform_port = env.get("PORT")
+    runtime_host = env.get(_SERVER_HOST_ENV)
+    if runtime_host is not None:
+        config.host.bind = runtime_host
+
+    platform_port = env.get(_SERVER_PORT_ENV)
     if platform_port is not None:
         config.host.port = int(platform_port)
 
@@ -1784,7 +1796,77 @@ async def phoenix_proxy(request: Request, path: str = ""):
     return await proxy_to_phoenix(request, supervisor, path)
 
 
-if __name__ == "__main__":
+def _server_host(value: str) -> str:
+    """Return a non-empty Uvicorn host value for argparse."""
+    host = value.strip()
+    if not host:
+        raise argparse.ArgumentTypeError("host must not be empty")
+    return host
+
+
+def _server_port(value: str) -> int:
+    """Return a valid TCP port for argparse."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def _server_argument_parser(
+    environ: Mapping[str, str] | None = None,
+) -> argparse.ArgumentParser:
+    """Build the direct-server CLI with explicit environment precedence."""
+    from kestrel_sovereign.multi_agent.config import (
+        DEFAULT_HOST_BIND,
+        DEFAULT_HOST_PORT,
+    )
+
+    env = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(
+        prog="python -m kestrel_sovereign.server",
+        description="Run the Kestrel Sovereign ASGI server.",
+    )
+    parser.add_argument(
+        "--host",
+        type=_server_host,
+        default=env.get(_SERVER_HOST_ENV, DEFAULT_HOST_BIND),
+        metavar="HOST",
+        help=(
+            "interface to bind (precedence: --host, KESTREL_SERVER_HOST, "
+            f"{DEFAULT_HOST_BIND})"
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=_server_port,
+        default=env.get(_SERVER_PORT_ENV, str(DEFAULT_HOST_PORT)),
+        metavar="PORT",
+        help=(
+            "TCP port to bind (precedence: --port, PORT, "
+            f"{DEFAULT_HOST_PORT})"
+        ),
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Run the packaged server entry point.
+
+    Resolved values are mirrored into the environment so the application
+    lifespan and Uvicorn observe the same effective host/port. ``argparse``
+    rejects unsupported or invalid arguments before any socket is opened.
+    """
+    args = _server_argument_parser().parse_args(argv)
+    os.environ[_SERVER_HOST_ENV] = args.host
+    os.environ[_SERVER_PORT_ENV] = str(args.port)
+
     import uvicorn
-    port = int(os.environ.get("PORT", 8888))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
