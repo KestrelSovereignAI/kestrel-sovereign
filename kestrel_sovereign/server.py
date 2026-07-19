@@ -1300,6 +1300,13 @@ async def auth_middleware(request: Request, call_next):
     if HOST_FEATURE_STATIC_ASSET_RE.match(request.url.path):
         return await call_next(request)
 
+    # Phoenix dynamic-import chunks request root-absolute /assets/… (outside the
+    # /phoenix cookie scope). The handler is a pure 307 redirect back under
+    # /phoenix — no data served — so it is safe header-less; the redirect target
+    # still enforces the embed-cookie auth at the proxy. GET/HEAD only.
+    if request.method in ("GET", "HEAD") and request.url.path.startswith("/assets/"):
+        return await call_next(request)
+
     # Phoenix reverse-proxy embed auth (issue #2570). The console mints a
     # short-lived, signed, HttpOnly cookie (scoped to /phoenix) via
     # POST /api/host/phoenix/session — which itself requires standard host auth —
@@ -1794,6 +1801,24 @@ async def phoenix_proxy(request: Request, path: str = ""):
 
     supervisor = _phoenix_supervisor(request)
     return await proxy_to_phoenix(request, supervisor, path)
+
+
+@app.get("/assets/{path:path}")
+@app.head("/assets/{path:path}")
+async def phoenix_assets_redirect(request: Request, path: str):
+    """Redirect Phoenix's root-absolute dynamic-import chunks into ``/phoenix``.
+
+    Phoenix's Vite bundle honours the root path in its static HTML tags
+    (``/phoenix/assets/...``) but *dynamically imported* chunks resolve from the
+    build-time base — root-absolute ``/assets/...`` — landing outside the
+    ``/phoenix`` cookie scope (observed: ``vendor-shiki``/``rolldown-runtime``
+    → 401, broken lazy views). A 307 sends the browser back under ``/phoenix``
+    where the embed cookie applies and the authenticated proxy serves the real
+    chunk. No data is served here; auth stays enforced at the proxy.
+    """
+    if _phoenix_supervisor(request) is None:
+        raise HTTPException(status_code=404)
+    return RedirectResponse(url=f"/phoenix/assets/{path}", status_code=307)
 
 
 def _server_host(value: str) -> str:

@@ -625,6 +625,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - `GET /health` — public aggregate readiness only (`status` and `agent_initialized`)
 - `GET /health/detailed` — authenticated operator diagnostics (API key, JWT, or OAuth session)
 - `/phoenix` and `/phoenix/{path}` — same-origin authenticated reverse proxy to the host-supervised Phoenix trace UI (embed-session cookie; all methods). Trace files use the private custody and migration contract in [`docs/architecture/security/PHOENIX_TRACE_CUSTODY.md`](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
+- `GET /assets/{path:path}` / `HEAD /assets/{path:path}` — unauthenticated 307 redirect into `/phoenix/assets/{path}` for Phoenix's root-absolute dynamic-import chunks (no data served; auth enforced at the proxy target)
 
 ### Router families mounted by `kestrel_sovereign/server.py`
 
