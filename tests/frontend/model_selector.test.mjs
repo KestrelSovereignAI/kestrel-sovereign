@@ -32,6 +32,7 @@ function loadModelSelector({ fetchImpl } = {}) {
     const modelSelect = createSelect();
     const routeSelect = createSelect();
     routeSelect.options = [];
+    const upstreamSelect = createSelect();
     const storage = new Map();
 
     const context = {
@@ -46,6 +47,7 @@ function loadModelSelector({ fetchImpl } = {}) {
                 if (id === 'provider-selector') return providerSelect;
                 if (id === 'model-selector') return modelSelect;
                 if (id === 'route-selector') return routeSelect;
+                if (id === 'upstream-selector') return upstreamSelect;
                 return null;
             },
         },
@@ -73,6 +75,7 @@ function loadModelSelector({ fetchImpl } = {}) {
         providerSelect,
         modelSelect,
         routeSelect,
+        upstreamSelect,
         storage,
     };
 }
@@ -352,6 +355,58 @@ test('selecting the Show all sentinel reveals every model without committing', (
     // Sentinel must not be treated as a model selection — no commit fired.
     assert.equal(commits.length, 0);
     assert.equal(selector.selectedModel, 'gpt-5.5');
+});
+
+test('upstream display filter keeps the active selection visible, selected, and uncommitted', () => {
+    // Regression: filtering OpenRouter to the Kimi upstream reseeded the combo
+    // to the first Kimi model WITHOUT committing — the dropdown showed a model
+    // the server never received, and clicking that same value could not fire a
+    // change event, so the pick could never commit (agent stayed on the old
+    // model while the UI claimed otherwise).
+    const commits = [];
+    const { ModelSelector, providerSelect, modelSelect, upstreamSelect } = loadModelSelector();
+    const selector = new ModelSelector({
+        providerSelectId: 'provider-selector',
+        modelSelectId: 'model-selector',
+        upstreamSelectId: 'upstream-selector',
+        storagePrefix: 'test',
+        onModelChange: (...a) => commits.push(a),
+    });
+    selector.allModelsData = {
+        default: null,
+        by_vendor: {
+            openrouter: [
+                { id: 'anthropic/claude-sonnet-5', provider: 'openrouter', display_name: 'Anthropic: Claude Sonnet 5', is_featured: true, underlying_provider: 'anthropic' },
+                { id: 'moonshotai/kimi-k3', provider: 'openrouter', display_name: 'MoonshotAI: Kimi K3', is_featured: true, underlying_provider: 'moonshotai' },
+            ],
+        },
+        routes: [{ vendor: 'openrouter', route: 'api', model: 'anthropic/claude-sonnet-5' }],
+    };
+    providerSelect.value = 'openrouter';
+    selector.selectedProvider = 'openrouter';
+    selector.isInitialLoad = false;
+    selector.selectedModel = 'anthropic/claude-sonnet-5';  // the committed/active model
+    selector._populateModels();
+    assert.equal(modelSelect.value, 'anthropic/claude-sonnet-5');
+
+    // Operator filters the combo to the Kimi upstream — a display filter only.
+    upstreamSelect.value = 'moonshotai';
+    selector._handleUpstreamChange();
+
+    // The filter must not mutate the selection: the active model stays
+    // rendered and selected alongside the filtered set, and nothing commits.
+    assert.equal(selector.selectedModel, 'anthropic/claude-sonnet-5');
+    assert.equal(modelSelect.value, 'anthropic/claude-sonnet-5');
+    assert.ok(modelSelect.innerHTML.includes('anthropic/claude-sonnet-5'));
+    assert.ok(modelSelect.innerHTML.includes('moonshotai/kimi-k3'));
+    assert.equal(commits.length, 0);
+
+    // An explicit pick of the filtered-to model is now a real value change —
+    // it commits the full (vendor, model, route) triple.
+    modelSelect.value = 'moonshotai/kimi-k3';
+    selector._handleModelChange();
+    assert.equal(commits.length, 1);
+    assert.deepEqual(commits[0], ['openrouter', 'moonshotai/kimi-k3', false, 'api']);
 });
 
 test('checkForModelChange renders a non-featured current model under the collapsed view', () => {

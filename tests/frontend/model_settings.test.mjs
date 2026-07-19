@@ -154,12 +154,16 @@ test('upstream facet appears for meta-provider catalogs and filters the model co
     assert.ok(modelSelect.innerHTML.includes('gpt-5.5'));
     assert.ok(modelSelect.innerHTML.includes('claude-sonnet-4-6'));
 
-    // Pick a specific upstream — model combo filters, no commit fires.
+    // Pick a specific upstream — the combo filters to that upstream PLUS the
+    // active selection, which stays visible and selected: a display filter
+    // must never mutate the selection (silently reseeding it left the combo
+    // showing a model the server never received).
     upstreamSelect.value = 'openai';
     selector._handleUpstreamChange();
     assert.ok(modelSelect.innerHTML.includes('gpt-5.5'));
     assert.ok(!modelSelect.innerHTML.includes('llama-4'));
-    assert.ok(!modelSelect.innerHTML.includes('claude-sonnet-4-6'));
+    assert.ok(modelSelect.innerHTML.includes('claude-sonnet-4-6'));
+    assert.equal(selector.selectedModel, 'anthropic/claude-sonnet-4-6');
 });
 
 test('upstream facet stays hidden for a plain vendor catalog', () => {

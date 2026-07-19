@@ -513,9 +513,15 @@ class ModelSelector {
         let visible = showAll ? ordered : featured.slice();
 
         // Keep the current selection visible even when it's not featured (e.g. a
-        // deprecated/older model the operator deliberately picked).
+        // deprecated/older model the operator deliberately picked) — or when the
+        // upstream DISPLAY filter hides it. The filter must never mutate the
+        // selection: reseeding here made the combo show a model the server never
+        // received, and re-clicking that value can't fire a change event, so the
+        // pick could never commit. Fall back to the unfiltered list so the
+        // active model stays selected; an explicit pick then always commits.
         if (this.selectedModel && !visible.some(m => m.id === this.selectedModel)) {
-            const sel = ordered.find(m => m.id === this.selectedModel);
+            const sel = ordered.find(m => m.id === this.selectedModel)
+                || fullList.find(m => m.id === this.selectedModel);
             if (sel) visible = [...visible, sel];
         }
 

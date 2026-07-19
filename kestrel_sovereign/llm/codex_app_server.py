@@ -84,11 +84,17 @@ _CODEX_DISABLED_NATIVE_FEATURES = (
     "workspace_dependencies",
 )
 
-# Resolution order for the binary. It ships inside the Codex desktop app
-# bundle and is deliberately NOT on PATH (reference: codex-cli-path),
-# which is why ``which codex`` misleads. An explicit env override wins.
+# Resolution order for the binary. It ships inside a desktop app bundle
+# and is deliberately NOT on PATH (reference: codex-cli-path), which is
+# why ``which codex`` misleads. An explicit env override wins. The
+# standalone Codex.app was absorbed into ChatGPT.app (mid-2026), which
+# carries the binary at the same Resources-relative location — probe the
+# current bundle first, then the legacy one for unmigrated machines.
 _CODEX_BIN_ENV = "KESTREL_CODEX_APP_SERVER_BIN"
-_CODEX_BUNDLE_PATH = "/Applications/Codex.app/Contents/Resources/codex"
+_CODEX_BUNDLE_PATHS = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+)
 
 # Server→client approval/elicitation requests we answer deterministically
 # so a turn can complete (mirrors kestrel-claw's
@@ -149,15 +155,16 @@ def resolve_codex_binary() -> str:
                 f"{_CODEX_BIN_ENV}={override!r} does not exist."
             )
         return override
-    if Path(_CODEX_BUNDLE_PATH).exists():
-        return _CODEX_BUNDLE_PATH
+    for bundle_path in _CODEX_BUNDLE_PATHS:
+        if Path(bundle_path).exists():
+            return bundle_path
     found = shutil.which("codex")
     if found:
         return found
     raise CodexAppServerError(
-        "codex binary not found. Install the Codex app/CLI, or set "
-        f"{_CODEX_BIN_ENV} to its path. (It ships inside Codex.app and is "
-        "intentionally off PATH.)"
+        "codex binary not found. Install the ChatGPT app (or the legacy "
+        f"Codex app/CLI), or set {_CODEX_BIN_ENV} to its path. (It ships "
+        "inside ChatGPT.app and is intentionally off PATH.)"
     )
 
 

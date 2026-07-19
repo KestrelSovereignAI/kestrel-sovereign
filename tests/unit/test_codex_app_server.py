@@ -105,6 +105,21 @@ class TestBinaryResolution:
             with pytest.raises(CodexAppServerError, match="does not exist"):
                 resolve_codex_binary()
 
+    def test_chatgpt_bundle_preferred_over_legacy(self):
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("kestrel_sovereign.llm.codex_app_server.Path.exists",
+                   autospec=True, side_effect=lambda self: True):
+            assert resolve_codex_binary() == (
+                "/Applications/ChatGPT.app/Contents/Resources/codex"
+            )
+
+    def test_legacy_codex_bundle_still_resolves(self):
+        legacy = "/Applications/Codex.app/Contents/Resources/codex"
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("kestrel_sovereign.llm.codex_app_server.Path.exists",
+                   autospec=True, side_effect=lambda self: str(self) == legacy):
+            assert resolve_codex_binary() == legacy
+
     def test_raises_with_hint_when_unfound(self):
         with patch.dict(os.environ, {}, clear=True), \
              patch("kestrel_sovereign.llm.codex_app_server.Path.exists",

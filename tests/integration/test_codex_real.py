@@ -24,17 +24,20 @@ import pytest
 
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.codex_adapter import CodexAdapter
-from kestrel_sovereign.llm.codex_app_server import CodexAppServerError
-
-_BIN = os.environ.get(
-    "KESTREL_CODEX_APP_SERVER_BIN",
-    "/Applications/Codex.app/Contents/Resources/codex",
+from kestrel_sovereign.llm.codex_app_server import (
+    CodexAppServerError,
+    resolve_codex_binary,
 )
+
+try:
+    _BIN = resolve_codex_binary()
+except CodexAppServerError:
+    _BIN = None
 _REAL_HOME = Path.home()
 _REAL_CODEX_HOME = Path(
     os.environ.get("CODEX_HOME", str(_REAL_HOME / ".codex"))
 ).expanduser().resolve()
-_HAVE = Path(_BIN).exists() and (_REAL_CODEX_HOME / "auth.json").exists()
+_HAVE = _BIN is not None and (_REAL_CODEX_HOME / "auth.json").exists()
 _LIVE_OPT_IN = os.environ.get("KESTREL_RUN_LIVE_CODEX") == "1"
 
 pytestmark = pytest.mark.skipif(
