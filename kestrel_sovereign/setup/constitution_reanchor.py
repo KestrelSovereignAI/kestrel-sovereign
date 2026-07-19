@@ -24,6 +24,17 @@ We do NOT delete the old document node or the old file blob — they're
 retained for audit. Only the ``governed_by`` edge and the RAG chunks
 move to the new hash.
 
+Drift is NOT just a hash mismatch. The integrity audit's proof 2 requires
+the ``governed_by`` edge to target the anchored hash, so an agent whose
+``constitution_hash`` is current but whose edge still points at an ancient
+anchor (the 2026-07-18 incident: a historical pre-atomic reanchor updated
+property + blob but never repointed the edge) fails closed at boot. This
+module therefore inspects the edge set before declaring "unchanged" and
+supports a **same-hash repair**: with ``--force`` + a signed artifact it
+atomically upserts the correct edge and removes every stale ``governed_by``
+target, without touching the (already-correct) hash, blob, RAG index, or
+genesis-audit receipt (#2616).
+
 Pre-flight: caller MUST ensure the agent isn't running. SQLite WAL
 locking would otherwise corrupt mid-write.
 """
@@ -86,6 +97,16 @@ class ReanchorResult:
     #: failure). The CLI uses this to print the diff-clause rather than
     #: a stack trace.
     iron_rule_violation: str | None = None
+    #: True when pre-write inspection found the ``governed_by`` edge set
+    #: inconsistent with the expected anchor — missing, mis-targeted, or
+    #: carrying stale extra targets (the 2026-07-18 incident shape, #2616).
+    #: Set alongside ``drift_unforced`` / ``reanchored`` so the CLI can
+    #: explain an edge-only (same-hash) repair.
+    governance_edge_drift: bool = False
+    #: ``governed_by`` targets that did not match the expected anchor at
+    #: inspection time. Informational — the write path re-reads the edge
+    #: set inside its transaction before deleting anything.
+    stale_edge_targets: tuple[str, ...] = ()
 
 
 async def reanchor_constitution(
@@ -197,7 +218,12 @@ async def reanchor_constitution(
             ),
         )
 
-    old_hash, agent_did, anchored_contract_json = await _read_agent_anchor(db_path)
+    (
+        old_hash,
+        agent_did,
+        anchored_contract_json,
+        governed_by_targets,
+    ) = await _read_agent_anchor(db_path)
     if old_hash is None:
         return ReanchorResult(
             agent_name=agent_name,
@@ -288,7 +314,23 @@ async def reanchor_constitution(
         and candidate_contract.enabled
     )
 
-    if old_hash == new_hash and not needs_sidecar_backfill:
+    # Edge consistency is part of the drift decision (#2616). Proof 2 of the
+    # fail-closed integrity audit requires an ``agent --governed_by--> anchor``
+    # edge targeting the anchored hash, so a matching hash alone does NOT mean
+    # "nothing to do": an edge left on an ancient anchor by a historical
+    # pre-atomic reanchor still safe-modes the agent at boot. Extra stale
+    # targets alongside the correct edge don't fail proof 2, but they mean the
+    # agent nominally has two governing constitutions — repair those too.
+    stale_edge_targets = tuple(t for t in governed_by_targets if t != new_hash)
+    governance_edge_drift = (
+        new_hash not in governed_by_targets or bool(stale_edge_targets)
+    )
+
+    if (
+        old_hash == new_hash
+        and not needs_sidecar_backfill
+        and not governance_edge_drift
+    ):
         return ReanchorResult(
             agent_name=agent_name,
             db_path=db_path,
@@ -308,6 +350,8 @@ async def reanchor_constitution(
             new_hash=new_hash,
             backup_path=None,
             drift_unforced=True,
+            governance_edge_drift=governance_edge_drift,
+            stale_edge_targets=stale_edge_targets,
         )
 
     # Authorization is a pre-write gate. The graph DB is the object being
@@ -402,28 +446,39 @@ async def reanchor_constitution(
         new_hash=new_hash,
         backup_path=backup_path,
         reanchored=True,
+        governance_edge_drift=governance_edge_drift,
+        stale_edge_targets=stale_edge_targets,
     )
 
 
 async def _read_agent_anchor(
     db_path: Path,
-) -> tuple[str | None, str, dict | None]:
-    """Return ``(constitution_hash, agent_did, emancipation_contract_json)``.
+) -> tuple[str | None, str, dict | None, tuple[str, ...]]:
+    """Return ``(constitution_hash, agent_did, emancipation_contract_json,
+    governed_by_targets)``.
 
     Read-only — safe to call before deciding whether to touch the DB.
-    Returns ``(None, "", None)`` if the agent node has no anchored hash.
+    Returns ``(None, "", None, ())`` if the agent node has no anchored hash.
     The contract field is ``None`` for dormant agents and for legacy
-    agents incepted before #1118 (no JSON receipt was written).
+    agents incepted before #1118 (no JSON receipt was written). The edge
+    targets feed the drift decision (#2616): integrity proof 2 requires a
+    ``governed_by`` edge at the anchored hash, so the caller must not
+    declare "unchanged" on the hash comparison alone.
     """
     async with AsyncStorage(str(db_path)) as storage:
         agent_nodes = await storage.graph.get_nodes_by_type("agent")
         if not agent_nodes:
-            return None, "", None
+            return None, "", None, ()
         agent = agent_nodes[0]
+        edges = await storage.graph.get_edges(agent.node_id, direction="out")
+        governed_by_targets = tuple(
+            edge.target_id for edge in edges if edge.label == "governed_by"
+        )
         return (
             agent.properties.get("constitution_hash"),
             agent.node_id,
             agent.properties.get("emancipation_contract"),
+            governed_by_targets,
         )
 
 
@@ -459,13 +514,26 @@ async def _write_reanchor(
          at a hash that has no file" inconsistency under partial
          visibility.
       2. Add the new graph document node (idempotent upsert on node_id).
-      3. Replace the governed_by edge: add new first, then delete old —
-         so a concurrent reader inside the transaction (if any) never
-         sees zero governing constitutions.
+      3. Repair the governed_by edge set: upsert the correct edge first,
+         then delete every stale target — so a concurrent reader inside
+         the transaction (if any) never sees zero governing
+         constitutions. Deleting ALL stale targets (not just
+         ``old_hash``) is what heals the 2026-07-18 incident shape,
+         where a historical pre-atomic reanchor left the edge on an
+         ancient anchor that ``delete_edge(old_hash)`` would never
+         touch (#2616). This also makes the writer valid for a
+         same-hash (``old_hash == new_hash``) edge repair.
       4. Re-index RAG: chunk the new content, then drop the old chunks
-         (same "always have something" reasoning).
+         (same "always have something" reasoning). Skipped entirely in
+         a same-hash repair — the chunks for ``new_hash`` ARE the live
+         index; re-chunking would duplicate them and "dropping the old"
+         would drop the fresh ones.
       5. Update the agent node's properties last — that's the pointer
-         everyone reads, so flipping it is the conceptual commit.
+         everyone reads, so flipping it is the conceptual commit. The
+         genesis-audit receipt is superseded only when the hash actually
+         moves: receipts are bound to their constitution hash, so a
+         same-hash repair leaves the existing receipt valid and must not
+         force a needless pending re-audit.
 
     If any step raises, the context manager rolls back and the DB is
     byte-identical to its pre-transaction state. The caller's file-
@@ -530,18 +598,32 @@ async def _write_reanchor(
                 )
             )
 
-            # 3. Replace the governed_by edge — add new first.
-            await storage.graph.add_edge(agent_did, new_hash, "governed_by")
-            await storage.graph.delete_edge(agent_did, old_hash, "governed_by")
-
-            # 4. Re-index RAG.
-            await storage.rag.chunk_document(
-                file_hash=new_hash,
-                content=new_content.decode("utf-8"),
-                chunk_size=500,
-                compute_embeddings=True,
+            # 3. Repair the governed_by edge set — upsert the correct edge
+            # first, then delete every stale target (see docstring).
+            existing_edges = await storage.graph.get_edges(
+                agent_did, direction="out"
             )
-            await storage.rag.delete_chunks_for_file(old_hash)
+            stale_edge_targets = sorted({
+                edge.target_id
+                for edge in existing_edges
+                if edge.label == "governed_by" and edge.target_id != new_hash
+            })
+            await storage.graph.add_edge(agent_did, new_hash, "governed_by")
+            for stale_target in stale_edge_targets:
+                await storage.graph.delete_edge(
+                    agent_did, stale_target, "governed_by"
+                )
+
+            # 4. Re-index RAG — only when the governing content actually
+            # moved (see docstring for the same-hash hazard).
+            if old_hash != new_hash:
+                await storage.rag.chunk_document(
+                    file_hash=new_hash,
+                    content=new_content.decode("utf-8"),
+                    chunk_size=500,
+                    compute_embeddings=True,
+                )
+                await storage.rag.delete_chunks_for_file(old_hash)
 
             # 5. Update the agent's pointer + audit record.
             agent_nodes = await storage.graph.get_nodes_by_type("agent")
@@ -549,15 +631,16 @@ async def _write_reanchor(
                 raise RuntimeError("Agent node disappeared mid-reanchor")
             agent = agent_nodes[0]
             agent.properties["constitution_hash"] = new_hash
-            from kestrel_sovereign.constitution.genesis_audit import (
-                supersede_genesis_audit,
-            )
+            if old_hash != new_hash:
+                from kestrel_sovereign.constitution.genesis_audit import (
+                    supersede_genesis_audit,
+                )
 
-            supersede_genesis_audit(
-                agent.properties,
-                constitution_hash=new_hash,
-                provenance="setup:constitution_reanchor",
-            )
+                supersede_genesis_audit(
+                    agent.properties,
+                    constitution_hash=new_hash,
+                    provenance="setup:constitution_reanchor",
+                )
             agent.properties["constitution_reanchor"] = {
                 "timestamp": _now_iso(),
                 "old_hash": old_hash,
@@ -568,6 +651,7 @@ async def _write_reanchor(
                 "signed_artifact_path": str(amendment_artifact_path),
                 "signed_artifact_signer": amendment_verification.signer,
                 "signed_artifact_verification": amendment_verification.reason,
+                "stale_edges_removed": stale_edge_targets,
             }
             # Anchor (or refresh) the structured contract receipt.
             # Idempotent for the unchanged-active case; performs the

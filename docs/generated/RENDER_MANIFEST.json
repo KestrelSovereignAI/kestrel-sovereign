@@ -4319,6 +4319,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.47.0.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "current",
+      "title": "v0.47.0 \u2014 Fail-Closed Constitution Integrity",
+      "type": "Release Notes"
+    },
+    {
       "existing_code_refs": [
         "docker/simpletuner_api.py"
       ],

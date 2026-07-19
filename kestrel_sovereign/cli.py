@@ -980,6 +980,22 @@ def cmd_constitution_reanchor(args) -> int:
         )
         return 0
     if result.drift_unforced:
+        if result.governance_edge_drift and result.old_hash == result.new_hash:
+            # Edge-only drift (#2616): the hash is current but the
+            # governed_by edge set is inconsistent — integrity proof 2
+            # will safe-mode the agent at boot.
+            stale = ", ".join(f"{t[:12]}…" for t in result.stale_edge_targets)
+            print(
+                f"{result.agent_name}: governance-edge drift detected.\n"
+                f"  Anchor: {result.new_hash[:12]}… (current)\n"
+                f"  governed_by edge(s): {stale or '(none)'}\n"
+                f"\n"
+                f"The fail-closed integrity audit (proof 2) will safe-mode "
+                f"this agent at next boot. Re-run with --force to repair the "
+                f"governance edge. The DB will be backed up to "
+                f"{result.db_path.name}.backup-<timestamp> before any write."
+            )
+            return 1
         print(
             f"{result.agent_name}: constitution drift detected.\n"
             f"  Stored: {result.old_hash[:12]}…\n"
@@ -990,7 +1006,16 @@ def cmd_constitution_reanchor(args) -> int:
             f"{result.db_path.name}.backup-<timestamp> before any write."
         )
         return 1
-    # Reanchored.
+    # Reanchored (or same-hash governance repair).
+    if result.governance_edge_drift and result.old_hash == result.new_hash:
+        print(
+            f"{result.agent_name}: governance edge repaired.\n"
+            f"  Anchor:  {result.new_hash[:12]}… (unchanged)\n"
+            f"  Removed: {', '.join(f'{t[:12]}…' for t in result.stale_edge_targets) or '(none)'}\n"
+            f"  Source:  {result.canonical_path}\n"
+            f"  Backup:  {result.backup_path}"
+        )
+        return 0
     print(
         f"{result.agent_name}: reanchored.\n"
         f"  Old: {result.old_hash[:12]}…\n"
