@@ -4217,6 +4217,12 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
             // diffed away as "already matches the server".
             const revertToServerTruth = async () => {
                 if (deps().api.getHostAgent() !== dispatchAgent) return;
+                // A newer pick may have superseded this request while it was
+                // in flight — reverting then would clobber that selection (and
+                // its own success/failure handling). Only revert while the
+                // selector still shows the pick that failed.
+                const cur = sharedModelSelector?.getSelection?.();
+                if (!cur || cur.model !== model || cur.vendor !== vendor) return;
                 await sharedModelSelector?.syncWithServer?.();
                 const sel = sharedModelSelector?.getSelection?.();
                 if (sel) {
