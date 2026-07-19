@@ -665,7 +665,8 @@ class PrivacyEnforcingStorage:
         privacy checks individually. It only guarantees that the writes
         which ARE permitted commit or roll back together.
         """
-        yield  # MUTATION: no-op transaction
+        async with self._storage.transaction():
+            yield
 
     async def delete_node(self, node_id: str) -> None:
         """Delete a graph node and its edges. Structural operation."""
