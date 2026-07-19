@@ -39,6 +39,7 @@ from kestrel_sovereign.agent.parts import (
     build_part_sentinel,
     current_part_collector,
     drain_parts,
+    sanitize_part,
 )
 from kestrel_sovereign.agent.streaming import (
     _build_revise_sentinel,
@@ -969,6 +970,13 @@ class OrchestratorEngineMixin:
             exec_duration_ms = int((time.time() - exec_start) * 1000)
             if tool_span:
                 tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
+        # #2641: envelope-carried parts → the owning turn's collector. The
+        # codex inline executor wraps this call in ``bind_part_collector``, so
+        # a tool that attached parts to its envelope (explicit
+        # ``ToolResult.parts`` or the no-collector ``emit_part`` fallback)
+        # still lands them on the turn. Collector-less transports (voice,
+        # MCP, A2A) no-op and keep the envelope copy.
+        self._reemit_envelope_parts(result)
 
         # --- POST_TOOL_USE hook (parallel, non-blocking) ---
         post_input = HookInput(
@@ -1201,6 +1209,10 @@ class OrchestratorEngineMixin:
             )
             return err_result
         exec_duration_ms = int((time.time() - exec_start) * 1000)
+        # #2641: envelope-carried subagent parts → this turn's collector (the
+        # codex inline executor re-binds it around this call, so parts emitted
+        # on the app-server's reader tasks still reach the owning turn).
+        self._reemit_envelope_parts(result)
         self._register_explored_feature_tools(feature)
 
         # Emit tool update event for progressive disclosure (#1315)
@@ -1287,6 +1299,32 @@ class OrchestratorEngineMixin:
     # ------------------------------------------------------------------
     # Shared helpers used by both streaming and non-streaming loops
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reemit_envelope_parts(result: Any) -> None:
+        """Deliver envelope-carried typed parts into the active turn collector.
+
+        #2641: tools (and whole subagent runs) can attach first-class parts to
+        their result envelope's ``parts`` field instead of relying on the
+        ``emit_part`` ContextVar reaching them. After a dispatch returns, this
+        re-emits each entry into the parent turn's collector so the eventual
+        PART sentinels land exactly where they always did — right after the
+        dispatching tool. Entries are re-sanitized (same type/size rules as
+        ``emit_part``); off a streaming turn (no collector bound) this is a
+        no-op and the envelope remains the caller's to consume.
+        """
+        if not isinstance(result, dict):
+            return
+        parts = result.get("parts")
+        if not isinstance(parts, list) or not parts:
+            return
+        collector = current_part_collector()
+        if collector is None:
+            return
+        for entry in parts:
+            clean = sanitize_part(entry)
+            if clean is not None:
+                collector.append(clean)
 
     @staticmethod
     def _build_tool_calls_msg(tool_calls) -> list:
@@ -1706,6 +1744,11 @@ class OrchestratorEngineMixin:
                 execute_fn=_exec_feature,
             )
 
+            # #2641: parts the subagent's tools produced ride the result
+            # envelope; re-emit them into this turn's collector so the
+            # streaming loop drains them right after this dispatch's card.
+            self._reemit_envelope_parts(result)
+
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
                 event_id=dispatch_event_id,
@@ -1877,6 +1920,13 @@ class OrchestratorEngineMixin:
                 session_id=session_id,
                 execute_fn=_exec_direct,
             )
+
+            # #2641: direct tools carry the same envelope contract as
+            # subagent dispatch. This matters after progressive disclosure:
+            # once a feature is explored, its tools re-register as DIRECT
+            # tools, so the second call to a parts-returning tool lands here
+            # rather than in ``_dispatch_feature_tool``.
+            self._reemit_envelope_parts(result)
 
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
