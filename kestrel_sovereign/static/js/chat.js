@@ -4210,6 +4210,35 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
             if (route) body.route = route;
             const headers = await deps().api.applyAuth({ 'Content-Type': 'application/json' });
 
+            // On failure the optimistic header/state above is a lie — revert
+            // everything to server truth. syncWithServer() also restores the
+            // selector's _lastSyncedSelection, re-arming its commit gate so
+            // re-picking the same model fires a fresh POST instead of being
+            // diffed away as "already matches the server".
+            const revertToServerTruth = async () => {
+                if (deps().api.getHostAgent() !== dispatchAgent) return;
+                // A newer pick may have superseded this request while it was
+                // in flight — reverting then would clobber that selection (and
+                // its own success/failure handling). Only revert while the
+                // selector still shows the pick that failed.
+                const cur = sharedModelSelector?.getSelection?.();
+                if (!cur || cur.model !== model || cur.vendor !== vendor) return;
+                // Route too: a newer pick can differ only by route. A null
+                // selection route means "the vendor's only route" (the commit
+                // path canonicalized it to this request's route), so null
+                // counts as matching.
+                if ((cur.route || route) !== route) return;
+                await sharedModelSelector?.syncWithServer?.();
+                const sel = sharedModelSelector?.getSelection?.();
+                if (sel) {
+                    deps().state.selectedModel = sel.model;
+                    deps().state.selectedProvider = sel.vendor;
+                    deps().state.selectedVendor = sel.vendor;
+                    deps().state.selectedRoute = sel.route || null;
+                }
+                updateModelSettingsSummary();
+            };
+
             try {
                 const resp = await fetch(deps().api.buildAgentUrl('/api/model/set'), {
                     method: 'POST',
@@ -4217,7 +4246,14 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
                     body: JSON.stringify(body),
                 });
                 if (!resp.ok) {
-                    console.warn(`set model failed (${dispatchAgent}): HTTP ${resp.status}`);
+                    let detail = `HTTP ${resp.status}`;
+                    try {
+                        const err = await resp.json();
+                        if (err && err.detail) detail = String(err.detail);
+                    } catch { /* non-JSON error body */ }
+                    console.warn(`set model failed (${dispatchAgent}): ${detail}`);
+                    deps().toast?.error?.(`Could not set model ${model}: ${detail}`);
+                    await revertToServerTruth();
                     return;
                 }
                 if (deps().api.getHostAgent() !== dispatchAgent) {
@@ -4230,6 +4266,8 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
                 // user's click; the server is the source of truth from here on.
             } catch (e) {
                 console.warn(`set model request error (${dispatchAgent}):`, e);
+                deps().toast?.error?.(`Could not set model ${model}: request failed`);
+                await revertToServerTruth();
             }
         }
     });
