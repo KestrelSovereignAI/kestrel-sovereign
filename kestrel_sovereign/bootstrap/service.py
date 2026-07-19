@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
+from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
@@ -667,6 +668,8 @@ And how do you like to work together - quick and direct, or more room to think t
         self,
         user_message: str,
         prior_history: Optional[List[Dict[str, str]]] = None,
+        *,
+        invocation_context: Optional[LLMInvocationContext] = None,
     ) -> Tuple[str, bool, bool]:
         """
         Process a message during discovery phase.
@@ -739,8 +742,17 @@ And how do you like to work together - quick and direct, or more room to think t
         # the adapter (older Ollama clients, mis-configured remote, etc.)
         # would wedge every subsequent request on this agent until the
         # process is restarted.
+        # #2624: pass the caller-supplied invocation_context so the metering
+        # callback fires with populated companion/user attribution — discovery
+        # turns burn real tokens and are billable. Without threading, the
+        # metering callback silently no-ops because the resolver sees
+        # companion_id=None/user_id=None on the ambient contextvar (post-#2550
+        # task-isolation).
         response = await asyncio.wait_for(
-            self.llm_service.generate_with_messages(messages=messages),
+            self.llm_service.generate_with_messages(
+                messages=messages,
+                invocation_context=invocation_context,
+            ),
             timeout=self.DISCOVERY_LLM_TIMEOUT_SECONDS,
         )
         assistant_message = response.content if hasattr(response, 'content') else str(response)

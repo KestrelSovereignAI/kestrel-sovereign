@@ -2873,7 +2873,13 @@ Expected Duration: {expected_duration}
         from datetime import datetime, timezone
         return datetime.now(timezone.utc).isoformat()
 
-    async def _handle_bootstrap(self, user_input: str, session_id: str = None) -> Optional[str]:
+    async def _handle_bootstrap(
+        self,
+        user_input: str,
+        session_id: str = None,
+        *,
+        invocation_context: Optional[LLMInvocationContext] = None,
+    ) -> Optional[str]:
         """
         Handle bootstrap/discovery flow for first-time agent wake-up.
 
@@ -2970,6 +2976,7 @@ Expected Duration: {expected_duration}
                 response, is_complete, wants_avatar = await self.bootstrap_service.process_discovery_message(
                     user_input,
                     prior_history=prior_history,
+                    invocation_context=invocation_context,
                 )
             except Exception as exc:
                 logging.warning(
@@ -3187,7 +3194,10 @@ Expected Duration: {expected_duration}
                 if user_input.startswith("!") and user_input.split()[0] in bootstrap_commands:
                     pass  # Let command handler process these
                 else:
-                    bootstrap_response = await self._handle_bootstrap(user_input, session_id)
+                    bootstrap_response = await self._handle_bootstrap(
+                        user_input, session_id,
+                        invocation_context=invocation_context,
+                    )
                     if bootstrap_response:
                         # Bootstrap persists real conversation rows and must
                         # enter the same privacy-gated memory ingestion path as
