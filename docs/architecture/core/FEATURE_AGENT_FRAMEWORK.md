@@ -166,10 +166,12 @@ the internal lifecycle API, the Feature Store API, and `kestrel feature disable`
 all reject attempts to disable a mandatory class before changing state.
 
 `MandatoryFeatureReadinessError` keeps the dependency exception as its private
-cause for protected logs, while its public string contains only the controlled
-feature name and lifecycle stage. `/health` returns HTTP 503 with that sanitized
+cause for protected logs, while its controlled string contains only the feature
+name and lifecycle stage. `/health` returns an aggregate HTTP 503 without that
 record, including for a partially loaded multi-agent fleet, so one healthy agent
 cannot hide a configured peer that failed its sovereignty foundation.
+Authenticated operators can inspect the controlled failure record through
+`/health/detailed`.
 
 ## 7. Status Update (November 2025)
 

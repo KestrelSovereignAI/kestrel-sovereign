@@ -1,9 +1,10 @@
 """Focused tests for server health endpoint behavior."""
 
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 
@@ -26,11 +27,11 @@ def test_health_returns_503_when_agent_missing():
     app.router.lifespan_context = noop_lifespan
     app.state.agent = None
     app.state.agent_manager = None
-    app.state.startup_error = "agent init failed"
+    app.state.startup_error = "agent init failed at /private/must-not-leak"
     app.state.mandatory_feature_failures = []
 
     try:
-        with TestClient(app) as client:
+        with TestClient(app, client=("203.0.113.10", 55000)) as client:
             response = client.get("/health")
     finally:
         app.router.lifespan_context = original_lifespan
@@ -40,11 +41,58 @@ def test_health_returns_503_when_agent_missing():
         app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 503
-    assert response.json()["status"] == "unhealthy"
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": False,
+    }
+    assert "must-not-leak" not in response.text
 
 
-def test_health_detailed_uses_health_feature_from_feature_dict():
-    """HealthFeature lookup should iterate feature values, not dict keys."""
+def test_load_balancer_probe_reports_minimal_degraded_state():
+    """A remote probe needs readiness, not deployment diagnostics."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+    original_mandatory_failures = getattr(
+        app.state, "mandatory_feature_failures", None
+    )
+    original_identity_failures = getattr(
+        app.state, "identity_readiness_failures", None
+    )
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = None
+        app.state.startup_error = None
+        app.state.mandatory_feature_failures = []
+        app.state.identity_readiness_failures = []
+        with TestClient(app, client=("198.51.100.20", 55000)) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+        app.state.mandatory_feature_failures = original_mandatory_failures
+        app.state.identity_readiness_failures = original_identity_failures
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "degraded",
+        "agent_initialized": False,
+    }
+
+
+def test_health_detailed_requires_auth_and_uses_feature_dict_with_api_key():
+    """Remote callers get no details; API-key operators get the full result."""
     from server import app
 
     @asynccontextmanager
@@ -63,7 +111,15 @@ def test_health_detailed_uses_health_feature_from_feature_dict():
 
     health_feature = MagicMock()
     health_feature.get_latest = AsyncMock(
-        return_value={"status": "healthy", "checks": [{"status": "ok"}]}
+        return_value={
+            "status": "healthy",
+            "checks": [
+                {
+                    "status": "pass",
+                    "message": "active: anthropic/claude-opus-secret-route",
+                }
+            ],
+        }
     )
     health_feature.__class__.__name__ = "HealthFeature"
 
@@ -76,8 +132,17 @@ def test_health_detailed_uses_health_feature_from_feature_dict():
     app.state.mandatory_feature_failures = []
 
     try:
-        with TestClient(app) as client:
-            response = client.get("/health/detailed")
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                unauthenticated = client.get("/health/detailed")
+                query_key_attempt = client.get(
+                    "/health/detailed",
+                    params={"api_key": "test-key"},
+                )
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
     finally:
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
@@ -85,13 +150,64 @@ def test_health_detailed_uses_health_feature_from_feature_dict():
         app.state.startup_error = original_startup_error
         app.state.mandatory_feature_failures = original_mandatory_failures
 
+    assert unauthenticated.status_code == 401
+    assert "claude-opus-secret-route" not in unauthenticated.text
+    assert query_key_attempt.status_code == 401
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
+    assert "claude-opus-secret-route" in response.text
     health_feature.get_latest.assert_awaited_once()
 
 
-def test_health_surfaces_llm_reachability():
-    """Basic /health should expose startup probe results for operators."""
+def test_multi_agent_prefixed_detailed_health_keeps_auth_then_routes():
+    """Agent-prefix rewriting must happen only after operator auth succeeds."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+
+    health_feature = MagicMock()
+    health_feature.get_latest = AsyncMock(
+        return_value={"status": "healthy", "checks": [{"name": "database"}]}
+    )
+    health_feature.__class__.__name__ = "HealthFeature"
+    agent = MagicMock()
+    agent.features = {"HealthFeature": health_feature}
+    manager = MagicMock()
+    manager.get_agent.side_effect = lambda name: agent if name == "Kite" else None
+    manager.list_agents.return_value = {"Kite": agent}
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                unauthenticated = client.get(
+                    "/api/agents/Kite/health/detailed"
+                )
+                authenticated = client.get(
+                    "/api/agents/Kite/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert unauthenticated.status_code == 401
+    assert authenticated.status_code == 200
+    assert authenticated.json()["checks"] == [{"name": "database"}]
+    health_feature.get_latest.assert_awaited_once()
+
+
+def test_public_health_does_not_surface_llm_reachability():
+    """The public probe stays stable even when detailed routing data exists."""
     from server import app
 
     @asynccontextmanager
@@ -133,11 +249,12 @@ def test_health_surfaces_llm_reachability():
         app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 200
-    assert response.json()["llm_reachability"][0]["name"] == "ollama:local"
+    assert response.json() == {"status": "ok", "agent_initialized": True}
+    assert "ollama" not in response.text
 
 
-def test_health_names_mandatory_failure_without_leaking_cause():
-    """Readiness diagnostics expose the class/stage, never dependency secrets."""
+def test_public_health_hides_mandatory_failure_diagnostics():
+    """Mandatory failures affect readiness without becoming public records."""
     from server import app
     from kestrel_sovereign.features import MandatoryFeatureReadinessError
 
@@ -187,13 +304,13 @@ def test_health_names_mandatory_failure_without_leaking_cause():
         app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 503
-    payload = response.json()
-    assert payload["status"] == "unhealthy"
-    failure = payload["mandatory_feature_failures"][0]
-    assert failure["feature"] == "SecurityFeature"
-    assert "SecurityFeature" in failure["error"]
-    assert "ANTHROPIC_API_KEY" not in failure["error"]
-    assert "must-not-leak" not in failure["error"]
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": False,
+    }
+    assert "SecurityFeature" not in response.text
+    assert "ANTHROPIC_API_KEY" not in response.text
+    assert "must-not-leak" not in response.text
 
 
 def test_health_rejects_partially_loaded_fleet_with_mandatory_failure():
@@ -238,12 +355,15 @@ def test_health_rejects_partially_loaded_fleet_with_mandatory_failure():
         app.state.mandatory_feature_failures = original_mandatory_failures
 
     assert response.status_code == 503
-    assert response.json()["agent_initialized"] is True
-    assert response.json()["mandatory_feature_failures"][0]["agent"] == "broken"
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+    assert "broken" not in response.text
 
 
-def test_health_names_identity_custody_failure_without_leaking_detail():
-    """A blocked root of trust is explicit, stable, and public-safe."""
+def test_public_health_hides_identity_custody_diagnostics():
+    """A blocked root of trust affects readiness without public detail."""
     from server import app
     from kestrel_sovereign.identity.runtime_identity import (
         IdentityReadinessError,
@@ -293,14 +413,12 @@ def test_health_names_identity_custody_failure_without_leaking_detail():
         app.state.identity_readiness_failures = original_identity_failures
 
     assert response.status_code == 503
-    payload = response.json()
-    assert payload["status"] == "unhealthy"
-    assert payload["agent_initialized"] is False
-    failure = payload["identity_readiness_failures"][0]
-    assert failure["state"] == "blocked"
-    assert failure["failure"] == "custody"
-    assert failure["error_code"] == "identity_custody"
-    assert failure["cause_type"] == "DecryptionError"
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": False,
+    }
+    assert "DecryptionError" not in response.text
+    assert "identity_custody" not in response.text
     assert "/private/agent" not in response.text
     assert "must-not-leak" not in response.text
 
@@ -352,14 +470,16 @@ def test_health_rejects_partially_loaded_fleet_with_identity_failure():
         app.state.identity_readiness_failures = original_identity_failures
 
     assert response.status_code == 503
-    payload = response.json()
-    assert payload["agent_initialized"] is True
-    assert payload["identity_readiness_failures"][0]["agent"] == "broken"
-    assert payload["identity_readiness_failures"][0]["failure"] == "binding"
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+    assert "broken" not in response.text
+    assert "binding" not in response.text
 
 
-def test_health_reports_durable_constitution_safe_mode_as_restricted():
-    """An initialized but constitutionally restricted agent is not healthy."""
+def test_public_health_hides_safe_mode_agent_state_and_reason():
+    """Safe mode blocks readiness without exposing its cause or agent."""
     from server import app
 
     @asynccontextmanager
@@ -405,13 +525,12 @@ def test_health_reports_durable_constitution_safe_mode_as_restricted():
         app.state.identity_readiness_failures = original_identity_failures
 
     assert response.status_code == 503
-    payload = response.json()
-    assert payload["status"] == "restricted"
-    assert payload["agent_initialized"] is True
-    record = payload["constitution_safe_mode"][0]
-    assert record["agent"] == "Kite"
-    assert record["error_code"] == "constitution_safe_mode"
-    assert record["failure"] == "integrity_restriction"
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+    assert "Kite" not in response.text
+    assert "restricted" not in response.text
     assert "must-not-leak" not in response.text
     assert "/private/constitution" not in response.text
 
@@ -455,9 +574,14 @@ def test_health_rejects_fleet_when_one_loaded_agent_is_in_safe_mode():
         app.state.mandatory_feature_failures = []
         app.state.identity_readiness_failures = []
 
-        with TestClient(app) as client:
-            response = client.get("/health")
-            detailed = client.get("/health/detailed")
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app, client=("203.0.113.10", 55000)) as client:
+                response = client.get("/health")
+                unauthenticated_detailed = client.get("/health/detailed")
+                detailed = client.get(
+                    "/health/detailed",
+                    headers={"Authorization": "Bearer test-key"},
+                )
     finally:
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
@@ -467,11 +591,15 @@ def test_health_rejects_fleet_when_one_loaded_agent_is_in_safe_mode():
         app.state.identity_readiness_failures = original_identity_failures
 
     assert response.status_code == 503
-    record = response.json()["constitution_safe_mode"][0]
-    assert record["agent"] == "restricted"
-    assert record["failure"] == "state_unavailable"
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+    assert "state_unavailable" not in response.text
+    assert unauthenticated_detailed.status_code == 401
     assert detailed.status_code == 503
     assert detailed.json()["status"] == "restricted"
+    assert detailed.json()["constitution_safe_mode"][0]["agent"] == "restricted"
 
 
 def test_health_reports_startup_audit_pending_as_restricted():
@@ -510,8 +638,12 @@ def test_detailed_health_cannot_report_healthy_during_safe_mode():
         app.router.lifespan_context = noop_lifespan
         app.state.agent = agent
         app.state.agent_manager = None
-        with TestClient(app) as client:
-            response = client.get("/health/detailed")
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/health/detailed",
+                    headers={"X-API-Key": "test-key"},
+                )
     finally:
         app.router.lifespan_context = original_lifespan
         app.state.agent = original_agent
@@ -519,3 +651,55 @@ def test_detailed_health_cannot_report_healthy_during_safe_mode():
 
     assert response.status_code == 503
     assert response.json()["status"] == "restricted"
+
+
+def test_oauth_session_can_access_detailed_health():
+    """A signed browser session retains operator diagnostic access."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+
+    health_feature = MagicMock()
+    health_feature.get_latest = AsyncMock(
+        return_value={
+            "status": "degraded",
+            "checks": [{"message": "operator-only backend diagnostic"}],
+        }
+    )
+    health_feature.__class__.__name__ = "HealthFeature"
+    agent = MagicMock()
+    agent.features = {"HealthFeature": health_feature}
+
+    @app.get("/_test/health-session")
+    async def _establish_health_session(request: Request):
+        request.session["user_email"] = "operator@example.com"
+        return {"ok": True}
+
+    session_route = app.router.routes[-1]
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                established = client.get(
+                    "/_test/health-session",
+                    headers={"X-API-Key": "test-key"},
+                )
+                response = client.get("/health/detailed")
+    finally:
+        app.router.routes.remove(session_route)
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert established.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert "operator-only backend diagnostic" in response.text

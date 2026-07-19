@@ -184,10 +184,15 @@ exists. A home with no identity material is still a valid pre-inception
 construction state. A home with material that cannot be decrypted, is partial or
 malformed, fails the hybrid private-to-public binding probe, or does not bind to
 the DID in the agent database is blocked instead of running as `identity=None`.
-`/health` returns HTTP 503 with a sanitized
-`identity_readiness_failures` record; it never includes key-storage paths or the
-underlying cryptographic exception message. Restore the correct custody key or
-complete identity package and restart the same home—do not re-incept it.
+The public `/health` readiness probe returns HTTP 503 with only aggregate
+`status` and `agent_initialized` fields; it does not identify the affected
+agent or failure class. Authenticated operators can inspect the controlled
+`identity_readiness_failures` record through `/health/detailed`, which never
+includes key-storage paths or the underlying cryptographic exception message.
+Restore the correct custody key or complete identity package and restart the
+same home—do not re-incept it. See
+[`HEALTH_ENDPOINT_AUTHORIZATION.md`](HEALTH_ENDPOINT_AUTHORIZATION.md) for the
+public/operator exposure boundary.
 
 ```bash
 curl -H "X-API-Key: $KEY" http://localhost:8888/api/agents/<name>/api/identity | python3 -m json.tool

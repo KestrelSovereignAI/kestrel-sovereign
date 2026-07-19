@@ -8,8 +8,8 @@ tags:
 - docs
 - audit
 - audit-ledger
-timestamp: '2026-06-18T00:00:00Z'
-status: needs-revalidation
+timestamp: '2026-07-18T00:00:00Z'
+status: active
 owner: documentation
 canonical: false
 generated: false
@@ -22,10 +22,10 @@ The live auth model is enforced centrally in [`server.py`](../../server.py), wit
 
 | Class | Description | Representative routes |
 |---|---|---|
-| `Public` | No API key or session required | `/health`, `/health/detailed`, `/webhooks/stripe/crypto` |
+| `Public` | No API key or session required; `/health` returns aggregate readiness only | `/health`, `/webhooks/stripe/crypto` |
 | `Public-Localhost` | Public only from localhost-like callers when bootstrap is enabled | `/api/auth/key` |
 | `OAuth public entrypoints` | Browser sign-in flow entrypoints | `/auth/login`, `/auth/callback`, `/auth/logout` |
-| `APIKeyOrSession` | Protected routes that accept either API key auth or OAuth session auth | most `/agent/*` and `/api/*` routes |
+| `APIKeyOrSession` | Protected routes that accept API key, bearer JWT, or OAuth session auth | `/health/detailed`, most `/agent/*` and `/api/*` routes |
 | `APIKeyOrSession+SSEQuery` | Protected routes that also permit `?api_key=` because `EventSource` cannot send custom headers | `/agent/stream`, `/agent/notifications/sse` |
 | `OAuthSessionSemantic` | Route may pass middleware via API key but still only returns success data with a real browser session | `/auth/me` |
 | `Browser-Conditional` | Root page behavior depends on UI mode and OAuth-required mode | `/` |
@@ -34,5 +34,10 @@ The live auth model is enforced centrally in [`server.py`](../../server.py), wit
 
 - The auth model is not just public versus protected.
 - Most protected routes are effectively `API key OR OAuth session`.
+- `/health` is the public load-balancer contract: only `status` and
+  `agent_initialized`; `/health/detailed` is operator-authenticated.
 - `/auth/me` is not middleware-public; it is semantically session-backed.
 - `/api/auth/key` is intentionally narrow and must remain localhost-scoped.
+
+The health boundary and regression history are documented in
+[`HEALTH_ENDPOINT_AUTHORIZATION.md`](../architecture/security/HEALTH_ENDPOINT_AUTHORIZATION.md).

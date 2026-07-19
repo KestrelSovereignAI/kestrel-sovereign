@@ -125,7 +125,7 @@ Your agent is now running. Two ports to know about, depending on which start for
 
 > **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
 
-> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page; append `/health` for a JSON readiness probe.
+> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page; append `/health` for the public aggregate JSON readiness probe. Full `/health/detailed` diagnostics require the normal API key, JWT, or OAuth session.
 
 > **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 

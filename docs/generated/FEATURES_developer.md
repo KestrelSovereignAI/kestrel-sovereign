@@ -172,6 +172,10 @@ Audited snapshot: **34** discoverable modules · **34** exported `Feature` subcl
 | `GET` | `/health` |
 | `GET` | `/health/detailed` |
 
+`/health` is the unauthenticated aggregate load-balancer probe and returns only
+`status` plus `agent_initialized`. `/health/detailed` requires an API key,
+bearer JWT, or OAuth session and returns operator diagnostics.
+
 ### Router Families
 
 #### [`endpoints/auth_oauth.py`](endpoints/auth_oauth.py)
@@ -374,10 +378,10 @@ Auth is enforced by middleware in `server.py`. The live auth classes are:
 
 | Auth class | Applies to |
 |---|---|
-| `Public` | `/health`, `/health/detailed`, `/favicon.ico` |
+| `Public` | `/health` (aggregate readiness only), `/favicon.ico` |
 | `Public-Localhost` | `/api/auth/key` (when bootstrap is enabled) |
 | `OAuth public entrypoints` | `/auth/login`, `/auth/callback`, `/auth/logout` |
-| `APIKeyOrSession` | Most protected `/agent/*` and `/api/*` routes |
+| `APIKeyOrSession` | `/health/detailed`; most protected `/agent/*` and `/api/*` routes |
 | `APIKeyOrSession+SSEQuery` | `/agent/stream`, `/agent/notifications/sse` — also accept `?api_key=` query param |
 | `OAuthSessionSemantic` | `/auth/me` — passes middleware via API key or session, but only returns authenticated data from a real OAuth session |
 | `Browser-Conditional` | `/` — serves UI for local/browser conditions; redirects to OAuth when OAuth-required mode is enabled |

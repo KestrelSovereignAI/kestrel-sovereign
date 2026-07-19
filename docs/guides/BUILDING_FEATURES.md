@@ -583,7 +583,8 @@ The five sovereignty-foundation classes (`ConstitutionFeature`,
 `IdentityFeature`, `PeersFeature`, `SecurityFeature`, and `WaitFeature`) are an
 exception: they cannot be disabled or excluded by any host, agent, or spawn
 configuration. A disable attempt or lifecycle failure makes readiness fail with
-a sanitized `MandatoryFeatureReadinessError`; `/health` reports the class and
+a sanitized `MandatoryFeatureReadinessError`; public `/health` reports only
+aggregate unhealthiness. Authenticated `/health/detailed` reports the class and
 stage without exposing the underlying dependency error.
 
 ## SKILL.md Convention

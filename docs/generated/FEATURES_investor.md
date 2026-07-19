@@ -234,15 +234,18 @@ The platform's authentication surface is designed to support the full spectrum o
 
 | Class | Routes | Notes |
 |---|---|---|
-| **Public** | `/health`, `/health/detailed`, webhook receivers | Infrastructure probes and inbound integrations |
+| **Public** | `/health`, webhook receivers | Aggregate infrastructure readiness and inbound integrations |
 | **Public-Localhost** | `/api/auth/key` (when bootstrap enabled) | Initial provisioning only |
 | **OAuth Public Entrypoints** | `/auth/login`, `/auth/callback`, `/auth/logout` | Human user authentication flows |
-| **API Key or Session** | Most `/agent/*` and `/api/*` routes | Standard programmatic and application access |
+| **API Key or Session** | `/health/detailed`, most `/agent/*` and `/api/*` routes | Operator diagnostics and standard application access |
 | **API Key or Session + SSE Query** | `/agent/stream`, `/agent/notifications/sse` | Streaming paths that accept key via query parameter |
 | **OAuth Session Semantic** | `/auth/me` | Returns authenticated data only for real sessions |
 | **Browser-Conditional** | `/` | Serves UI locally; redirects to OAuth when required |
 
-This model ensures that public-facing health and integration endpoints are always reachable without credentials, OAuth flows are cleanly separated from programmatic access, and SSE streaming paths — which have inherent browser constraints — are handled correctly.
+This model keeps aggregate readiness reachable for infrastructure probes while
+reserving detailed health diagnostics for authenticated operators. OAuth flows
+remain separated from programmatic access, and SSE streaming paths — which have
+inherent browser constraints — are handled explicitly.
 
 ---
 
