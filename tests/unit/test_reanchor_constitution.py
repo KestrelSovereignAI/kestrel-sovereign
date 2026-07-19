@@ -62,6 +62,9 @@ def _make_agent(stored_hash="oldhash", safe_mode=False):
     agent.storage.get_node = AsyncMock(return_value=node)
     agent.storage.store_file = AsyncMock()
     agent.storage.add_node = AsyncMock()
+    # transaction() is an async context manager, not a coroutine — a plain
+    # MagicMock provides __aenter__/__aexit__ on its return value.
+    agent.storage.transaction = MagicMock()
     agent.privacy_agent = MagicMock()
     agent.privacy_agent.add_conversation = AsyncMock()
 
@@ -399,6 +402,114 @@ async def test_reanchor_does_not_exit_safe_mode(tmp_path):
     assert agent._safe_mode is True
     assert "safe mode" in result.lower()
     assert node.properties["constitution_hash"] == FAKE_HASH
+
+
+# --- Governance edge pruning (#2617) ---
+
+def _bind_real_governance_anchor(agent):
+    """Bind the real edge-maintenance method so its prune logic runs."""
+    agent._anchor_constitution_governance = (
+        ConstitutionMixin._anchor_constitution_governance.__get__(
+            agent, KestrelAgent
+        )
+    )
+
+
+def _edge(target_id, label="governed_by"):
+    return SimpleNamespace(
+        source_id=AGENT_DID, target_id=target_id, label=label
+    )
+
+
+@pytest.mark.asyncio
+async def test_anchor_governance_prunes_nontarget_governed_by_edges():
+    """Anchoring deletes every governed_by edge except the anchored one,
+    and leaves non-governance edges alone."""
+    agent, _ = _make_agent()
+    _bind_real_governance_anchor(agent)
+    dangling = "d" * 64
+    agent.storage.get_edges_from = AsyncMock(
+        return_value=[
+            _edge(dangling),
+            _edge(FAKE_HASH),
+            _edge("some-memory-node", label="references"),
+        ]
+    )
+
+    pruned = await agent._anchor_constitution_governance(FAKE_HASH)
+
+    assert pruned == [dangling]
+    agent.storage.add_edge.assert_awaited_once_with(
+        AGENT_DID, FAKE_HASH, "governed_by"
+    )
+    agent.storage.delete_edge.assert_awaited_once_with(
+        AGENT_DID, dangling, "governed_by"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reanchor_success_prunes_dangling_governed_by_edges(tmp_path):
+    """A runtime reanchor removes the old edge AND any dangling edge —
+    not just the property-derived old hash (#2617)."""
+    agent, node = _make_agent(stored_hash="oldhash")
+    _bind_real_governance_anchor(agent)
+    agent.storage.store_file = AsyncMock(return_value=FAKE_HASH)
+    dangling = "d" * 64
+    agent.storage.get_edges_from = AsyncMock(
+        return_value=[
+            _edge("oldhash"),
+            _edge(dangling),
+            _edge(FAKE_HASH),
+        ]
+    )
+    artifact_path = _write_artifact(tmp_path)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(
+            FAKE_CONSTITUTION, artifact_path.read_bytes()
+        )
+        result = await agent.reanchor_constitution(
+            expected_hash=FAKE_HASH[:8],
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "re-anchored successfully" in result.lower()
+    assert "pruned stale governed_by edge(s)" in result.lower()
+    assert dangling[:16] in result
+    deleted = {call.args for call in agent.storage.delete_edge.await_args_list}
+    assert (AGENT_DID, "oldhash", "governed_by") in deleted
+    assert (AGENT_DID, dangling, "governed_by") in deleted
+    assert (AGENT_DID, FAKE_HASH, "governed_by") not in deleted
+
+
+@pytest.mark.asyncio
+async def test_reanchor_noop_prunes_dangling_governed_by_edges(tmp_path):
+    """Already-anchored + verified artifact converges governance edges:
+    the one-shot cleanup for DBs carrying pre-fix dangling edges (#2617)."""
+    agent, node = _make_agent(stored_hash=FAKE_HASH)
+    _bind_real_governance_anchor(agent)
+    dangling = "d" * 64
+    agent.storage.get_edges_from = AsyncMock(
+        return_value=[_edge(FAKE_HASH), _edge(dangling)]
+    )
+    artifact_path = _write_artifact(tmp_path)
+
+    with patch("builtins.open", create=True) as mock_open:
+        mock_open.side_effect = _open_handles(
+            FAKE_CONSTITUTION, artifact_path.read_bytes()
+        )
+        result = await agent.reanchor_constitution(
+            expected_hash=FAKE_HASH[:8],
+            amendment_artifact_path=str(artifact_path),
+        )
+
+    assert "already anchored" in result.lower()
+    assert "pruned 1 stale governed_by edge(s)" in result.lower()
+    assert dangling[:16] in result
+    agent.storage.delete_edge.assert_awaited_once_with(
+        AGENT_DID, dangling, "governed_by"
+    )
+    agent.storage.store_file.assert_not_called()
 
 
 # --- Edge cases ---
