@@ -4223,6 +4223,11 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
                 // selector still shows the pick that failed.
                 const cur = sharedModelSelector?.getSelection?.();
                 if (!cur || cur.model !== model || cur.vendor !== vendor) return;
+                // Route too: a newer pick can differ only by route. A null
+                // selection route means "the vendor's only route" (the commit
+                // path canonicalized it to this request's route), so null
+                // counts as matching.
+                if ((cur.route || route) !== route) return;
                 await sharedModelSelector?.syncWithServer?.();
                 const sel = sharedModelSelector?.getSelection?.();
                 if (sel) {
