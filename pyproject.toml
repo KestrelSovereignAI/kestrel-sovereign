@@ -63,13 +63,14 @@ dependencies = [
     # spans without importing a feature package (stays on the right side of the
     # core-never-imports-features boundary). Tracing is still a runtime no-op
     # unless an OTLP endpoint is configured.
-    # NOTE (obs#32): the host autowires KESTREL_OTEL_PROJECT=kestrel-fleet, which
-    # the SDK's tracing bootstrap reads to scope the Phoenix project. That reader
-    # lands in SDK 0.30.2; bump this floor to >=0.30.2 once it publishes (0.30.2
-    # is not on PyPI yet, so pinning it now makes the resolve unsatisfiable).
-    # Setting the env is forward-compatible — 0.30.1 ignores it, 0.30.2+ honours
-    # it — so the autowiring ships ahead of the floor bump.
-    "kestrel-sovereign-sdk[tracing]>=0.30.1,<0.31",
+    # 0.31.0 floor: first-class typed parts on the ToolResult envelope (#2641).
+    # kestrel_sdk.tools.parts hosts the pending-parts buffer ContextVar that
+    # agent/parts.py re-exports (emit_part's tool-result fallback), and
+    # DynamicTool.execute attaches buffered/explicit parts to the serialized
+    # envelope — the SDK owns the buffer so in-tree and external features share
+    # it. This floor also covers the obs#32 KESTREL_OTEL_PROJECT reader that
+    # landed in 0.30.2.
+    "kestrel-sovereign-sdk[tracing]>=0.31.0,<0.32",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -239,7 +240,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics,tracing]>=0.30.1,<0.31",
+    "kestrel-sovereign-sdk[metrics,tracing]>=0.31.0,<0.32",
 ]
 # Host-supervised Arize Phoenix trace backend (OTel pivot, #2570). Installing
 # this extra is the ONLY step needed to get traces flowing: on host start the
