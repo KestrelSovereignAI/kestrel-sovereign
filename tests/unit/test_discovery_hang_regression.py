@@ -280,7 +280,10 @@ async def test_process_discovery_message_times_out_on_llm_hang():
     deadline."""
 
     class HangingLLM:
-        async def generate_with_messages(self, *, messages):
+        async def generate_with_messages(self, *, messages, **_kwargs):
+            # ``**_kwargs`` accepts kwargs bootstrap threads (e.g.
+            # invocation_context, #2624) without altering the hang behavior
+            # this test asserts on.
             await asyncio.sleep(60)  # well past the test timeout
 
     db = MagicMock()

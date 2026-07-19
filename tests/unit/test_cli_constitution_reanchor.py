@@ -153,10 +153,10 @@ def test_reanchor_unchanged_returns_zero(reanchor_env, capsys):
     assert "already anchored" in out
 
 
-def test_reanchor_unchanged_with_prune_reports_and_returns_zero(
+def test_reanchor_same_hash_edge_repair_reports_removed(
     reanchor_env, capsys,
 ):
-    """#2617 prune-only cleanup: unchanged anchor, stale edges pruned."""
+    """#2617 cleanup shape: unchanged anchor, stale edge repaired (#2616 flow)."""
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
     backup_path = (
         reanchor_env / "agent_data" / "Test"
@@ -170,9 +170,9 @@ def test_reanchor_unchanged_with_prune_reports_and_returns_zero(
         old_hash="a" * 64,
         new_hash="a" * 64,
         backup_path=backup_path,
-        unchanged=True,
-        stale_edges=(stale,),
-        pruned_stale_edges=(stale,),
+        reanchored=True,
+        governance_edge_drift=True,
+        stale_edge_targets=(stale,),
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
          patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
@@ -183,9 +183,8 @@ def test_reanchor_unchanged_with_prune_reports_and_returns_zero(
         rc = cmd_constitution(args)
     assert rc == 0
     out = capsys.readouterr().out
-    assert "unchanged anchor" in out.lower()
-    assert "pruned 1 stale governed_by edge" in out.lower()
-    assert stale[:12] in out  # which edge was pruned
+    assert "governance edge repaired" in out.lower()
+    assert stale[:12] in out  # which edge was removed
     assert str(backup_path) in out
 
 
@@ -201,7 +200,8 @@ def test_reanchor_stale_edge_drift_unforced_returns_one(reanchor_env, capsys):
         new_hash="a" * 64,
         backup_path=None,
         drift_unforced=True,
-        stale_edges=(stale,),
+        governance_edge_drift=True,
+        stale_edge_targets=(stale,),
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
          patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
@@ -212,15 +212,16 @@ def test_reanchor_stale_edge_drift_unforced_returns_one(reanchor_env, capsys):
         rc = cmd_constitution(args)
     assert rc == 1
     out = capsys.readouterr().out
-    assert "stale governed_by edge drift detected" in out.lower()
+    assert "governance-edge drift detected" in out.lower()
     assert stale[:12] in out
     assert "--force" in out
-    assert "--signed-artifact" in out
     assert "backup" in out.lower()
 
 
-def test_reanchor_success_reports_pruned_stale_edges(reanchor_env, capsys):
-    """A full reanchor that also pruned dangling edges says so."""
+def test_reanchor_success_with_stale_edges_reports_reanchored(
+    reanchor_env, capsys,
+):
+    """A full reanchor over a drifted edge set still reports cleanly."""
     args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
     stale = "5" * 64
     result = ReanchorResult(
@@ -231,8 +232,8 @@ def test_reanchor_success_reports_pruned_stale_edges(reanchor_env, capsys):
         new_hash="b" * 64,
         backup_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db.backup-x",
         reanchored=True,
-        stale_edges=(stale,),
-        pruned_stale_edges=(stale,),
+        governance_edge_drift=True,
+        stale_edge_targets=(stale,),
     )
     with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
          patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
@@ -244,8 +245,8 @@ def test_reanchor_success_reports_pruned_stale_edges(reanchor_env, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "reanchored" in out.lower()
-    assert "pruned stale governed_by edge" in out.lower()
-    assert stale[:12] in out
+    assert ("a" * 64)[:12] in out
+    assert ("b" * 64)[:12] in out
 
 
 def test_reanchor_drift_unforced_returns_one(reanchor_env, capsys):

@@ -26,7 +26,12 @@ from kestrel_sovereign.cli import (
     _agent_http_timeout,
     _DEFAULT_ASK_READ_TIMEOUT,
 )
-from kestrel_sovereign.cli_lifecycle import _start_inprocess_mode
+from kestrel_sovereign.cli_lifecycle import (
+    _REANCHOR_RUNBOOK,
+    _diagnose_unready_server,
+    _fetch_detailed_health,
+    _start_inprocess_mode,
+)
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
@@ -668,6 +673,231 @@ class TestCmdStart:
         output = capsys.readouterr().out
         assert "Server did not become healthy within 42s" in output
         assert str(multi_agent_env / "logs" / "host.log") in output
+
+    def test_start_single_timeout_reports_safe_mode(
+        self, multi_agent_env, capsys
+    ):
+        """A responding-but-restricted agent gets the diagnosis, not the
+        generic 'may still be initializing' message (#2618)."""
+        args = build_parser().parse_args(
+            ["start", "claw", "--startup-timeout", "42"]
+        )
+        detail = [
+            "/health is responding (HTTP 503); /health/detailed "
+            "reports status: restricted",
+            "Constitution safe mode:",
+            "  - claw: integrity_restriction (constitution_safe_mode)",
+            f"Reanchor runbook: {_REANCHOR_RUNBOOK}",
+        ]
+
+        with patch(
+            "kestrel_sovereign.cli._get_project_dir",
+            return_value=multi_agent_env,
+        ), patch.object(ProcessManager, "start_agent"), patch.object(
+            ProcessManager,
+            "wait_for_health",
+            return_value=False,
+        ), patch(
+            "kestrel_sovereign.cli_lifecycle._diagnose_unready_server",
+            return_value=detail,
+        ) as diagnose:
+            rc = cmd_start(args)
+
+        assert rc == 1
+        assert diagnose.call_args.args[0] == 18801
+        output = capsys.readouterr().out
+        assert "claw did not become healthy within 42s" in output
+        assert "may still be initializing" not in output
+        assert "claw: integrity_restriction (constitution_safe_mode)" in output
+        assert _REANCHOR_RUNBOOK in output
+        assert str(multi_agent_env / "agent_data" / "claw" / "agent.log") in output
+
+    def test_start_all_timeout_reports_safe_mode(
+        self, multi_agent_env, capsys
+    ):
+        multi_agent = MultiAgentConfig.load(multi_agent_env / "multi_agent.toml")
+        pm = MagicMock(spec=ProcessManager)
+        pm.read_pid.return_value = None
+        pm.is_port_in_use.return_value = False
+        pm._load_env.return_value = {}
+        pm.wait_for_health.return_value = False
+        detail = [
+            "/health is responding (HTTP 503); /health/detailed "
+            "reports status: restricted",
+            "Constitution safe mode:",
+            "  - Emma: state_unavailable (constitution_safe_mode)",
+            f"Reanchor runbook: {_REANCHOR_RUNBOOK}",
+        ]
+
+        with patch(
+            "kestrel_sovereign.cli_lifecycle._diagnose_unready_server",
+            return_value=detail,
+        ) as diagnose:
+            rc = _start_inprocess_mode(
+                multi_agent_env,
+                multi_agent,
+                pm,
+                startup_timeout=42.0,
+            )
+
+        assert rc == 1
+        assert diagnose.call_args.args[0] == 18888
+        output = capsys.readouterr().out
+        assert "Server did not become healthy within 42s" in output
+        assert "may still be initializing" not in output
+        assert "Emma: state_unavailable (constitution_safe_mode)" in output
+        assert _REANCHOR_RUNBOOK in output
+        assert str(multi_agent_env / "logs" / "host.log") in output
+
+
+# -----------------------------------------------------------------------
+# Readiness-timeout diagnosis (#2618)
+# -----------------------------------------------------------------------
+
+class TestDiagnoseUnreadyServer:
+    """`kestrel start`/`update` explain a responding-but-restricted server
+    instead of the generic timeout message, without touching the public
+    /health payload (#2629 anti-fingerprinting stays intact)."""
+
+    def test_not_responding_keeps_generic_message(self):
+        with patch(
+            "kestrel_sovereign.cli_lifecycle._probe_health_status",
+            return_value=None,
+        ):
+            assert _diagnose_unready_server(18888, {}) is None
+
+    def test_healthy_just_after_deadline(self):
+        with patch(
+            "kestrel_sovereign.cli_lifecycle._probe_health_status",
+            return_value=200,
+        ):
+            lines = _diagnose_unready_server(18888, {})
+        assert "HTTP 200" in "\n".join(lines)
+
+    def test_no_api_key_fails_soft_with_pointer(self):
+        """No locally-resolved key: no detailed call, just the pointer."""
+        with patch(
+            "kestrel_sovereign.cli_lifecycle._probe_health_status",
+            return_value=503,
+        ), patch(
+            "kestrel_sovereign.cli_lifecycle._fetch_detailed_health",
+        ) as fetch:
+            lines = _diagnose_unready_server(18888, {})
+        fetch.assert_not_called()
+        joined = "\n".join(lines)
+        assert "KESTREL_API_KEY" in joined
+        assert "/health/detailed" in joined
+        assert _REANCHOR_RUNBOOK in joined
+
+    def test_key_rejected_fails_soft_with_pointer(self):
+        with patch(
+            "kestrel_sovereign.cli_lifecycle._probe_health_status",
+            return_value=503,
+        ), patch(
+            "kestrel_sovereign.cli_lifecycle._fetch_detailed_health",
+            return_value=None,
+        ) as fetch:
+            lines = _diagnose_unready_server(
+                18888, {"KESTREL_API_KEY": "sk-test"}
+            )
+        fetch.assert_called_once_with(18888, "sk-test")
+        joined = "\n".join(lines)
+        assert "/health/detailed" in joined
+        assert _REANCHOR_RUNBOOK in joined
+
+    def test_safe_mode_entries_formatted(self):
+        payload = {
+            "status": "restricted",
+            "constitution_safe_mode": [
+                {
+                    "agent": "Emma",
+                    "state": "safe_mode",
+                    "failure": "integrity_restriction",
+                    "error_code": "constitution_safe_mode",
+                },
+                {
+                    "agent": "Nellie",
+                    "state": "audit_pending",
+                    "failure": "startup_audit_required",
+                    "error_code": "constitution_audit_pending",
+                },
+            ],
+            "checks": [],
+        }
+        with patch(
+            "kestrel_sovereign.cli_lifecycle._probe_health_status",
+            return_value=503,
+        ), patch(
+            "kestrel_sovereign.cli_lifecycle._fetch_detailed_health",
+            return_value=payload,
+        ):
+            lines = _diagnose_unready_server(
+                18888, {"KESTREL_API_KEY": "sk-test"}
+            )
+        joined = "\n".join(lines)
+        assert "status: restricted" in joined
+        assert "Emma: integrity_restriction (constitution_safe_mode)" in joined
+        assert (
+            "Nellie: startup_audit_required (constitution_audit_pending)"
+            in joined
+        )
+        assert _REANCHOR_RUNBOOK in joined
+
+    def test_non_constitutional_cause_prints_status_generically(self):
+        payload = {
+            "status": "unhealthy",
+            "error": "No agent available",
+            "checks": [],
+        }
+        with patch(
+            "kestrel_sovereign.cli_lifecycle._probe_health_status",
+            return_value=503,
+        ), patch(
+            "kestrel_sovereign.cli_lifecycle._fetch_detailed_health",
+            return_value=payload,
+        ):
+            lines = _diagnose_unready_server(
+                18888, {"KESTREL_API_KEY": "sk-test"}
+            )
+        joined = "\n".join(lines)
+        assert "status: unhealthy" in joined
+        assert "No agent available" in joined
+        assert _REANCHOR_RUNBOOK not in joined
+
+    def test_fetch_detailed_reads_503_body(self):
+        """The restricted host answers 503 — urllib raises HTTPError and the
+        diagnostic body must still be read from it."""
+        import io
+        import json as jsonlib
+        import urllib.error
+
+        body = jsonlib.dumps(
+            {"status": "restricted", "constitution_safe_mode": []}
+        ).encode()
+        err = urllib.error.HTTPError(
+            "http://localhost:18888/health/detailed",
+            503,
+            "Service Unavailable",
+            None,
+            io.BytesIO(body),
+        )
+        with patch("urllib.request.urlopen", side_effect=err):
+            payload = _fetch_detailed_health(18888, "sk-test")
+        assert payload == {"status": "restricted", "constitution_safe_mode": []}
+
+    def test_fetch_detailed_auth_rejected_returns_none(self):
+        import io
+        import urllib.error
+
+        err = urllib.error.HTTPError(
+            "http://localhost:18888/health/detailed",
+            401,
+            "Unauthorized",
+            None,
+            io.BytesIO(b"{}"),
+        )
+        with patch("urllib.request.urlopen", side_effect=err):
+            assert _fetch_detailed_health(18888, "bad-key") is None
 
 
 # -----------------------------------------------------------------------

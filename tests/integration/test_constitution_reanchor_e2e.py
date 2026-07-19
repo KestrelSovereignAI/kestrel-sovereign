@@ -290,8 +290,8 @@ async def test_reanchor_prunes_dangling_governed_by_edges(tmp_path, monkeypatch)
     assert result.reanchored, f"reanchor failed: {result.error}"
     assert result.old_hash == phantom_hash
     assert result.new_hash == v2_hash
-    assert result.stale_edges == (v1_hash,)
-    assert result.pruned_stale_edges == (v1_hash,)
+    assert result.governance_edge_drift is True
+    assert result.stale_edge_targets == (v1_hash,)
 
     post = await _snapshot(db_path, creds.agent_did)
     assert post["governed_by_targets"] == [v2_hash], (
@@ -343,10 +343,13 @@ async def test_reanchor_unchanged_force_prunes_stale_edges(tmp_path, monkeypatch
         sovereign_trust_root_path=trust_root_path,
     )
     assert result.error is None
-    assert result.unchanged, "anchor must not change during a prune-only run"
+    # A same-hash governance repair is modeled as a reanchored result with
+    # old_hash == new_hash and governance_edge_drift set (#2616 semantics).
+    assert result.reanchored
     assert result.old_hash == v1_hash
     assert result.new_hash == v1_hash
-    assert result.pruned_stale_edges == (stale_hash,)
+    assert result.governance_edge_drift is True
+    assert result.stale_edge_targets == (stale_hash,)
     assert result.backup_path is not None and result.backup_path.exists(), (
         "prune-only write must still take the file-level backup"
     )
@@ -388,7 +391,8 @@ async def test_reanchor_unchanged_stale_edges_unforced_reports_drift(
         force=False,
     )
     assert result.drift_unforced
-    assert result.stale_edges == (stale_hash,)
+    assert result.governance_edge_drift is True
+    assert result.stale_edge_targets == (stale_hash,)
     assert result.backup_path is None
 
     post = await _snapshot(db_path, creds.agent_did)
@@ -466,6 +470,148 @@ async def test_reanchor_no_op_when_already_anchored(tmp_path, monkeypatch):
     # stronger guarantee is "no .backup-* file created".
     backups = list(db_path.parent.glob("*.backup-*"))
     assert backups == [], "no-op reanchor must not produce a backup"
+
+
+@pytest.mark.asyncio
+async def test_doctor_edge_drift_repaired_by_same_hash_reanchor(
+    tmp_path, monkeypatch
+):
+    """#2616: the exact doctor → reanchor workflow on a real DB.
+
+    The 2026-07-18 incident shape: ``constitution_hash`` + blob are current,
+    but the ``governed_by`` edge still targets an ancient anchor (a historical
+    pre-atomic reanchor updated property + blob, never the edge). Doctor must
+    FAIL with the ``reanchor --force`` remediation, and that exact command
+    must actually repair the edge via the same-hash repair path — not return
+    ``unchanged`` and leave the agent to safe-mode at boot.
+    """
+    from kestrel_sovereign.doctor import diagnose
+    from kestrel_sovereign.multi_agent.config import (
+        HostConfig,
+        LocalAgentConfig,
+        MULTI_AGENT_CONFIG_FILENAME,
+        MultiAgentConfig,
+    )
+    from kestrel_sovereign.setup.env_file import write_env
+    from kestrel_sovereign.setup.toml_file import write_toml
+
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    v1_hash = hashlib.sha256(CONSTITUTION_V1).hexdigest()
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+    agent_did = creds.agent_did
+
+    # Recreate the legacy pre-atomic-reanchor state: repoint the edge at an
+    # ancient anchor while property + blob stay current.
+    ancient = hashlib.sha256(b"ancient governing text").hexdigest()
+    async with AsyncStorage(str(db_path)) as storage:
+        await storage.graph.add_edge(agent_did, ancient, "governed_by")
+        await storage.graph.delete_edge(agent_did, v1_hash, "governed_by")
+
+    pre = await _snapshot(db_path, agent_did)
+    assert pre["agent_constitution_hash"] == v1_hash
+    assert pre["governed_by_targets"] == [ancient]
+
+    # Project tree so doctor can run against this agent.
+    write_env(tmp_path / ".env", {
+        "KESTREL_DATA_KEY": "test-data-key",
+        "OPENAI_API_KEY": "sk-x",
+    })
+    write_toml(tmp_path / "kestrel.toml", {"llm": {
+        "route_priority": ["openai:api"],
+        "vendors": {"openai": {"is_cloud": True, "routes": {"api": {
+            "adapter": "OpenAIAdapter",
+            "api_key_env": "OPENAI_API_KEY",
+        }}}},
+    }})
+    MultiAgentConfig(
+        host=HostConfig(),
+        agents={"TestAgent": LocalAgentConfig(
+            data_dir=Path("agent_data/TestAgent"), port=8801, autostart=True,
+        )},
+    ).save(tmp_path / MULTI_AGENT_CONFIG_FILENAME)
+
+    # ---- Doctor detects the drift and names the remediation ----
+    report = diagnose(tmp_path)
+    drift = [m for m in report.fail if "anchor drift" in m]
+    assert len(drift) == 1, f"fail={report.fail}"
+    assert ancient[:12] in drift[0]
+    assert v1_hash[:12] in drift[0]
+    assert (
+        "kestrel constitution reanchor --agent-name TestAgent --force"
+        in drift[0]
+    )
+
+    # ---- The recommended command, without --force: reports edge drift ----
+    unforced = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=False,
+    )
+    assert unforced.drift_unforced, f"expected drift report: {unforced}"
+    assert unforced.governance_edge_drift
+    assert unforced.stale_edge_targets == (ancient,)
+    mid = await _snapshot(db_path, agent_did)
+    assert mid == pre, "unforced run must not write"
+
+    # ---- The recommended command, with --force: same-hash edge repair ----
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V1,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        authorization="doctor-workflow-test",
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+    )
+    assert not result.unchanged, (
+        "edge-only drift must not be reported as 'unchanged' — that was the "
+        "no-op remediation bug"
+    )
+    assert result.reanchored, f"repair failed: {result.error}"
+    assert result.governance_edge_drift
+    assert result.old_hash == result.new_hash == v1_hash
+    assert result.backup_path is not None and result.backup_path.exists()
+
+    post = await _snapshot(db_path, agent_did)
+    # The edge now targets the anchored constitution — and ONLY it.
+    assert post["governed_by_targets"] == [v1_hash]
+    # Same-hash repair: the hash, blob, and RAG index are untouched.
+    assert post["agent_constitution_hash"] == v1_hash
+    assert post["chunks_for"][v1_hash] == pre["chunks_for"][v1_hash]
+    # Genesis-audit receipt is hash-bound and the hash didn't move — it
+    # must NOT be superseded into a fresh pending cycle.
+    assert post["genesis_audit"] == pre["genesis_audit"]
+    assert post["genesis_audit_history"] == pre["genesis_audit_history"]
+    # The audit record names what was removed.
+    assert post["agent_audit"]["old_hash"] == v1_hash
+    assert post["agent_audit"]["new_hash"] == v1_hash
+    assert post["agent_audit"]["stale_edges_removed"] == [ancient]
+
+    # ---- Doctor is clean again ----
+    report2 = diagnose(tmp_path)
+    assert not [m for m in report2.fail if "anchor drift" in m]
+    assert any(
+        "governed_by edge targets the anchored constitution" in m
+        for m in report2.ok
+    )
+    assert report2.ready, f"fail={report2.fail}"
 
 
 @pytest.mark.asyncio

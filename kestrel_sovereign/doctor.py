@@ -17,6 +17,12 @@ Checks performed:
     matches the SHA256 of the canonical KESTREL_CONSTITUTION.md.
     Drift here means the agent is silently governing itself by an
     older constitution than what's on disk — see ``_check_constitution_drift``.
+  - For each registered agent, the ``governed_by`` graph edge targets the
+    anchored ``constitution_hash`` (integrity proof 2) and any per-agent
+    ``CONSTITUTION.md`` overlay is anchored and unmodified (#1722). The
+    fail-closed integrity audit safe-modes an agent on either at boot;
+    doctor surfaces them pre-upgrade so operators can reanchor first
+    (#2616) — see ``_check_anchor_consistency``.
   - Legacy local identity exports are inspected by metadata only. Unsafe
     directory/file modes, links, and non-regular entries are reported without
     opening or parsing package contents.
@@ -74,6 +80,7 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_llm(config, env, toml_path, report)
     _check_multi_agent(multi_agent_path, project_dir, report)
     _check_constitution_drift(multi_agent_path, project_dir, report)
+    _check_anchor_consistency(multi_agent_path, project_dir, report)
     _check_legacy_identity_exports(project_dir, report)
 
     return report
@@ -196,11 +203,10 @@ def _check_constitution_drift(
       - File is corrupt or partially written. Warn + skip with the
         underlying error so the user can debug.
 
-    Per-agent overlay (``<agent_dir>/CONSTITUTION.md``, #898) is
-    deliberately NOT compared here. Overlays affect runtime grant
-    lookups but are not anchored at inception, so there is no anchor
-    for them to drift against. (If we ever start anchoring overlay
-    text, this check needs an extension.)
+    Per-agent overlay (``<agent_dir>/CONSTITUTION.md``) and the
+    ``governed_by`` governance edge are NOT compared here — overlays ARE
+    anchored since #1722, and the edge is integrity proof 2. Both are
+    checked by ``_check_anchor_consistency`` (#2616).
     """
     multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
     agents = multi_agent.get_local_agents()
@@ -300,6 +306,221 @@ def _check_constitution_drift(
                 f"Run `kestrel constitution reanchor --agent-name {name} --force` "
                 f"to update (DB is backed up first)."
             )
+
+
+# Mirror kestrel_sovereign.setup.overlay_anchor — importing that module here
+# would drag in the full AsyncStorage stack; doctor deliberately reads agent
+# DBs with stock sqlite3 only.
+_OVERLAY_FILENAME = "CONSTITUTION.md"
+_OVERLAY_HASH_PROPERTY = "constitution_overlay_hash"
+
+
+def _check_anchor_consistency(
+    multi_agent_path: Path, project_dir: Path, report: DoctorReport
+) -> None:
+    """Pre-upgrade anchor-drift checks beyond base-hash drift (#2616).
+
+    The fail-closed constitution integrity audit (#2463 proofs, #2595
+    durable safe mode, #2600 genesis-audit lifecycle) safe-modes an agent
+    at boot on anchor inconsistencies the hash comparison in
+    ``_check_constitution_drift`` cannot see:
+
+      - Proof 2: the ``agent --governed_by--> constitution`` graph edge
+        must target the anchored ``constitution_hash``. A historical
+        pre-atomic reanchor could update the property + blob but leave
+        the edge pointing at an ancient anchor (the 2026-07-18 incident:
+        three prod agents fail-closed at first boot after upgrade).
+      - Overlay: a per-agent ``CONSTITUTION.md`` overlay must be anchored
+        (``constitution_overlay_hash``) and match the file on disk; an
+        anchored overlay must still exist (#1722).
+
+    Each drift fail names the trusted-channel remediation command so
+    operators can reanchor BEFORE upgrading into the fail-closed
+    enforcement. Unreadable DBs, missing agent nodes, and a missing base
+    anchor are already surfaced by ``_check_constitution_drift``; this
+    check stays silent for those instead of duplicating the warning.
+    """
+    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
+    agents = multi_agent.get_local_agents()
+    for name, cfg in agents.items():
+        agent_dir = (project_dir / cfg.data_dir).resolve()
+        db_path = agent_dir / "kestrel_prime.db"
+        if not db_path.exists():
+            # Already a fail in _check_multi_agent; don't duplicate.
+            continue
+
+        node = _read_agent_node(db_path)
+        if isinstance(node, (_UnreadableDB, _NoAgentNode)):
+            # Already warned by _check_constitution_drift.
+            continue
+        node_id, properties = node
+        if properties is None:
+            # Unparseable properties — _check_constitution_drift already
+            # warns (missing constitution_hash); nothing verifiable here.
+            continue
+
+        _check_governance_edge(name, db_path, node_id, properties, report)
+        _check_overlay_anchor(name, agent_dir, properties, report)
+
+
+def _check_governance_edge(
+    name: str,
+    db_path: Path,
+    node_id: str,
+    properties: dict,
+    report: DoctorReport,
+) -> None:
+    """Verify the ``governed_by`` edge targets the anchored constitution_hash."""
+    stored_hash = properties.get("constitution_hash")
+    if not stored_hash or not isinstance(stored_hash, str):
+        # No anchor to agree with; _check_constitution_drift already warns.
+        return
+
+    targets = _read_governed_by_targets(db_path, node_id)
+    if isinstance(targets, _UnreadableDB):
+        # FAIL, not warn: we could read the agent node moments ago, so the
+        # DB is not sqlcipher-encrypted — the edges specifically cannot be
+        # read (missing graph_edges table / corruption). The runtime fails
+        # closed either way: an edge-read error is an integrity failure,
+        # and a missing table is auto-created empty at startup, leaving
+        # proof 2 with no edge. Reporting "Ready" here would upgrade the
+        # operator straight into safe mode.
+        report.fail.append(
+            f"{name}: cannot verify the governed_by governance edge — "
+            f"{targets.reason}. The fail-closed integrity audit (proof 2) "
+            f"requires an edge at the anchored constitution and will "
+            f"safe-mode this agent at next boot. Run `kestrel constitution "
+            f"reanchor --agent-name {name} --force` with a signed artifact "
+            f"to repair (DB is backed up first)."
+        )
+        return
+
+    if stored_hash in targets:
+        report.ok.append(
+            f"{name}: governed_by edge targets the anchored constitution "
+            f"({stored_hash[:12]}…)"
+        )
+        stale = sorted({t for t in targets if t != stored_hash})
+        if stale:
+            # Proof 2 tolerates extra edges (it only requires one at the
+            # anchor), so this won't safe-mode — but the agent nominally
+            # has two governing constitutions. Reanchor cleans these up.
+            report.warn.append(
+                f"{name}: stale extra governed_by edge(s) alongside the "
+                f"anchored constitution "
+                f"({', '.join(t[:12] + '…' for t in stale)}). Boot will "
+                f"succeed, but `kestrel constitution reanchor --agent-name "
+                f"{name} --force` will remove them."
+            )
+    elif targets:
+        report.fail.append(
+            f"{name}: anchor drift — governed_by edge targets "
+            f"{targets[0][:12]}… but constitution_hash is {stored_hash[:12]}…. "
+            f"The fail-closed integrity audit (proof 2) will safe-mode this "
+            f"agent at next boot. Run `kestrel constitution reanchor "
+            f"--agent-name {name} --force` with a signed artifact to repair "
+            f"(DB is backed up first)."
+        )
+    else:
+        report.fail.append(
+            f"{name}: anchor drift — no governed_by edge to the anchored "
+            f"constitution ({stored_hash[:12]}…). The fail-closed integrity "
+            f"audit (proof 2) will safe-mode this agent at next boot. Run "
+            f"`kestrel constitution reanchor --agent-name {name} --force` "
+            f"with a signed artifact to repair (DB is backed up first)."
+        )
+
+
+def _describe_overlay_anchor(anchor: object) -> str:
+    """Format an overlay anchor for a report line without assuming it's a hash.
+
+    The runtime treats ANY truthy ``constitution_overlay_hash`` value as an
+    anchor (truthiness, not isinstance), so a malformed non-string value must
+    be reported, not slice-crashed on.
+    """
+    if isinstance(anchor, str):
+        return f"{anchor[:12]}…"
+    return f"a malformed non-string value ({anchor!r:.60})"
+
+
+def _check_overlay_anchor(
+    name: str, agent_dir: Path, properties: dict, report: DoctorReport
+) -> None:
+    """Verify any per-agent CONSTITUTION.md overlay is anchored + unmodified.
+
+    Mirrors the runtime ``verify_constitution_overlay`` decision matrix
+    (#1722) EXACTLY, including its edge states:
+
+      - The anchor is "present" by truthiness, not type: a malformed
+        non-string ``constitution_overlay_hash`` counts as anchored at
+        runtime and can never equal the overlay's sha — that's a FAIL
+        (drift if the overlay exists, tampering if it doesn't), never
+        silently "unanchored".
+      - An overlay file that exists but cannot be read is treated by the
+        runtime as ABSENT (its sha never computes). With an anchor that is
+        the "anchored overlay missing" tampering failure → FAIL here too.
+        Without an anchor the runtime passes ("no overlay"), so doctor
+        only warns that it could not verify the file.
+
+    Overlay absent + no anchor is the normal case and stays silent.
+    """
+    overlay_path = agent_dir / _OVERLAY_FILENAME
+    # Runtime truthiness (#1722): any truthy value is an anchor.
+    anchor = properties.get(_OVERLAY_HASH_PROPERTY) or None
+
+    if overlay_path.exists():
+        try:
+            overlay_hash = hashlib.sha256(overlay_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            if anchor is not None:
+                report.fail.append(
+                    f"{name}: constitution overlay {overlay_path} exists but "
+                    f"cannot be read ({exc}). The fail-closed integrity audit "
+                    f"treats an unreadable overlay as absent, and an absent "
+                    f"overlay with an anchor ("
+                    f"{_describe_overlay_anchor(anchor)}) as tampering — this "
+                    f"agent will safe-mode at next boot. Make the overlay "
+                    f"readable, or restore it and re-run `kestrel constitution "
+                    f"anchor-overlay --agent-name {name}`."
+                )
+            else:
+                report.warn.append(
+                    f"{name}: overlay anchor check incomplete — cannot read "
+                    f"{overlay_path}: {exc}. The runtime treats an unreadable "
+                    f"overlay as absent (no anchor is set, so boot will not "
+                    f"safe-mode), but doctor could not verify the file."
+                )
+            return
+        if anchor is None:
+            report.fail.append(
+                f"{name}: constitution overlay {overlay_path} is present but "
+                f"NOT anchored — the fail-closed integrity audit will "
+                f"safe-mode this agent at next boot. If the overlay is "
+                f"legitimate, stop the agent and run `kestrel constitution "
+                f"anchor-overlay --agent-name {name}`."
+            )
+        elif anchor != overlay_hash:
+            report.fail.append(
+                f"{name}: constitution overlay drift — anchored "
+                f"{_describe_overlay_anchor(anchor)} does not match "
+                f"{overlay_path} ({overlay_hash[:12]}…). If the "
+                f"change is legitimate, stop the agent and run `kestrel "
+                f"constitution anchor-overlay --agent-name {name}`."
+            )
+        else:
+            report.ok.append(
+                f"{name}: constitution overlay anchored ({overlay_hash[:12]}…)"
+            )
+    elif anchor is not None:
+        report.fail.append(
+            f"{name}: an anchored constitution overlay is missing from disk "
+            f"(anchored {_describe_overlay_anchor(anchor)}, expected at "
+            f"{overlay_path}) — the "
+            f"fail-closed integrity audit treats this as tampering and will "
+            f"safe-mode this agent at next boot. Restore the overlay file, or "
+            f"re-run `kestrel constitution anchor-overlay --agent-name {name}` "
+            f"after restoring the intended content."
+        )
 
 
 def _canonical_constitution_path() -> Path:
@@ -416,3 +637,69 @@ def _read_anchored_emancipation_contract(db_path: Path):
         return None
 
     return properties.get("emancipation_contract")
+
+
+def _read_agent_node(db_path: Path):
+    """Read the agent node's id + properties from a Kestrel DB.
+
+    Returns:
+        - ``(node_id, properties_dict)`` on success.
+        - ``(node_id, None)`` when the properties column is missing,
+          unparseable, or not a JSON object.
+        - ``_UnreadableDB(reason=...)`` / ``_NoAgentNode()`` sentinels,
+          matching ``_read_anchored_constitution_hash``.
+    """
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute(
+                "SELECT node_id, properties FROM graph_nodes "
+                "WHERE node_type='agent' LIMIT 1"
+            ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        return _UnreadableDB(reason=f"DB unreadable ({exc})")
+    except sqlite3.Error as exc:
+        return _UnreadableDB(reason=f"sqlite error ({exc})")
+
+    if row is None:
+        return _NoAgentNode()
+
+    node_id, properties_raw = row
+    if properties_raw is None:
+        return node_id, None
+
+    try:
+        properties = (
+            json.loads(properties_raw)
+            if isinstance(properties_raw, (str, bytes, bytearray))
+            else properties_raw
+        )
+    except (TypeError, ValueError):
+        return node_id, None
+
+    if not isinstance(properties, dict):
+        return node_id, None
+
+    return node_id, properties
+
+
+def _read_governed_by_targets(db_path: Path, source_id: str):
+    """Return the targets of the agent's ``governed_by`` edges.
+
+    Returns a tuple of target hashes (possibly empty), or
+    ``_UnreadableDB(reason=...)`` when the edges cannot be read — a
+    sqlcipher DB, corruption, or a legacy/synthetic DB with no
+    ``graph_edges`` table.
+    """
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT target_id FROM graph_edges "
+                "WHERE source_id=? AND label='governed_by'",
+                (source_id,),
+            ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        return _UnreadableDB(reason=f"cannot read graph_edges ({exc})")
+    except sqlite3.Error as exc:
+        return _UnreadableDB(reason=f"sqlite error reading graph_edges ({exc})")
+
+    return tuple(row[0] for row in rows if row[0])

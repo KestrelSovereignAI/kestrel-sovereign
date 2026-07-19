@@ -224,16 +224,31 @@ from kestrel_sovereign.doctor import (  # noqa: E402
 )
 
 
+# Sentinel default: "make the governed_by edge target the stored hash",
+# distinguishable from an explicit None (= no edge at all).
+_EDGE_MATCHES_ANCHOR = object()
+
+
 def _seed_with_anchored_constitution(
     tmp_path: Path,
     *,
     constitution_text: bytes,
     stored_hash: str | None,
+    governed_by_target: object = _EDGE_MATCHES_ANCHOR,
+    overlay_anchor: object = None,
+    create_edges_table: bool = True,
 ) -> None:
     """Build a project tree where the agent's anchored hash is exactly ``stored_hash``.
 
     Pass ``stored_hash=None`` to omit the constitution_hash property
     entirely (older-agent scenario).
+
+    By default the DB carries the realistic inception governance wiring:
+    a ``graph_edges`` table with an ``agent --governed_by--> stored_hash``
+    edge. ``governed_by_target`` overrides the edge target (a stale-anchor
+    DB) or, when ``None``, omits the edge. ``create_edges_table=False``
+    synthesizes a legacy DB with no ``graph_edges`` table at all.
+    ``overlay_anchor`` sets ``constitution_overlay_hash`` on the agent node.
 
     Always writes to ``tmp_path / "agent_data" / "test"`` to match the
     lowercase data_dir produced by ``_seed_ready``. On case-sensitive
@@ -254,6 +269,11 @@ def _seed_with_anchored_constitution(
     properties: dict = {"name": "Test"}
     if stored_hash is not None:
         properties["constitution_hash"] = stored_hash
+    if overlay_anchor is not None:
+        properties["constitution_overlay_hash"] = overlay_anchor
+
+    if governed_by_target is _EDGE_MATCHES_ANCHOR:
+        governed_by_target = stored_hash
 
     with sqlite3.connect(str(db_path)) as conn:
         conn.executescript(
@@ -266,11 +286,28 @@ def _seed_with_anchored_constitution(
             );
             """
         )
+        if create_edges_table:
+            conn.executescript(
+                """
+                CREATE TABLE graph_edges (
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    properties TEXT
+                );
+                """
+            )
         conn.execute(
             "INSERT INTO graph_nodes(node_id, node_type, label, properties) "
             "VALUES (?, 'agent', ?, ?)",
             ("did:test:Test", "Test", json.dumps(properties)),
         )
+        if create_edges_table and governed_by_target is not None:
+            conn.execute(
+                "INSERT INTO graph_edges(source_id, target_id, label, properties) "
+                "VALUES (?, ?, 'governed_by', NULL)",
+                ("did:test:Test", governed_by_target),
+            )
         conn.commit()
 
 
@@ -497,6 +534,385 @@ def test_read_hash_handles_corrupt_properties_json(tmp_path):
         )
         conn.commit()
     assert isinstance(_read_anchored_constitution_hash(db), _NoHashProperty)
+
+
+# ---------------------------------------------------------------------------
+# Anchor consistency (#2616): governed_by edge + overlay anchoring
+#
+# The fail-closed integrity audit safe-modes agents at boot on a
+# mis-targeted/missing governed_by edge (proof 2) or an unanchored/
+# drifted/removed overlay. Doctor must surface these BEFORE an upgrade
+# into that enforcement — the 2026-07-18 incident shape.
+# ---------------------------------------------------------------------------
+
+
+from kestrel_sovereign.doctor import (  # noqa: E402
+    _read_agent_node,
+    _read_governed_by_targets,
+)
+
+
+def _seed_matching_anchor(tmp_path, monkeypatch, **kwargs) -> str:
+    """Seed a project whose base anchor matches the canonical file.
+
+    Keeps the base drift check green so anchor-consistency asserts are
+    isolated. Returns the stored hash.
+    """
+    text = b"# Kestrel Constitution\nv1\n"
+    canonical = _patch_canonical(tmp_path, text)
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
+    )
+    stored = hashlib.sha256(text).hexdigest()
+    _seed_with_anchored_constitution(
+        tmp_path, constitution_text=text, stored_hash=stored, **kwargs
+    )
+    return stored
+
+
+def test_governed_by_edge_match_passes(tmp_path, monkeypatch):
+    stored = _seed_matching_anchor(tmp_path, monkeypatch)
+    report = diagnose(tmp_path)
+    assert any(
+        "governed_by edge targets the anchored constitution" in m
+        and stored[:12] in m
+        for m in report.ok
+    )
+    assert not any("anchor drift" in m for m in report.fail)
+
+
+def test_governed_by_edge_mistargeted_fails(tmp_path, monkeypatch):
+    """The 2026-07-18 incident: property + blob reanchored, edge still on
+    the ancient anchor → proof 2 fails closed at boot."""
+    ancient = hashlib.sha256(b"ancient constitution").hexdigest()
+    stored = _seed_matching_anchor(
+        tmp_path, monkeypatch, governed_by_target=ancient
+    )
+    report = diagnose(tmp_path)
+    drift = [m for m in report.fail if "anchor drift" in m]
+    assert len(drift) == 1
+    msg = drift[0]
+    assert ancient[:12] in msg
+    assert stored[:12] in msg
+    assert "safe-mode" in msg
+    assert "kestrel constitution reanchor --agent-name Test --force" in msg
+    # The base hash check must still pass — this drift is edge-only.
+    assert any("constitution anchored to current file" in m for m in report.ok)
+
+
+def test_governed_by_edge_missing_fails(tmp_path, monkeypatch):
+    stored = _seed_matching_anchor(
+        tmp_path, monkeypatch, governed_by_target=None
+    )
+    report = diagnose(tmp_path)
+    drift = [m for m in report.fail if "anchor drift" in m]
+    assert len(drift) == 1
+    assert "no governed_by edge" in drift[0]
+    assert stored[:12] in drift[0]
+    assert "kestrel constitution reanchor --agent-name Test --force" in drift[0]
+
+
+def test_governed_by_check_fails_without_edges_table(tmp_path, monkeypatch):
+    """A DB whose graph_edges cannot be read (missing table/corruption)
+    while the agent node CAN be read is not a skip — the runtime fails
+    closed either way (an edge-read error is an integrity failure, and a
+    missing table is auto-created empty, leaving proof 2 with no edge).
+    Doctor must not report Ready and upgrade the operator into safe mode."""
+    _seed_matching_anchor(tmp_path, monkeypatch, create_edges_table=False)
+    report = diagnose(tmp_path)
+    unverifiable = [
+        m for m in report.fail
+        if "cannot verify the governed_by governance edge" in m
+    ]
+    assert len(unverifiable) == 1
+    assert "safe-mode" in unverifiable[0]
+    assert (
+        "kestrel constitution reanchor --agent-name Test --force"
+        in unverifiable[0]
+    )
+    assert not report.ready
+
+
+def test_governed_by_stale_extra_edge_warns_but_passes(tmp_path, monkeypatch):
+    """Correct edge present + a stale extra target: proof 2 passes (it only
+    requires one edge at the anchor), so boot succeeds — ok + warn, not fail."""
+    stored = _seed_matching_anchor(tmp_path, monkeypatch)
+    ancient = hashlib.sha256(b"ancient constitution").hexdigest()
+    db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO graph_edges(source_id, target_id, label, properties) "
+            "VALUES (?, ?, 'governed_by', NULL)",
+            ("did:test:Test", ancient),
+        )
+        conn.commit()
+    report = diagnose(tmp_path)
+    assert any(
+        "governed_by edge targets the anchored constitution" in m
+        and stored[:12] in m
+        for m in report.ok
+    )
+    stale = [m for m in report.warn if "stale extra governed_by edge" in m]
+    assert len(stale) == 1
+    assert ancient[:12] in stale[0]
+    assert "kestrel constitution reanchor --agent-name Test --force" in stale[0]
+    assert not any("anchor drift" in m for m in report.fail)
+
+
+def test_governed_by_check_silent_without_base_anchor(tmp_path, monkeypatch):
+    """No constitution_hash property → nothing for the edge to agree with.
+    The base check already warns; the edge check must stay silent."""
+    text = b"# constitution\n"
+    canonical = _patch_canonical(tmp_path, text)
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
+    )
+    _seed_with_anchored_constitution(
+        tmp_path, constitution_text=text, stored_hash=None,
+    )
+    report = diagnose(tmp_path)
+    assert not any(
+        "governed_by" in m or "governance-edge" in m
+        for m in (*report.ok, *report.warn, *report.fail)
+    )
+
+
+def test_overlay_unanchored_fails(tmp_path, monkeypatch):
+    """Present-but-unanchored overlay (the incident's Emma shape) fails
+    with the anchor-overlay remediation."""
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    overlay = tmp_path / "agent_data" / "test" / "CONSTITUTION.md"
+    overlay.write_bytes(b"# Overlay\ngrant: nothing\n")
+    report = diagnose(tmp_path)
+    unanchored = [m for m in report.fail if "NOT anchored" in m]
+    assert len(unanchored) == 1
+    assert "safe-mode" in unanchored[0]
+    assert "kestrel constitution anchor-overlay --agent-name Test" in unanchored[0]
+
+
+def test_overlay_anchored_matching_passes(tmp_path, monkeypatch):
+    overlay_text = b"# Overlay\ngrant: nothing\n"
+    overlay_hash = hashlib.sha256(overlay_text).hexdigest()
+    _seed_matching_anchor(tmp_path, monkeypatch, overlay_anchor=overlay_hash)
+    overlay = tmp_path / "agent_data" / "test" / "CONSTITUTION.md"
+    overlay.write_bytes(overlay_text)
+    report = diagnose(tmp_path)
+    assert any(
+        "constitution overlay anchored" in m and overlay_hash[:12] in m
+        for m in report.ok
+    )
+    assert report.ready, f"fail={report.fail}"
+
+
+def test_overlay_modified_fails(tmp_path, monkeypatch):
+    anchored_text = b"# Overlay\nv1\n"
+    anchored_hash = hashlib.sha256(anchored_text).hexdigest()
+    _seed_matching_anchor(tmp_path, monkeypatch, overlay_anchor=anchored_hash)
+    overlay = tmp_path / "agent_data" / "test" / "CONSTITUTION.md"
+    modified = b"# Overlay\nv2 - edited\n"
+    overlay.write_bytes(modified)
+    report = diagnose(tmp_path)
+    drift = [m for m in report.fail if "constitution overlay drift" in m]
+    assert len(drift) == 1
+    assert anchored_hash[:12] in drift[0]
+    assert hashlib.sha256(modified).hexdigest()[:12] in drift[0]
+    assert "kestrel constitution anchor-overlay --agent-name Test" in drift[0]
+
+
+def test_overlay_anchor_missing_file_fails(tmp_path, monkeypatch):
+    anchored_hash = hashlib.sha256(b"# Overlay\n").hexdigest()
+    _seed_matching_anchor(tmp_path, monkeypatch, overlay_anchor=anchored_hash)
+    # No overlay file written.
+    report = diagnose(tmp_path)
+    missing = [
+        m for m in report.fail
+        if "anchored constitution overlay is missing from disk" in m
+    ]
+    assert len(missing) == 1
+    assert anchored_hash[:12] in missing[0]
+
+
+def test_overlay_malformed_anchor_with_overlay_present_fails(
+    tmp_path, monkeypatch
+):
+    """A truthy non-string anchor counts as anchored at runtime (truthiness,
+    not isinstance) and can never equal the overlay sha → drift fail, not
+    'present but NOT anchored', and definitely not silence."""
+    _seed_matching_anchor(
+        tmp_path, monkeypatch, overlay_anchor={"hash": "not-a-string"}
+    )
+    overlay = tmp_path / "agent_data" / "test" / "CONSTITUTION.md"
+    overlay.write_bytes(b"# Overlay\n")
+    report = diagnose(tmp_path)
+    drift = [m for m in report.fail if "constitution overlay drift" in m]
+    assert len(drift) == 1
+    assert "malformed non-string value" in drift[0]
+    assert "kestrel constitution anchor-overlay --agent-name Test" in drift[0]
+    assert not report.ready
+
+
+def test_overlay_malformed_anchor_without_overlay_fails(tmp_path, monkeypatch):
+    """Overlay file absent + truthy non-string anchor: the runtime treats
+    the anchor as present → 'anchored overlay missing' tampering failure.
+    Doctor must not silently coerce the malformed anchor to absent."""
+    _seed_matching_anchor(
+        tmp_path, monkeypatch, overlay_anchor={"hash": "not-a-string"}
+    )
+    report = diagnose(tmp_path)
+    missing = [
+        m for m in report.fail
+        if "anchored constitution overlay is missing from disk" in m
+    ]
+    assert len(missing) == 1
+    assert "malformed non-string value" in missing[0]
+    assert not report.ready
+
+
+def test_overlay_unreadable_with_anchor_fails(tmp_path, monkeypatch):
+    """An overlay that exists but cannot be read is treated as ABSENT by the
+    runtime; with an anchor set that is the tampering failure → safe mode.
+    Doctor must fail, not warn. (A directory named CONSTITUTION.md exists()
+    but raises OSError on read_bytes — cross-platform unreadability.)"""
+    anchored_hash = hashlib.sha256(b"# Overlay\n").hexdigest()
+    _seed_matching_anchor(tmp_path, monkeypatch, overlay_anchor=anchored_hash)
+    (tmp_path / "agent_data" / "test" / "CONSTITUTION.md").mkdir()
+    report = diagnose(tmp_path)
+    unreadable = [m for m in report.fail if "cannot be read" in m]
+    assert len(unreadable) == 1
+    assert "safe-mode" in unreadable[0]
+    assert anchored_hash[:12] in unreadable[0]
+    assert not report.ready
+
+
+def test_overlay_unreadable_without_anchor_warns(tmp_path, monkeypatch):
+    """Unreadable overlay + no anchor: the runtime treats it as 'no overlay'
+    and boots fine — doctor warns that verification was incomplete but must
+    not block readiness (matrix-exact with verify_constitution_overlay)."""
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    (tmp_path / "agent_data" / "test" / "CONSTITUTION.md").mkdir()
+    report = diagnose(tmp_path)
+    incomplete = [
+        m for m in report.warn if "overlay anchor check incomplete" in m
+    ]
+    assert len(incomplete) == 1
+    assert not any("overlay" in m.lower() for m in report.fail)
+    assert report.ready, f"fail={report.fail}"
+
+
+def test_overlay_silent_when_absent_and_unanchored(tmp_path, monkeypatch):
+    """Normal agent: no overlay file, no anchor → zero overlay messages."""
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    report = diagnose(tmp_path)
+    assert not any(
+        "overlay" in m for m in (*report.ok, *report.warn, *report.fail)
+    )
+
+
+def test_overlay_checked_for_legacy_agent_without_base_anchor(
+    tmp_path, monkeypatch
+):
+    """#1722 legacy shape: anchored overlay but NO base constitution_hash.
+    The overlay check must still run (the runtime audits it first and
+    unconditionally)."""
+    text = b"# constitution\n"
+    canonical = _patch_canonical(tmp_path, text)
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH", str(canonical)
+    )
+    overlay_text = b"# Overlay\n"
+    overlay_hash = hashlib.sha256(overlay_text).hexdigest()
+    _seed_with_anchored_constitution(
+        tmp_path,
+        constitution_text=text,
+        stored_hash=None,
+        overlay_anchor=overlay_hash,
+    )
+    (tmp_path / "agent_data" / "test" / "CONSTITUTION.md").write_bytes(
+        overlay_text
+    )
+    report = diagnose(tmp_path)
+    assert any("constitution overlay anchored" in m for m in report.ok)
+
+
+# Helper-level tests for the new readers.
+
+
+def test_read_agent_node_returns_id_and_properties(tmp_path):
+    db = tmp_path / "k.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.executescript(
+            """CREATE TABLE graph_nodes (
+                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
+            );"""
+        )
+        conn.execute(
+            "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
+            ("did:x", "x", json.dumps({"constitution_hash": "abc123"})),
+        )
+        conn.commit()
+    node_id, properties = _read_agent_node(db)
+    assert node_id == "did:x"
+    assert properties == {"constitution_hash": "abc123"}
+
+
+def test_read_agent_node_none_properties_on_corrupt_json(tmp_path):
+    db = tmp_path / "k.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.executescript(
+            """CREATE TABLE graph_nodes (
+                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
+            );"""
+        )
+        conn.execute(
+            "INSERT INTO graph_nodes VALUES (?, 'agent', ?, ?)",
+            ("did:x", "x", "{not valid json"),
+        )
+        conn.commit()
+    node_id, properties = _read_agent_node(db)
+    assert node_id == "did:x"
+    assert properties is None
+
+
+def test_read_agent_node_sentinels(tmp_path):
+    empty = tmp_path / "empty.db"
+    sqlite3.connect(str(empty)).close()
+    assert isinstance(_read_agent_node(empty), _UnreadableDB)
+
+    no_agent = tmp_path / "noagent.db"
+    with sqlite3.connect(str(no_agent)) as conn:
+        conn.executescript(
+            """CREATE TABLE graph_nodes (
+                node_id TEXT, node_type TEXT, label TEXT, properties TEXT
+            );"""
+        )
+        conn.commit()
+    assert isinstance(_read_agent_node(no_agent), _NoAgentNode)
+
+
+def test_read_governed_by_targets_filters_by_source_and_label(tmp_path):
+    db = tmp_path / "k.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.executescript(
+            """CREATE TABLE graph_edges (
+                source_id TEXT, target_id TEXT, label TEXT, properties TEXT
+            );"""
+        )
+        conn.executemany(
+            "INSERT INTO graph_edges VALUES (?, ?, ?, NULL)",
+            [
+                ("did:x", "hash-a", "governed_by"),
+                ("did:x", "hash-b", "knows"),
+                ("did:other", "hash-c", "governed_by"),
+            ],
+        )
+        conn.commit()
+    assert _read_governed_by_targets(db, "did:x") == ("hash-a",)
+
+
+def test_read_governed_by_targets_unreadable_without_table(tmp_path):
+    db = tmp_path / "k.db"
+    sqlite3.connect(str(db)).close()
+    assert isinstance(_read_governed_by_targets(db, "did:x"), _UnreadableDB)
 
 
 def test_doctor_accepts_openrouter_management_key_only(tmp_path):

@@ -54,6 +54,7 @@ This directory holds detailed documentation for kestrel-sovereign. The top-level
 - **[`user-documentation/README.md`](user-documentation/README.md)** — end-user guides, concept explanations, key ceremonies
 - **[`use_cases/`](use_cases/)** — concrete deployment scenarios
 - **[`deployment/README.md`](deployment/README.md)** — deployment notes
+- **[`releases/v0.47.0.md`](releases/v0.47.0.md)** — upgrade notes for the fail-closed constitution integrity release (pre-upgrade `kestrel doctor` anchor check + reanchor runbook)
 - **[`demos/DEMO_SCRIPT.md`](demos/DEMO_SCRIPT.md)** — narrated demo walkthrough
 
 ## Generated documentation

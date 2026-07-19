@@ -50,6 +50,119 @@ def _format_seconds(seconds: float) -> str:
     return f"{seconds:g}s"
 
 
+# Reanchor runbook surfaced when a readiness timeout traces back to
+# constitution safe mode (#2616/#2618).
+_REANCHOR_RUNBOOK = "docs/architecture/security/SOVEREIGN_TRUST_ROOT.md"
+
+
+def _probe_health_status(port: int) -> Optional[int]:
+    """One-shot GET /health. Returns the HTTP status code when anything is
+    answering on the port (200, 503, ...), or ``None`` when nothing is."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://localhost:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def _fetch_detailed_health(port: int, api_key: str) -> Optional[dict]:
+    """Authenticated GET /health/detailed. Returns the parsed JSON payload,
+    or ``None`` when the key is rejected or the request/parse fails.
+
+    A restricted host answers 503 with the diagnostic body, which urllib
+    raises as ``HTTPError`` — the body still has to be read from it.
+    """
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"http://localhost:{port}/health/detailed",
+        headers={"X-API-Key": api_key, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return None
+        try:
+            body = exc.read()
+        except (OSError, ValueError):
+            return None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _diagnose_unready_server(port: int, env: dict) -> Optional[list]:
+    """Explain a readiness-poll timeout when the server IS responding.
+
+    After ``wait_for_health`` gives up, the port may still be serving
+    ``/health`` — most notably held at 503 because an agent booted into
+    constitution safe mode (#2616/#2618). The public payload deliberately
+    hides the cause (#2629 anti-fingerprinting), so the cause is read from
+    the authenticated ``/health/detailed`` using the locally-resolved
+    ``KESTREL_API_KEY`` (the CLI runs as the operator and already loads the
+    project ``.env``). Returns display lines, or ``None`` when nothing is
+    answering on the port — the caller keeps the generic timeout message.
+    """
+    status_code = _probe_health_status(port)
+    if status_code is None:
+        return None
+    if status_code == 200:
+        return [
+            "/health now reports HTTP 200 — the server finished "
+            "initializing just after the deadline. Check `kestrel status`.",
+        ]
+    api_key = (env.get("KESTREL_API_KEY") or "").strip()
+    if not api_key:
+        return [
+            f"/health is responding (HTTP {status_code}) — the server "
+            "process is up but held not-ready.",
+            "No KESTREL_API_KEY resolved locally; query the authenticated "
+            "/health/detailed for the cause (e.g. constitution safe mode). "
+            f"Reanchor runbook: {_REANCHOR_RUNBOOK}",
+        ]
+    payload = _fetch_detailed_health(port, api_key)
+    if payload is None:
+        return [
+            f"/health is responding (HTTP {status_code}) — the server "
+            "process is up but held not-ready.",
+            "/health/detailed could not be read with the local "
+            "KESTREL_API_KEY (rejected or errored) — query it manually. "
+            f"Reanchor runbook: {_REANCHOR_RUNBOOK}",
+        ]
+    lines = [
+        f"/health is responding (HTTP {status_code}); /health/detailed "
+        f"reports status: {payload.get('status', 'unknown')}",
+    ]
+    records = payload.get("constitution_safe_mode") or []
+    if records:
+        lines.append("Constitution safe mode:")
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            lines.append(
+                f"  - {record.get('agent', '?')}: "
+                f"{record.get('failure', '?')} "
+                f"({record.get('error_code', '?')})"
+            )
+        lines.append(f"Reanchor runbook: {_REANCHOR_RUNBOOK}")
+    elif payload.get("error"):
+        lines.append(f"Detail: {payload['error']}")
+    return lines
+
+
 def _add_startup_timeout_argument(parser: argparse.ArgumentParser) -> None:
     """Add the canonical readiness deadline to a lifecycle subcommand."""
     parser.add_argument(
@@ -141,11 +254,22 @@ def cmd_start(args) -> int:
             log_file = ProcessManager.agent_log_file(
                 (project_dir / agent_cfg.data_dir).resolve()
             )
-            print(
-                f"   {args.name} did not become healthy within "
-                f"{_format_seconds(startup_timeout)}; the process may still "
-                "be initializing."
+            detail_lines = _diagnose_unready_server(
+                agent_cfg.port, pm._load_env()
             )
+            if detail_lines is None:
+                print(
+                    f"   {args.name} did not become healthy within "
+                    f"{_format_seconds(startup_timeout)}; the process may "
+                    "still be initializing."
+                )
+            else:
+                print(
+                    f"   {args.name} did not become healthy within "
+                    f"{_format_seconds(startup_timeout)}:"
+                )
+                for line in detail_lines:
+                    print(f"   {line}")
             print(f"   Check log: {log_file}")
             return 1
         return 0
@@ -226,11 +350,20 @@ def _start_inprocess_mode(
         print("          \u2705")
     else:
         print("          \u274c")
-        print(
-            "   Server did not become healthy within "
-            f"{_format_seconds(startup_timeout)}; the process may still be "
-            "initializing."
-        )
+        detail_lines = _diagnose_unready_server(multi_agent.host.port, env)
+        if detail_lines is None:
+            print(
+                "   Server did not become healthy within "
+                f"{_format_seconds(startup_timeout)}; the process may still "
+                "be initializing."
+            )
+        else:
+            print(
+                "   Server did not become healthy within "
+                f"{_format_seconds(startup_timeout)}:"
+            )
+            for line in detail_lines:
+                print(f"   {line}")
         print(f"   Check log: {log_file}")
         return 1
 
