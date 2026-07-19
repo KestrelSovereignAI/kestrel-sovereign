@@ -330,21 +330,27 @@ kestrel status
 ### Alternative: Direct Commands
 
 ```bash
-# Start server directly (set KESTREL_DB_PATH first).
-# Pip-installed users invoke the in-package module (the wheel only ships
-# `kestrel_sovereign/`, no top-level `server.py`):
-KESTREL_DB_PATH=./agent_data/myagent uvicorn kestrel_sovereign.server:app --port 8888
+# Canonical direct-server command (set KESTREL_DB_PATH first). Explicit
+# loopback binding avoids exposing a local development agent to the LAN:
+KESTREL_DB_PATH=./agent_data/myagent uv run python -m kestrel_sovereign.server \
+  --host 127.0.0.1 --port 8888
 
 # CLI chat (no server needed)
 python -m kestrel_sovereign.main ./agent_data/myagent
 
-# Source-clone shorthand: a thin re-export shim at the repo root keeps
-# the historical commands working when you've cloned the repo:
-#   uvicorn server:app --port 8888
+# Source-clone shorthand for CLI chat remains available:
 #   python main.py ./agent_data/myagent
 ```
 
 > **Note:** `KESTREL_DB_PATH` is a **directory** path, not a file path. The database file `kestrel_prime.db` is created inside the specified directory. For example, setting `KESTREL_DB_PATH=./agent_data/myagent` stores the database at `./agent_data/myagent/kestrel_prime.db`.
+
+The direct server rejects unknown options instead of silently ignoring bind
+intent. `--host` overrides `KESTREL_SERVER_HOST`, while `--port` overrides the
+platform-standard `PORT`; the compatibility defaults remain `0.0.0.0:8888`.
+For normal fleet operation, `kestrel start` reads its bind and port from
+`multi_agent.toml` and does not accept these direct-server flags. See the
+[server launch contract](docs/architecture/core/SERVER_LAUNCH_CONTRACT.md) for
+the complete precedence and managed-container behavior.
 
 > **Keeping the host awake (long sessions / 24/7).** Kestrel does not manage
 > host power state itself — a long-running agent that must survive an idle
@@ -688,7 +694,7 @@ PY
 
 ```bash
 export KESTREL_DB_KEY="your-db-passphrase"
-uv run python -m kestrel_sovereign.server
+uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8888
 ```
 
 - Without `pysqlcipher3`, the system falls back to normal SQLite. File blobs and conversations still encrypt with `KESTREL_DATA_KEY` if set.

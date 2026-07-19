@@ -81,7 +81,9 @@ The demo agent is flagged as a test instance with proper disclosure so it knows 
 kestrel demo run technical
 ```
 
-The runner internally does `scripts/setup_demo_agent.py` + `KESTREL_DB_PATH=agent_data/demo uv run uvicorn kestrel_sovereign.server:app --port 8900` + the Playwright run, with a `finally`-trap to stop the server on exit.
+The runner internally creates the agent with `scripts/setup_demo_agent.py`,
+launches the same ASGI app on isolated loopback port `8900`, and runs
+Playwright, with a `finally`-trap to stop the server on exit.
 
 Output lands in `demos/technical/demo-output/` — video (.webm), 20 screenshots, and `narration.md`.
 
@@ -101,9 +103,9 @@ This walkthrough is backed by executable demo assets:
 ### Live (with presenter)
 
 1. Run `setup_demo_agent.py` to create a clean demo agent
-2. Start the server with `KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server`
+2. Start the server with `KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8900`
 3. Skip discovery and set model to Ollama (see step 3 above)
-4. Open `http://localhost:8888` in a browser
+4. Open `http://localhost:8900` in a browser
 5. Follow the Acts below — each section has the exact steps
 6. Pick your audience and use the matching talking points
 
@@ -340,7 +342,7 @@ Size: 89949 bytes
 
 | Problem | Recovery |
 |---------|----------|
-| Server not responding | `KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server` — wait 8 seconds |
+| Server not responding | `KESTREL_DB_PATH=agent_data/demo uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8900` — wait 8 seconds |
 | Agent returns 401 | Check API key: `grep KESTREL_API_KEY .env` |
 | `!status` returns LLM response instead of DID | Run `!bootstrap-status` — if in discovery state, run `!skip-discovery` first |
 | EPHEMERAL invoke returns 500 | Ollama not running. Start: `ollama serve`. If unavailable, skip invoke — explain: "EPHEMERAL forces all LLM calls to a local model — zero network traffic. The code path literally doesn't call cloud APIs." |
@@ -361,7 +363,7 @@ Size: 89949 bytes
 | `KESTREL_API_KEY` | auto-fetched from demo DB | API authentication |
 | `DEMO_SLOWMO` | `150` | Milliseconds between actions (Playwright) |
 | `KESTREL_DB_PATH` | `agent_data/demo` | Set by `kestrel demo run` for the isolated server |
-| `--port` | `8900` | Port for the isolated demo server (runner refuses `8888`) |
+| CLI `--port` option | `8900` | Port for the isolated demo server (runner refuses `8888`) |
 
 ---
 

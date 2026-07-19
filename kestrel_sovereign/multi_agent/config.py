@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_HOST_BIND = "0.0.0.0"
 DEFAULT_HOST_PORT = 8888
 DEFAULT_AGENT_START_PORT = 8801
 MULTI_AGENT_CONFIG_FILENAME = "multi_agent.toml"
@@ -53,7 +54,7 @@ class HostConfig(BaseModel):
         le=65535,
     )
     bind: str = Field(
-        default="0.0.0.0",
+        default=DEFAULT_HOST_BIND,
         description="Interface to bind to (0.0.0.0 for all interfaces)",
     )
 
