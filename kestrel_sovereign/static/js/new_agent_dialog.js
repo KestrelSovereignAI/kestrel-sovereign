@@ -75,7 +75,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
     let dialogHandle;
 
     const showError = (message) => {
-        const el = document.getElementById(ERROR_ID);
+        const el = dialogHandle?.querySelector(`#${ERROR_ID}`);
         if (el) {
             // textContent (not innerHTML) so a server-supplied detail string can
             // never inject markup into the dialog.
@@ -85,7 +85,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
     };
 
     const clearError = () => {
-        const el = document.getElementById(ERROR_ID);
+        const el = dialogHandle?.querySelector(`#${ERROR_ID}`);
         if (el) {
             el.textContent = '';
             el.style.display = 'none';
@@ -94,7 +94,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
 
     const submit = async () => {
         if (submitting) return;
-        const input = document.getElementById(INPUT_ID);
+        const input = dialogHandle?.querySelector(`#${INPUT_ID}`);
         const name = (input?.value || '').trim();
         if (!name) {
             showError('Agent name is required.');
@@ -110,27 +110,52 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         // may reuse the same DOM ids, so element identity is not an ownership
         // primitive; the shared Modal handle is.
         const requestOwner = dialogHandle;
+        let created = false;
         try {
             const result = await api.createAgent(name);
+            created = true;
             // Success: close the dialog first, then let the host refresh the list
             // and select the freshly-minted agent. The refresh/select still runs
             // even if the user dismissed the dialog mid-flight — the agent WAS
             // created; only the lifecycle close must be scoped.
-            requestOwner.close();
+            const completionErrors = [];
+            try {
+                requestOwner.close();
+            } catch (error) {
+                completionErrors.push(error);
+            }
             // Partial failure (codex P2): HTTP 200 with persisted:false means
             // the agent EXISTS but its registration didn't reach
             // multi_agent.toml — it will vanish from the fleet on the next
-            // restart. That must never masquerade as full success.
-            if (result && result.persisted === false && toast && typeof toast.warning === 'function') {
-                toast.warning(
-                    `Agent "${name}" was created but could NOT be saved to the server's `
-                    + 'multi_agent config — it will disappear on the next restart. '
-                    + 'Check the server logs.',
-                    12000,
-                );
+            // restart. That must never masquerade as full success. Each
+            // completion stage is isolated so a UI callback failure cannot
+            // skip host reconciliation for an agent that already exists.
+            try {
+                if (result && result.persisted === false && toast && typeof toast.warning === 'function') {
+                    toast.warning(
+                        `Agent "${name}" was created but could NOT be saved to the server's `
+                        + 'multi_agent config — it will disappear on the next restart. '
+                        + 'Check the server logs.',
+                        12000,
+                    );
+                }
+            } catch (error) {
+                completionErrors.push(error);
             }
-            if (onCreated) await onCreated(name);
+            try {
+                if (onCreated) await onCreated(name);
+            } catch (error) {
+                completionErrors.push(error);
+            }
+            if (completionErrors.length === 1) throw completionErrors[0];
+            if (completionErrors.length > 1) {
+                throw new AggregateError(completionErrors, 'Create-agent completion failed');
+            }
         } catch (err) {
+            // Once creation succeeds, close/focus or host-refresh failures are
+            // not validation failures and must not be painted into a stale
+            // dialog. Let Modal's async action boundary report them instead.
+            if (created) throw err;
             // Surface the 409/400 (or any) failure inline — never a toast, so the
             // user can correct the name in place without losing the dialog. But
             // only into the SAME dialog instance that submitted.
@@ -146,7 +171,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         content,
         buttons: [
             { label: 'Cancel', type: 'secondary', onClick: () => dialogHandle.close() },
-            { label: 'Create', type: 'primary', onClick: () => { submit(); } },
+            { label: 'Create', type: 'primary', onClick: () => submit() },
         ],
     });
 
@@ -154,23 +179,27 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
     // Deferred so it runs after Modal.show has appended the content.
     setTimeout(() => {
         if (!dialogHandle.isCurrent()) return;
-        const input = document.getElementById(INPUT_ID);
+        const input = dialogHandle.querySelector(`#${INPUT_ID}`);
         if (input) {
             input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
+                if (e.key === 'Enter' && !e.isComposing) {
                     e.preventDefault();
                     e.stopPropagation();
-                    submit();
+                    if (!dialogHandle.isCurrent()) return;
+                    dialogHandle.querySelector('.modal-btn-primary')?.click();
                 }
             });
             input.addEventListener('input', clearError);
         }
-        const link = document.getElementById(SPAWN_LINK_ID);
+        const link = dialogHandle.querySelector(`#${SPAWN_LINK_ID}`);
         if (link) {
             link.addEventListener('click', (e) => {
                 e.preventDefault();
-                dialogHandle.close();
-                if (onSpawn) onSpawn();
+                try {
+                    dialogHandle.close();
+                } finally {
+                    if (onSpawn) onSpawn();
+                }
             });
         }
     }, 0);

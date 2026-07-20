@@ -211,7 +211,7 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
                 label: action.label,
                 type: 'danger',
                 onClick: () => {
-                    const input = document.getElementById(inputId);
+                    const input = confirmModal.querySelector(`#${inputId}`);
                     const value = input ? input.value : '';
                     if (value !== required) {
                         // Guard: the button can be clicked before it is armed;
@@ -219,8 +219,11 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
                         if (input) input.style.borderColor = 'var(--error)';
                         return;
                     }
-                    confirmModal.close();
-                    _runDelete({ action, displayName, Toast });
+                    try {
+                        confirmModal.close();
+                    } finally {
+                        _runDelete({ action, displayName, Toast });
+                    }
                 },
             },
         ],
@@ -230,8 +233,8 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
     // prompt() wiring in ui.js — the modal is already in the DOM by now).
     setTimeout(() => {
         if (!confirmModal.isCurrent()) return;
-        const input = document.getElementById(inputId);
-        const dangerBtn = document.querySelector('#modal-overlay .modal-btn-danger');
+        const input = confirmModal.querySelector(`#${inputId}`);
+        const dangerBtn = confirmModal.querySelector('.modal-btn-danger');
         if (!input || !dangerBtn) return;
         const sync = () => {
             const armed = input.value === required;
@@ -243,11 +246,14 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
         sync();
         input.addEventListener('input', sync);
         input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && input.value === required) {
+            if (e.key === 'Enter' && !e.isComposing && input.value === required) {
                 e.preventDefault();
                 e.stopPropagation();
-                confirmModal.close();
-                _runDelete({ action, displayName, Toast });
+                try {
+                    confirmModal.close();
+                } finally {
+                    _runDelete({ action, displayName, Toast });
+                }
             }
         });
         input.focus();

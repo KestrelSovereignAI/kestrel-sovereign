@@ -429,21 +429,23 @@ function showExportModal() {
         buttons: [
             { label: 'Cancel', type: 'secondary', onClick: () => exportModal.close() },
             { label: 'Export', type: 'primary', onClick: async () => {
-                const tierInput = document.querySelector('input[name="export-tier"]:checked');
-                const encryptInput = document.getElementById('export-encrypt');
+                const tierInput = exportModal.querySelector('input[name="export-tier"]:checked');
+                const encryptInput = exportModal.querySelector('#export-encrypt');
 
                 const tier = tierInput?.value || 'IPFS';
                 const encrypt = encryptInput?.checked ?? true;
 
-                exportModal.close();
-
                 try {
-                    Toast.info('Starting export...');
-                    const result = await API.exportSovereignty(tier, encrypt);
-                    Toast.success(result.message || 'Export completed successfully!');
-                    loadExports();
-                } catch (e) {
-                    Toast.error(`Export failed: ${e.message}`);
+                    exportModal.close();
+                } finally {
+                    try {
+                        Toast.info('Starting export...');
+                        const result = await API.exportSovereignty(tier, encrypt);
+                        Toast.success(result.message || 'Export completed successfully!');
+                        loadExports();
+                    } catch (e) {
+                        Toast.error(`Export failed: ${e.message}`);
+                    }
                 }
             }}
         ]
@@ -513,7 +515,7 @@ function showImportModal() {
         buttons: [
             { label: 'Cancel', type: 'secondary', onClick: () => importModal.close() },
             { label: 'Import', type: 'primary', onClick: async () => {
-                const cidInput = document.getElementById('import-cid-input');
+                const cidInput = importModal.querySelector('#import-cid-input');
                 const cid = cidInput?.value?.trim();
 
                 if (!cid) {
@@ -526,15 +528,17 @@ function showImportModal() {
                     return;
                 }
 
-                importModal.close();
-
                 try {
-                    Toast.info('Starting import...');
-                    const result = await API.importSovereignty(cid);
-                    Toast.success(result.message || 'Import completed successfully!');
-                    loadExports();
-                } catch (e) {
-                    Toast.error(`Import failed: ${e.message}`);
+                    importModal.close();
+                } finally {
+                    try {
+                        Toast.info('Starting import...');
+                        const result = await API.importSovereignty(cid);
+                        Toast.success(result.message || 'Import completed successfully!');
+                        loadExports();
+                    } catch (e) {
+                        Toast.error(`Import failed: ${e.message}`);
+                    }
                 }
             }}
         ]
@@ -542,8 +546,8 @@ function showImportModal() {
 
     setTimeout(() => {
         if (!importModal.isCurrent()) return;
-        const pasteBtn = document.getElementById('paste-cid-btn');
-        const cidInput = document.getElementById('import-cid-input');
+        const pasteBtn = importModal.querySelector('#paste-cid-btn');
+        const cidInput = importModal.querySelector('#import-cid-input');
 
         if (pasteBtn && cidInput) {
             pasteBtn.addEventListener('click', async () => {
@@ -560,11 +564,11 @@ function showImportModal() {
             });
 
             cidInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
+                if (e.key === 'Enter' && !e.isComposing) {
                     e.preventDefault();
                     e.stopPropagation();
                     if (!importModal.isCurrent()) return;
-                    document.querySelector('.modal-btn-primary')?.click();
+                    importModal.querySelector('.modal-btn-primary')?.click();
                 }
             });
         }

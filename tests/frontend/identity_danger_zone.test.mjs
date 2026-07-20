@@ -36,6 +36,10 @@ globalThis.window.SharedMarkdown = {
 
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 const API = apiModule.default;
+const { Modal, setOverlayRoot } = await import('../../kestrel_sovereign/static/js/ui.js');
+const { renderIdentityDangerZone } = await import(
+    '../../kestrel_sovereign/static/js/identity-danger-zone.js'
+);
 
 const { loadIdentity } = await import('../../kestrel_sovereign/static/js/identity.js');
 
@@ -127,6 +131,127 @@ test('loadIdentity() renders a host-injected delete handler even without native 
     assert.equal(hostCalled, 'Companion', 'host handler fires with the identity payload');
 
     delete globalThis.KESTREL_UI_CONFIG;
+});
+
+test('IME composition Enter never confirms a danger-zone deletion', async () => {
+    resetPanel();
+    API.getIdentity = async () => ({ name: 'Emma', did: 'did:pkh:emma' });
+    API.hasCapability = () => true;
+    const prevGetHostAgent = API.getHostAgent;
+    API.getHostAgent = () => 'Emma';
+    let deletes = 0;
+    API.deleteAgent = async () => { deletes += 1; return { success: true }; };
+    delete globalThis.KESTREL_UI_CONFIG;
+
+    try {
+        await loadIdentity();
+        document.getElementById('danger-zone-delete-btn').click();
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        const input = document.getElementById('danger-zone-confirm-input');
+        input.value = 'Emma';
+
+        input.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+            key: 'Enter',
+            isComposing: true,
+            bubbles: true,
+            cancelable: true,
+        }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(deletes, 0);
+        assert.ok(document.getElementById('modal-overlay'));
+
+        input.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+            key: 'Enter',
+            bubbles: true,
+            cancelable: true,
+        }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(deletes, 1);
+    } finally {
+        API.getHostAgent = prevGetHostAgent;
+    }
+});
+
+test('a confirmed deletion still starts when modal focus restoration fails', async () => {
+    resetPanel();
+    API.getIdentity = async () => ({ name: 'Emma', did: 'did:pkh:emma' });
+    API.hasCapability = () => true;
+    const prevGetHostAgent = API.getHostAgent;
+    API.getHostAgent = () => 'Emma';
+    let deletes = 0;
+    API.deleteAgent = async () => { deletes += 1; return { success: true }; };
+    delete globalThis.KESTREL_UI_CONFIG;
+
+    try {
+        await loadIdentity();
+        const opener = document.getElementById('danger-zone-delete-btn');
+        opener.focus();
+        opener.click();
+        const input = document.getElementById('danger-zone-confirm-input');
+        input.value = 'Emma';
+        opener.focus = () => { throw new Error('opener focus failed'); };
+
+        const reportedError = new Promise((resolve) => {
+            window.addEventListener('error', (event) => {
+                event.preventDefault();
+                resolve(event.error);
+            }, { once: true });
+        });
+        document.querySelector('#modal-overlay .modal-btn-danger').click();
+
+        assert.match((await reportedError).message, /opener focus failed/);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(deletes, 1, 'the confirmed irreversible action is not lost after teardown');
+        assert.equal(document.getElementById('modal-overlay'), null);
+    } finally {
+        Modal.hide();
+        API.getHostAgent = prevGetHostAgent;
+    }
+});
+
+test('closed-shadow danger-zone confirmation queries and arms its own lifecycle', async () => {
+    Modal.hide();
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const container = document.createElement('div');
+    const mount = document.createElement('div');
+    shadow.append(container, mount);
+    document.body.appendChild(host);
+    let deletes = 0;
+    setOverlayRoot(mount);
+    try {
+        renderIdentityDangerZone({
+            container,
+            identity: { name: 'Emma' },
+            api: {},
+            Modal,
+            Toast: {},
+            config: {
+                dangerZone: {
+                    delete: { handler: async () => { deletes += 1; } },
+                },
+            },
+        });
+        container.querySelector('#danger-zone-delete-btn').click();
+        await new Promise((resolve) => setTimeout(resolve, 60));
+
+        const input = mount.querySelector('#danger-zone-confirm-input');
+        const danger = mount.querySelector('.modal-btn-danger');
+        assert.ok(input && danger);
+        assert.equal(document.getElementById('danger-zone-confirm-input'), null);
+        input.value = 'Emma';
+        input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+        assert.equal(danger.disabled, false);
+        danger.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        assert.equal(deletes, 1);
+        assert.equal(mount.querySelector('.modal-overlay'), null);
+    } finally {
+        Modal.hide();
+        setOverlayRoot(null);
+        host.remove();
+    }
 });
 
 test('native delete targets the manager routing key, not the editable display name (#2208 codex P2)', async () => {

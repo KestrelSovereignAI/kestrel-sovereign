@@ -3419,8 +3419,11 @@ window.openContextBreakdownPopup = async function () {
                     label: 'Save older turns into a durable note (!compact)',
                     type: 'primary',
                     onClick: () => {
-                        breakdownModal.close();
-                        window.compactContext();
+                        try {
+                            breakdownModal.close();
+                        } finally {
+                            window.compactContext();
+                        }
                     },
                 }]
                 : []),

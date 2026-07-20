@@ -198,7 +198,10 @@ test('show returns a lifecycle-bound ownership handle', () => {
 
     assert.ok(replacement, 'a current owner may replace its lifecycle');
     assert.equal(first.isCurrent(), false);
+    assert.equal(first.querySelector('.modal-container'), null,
+        'a stale owner cannot query the replacement lifecycle');
     assert.equal(replacement.isCurrent(), true);
+    assert.equal(replacement.querySelector('.modal-body')?.textContent.trim(), 'replacement');
     assert.equal(first.close(), false, 'a stale owner cannot close the replacement');
     assert.equal(first.replace({ title: 'Stale', content: '' }), null,
         'a stale owner cannot replace the active lifecycle');
@@ -445,6 +448,34 @@ test('positive tabindex controls determine the real focus-trap order', () => {
     assert.equal(document.activeElement, document.querySelector('.modal-close-btn'));
 });
 
+test('a radio group contributes only its checked control to the focus-trap boundary', () => {
+    openModal({
+        content: `
+            <input id="radio-checked" type="radio" name="choice" checked>
+            <input id="radio-unchecked" type="radio" name="choice">
+        `,
+    });
+
+    const checked = document.getElementById('radio-checked');
+    const close = document.querySelector('.modal-close-btn');
+    assert.equal(document.activeElement, checked, 'initial focus uses the radio group tab stop');
+
+    keydown('Tab');
+    assert.equal(document.activeElement, close,
+        'Tab wraps from the checked radio instead of escaping past an unchecked radio');
+});
+
+test('an explicit programmatic autofocus target may use tabindex -1', () => {
+    openModal({
+        content: `
+            <h4 id="autofocus-heading" tabindex="-1" autofocus>Dialog context</h4>
+            <button id="later-action">Continue</button>
+        `,
+    });
+
+    assert.equal(document.activeElement, document.getElementById('autofocus-heading'));
+});
+
 test('initial focus skips controls in hidden and inert ancestor subtrees', () => {
     openModal({
         content: `
@@ -455,6 +486,174 @@ test('initial focus skips controls in hidden and inert ancestor subtrees', () =>
     });
 
     assert.equal(document.activeElement.id, 'visible-control');
+});
+
+test('shadow-mounted dialogs keep internal focus and restore the deep opener', () => {
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const opener = document.createElement('button');
+    const mount = document.createElement('div');
+    shadow.append(opener, mount);
+    document.body.appendChild(host);
+    opener.focus();
+    assert.equal(shadow.activeElement, opener);
+
+    setOverlayRoot(mount);
+    try {
+        const handle = Modal.show({
+            title: 'Shadow dialog',
+            content: '<input id="shadow-first"><input id="shadow-second">',
+        });
+        const first = mount.querySelector('#shadow-first');
+        const second = mount.querySelector('#shadow-second');
+        assert.equal(shadow.activeElement, first);
+
+        second.focus();
+        assert.equal(shadow.activeElement, second,
+            'document focus guards recognize retargeted focus from inside the dialog');
+
+        handle.close();
+        assert.equal(shadow.activeElement, opener,
+            'close restores the actual shadow descendant that opened the dialog');
+    } finally {
+        setOverlayRoot(null);
+    }
+});
+
+test('shadow-mounted dialogs restore a light-DOM opener outside the overlay root', () => {
+    const opener = document.createElement('button');
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    const mount = document.createElement('div');
+    shadow.appendChild(mount);
+    document.body.append(opener, host);
+    opener.focus();
+    assert.equal(shadow.activeElement, null,
+        'the overlay root has no active element before the dialog opens');
+    assert.equal(document.activeElement, opener);
+
+    setOverlayRoot(mount);
+    try {
+        const handle = Modal.show({
+            title: 'Shadow dialog from light DOM',
+            content: '<input id="shadow-light-opener-input">',
+        });
+        assert.equal(shadow.activeElement, mount.querySelector('#shadow-light-opener-input'));
+
+        handle.close();
+        assert.equal(document.activeElement, opener,
+            'close falls back to the document opener when the overlay root had none');
+    } finally {
+        setOverlayRoot(null);
+    }
+});
+
+test('closed-shadow dialogs own keyboard focus and restore their inner opener', () => {
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const opener = document.createElement('button');
+    const mount = document.createElement('div');
+    shadow.append(opener, mount);
+    document.body.appendChild(host);
+    opener.focus();
+    assert.equal(host.shadowRoot, null, 'the test exercises closed-root retargeting');
+    assert.equal(shadow.activeElement, opener);
+
+    setOverlayRoot(mount);
+    try {
+        const handle = Modal.show({
+            title: 'Closed shadow dialog',
+            content: '<input id="closed-first"><input id="closed-second">',
+        });
+        const first = handle.querySelector('#closed-first');
+        const second = handle.querySelector('#closed-second');
+        const close = handle.querySelector('.modal-close-btn');
+        assert.equal(shadow.activeElement, first);
+
+        second.focus();
+        assert.equal(shadow.activeElement, second,
+            'focusin ownership is derived from the closed root, not document.activeElement');
+        second.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+            key: 'x',
+            bubbles: true,
+            composed: true,
+            cancelable: true,
+        }));
+        assert.equal(shadow.activeElement, second,
+            'a retargeted ordinary key does not reset focus to the first control');
+
+        second.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+            key: 'Tab',
+            bubbles: true,
+            composed: true,
+            cancelable: true,
+        }));
+        assert.equal(shadow.activeElement, close,
+            'Tab wraps using activeElement from the retained closed root');
+
+        close.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+            key: 'Escape',
+            bubbles: true,
+            composed: true,
+            cancelable: true,
+        }));
+        assert.equal(handle.isCurrent(), false);
+        assert.equal(shadow.activeElement, opener,
+            'close restores the true inner opener instead of the closed-root host');
+    } finally {
+        setOverlayRoot(null);
+    }
+});
+
+test('Modal.prompt reads its value through the handle inside a closed shadow root', async () => {
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const mount = document.createElement('div');
+    shadow.appendChild(mount);
+    document.body.appendChild(host);
+    setOverlayRoot(mount);
+    try {
+        const result = Modal.prompt('Shadow prompt');
+        const input = mount.querySelector('.modal-body input');
+        input.value = 'inside shadow';
+        [...mount.querySelectorAll('.modal-btn')]
+            .find((button) => button.textContent === 'OK').click();
+
+        assert.equal(await result, 'inside shadow');
+        assert.equal(mount.querySelector('.modal-overlay'), null);
+    } finally {
+        setOverlayRoot(null);
+    }
+});
+
+test('a rejected async onClose is reported once after synchronous teardown', async () => {
+    const originalReportError = window.reportError;
+    const reported = [];
+    window.reportError = (error) => reported.push(error);
+    try {
+        openModal({
+            onClose: async () => {
+                throw new Error('async close failed');
+            },
+        });
+
+        Modal.hide();
+        assert.equal(document.querySelector('.modal-overlay'), null);
+        assert.equal(listenerCount(), 0);
+        await Promise.resolve();
+        await Promise.resolve();
+
+        assert.equal(reported.length, 1);
+        assert.match(reported[0].message, /async close failed/);
+        Modal.hide();
+        assert.equal(reported.length, 1, 'idempotent close never observes onClose twice');
+    } finally {
+        if (originalReportError === undefined) {
+            delete window.reportError;
+        } else {
+            window.reportError = originalReportError;
+        }
+    }
 });
 
 test('modal keyboard events do not trigger background document shortcuts', () => {
@@ -474,6 +673,38 @@ test('modal keyboard events do not trigger background document shortcuts', () =>
         keydown('Escape');
         assert.equal(backgroundEscapes, 0);
         assert.equal(document.querySelector('.modal-overlay'), null);
+    } finally {
+        document.removeEventListener('keydown', backgroundHandler);
+    }
+});
+
+test('IME composition Escape stays inside the modal without closing it', () => {
+    let backgroundEscapes = 0;
+    const backgroundHandler = (event) => {
+        if (event.key === 'Escape') backgroundEscapes += 1;
+    };
+    document.addEventListener('keydown', backgroundHandler);
+    try {
+        openModal({ content: '<input id="composing-input">' });
+        const input = document.getElementById('composing-input');
+        const compositionEscape = new dom.window.KeyboardEvent('keydown', {
+            key: 'Escape',
+            isComposing: true,
+            bubbles: true,
+            cancelable: true,
+        });
+
+        assert.equal(input.dispatchEvent(compositionEscape), true,
+            'the input retains the Escape default needed to cancel composition');
+        assert.ok(document.querySelector('.modal-overlay'),
+            'composition cancellation leaves the dialog open');
+        assert.equal(backgroundEscapes, 0,
+            'composition Escape remains isolated from background shortcuts');
+
+        keydown('Escape');
+        assert.equal(document.querySelector('.modal-overlay'), null,
+            'a subsequent non-composing Escape still closes the dialog');
+        assert.equal(backgroundEscapes, 0);
     } finally {
         document.removeEventListener('keydown', backgroundHandler);
     }

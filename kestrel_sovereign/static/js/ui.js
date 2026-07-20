@@ -332,7 +332,9 @@ const MODAL_FOCUSABLE_SELECTOR = [
     'input:not([disabled]):not([type="hidden"])',
     'select:not([disabled])',
     'textarea:not([disabled])',
-    '[contenteditable="true"]',
+    'details > summary:first-of-type',
+    'iframe',
+    '[contenteditable]:not([contenteditable="false"])',
     '[tabindex]:not([tabindex="-1"])',
 ].join(', ');
 
@@ -363,13 +365,42 @@ function modalElementIsHidden(element, modal) {
 }
 
 function modalFocusableElements(modal) {
-    return Array.from(modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR))
-        .map((element, domIndex) => ({ element, domIndex }))
+    // Derive DOM order independently from the selector-list result. Browsers
+    // return selector-list matches in tree order, but jsdom has regressed this
+    // for mixed combinator/simple selector lists; the trap must not depend on
+    // selector-engine grouping to identify its first and last controls.
+    const domOrder = new Map(
+        Array.from(modal.querySelectorAll('*')).map((element, index) => [element, index]),
+    );
+    const candidates = Array.from(modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR))
+        .map((element) => ({ element, domIndex: domOrder.get(element) }))
         .filter(({ element }) => {
             return element.tabIndex >= 0
                 && !element.matches(':disabled')
                 && !modalElementIsHidden(element, modal);
-        })
+        });
+
+    // A named radio group contributes one sequential tab stop: its checked
+    // control, or the first available control when none is checked. Counting
+    // every radio can make the focus trap believe a non-tabbable radio is its
+    // final boundary and allow Tab to escape into the page behind the dialog.
+    const tabbable = candidates.filter(({ element }) => {
+        if (!(element instanceof window.HTMLInputElement)
+            || element.type !== 'radio'
+            || !element.name) {
+            return true;
+        }
+        const group = candidates
+            .map((candidate) => candidate.element)
+            .filter((candidate) => candidate instanceof window.HTMLInputElement
+                && candidate.type === 'radio'
+                && candidate.name === element.name
+                && candidate.form === element.form
+                && candidate.getRootNode() === element.getRootNode());
+        return element === (group.find((candidate) => candidate.checked) || group[0]);
+    });
+
+    return tabbable
         .sort((left, right) => {
             const leftTabIndex = left.element.tabIndex;
             const rightTabIndex = right.element.tabIndex;
@@ -381,6 +412,33 @@ function modalFocusableElements(modal) {
             return left.domIndex - right.domIndex;
         })
         .map(({ element }) => element);
+}
+
+function deepActiveElement(root = document) {
+    let active = root?.activeElement || null;
+    while (active?.shadowRoot?.activeElement) {
+        active = active.shadowRoot.activeElement;
+    }
+    return active;
+}
+
+function modalEventIsInside(event, modal) {
+    const eventPath = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    return eventPath.includes(modal) || modal.contains(event.target);
+}
+
+function eventOriginatesFromRoot(event, root) {
+    if (!root || root === document) return false;
+    const eventPath = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    if (eventPath.includes(root)) return true;
+
+    // A closed ShadowRoot is deliberately omitted from composedPath() outside
+    // that tree. Its host remains visible, and activeElement on the retained
+    // root tells us whether the host is a retargeted inner event or the actual
+    // external target. The root's own capture guard will handle the former.
+    return Boolean(root.host
+        && eventPath.includes(root.host)
+        && root.activeElement);
 }
 
 function addModalListener(lifecycle, target, type, listener, options) {
@@ -406,10 +464,21 @@ function reportModalActionError(error) {
     }, 0);
 }
 
+function invokeModalCloseCallback(callback) {
+    const result = callback();
+    if (result && typeof result.then === 'function') {
+        Promise.resolve(result).catch(reportModalActionError);
+    }
+}
+
 function createModalHandle(controller, lifecycle) {
     return Object.freeze({
         isCurrent() {
             return controller._lifecycle === lifecycle && !lifecycle.closed;
+        },
+        querySelector(selector) {
+            if (controller._lifecycle !== lifecycle || lifecycle.closed) return null;
+            return lifecycle.modal.querySelector(selector);
         },
         close() {
             if (controller._lifecycle !== lifecycle || lifecycle.closed) return false;
@@ -426,6 +495,7 @@ function createModalHandle(controller, lifecycle) {
 function createInactiveModalHandle() {
     return Object.freeze({
         isCurrent: () => false,
+        querySelector: () => null,
         close: () => false,
         replace: () => null,
     });
@@ -438,7 +508,9 @@ function createInactiveModalHandle() {
 // their result before hide(), while Promise observers run after teardown. A
 // throwing or rejecting action is the exceptional case: its lifecycle is torn
 // down before the original error is reported, so broken caller code cannot
-// strand the dialog or its global focus listener.
+// strand the dialog or its root/document focus guards. Handles also scope DOM
+// queries to their own live modal, so shadow mounts and replacements cannot be
+// confused through global selectors.
 export const Modal = {
     _currentModal: null,
     _lifecycle: null,
@@ -454,13 +526,15 @@ export const Modal = {
         // unmounted request is still cancelled through its close callback so
         // confirm(), prompt(), and approval promises cannot remain pending.
         if (showSequence !== this._showSequence) {
-            if (typeof options?.onClose === 'function') options.onClose();
+            if (typeof options?.onClose === 'function') invokeModalCloseCallback(options.onClose);
             return createInactiveModalHandle();
         }
 
         const { title, content, buttons = [], onClose } = options;
         const titleId = `modal-title-${++modalId}`;
-        const opener = document.activeElement;
+        const overlayRoot = getOverlayRoot();
+        const opener = deepActiveElement(overlayRoot.getRootNode())
+            || deepActiveElement(document);
 
         const overlay = document.createElement('div');
         overlay.id = 'modal-overlay';
@@ -555,6 +629,7 @@ export const Modal = {
         const lifecycle = {
             overlay,
             modal,
+            root: null,
             opener,
             onClose,
             removeListeners: [],
@@ -573,6 +648,7 @@ export const Modal = {
             e.stopPropagation();
 
             if (e.key === 'Escape') {
+                if (e.isComposing) return;
                 if (e.defaultPrevented) return;
                 e.preventDefault();
                 this._close(lifecycle);
@@ -591,7 +667,7 @@ export const Modal = {
 
             const first = focusable[0];
             const last = focusable[focusable.length - 1];
-            const active = document.activeElement;
+            const active = deepActiveElement(lifecycle.root);
 
             if (!focusable.includes(active)) {
                 e.preventDefault();
@@ -604,11 +680,9 @@ export const Modal = {
                 first.focus();
             }
         };
-        const documentKeydownHandler = (e) => {
+        const rootKeydownHandler = (e) => {
             if (this._lifecycle !== lifecycle || lifecycle.closed) return;
-
-            const eventPath = typeof e.composedPath === 'function' ? e.composedPath() : [];
-            if (eventPath.includes(modal) || modal.contains(e.target)) return;
+            if (modalEventIsInside(e, modal)) return;
 
             // Removing or disabling the focused control can move focus to the
             // document body without firing focusin. Contain that orphaned key
@@ -623,10 +697,15 @@ export const Modal = {
             target.focus();
             lifecycle.lastFocused = target;
         };
-        const focusinHandler = (e) => {
+        const rootFocusinHandler = (e) => {
             if (this._lifecycle !== lifecycle || lifecycle.closed || lifecycle.redirectingFocus) return;
-            if (modal.contains(e.target)) {
-                lifecycle.lastFocused = e.target;
+            const eventPath = typeof e.composedPath === 'function' ? e.composedPath() : [];
+            if (modalEventIsInside(e, modal)) {
+                const active = deepActiveElement(lifecycle.root);
+                lifecycle.lastFocused = modal.contains(active)
+                    ? active
+                    : (eventPath.find((target) => target?.nodeType === Node.ELEMENT_NODE
+                        && modal.contains(target)) || e.target);
                 return;
             }
 
@@ -640,6 +719,14 @@ export const Modal = {
             } finally {
                 lifecycle.redirectingFocus = false;
             }
+        };
+        const documentKeydownHandler = (e) => {
+            if (eventOriginatesFromRoot(e, lifecycle.root)) return;
+            rootKeydownHandler(e);
+        };
+        const documentFocusinHandler = (e) => {
+            if (eventOriginatesFromRoot(e, lifecycle.root)) return;
+            rootFocusinHandler(e);
         };
 
         try {
@@ -700,23 +787,41 @@ export const Modal = {
             addModalListener(lifecycle, overlay, 'keydown', keydownHandler);
 
             overlay.appendChild(modal);
-            getOverlayRoot().appendChild(overlay);
+            overlayRoot.appendChild(overlay);
+            lifecycle.root = modal.getRootNode();
             this._currentModal = overlay;
             this._lifecycle = lifecycle;
-            addModalListener(lifecycle, document, 'keydown', documentKeydownHandler, true);
-            addModalListener(lifecycle, document, 'focusin', focusinHandler, true);
+            addModalListener(lifecycle, lifecycle.root, 'keydown', rootKeydownHandler, true);
+            addModalListener(lifecycle, lifecycle.root, 'focusin', rootFocusinHandler, true);
+            if (lifecycle.root !== document) {
+                addModalListener(lifecycle, document, 'keydown', documentKeydownHandler, true);
+                addModalListener(lifecycle, document, 'focusin', documentFocusinHandler, true);
+            }
 
             // Prefer an explicitly-autofocused/content control, then an action,
             // with the always-present close button as the final fallback.
             const focusable = modalFocusableElements(modal);
             const modalBody = modal.querySelector('.modal-body');
-            const initialFocus = focusable.find((element) => element.hasAttribute('autofocus'))
+            const autofocus = Array.from(modal.querySelectorAll('[autofocus]'))
+                .find((element) => !element.matches(':disabled')
+                    && !modalElementIsHidden(element, modal));
+            const fallbackFocus = focusable.find((element) => modalBody?.contains(element))
+                || focusable.find((element) => element.classList.contains('modal-btn'))
+                || focusable.find((element) => element.classList.contains('modal-close-btn'))
+                || modal;
+            let initialFocus = autofocus
                 || focusable.find((element) => modalBody?.contains(element))
                 || focusable.find((element) => element.classList.contains('modal-btn'))
                 || focusable.find((element) => element.classList.contains('modal-close-btn'))
                 || modal;
             initialFocus.focus();
-            lifecycle.lastFocused = initialFocus;
+            if (!modal.contains(deepActiveElement(lifecycle.root)) && initialFocus !== fallbackFocus) {
+                initialFocus = fallbackFocus;
+                initialFocus.focus();
+            }
+            lifecycle.lastFocused = modal.contains(deepActiveElement(lifecycle.root))
+                ? deepActiveElement(lifecycle.root)
+                : initialFocus;
         } catch (error) {
             lifecycle.onClose = null;
             try {
@@ -777,7 +882,7 @@ export const Modal = {
         if (!lifecycle.onCloseInvoked && typeof lifecycle.onClose === 'function') {
             lifecycle.onCloseInvoked = true;
             try {
-                lifecycle.onClose();
+                invokeModalCloseCallback(lifecycle.onClose);
             } catch (error) {
                 errors.push(error);
             }
@@ -831,7 +936,7 @@ export const Modal = {
                 buttons: [
                     { label: 'Cancel', type: 'secondary', onClick: () => { resolve(null); handle.close(); } },
                     { label: 'OK', type: 'primary', onClick: () => {
-                        const value = document.getElementById(inputId)?.value || '';
+                        const value = handle.querySelector(`#${inputId}`)?.value || '';
                         resolve(value);
                         handle.close();
                     }}
@@ -840,7 +945,7 @@ export const Modal = {
             });
 
             const lifecycle = handle.isCurrent() ? this._lifecycle : null;
-            const input = lifecycle?.modal.querySelector(`#${inputId}`);
+            const input = handle.querySelector(`#${inputId}`);
             if (input && !lifecycle.closed) {
                 addModalListener(lifecycle, input, 'keydown', (e) => {
                     if (e.key === 'Enter' && !e.isComposing) {

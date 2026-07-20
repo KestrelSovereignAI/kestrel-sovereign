@@ -525,31 +525,41 @@ function renderDetailModal(detail, owner) {
         buttons.push({
             label: 'Disable',
             type: 'secondary',
-            onClick: () => { detailModal.close(); disableFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { disableFeature(name); }
+            }
         });
         buttons.push({
             label: 'Remove',
             type: 'danger',
-            onClick: () => { detailModal.close(); removeFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { removeFeature(name); }
+            }
         });
     } else if (status === 'disabled' || status === 'installed') {
         buttons.push({
             label: 'Enable',
             type: 'primary',
-            onClick: () => { detailModal.close(); enableFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { enableFeature(name); }
+            }
         });
         if (!isCore) {
             buttons.push({
                 label: 'Remove',
                 type: 'danger',
-                onClick: () => { detailModal.close(); removeFeature(name); }
+                onClick: () => {
+                    try { detailModal.close(); } finally { removeFeature(name); }
+                }
             });
         }
     } else if (status === 'available') {
         buttons.push({
             label: 'Install',
             type: 'primary',
-            onClick: () => { detailModal.close(); installFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { installFeature(name); }
+            }
         });
     }
     buttons.push({
@@ -715,7 +725,8 @@ async function runConfigAction(btn) {
         if (!ok) return;
     }
 
-    const resultEl = document.getElementById('feature-config-action-result');
+    const resultEl = btn.closest('.modal-container')
+        ?.querySelector('#feature-config-action-result');
     const setResult = (text, color) => {
         if (resultEl) {
             resultEl.textContent = text;
@@ -825,7 +836,7 @@ async function showConfigForm(name) {
 }
 
 async function saveConfig(name, properties, owner) {
-    const form = document.getElementById('feature-config-form');
+    const form = owner.querySelector('#feature-config-form');
     if (!form) return;
 
     const config = {};
