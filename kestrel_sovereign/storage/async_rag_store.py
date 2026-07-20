@@ -109,7 +109,12 @@ class AsyncRAGStore:
         owner_alias: str = "rag_chunk_owner",
     ) -> Tuple[str, Tuple[Any, ...]]:
         """Return chunk and file capability predicates for tenant reads."""
-        if not self.agent_id:
+        # Some narrowly-scoped callers construct a store with ``__new__`` to
+        # exercise retrieval without initializing an ownership capability.
+        # Preserve that legacy unbound behavior; ordinary construction always
+        # defines ``agent_id`` in ``__init__``.
+        agent_id = getattr(self, "agent_id", "")
+        if not agent_id:
             return "1 = 1", ()
         file_owner_alias = f"{owner_alias}_file"
         return (
@@ -119,7 +124,7 @@ class AsyncRAGStore:
             "AND EXISTS (SELECT 1 FROM file_owners AS "
             f"{file_owner_alias} WHERE {file_owner_alias}.content_hash = "
             f"{chunk_table}.file_hash AND {file_owner_alias}.agent_id = ?)",
-            (self.agent_id, self.agent_id),
+            (agent_id, agent_id),
         )
 
     def _get_embedding_service(self):
@@ -440,7 +445,12 @@ class AsyncRAGStore:
         # stores therefore use the scoped legacy path until the vector layer
         # can express a file_owners semi-join; filtering only after top-k could
         # both starve results and expose cross-tenant candidates.
-        sf = None if self.agent_id else self._get_vector_session_factory()
+        # ``__new__``-constructed legacy stores are unbound, just as a store
+        # constructed with the default empty ``agent_id`` is. They may use the
+        # generic vector backend; a bound store must stay on the ownership-
+        # scoped path.
+        agent_id = getattr(self, "agent_id", "")
+        sf = None if agent_id else self._get_vector_session_factory()
         if sf is not None:
             scored = await self._search_via_vector_backend(
                 sf, query_embedding, limit, min_score,
