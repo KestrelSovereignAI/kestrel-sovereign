@@ -325,13 +325,58 @@ export const Toast = {
 // Modal System
 // ============================================================================
 
+const MODAL_FOCUSABLE_SELECTOR = [
+    'a[href]',
+    'area[href]',
+    'button:not([disabled])',
+    'input:not([disabled]):not([type="hidden"])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[contenteditable="true"]',
+    '[tabindex]:not([tabindex="-1"])',
+].join(', ');
+
+let modalId = 0;
+
+function modalFocusableElements(modal) {
+    return Array.from(modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR)).filter((element) => {
+        const style = window.getComputedStyle(element);
+        return element.tabIndex >= 0
+            && !element.matches(':disabled')
+            && !element.hidden
+            && !element.closest('[hidden], [aria-hidden="true"]')
+            && style.display !== 'none'
+            && style.visibility !== 'hidden';
+    });
+}
+
+function addModalListener(lifecycle, target, type, listener) {
+    target.addEventListener(type, listener);
+    lifecycle.removeListeners.push(() => target.removeEventListener(type, listener));
+}
+
+// Close contract: X, overlay, Escape, direct hide(), and replacement all run
+// the same synchronous teardown. DOM/listeners are removed and opener focus is
+// restored before onClose runs, and onClose runs at most once. Action buttons
+// remain caller-controlled for compatibility; Modal.confirm()/prompt() record
+// their result before hide(), while Promise observers run after teardown.
 export const Modal = {
     _currentModal: null,
-    _resolvePromise: null,
+    _lifecycle: null,
+    _showSequence: 0,
 
     show(options) {
+        const showSequence = ++this._showSequence;
         this.hide();
+
+        // An onClose callback may synchronously open a different modal while
+        // the previous one is being replaced. The newest show() request wins;
+        // never append a second overlay from the superseded request.
+        if (showSequence !== this._showSequence) return;
+
         const { title, content, buttons = [], onClose } = options;
+        const titleId = `modal-title-${++modalId}`;
+        const opener = document.activeElement;
 
         const overlay = document.createElement('div');
         overlay.id = 'modal-overlay';
@@ -346,6 +391,10 @@ export const Modal = {
 
         const modal = document.createElement('div');
         modal.className = 'modal-container';
+        modal.tabIndex = -1;
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        modal.setAttribute('aria-labelledby', titleId);
         modal.style.cssText = `
             background: var(--bg-secondary);
             border: 1px solid var(--border-color);
@@ -368,8 +417,8 @@ export const Modal = {
                 justify-content: space-between;
                 align-items: center;
             ">
-                <h3 style="margin: 0; font-size: 1.125rem; font-weight: 600;">${title}</h3>
-                <button class="modal-close-btn" style="
+                <h3 id="${titleId}" style="margin: 0; font-size: 1.125rem; font-weight: 600;">${title || 'Dialog'}</h3>
+                <button type="button" class="modal-close-btn" aria-label="Close dialog" style="
                     background: none;
                     border: none;
                     font-size: 1.5rem;
@@ -399,7 +448,7 @@ export const Modal = {
                     flex: 0 0 auto;
                 ">
                     ${buttons.map((btn, i) => `
-                        <button class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}"${btn.disabled ? ' disabled' : ''}${btn.title ? ` title="${String(btn.title).replace(/"/g, '&quot;')}"` : ''} style="
+                        <button type="button" class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}"${btn.disabled ? ' disabled' : ''}${btn.title ? ` title="${String(btn.title).replace(/"/g, '&quot;')}"` : ''} style="
                             padding: 0.625rem 1.25rem;
                             border: none;
                             border-radius: 8px;
@@ -419,20 +468,28 @@ export const Modal = {
             ` : ''}
         `;
 
-        modal.querySelector('.modal-close-btn').addEventListener('click', () => {
-            this.hide();
-            if (onClose) onClose();
+        const lifecycle = {
+            overlay,
+            modal,
+            opener,
+            onClose,
+            removeListeners: [],
+            closed: false,
+            onCloseInvoked: false,
+        };
+
+        addModalListener(lifecycle, modal.querySelector('.modal-close-btn'), 'click', () => {
+            this._close(lifecycle);
         });
 
-        overlay.addEventListener('click', (e) => {
+        addModalListener(lifecycle, overlay, 'click', (e) => {
             if (e.target === overlay) {
-                this.hide();
-                if (onClose) onClose();
+                this._close(lifecycle);
             }
         });
 
         modal.querySelectorAll('.modal-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
+            addModalListener(lifecycle, btn, 'click', () => {
                 const index = parseInt(btn.dataset.btnIndex);
                 // Disabled buttons (e.g. a tier-gated approval scope, #2232) are
                 // rendered but inert — the user should SEE the option, not act
@@ -444,31 +501,92 @@ export const Modal = {
             });
         });
 
-        const escHandler = (e) => {
+        const keydownHandler = (e) => {
+            if (this._lifecycle !== lifecycle || lifecycle.closed) return;
+
             if (e.key === 'Escape') {
-                this.hide();
-                if (onClose) onClose();
-                document.removeEventListener('keydown', escHandler);
+                e.preventDefault();
+                this._close(lifecycle);
+                return;
+            }
+
+            if (e.key !== 'Tab') return;
+
+            const focusable = modalFocusableElements(modal);
+            if (focusable.length === 0) {
+                e.preventDefault();
+                modal.focus();
+                return;
+            }
+
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            const active = document.activeElement;
+
+            if (!modal.contains(active)) {
+                e.preventDefault();
+                (e.shiftKey ? last : first).focus();
+            } else if (e.shiftKey && active === first) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && active === last) {
+                e.preventDefault();
+                first.focus();
             }
         };
-        document.addEventListener('keydown', escHandler);
+        addModalListener(lifecycle, document, 'keydown', keydownHandler);
 
         overlay.appendChild(modal);
         getOverlayRoot().appendChild(overlay);
         this._currentModal = overlay;
+        this._lifecycle = lifecycle;
 
-        const firstInput = modal.querySelector('input, select, textarea');
-        if (firstInput) setTimeout(() => firstInput.focus(), 50);
+        // Prefer an explicitly-autofocused/content control, then an action,
+        // with the always-present close button as the final fallback.
+        const focusable = modalFocusableElements(modal);
+        const modalBody = modal.querySelector('.modal-body');
+        const initialFocus = focusable.find((element) => element.hasAttribute('autofocus'))
+            || focusable.find((element) => modalBody?.contains(element))
+            || focusable.find((element) => element.classList.contains('modal-btn'))
+            || focusable.find((element) => element.classList.contains('modal-close-btn'))
+            || modal;
+        initialFocus.focus();
     },
 
     hide() {
-        if (this._currentModal) {
-            this._currentModal.remove();
+        if (this._lifecycle) {
+            this._close(this._lifecycle);
+        }
+    },
+
+    _close(lifecycle) {
+        if (!lifecycle || lifecycle.closed) return;
+        lifecycle.closed = true;
+
+        for (const removeListener of lifecycle.removeListeners) {
+            removeListener();
+        }
+        lifecycle.removeListeners.length = 0;
+        lifecycle.overlay.remove();
+
+        if (this._lifecycle === lifecycle) {
+            this._lifecycle = null;
             this._currentModal = null;
         }
-        if (this._resolvePromise) {
-            this._resolvePromise(null);
-            this._resolvePromise = null;
+
+        // Teardown and focus restoration are complete before onClose runs.
+        // The callback is deliberately not caught: caller errors still fail
+        // visibly, but can no longer strand DOM or document listeners.
+        if (lifecycle.opener
+            && lifecycle.opener !== document.body
+            && lifecycle.opener.isConnected
+            && typeof lifecycle.opener.focus === 'function') {
+            lifecycle.opener.focus();
+        }
+
+        if (!lifecycle.onCloseInvoked && typeof lifecycle.onClose === 'function') {
+            lifecycle.onCloseInvoked = true;
+            lifecycle.onClose();
         }
     },
 
@@ -478,8 +596,8 @@ export const Modal = {
                 title,
                 content: `<p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">${message}</p>`,
                 buttons: [
-                    { label: 'Cancel', type: 'secondary', onClick: () => { this.hide(); resolve(false); } },
-                    { label: 'Confirm', type: 'primary', onClick: () => { this.hide(); resolve(true); } }
+                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(false); this.hide(); } },
+                    { label: 'Confirm', type: 'primary', onClick: () => { resolve(true); this.hide(); } }
                 ],
                 onClose: () => resolve(false)
             });
@@ -511,11 +629,11 @@ export const Modal = {
                     />
                 `,
                 buttons: [
-                    { label: 'Cancel', type: 'secondary', onClick: () => { this.hide(); resolve(null); } },
+                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(null); this.hide(); } },
                     { label: 'OK', type: 'primary', onClick: () => {
                         const value = document.getElementById(inputId)?.value || '';
-                        this.hide();
                         resolve(value);
+                        this.hide();
                     }}
                 ],
                 onClose: () => resolve(null)
@@ -526,8 +644,8 @@ export const Modal = {
                 if (input) {
                     input.addEventListener('keydown', (e) => {
                         if (e.key === 'Enter') {
-                            this.hide();
                             resolve(input.value);
+                            this.hide();
                         }
                     });
                 }

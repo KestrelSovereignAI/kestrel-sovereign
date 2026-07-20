@@ -139,12 +139,12 @@ export const Security = {
             const resolver = this._activeApprovalResolver;
             this._activeApprovalResolver = null;
             this._activeApprovalId = null;
+            resolver({ approved: false, scope: 'once', _withdrawn: true });
             try {
                 Modal.hide();
             } catch (err) {
                 // Modal may already be closing — non-fatal.
             }
-            resolver({ approved: false, scope: 'once', _withdrawn: true });
         }
 
         // Drop any queued-but-not-yet-shown entry.
@@ -311,30 +311,30 @@ export const Security = {
                         label: `${kicon('x-mark')} Deny`,
                         type: 'danger',
                         onClick: () => {
-                            Modal.hide();
                             wrappedResolve({ approved: false, scope: 'once' });
+                            Modal.hide();
                         }
                     },
                     {
                         label: 'This Time',
                         type: 'secondary',
                         onClick: () => {
-                            Modal.hide();
                             wrappedResolve({ approved: true, scope: 'once' });
+                            Modal.hide();
                         }
                     },
                     {
                         ...scopeButton('session', 'This Session', 'primary'),
                         onClick: () => {
-                            Modal.hide();
                             wrappedResolve({ approved: true, scope: 'session' });
+                            Modal.hide();
                         }
                     },
                     {
                         ...scopeButton('always', `${kicon('checkmark')} Always`, 'primary'),
                         onClick: () => {
-                            Modal.hide();
                             wrappedResolve({ approved: true, scope: 'always' });
+                            Modal.hide();
                         }
                     },
                     {
@@ -364,10 +364,16 @@ export const Security = {
     async _enableGlobalAutoFromModal(scope, wrappedResolve) {
         try {
             const response = await this.setGlobalAutoScope(scope);
-            Modal.hide();
+            // The request can outlive this approval modal. Its onClose clears
+            // the resolver identity, so only the still-active owner may settle
+            // the approval and close the shared Modal singleton. Otherwise a
+            // stale Auto completion could close a replacement dialog.
+            if (this._activeApprovalResolver === wrappedResolve) {
+                wrappedResolve({ approved: true, scope: 'once', suppressToast: true });
+                Modal.hide();
+            }
             Toast[this.globalAutoScope === 'always' ? 'danger' : 'warning'](response.warning);
             await this.loadPermissionTree();
-            wrappedResolve({ approved: true, scope: 'once', suppressToast: true });
         } catch (error) {
             console.error('Failed to enable Auto mode from approval modal:', error);
             Toast.error('Failed to enable Auto mode');
@@ -956,9 +962,9 @@ export const Security = {
                     </p>
                 `,
                 buttons: [
-                    { label: 'Cancel', type: 'secondary', onClick: () => { Modal.hide(); resolve(null); } },
-                    { label: `${kicon('shield')} This Session`, type: 'primary', onClick: () => { Modal.hide(); resolve('session'); } },
-                    { label: `${kicon('shield')} Always`, type: 'danger', onClick: () => { Modal.hide(); resolve('always'); } }
+                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(null); Modal.hide(); } },
+                    { label: `${kicon('shield')} This Session`, type: 'primary', onClick: () => { resolve('session'); Modal.hide(); } },
+                    { label: `${kicon('shield')} Always`, type: 'danger', onClick: () => { resolve('always'); Modal.hide(); } }
                 ],
                 onClose: () => resolve(null)
             });
@@ -986,8 +992,8 @@ export const Security = {
                         </p>
                     `,
                     buttons: [
-                        { label: 'Cancel', type: 'secondary', onClick: () => { Modal.hide(); resolve(false); } },
-                        { label: 'Reset', type: 'primary', onClick: () => { Modal.hide(); resolve(true); } }
+                        { label: 'Cancel', type: 'secondary', onClick: () => { resolve(false); Modal.hide(); } },
+                        { label: 'Reset', type: 'primary', onClick: () => { resolve(true); Modal.hide(); } }
                     ],
                     onClose: () => resolve(false)
                 });
@@ -1024,8 +1030,8 @@ export const Security = {
                         </p>
                     `,
                     buttons: [
-                        { label: 'Keep Waiting', type: 'secondary', onClick: () => { Modal.hide(); resolve(false); } },
-                        { label: 'Cancel All', type: 'danger', onClick: () => { Modal.hide(); resolve(true); } }
+                        { label: 'Keep Waiting', type: 'secondary', onClick: () => { resolve(false); Modal.hide(); } },
+                        { label: 'Cancel All', type: 'danger', onClick: () => { resolve(true); Modal.hide(); } }
                     ],
                     onClose: () => resolve(false)
                 });
