@@ -1680,22 +1680,34 @@ def _agent_raw_db(agent):
     ``agent.storage`` is usually a PrivacyEnforcingStorage wrapper (no
     ``.db`` of its own) around the real AsyncStorage, which owns the
     ``.db`` handle. Reach through the wrapper's ``_storage`` when the outer
-    object doesn't expose ``db`` directly. Returns ``None`` when no handle
-    is reachable.
+    object doesn't expose ``db`` directly. The handle is exposed only when
+    the storage capability is bound to the same non-empty agent id as the
+    request context; a cross-wired host must fail closed before corpus SQL.
     """
     storage = getattr(agent, "storage", None)
+    agent_id = getattr(agent, "agent_id", None)
+    storage_agent_id = getattr(storage, "agent_id", None) if storage else None
     db = getattr(storage, "db", None) if storage else None
     if db is None and storage is not None:
         inner = getattr(storage, "_storage", None)
         db = getattr(inner, "db", None) if inner else None
+        if storage_agent_id is None and inner is not None:
+            storage_agent_id = getattr(inner, "agent_id", None)
+    if (
+        not isinstance(agent_id, str)
+        or not agent_id
+        or not isinstance(storage_agent_id, str)
+        or storage_agent_id != agent_id
+    ):
+        return None
     return db
 
 
 async def _classify_stale_embedding_rows(agent, service=None) -> Optional[Dict[str, int]]:
     """Classify stored stale rows into actionable vs unembeddable (#2289/#2426).
 
-    Scoped to the agent for the per-agent tables (conversation_history,
-    saved_items); document_chunks is global. Returns ``None`` when no
+    Scoped to the agent for every table; document chunks use their independent
+    ownership ledger. Returns ``None`` when no
     embedding profile resolves or storage isn't available — the caller
     treats that as "re-embed action not applicable".
 
@@ -2324,8 +2336,8 @@ async def reindex_embeddings(request: Request):
     - ``tables``: optional list restricting the sweep (default: all three
       embedding-bearing tables).
 
-    Agent scoping comes from the request's agent context (per-agent tables are
-    filtered to ``agent.agent_id``; ``document_chunks`` is global), so there is
+    Agent scoping comes from a storage capability bound to the request agent;
+    document chunks are filtered through their ownership ledger, so there is
     no ``KESTREL_DB_PATH`` ambiguity (#2327). Refuses with 409 when no embedding
     provider resolves, ``embedding_route = "none"``, or on a dimension mismatch.
     """

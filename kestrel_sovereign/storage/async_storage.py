@@ -216,7 +216,11 @@ class AsyncStorage:
                 destructive_audit=self.destructive_audit,
             )
             self.graph = AsyncGraphStore(self.db, agent_id=self.agent_id)
-            self.rag = AsyncRAGStore(self.db, llm_service=self.llm_service)
+            self.rag = AsyncRAGStore(
+                self.db,
+                llm_service=self.llm_service,
+                agent_id=self.agent_id,
+            )
             self.agent_resources = (
                 AgentResourceStore(self.db, self.agent_id)
                 if self.agent_id else None

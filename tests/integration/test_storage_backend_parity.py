@@ -25,7 +25,9 @@ from kestrel_sovereign.a2a.types import (
 from kestrel_sovereign.features.webhooks.feature import WebhookFeature
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.associative_linker import AssociativeLinker
+from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
+from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 from kestrel_sovereign.storage.schema_router import SchemaRouter
@@ -308,11 +310,11 @@ async def test_db_explorer_scopes_rows_to_requesting_agent(db_backend):
     agent's rows for agent-scoped tables, never another agent's data in a
     shared multi-agent database — and the scope must survive a free-text
     search."""
-    storage = AsyncStorage.from_backend(db_backend)
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
     await storage.initialize()
     privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-    agent_id = f"did:test:{uuid4()}"
     other_agent_id = f"did:test:{uuid4()}"
     start = datetime(2026, 4, 16, 12, 0, 0)
 
@@ -354,14 +356,43 @@ async def test_db_explorer_scopes_rows_to_requesting_agent(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_rag_chunks_are_scoped_through_file_ownership(db_backend):
+    """All backend-neutral RAG reads enforce the document capability."""
+    agent_a = f"did:test:{uuid4()}"
+    agent_b = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_a)
+    await storage.initialize()
+    files_b = AsyncFileStore(storage.db, agent_id=agent_b)
+    rag_b = AsyncRAGStore(storage.db, agent_id=agent_b)
+
+    hash_a = await storage.files.store_file(b"alpha", "alpha.txt")
+    hash_b = await files_b.store_file(b"bravo", "bravo.txt")
+    await storage.rag.chunk_document(
+        hash_a, "alpha-backend-private", compute_embeddings=False
+    )
+    await rag_b.chunk_document(
+        hash_b, "bravo-backend-private", compute_embeddings=False
+    )
+
+    assert await storage.rag.get_chunks_for_file(hash_b) == []
+    assert await storage.rag._search_by_like("bravo-backend-private") == []
+    assert await rag_b.get_chunks_for_file(hash_b) == ["bravo-backend-private"]
+    with pytest.raises(ValueError, match="outside the bound agent"):
+        await storage.rag.chunk_document(
+            hash_b, "unauthorized", compute_embeddings=False
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend):
     """#1651: for agent-scoped tables, EPHEMERAL/ISOLATED modes must not
     surface persisted rows through the raw explorer."""
-    storage = AsyncStorage.from_backend(db_backend)
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
     await storage.initialize()
     privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-    agent_id = f"did:test:{uuid4()}"
     await storage.db.execute_many(
         """
         INSERT INTO conversation_history (agent_id, role, content, metadata, created_at)
@@ -391,11 +422,11 @@ async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend):
 @pytest.mark.dual_backend
 async def test_db_explorer_scopes_graph_nodes_by_canonical_ownership(db_backend):
     """Graph ownership includes the untagged canonical root and tagged nodes."""
-    storage = AsyncStorage.from_backend(db_backend)
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
     await storage.initialize()
     privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-    agent_id = f"did:test:{uuid4()}"
     other_agent_id = f"did:test:{uuid4()}"
 
     await storage.db.execute_many(

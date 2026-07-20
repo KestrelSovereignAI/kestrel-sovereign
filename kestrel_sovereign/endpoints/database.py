@@ -20,6 +20,18 @@ ALLOWED_TABLES = frozenset({
 })
 
 
+def _require_bound_database_scope(agent, storage) -> str:
+    """Return the request agent id only for its matching storage capability."""
+    agent_id = getattr(agent, "agent_id", None)
+    storage_agent_id = getattr(storage, "agent_id", None)
+    if not agent_id or storage_agent_id != agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent-scoped database storage is not available.",
+        )
+    return agent_id
+
+
 def _agent_scope(table_name, column_names, agent_id, _backend_type):
     """Return ``(condition, params)`` scoping a query to one agent, else ``(None, [])``.
 
@@ -135,7 +147,7 @@ async def list_database_tables(request: Request):
     try:
         agent = get_agent(request)
         storage = agent.storage
-        agent_id = getattr(agent, "agent_id", None)
+        agent_id = _require_bound_database_scope(agent, storage)
 
         # Use async database query
         all_tables = await _list_table_names(storage.db)
@@ -242,7 +254,7 @@ async def query_database_table(
     try:
         agent = get_agent(request)
         storage = agent.storage
-        agent_id = getattr(agent, "agent_id", None)
+        agent_id = _require_bound_database_scope(agent, storage)
 
         # Validate table name for safe SQL interpolation (defense-in-depth;
         # ALLOWED_TABLES check above is the primary gate)

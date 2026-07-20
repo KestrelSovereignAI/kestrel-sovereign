@@ -1013,7 +1013,7 @@ async def create_kestrel_identity_async(
 
     # 8. Index constitution for RAG (enables Constitutional RAG)
     from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
-    rag = AsyncRAGStore(db)
+    rag = AsyncRAGStore(db, agent_id=agent_did)
     constitution_text = constitution_content.decode('utf-8') if isinstance(constitution_content, bytes) else constitution_content
     chunks_created = await rag.chunk_document(
         file_hash=constitution_hash,
@@ -1029,8 +1029,10 @@ async def create_kestrel_identity_async(
         if us_const_path.exists():
             with open(us_const_path, "r", encoding="utf-8") as f:
                 us_content = f.read()
-            import hashlib
-            us_hash = hashlib.sha256(us_content.encode()).hexdigest()[:16]
+            us_hash = await files.store_file(
+                us_content.encode("utf-8"),
+                "US_CONSTITUTION.md",
+            )
             us_chunks = await rag.chunk_document(
                 file_hash=us_hash,
                 content=us_content,

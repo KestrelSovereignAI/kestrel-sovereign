@@ -39,8 +39,9 @@ def test_database_tables_endpoint_returns_shape_from_storage():
         [(0, "id", "TEXT", 1, None, 1)],
     ])
     db.fetchone = AsyncMock(return_value=(3,))
-    storage = MagicMock(db=db, db_path="/tmp/fake.db")
-    agent = MagicMock(storage=storage)
+    agent_id = "did:test:database-list-contract"
+    storage = MagicMock(db=db, db_path="/tmp/fake.db", agent_id=agent_id)
+    agent = MagicMock(storage=storage, agent_id=agent_id)
 
     app, original = _prepare_app(agent)
     try:

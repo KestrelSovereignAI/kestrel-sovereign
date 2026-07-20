@@ -12,8 +12,10 @@ import pytest
 import pytest_asyncio
 
 from kestrel_sovereign.identity import AgentIdentityPackage, IdentityImporter
+from kestrel_sovereign.identity.exporter import IdentityExporter
 from kestrel_sovereign.identity.graph_namespace import (
     namespace_imported_graph_node,
+    namespace_imported_record,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -208,6 +210,75 @@ async def test_did_pkh_import_namespaces_use_the_complete_identity(graph_db):
         (node_a, node_b),
     )
     assert set(owners) == {(node_a, agent_a), (node_b, agent_b)}
+
+
+@pytest.mark.asyncio
+async def test_did_pkh_import_row_ids_cannot_replace_peer_records(graph_db):
+    """All imported row PKs use the complete identity and export raw ids."""
+    agent_a = "did:pkh:eip155:1:0x1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    agent_b = "did:pkh:eip155:1:0x1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert agent_a[:20] == agent_b[:20]
+
+    for agent_id, marker in ((agent_a, "agent-a"), (agent_b, "agent-b")):
+        importer = IdentityImporter(graph_db, target_agent_id=agent_id)
+        await importer._import_episodes(
+            agent_id,
+            [{"id": "shared", "title": marker}],
+        )
+        await importer._import_saved_items(
+            agent_id,
+            [{
+                "id": "shared",
+                "item_type": "note",
+                "name": marker,
+                "content": marker,
+            }],
+        )
+        await importer._import_temporal_patterns(
+            agent_id,
+            [{
+                "id": "shared",
+                "pattern_type": "test",
+                "description": marker,
+            }],
+        )
+        await importer._import_reflection_insights(
+            agent_id,
+            [{
+                "id": "shared",
+                "insight_type": "test",
+                "title": marker,
+            }],
+        )
+
+    for table in (
+        "memory_episodes",
+        "saved_items",
+        "temporal_patterns",
+        "reflection_insights",
+    ):
+        rows = await graph_db.fetchall(
+            f"SELECT id, agent_id FROM {table} ORDER BY agent_id"
+        )
+        assert set(rows) == {
+            (namespace_imported_record(agent_a, "shared"), agent_a),
+            (namespace_imported_record(agent_b, "shared"), agent_b),
+        }
+
+    for agent_id in (agent_a, agent_b):
+        exporter = IdentityExporter(graph_db, agent_id)
+        assert [row["id"] for row in await exporter._get_memory_episodes()] == [
+            "shared"
+        ]
+        assert [row["id"] for row in await exporter._get_saved_items()] == [
+            "shared"
+        ]
+        assert [row["id"] for row in await exporter._get_temporal_patterns()] == [
+            "shared"
+        ]
+        assert [row["id"] for row in await exporter._get_reflection_insights()] == [
+            "shared"
+        ]
 
 
 @pytest.mark.asyncio

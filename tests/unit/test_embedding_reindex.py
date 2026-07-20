@@ -47,9 +47,11 @@ class FakeEmbeddingService:
         self._dim = dim
         self.crash_on_call = crash_on_call
         self.calls = 0
+        self.seen_texts: List[str] = []
 
     async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
         self.calls += 1
+        self.seen_texts.extend(texts)
         if self.crash_on_call is not None and self.calls >= self.crash_on_call:
             raise KeyboardInterrupt("simulated interrupt")
         out: List[Optional[List[float]]] = []
@@ -119,7 +121,7 @@ async def _seed(database: AsyncDatabase) -> None:
         ("s2", "a1", "note", "Note 2", None, "content only body", None),
     )
 
-    # document_chunks: two stale (global — no agent_id).
+    # document_chunks: two stale rows owned by a1 through the chunk ledger.
     await database.execute_commit(
         "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
         "VALUES (?, ?, ?)",
@@ -129,6 +131,19 @@ async def _seed(database: AsyncDatabase) -> None:
         "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
         "VALUES (?, ?, ?)",
         ("h2", "chunk two text", None),
+    )
+    chunk_rows = await database.fetchall(
+        "SELECT chunk_id, file_hash FROM document_chunks "
+        "WHERE file_hash IN ('h1', 'h2') ORDER BY chunk_id"
+    )
+    await database.execute_many(
+        "INSERT OR IGNORE INTO file_owners "
+        "(content_hash, agent_id, original_name, metadata) VALUES (?, ?, ?, ?)",
+        [(row[1], "a1", f"{row[1]}.txt", "{}") for row in chunk_rows],
+    )
+    await database.execute_many(
+        "INSERT INTO document_chunk_owners (chunk_id, agent_id) VALUES (?, ?)",
+        [(row[0], "a1") for row in chunk_rows],
     )
 
 
@@ -184,7 +199,7 @@ async def test_dominant_embedding_profile_agent_scoped(db):
     )
     prof = await dominant_embedding_profile(db, agent_id="a1")
     assert prof is not None
-    # a1's OTHER rows: conv(1) + saved(1) + global chunk(1) = 3 (a2 excluded).
+    # a1's OTHER rows: conv(1) + saved(1) + owned chunk(1) = 3 (a2 excluded).
     assert prof["row_count"] == 3
 
 
@@ -263,6 +278,94 @@ async def test_dry_run_counts_match_and_touch_nothing(db):
     # Agent-scoped count excludes the other agent's row.
     scoped = await reindexer.count_stale("conversation_history", agent_id="a1")
     assert scoped == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_hash_reindex_scopes_count_text_and_write_by_chunk_owner(db):
+    """A tenant reindex never submits or mutates a co-owner's chunk text."""
+    shared_hash = "shared-content-hash"
+    await db.execute_many(
+        "INSERT INTO file_owners "
+        "(content_hash, agent_id, original_name, metadata) VALUES (?, ?, ?, ?)",
+        [
+            (shared_hash, "a1", "a.txt", "{}"),
+            (shared_hash, "a2", "b.txt", "{}"),
+        ],
+    )
+    await db.execute_many(
+        "INSERT INTO document_chunks "
+        "(file_hash, content, embedding_profile_id) VALUES (?, ?, ?)",
+        [
+            (shared_hash, "a1 private chunk", OTHER),
+            (shared_hash, "a2 private chunk", OTHER),
+        ],
+    )
+    chunks = await db.fetchall(
+        "SELECT chunk_id, content FROM document_chunks "
+        "WHERE file_hash = ? ORDER BY chunk_id",
+        (shared_hash,),
+    )
+    await db.execute_many(
+        "INSERT INTO document_chunk_owners (chunk_id, agent_id) VALUES (?, ?)",
+        [(chunks[0][0], "a1"), (chunks[1][0], "a2")],
+    )
+
+    service = FakeEmbeddingService()
+    reindexer = EmbeddingReindexer(
+        db, service, TARGET, column_dim=DIM, batch_size=10
+    )
+    assert await reindexer.count_stale("document_chunks", agent_id="a1") == 1
+    assert await reindexer.classify_table_stale(
+        "document_chunks", agent_id="a1"
+    ) == {"stale": 1, "actionable": 1, "unembeddable": 0}
+
+    stats = await reindexer.reindex_table("document_chunks", agent_id="a1")
+    assert stats.reembedded == 1
+    assert service.seen_texts == ["a1 private chunk"]
+    profiles = await db.fetchall(
+        "SELECT content, embedding_profile_id, embedding_vec "
+        "FROM document_chunks WHERE file_hash = ? ORDER BY chunk_id",
+        (shared_hash,),
+    )
+    assert profiles[0][0:2] == ("a1 private chunk", TARGET)
+    assert profiles[0][2] is not None
+    assert profiles[1] == ("a2 private chunk", OTHER, None)
+
+
+@pytest.mark.asyncio
+async def test_cli_audit_requires_chunk_and_file_ownership(db, capsys):
+    """The per-agent audit reports only chunks the RAG capability can read."""
+    from kestrel_sovereign import cli_embeddings
+
+    await db.execute_many(
+        "INSERT INTO document_chunks "
+        "(file_hash, content, embedding_profile_id) VALUES (?, ?, ?)",
+        [
+            ("visible-hash", "visible chunk", "visible-profile"),
+            ("released-hash", "released chunk", "released-profile"),
+        ],
+    )
+    chunks = await db.fetchall(
+        "SELECT chunk_id, file_hash FROM document_chunks "
+        "WHERE file_hash IN ('visible-hash', 'released-hash') "
+        "ORDER BY chunk_id"
+    )
+    await db.execute_commit(
+        "INSERT INTO file_owners "
+        "(content_hash, agent_id, original_name, metadata) VALUES (?, ?, ?, ?)",
+        ("visible-hash", "a1", "visible.txt", "{}"),
+    )
+    await db.execute_many(
+        "INSERT INTO document_chunk_owners (chunk_id, agent_id) VALUES (?, ?)",
+        [(row[0], "a1") for row in chunks],
+    )
+
+    assert await cli_embeddings._audit(
+        db, table="document_chunks", agent_id="a1"
+    ) == 0
+    output = capsys.readouterr().out
+    assert "visible-profile" in output
+    assert "released-profile" not in output
 
 
 @pytest.mark.asyncio

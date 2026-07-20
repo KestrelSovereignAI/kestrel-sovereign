@@ -43,6 +43,20 @@ class AsyncFileStore:
             raise ValueError("File owner does not match the bound agent")
         return self.agent_id or declared or ""
 
+    def _require_matching_read_owner(self, agent_id: str) -> None:
+        """Reject a per-call avatar read outside this bound capability."""
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError("A bound file store cannot read another agent")
+
+    @staticmethod
+    def _avatar_node_id(
+        agent_id: str, avatar_type: str, content_hash: str
+    ) -> str:
+        """Return a tenant/type namespace for content-addressed avatar nodes."""
+        agent_digest = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()
+        type_digest = hashlib.sha256(avatar_type.encode("utf-8")).hexdigest()
+        return f"avatar:{agent_digest}:{type_digest}:{content_hash}"
+
     def _reference_upsert_sql(self) -> str:
         if self.db.backend_type == "postgres":
             return """
@@ -273,47 +287,54 @@ class AsyncFileStore:
             "created_at": datetime.now(UTC).isoformat()
         }
 
-        content_hash = await self.store_file(
-            image_data, f"avatar_{avatar_type}.jpg", metadata
-        )
-
-        # Use the canonical graph writer so the node and edge receive durable
-        # tenant-ownership witnesses together with their graph rows (#2649).
-        graph = AsyncGraphStore(self.db, agent_id=agent_id)
-        root = await self.db.fetchone(
-            "SELECT node_type FROM graph_nodes WHERE node_id = ?",
-            (agent_id,),
-        )
-        if root and root[0] != "agent":
-            raise ValueError("Avatar owner id collides with a non-agent graph node")
-        # Some bootstrap/test callers store an avatar before the physical agent
-        # root is inserted. The DID is still the canonical self-owner, so reserve
-        # that exact ownership witness; later root creation uses the same owner.
-        await record_graph_node_owner(self.db, agent_id, agent_id)
-        await graph.add_node(
-            GraphNode(
-                node_id=content_hash,
-                node_type="avatar",
-                label=f"Avatar ({avatar_type})",
-                properties=metadata,
+        async with self.db.transaction():
+            content_hash = await self.store_file(
+                image_data, f"avatar_{avatar_type}.jpg", metadata
             )
-        )
-        await graph.add_edge(
-            agent_id,
-            content_hash,
-            "has_avatar",
-            {"avatar_type": avatar_type},
-        )
+            avatar_node_id = self._avatar_node_id(
+                agent_id, avatar_type, content_hash
+            )
+            graph_metadata = {**metadata, "hash": content_hash}
 
-        # Update agent node's identity with avatar_hash (like constitution_hash)
-        # This makes the avatar intrinsic to the agent's identity
-        if avatar_type == "primary":
-            agent_node = await graph.get_node(agent_id)
-            if agent_node is not None:
-                agent_node.properties["avatar_hash"] = content_hash
-                await graph.add_node(
-                    agent_node
+            # Use the canonical graph writer so the node and edge receive
+            # durable tenant-ownership witnesses together with their graph
+            # rows. The graph id is tenant/type namespaced because identical
+            # bytes do not imply shared avatar metadata (#2649).
+            graph = AsyncGraphStore(self.db, agent_id=agent_id)
+            root = await self.db.fetchone(
+                "SELECT node_type FROM graph_nodes WHERE node_id = ?",
+                (agent_id,),
+            )
+            if root and root[0] != "agent":
+                raise ValueError(
+                    "Avatar owner id collides with a non-agent graph node"
                 )
+            # Some bootstrap/test callers store an avatar before the physical
+            # agent root is inserted. The DID is still the canonical self-owner,
+            # so reserve that witness; later root creation uses the same owner.
+            await record_graph_node_owner(self.db, agent_id, agent_id)
+            await graph.add_node(
+                GraphNode(
+                    node_id=avatar_node_id,
+                    node_type="avatar",
+                    label=f"Avatar ({avatar_type})",
+                    properties=graph_metadata,
+                )
+            )
+            await graph.add_edge(
+                agent_id,
+                avatar_node_id,
+                "has_avatar",
+                {"avatar_type": avatar_type},
+            )
+
+            # Update agent node's identity with avatar_hash (like constitution_hash)
+            # This makes the avatar intrinsic to the agent's identity.
+            if avatar_type == "primary":
+                agent_node = await graph.get_node(agent_id)
+                if agent_node is not None:
+                    agent_node.properties["avatar_hash"] = content_hash
+                    await graph.add_node(agent_node)
 
         return content_hash
 
@@ -333,16 +354,25 @@ class AsyncFileStore:
         Raises:
             DecryptionError: If avatar is encrypted but decryption fails (wrong key)
         """
+        self._require_matching_read_owner(agent_id)
         # Build backend-agnostic query
         avatar_type_filter = self._json_extract("e.properties", "avatar_type")
-        order_by = self._order_by_created_at("f.metadata")
+        avatar_hash = self._json_extract("avatar.properties", "hash")
+        order_by = self._order_by_created_at("avatar.properties")
 
         # Find avatar via graph edge relationship
         row = await self.db.fetchone(
-            f"""SELECT f.content, f.metadata FROM files f
+            f"""SELECT f.content, f.metadata FROM graph_edges e
+               JOIN graph_nodes avatar
+                 ON avatar.node_id = e.target_id
+                AND avatar.node_type = 'avatar'
+               JOIN graph_node_owners avatar_owner
+                 ON avatar_owner.node_id = avatar.node_id
+                AND avatar_owner.agent_id = ?
+               JOIN files f
+                 ON f.content_hash = COALESCE({avatar_hash}, e.target_id)
                JOIN file_owners fo
                  ON fo.content_hash = f.content_hash AND fo.agent_id = ?
-               JOIN graph_edges e ON f.content_hash = e.target_id
                JOIN graph_edge_owners eo
                  ON eo.source_id = e.source_id
                 AND eo.target_id = e.target_id
@@ -352,7 +382,7 @@ class AsyncFileStore:
                AND {avatar_type_filter} = ?
                {order_by}
                LIMIT 1""",
-            (agent_id, agent_id, agent_id, avatar_type)
+            (agent_id, agent_id, agent_id, agent_id, avatar_type)
         )
 
         if not row:
@@ -379,6 +409,7 @@ class AsyncFileStore:
         Returns:
             Content hash (SHA256) or None if not found
         """
+        self._require_matching_read_owner(agent_id)
         # For primary avatar, check agent node property first (authoritative)
         if avatar_type == "primary":
             agent_node = await AsyncGraphStore(
@@ -394,12 +425,21 @@ class AsyncFileStore:
         # Fallback to graph edge lookup (for non-primary or legacy data)
         # Build backend-agnostic query
         avatar_type_filter = self._json_extract("e.properties", "avatar_type")
+        avatar_hash = self._json_extract("avatar.properties", "hash")
         order_by = self._order_by_insertion("e")
 
         row = await self.db.fetchone(
-            f"""SELECT e.target_id FROM graph_edges e
+            f"""SELECT COALESCE({avatar_hash}, e.target_id)
+               FROM graph_edges e
+               JOIN graph_nodes avatar
+                 ON avatar.node_id = e.target_id
+                AND avatar.node_type = 'avatar'
+               JOIN graph_node_owners avatar_owner
+                 ON avatar_owner.node_id = avatar.node_id
+                AND avatar_owner.agent_id = ?
                JOIN file_owners fo
-                 ON fo.content_hash = e.target_id AND fo.agent_id = ?
+                 ON fo.content_hash = COALESCE({avatar_hash}, e.target_id)
+                AND fo.agent_id = ?
                JOIN graph_edge_owners eo
                  ON eo.source_id = e.source_id
                 AND eo.target_id = e.target_id
@@ -408,6 +448,6 @@ class AsyncFileStore:
                WHERE e.source_id = ? AND e.label = 'has_avatar'
                AND {avatar_type_filter} = ?
                {order_by} LIMIT 1""",
-            (agent_id, agent_id, agent_id, avatar_type)
+            (agent_id, agent_id, agent_id, agent_id, avatar_type)
         )
         return row[0] if row else None

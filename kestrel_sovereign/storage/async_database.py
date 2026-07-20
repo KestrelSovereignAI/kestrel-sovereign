@@ -89,6 +89,18 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     embedding BLOB
 );
 
+-- Chunk text is caller-supplied and is therefore a separate tenant
+-- capability from the content-addressed file bytes. Two agents may own the
+-- same file without sharing annotations or derived chunk content.
+CREATE TABLE IF NOT EXISTS document_chunk_owners (
+    chunk_id INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunk_owners_agent
+    ON document_chunk_owners(agent_id, chunk_id);
+
 CREATE TABLE IF NOT EXISTS conversation_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id TEXT NOT NULL DEFAULT '',
@@ -763,6 +775,12 @@ class AsyncDatabase:
         # unowned and therefore inaccessible to tenant-bound stores.
         await self._backfill_file_ownership()
 
+        # Legacy chunks are visible to a tenant only when the corresponding
+        # file has one unambiguous owner. Shared/ownerless documents remain
+        # unowned rather than granting one tenant another tenant's derived
+        # plaintext during upgrade.
+        await self._backfill_document_chunk_ownership()
+
         # Soft-delete migration (#763): add deleted_at to conversation_history
         # for databases created before soft-delete shipped. Idempotent — does
         # nothing on fresh databases (column already in CREATE TABLE). The
@@ -1185,54 +1203,170 @@ class AsyncDatabase:
                 )
             )
 
-            # An edge between two nodes owned by the same agent is private to
-            # that agent.  A cross-tenant edge has no shared owner and is not
-            # admitted by this insert.
+            # An ownerless legacy edge can be assigned only when its endpoints
+            # have exactly one common owner.  Existing edge ownership is
+            # authoritative and independent of endpoint ownership: rerunning
+            # this migration must never grant a newly-added common node owner
+            # access to another tenant's already-owned edge payload.
             await self.execute(
                 insert_ignore(
                     "graph_edge_owners",
                     "source_id, target_id, label, agent_id",
-                    "SELECT e.source_id, e.target_id, e.label, src.agent_id "
+                    "SELECT e.source_id, e.target_id, e.label, MIN(src.agent_id) "
                     "FROM graph_edges e "
                     "JOIN graph_node_owners src ON src.node_id = e.source_id "
                     "JOIN graph_node_owners dst "
                     "  ON dst.node_id = e.target_id "
-                    " AND dst.agent_id = src.agent_id",
+                    " AND dst.agent_id = src.agent_id "
+                    "WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM graph_edge_owners existing_owner "
+                    "  WHERE existing_owner.source_id = e.source_id "
+                    "    AND existing_owner.target_id = e.target_id "
+                    "    AND existing_owner.label = e.label"
+                    ") "
+                    "GROUP BY e.source_id, e.target_id, e.label "
+                    "HAVING COUNT(DISTINCT src.agent_id) = 1",
                 )
             )
 
     async def _backfill_file_ownership(self) -> None:
-        """Backfill only legacy file references proven by owned graph nodes.
+        """Backfill only legacy files anchored by a canonical agent root.
 
         Generic blobs historically had no authoritative owner.  Metadata JSON
         is intentionally not trusted for migration because it was not an
-        isolation boundary and may be caller-controlled.  A document/avatar
-        node whose content-addressed id equals the file hash, coupled with an
-        existing graph ownership witness, is a conservative durable proof.
+        isolation boundary and may be caller-controlled. An orphan graph node
+        is insufficient too: a tenant could name it after a known foreign
+        content hash. Only a canonical constitution/avatar pointer on a
+        self-owned agent root, with its matching relationship and typed target,
+        is accepted; ambiguous roots fail closed.
+        """
+
+        root_constitution_hash = (
+            "(root.properties::jsonb->>'constitution_hash')"
+            if self.backend_type == "postgres"
+            else "json_extract(root.properties, '$.constitution_hash')"
+        )
+        root_avatar_hash = (
+            "(root.properties::jsonb->>'avatar_hash')"
+            if self.backend_type == "postgres"
+            else "json_extract(root.properties, '$.avatar_hash')"
+        )
+        target_avatar_hash = (
+            "COALESCE(target.properties::jsonb->>'hash', e.target_id)"
+            if self.backend_type == "postgres"
+            else "COALESCE(json_extract(target.properties, '$.hash'), e.target_id)"
+        )
+        proven_owners = f"""
+            SELECT DISTINCT e.target_id AS content_hash,
+                   roots.agent_id AS agent_id,
+                   'constitution' AS reference_kind
+            FROM graph_edges e
+            JOIN graph_nodes root ON root.node_id = e.source_id
+            JOIN graph_nodes target ON target.node_id = e.target_id
+            JOIN graph_node_owners roots
+              ON roots.node_id = root.node_id
+             AND roots.agent_id = root.node_id
+            WHERE e.label = 'governed_by'
+              AND root.node_type = 'agent'
+              AND target.node_type = 'document'
+              AND target.label = 'KESTREL_CONSTITUTION'
+              AND {root_constitution_hash} = e.target_id
+            UNION ALL
+            SELECT avatar_witnesses.content_hash,
+                   MIN(avatar_witnesses.agent_id) AS agent_id,
+                   'avatar' AS reference_kind
+            FROM (
+                SELECT {target_avatar_hash} AS content_hash,
+                       roots.agent_id AS agent_id
+                FROM graph_edges e
+                JOIN graph_nodes root ON root.node_id = e.source_id
+                JOIN graph_nodes target ON target.node_id = e.target_id
+                JOIN graph_node_owners roots
+                  ON roots.node_id = root.node_id
+                 AND roots.agent_id = root.node_id
+                WHERE e.label = 'has_avatar'
+                  AND root.node_type = 'agent'
+                  AND target.node_type = 'avatar'
+                  AND {root_avatar_hash} = {target_avatar_hash}
+            ) avatar_witnesses
+            GROUP BY avatar_witnesses.content_hash
+            HAVING COUNT(DISTINCT avatar_witnesses.agent_id) = 1
         """
 
         if self.backend_type == "postgres":
-            sql = """
+            sql = f"""
                 INSERT INTO file_owners
                     (content_hash, agent_id, original_name, metadata)
                 SELECT f.content_hash, owners.agent_id,
-                       f.original_name, f.metadata
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN 'KESTREL_CONSTITUTION.md'
+                            ELSE f.original_name END,
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN '{{}}'
+                            ELSE f.metadata END
                 FROM files f
-                JOIN graph_nodes n ON n.node_id = f.content_hash
-                JOIN graph_node_owners owners ON owners.node_id = n.node_id
-                WHERE n.node_type IN ('document', 'avatar')
+                JOIN ({proven_owners}) owners
+                  ON owners.content_hash = f.content_hash
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM file_owners existing_owner
+                      WHERE existing_owner.content_hash = f.content_hash
+                        AND existing_owner.agent_id = owners.agent_id
+                  )
+                ON CONFLICT DO NOTHING
+            """
+        else:
+            sql = f"""
+                INSERT OR IGNORE INTO file_owners
+                    (content_hash, agent_id, original_name, metadata)
+                SELECT f.content_hash, owners.agent_id,
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN 'KESTREL_CONSTITUTION.md'
+                            ELSE f.original_name END,
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN '{{}}'
+                            ELSE f.metadata END
+                FROM files f
+                JOIN ({proven_owners}) owners
+                  ON owners.content_hash = f.content_hash
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM file_owners existing_owner
+                      WHERE existing_owner.content_hash = f.content_hash
+                        AND existing_owner.agent_id = owners.agent_id
+                  )
+            """
+        await self.execute(sql)
+
+    async def _backfill_document_chunk_ownership(self) -> None:
+        """Assign legacy chunks only from an unambiguous file capability."""
+
+        if self.backend_type == "postgres":
+            sql = """
+                INSERT INTO document_chunk_owners (chunk_id, agent_id)
+                SELECT chunks.chunk_id, MIN(owners.agent_id)
+                FROM document_chunks chunks
+                JOIN file_owners owners
+                  ON owners.content_hash = chunks.file_hash
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_chunk_owners existing_owner
+                    WHERE existing_owner.chunk_id = chunks.chunk_id
+                )
+                GROUP BY chunks.chunk_id
+                HAVING COUNT(DISTINCT owners.agent_id) = 1
                 ON CONFLICT DO NOTHING
             """
         else:
             sql = """
-                INSERT OR IGNORE INTO file_owners
-                    (content_hash, agent_id, original_name, metadata)
-                SELECT f.content_hash, owners.agent_id,
-                       f.original_name, f.metadata
-                FROM files f
-                JOIN graph_nodes n ON n.node_id = f.content_hash
-                JOIN graph_node_owners owners ON owners.node_id = n.node_id
-                WHERE n.node_type IN ('document', 'avatar')
+                INSERT OR IGNORE INTO document_chunk_owners (chunk_id, agent_id)
+                SELECT chunks.chunk_id, MIN(owners.agent_id)
+                FROM document_chunks chunks
+                JOIN file_owners owners
+                  ON owners.content_hash = chunks.file_hash
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_chunk_owners existing_owner
+                    WHERE existing_owner.chunk_id = chunks.chunk_id
+                )
+                GROUP BY chunks.chunk_id
+                HAVING COUNT(DISTINCT owners.agent_id) = 1
             """
         await self.execute(sql)
 

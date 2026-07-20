@@ -9,6 +9,7 @@ import pytest
 
 from kestrel_sovereign.identity.graph_namespace import (
     namespace_imported_graph_node,
+    namespace_imported_record,
 )
 from kestrel_sovereign.identity.identity_package import (
     AgentIdentityPackage,
@@ -348,10 +349,18 @@ async def test_replace_exact_inventory_and_preserves_audit_nodes(db_backend):
         assert result.migration_id
 
         expected_ids = {
-            "memory_episodes": f"{inventory.agent_id[:20]}_new-episode",
-            "saved_items": f"{inventory.agent_id[:20]}_new-item",
-            "temporal_patterns": f"{inventory.agent_id[:20]}_new-pattern",
-            "reflection_insights": f"{inventory.agent_id[:20]}_new-insight",
+            "memory_episodes": namespace_imported_record(
+                inventory.agent_id, "new-episode"
+            ),
+            "saved_items": namespace_imported_record(
+                inventory.agent_id, "new-item"
+            ),
+            "temporal_patterns": namespace_imported_record(
+                inventory.agent_id, "new-pattern"
+            ),
+            "reflection_insights": namespace_imported_record(
+                inventory.agent_id, "new-insight"
+            ),
         }
         for table, expected_id in expected_ids.items():
             rows = await db.fetchall(

@@ -542,7 +542,17 @@ class MemoryFeature(Feature):
             if hasattr(self.storage, 'rag'):
                 try:
                     count_result = await self._db.fetchone(
-                        "SELECT COUNT(*) FROM document_chunks"
+                        "SELECT COUNT(*) FROM document_chunks AS chunks "
+                        "WHERE EXISTS ("
+                        "  SELECT 1 FROM document_chunk_owners AS chunk_owner "
+                        "  WHERE chunk_owner.chunk_id = chunks.chunk_id "
+                        "  AND chunk_owner.agent_id = ?"
+                        ") AND EXISTS ("
+                        "  SELECT 1 FROM file_owners AS owner "
+                        "  WHERE owner.content_hash = chunks.file_hash "
+                        "  AND owner.agent_id = ?"
+                        ")",
+                        (self.agent_id, self.agent_id),
                     )
                     rag_stats["document_chunks"] = count_result[0] if count_result else 0
                 except Exception:

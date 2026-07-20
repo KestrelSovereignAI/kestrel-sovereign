@@ -32,6 +32,16 @@ def _request(storage, agent_id=None):
     return SimpleNamespace(state=SimpleNamespace(agent=agent))
 
 
+def _database_request(storage, agent_id):
+    """Model the production endpoint contract with a tenant-bound facade."""
+    bound_storage = SimpleNamespace(
+        db=storage.db,
+        agent_id=agent_id,
+        privacy_config=getattr(storage, "privacy_config", None),
+    )
+    return _request(bound_storage, agent_id)
+
+
 @pytest.mark.asyncio
 async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_path):
     """Two agent consoles cannot cross either scoped or unowned boundaries."""
@@ -103,7 +113,7 @@ async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_p
         )
 
         result_a = await query_database_table(
-            _request(storage, agent_a),
+            _database_request(storage, agent_a),
             "conversation_history",
             limit=50,
             offset=0,
@@ -118,7 +128,7 @@ async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_p
         assert rendered_long == unicode_long[:500] + "..."
 
         result_b = await query_database_table(
-            _request(storage, agent_b),
+            _database_request(storage, agent_b),
             "conversation_history",
             limit=50,
             offset=0,
@@ -129,14 +139,14 @@ async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_p
         ]
 
         graph_a = await query_database_table(
-            _request(storage, agent_a),
+            _database_request(storage, agent_a),
             "graph_nodes",
             limit=50,
             offset=0,
             search=None,
         )
         graph_b = await query_database_table(
-            _request(storage, agent_b),
+            _database_request(storage, agent_b),
             "graph_nodes",
             limit=50,
             offset=0,
@@ -152,7 +162,7 @@ async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_p
         }
 
         edges_a = await query_database_table(
-            _request(storage, agent_a),
+            _database_request(storage, agent_a),
             "graph_edges",
             limit=50,
             offset=0,
@@ -162,7 +172,7 @@ async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_p
         assert "node-b" not in repr(edges_a)
         assert "agent-b-edge-payload" not in repr(edges_a)
 
-        listing = await list_database_tables(_request(storage, agent_a))
+        listing = await list_database_tables(_database_request(storage, agent_a))
         chunks = next(
             table for table in listing["tables"] if table["name"] == "document_chunks"
         )
@@ -181,7 +191,7 @@ async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_p
             for agent_id in (agent_a, agent_b):
                 with pytest.raises(HTTPException) as exc_info:
                     await query_database_table(
-                        _request(storage, agent_id),
+                        _database_request(storage, agent_id),
                         document_table,
                         limit=50,
                         offset=0,
@@ -270,7 +280,7 @@ async def test_legacy_graph_ownership_backfill_is_precise_and_idempotent(tmp_pat
 
     storage = await AsyncStorage.create_sqlite(str(db_path))
     try:
-        request = _request(storage, agent_a)
+        request = _database_request(storage, agent_a)
         nodes = await query_database_table(
             request, "graph_nodes", limit=50, offset=0, search=None
         )
@@ -333,6 +343,67 @@ async def test_legacy_graph_ownership_backfill_is_precise_and_idempotent(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_legacy_shared_constitution_backfill_keeps_each_file_capability(
+    tmp_path,
+):
+    """Every canonical root anchoring shared legacy bytes retains its own read grant."""
+    storage = await AsyncStorage.create_sqlite(str(tmp_path / "legacy-shared.db"))
+    agent_a = "did:test:legacy-constitution-a"
+    agent_b = "did:test:legacy-constitution-b"
+    constitution_hash = "legacy-shared-constitution"
+
+    try:
+        await storage.db.execute_many(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (
+                    agent_a,
+                    "agent",
+                    "A",
+                    json.dumps({"constitution_hash": constitution_hash}),
+                ),
+                (
+                    agent_b,
+                    "agent",
+                    "B",
+                    json.dumps({"constitution_hash": constitution_hash}),
+                ),
+                (
+                    constitution_hash,
+                    "document",
+                    "KESTREL_CONSTITUTION",
+                    "{}",
+                ),
+            ],
+        )
+        await storage.db.execute_many(
+            "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (agent_a, constitution_hash, "governed_by", "{}"),
+                (agent_b, constitution_hash, "governed_by", "{}"),
+            ],
+        )
+        await storage.db.execute(
+            "INSERT INTO files (content_hash, original_name, content, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (constitution_hash, "legacy.md", b"shared constitution", "{}"),
+        )
+
+        await storage.db._backfill_graph_ownership()
+        await storage.db._backfill_file_ownership()
+
+        assert await storage.db.fetchall(
+            "SELECT agent_id FROM file_owners WHERE content_hash = ? "
+            "ORDER BY agent_id",
+            (constitution_hash,),
+        ) == [(agent_a,), (agent_b,)]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_shared_constitution_node_and_each_governed_edge_are_owned(tmp_path):
     """Content-addressed nodes can be shared without sharing private edges."""
     storage = await AsyncStorage.create_sqlite(str(tmp_path / "shared-graph.db"))
@@ -343,11 +414,29 @@ async def test_shared_constitution_node_and_each_governed_edge_are_owned(tmp_pat
     graph_b = AsyncGraphStore(storage.db, agent_id=agent_b)
 
     try:
+        # Production stores the content reference before adding its document
+        # node.  Both tenants possess the same bytes, so both references are
+        # authorized to share the immutable content-addressed graph node.
+        await storage.db.execute(
+            "INSERT INTO files VALUES (?, 'constitution.md', ?, '{}')",
+            (constitution_hash, b"same constitution"),
+        )
+        await storage.db.execute_many(
+            "INSERT INTO file_owners VALUES (?, ?, 'constitution.md', '{}')",
+            [
+                (constitution_hash, agent_a),
+                (constitution_hash, agent_b),
+            ],
+        )
         document = GraphNode(
             constitution_hash,
             "document",
             "KESTREL_CONSTITUTION",
-            {"hash": constitution_hash, "created_at": "2026-01-01T00:00:00+00:00"},
+            {
+                "hash": constitution_hash,
+                "type": "Constitution",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
         )
         await graph_a.add_node(document)
         await graph_a.add_node(
@@ -367,6 +456,7 @@ async def test_shared_constitution_node_and_each_governed_edge_are_owned(tmp_pat
                 "KESTREL_CONSTITUTION",
                 {
                     "hash": constitution_hash,
+                    "type": "Constitution",
                     "created_at": "2026-02-01T00:00:00+00:00",
                 },
             )
@@ -400,7 +490,7 @@ async def test_shared_constitution_node_and_each_governed_edge_are_owned(tmp_pat
             (agent_b, agent_b, agent_a),
         ):
             nodes = await query_database_table(
-                _request(storage, agent_id),
+                _database_request(storage, agent_id),
                 "graph_nodes",
                 limit=50,
                 offset=0,
@@ -409,7 +499,7 @@ async def test_shared_constitution_node_and_each_governed_edge_are_owned(tmp_pat
             assert constitution_hash in {row["node_id"] for row in nodes["rows"]}
 
             edges = await query_database_table(
-                _request(storage, agent_id),
+                _database_request(storage, agent_id),
                 "graph_edges",
                 limit=50,
                 offset=0,
@@ -421,6 +511,273 @@ async def test_shared_constitution_node_and_each_governed_edge_are_owned(tmp_pat
             assert foreign_source not in repr(edges)
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_graph_and_file_backfills_never_grant_a_later_node_owner(tmp_path):
+    """Restart inference handles only unowned legacy rows, never live grants."""
+    db_path = str(tmp_path / "no-retroactive-grants.db")
+    agent_a = "did:test:backfill-a"
+    agent_b = "did:test:backfill-b"
+    storage_a = AsyncStorage(db_path, agent_id=agent_a)
+    storage_b = AsyncStorage(db_path, agent_id=agent_b)
+    await storage_a.initialize()
+    await storage_b.initialize()
+
+    try:
+        first = GraphNode("shared:backfill:first", "concept", "first", {})
+        second = GraphNode("shared:backfill:second", "concept", "second", {})
+        await storage_a.graph.add_node(first)
+        await storage_a.graph.add_node(second)
+        # Model a legacy shared-node ledger directly. New bound writers may no
+        # longer acquire arbitrary foreign nodes by replaying their payload.
+        await storage_a.db.execute_many(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            [(first.node_id, agent_b), (second.node_id, agent_b)],
+        )
+        await storage_a.graph.add_edge(first.node_id, second.node_id, "private-a")
+
+        content = b"agent-a private file"
+        content_hash = await storage_a.store_file(content, "private-a.txt")
+        document = GraphNode(
+            content_hash,
+            "document",
+            "private-a.txt",
+            {"hash": content_hash},
+        )
+        await storage_a.graph.add_node(document)
+        # Replaying a foreign document reference is not authority to acquire
+        # either its graph metadata or its bytes.
+        with pytest.raises(TransactionError, match="owned by another agent"):
+            await storage_b.graph.add_node(document)
+        with pytest.raises(TransactionError, match="owned by another agent"):
+            await storage_b.graph.add_node(
+                GraphNode(
+                    content_hash,
+                    "document",
+                    "private-a.txt",
+                    {"hash": content_hash, "created_at": "later"},
+                )
+            )
+
+        await storage_a.db._backfill_graph_ownership()
+        await storage_a.db._backfill_file_ownership()
+
+        edge_owners = await storage_a.db.fetchall(
+            "SELECT agent_id FROM graph_edge_owners "
+            "WHERE source_id = ? AND target_id = ? AND label = ?",
+            (first.node_id, second.node_id, "private-a"),
+        )
+        assert edge_owners == [(agent_a,)]
+        file_owners = await storage_a.db.fetchall(
+            "SELECT agent_id FROM file_owners WHERE content_hash = ?",
+            (content_hash,),
+        )
+        assert file_owners == [(agent_a,)]
+        assert await storage_b.retrieve_file(content_hash) is None
+    finally:
+        await storage_a.close()
+        await storage_b.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_backfills_leave_ambiguous_file_and_chunks_unowned(tmp_path):
+    """Shared or orphan graph nodes are not proof of legacy byte custody."""
+    import hashlib
+
+    agent_a = "did:test:ambiguous-a"
+    agent_b = "did:test:ambiguous-b"
+    storage_a = AsyncStorage(str(tmp_path / "ambiguous.db"), agent_id=agent_a)
+    storage_b = AsyncStorage(str(tmp_path / "ambiguous.db"), agent_id=agent_b)
+    await storage_a.initialize()
+    await storage_b.initialize()
+    content = b"ambiguous legacy body"
+    content_hash = hashlib.sha256(content).hexdigest()
+    orphan_content = b"foreign bytes named by one hostile graph node"
+    orphan_hash = hashlib.sha256(orphan_content).hexdigest()
+
+    try:
+        await storage_a.db.execute(
+            "INSERT INTO files (content_hash, original_name, content, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (content_hash, "legacy.txt", content, "{}"),
+        )
+        await storage_a.db.execute(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, 'document', 'legacy.txt', ?)",
+            (content_hash, json.dumps({"hash": content_hash})),
+        )
+        await storage_a.db.execute_many(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            [(content_hash, agent_a), (content_hash, agent_b)],
+        )
+        await storage_a.db.execute(
+            "INSERT INTO document_chunks (file_hash, content) VALUES (?, ?)",
+            (content_hash, "legacy-derived-secret"),
+        )
+        await storage_a.db.execute(
+            "INSERT INTO files (content_hash, original_name, content, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (orphan_hash, "victim.txt", orphan_content, "{}"),
+        )
+        await storage_a.db.execute(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, 'document', 'guessed-hash', ?)",
+            (orphan_hash, json.dumps({"hash": orphan_hash})),
+        )
+        await storage_a.db.execute(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (orphan_hash, agent_a),
+        )
+
+        await storage_a.db._backfill_file_ownership()
+        await storage_a.db._backfill_document_chunk_ownership()
+
+        assert await storage_a.retrieve_file(content_hash) is None
+        assert await storage_b.retrieve_file(content_hash) is None
+        assert await storage_a.retrieve_file(orphan_hash) is None
+        assert await storage_a.rag.get_chunks_for_file(content_hash) == []
+        assert await storage_b.rag.get_chunks_for_file(content_hash) == []
+        assert await storage_a.db.fetchall(
+            "SELECT agent_id FROM file_owners WHERE content_hash = ?",
+            (content_hash,),
+        ) == []
+        assert await storage_a.db.fetchall(
+            "SELECT agent_id FROM document_chunk_owners",
+        ) == []
+    finally:
+        await storage_a.close()
+        await storage_b.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_file_owners_keep_chunk_plaintext_private(tmp_path):
+    """Content deduplication never merges tenant-authored RAG plaintext."""
+    agent_a = "did:test:chunk-owner-a"
+    agent_b = "did:test:chunk-owner-b"
+    storage_a = AsyncStorage(str(tmp_path / "shared-chunks.db"), agent_id=agent_a)
+    storage_b = AsyncStorage(str(tmp_path / "shared-chunks.db"), agent_id=agent_b)
+    await storage_a.initialize()
+    await storage_b.initialize()
+
+    try:
+        content = b"identical shared file bytes"
+        hash_a = await storage_a.store_file(content, "a.txt")
+        hash_b = await storage_b.store_file(content, "b.txt")
+        assert hash_a == hash_b
+
+        await storage_a.rag.chunk_document(
+            hash_a, "agent-a-private-annotation", compute_embeddings=False
+        )
+        await storage_b.rag.chunk_document(
+            hash_b, "agent-b-private-annotation", compute_embeddings=False
+        )
+        await storage_a.db.execute(
+            "INSERT INTO document_chunks (file_hash, content) VALUES (?, ?)",
+            (hash_a, "ambiguous-ownerless-legacy-chunk"),
+        )
+
+        assert await storage_a.rag.get_chunks_for_file(hash_a) == [
+            "agent-a-private-annotation"
+        ]
+        assert await storage_b.rag.get_chunks_for_file(hash_b) == [
+            "agent-b-private-annotation"
+        ]
+        assert await storage_a.db.fetchone(
+            "SELECT 1 FROM document_chunks "
+            "WHERE file_hash = ? AND content = ?",
+            (hash_a, "ambiguous-ownerless-legacy-chunk"),
+        ) == (1,)
+        assert await storage_a.rag._search_by_like("agent-b-private") == []
+        assert await storage_b.rag._search_by_like("agent-a-private") == []
+
+        await storage_a.rag.delete_chunks_for_file(hash_a)
+        assert await storage_a.rag.get_chunks_for_file(hash_a) == []
+        assert await storage_b.rag.get_chunks_for_file(hash_b) == [
+            "agent-b-private-annotation"
+        ]
+        assert await storage_a.db.fetchone(
+            "SELECT 1 FROM document_chunks "
+            "WHERE file_hash = ? AND content = ?",
+            (hash_a, "ambiguous-ownerless-legacy-chunk"),
+        ) == (1,)
+    finally:
+        await storage_a.close()
+        await storage_b.close()
+
+
+@pytest.mark.asyncio
+async def test_graph_replay_cannot_acquire_foreign_nodes_or_edges(tmp_path):
+    """Guessing canonical graph payloads never creates an ownership witness."""
+    agent_a = "did:test:graph-replay-a"
+    agent_b = "did:test:graph-replay-b"
+    storage_a = AsyncStorage(str(tmp_path / "graph-replay.db"), agent_id=agent_a)
+    storage_b = AsyncStorage(str(tmp_path / "graph-replay.db"), agent_id=agent_b)
+    await storage_a.initialize()
+    await storage_b.initialize()
+
+    try:
+        private = GraphNode("concept:private", "concept", "private", {})
+        await storage_a.graph.add_node(private)
+        with pytest.raises(TransactionError, match="owned by another agent"):
+            await storage_b.graph.add_node(private)
+
+        left = GraphNode("concept:shared-left", "concept", "left", {})
+        right = GraphNode("concept:shared-right", "concept", "right", {})
+        await storage_a.graph.add_node(left)
+        await storage_a.graph.add_node(right)
+        await storage_a.db.execute_many(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            [(left.node_id, agent_b), (right.node_id, agent_b)],
+        )
+        await storage_a.graph.add_edge(left.node_id, right.node_id, "private")
+        with pytest.raises(TransactionError, match="owned by another agent"):
+            await storage_b.graph.add_edge(left.node_id, right.node_id, "private")
+
+        shared_hash = await storage_a.store_file(b"same constitution", "a.md")
+        assert await storage_b.store_file(
+            b"same constitution", "b.md"
+        ) == shared_hash
+        await storage_a.graph.add_node(
+            GraphNode(
+                shared_hash,
+                "document",
+                "KESTREL_CONSTITUTION",
+                {
+                    "hash": shared_hash,
+                    "type": "Constitution",
+                    "created_at": "agent-a-private-metadata",
+                },
+            )
+        )
+        with pytest.raises(TransactionError, match="owned by another agent"):
+            await storage_b.graph.add_node(
+                GraphNode(
+                    shared_hash,
+                    "document",
+                    "KESTREL_CONSTITUTION",
+                    {
+                        "hash": shared_hash,
+                        "type": "Constitution",
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                    },
+                )
+            )
+
+        assert await storage_b.graph.get_node(private.node_id) is None
+        assert await storage_b.graph.get_node(shared_hash) is None
+        assert await storage_a.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+            (private.node_id,),
+        ) == [(agent_a,)]
+        assert await storage_a.db.fetchall(
+            "SELECT agent_id FROM graph_edge_owners "
+            "WHERE source_id = ? AND target_id = ? AND label = 'private'",
+            (left.node_id, right.node_id),
+        ) == [(agent_a,)]
+    finally:
+        await storage_a.close()
+        await storage_b.close()
 
 
 @pytest.mark.asyncio
@@ -482,6 +839,55 @@ async def test_bound_graph_api_hides_foreign_documents_and_prevents_delete(tmp_p
             assert file_error.value.status_code == 404
 
         assert await storage_b.retrieve_file(private_hash) == private_bytes
+    finally:
+        await storage_a.close()
+        await storage_b.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_rag_and_avatar_reads_cannot_cross_agents(tmp_path):
+    """Every document and avatar read path honors the bound file capability."""
+    db_path = str(tmp_path / "shared-rag-avatar.db")
+    agent_a = "did:test:rag-a"
+    agent_b = "did:test:rag-b"
+    storage_a = AsyncStorage(db_path, agent_id=agent_a)
+    storage_b = AsyncStorage(db_path, agent_id=agent_b)
+    await storage_a.initialize()
+    await storage_b.initialize()
+
+    try:
+        await storage_a.graph.add_node(GraphNode(agent_a, "agent", "A", {}))
+        await storage_b.graph.add_node(GraphNode(agent_b, "agent", "B", {}))
+        hash_a = await storage_a.store_file(b"alpha", "alpha.txt")
+        hash_b = await storage_b.store_file(b"bravo", "bravo.txt")
+        await storage_a.rag.chunk_document(
+            hash_a, "alpha-private-token", compute_embeddings=False
+        )
+        await storage_b.rag.chunk_document(
+            hash_b, "bravo-private-token", compute_embeddings=False
+        )
+
+        assert await storage_a.rag.get_chunks_for_file(hash_b) == []
+        assert await storage_a.rag._search_by_like("bravo-private-token") == []
+        assert await storage_a.rag.search_chunks("bravo-private-token") == []
+        with pytest.raises(ValueError, match="outside the bound agent"):
+            await storage_a.rag.chunk_document(
+                hash_b, "attempted-copy", compute_embeddings=False
+            )
+        await storage_a.rag.delete_chunks_for_file(hash_b)
+        assert await storage_b.rag.get_chunks_for_file(hash_b) == [
+            "bravo-private-token"
+        ]
+
+        avatar_hash = await storage_b.files.store_avatar(
+            b"private-avatar", agent_b, "primary"
+        )
+        assert avatar_hash
+        with pytest.raises(ValueError, match="cannot read another agent"):
+            await storage_a.files.get_agent_avatar(agent_b)
+        with pytest.raises(ValueError, match="cannot read another agent"):
+            await storage_a.files.get_agent_avatar_hash(agent_b)
+        assert await storage_b.files.get_agent_avatar(agent_b) == b"private-avatar"
     finally:
         await storage_a.close()
         await storage_b.close()
@@ -671,15 +1077,25 @@ async def test_bound_delete_releases_only_callers_shared_witnesses(tmp_path):
     second = GraphNode("shared:second", "concept", "second", {"stable": True})
 
     try:
-        for graph in (graph_a, graph_b):
-            await graph.add_node(first)
-            await graph.add_node(second)
-            await graph.add_edge(
-                first.node_id,
-                second.node_id,
-                "related",
-                {"stable": True},
-            )
+        await graph_a.add_node(first)
+        await graph_a.add_node(second)
+        await graph_a.add_edge(
+            first.node_id,
+            second.node_id,
+            "related",
+            {"stable": True},
+        )
+        # Legacy/explicitly-authorized shared witnesses can still exist; the
+        # bound public writer simply cannot create them by payload replay.
+        await storage.db.execute_many(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            [(first.node_id, agent_b), (second.node_id, agent_b)],
+        )
+        await storage.db.execute(
+            "INSERT INTO graph_edge_owners "
+            "(source_id, target_id, label, agent_id) VALUES (?, ?, ?, ?)",
+            (first.node_id, second.node_id, "related", agent_b),
+        )
 
         await graph_a.delete_node(first.node_id)
 
@@ -700,6 +1116,42 @@ async def test_bound_delete_releases_only_callers_shared_witnesses(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_preserves_foreign_trusted_external_reference(tmp_path):
+    """Removing a parent node cannot erase a child's durable lineage edge."""
+    storage = await AsyncStorage.create_sqlite(str(tmp_path / "lineage-delete.db"))
+    parent = "did:test:lineage-parent"
+    child = "did:test:lineage-child"
+    parent_graph = AsyncGraphStore(storage.db, agent_id=parent)
+    child_graph = AsyncGraphStore(storage.db, agent_id=child)
+
+    try:
+        await parent_graph.add_node(GraphNode(parent, "agent", "Parent", {}))
+        await child_graph.add_node(GraphNode(child, "agent", "Child", {}))
+        await child_graph.add_trusted_cross_agent_edge(
+            child,
+            parent,
+            "spawned_by",
+            {"purpose": "lineage"},
+        )
+
+        await parent_graph.delete_node(parent)
+
+        assert await parent_graph.get_node(parent) is None
+        edges = await child_graph.get_edges(child, direction="out")
+        assert [(edge.target_id, edge.label) for edge in edges] == [
+            (parent, "spawned_by")
+        ]
+        owner = await storage.db.fetchone(
+            "SELECT agent_id FROM graph_edge_owners "
+            "WHERE source_id = ? AND target_id = ? AND label = ?",
+            (child, parent, "spawned_by"),
+        )
+        assert owner == (child,)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("agent_id", [None, ""])
 async def test_queryable_tables_fail_closed_without_proven_agent_identity(
     tmp_path, agent_id
@@ -714,23 +1166,44 @@ async def test_queryable_tables_fail_closed_without_proven_agent_identity(
             ("did:test:owner", "user", "must-not-leak", "{}"),
         )
 
-        result = await query_database_table(
-            _request(storage, agent_id),
-            "conversation_history",
-            limit=50,
-            offset=0,
-            search=None,
-        )
-        assert result["rows"] == []
-        assert result["total_rows"] == 0
+        with pytest.raises(HTTPException) as query_exc:
+            await query_database_table(
+                _request(storage, agent_id),
+                "conversation_history",
+                limit=50,
+                offset=0,
+                search=None,
+            )
+        assert query_exc.value.status_code == 503
 
-        listing = await list_database_tables(_request(storage, agent_id))
-        conversation = next(
-            table
-            for table in listing["tables"]
-            if table["name"] == "conversation_history"
+        with pytest.raises(HTTPException) as list_exc:
+            await list_database_tables(_request(storage, agent_id))
+        assert list_exc.value.status_code == 503
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_database_explorer_rejects_cross_wired_storage_capability(tmp_path):
+    storage = await AsyncStorage.create_sqlite(str(tmp_path / "cross-wired.db"))
+    try:
+        request = _request(
+            SimpleNamespace(db=storage.db, agent_id="did:test:storage-b"),
+            "did:test:request-a",
         )
-        assert conversation["row_count"] == 0
+        with pytest.raises(HTTPException) as query_exc:
+            await query_database_table(
+                request,
+                "conversation_history",
+                limit=50,
+                offset=0,
+                search=None,
+            )
+        assert query_exc.value.status_code == 503
+
+        with pytest.raises(HTTPException) as list_exc:
+            await list_database_tables(request)
+        assert list_exc.value.status_code == 503
     finally:
         await storage.close()
 

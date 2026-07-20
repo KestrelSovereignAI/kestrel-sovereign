@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -115,3 +116,30 @@ async def test_memory_status_survives_unavailable_index_health(monkeypatch):
     assert result.data["lexical_index"]["available"] is False
     assert "migration incomplete" in result.data["lexical_index"]["error"]
     assert result.data["embedding_profiles"]["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_memory_status_scopes_rag_count_by_chunk_and_file_owner(monkeypatch):
+    store = MagicMock()
+    store.agent_id = "did:test:lexical-feature"
+    store.encryption_enabled = False
+    store.get_lexical_index_health = AsyncMock(return_value={"coverage": 1.0})
+    store.get_embedding_profile_health = AsyncMock(return_value={})
+    feature = _feature_with_store(monkeypatch, store)
+    feature._db = MagicMock()
+    feature._db.fetchone = AsyncMock(side_effect=[(5,), (1,), (2,)])
+    feature.storage = SimpleNamespace(rag=object())
+    feature._memory_system = None
+    feature.agent.memory_system = None
+
+    result = await feature.memory_status()
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["rag"]["document_chunks"] == 1
+    rag_call = feature._db.fetchone.await_args_list[1]
+    assert "document_chunk_owners" in rag_call.args[0]
+    assert "file_owners" in rag_call.args[0]
+    assert rag_call.args[1] == (
+        "did:test:lexical-feature",
+        "did:test:lexical-feature",
+    )

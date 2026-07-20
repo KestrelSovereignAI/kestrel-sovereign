@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 from kestrel_sovereign.storage.async_graph_store import (
     record_graph_edge_owner,
     record_graph_node_owner,
+    release_graph_node_owners,
 )
 
 from .access_grant import (
@@ -32,7 +33,7 @@ from .identity_package import (
     SubstrateType,
     create_migration_id,
 )
-from .graph_namespace import namespace_imported_graph_node
+from .graph_namespace import namespace_imported_record
 
 if TYPE_CHECKING:
     from kestrel_sovereign.identity.portable_trust import IdentityTrustPolicy
@@ -664,26 +665,15 @@ class IdentityImporter:
                 (agent_id, node_id, node_id),
             )
             if not remaining_owned or remaining_owned[0] == 0:
-                await self.db.execute(
-                    "DELETE FROM graph_node_owners "
-                    "WHERE node_id = ? AND agent_id = ?",
-                    (node_id, agent_id),
-                )
-                await self.db.execute(
-                    "DELETE FROM graph_nodes "
-                    "WHERE node_id = ? AND node_type = ? "
-                    "AND NOT EXISTS ("
-                    "  SELECT 1 FROM graph_node_owners AS remaining_owner "
-                    "  WHERE remaining_owner.node_id = graph_nodes.node_id"
-                    ")",
-                    (node_id, node_type),
+                await release_graph_node_owners(
+                    self.db, [node_id], agent_id
                 )
 
     async def _import_episodes(self, agent_id: str, episodes: List[Dict[str, Any]]):
         """Import memory episodes."""
         count = 0
         for index, ep in enumerate(episodes):
-            new_id = f"{agent_id[:20]}_{ep['id']}"
+            new_id = namespace_imported_record(agent_id, ep["id"])
             await self.db.execute(
                 """INSERT OR REPLACE INTO memory_episodes
                    (id, agent_id, title, summary, timespan_start, timespan_end,
@@ -722,7 +712,7 @@ class IdentityImporter:
         """Import saved items."""
         count = 0
         for index, item in enumerate(items):
-            new_id = f"{agent_id[:20]}_{item['id']}"
+            new_id = namespace_imported_record(agent_id, item["id"])
             await self.db.execute(
                 """INSERT OR REPLACE INTO saved_items
                    (id, agent_id, item_type, name, summary, content, content_hash,
@@ -762,7 +752,7 @@ class IdentityImporter:
         """Import temporal patterns."""
         count = 0
         for index, pattern in enumerate(patterns):
-            new_id = f"{agent_id[:20]}_{pattern['id']}"
+            new_id = namespace_imported_record(agent_id, pattern["id"])
             await self.db.execute(
                 """INSERT OR REPLACE INTO temporal_patterns
                    (id, agent_id, pattern_type, description, trigger_conditions,
@@ -795,7 +785,7 @@ class IdentityImporter:
         """Import reflection insights."""
         count = 0
         for index, insight in enumerate(insights):
-            new_id = f"{agent_id[:20]}_{insight['id']}"
+            new_id = namespace_imported_record(agent_id, insight["id"])
             await self.db.execute(
                 """INSERT OR REPLACE INTO reflection_insights
                    (id, agent_id, type, title, description, evidence, confidence,
@@ -824,7 +814,7 @@ class IdentityImporter:
 
     def _namespace_node_id(self, agent_id: str, raw_id: str) -> str:
         """Place a package-supplied graph id in this full agent's namespace."""
-        return namespace_imported_graph_node(agent_id, raw_id)
+        return namespace_imported_record(agent_id, raw_id)
 
     async def _upsert_owned_graph_node(
         self,

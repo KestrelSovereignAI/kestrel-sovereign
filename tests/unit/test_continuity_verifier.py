@@ -5,6 +5,7 @@ Unit tests for the Continuity Verifier module.
 Tests identity challenges, verification, and migration certificates.
 """
 import pytest
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 from kestrel_sovereign.identity import (
@@ -23,6 +24,13 @@ from kestrel_sovereign.identity import (
     AuditTrail,
     verify_migration,
 )
+from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.db import TransactionError
+
+
+@asynccontextmanager
+async def _mock_transaction():
+    yield
 
 
 class TestIdentityChallenge:
@@ -435,6 +443,7 @@ class TestAuditTrail:
     async def test_record_migration(self):
         """Test recording a migration."""
         mock_db = AsyncMock()
+        mock_db.transaction = _mock_transaction
         trail = AuditTrail(db=mock_db)
 
         cert = MigrationCertificate(
@@ -459,7 +468,61 @@ class TestAuditTrail:
 
         # Verify database calls
         assert mock_db.execute.call_count == 4
-        assert mock_db.commit.called
+        mock_db.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_after_write", [1, 2, 3, 4])
+    async def test_record_migration_rolls_back_every_partial_write(
+        self, tmp_path, monkeypatch, fail_after_write
+    ):
+        """Node, edge, and both witnesses are one atomic audit record."""
+        storage = await AsyncStorage.create_sqlite(
+            str(tmp_path / f"audit-{fail_after_write}.db")
+        )
+        original_execute = storage.db.execute
+        writes = 0
+
+        async def fail_at_boundary(sql, params=()):
+            nonlocal writes
+            result = await original_execute(sql, params)
+            writes += 1
+            if writes == fail_after_write:
+                raise RuntimeError("injected audit write failure")
+            return result
+
+        monkeypatch.setattr(storage.db, "execute", fail_at_boundary)
+        trail = AuditTrail(db=storage.db)
+        cert = MigrationCertificate(
+            certificate_id="cert_atomic",
+            migration_id="mig_atomic",
+            source_did="did:source",
+            target_did="did:target",
+            source_substrate="anthropic:claude",
+            target_substrate="openai:gpt",
+            source_package_hash="hash123",
+            verification_score=0.85,
+            timestamp="2025-01-20T10:00:00Z",
+        )
+        score = ContinuityScore(
+            overall_score=0.85,
+            challenges_passed=8,
+            challenges_total=10,
+        )
+
+        try:
+            with pytest.raises(TransactionError, match="injected audit write failure"):
+                await trail.record_migration("did:agent", cert, score)
+
+            for table in (
+                "graph_nodes",
+                "graph_node_owners",
+                "graph_edges",
+                "graph_edge_owners",
+            ):
+                row = await storage.db.fetchone(f"SELECT COUNT(*) FROM {table}")
+                assert row == (0,)
+        finally:
+            await storage.close()
 
 
 class TestVerifyMigration:

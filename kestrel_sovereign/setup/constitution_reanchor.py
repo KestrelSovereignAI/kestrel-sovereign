@@ -542,6 +542,7 @@ async def _write_reanchor(
     async with AsyncStorage(str(db_path)) as storage:
         storage.graph.bind_agent(agent_did)
         storage.files.bind_agent(agent_did)
+        storage.rag.bind_agent(agent_did)
         async with storage.db.transaction():
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
             stored_hash = await storage.files.store_file(

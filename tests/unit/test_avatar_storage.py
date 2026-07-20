@@ -4,6 +4,8 @@ import pytest
 import json
 from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+from kestrel_sovereign.storage.db import TransactionError
 
 
 @pytest.fixture
@@ -82,9 +84,14 @@ class TestAvatarStorage:
 
         assert row is not None
         assert row[0] == agent_id  # source_id
-        assert row[1] == content_hash  # target_id
+        assert row[1] != content_hash  # tenant/type-namespaced graph id
         props = json.loads(row[3])
         assert props["avatar_type"] == "primary"
+        avatar = await file_store.db.fetchone(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?",
+            (row[1],),
+        )
+        assert json.loads(avatar[0])["hash"] == content_hash
 
     @pytest.mark.asyncio
     async def test_store_avatar_updates_agent_node_property(self, file_store_with_agent):
@@ -189,6 +196,64 @@ class TestAvatarStorage:
         hash2 = await file_store.store_avatar(same_image, agent_id, "variant_1")
 
         assert hash1 == hash2  # Same content = same hash
+        assert await file_store.get_agent_avatar(agent_id, "primary") == same_image
+        assert await file_store.get_agent_avatar(agent_id, "variant_1") == same_image
+
+    @pytest.mark.asyncio
+    async def test_identical_avatar_bytes_keep_tenant_graph_metadata_separate(
+        self, tmp_path
+    ):
+        db = await AsyncDatabase.sqlite(str(tmp_path / "shared-avatar.db"))
+        agent_a = "did:test:avatar-a"
+        agent_b = "did:test:avatar-b"
+        store_a = AsyncFileStore(db, agent_id=agent_a)
+        store_b = AsyncFileStore(db, agent_id=agent_b)
+        image = b"same-avatar-bytes"
+        try:
+            hash_a = await store_a.store_avatar(image, agent_a, "primary")
+            hash_b = await store_b.store_avatar(image, agent_b, "primary")
+
+            assert hash_a == hash_b
+            assert await store_a.get_agent_avatar(agent_a, "primary") == image
+            assert await store_b.get_agent_avatar(agent_b, "primary") == image
+            nodes = await db.fetchall(
+                "SELECT node_id, properties FROM graph_nodes "
+                "WHERE node_type = 'avatar' ORDER BY node_id"
+            )
+            assert len(nodes) == 2
+            assert nodes[0][0] != nodes[1][0]
+            assert {json.loads(row[1])["agent_id"] for row in nodes} == {
+                agent_a,
+                agent_b,
+            }
+            assert await db.fetchall(
+                "SELECT agent_id FROM file_owners "
+                "WHERE content_hash = ? ORDER BY agent_id",
+                (hash_a,),
+            ) == [(agent_a,), (agent_b,)]
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_store_avatar_rolls_back_file_reference_on_graph_failure(
+        self, file_store, monkeypatch
+    ):
+        async def fail_graph_write(*_args, **_kwargs):
+            raise RuntimeError("injected avatar graph failure")
+
+        monkeypatch.setattr(AsyncGraphStore, "add_node", fail_graph_write)
+        with pytest.raises(TransactionError, match="injected avatar graph failure"):
+            await file_store.store_avatar(
+                b"must-rollback", "did:test:avatar-rollback", "primary"
+            )
+
+        assert await file_store.db.fetchone("SELECT COUNT(*) FROM files") == (0,)
+        assert await file_store.db.fetchone(
+            "SELECT COUNT(*) FROM file_owners"
+        ) == (0,)
+        assert await file_store.db.fetchone(
+            "SELECT COUNT(*) FROM graph_node_owners"
+        ) == (0,)
 
     @pytest.mark.asyncio
     async def test_avatar_metadata_includes_source_url(self, file_store):

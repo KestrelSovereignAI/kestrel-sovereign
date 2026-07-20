@@ -27,7 +27,7 @@ from .identity_package import (
     SubstrateType,
     IDENTITY_PACKAGE_VERSION,
 )
-from .graph_namespace import strip_imported_graph_namespace
+from .graph_namespace import strip_imported_record_namespace
 from .personality_analyzer import PersonalityAnalyzer, generate_calibration_prompt
 
 if TYPE_CHECKING:
@@ -346,7 +346,7 @@ class IdentityExporter:
         episodes = []
         for row in rows:
             episodes.append({
-                "id": row[0],
+                "id": self._strip_own_namespace(row[0]),
                 "title": row[1],
                 "summary": row[2],
                 "timespan_start": row[3],
@@ -374,7 +374,7 @@ class IdentityExporter:
         items = []
         for row in rows:
             items.append({
-                "id": row[0],
+                "id": self._strip_own_namespace(row[0]),
                 "item_type": row[1],
                 "name": row[2],
                 "summary": row[3],
@@ -404,7 +404,7 @@ class IdentityExporter:
         patterns = []
         for row in rows:
             patterns.append({
-                "id": row[0],
+                "id": self._strip_own_namespace(row[0]),
                 "pattern_type": row[1],
                 "description": row[2],
                 "trigger_conditions": json.loads(row[3]) if row[3] else {},
@@ -429,7 +429,7 @@ class IdentityExporter:
         insights = []
         for row in rows:
             insights.append({
-                "id": row[0],
+                "id": self._strip_own_namespace(row[0]),
                 "insight_type": row[1],  # 'type' column maps to insight_type
                 "title": row[2],
                 "description": row[3],
@@ -443,7 +443,7 @@ class IdentityExporter:
 
     def _strip_own_namespace(self, node_id: str) -> str:
         """Strip this agent's current or legacy import namespace (F186)."""
-        return strip_imported_graph_namespace(self.agent_id, node_id)
+        return strip_imported_record_namespace(self.agent_id, node_id)
 
     async def _get_relationships(self) -> List[RelationshipRecord]:
         """

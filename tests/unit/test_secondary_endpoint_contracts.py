@@ -74,6 +74,7 @@ def test_database_table_query_contract_supports_search_and_pagination():
     db.fetchone = AsyncMock(return_value=(3,))
     storage = MagicMock(db=db)
     storage.privacy_config = None
+    storage.agent_id = "did:test:database-contract"
     agent = MagicMock(storage=storage, agent_id="did:test:database-contract")
 
     app, original = _prepare_app(agent)

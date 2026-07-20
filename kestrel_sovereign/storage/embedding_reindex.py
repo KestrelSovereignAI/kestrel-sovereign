@@ -95,10 +95,32 @@ _TABLE_SPECS: Dict[str, _TableSpec] = {
     "document_chunks": _TableSpec(
         name="document_chunks",
         id_col="chunk_id",
-        agent_col=None,  # global — no agent scoping
+        agent_col=None,  # scoped through document_chunk_owners below
         text_cols=("content",),
     ),
 }
+
+
+def _agent_scope(
+    spec: _TableSpec,
+    agent_id: Optional[str],
+) -> Tuple[str, List[Any]]:
+    """Return the table-specific tenant predicate used by every sweep."""
+    if not agent_id:
+        return "", []
+    if spec.agent_col:
+        return f"{spec.agent_col} = ?", [agent_id]
+    if spec.name == "document_chunks":
+        return (
+            "EXISTS (SELECT 1 FROM document_chunk_owners chunk_owner "
+            "WHERE chunk_owner.chunk_id = document_chunks.chunk_id "
+            "AND chunk_owner.agent_id = ?) "
+            "AND EXISTS (SELECT 1 FROM file_owners file_owner "
+            "WHERE file_owner.content_hash = document_chunks.file_hash "
+            "AND file_owner.agent_id = ?)",
+            [agent_id, agent_id],
+        )
+    return "", []
 
 
 def _serialize_embedding(embedding: Sequence[float]) -> bytes:
@@ -159,10 +181,9 @@ async def dominant_embedding_profile(
     counts: Dict[str, int] = {}
     for table, spec in _TABLE_SPECS.items():
         where = "embedding_profile_id IS NOT NULL"
-        params: List[Any] = []
-        if spec.agent_col and agent_id:
-            where += f" AND {spec.agent_col} = ?"
-            params.append(agent_id)
+        scope, params = _agent_scope(spec, agent_id)
+        if scope:
+            where += f" AND {scope}"
         try:
             rows = await db.fetchall(
                 f"SELECT embedding_profile_id, COUNT(*) FROM {spec.name} "
@@ -282,9 +303,10 @@ class EmbeddingReindexer:
             "OR embedding_profile_id <> ?)"
         )
         params: List[Any] = [self.target]
-        if spec.agent_col and agent_id:
-            clause += f" AND {spec.agent_col} = ?"
-            params.append(agent_id)
+        scope, scope_params = _agent_scope(spec, agent_id)
+        if scope:
+            clause += f" AND {scope}"
+            params.extend(scope_params)
         return clause, params
 
     async def count_stale(self, table: str, agent_id: Optional[str] = None) -> int:
@@ -434,25 +456,41 @@ class EmbeddingReindexer:
 
     # ------------------------------------------------------------------- write
 
-    async def _write_row(self, spec: _TableSpec, row_id: Any, embedding: List[float]) -> None:
+    async def _write_row(
+        self,
+        spec: _TableSpec,
+        row_id: Any,
+        embedding: List[float],
+        agent_id: Optional[str] = None,
+    ) -> None:
         """Stamp a single row with the new vector + target profile id."""
+        scope, scope_params = _agent_scope(spec, agent_id)
+        where = f"{spec.id_col} = ?"
+        if scope:
+            where += f" AND {scope}"
         if self.backend_type == "postgres":
             await self.db.execute_commit(
                 f"UPDATE {spec.name} SET embedding_vec = ?::vector, "
-                f"embedding_profile_id = ? WHERE {spec.id_col} = ?",
-                (_format_pgvector_text(embedding), self.target, row_id),
+                f"embedding_profile_id = ? WHERE {where}",
+                (_format_pgvector_text(embedding), self.target, row_id)
+                + tuple(scope_params),
             )
         else:
             await self.db.execute_commit(
                 f"UPDATE {spec.name} SET embedding_vec = ?, "
-                f"embedding_profile_id = ? WHERE {spec.id_col} = ?",
-                (_serialize_embedding(embedding), self.target, row_id),
+                f"embedding_profile_id = ? WHERE {where}",
+                (_serialize_embedding(embedding), self.target, row_id)
+                + tuple(scope_params),
             )
 
     # ------------------------------------------------------------- embed+write
 
     async def _embed_and_write(
-        self, spec: _TableSpec, pending: List[Tuple[Any, str]], stats: ReindexStats
+        self,
+        spec: _TableSpec,
+        pending: List[Tuple[Any, str]],
+        stats: ReindexStats,
+        agent_id: Optional[str] = None,
     ) -> None:
         """Embed *pending* rows, halving-retrying a transient wholesale failure.
 
@@ -498,8 +536,12 @@ class EmbeddingReindexer:
             )
             if self.retry_backoff_s:
                 await asyncio.sleep(self.retry_backoff_s)
-            await self._embed_and_write(spec, pending[:half], stats)
-            await self._embed_and_write(spec, pending[half:], stats)
+            await self._embed_and_write(
+                spec, pending[:half], stats, agent_id=agent_id
+            )
+            await self._embed_and_write(
+                spec, pending[half:], stats, agent_id=agent_id
+            )
             return
 
         empty_in_batch = 0
@@ -520,7 +562,9 @@ class EmbeddingReindexer:
                 stats.skipped_dim_mismatch += 1
                 continue
             try:
-                await self._write_row(spec, row_id, list(embedding))
+                await self._write_row(
+                    spec, row_id, list(embedding), agent_id=agent_id
+                )
                 stats.reembedded += 1
             except Exception as exc:
                 logger.warning(
@@ -587,7 +631,9 @@ class EmbeddingReindexer:
                 pending.append((row_id, text))
 
             if pending:
-                await self._embed_and_write(spec, pending, stats)
+                await self._embed_and_write(
+                    spec, pending, stats, agent_id=agent_id
+                )
 
             if progress is not None:
                 progress(stats)

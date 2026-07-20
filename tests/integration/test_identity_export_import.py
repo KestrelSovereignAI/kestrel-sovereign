@@ -25,6 +25,7 @@ from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 from kestrel_sovereign.identity.graph_namespace import (
     namespace_imported_graph_node,
+    namespace_imported_record,
 )
 
 
@@ -839,8 +840,10 @@ class TestIdentityImporter:
 
         assert result.stats.get("episodes_imported") == 1
 
-        # Verify in database - ID is prefixed with agent_id[:20]
-        expected_id = f"{sample_package.did[:20]}_ep_import_001"
+        # Imported row ids use the complete DID so peer agents cannot collide.
+        expected_id = namespace_imported_record(
+            sample_package.did, "ep_import_001"
+        )
         row = await test_db.fetchone(
             "SELECT title FROM memory_episodes WHERE id = ?",
             (expected_id,)
@@ -856,8 +859,10 @@ class TestIdentityImporter:
 
         assert result.stats.get("saved_items_imported") == 1
 
-        # Verify in database - ID is prefixed with agent_id[:20]
-        expected_id = f"{sample_package.did[:20]}_item_import_001"
+        # Imported row ids use the complete DID so peer agents cannot collide.
+        expected_id = namespace_imported_record(
+            sample_package.did, "item_import_001"
+        )
         row = await test_db.fetchone(
             "SELECT name FROM saved_items WHERE id = ?",
             (expected_id,)
