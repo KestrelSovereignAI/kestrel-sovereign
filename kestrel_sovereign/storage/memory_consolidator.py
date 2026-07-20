@@ -685,6 +685,7 @@ class MemoryConsolidator:
                     label=episode.title,
                     properties={
                         "source": "consolidator",
+                        "agent_id": self.agent_id,
                         "summary": episode.summary,
                         "emotional_arc": episode.emotional_arc,
                         "message_count": len(episode.key_message_ids),

@@ -27,6 +27,7 @@ from .identity_package import (
     SubstrateType,
     IDENTITY_PACKAGE_VERSION,
 )
+from .graph_namespace import strip_imported_graph_namespace
 from .personality_analyzer import PersonalityAnalyzer, generate_calibration_prompt
 
 if TYPE_CHECKING:
@@ -232,8 +233,13 @@ class IdentityExporter:
         """Get agent metadata from graph."""
         row = await self.db.fetchone(
             """SELECT properties FROM graph_nodes
-               WHERE node_id = ? AND node_type = 'agent'""",
-            (self.agent_id,)
+               WHERE node_id = ? AND node_type = 'agent'
+               AND EXISTS (
+                   SELECT 1 FROM graph_node_owners
+                   WHERE graph_node_owners.node_id = graph_nodes.node_id
+                   AND graph_node_owners.agent_id = ?
+               )""",
+            (self.agent_id, self.agent_id)
         )
         if row and row[0]:
             return json.loads(row[0])
@@ -254,7 +260,9 @@ class IdentityExporter:
             # its own constitution check on import (#2505 live Kite gate).
             from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 
-            content = await AsyncFileStore(self.db).retrieve_file(constitution_hash)
+            content = await AsyncFileStore(
+                self.db, agent_id=self.agent_id
+            ).retrieve_file(constitution_hash)
             if content is not None:
                 text = content.decode("utf-8")
                 return {"hash": constitution_hash, "text": text}
@@ -434,21 +442,8 @@ class IdentityExporter:
         return insights
 
     def _strip_own_namespace(self, node_id: str) -> str:
-        """Strip THIS agent's import namespace prefix (``agent_id[:20]_``) from a
-        graph node id so the exported package carries the RAW logical id (F186).
-
-        The importer writes package-supplied user/skill nodes under
-        ``{importer[:20]}_{raw_id}`` (see IdentityImporter._namespace_node_id).
-        Without stripping on export, a node imported as ``{me[:20]}_alice`` would
-        be re-exported namespaced and re-prefixed on the next import
-        (``{next[:20]}_{me[:20]}_alice``), growing the prefix every migration hop
-        and never matching a live node. Stripping our own prefix makes the
-        export/import roundtrip idempotent: alice -> {A}_alice -> alice -> {B}_alice.
-        """
-        prefix = f"{self.agent_id[:20]}_"
-        if node_id and node_id.startswith(prefix):
-            return node_id[len(prefix):]
-        return node_id
+        """Strip this agent's current or legacy import namespace (F186)."""
+        return strip_imported_graph_namespace(self.agent_id, node_id)
 
     async def _get_relationships(self) -> List[RelationshipRecord]:
         """
@@ -461,8 +456,15 @@ class IdentityExporter:
             """SELECT gn.node_id, gn.properties, ge.label
                FROM graph_nodes gn
                JOIN graph_edges ge ON gn.node_id = ge.target_id
+               JOIN graph_node_owners gno
+                 ON gno.node_id = gn.node_id AND gno.agent_id = ?
+               JOIN graph_edge_owners geo
+                 ON geo.source_id = ge.source_id
+                AND geo.target_id = ge.target_id
+                AND geo.label = ge.label
+                AND geo.agent_id = ?
                WHERE ge.source_id = ? AND gn.node_type = 'user'""",
-            (self.agent_id,)
+            (self.agent_id, self.agent_id, self.agent_id)
         )
 
         relationships = []
@@ -497,13 +499,20 @@ class IdentityExporter:
         # 1. Load persisted skill data from graph (keyed by skill_id)
         graph_skills: Dict[str, Dict[str, Any]] = {}
         rows = await self.db.fetchall(
-            """SELECT node_id, label, properties FROM graph_nodes
-               WHERE node_type = 'skill'
-               AND node_id IN (
-                   SELECT target_id FROM graph_edges
-                   WHERE source_id = ? AND label = 'has_skill'
-               )""",
-            (self.agent_id,)
+            """SELECT gn.node_id, gn.label, gn.properties
+               FROM graph_nodes gn
+               JOIN graph_node_owners gno
+                 ON gno.node_id = gn.node_id AND gno.agent_id = ?
+               JOIN graph_edges ge
+                 ON ge.target_id = gn.node_id
+                AND ge.source_id = ? AND ge.label = 'has_skill'
+               JOIN graph_edge_owners geo
+                 ON geo.source_id = ge.source_id
+                AND geo.target_id = ge.target_id
+                AND geo.label = ge.label
+                AND geo.agent_id = ?
+               WHERE gn.node_type = 'skill'""",
+            (self.agent_id, self.agent_id, self.agent_id)
         )
         for row in rows:
             props = json.loads(row[2]) if row[2] else {}
@@ -605,13 +614,20 @@ class IdentityExporter:
     async def _get_migration_history(self) -> List[MigrationRecord]:
         """Get previous migration records."""
         rows = await self.db.fetchall(
-            """SELECT node_id, properties FROM graph_nodes
-               WHERE node_type = 'migration_record'
-               AND node_id IN (
-                   SELECT target_id FROM graph_edges
-                   WHERE source_id = ? AND label = 'migrated_via'
-               )""",
-            (self.agent_id,)
+            """SELECT gn.node_id, gn.properties
+               FROM graph_nodes gn
+               JOIN graph_node_owners gno
+                 ON gno.node_id = gn.node_id AND gno.agent_id = ?
+               JOIN graph_edges ge
+                 ON ge.target_id = gn.node_id
+                AND ge.source_id = ? AND ge.label = 'migrated_via'
+               JOIN graph_edge_owners geo
+                 ON geo.source_id = ge.source_id
+                AND geo.target_id = ge.target_id
+                AND geo.label = ge.label
+                AND geo.agent_id = ?
+               WHERE gn.node_type = 'migration_record'""",
+            (self.agent_id, self.agent_id, self.agent_id)
         )
 
         records = []

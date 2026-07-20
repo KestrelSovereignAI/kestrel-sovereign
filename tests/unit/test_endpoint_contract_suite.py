@@ -60,8 +60,8 @@ def test_files_head_uses_existence_check_contract():
     file_store = MagicMock()
     file_store.file_exists = AsyncMock(return_value=True)
     file_store.get_file_metadata = AsyncMock(return_value=None)
-    storage = MagicMock(files=file_store)
-    agent = MagicMock(storage=storage)
+    storage = MagicMock(files=file_store, agent_id="did:test:file-head")
+    agent = MagicMock(storage=storage, agent_id="did:test:file-head")
 
     app, original = _prepare_app(agent)
     try:

@@ -4,7 +4,10 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
-from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    privacy_hides_persisted,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,7 @@ ALLOWED_TABLES = frozenset({
 })
 
 
-def _agent_scope(table_name, column_names, agent_id, backend_type):
+def _agent_scope(table_name, column_names, agent_id, _backend_type):
     """Return ``(condition, params)`` scoping a query to one agent, else ``(None, [])``.
 
     Cross-agent isolation only matters in a shared-DB deployment (the default
@@ -25,12 +28,17 @@ def _agent_scope(table_name, column_names, agent_id, backend_type):
     scopes it*, so the explorer never exposes more than the app does:
 
       - ``conversation_history``: physical ``agent_id`` column.
-      - ``graph_nodes``: ``agent_id`` lives inside the JSON ``properties``.
-      - ``graph_edges``: an edge belongs to the agent if it touches one of
-        the agent's nodes (mirrors the scoped purge in async_graph_store).
+      - ``graph_nodes``: ``graph_node_owners`` is the authoritative,
+        many-to-many ownership ledger (shared content-addressed nodes may have
+        more than one owner).
+      - ``graph_edges``: ``graph_edge_owners`` scopes the edge itself.  Edge
+        visibility is never inferred from one endpoint, which would disclose
+        another tenant's node identifier and edge payload.
 
-    File-content tables are deliberately not queryable because their current
-    schemas do not carry an agent owner or provide an agent-scoped mapping.
+    File-content tables remain deliberately non-queryable even though
+    ``file_owners`` now scopes file access: the explorer has no reason to emit
+    raw BLOBs or per-reference metadata when the file API is the narrower
+    capability.
     Queryable tables fail closed to an empty scope when the requesting agent
     or the ownership columns required by the schema are unavailable.
     """
@@ -41,33 +49,29 @@ def _agent_scope(table_name, column_names, agent_id, backend_type):
         return None, []
     if "agent_id" in column_names:
         return "agent_id = ?", [agent_id]
-    node_agent = (
-        "(properties::jsonb->>'agent_id')"
-        if backend_type == "postgres"
-        else "json_extract(properties, '$.agent_id')"
-    )
     if table_name == "graph_nodes":
-        if "properties" not in column_names:
+        if "node_id" not in column_names:
             return "1 = 0", []
-        return f"{node_agent} = ?", [agent_id]
-    if table_name == "graph_edges":
-        if not {"source_id", "target_id"}.issubset(column_names):
-            return "1 = 0", []
-        owned = f"SELECT node_id FROM graph_nodes WHERE {node_agent} = ?"
         return (
-            f"(source_id IN ({owned}) OR target_id IN ({owned}))",
-            [agent_id, agent_id],
+            "EXISTS (SELECT 1 FROM graph_node_owners AS graph_scope_owner "
+            "WHERE graph_scope_owner.node_id = graph_nodes.node_id "
+            "AND graph_scope_owner.agent_id = ?)",
+            [agent_id],
+        )
+    if table_name == "graph_edges":
+        if not {"source_id", "target_id", "label"}.issubset(column_names):
+            return "1 = 0", []
+        return (
+            "EXISTS (SELECT 1 FROM graph_edge_owners AS graph_scope_owner "
+            "WHERE graph_scope_owner.source_id = graph_edges.source_id "
+            "AND graph_scope_owner.target_id = graph_edges.target_id "
+            "AND graph_scope_owner.label = graph_edges.label "
+            "AND graph_scope_owner.agent_id = ?)",
+            [agent_id],
         )
     if table_name in ALLOWED_TABLES:
         return "1 = 0", []
     return None, []
-
-
-def _privacy_hides_persisted(storage) -> bool:
-    """True when the agent's privacy mode (EPHEMERAL/ISOLATED) means persisted
-    rows are not part of its visible state and must not be surfaced raw."""
-    pconf = getattr(storage, "privacy_config", None)
-    return pconf is not None and (pconf.is_ephemeral() or pconf.uses_temp_storage())
 
 
 async def _list_table_names(db):
@@ -170,7 +174,7 @@ async def list_database_tables(request: Request):
                 )
                 # For agent-scoped tables, EPHEMERAL/ISOLATED modes must not
                 # reveal that persisted rows exist, so report the count as 0.
-                if scope_cond is not None and _privacy_hides_persisted(storage):
+                if scope_cond is not None and privacy_hides_persisted(storage):
                     row_count = 0
                 else:
                     where_clause = f"WHERE {scope_cond}" if scope_cond else ""
@@ -194,12 +198,15 @@ async def list_database_tables(request: Request):
         # The endpoint has no trustworthy tenant-exclusivity signal for the
         # physical database. In shared deployments its aggregate byte size is
         # cross-agent activity metadata, while its path discloses host layout.
-        # Keep size present as the explorer's established unavailable sentinel
-        # and omit the path entirely until storage can prove exclusive custody.
+        # Keep both established response fields present with non-disclosing
+        # sentinels until storage can prove exclusive custody.  ``db_path`` was
+        # part of the public response before the isolation fix, so removing the
+        # key outright needlessly breaks API consumers.
         return {
             "tables": tables,
             "table_count": len(tables),
             "db_size": -1,
+            "db_path": None,
         }
     except HTTPException:
         raise
@@ -253,7 +260,7 @@ async def query_database_table(
         # bypassing the privacy wrapper. For agent-scoped tables, EPHEMERAL
         # and ISOLATED modes promise the persisted rows are not part of the
         # agent's visible state, so don't surface them here either (#1651).
-        if scope_cond is not None and _privacy_hides_persisted(storage):
+        if scope_cond is not None and privacy_hides_persisted(storage):
             return {
                 "table": table_name,
                 "columns": columns,

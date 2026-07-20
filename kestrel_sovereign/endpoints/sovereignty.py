@@ -4,14 +4,17 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pathlib import Path
 import json
+import os
 import re
 import time
-import os
 import logging
 from typing import Any, Dict
 
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
-from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    privacy_hides_persisted,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +27,6 @@ router = APIRouter(prefix="/api", tags=["sovereignty"])
 # CWD; after the move into the package (codex review v3 on PR #1097)
 # the package-relative path no longer matches the operator's cache,
 # so the file browser silently listed the wrong directory.
-import os
 STORAGE_CACHE_DIR = Path(
     os.environ.get("KESTREL_CACHE_DIR") or "storage_cache"
 ).resolve()
@@ -103,45 +105,48 @@ async def get_storage_stats(request: Request):
     try:
         agent = get_agent(request)
         storage = agent.storage
-        db_path = storage.db_path
+        agent_id = getattr(agent, "agent_id", None)
+        if getattr(storage, "agent_id", None) != agent_id:
+            agent_id = None
+        if privacy_hides_persisted(storage):
+            agent_id = None
 
-        db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
-
-        # Use async database query with agent_id filter
-        agent_id = getattr(storage, 'agent_id', '') or getattr(storage._storage, 'agent_id', '')
+        # Missing identity cannot authorize any tenant rows.
         conv_row = await storage.db.fetchone(
             "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
-            (agent_id,)
-        )
+            (agent_id or "",),
+        ) if agent_id else None
         conversation_count = conv_row[0] if conv_row else 0
 
-        # Use async database query for graph nodes
         node_rows = await storage.db.fetchall(
-            "SELECT node_type, COUNT(*) FROM graph_nodes GROUP BY node_type"
-        )
+            "SELECT nodes.node_type, COUNT(*) "
+            "FROM graph_nodes nodes "
+            "JOIN graph_node_owners owners ON owners.node_id = nodes.node_id "
+            "WHERE owners.agent_id = ? GROUP BY nodes.node_type",
+            (agent_id,),
+        ) if agent_id else []
         node_counts = dict(node_rows) if node_rows else {}
 
-        try:
-            file_row = await storage.db.fetchone(
-                "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) FROM files"
-            )
-            file_count = file_row[0] if file_row else 0
-            file_size = file_row[1] if file_row else 0
-        except Exception:
-            file_count = 0
-            file_size = 0
-
-        # Use async storage methods
-        exports = await storage.get_nodes_by_type("sovereignty_receipt")
-        backups = await storage.get_nodes_by_type("backup_artifact")
+        file_row = await storage.db.fetchone(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(files.content)), 0) "
+            "FROM files JOIN file_owners owners "
+            "ON owners.content_hash = files.content_hash "
+            "WHERE owners.agent_id = ?",
+            (agent_id,),
+        ) if agent_id else None
+        file_count = file_row[0] if file_row else 0
+        file_size = file_row[1] if file_row else 0
 
         return {
-            "database": {"path": db_path, "size_bytes": db_size},
+            # Physical path/size are host-layout and cross-tenant activity
+            # metadata. Preserve the response keys with non-disclosing
+            # sentinels until storage has an explicit exclusivity capability.
+            "database": {"path": None, "size_bytes": -1},
             "conversations": {"count": conversation_count},
             "graph_nodes": node_counts,
             "files": {"count": file_count, "size_bytes": file_size},
-            "sovereignty_exports": len(exports),
-            "backups": len(backups),
+            "sovereignty_exports": node_counts.get("sovereignty_receipt", 0),
+            "backups": node_counts.get("backup_artifact", 0),
         }
     except HTTPException:
         raise

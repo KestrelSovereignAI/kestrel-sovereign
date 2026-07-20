@@ -128,6 +128,13 @@ class AssociativeLinker:
         """
         categorized = self._extract_concepts_categorized(content)
 
+        # The message node is the durable source for schema-routed action and
+        # decision edges too, not only for concept mentions.  Create it before
+        # the empty-concept return so the downstream router never leaves an
+        # orphan typed node when a commitment contains no recognized concept.
+        message_node_id = f"message:{agent_id}:{message_id}"
+        await self._ensure_message_node(message_node_id, message_id, agent_id)
+
         if not categorized:
             return []
 
@@ -138,9 +145,6 @@ class AssociativeLinker:
             await self._ensure_concept_node(label, agent_id)
 
         # Create message → concept links
-        message_node_id = f"message:{agent_id}:{message_id}"
-        await self._ensure_message_node(message_node_id, message_id)
-
         linked: List[LinkedConcept] = []
         for label, category in categorized:
             concept_node_id = f"concept:{agent_id}:{label}"
@@ -254,7 +258,8 @@ class AssociativeLinker:
     async def _ensure_message_node(
         self,
         node_id: str,
-        message_id: str
+        message_id: str,
+        agent_id: str,
     ) -> None:
         """Create message node if it doesn't exist."""
         existing = await self.graph.get_node(node_id)
@@ -265,6 +270,7 @@ class AssociativeLinker:
                 label=f"Message {message_id}",
                 properties={
                     "message_id": message_id,
+                    "agent_id": agent_id,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
             ))

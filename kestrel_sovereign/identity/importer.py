@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
+from kestrel_sovereign.storage.async_graph_store import (
+    record_graph_edge_owner,
+    record_graph_node_owner,
+)
+
 from .access_grant import (
     DataAccessGrant,
     REJECT_HOST_POLICY,
@@ -27,6 +32,7 @@ from .identity_package import (
     SubstrateType,
     create_migration_id,
 )
+from .graph_namespace import namespace_imported_graph_node
 
 if TYPE_CHECKING:
     from kestrel_sovereign.identity.portable_trust import IdentityTrustPolicy
@@ -468,10 +474,18 @@ class IdentityImporter:
             """SELECT COUNT(*)
                FROM graph_edges ge
                JOIN graph_nodes gn ON gn.node_id = ge.target_id
+               JOIN graph_edge_owners geo
+                 ON geo.source_id = ge.source_id
+                AND geo.target_id = ge.target_id
+                AND geo.label = ge.label
+                AND geo.agent_id = ?
+               JOIN graph_node_owners gno
+                 ON gno.node_id = gn.node_id
+                AND gno.agent_id = ?
                WHERE ge.source_id = ?
                  AND (gn.node_type = 'user'
                       OR (gn.node_type = 'skill' AND ge.label = 'has_skill'))""",
-            (agent_id,),
+            (agent_id, agent_id, agent_id),
         )
         return bool(row and row[0] > 0)
 
@@ -602,9 +616,20 @@ class IdentityImporter:
         query = (
             "SELECT DISTINCT gn.node_id FROM graph_nodes gn "
             "JOIN graph_edges ge ON gn.node_id = ge.target_id "
+            "JOIN graph_node_owners gno "
+            "  ON gno.node_id = gn.node_id AND gno.agent_id = ? "
+            "JOIN graph_edge_owners geo "
+            "  ON geo.source_id = ge.source_id "
+            " AND geo.target_id = ge.target_id "
+            " AND geo.label = ge.label AND geo.agent_id = ? "
             "WHERE ge.source_id = ? AND gn.node_type = ?"
         )
-        query_params: tuple[Any, ...] = (agent_id, node_type)
+        query_params: tuple[Any, ...] = (
+            agent_id,
+            agent_id,
+            agent_id,
+            node_type,
+        )
         if label is not None:
             query += " AND ge.label = ?"
             query_params += (label,)
@@ -612,23 +637,45 @@ class IdentityImporter:
 
         for row in rows:
             node_id = row[0]
-            delete_sql = (
-                "DELETE FROM graph_edges WHERE source_id = ? AND target_id = ?"
-            )
+            delete_condition = "source_id = ? AND target_id = ?"
             delete_params: tuple[Any, ...] = (agent_id, node_id)
             if label is not None:
-                delete_sql += " AND label = ?"
+                delete_condition += " AND label = ?"
                 delete_params += (label,)
-            await self.db.execute(delete_sql, delete_params)
-
-            remaining = await self.db.fetchone(
-                "SELECT COUNT(*) FROM graph_edges "
-                "WHERE source_id = ? OR target_id = ?",
-                (node_id, node_id),
+            await self.db.execute(
+                f"DELETE FROM graph_edge_owners WHERE {delete_condition} "
+                "AND agent_id = ?",
+                delete_params + (agent_id,),
             )
-            if not remaining or remaining[0] == 0:
+            await self.db.execute(
+                f"DELETE FROM graph_edges WHERE {delete_condition} "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM graph_edge_owners AS remaining_owner "
+                "  WHERE remaining_owner.source_id = graph_edges.source_id "
+                "  AND remaining_owner.target_id = graph_edges.target_id "
+                "  AND remaining_owner.label = graph_edges.label"
+                ")",
+                delete_params,
+            )
+
+            remaining_owned = await self.db.fetchone(
+                "SELECT COUNT(*) FROM graph_edge_owners "
+                "WHERE agent_id = ? AND (source_id = ? OR target_id = ?)",
+                (agent_id, node_id, node_id),
+            )
+            if not remaining_owned or remaining_owned[0] == 0:
                 await self.db.execute(
-                    "DELETE FROM graph_nodes WHERE node_id = ? AND node_type = ?",
+                    "DELETE FROM graph_node_owners "
+                    "WHERE node_id = ? AND agent_id = ?",
+                    (node_id, agent_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM graph_nodes "
+                    "WHERE node_id = ? AND node_type = ? "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM graph_node_owners AS remaining_owner "
+                    "  WHERE remaining_owner.node_id = graph_nodes.node_id"
+                    ")",
                     (node_id, node_type),
                 )
 
@@ -776,14 +823,84 @@ class IdentityImporter:
         logger.info(f"Imported {count} reflection insights")
 
     def _namespace_node_id(self, agent_id: str, raw_id: str) -> str:
-        """Prefix a package-supplied node id with the importing agent's id.
+        """Place a package-supplied graph id in this full agent's namespace."""
+        return namespace_imported_graph_node(agent_id, raw_id)
 
-        F186: mirrors the ``agent_id[:20]_...`` prefixing that episodes /
-        saved_items already use, so package-supplied graph node ids can't
-        be written unnamespaced (and therefore can't collide with — and
-        overwrite — arbitrary existing ``graph_nodes`` rows).
-        """
-        return f"{agent_id[:20]}_{raw_id}"
+    async def _upsert_owned_graph_node(
+        self,
+        agent_id: str,
+        *,
+        node_id: str,
+        node_type: str,
+        label: str,
+        properties: str,
+    ) -> None:
+        """Insert or update one import-owned node without claiming collisions."""
+        existing = await self.db.fetchone(
+            "SELECT 1 FROM graph_nodes WHERE node_id = ?",
+            (node_id,),
+        )
+        if existing:
+            owner_rows = await self.db.fetchall(
+                "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+                (node_id,),
+            )
+            if {row[0] for row in owner_rows} != {agent_id}:
+                raise ValueError(
+                    "import graph node id is unowned or owned by another agent"
+                )
+            await self.db.execute(
+                "UPDATE graph_nodes SET node_type = ?, label = ?, properties = ? "
+                "WHERE node_id = ?",
+                (node_type, label, properties, node_id),
+            )
+        else:
+            await self.db.execute(
+                "INSERT INTO graph_nodes "
+                "(node_id, node_type, label, properties) VALUES (?, ?, ?, ?)",
+                (node_id, node_type, label, properties),
+            )
+        await record_graph_node_owner(self.db, node_id, agent_id)
+
+    async def _upsert_owned_graph_edge(
+        self,
+        agent_id: str,
+        *,
+        source_id: str,
+        target_id: str,
+        label: str,
+        properties: str = "{}",
+    ) -> None:
+        """Insert or update one import-owned edge without replacing a peer's."""
+        existing = await self.db.fetchone(
+            "SELECT 1 FROM graph_edges "
+            "WHERE source_id = ? AND target_id = ? AND label = ?",
+            (source_id, target_id, label),
+        )
+        if existing:
+            owner_rows = await self.db.fetchall(
+                "SELECT agent_id FROM graph_edge_owners "
+                "WHERE source_id = ? AND target_id = ? AND label = ?",
+                (source_id, target_id, label),
+            )
+            if {row[0] for row in owner_rows} != {agent_id}:
+                raise ValueError(
+                    "import graph edge is unowned or owned by another agent"
+                )
+            await self.db.execute(
+                "UPDATE graph_edges SET properties = ? "
+                "WHERE source_id = ? AND target_id = ? AND label = ?",
+                (properties, source_id, target_id, label),
+            )
+        else:
+            await self.db.execute(
+                "INSERT INTO graph_edges "
+                "(source_id, target_id, label, properties) VALUES (?, ?, ?, ?)",
+                (source_id, target_id, label, properties),
+            )
+        await record_graph_edge_owner(
+            self.db, source_id, target_id, label, agent_id
+        )
 
     async def _node_is_protected(self, agent_id: str, node_id: str) -> bool:
         """True if ``node_id`` must not be overwritten by an import.
@@ -829,18 +946,20 @@ class IdentityImporter:
                 "preferences": rel_dict.get("preferences_learned", {}),
             })
 
-            await self.db.execute(
-                """INSERT OR REPLACE INTO graph_nodes
-                   (node_id, node_type, label, properties)
-                   VALUES (?, 'user', ?, ?)""",
-                (user_id, f"User {str(raw_user_id)[:8]}", properties)
+            await self._upsert_owned_graph_node(
+                agent_id,
+                node_id=user_id,
+                node_type="user",
+                label=f"User {str(raw_user_id)[:8]}",
+                properties=properties,
             )
 
-            await self.db.execute(
-                """INSERT OR REPLACE INTO graph_edges
-                   (source_id, target_id, label, properties)
-                   VALUES (?, ?, ?, '{}')""",
-                (agent_id, user_id, rel_dict.get("relationship_type", "knows"))
+            relationship_type = rel_dict.get("relationship_type", "knows")
+            await self._upsert_owned_graph_edge(
+                agent_id,
+                source_id=agent_id,
+                target_id=user_id,
+                label=relationship_type,
             )
             count += 1
 
@@ -866,18 +985,19 @@ class IdentityImporter:
                 "config": skill_dict.get("configuration", {}),
             })
 
-            await self.db.execute(
-                """INSERT OR REPLACE INTO graph_nodes
-                   (node_id, node_type, label, properties)
-                   VALUES (?, 'skill', ?, ?)""",
-                (skill_id, skill_dict["skill_name"], properties)
+            await self._upsert_owned_graph_node(
+                agent_id,
+                node_id=skill_id,
+                node_type="skill",
+                label=skill_dict["skill_name"],
+                properties=properties,
             )
 
-            await self.db.execute(
-                """INSERT OR REPLACE INTO graph_edges
-                   (source_id, target_id, label, properties)
-                   VALUES (?, ?, 'has_skill', '{}')""",
-                (agent_id, skill_id)
+            await self._upsert_owned_graph_edge(
+                agent_id,
+                source_id=agent_id,
+                target_id=skill_id,
+                label="has_skill",
             )
             count += 1
 
@@ -985,12 +1105,16 @@ class IdentityImporter:
                VALUES (?, 'migration_record', ?, ?)""",
             (migration_id, f"Migration {migration_id[:8]}", properties)
         )
+        await record_graph_node_owner(self.db, migration_id, agent_id)
 
         await self.db.execute(
             """INSERT INTO graph_edges
                (source_id, target_id, label, properties)
                VALUES (?, ?, 'migrated_via', '{}')""",
             (agent_id, migration_id)
+        )
+        await record_graph_edge_owner(
+            self.db, agent_id, migration_id, "migrated_via", agent_id
         )
         logger.info(f"Recorded migration: {migration_id}")
 

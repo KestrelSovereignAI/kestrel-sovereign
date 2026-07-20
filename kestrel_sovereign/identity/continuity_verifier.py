@@ -19,6 +19,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from kestrel_sovereign.storage.async_graph_store import (
+    record_graph_edge_owner,
+    record_graph_node_owner,
+)
+
 from .identity_package import (
     AgentIdentityPackage,
     MigrationRecord,
@@ -616,12 +621,22 @@ class AuditTrail:
             (certificate.migration_id, f"Migration to {certificate.target_substrate}",
              json.dumps(properties))
         )
+        await record_graph_node_owner(
+            self.db, certificate.migration_id, agent_id
+        )
 
         # Link to agent
         await self.db.execute(
             """INSERT INTO graph_edges (source_id, target_id, label)
                VALUES (?, ?, 'migrated_via')""",
             (agent_id, certificate.migration_id)
+        )
+        await record_graph_edge_owner(
+            self.db,
+            agent_id,
+            certificate.migration_id,
+            "migrated_via",
+            agent_id,
         )
 
         await self.db.commit()

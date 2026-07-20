@@ -38,16 +38,20 @@ def test_storage_stats_returns_expected_shape(tmp_path):
 
     db = MagicMock()
     db.fetchone = AsyncMock(side_effect=[(4,), (2, 128)])
-    db.fetchall = AsyncMock(return_value=[("agent", 1), ("memory", 3)])
+    db.fetchall = AsyncMock(return_value=[
+        ("agent", 1),
+        ("memory", 3),
+        ("sovereignty_receipt", 1),
+        ("backup_artifact", 2),
+    ])
 
-    storage = MagicMock(db_path=str(db_path), db=db, agent_id="did:agent")
-    storage.get_nodes_by_type = AsyncMock(
-        side_effect=[
-            [SimpleNamespace(node_id="exp-1")],
-            [SimpleNamespace(node_id="bak-1"), SimpleNamespace(node_id="bak-2")],
-        ]
+    storage = MagicMock(
+        db_path=str(db_path),
+        db=db,
+        agent_id="did:agent",
+        privacy_config=None,
     )
-    agent = MagicMock(storage=storage)
+    agent = MagicMock(storage=storage, agent_id="did:agent")
 
     app, original = _prepare_app(agent)
     try:
@@ -56,12 +60,15 @@ def test_storage_stats_returns_expected_shape(tmp_path):
                 response = client.get("/api/storage/stats", headers={"X-API-Key": "test-key"})
         assert response.status_code == 200
         payload = response.json()
-        assert payload["database"]["path"] == str(db_path)
+        assert payload["database"] == {"path": None, "size_bytes": -1}
+        assert str(db_path) not in repr(payload)
         assert payload["conversations"]["count"] == 4
         assert payload["graph_nodes"]["agent"] == 1
         assert payload["files"]["count"] == 2
         assert payload["sovereignty_exports"] == 1
         assert payload["backups"] == 2
+        assert "graph_node_owners" in db.fetchall.await_args.args[0]
+        assert "file_owners" in db.fetchone.await_args_list[1].args[0]
     finally:
         _restore_app(app, original)
 

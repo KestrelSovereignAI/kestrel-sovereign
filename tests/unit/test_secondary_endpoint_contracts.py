@@ -116,9 +116,13 @@ def test_file_get_and_observability_summary_contracts():
         duration_ms=12,
     )
     observability_store = MagicMock(query_events=AsyncMock(return_value=[event_error, event_tool]))
-    storage = MagicMock(files=file_store)
+    storage = MagicMock(files=file_store, agent_id="did:test:file-get")
     storage.retrieve_file = AsyncMock(return_value=b"image-bytes")
-    agent = MagicMock(storage=storage, observability_store=observability_store)
+    agent = MagicMock(
+        storage=storage,
+        agent_id="did:test:file-get",
+        observability_store=observability_store,
+    )
 
     app, original = _prepare_app(agent)
     try:

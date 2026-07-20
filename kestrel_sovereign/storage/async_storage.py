@@ -208,14 +208,14 @@ class AsyncStorage:
             if self.backend_type == "sqlite" and self.db_path and self.db_path != ":memory:":
                 self.destructive_audit = DestructiveAuditLog(audit_db_path_for(self.db_path))
                 await self.destructive_audit.initialize()
-            self.files = AsyncFileStore(self.db)
+            self.files = AsyncFileStore(self.db, agent_id=self.agent_id)
             self.conversation = AsyncConversationStore(
                 self.db,
                 agent_id=self.agent_id,
                 llm_service=self.llm_service,
                 destructive_audit=self.destructive_audit,
             )
-            self.graph = AsyncGraphStore(self.db)
+            self.graph = AsyncGraphStore(self.db, agent_id=self.agent_id)
             self.rag = AsyncRAGStore(self.db, llm_service=self.llm_service)
             self.agent_resources = (
                 AgentResourceStore(self.db, self.agent_id)

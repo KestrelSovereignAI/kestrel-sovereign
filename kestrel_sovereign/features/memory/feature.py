@@ -551,7 +551,7 @@ class MemoryFeature(Feature):
             file_count = 0
             try:
                 file_result = await self._db.fetchone(
-                    "SELECT COUNT(*) FROM files WHERE agent_id = ?",
+                    "SELECT COUNT(*) FROM file_owners WHERE agent_id = ?",
                     (self.agent_id,)
                 )
                 file_count = file_result[0] if file_result else 0

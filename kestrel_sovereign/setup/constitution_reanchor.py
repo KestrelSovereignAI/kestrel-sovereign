@@ -540,6 +540,8 @@ async def _write_reanchor(
     level backup remains untouched and available either way.
     """
     async with AsyncStorage(str(db_path)) as storage:
+        storage.graph.bind_agent(agent_did)
+        storage.files.bind_agent(agent_did)
         async with storage.db.transaction():
             # 1. File blob (encrypted at rest if KESTREL_DATA_KEY is set).
             stored_hash = await storage.files.store_file(
@@ -600,18 +602,31 @@ async def _write_reanchor(
 
             # 3. Repair the governed_by edge set — upsert the correct edge
             # first, then delete every stale target (see docstring).
-            existing_edges = await storage.graph.get_edges(
-                agent_did, direction="out"
+            # This repair routine explicitly heals pre-ledger governance drift.
+            # A bound graph capability intentionally cannot see an unowned
+            # legacy edge, so inspect only this exact agent source + label via
+            # the privileged maintenance connection.  No target supplied by a
+            # caller is interpolated into SQL.
+            stale_rows = await storage.db.fetchall(
+                "SELECT target_id FROM graph_edges "
+                "WHERE source_id = ? AND label = 'governed_by' "
+                "AND target_id <> ?",
+                (agent_did, new_hash),
             )
-            stale_edge_targets = sorted({
-                edge.target_id
-                for edge in existing_edges
-                if edge.label == "governed_by" and edge.target_id != new_hash
-            })
+            stale_edge_targets = sorted({row[0] for row in stale_rows})
             await storage.graph.add_edge(agent_did, new_hash, "governed_by")
             for stale_target in stale_edge_targets:
-                await storage.graph.delete_edge(
-                    agent_did, stale_target, "governed_by"
+                await storage.db.execute(
+                    "DELETE FROM graph_edge_owners "
+                    "WHERE source_id = ? AND target_id = ? "
+                    "AND label = 'governed_by'",
+                    (agent_did, stale_target),
+                )
+                await storage.db.execute(
+                    "DELETE FROM graph_edges "
+                    "WHERE source_id = ? AND target_id = ? "
+                    "AND label = 'governed_by'",
+                    (agent_did, stale_target),
                 )
 
             # 4. Re-index RAG — only when the governing content actually

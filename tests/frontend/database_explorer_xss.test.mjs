@@ -61,7 +61,8 @@ test('hostile stored markup remains inert text across explorer rendering and pag
     const tableName = 'messages"><img id="table-xss" src=x onerror="alert(1)">';
     const columnName = 'content</th><script id="column-xss">alert(3)</script>';
     const cellValue = '<img id="cell-xss" src=x onerror="globalThis.databaseXssExecuted=true">';
-    const unicodeLong = `${'a'.repeat(99)}🦅tail`;
+    const familyEmoji = '👩‍👩‍👧‍👦';
+    const unicodeLong = `${'a'.repeat(99)}${familyEmoji}tail`;
     const calls = [];
 
     API.getDbTables = async (agent) => ({
@@ -112,9 +113,15 @@ test('hostile stored markup remains inert text across explorer rendering and pag
     assert.ok(container.textContent.includes(columnName), 'hostile column name is text');
     assert.ok(container.textContent.includes(cellValue), 'hostile stored cell is text');
     const cells = Array.from(container.querySelectorAll('tbody td'));
-    assert.equal(cells[2].textContent, `${'a'.repeat(99)}🦅`);
-    assert.equal(Array.from(cells[2].textContent).length, 100,
-        'long Unicode values are truncated without splitting a surrogate pair');
+    assert.equal(cells[2].textContent, `${'a'.repeat(99)}${familyEmoji}`);
+    assert.equal(
+        Array.from(
+            new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+                .segment(cells[2].textContent),
+        ).length,
+        100,
+        'long Unicode values are truncated without splitting a grapheme cluster',
+    );
     assert.equal(
         container.querySelectorAll('img, svg, script, [onerror], [onload], [onclick]').length,
         0,
@@ -127,6 +134,10 @@ test('hostile stored markup remains inert text across explorer rendering and pag
         .find((button) => button.textContent.includes('Next'));
     assert.ok(next);
     assert.equal(next.getAttribute('onclick'), null, 'pagination uses a bound listener');
+    assert.equal(container.querySelector('th').scope, 'col');
+    assert.equal(container.querySelector('[role="region"]').tabIndex, 0,
+        'the scrollable result region is keyboard-focusable');
+    assert.equal(container.querySelector('.db-table-item').getAttribute('aria-pressed'), 'true');
     next.click();
     await flush();
     assert.deepEqual(calls[1], {
@@ -194,6 +205,20 @@ test('hostile database error text cannot become markup', async () => {
     assert.ok(container.textContent.includes(databaseError));
     assert.equal(container.querySelector('img'), null);
     assert.equal(container.querySelector('[onerror]'), null);
+    assert.equal(container.querySelector('[role="alert"]').textContent.includes(databaseError), true);
+});
+
+test('malformed table-list responses fail closed and are not cached', async () => {
+    const container = mountExplorer();
+    API.getDbTables = async () => ({ tables: null, table_count: 1, db_size: 1024 });
+
+    await loadDbTables();
+
+    assert.equal(state.dbTables, null);
+    assert.equal(container.getAttribute('aria-busy'), 'false');
+    assert.ok(container.querySelector('[role="alert"]')
+        .textContent.includes('Invalid database table-list response'));
+    assert.equal(container.querySelector('.db-table-item'), null);
 });
 
 test('agent switch invalidates cached explorer data and rejects delayed responses', async () => {
@@ -220,16 +245,14 @@ test('agent switch invalidates cached explorer data and rejects delayed response
         }],
     });
 
-    API.getDbTables = async () => {
-        const dispatchAgent = API.getHostAgent();
+    API.getDbTables = async (dispatchAgent) => {
         if (dispatchAgent === 'Agent A' && ++agentATableLoads > 1) {
             return staleTables;
         }
         if (dispatchAgent === 'Agent B') agentBTableLoads += 1;
         return tablesFor(dispatchAgent);
     };
-    API.queryDbTable = async (table) => {
-        const dispatchAgent = API.getHostAgent();
+    API.queryDbTable = async (table, limit, offset, search, dispatchAgent) => {
         if (dispatchAgent === 'Agent A') return staleRows;
         return {
             table,
@@ -262,6 +285,11 @@ test('agent switch invalidates cached explorer data and rejects delayed response
     await flush();
     assert.equal(agentBTableLoads, 0,
         'a stale switch event cannot release the capability barrier for Agent B');
+
+    bus.emit('agent:switch', {});
+    await flush();
+    assert.equal(agentBTableLoads, 0,
+        'a malformed switch event cannot release the capability barrier');
 
     bus.emit('agent:switch', { prev: 'Agent A', next: 'Agent B' });
     await flush();
@@ -347,8 +375,7 @@ test('post-capability switch does not load database metadata when sovereignty is
 test('reopening after route change waits for the post-capability switch event', async () => {
     API.setHostAgent('Agent A');
     const container = mountExplorer();
-    API.getDbTables = async () => {
-        const agent = API.getHostAgent();
+    API.getDbTables = async (agent) => {
         return {
             table_count: 1,
             db_size: 1024,
@@ -441,6 +468,10 @@ test('legacy onclick explorer button is not toggled a second time by delegation'
     };
 
     const toggle = document.getElementById('toggle-db-explorer');
+    assert.equal(toggle.type, 'button');
+    assert.equal(toggle.getAttribute('aria-controls'), 'db-explorer-section');
+    assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(document.getElementById('db-explorer-section').hidden, true);
     toggle.setAttribute('onclick', 'toggleDbExplorer()');
     toggle.onclick = window.toggleDbExplorer;
     toggle.click();
@@ -448,6 +479,7 @@ test('legacy onclick explorer button is not toggled a second time by delegation'
 
     assert.equal(state.dbExplorerVisible, true);
     assert.equal(document.getElementById('db-explorer-section').style.display, 'block');
+    assert.equal(document.getElementById('db-explorer-section').hidden, false);
     assert.equal(toggle.getAttribute('aria-expanded'), 'true');
     assert.equal(loads, 1, 'one legacy click performs exactly one toggle/load');
 });

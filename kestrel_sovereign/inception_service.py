@@ -777,6 +777,13 @@ async def create_kestrel_identity_async(
         identity_paths = [key_path, Path(output_dir) / f"{key_id}.json"]
         logging.info(f"Saved keys to {key_path}")
 
+    # Every graph row written during inception belongs to this newly minted
+    # agent.  Bind before the shared/content-addressed constitution node is
+    # created so both that node and the governed_by edge receive durable
+    # ownership witnesses (#2649).
+    graph.bind_agent(agent_did)
+    files.bind_agent(agent_did)
+
     # 3. Anchor the Kestrel Constitution as the first document
     # Resolve constitution path if not provided
     if constitution_path is None:
@@ -990,7 +997,12 @@ async def create_kestrel_identity_async(
             edge_properties["features_allowed"] = list(
                 getattr(spawn_mandate, "features_allowed", []) or []
             )
-        await graph.add_edge(agent_did, parent_did, "spawned_by", properties=edge_properties)
+        await graph.add_trusted_cross_agent_edge(
+            agent_did,
+            parent_did,
+            "spawned_by",
+            properties=edge_properties,
+        )
         logging.info(f"Recorded spawned_by edge from {agent_did} to {parent_did}")
 
     # 7. OpenRouter key provisioning is opt-in (not automatic at inception).

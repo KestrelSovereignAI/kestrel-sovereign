@@ -696,7 +696,8 @@ export function createApiClient({
             search = null,
             agent = state.selectedHostAgent,
         ) => {
-            let url = `/api/db/tables/${encodeURIComponent(table)}?limit=${limit}&offset=${offset}`;
+            let url = `/api/db/tables/${encodeURIComponent(table)}`
+                + `?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`;
             if (search) url += `&search=${encodeURIComponent(search)}`;
             return client.requestForAgent(url, {}, agent);
         },

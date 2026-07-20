@@ -458,7 +458,7 @@ class TestAuditTrail:
         await trail.record_migration("did:agent", cert, score)
 
         # Verify database calls
-        assert mock_db.execute.call_count == 2
+        assert mock_db.execute.call_count == 4
         assert mock_db.commit.called
 
 
