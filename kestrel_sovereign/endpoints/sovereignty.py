@@ -143,6 +143,8 @@ async def get_storage_stats(request: Request):
             "sovereignty_exports": len(exports),
             "backups": len(backups),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting storage stats: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving storage stats.")
@@ -180,6 +182,8 @@ async def list_sovereignty_exports(request: Request):
                 for b in backups
             ],
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing sovereignty exports: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving sovereignty exports.")
