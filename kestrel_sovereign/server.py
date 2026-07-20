@@ -1323,88 +1323,97 @@ async def auth_middleware(request: Request, call_next):
             request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
             return await call_next(request)
 
+    # Credential evaluation only happens inside this try. Dispatch of an
+    # authenticated (or deliberately unauthenticated) request stays OUTSIDE
+    # it, so an unhandled downstream application fault keeps FastAPI's
+    # 500 semantics instead of masquerading as a 401 (#2490).
+    from kestrel_sovereign.auth import CallerContext, AuthMethod
+
+    caller = None
+    unauthenticated_root_dispatch = False
     try:
         expected_key = get_api_key()
-
-        from kestrel_sovereign.auth import CallerContext, AuthMethod
 
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
-            request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
-            return await call_next(request)
+            caller = CallerContext.sovereign(AuthMethod.API_KEY)
 
         # Check Bearer token (API key OR JWT)
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            # First try: API key match
-            if secrets.compare_digest(token, expected_key):
-                request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
-                return await call_next(request)
-            # Second try: JWT token
-            try:
-                from kestrel_sovereign.endpoints.auth_oauth import _verify_jwt
-                jwt_payload = _verify_jwt(token)
-                if jwt_payload:
-                    request.state.caller = CallerContext.authenticated(
-                        identity=jwt_payload.get("sub", "unknown"),
-                        auth_method=AuthMethod.JWT,
-                    )
-                    return await call_next(request)
-            except Exception:
-                pass
+        if caller is None:
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+                # First try: API key match
+                if secrets.compare_digest(token, expected_key):
+                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+                else:
+                    # Second try: JWT token
+                    try:
+                        from kestrel_sovereign.endpoints.auth_oauth import _verify_jwt
+                        jwt_payload = _verify_jwt(token)
+                        if jwt_payload:
+                            caller = CallerContext.authenticated(
+                                identity=jwt_payload.get("sub", "unknown"),
+                                auth_method=AuthMethod.JWT,
+                            )
+                    except Exception:
+                        pass
 
         # Check query parameter for SSE endpoints only (EventSource can't send headers)
         # Restricted to SSE_PATHS to avoid leaking keys in URL logs on other endpoints.
         # Use scope["path"] rather than request.url.path: the deprecated_agent_prefix_compat
         # middleware rewrites scope["path"] before auth runs, but request.url caches the
         # original path if it was accessed earlier in the same middleware call chain.
-        api_key_query = request.query_params.get("api_key")
-        _scope_path = request.scope.get("path", request.url.path)
-        # Browser-rendered images (an <img> can't set headers) need the same
-        # query-param auth as SSE: the channel pairing-QR endpoint is fetched by
-        # `<img src=...>` from the chat. Matched narrowly by suffix so the
-        # query-key path doesn't widen to arbitrary endpoints (#1825).
-        _query_key_ok = any(
-            _scope_path == p or _scope_path.endswith(p) for p in SSE_PATHS
-        ) or _scope_path.endswith("/link-qr.png")
-        if api_key_query and _query_key_ok:
-            if secrets.compare_digest(api_key_query, expected_key):
-                request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
-                return await call_next(request)
+        if caller is None:
+            api_key_query = request.query_params.get("api_key")
+            _scope_path = request.scope.get("path", request.url.path)
+            # Browser-rendered images (an <img> can't set headers) need the same
+            # query-param auth as SSE: the channel pairing-QR endpoint is fetched by
+            # `<img src=...>` from the chat. Matched narrowly by suffix so the
+            # query-key path doesn't widen to arbitrary endpoints (#1825).
+            _query_key_ok = any(
+                _scope_path == p or _scope_path.endswith(p) for p in SSE_PATHS
+            ) or _scope_path.endswith("/link-qr.png")
+            if api_key_query and _query_key_ok:
+                if secrets.compare_digest(api_key_query, expected_key):
+                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
 
         # Check OAuth session cookie
-        user_email = request.session.get("user_email") if hasattr(request, "session") else None
-        if user_email:
-            # CSRF: a cookie-authed state-changing request to a host-feature
-            # endpoint must present a matching double-submit token. API-key /
-            # bearer callers (handled above) are exempt — not CSRF-susceptible.
-            # Scoped to host-feature paths so per-agent routes stay unchanged
-            # (#2293/#2382).
-            csrf_error = _enforce_host_csrf(request)
-            if csrf_error is not None:
-                return csrf_error
-            request.state.caller = CallerContext.authenticated(
-                identity=user_email,
-                auth_method=AuthMethod.OAUTH_SESSION,
-            )
-            return await call_next(request)
+        if caller is None:
+            user_email = request.session.get("user_email") if hasattr(request, "session") else None
+            if user_email:
+                # CSRF: a cookie-authed state-changing request to a host-feature
+                # endpoint must present a matching double-submit token. API-key /
+                # bearer callers (handled above) are exempt — not CSRF-susceptible.
+                # Scoped to host-feature paths so per-agent routes stay unchanged
+                # (#2293/#2382).
+                csrf_error = _enforce_host_csrf(request)
+                if csrf_error is not None:
+                    return csrf_error
+                caller = CallerContext.authenticated(
+                    identity=user_email,
+                    auth_method=AuthMethod.OAUTH_SESSION,
+                )
 
         # No valid auth — for the root page in a browser:
-        if request.url.path == "/" and SERVE_UI:
+        if caller is None and request.url.path == "/" and SERVE_UI:
             accept = request.headers.get("accept", "")
             if "text/html" in accept:
                 if _oauth_required() and "google" in oauth._clients:
                     return RedirectResponse(url="/auth/login", status_code=302)
-                else:
-                    return await call_next(request)
-
-        return JSONResponse(content={"detail": "Invalid or missing API Key"}, status_code=401)
+                unauthenticated_root_dispatch = True
 
     except Exception as exc:
         logger.error(f"Auth error: {exc}")
         return JSONResponse(content={"detail": "Authentication failed"}, status_code=401)
+
+    if caller is not None:
+        request.state.caller = caller
+        return await call_next(request)
+    if unauthenticated_root_dispatch:
+        return await call_next(request)
+    return JSONResponse(content={"detail": "Invalid or missing API Key"}, status_code=401)
 
 
 # Session middleware must be added AFTER auth_middleware so it's outermost
