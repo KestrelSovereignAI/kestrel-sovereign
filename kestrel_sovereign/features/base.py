@@ -1,3 +1,4 @@
+import contextlib
 import inspect
 import json
 import logging
@@ -871,115 +872,126 @@ class Feature(_SdkFeature):
                 ),
             })
 
-        hooks_manager = getattr(self.agent, "hooks_manager", None)
-        effective_args = args
-        if hooks_manager is not None:
-            from kestrel_sdk.hooks.base import (
-                HookEvent, HookInput, PermissionDecision,
-            )
-            hook_input = HookInput(
-                session_id="subagent",
-                hook_event_name=HookEvent.PRE_TOOL_USE.value,
-                tool_name=tool_name,
-                tool_input=args,
-                feature_name=type(self).__name__,
-            )
-            hook_output = await hooks_manager.execute_hooks(
-                HookEvent.PRE_TOOL_USE, hook_input,
-            )
-            # Compute the effective args from the post-hook state FIRST,
-            # before the block check. A hook chain may redact via an
-            # early MODIFY hook (in-place mutation of
-            # ``hook_input.tool_input``) and then DENY via a later
-            # PermissionHook; the blocking branch must surface the
-            # REDACTED args to the codex audit path or PII the
-            # redaction hook removed will leak straight into
-            # ``a2a_tool_dispatches.args_redacted`` /
-            # ``executed_tool_calls``. Codex round 5 P1 on #1461
-            # follow-up.
-            mutated_input = getattr(hook_input, "tool_input", None)
-            if isinstance(mutated_input, dict):
-                effective_args = mutated_input
-            updated = getattr(hook_output, "updated_input", None)
-            if isinstance(updated, dict):
-                effective_args = updated
+        # #2641: bind the subagent-local parts sink as the active collector
+        # for the WHOLE gated call — PRE_TOOL_USE hooks included, not just the
+        # tool body — so ``emit_part`` lands deterministically on THIS
+        # subagent's buffer no matter which task/context the transport
+        # dispatched the call on (the codex app-server runs inline calls on
+        # reader-spawned tasks whose frozen context has no live collector —
+        # the exact gap parts.py documents for the parent-turn executor).
+        # Covering the hooks matters for ordering: a part emitted by a PRE
+        # hook must land on the same buffer as the tool's own parts, in
+        # emission order (hook part first). This binding is the ONLY
+        # ContextVar-side capture the subagent path performs — the ambient
+        # collector outside this scope is the PARENT turn's (the dispatch
+        # loop runs on the parent's task, and orchestrator+feature share one
+        # hooks manager in production), so draining it from subagent code
+        # steals the outer PRE_TOOL_USE gate's parts and reorders them
+        # behind tool-body parts (#2641 review P1, both rounds).
+        if parts_sink is None:
+            sink_scope = contextlib.nullcontext()
+        else:
+            from kestrel_sovereign.agent.parts import bind_part_collector
+            sink_scope = bind_part_collector(parts_sink)
 
-            # Both DENY and ASK must short-circuit. ASK means "human
-            # approval required" — the orchestrator-driven path's
-            # ``execute_named_tool`` blocks both, and the codex inline
-            # subagent path must match that contract or approval-gated
-            # tools silently run without approval (codex round 2 P1
-            # on #1461 follow-up).
-            if hook_output.permission_decision in (
-                PermissionDecision.DENY,
-                PermissionDecision.ASK,
-            ):
-                reason = (
-                    hook_output.permission_reason
-                    or "Blocked by security policy"
+        with sink_scope:
+            hooks_manager = getattr(self.agent, "hooks_manager", None)
+            effective_args = args
+            if hooks_manager is not None:
+                from kestrel_sdk.hooks.base import (
+                    HookEvent, HookInput, PermissionDecision,
                 )
-                decision_label = (
-                    "PERMISSION DENIED"
-                    if hook_output.permission_decision == PermissionDecision.DENY
-                    else "APPROVAL REQUIRED"
+                hook_input = HookInput(
+                    session_id="subagent",
+                    hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                    tool_name=tool_name,
+                    tool_input=args,
+                    feature_name=type(self).__name__,
                 )
-                logger.info(
-                    "[SUBAGENT-TOOL] %s blocked (%s): %s",
-                    tool_name, decision_label, reason,
+                hook_output = await hooks_manager.execute_hooks(
+                    HookEvent.PRE_TOOL_USE, hook_input,
                 )
-                # Surface the POST-hook args even on the block path —
-                # an upstream redaction hook may have run before the
-                # downstream permission hook denied, and the codex
-                # audit row should record the redacted form, not the
-                # raw PII (codex round 5 P1 on #1461 follow-up).
-                return _shape(effective_args, {
-                    "success": False,
-                    "error": (
-                        f"{decision_label}: {reason}. The tool was "
-                        f"NOT executed. Do NOT tell the user this "
-                        f"action succeeded — inform them it was "
-                        f"blocked by security policy."
-                    ),
-                })
-            # ``effective_args`` was already resolved above to the
-            # post-hook state (mutated ``tool_input`` first, then any
-            # ``updated_input`` override) — see the comment block
-            # before the DENY/ASK branch.
+                # Compute the effective args from the post-hook state FIRST,
+                # before the block check. A hook chain may redact via an
+                # early MODIFY hook (in-place mutation of
+                # ``hook_input.tool_input``) and then DENY via a later
+                # PermissionHook; the blocking branch must surface the
+                # REDACTED args to the codex audit path or PII the
+                # redaction hook removed will leak straight into
+                # ``a2a_tool_dispatches.args_redacted`` /
+                # ``executed_tool_calls``. Codex round 5 P1 on #1461
+                # follow-up.
+                mutated_input = getattr(hook_input, "tool_input", None)
+                if isinstance(mutated_input, dict):
+                    effective_args = mutated_input
+                updated = getattr(hook_output, "updated_input", None)
+                if isinstance(updated, dict):
+                    effective_args = updated
 
-        try:
-            if parts_sink is not None:
-                # #2641: bind the subagent-local parts sink as the active
-                # collector for the duration of the tool call, so ``emit_part``
-                # lands deterministically on THIS subagent's buffer no matter
-                # which task/context the transport dispatched the call on (the
-                # codex app-server runs inline calls on reader-spawned tasks
-                # whose frozen context has no live collector — the exact gap
-                # parts.py documents for the parent-turn executor).
-                from kestrel_sovereign.agent.parts import bind_part_collector
-                with bind_part_collector(parts_sink):
-                    result = await tool.execute(**effective_args)
-            else:
+                # Both DENY and ASK must short-circuit. ASK means "human
+                # approval required" — the orchestrator-driven path's
+                # ``execute_named_tool`` blocks both, and the codex inline
+                # subagent path must match that contract or approval-gated
+                # tools silently run without approval (codex round 2 P1
+                # on #1461 follow-up).
+                if hook_output.permission_decision in (
+                    PermissionDecision.DENY,
+                    PermissionDecision.ASK,
+                ):
+                    reason = (
+                        hook_output.permission_reason
+                        or "Blocked by security policy"
+                    )
+                    decision_label = (
+                        "PERMISSION DENIED"
+                        if hook_output.permission_decision == PermissionDecision.DENY
+                        else "APPROVAL REQUIRED"
+                    )
+                    logger.info(
+                        "[SUBAGENT-TOOL] %s blocked (%s): %s",
+                        tool_name, decision_label, reason,
+                    )
+                    # Surface the POST-hook args even on the block path —
+                    # an upstream redaction hook may have run before the
+                    # downstream permission hook denied, and the codex
+                    # audit row should record the redacted form, not the
+                    # raw PII (codex round 5 P1 on #1461 follow-up).
+                    return _shape(effective_args, {
+                        "success": False,
+                        "error": (
+                            f"{decision_label}: {reason}. The tool was "
+                            f"NOT executed. Do NOT tell the user this "
+                            f"action succeeded — inform them it was "
+                            f"blocked by security policy."
+                        ),
+                    })
+                # ``effective_args`` was already resolved above to the
+                # post-hook state (mutated ``tool_input`` first, then any
+                # ``updated_input`` override) — see the comment block
+                # before the DENY/ASK branch.
+
+            try:
                 result = await tool.execute(**effective_args)
-        except Exception as e:
-            logger.warning(
-                "[SUBAGENT-TOOL] %s raised %s",
-                tool_name, e,
-            )
-            return _shape(
-                effective_args,
-                {"success": False, "error": f"{type(e).__name__}: {e}"},
-            )
-        serialized = _serialize_tool_result(result)
-        # Harvest envelope-carried parts (``ToolResult.parts`` / a result
-        # dict's ``parts`` field) into the sink too — the explicit,
-        # ContextVar-free half of the #2641 contract. The envelope keeps its
-        # copy; delivery to the outbound stream happens once, at the
-        # orchestrator's dispatch site.
-        if parts_sink is not None and isinstance(serialized, dict):
-            envelope_parts = serialized.get("parts")
-            if isinstance(envelope_parts, list) and envelope_parts:
-                parts_sink.extend(envelope_parts)
-        return _shape(effective_args, serialized)
+            except Exception as e:
+                logger.warning(
+                    "[SUBAGENT-TOOL] %s raised %s",
+                    tool_name, e,
+                )
+                return _shape(
+                    effective_args,
+                    {"success": False, "error": f"{type(e).__name__}: {e}"},
+                )
+            serialized = _serialize_tool_result(result)
+            # Harvest envelope-carried parts (``ToolResult.parts`` / a result
+            # dict's ``parts`` field) into the sink too — the explicit,
+            # ContextVar-free half of the #2641 contract. The envelope keeps its
+            # copy; delivery to the outbound stream happens once, at the
+            # orchestrator's dispatch site.
+            if parts_sink is not None and isinstance(serialized, dict):
+                envelope_parts = serialized.get("parts")
+                if isinstance(envelope_parts, list) and envelope_parts:
+                    parts_sink.extend(envelope_parts)
+            return _shape(effective_args, serialized)
 
     def _get_subagent_prompt(self) -> str:
         """
@@ -1041,10 +1053,12 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             max_iterations: Maximum tool call iterations to prevent infinite loops.
                            Defaults to KESTREL_MAX_TOOL_ITERATIONS env var (default: 5)
             parts_sink: Subagent-local buffer for first-class typed parts
-                        (#2641). After each tool execution the loop harvests
-                        both the ContextVar collector's drained parts and any
-                        envelope-carried ``parts`` into it, so
-                        ``execute_as_subagent`` can return them by contract.
+                        (#2641). Threaded into ``_execute_subagent_tool``,
+                        which binds it as the active collector for the whole
+                        gated call and harvests envelope-carried ``parts``
+                        into it, so ``execute_as_subagent`` can return them
+                        by contract. The loop itself never drains the ambient
+                        collector — that is the parent turn's buffer.
 
         Returns:
             Final text response after all tool calls are processed
@@ -1113,15 +1127,6 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     tools_by_name=tools_by_name,
                     parts_sink=parts_sink,
                 )
-                if parts_sink is not None:
-                    # #2641: also harvest anything that DID land on a bound
-                    # ContextVar collector (e.g. a hook emitting outside the
-                    # sink-bound window) so no path leaks parts past the
-                    # envelope contract.
-                    from kestrel_sovereign.agent.parts import drain_parts
-                    stray = drain_parts()
-                    if stray:
-                        parts_sink.extend(stray)
                 result_str = json.dumps(result) if isinstance(result, dict) else str(result)
                 logger.info(
                     f"[SUBAGENT-TOOL] {tool_name} result ({len(result_str)} chars): {result_str[:300]}..."

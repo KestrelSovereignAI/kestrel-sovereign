@@ -588,6 +588,13 @@ class OrchestratorEngineMixin:
             if tool_span:
                 tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
 
+        # #2641: envelope-carried parts → this turn's collector, BEFORE the
+        # POST_TOOL_USE hooks fire. A POST hook may emit its own parts; the
+        # pre-envelope collector path always delivered tool-body parts first
+        # (they were appended during execution), so the envelope re-emit must
+        # keep that outbound-stream ordering.
+        self._reemit_envelope_parts(result)
+
         # --- POST_TOOL_USE hooks (parallel, non-blocking) ---
         post_hook_input = HookInput(
             session_id=session_id,
@@ -1743,11 +1750,11 @@ class OrchestratorEngineMixin:
                 session_id=session_id,
                 execute_fn=_exec_feature,
             )
-
             # #2641: parts the subagent's tools produced ride the result
-            # envelope; re-emit them into this turn's collector so the
-            # streaming loop drains them right after this dispatch's card.
-            self._reemit_envelope_parts(result)
+            # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
+            # turn's collector before firing POST_TOOL_USE, so the streaming
+            # loop drains them right after this dispatch's card and ahead of
+            # any POST-hook-emitted parts.
 
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
@@ -1920,13 +1927,12 @@ class OrchestratorEngineMixin:
                 session_id=session_id,
                 execute_fn=_exec_direct,
             )
-
             # #2641: direct tools carry the same envelope contract as
-            # subagent dispatch. This matters after progressive disclosure:
-            # once a feature is explored, its tools re-register as DIRECT
-            # tools, so the second call to a parts-returning tool lands here
-            # rather than in ``_dispatch_feature_tool``.
-            self._reemit_envelope_parts(result)
+            # subagent dispatch (matters after progressive disclosure: an
+            # explored feature's tools re-register as DIRECT tools, so the
+            # second call to a parts-returning tool lands here rather than
+            # in ``_dispatch_feature_tool``). ``_execute_tool_with_hooks``
+            # re-emitted the envelope parts before POST_TOOL_USE fired.
 
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
