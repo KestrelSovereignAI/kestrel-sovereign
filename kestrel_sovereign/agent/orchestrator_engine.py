@@ -578,15 +578,13 @@ class OrchestratorEngineMixin:
         )
 
         # --- Execute the tool ---
+        # Deliberately no span here (#2639): the observability hook's
+        # OpenInference TOOL span is the one source of truth for tool
+        # executions — a telemetry-layer ``agent.tool_execution`` span would
+        # double-instrument the call and root as the ``unknown`` agent.
         exec_start = time.time()
-        with optional_span("agent.tool_execution", {
-            "tool.name": tool_name,
-            "tool.feature": feature_name,
-        }) as tool_span:
-            result = await execute_fn(args)
-            exec_duration_ms = int((time.time() - exec_start) * 1000)
-            if tool_span:
-                tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
+        result = await execute_fn(args)
+        exec_duration_ms = int((time.time() - exec_start) * 1000)
 
         # #2641: envelope-carried parts → this turn's collector, BEFORE the
         # POST_TOOL_USE hooks fire. A POST hook may emit its own parts; the
@@ -967,16 +965,12 @@ class OrchestratorEngineMixin:
         effective_args = post_hook_args
 
         # --- Execute the tool ---
+        # Deliberately no span here (#2639): the observability hook's
+        # OpenInference TOOL span is the one source of truth for tool
+        # executions.
         exec_start = time.time()
-        with optional_span("agent.tool_execution", {
-            "tool.name": tool_name,
-            "tool.feature": feature_name,
-            "tool.source": source,
-        }) as tool_span:
-            result = await found_tool.execute(**effective_args)
-            exec_duration_ms = int((time.time() - exec_start) * 1000)
-            if tool_span:
-                tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
+        result = await found_tool.execute(**effective_args)
+        exec_duration_ms = int((time.time() - exec_start) * 1000)
         # #2641: envelope-carried parts → the owning turn's collector. The
         # codex inline executor wraps this call in ``bind_part_collector``, so
         # a tool that attached parts to its envelope (explicit
