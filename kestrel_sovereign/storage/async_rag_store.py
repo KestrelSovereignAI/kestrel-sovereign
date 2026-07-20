@@ -725,7 +725,10 @@ class AsyncRAGStore:
                 raw_limit = max(doc_count, limit)
             results = await self._bm25_index.asearch(query, raw_limit)
 
-            if results and (current_profile_id is not None or self.agent_id):
+            if results and (
+                current_profile_id is not None
+                or getattr(self, "agent_id", "")
+            ):
                 # Lookup profile ids for the candidate chunk_ids in
                 # bounded batches so SQLite's default ~999-variable
                 # parameter limit doesn't crash the IN-list and
