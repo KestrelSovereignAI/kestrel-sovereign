@@ -106,20 +106,53 @@ def test_invalid_credentials_are_401(client, lane):
     response = client.get(OK_PATH, **_lane_kwargs(client, lane, key="wrong-key-2490"))
     assert response.status_code == 401
     assert response.json()["detail"] == "Invalid or missing API Key"
+    assert response.json()["error"]["code"] == "authentication_required"
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]
 
 
 def test_missing_credentials_are_401(client):
-    response = client.get(OK_PATH)
+    correlation_id = "auth-integration-2651"
+    response = client.get(OK_PATH, headers={"X-Correlation-ID": correlation_id})
     assert response.status_code == 401
     assert response.json()["detail"] == "Invalid or missing API Key"
+    assert response.json()["error"] == {
+        "code": "authentication_required",
+        "message": "Invalid or missing API Key",
+        "correlation_id": correlation_id,
+    }
+    assert response.headers["X-Correlation-ID"] == correlation_id
+
+
+def test_cors_exposes_auth_error_correlation_id(client):
+    response = client.get(
+        OK_PATH,
+        headers={"Origin": "http://localhost:3000"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
+    exposed = {
+        value.strip().lower()
+        for value in response.headers["Access-Control-Expose-Headers"].split(",")
+    }
+    assert "x-correlation-id" in exposed
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]
 
 
 @pytest.mark.parametrize("lane", AUTH_LANES)
 def test_authenticated_downstream_failure_is_generic_500_not_401(client, lane):
     response = client.get(FAILING_PATH, **_lane_kwargs(client, lane))
     assert response.status_code == 500
-    # Framework generic body — no auth translation, no traceback, no secrets.
-    assert response.text == "Internal Server Error"
+    # Canonical generic body — no auth translation, traceback, or secrets.
+    assert response.json()["error"]["code"] == "internal_error"
+    assert response.json()["detail"] == "An internal error occurred."
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]
     assert SENTINEL not in response.text
     assert API_KEY not in response.text
     assert "Authentication failed" not in response.text

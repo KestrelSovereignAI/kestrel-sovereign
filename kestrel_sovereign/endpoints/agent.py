@@ -19,6 +19,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.api_errors import ApiHTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,11 @@ async def _parse_json_body(request: Request) -> dict:
                 return json.loads(cleaned)
             except Exception:
                 pass
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {orig_err}")
+        raise ApiHTTPException(
+            status_code=400,
+            code="invalid_json",
+            message=f"Invalid JSON: {orig_err}",
+        )
 
 
 async def _parse_optional_json_body(request: Request) -> dict:
@@ -96,7 +101,11 @@ async def _parse_optional_json_body(request: Request) -> dict:
                 return json.loads(cleaned)
             except Exception:
                 pass
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {orig_err}")
+        raise ApiHTTPException(
+            status_code=400,
+            code="invalid_json",
+            message=f"Invalid JSON: {orig_err}",
+        )
 
 
 @router.post("/invoke")
@@ -118,7 +127,11 @@ async def invoke_agent(request: Request):
         user_passphrase = data.get("user_passphrase")
 
         if user_input is None:
-            raise HTTPException(status_code=400, detail="Input not provided.")
+            raise ApiHTTPException(
+                status_code=400,
+                code="input_required",
+                message="Input not provided.",
+            )
 
         # Combine provider and model for proper routing
         if provider_override and model_override:
@@ -156,7 +169,11 @@ async def invoke_agent(request: Request):
         raise
     except Exception as e:
         logger.error(f"Error invoking agent: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+        raise ApiHTTPException(
+            status_code=500,
+            code="invoke_failed",
+            message="An internal error occurred.",
+        )
 
 
 # Chat attachments (#1662). Images can be sent to the model as vision input
@@ -302,7 +319,11 @@ async def stream_agent_response(request: Request):
         attachments = _sanitize_attachments(data.get("attachments"))
 
         if user_input is None:
-            raise HTTPException(status_code=400, detail="Input not provided.")
+            raise ApiHTTPException(
+                status_code=400,
+                code="input_required",
+                message="Input not provided.",
+            )
 
         agent = get_agent(request)
         caller = getattr(request.state, "caller", None)
@@ -403,7 +424,11 @@ async def stream_agent_response(request: Request):
         raise
     except Exception as e:
         logger.error(f"Error setting up stream: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error setting up stream.")
+        raise ApiHTTPException(
+            status_code=500,
+            code="stream_setup_failed",
+            message="Error setting up stream.",
+        )
 
 
 @router.post("/stop")

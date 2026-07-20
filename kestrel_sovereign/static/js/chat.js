@@ -1444,7 +1444,8 @@ function uploadAndStage(file, inline) {
             });
             renderAttachmentTray();
         } catch (err) {
-            Toast.error(`Attachment upload failed: ${err && err.message ? err.message : err}`);
+            const detail = err && err.message ? err.message : err;
+            deps().toast.error(deps().escapeHtml(`Attachment upload failed: ${detail}`));
         }
     })();
     pane.pendingUploads.add(p);
@@ -3010,7 +3011,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                     wasAborted = true;
                     throw streamError;
                 }
-                if (streamError.message.includes('404') || streamError.message.includes('405')) {
+                if (streamError.status === 404 || streamError.status === 405) {
                     console.log('Streaming not available, falling back to standard invoke');
                     deps().state.useStreaming = false;
                     msgDiv.remove();
@@ -3054,7 +3055,7 @@ export async function sendMessage(overrideText, overrideAgent) {
         if (e && e.name === 'AbortError') {
             wasAborted = true;
         } else if (isPaneFresh()) {
-            await addMessage('agent', `Error: ${e.message}`, pane.element);
+            addTextMessage('agent', `Error: ${e && e.message ? e.message : 'Request failed.'}`, pane.element);
         } else {
             console.warn(`stream error on ${dispatchAgent} (pane stale):`, e.message);
         }
@@ -4008,6 +4009,25 @@ export async function addMessage(role, content, paneElement = null, attachments 
     return div;
 }
 
+/** Append plain text without passing transport errors through Markdown/HTML. */
+export function addTextMessage(role, content, paneElement = null) {
+    const target = resolvePaneElement(paneElement);
+    const div = document.createElement('div');
+    div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    contentDiv.textContent = String(content == null ? '' : content);
+    div.appendChild(contentDiv);
+    if (target) target.appendChild(div);
+
+    const c = getChatContainer();
+    if (c && target && target.parentNode === c) {
+        c.scrollTop = c.scrollHeight;
+    }
+    return div;
+}
+
 // ============================================================================
 // Host extension: custom message-part renderers (#1597 Stage 8)
 // ============================================================================
@@ -4170,8 +4190,9 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
         summaryEl.title = 'Model settings';
     }
 
-    // Create the shared model selector instance
-    // Use deps().api.buildAgentUrl() for proper multi_agent routing and pass auth headers
+    // Create the shared model selector instance. The selector's own catalog
+    // reads use pinned URLs/auth headers; commits use requestForAgent below so
+    // they also share the canonical auth-retry and ApiError path.
     const nextModelSelector = new ModelSelector({
         providerSelectId: 'provider-selector',
         routeSelectId: 'route-selector',
@@ -4208,8 +4229,6 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
 
             const body = { vendor, model };
             if (route) body.route = route;
-            const headers = await deps().api.applyAuth({ 'Content-Type': 'application/json' });
-
             // On failure the optimistic header/state above is a lie — revert
             // everything to server truth. syncWithServer() also restores the
             // selector's _lastSyncedSelection, re-arming its commit gate so
@@ -4240,22 +4259,10 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
             };
 
             try {
-                const resp = await fetch(deps().api.buildAgentUrl('/api/model/set'), {
+                await deps().api.requestForAgent('/api/model/set', {
                     method: 'POST',
-                    headers,
                     body: JSON.stringify(body),
-                });
-                if (!resp.ok) {
-                    let detail = `HTTP ${resp.status}`;
-                    try {
-                        const err = await resp.json();
-                        if (err && err.detail) detail = String(err.detail);
-                    } catch { /* non-JSON error body */ }
-                    console.warn(`set model failed (${dispatchAgent}): ${detail}`);
-                    deps().toast?.error?.(`Could not set model ${model}: ${detail}`);
-                    await revertToServerTruth();
-                    return;
-                }
+                }, dispatchAgent);
                 if (deps().api.getHostAgent() !== dispatchAgent) {
                     // User switched agents before the server acked. Silently
                     // succeed — the change on dispatchAgent is persisted; don't
@@ -4266,7 +4273,8 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
                 // user's click; the server is the source of truth from here on.
             } catch (e) {
                 console.warn(`set model request error (${dispatchAgent}):`, e);
-                deps().toast?.error?.(`Could not set model ${model}: request failed`);
+                const detail = e && e.message ? e.message : 'Request failed.';
+                deps().toast?.error?.(deps().escapeHtml(`Could not set model ${model}: ${detail}`));
                 await revertToServerTruth();
             }
         }

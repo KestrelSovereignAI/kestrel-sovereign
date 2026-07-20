@@ -1,5 +1,5 @@
 // #2232: host tier-gate ("upgrade_required") rendering. Covers the API error
-// enrichment (status + parsed body survive on the thrown Error) and the pure
+// enrichment (status + parsed body survive on the thrown ApiError) and the pure
 // rendering helpers that turn the structured 403 envelope into an upsell.
 
 import test from 'node:test';
@@ -65,8 +65,8 @@ test('performRequest attaches status + parsed body to the thrown error', async (
             assert.ok(err.body, 'error carries the parsed body');
             assert.equal(err.body.code, 'upgrade_required');
             assert.equal(err.body.upgrade_href, 'https://frinz.example/upgrade');
-            // message still flattens to `detail`-or-fallback for legacy callers
-            assert.match(err.message, /HTTP 403|upgrade/i);
+            // The normalized message now surfaces the actionable envelope text.
+            assert.equal(err.message, 'Session approvals need Premium.');
             return true;
         },
     );

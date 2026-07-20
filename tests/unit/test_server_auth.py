@@ -106,6 +106,10 @@ def test_missing_credentials_are_401(client):
     response = client.get("/api/agent/info")
     assert response.status_code == 401
     assert response.json()["detail"] == "Invalid or missing API Key"
+    assert response.json()["error"]["code"] == "authentication_required"
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]
 
 
 def test_query_param_lane_stays_restricted_to_sse_paths(client):
@@ -141,3 +145,7 @@ def test_credential_evaluation_crash_still_produces_auth_401(client, monkeypatch
     response = client.get("/api/agent/info", headers={"X-API-Key": API_KEY})
     assert response.status_code == 401
     assert response.json()["detail"] == "Authentication failed"
+    assert response.json()["error"]["code"] == "authentication_failed"
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]

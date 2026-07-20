@@ -164,6 +164,8 @@ def test_agent_prefixed_host_path_still_requires_csrf():
 
     assert response is not None
     assert response.status_code == 403
+    assert b'"code":"csrf_failed"' in response.body
+    assert response.headers["X-Correlation-ID"]
 
 
 # ---------------------------------------------------------------------------

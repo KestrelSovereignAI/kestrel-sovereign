@@ -32,9 +32,8 @@ function esc(s) {
 
 /**
  * Normalize an API error into upgrade info, or null when it is not a
- * tier-gate rejection. `performRequest` (api_client.mjs) attaches `status`
- * and the parsed `body` to every thrown Error, so a caller can inspect the
- * structured envelope here.
+ * tier-gate rejection. The shared `ApiError` (api_client.mjs) retains `status`
+ * and the parsed `body`, so a caller can inspect the structured envelope here.
  */
 export function extractUpgradeRequired(error) {
     const body = error && error.body;

@@ -762,6 +762,18 @@
     },
     {
       "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/core/API_ERROR_CONTRACT.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "API Error Contract",
+      "type": "Architecture"
+    },
+    {
+      "existing_code_refs": [],
       "findings": [
         "missing_code_refs"
       ],

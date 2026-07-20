@@ -27,6 +27,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+from kestrel_sovereign.api_errors import api_error_response, register_api_error_handlers
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -998,6 +999,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+register_api_error_handlers(app)
 
 
 # ---------------------------------------------------------------------------
@@ -1139,16 +1141,17 @@ _AGENT_PATH_RE = re.compile(r"^/api/agents/([^/]+)/(.+)$")
 _DEPRECATED_AGENT_PREFIX_SEEN: set[tuple[str, str]] = set()
 
 
-@app.middleware("http")
 async def logging_context_middleware(request: Request, call_next):
     """Set request-scoped logging context (correlation ID, session ID, agent name).
 
-    Starlette processes middleware in reverse order of addition, so this
-    runs early (before auth/routing) and cleans up after the response.
+    This middleware is registered explicitly after ``auth_middleware`` below.
+    Starlette processes middleware in reverse order of addition, so correlation
+    context exists before authentication and is cleaned up after the response.
     """
     # Correlation ID: prefer incoming header, else generate
     cid = request.headers.get("X-Correlation-ID") or get_correlation_id()
     token_cid = correlation_id_var.set(cid)
+    request.state.correlation_id = cid
 
     # Session ID from query params or headers (if available)
     sid = request.query_params.get("session_id") or request.headers.get("X-Session-ID")
@@ -1406,14 +1409,28 @@ async def auth_middleware(request: Request, call_next):
 
     except Exception as exc:
         logger.error(f"Auth error: {exc}")
-        return JSONResponse(content={"detail": "Authentication failed"}, status_code=401)
+        return api_error_response(
+            status_code=401,
+            code="authentication_failed",
+            message="Authentication failed",
+        )
 
     if caller is not None:
         request.state.caller = caller
         return await call_next(request)
     if unauthenticated_root_dispatch:
         return await call_next(request)
-    return JSONResponse(content={"detail": "Invalid or missing API Key"}, status_code=401)
+    return api_error_response(
+        status_code=401,
+        code="authentication_required",
+        message="Invalid or missing API Key",
+    )
+
+
+# Register correlation/logging context AFTER auth so it executes OUTSIDE auth.
+# Middleware-returned 401s therefore share the same request correlation ID as
+# route/handler errors and receive the response header decoration as well.
+app.middleware("http")(logging_context_middleware)
 
 
 # Session middleware must be added AFTER auth_middleware so it's outermost
@@ -1467,6 +1484,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    expose_headers=["X-Correlation-ID"],
 )
 
 
@@ -1707,7 +1725,11 @@ def _enforce_host_csrf(request: Request):
     try:
         enforce_csrf(request, authed_via_cookie=True)
     except CSRFError as exc:
-        return JSONResponse(content={"detail": exc.detail}, status_code=403)
+        return api_error_response(
+            status_code=403,
+            code="csrf_failed",
+            message=exc.detail,
+        )
     return None
 
 

@@ -36,6 +36,180 @@ const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 // server's CSRF_HEADER_NAME.
 const CSRF_HEADER_NAME = 'X-CSRF-Token';
 
+const MAX_ERROR_TEXT_LENGTH = 1000;
+const MAX_ERROR_DETAILS = 20;
+
+function normalizeCorrelationId(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > 128) return null;
+    return /^[A-Za-z0-9._:-]+$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeUserText(value) {
+    if (typeof value !== 'string') return '';
+    let text = value
+        .replace(/<\/?[A-Za-z][^>]*>/g, ' ')
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    // Error payloads sometimes contain exception strings from upstream SDKs.
+    // Redact common credential assignments before anything becomes visible.
+    text = text
+        .replace(/\b(authorization)\s*[:=]\s*(?:bearer\s+)?\S+/gi, '$1: [redacted]')
+        .replace(/\b(api[ _-]?key|access[ _-]?token|password|secret)\s*[:=]\s*\S+/gi, '$1: [redacted]')
+        .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, '[redacted]');
+    return text.slice(0, MAX_ERROR_TEXT_LENGTH);
+}
+
+function looksLikeHtml(value) {
+    return typeof value === 'string' && /<\s*(?:!doctype|html|head|body|script|style)\b/i.test(value);
+}
+
+function firstUserText(...values) {
+    for (const value of values) {
+        const text = normalizeUserText(value);
+        if (text) return text;
+    }
+    return '';
+}
+
+function normalizeDetailItem(item) {
+    if (typeof item === 'string') {
+        const message = normalizeUserText(item);
+        return message ? { message } : null;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+
+    const rawLocation = item.location ?? item.loc;
+    const locationParts = Array.isArray(rawLocation)
+        ? rawLocation.map((part) => normalizeUserText(String(part))).filter(Boolean)
+        : [];
+    const message = firstUserText(
+        item.message,
+        item.msg,
+        item.reason,
+        typeof item.detail === 'string' ? item.detail : '',
+        typeof item.error === 'string' ? item.error : '',
+        item.title,
+    );
+    if (!message) return null;
+
+    const normalized = { message };
+    if (locationParts.length) normalized.location = locationParts.join('.');
+    const code = firstUserText(item.code, item.type);
+    if (code) normalized.code = code;
+    return normalized;
+}
+
+function normalizeDetails(value) {
+    const items = Array.isArray(value) ? value : [value];
+    return items
+        .slice(0, MAX_ERROR_DETAILS)
+        .map(normalizeDetailItem)
+        .filter(Boolean);
+}
+
+function detailDisplay(detail) {
+    return detail.location ? `${detail.location}: ${detail.message}` : detail.message;
+}
+
+/**
+ * Typed error returned for every non-successful HTTP response.
+ *
+ * `body` is retained for structured consumers such as upgrade/tier gates.
+ * `message` and `details` are separately normalized for safe user display.
+ */
+export class ApiError extends Error {
+    constructor({ status, body, message, details = [], correlationId = null }) {
+        const safeCorrelationId = normalizeCorrelationId(correlationId);
+        const baseMessage = normalizeUserText(message) || `HTTP ${status}`;
+        super(safeCorrelationId
+            ? `${baseMessage} (Reference: ${safeCorrelationId})`
+            : baseMessage);
+        this.name = 'ApiError';
+        this.status = status;
+        this.body = body;
+        this.details = details;
+        this.correlationId = safeCorrelationId;
+    }
+}
+
+async function readResponseErrorBody(response) {
+    if (typeof response.text === 'function') {
+        try {
+            const raw = await response.text();
+            if (!raw || !raw.trim()) return null;
+            try {
+                return JSON.parse(raw);
+            } catch (_) {
+                return raw;
+            }
+        } catch (_) {
+            // Some test doubles and non-standard fetch implementations expose
+            // json() but no usable text() body. Fall through to that path.
+        }
+    }
+    if (typeof response.json === 'function') {
+        try {
+            return await response.json();
+        } catch (_) {
+            return null;
+        }
+    }
+    return null;
+}
+
+/** Parse a failed Fetch Response into the console's single ApiError shape. */
+export async function parseResponseError(response, { fallbackMessage = '' } = {}) {
+    const status = Number.isInteger(response?.status) ? response.status : 0;
+    const body = await readResponseErrorBody(response || {});
+    const envelope = body && typeof body === 'object' && !Array.isArray(body)
+        && body.error && typeof body.error === 'object' && !Array.isArray(body.error)
+        ? body.error
+        : null;
+
+    const details = [
+        ...normalizeDetails(envelope?.details),
+        ...normalizeDetails(body && typeof body === 'object' && !Array.isArray(body)
+            ? body.detail
+            : null),
+    ].filter((detail, index, all) => all.findIndex((candidate) => (
+        candidate.message === detail.message
+        && candidate.location === detail.location
+        && candidate.code === detail.code
+    )) === index);
+
+    const objectBody = body && typeof body === 'object' && !Array.isArray(body) ? body : null;
+    let message = firstUserText(
+        envelope?.message,
+        objectBody?.message,
+        typeof objectBody?.detail === 'string' ? objectBody.detail : '',
+        typeof objectBody?.error === 'string' ? objectBody.error : '',
+    );
+
+    const detailSummary = details.slice(0, 3).map(detailDisplay).join('; ');
+    if (detailSummary && (!message || /^request validation failed\.?$/i.test(message))) {
+        const prefix = message || (status === 422 ? 'Request validation failed.' : 'Request failed.');
+        message = `${prefix} ${detailSummary}`;
+    }
+    if (!message && typeof body === 'string' && !looksLikeHtml(body)) {
+        message = normalizeUserText(body);
+    }
+    message = message
+        || normalizeUserText(fallbackMessage)
+        || normalizeUserText(response?.statusText)
+        || `HTTP ${status}`;
+
+    let correlationId = null;
+    try {
+        correlationId = normalizeCorrelationId(response?.headers?.get?.('X-Correlation-ID'));
+    } catch (_) { /* malformed/non-standard headers — use the envelope fallback */ }
+    correlationId = correlationId || normalizeCorrelationId(envelope?.correlation_id);
+
+    return new ApiError({ status, body, message, details, correlationId });
+}
+
 // Canonical list of known UI capability keys (#879, #2041).
 //
 // Two classes live here:
@@ -441,20 +615,13 @@ export function createApiClient({
             if (recovery === 'redirected') return;
             if (recovery === 'refreshed' && retryCb) return retryCb();
 
-            const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
-            throw new Error(error.detail || 'Authentication failed - please refresh the page');
+            throw await parseResponseError(response, {
+                fallbackMessage: 'Authentication failed - please refresh the page',
+            });
         }
 
         if (!response.ok) {
-            const error = await response.json().catch(() => ({ detail: response.statusText }));
-            // Preserve the HTTP status and the full parsed body on the thrown
-            // Error so callers can react to structured envelopes (e.g. a host
-            // policy layer's ``403 {code: 'upgrade_required', ...}`` tier gate,
-            // #2232) instead of only seeing a flattened message string.
-            const err = new Error(error.detail || `HTTP ${response.status}`);
-            err.status = response.status;
-            err.body = error;
-            throw err;
+            throw await parseResponseError(response);
         }
         return response.json();
     }
@@ -818,11 +985,12 @@ export function createApiClient({
                         return;
                     }
 
-                    const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
-                    throw new Error(error.detail || 'Authentication failed - please refresh the page');
+                    throw await parseResponseError(response, {
+                        fallbackMessage: 'Authentication failed - please refresh the page',
+                    });
                 }
 
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                if (!response.ok) throw await parseResponseError(response);
                 state.currentStreamRequestIds.set(dispatchAgent, response.headers.get('X-Request-ID'));
                 // Capture the server-resolved session_id BEFORE the body
                 // streams. sendMessage reads it via getEffectiveSessionId
@@ -875,6 +1043,7 @@ export function createApiClient({
         async applyAuth(headers = {}) {
             return await auth.applyAuth({ ...headers });
         },
+        parseResponseError,
         setHostAgent(agentName) {
             state.selectedHostAgent = agentName;
         },
