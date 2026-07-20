@@ -343,7 +343,8 @@ window.toggleExportDetails = function(index) {
 // ============================================================================
 
 function showExportModal() {
-    Modal.show({
+    let exportModal;
+    exportModal = Modal.show({
         title: 'Export Agent Data',
         content: `
             <p style="margin: 0 0 1.25rem 0; color: var(--text-secondary); line-height: 1.6;">
@@ -426,7 +427,7 @@ function showExportModal() {
             </div>
         `,
         buttons: [
-            { label: 'Cancel', type: 'secondary', onClick: () => Modal.hide() },
+            { label: 'Cancel', type: 'secondary', onClick: () => exportModal.close() },
             { label: 'Export', type: 'primary', onClick: async () => {
                 const tierInput = document.querySelector('input[name="export-tier"]:checked');
                 const encryptInput = document.getElementById('export-encrypt');
@@ -434,7 +435,7 @@ function showExportModal() {
                 const tier = tierInput?.value || 'IPFS';
                 const encrypt = encryptInput?.checked ?? true;
 
-                Modal.hide();
+                exportModal.close();
 
                 try {
                     Toast.info('Starting export...');
@@ -454,7 +455,8 @@ function showExportModal() {
 // ============================================================================
 
 function showImportModal() {
-    Modal.show({
+    let importModal;
+    importModal = Modal.show({
         title: 'Import from CID',
         content: `
             <p style="margin: 0 0 1.25rem 0; color: var(--text-secondary); line-height: 1.6;">
@@ -509,7 +511,7 @@ function showImportModal() {
             </div>
         `,
         buttons: [
-            { label: 'Cancel', type: 'secondary', onClick: () => Modal.hide() },
+            { label: 'Cancel', type: 'secondary', onClick: () => importModal.close() },
             { label: 'Import', type: 'primary', onClick: async () => {
                 const cidInput = document.getElementById('import-cid-input');
                 const cid = cidInput?.value?.trim();
@@ -524,7 +526,7 @@ function showImportModal() {
                     return;
                 }
 
-                Modal.hide();
+                importModal.close();
 
                 try {
                     Toast.info('Starting import...');
@@ -539,6 +541,7 @@ function showImportModal() {
     });
 
     setTimeout(() => {
+        if (!importModal.isCurrent()) return;
         const pasteBtn = document.getElementById('paste-cid-btn');
         const cidInput = document.getElementById('import-cid-input');
 
@@ -546,16 +549,21 @@ function showImportModal() {
             pasteBtn.addEventListener('click', async () => {
                 try {
                     const text = await navigator.clipboard.readText();
+                    if (!importModal.isCurrent()) return;
                     cidInput.value = text.trim();
                     cidInput.focus();
                     Toast.success('Pasted from clipboard');
                 } catch (e) {
+                    if (!importModal.isCurrent()) return;
                     Toast.error('Could not access clipboard');
                 }
             });
 
             cidInput.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!importModal.isCurrent()) return;
                     document.querySelector('.modal-btn-primary')?.click();
                 }
             });

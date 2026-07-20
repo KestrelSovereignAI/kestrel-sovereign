@@ -37,6 +37,7 @@ export const Security = {
     // immediately rather than wait for the user. #877.
     _activeApprovalId: null,
     _activeApprovalResolver: null,
+    _activeApprovalModal: null,
 
     // === Initialization ===
 
@@ -137,11 +138,13 @@ export const Security = {
         // skip the POST that would otherwise 404.
         if (this._activeApprovalId === data.id && this._activeApprovalResolver) {
             const resolver = this._activeApprovalResolver;
+            const approvalModal = this._activeApprovalModal;
             this._activeApprovalResolver = null;
+            this._activeApprovalModal = null;
             this._activeApprovalId = null;
             resolver({ approved: false, scope: 'once', _withdrawn: true });
             try {
-                Modal.hide();
+                approvalModal?.close();
             } catch (err) {
                 // Modal may already be closing — non-fatal.
             }
@@ -261,6 +264,7 @@ export const Security = {
                 if (this._activeApprovalId === data.id) {
                     this._activeApprovalId = null;
                     this._activeApprovalResolver = null;
+                    this._activeApprovalModal = null;
                 }
                 resolve(decision);
             };
@@ -282,7 +286,8 @@ export const Security = {
                 ">${this._escapeHtml(JSON.stringify(data.args, null, 2))}</pre>`
                 : '';
 
-            Modal.show({
+            let approvalModal;
+            approvalModal = Modal.show({
                 title: kicon('lock') + ' Permission Required',
                 content: `
                     <div class="security-approval">
@@ -312,7 +317,7 @@ export const Security = {
                         type: 'danger',
                         onClick: () => {
                             wrappedResolve({ approved: false, scope: 'once' });
-                            Modal.hide();
+                            approvalModal.close();
                         }
                     },
                     {
@@ -320,21 +325,21 @@ export const Security = {
                         type: 'secondary',
                         onClick: () => {
                             wrappedResolve({ approved: true, scope: 'once' });
-                            Modal.hide();
+                            approvalModal.close();
                         }
                     },
                     {
                         ...scopeButton('session', 'This Session', 'primary'),
                         onClick: () => {
                             wrappedResolve({ approved: true, scope: 'session' });
-                            Modal.hide();
+                            approvalModal.close();
                         }
                     },
                     {
                         ...scopeButton('always', `${kicon('checkmark')} Always`, 'primary'),
                         onClick: () => {
                             wrappedResolve({ approved: true, scope: 'always' });
-                            Modal.hide();
+                            approvalModal.close();
                         }
                     },
                     {
@@ -343,34 +348,35 @@ export const Security = {
                         // non-denied tools, not just this one.
                         label: `${kicon('shield')} Auto: Session`,
                         type: 'primary',
-                        onClick: () => this._enableGlobalAutoFromModal('session', wrappedResolve)
+                        onClick: () => this._enableGlobalAutoFromModal('session', wrappedResolve, approvalModal)
                     },
                     {
                         // Global Auto, persistent tier (red): survives refresh
                         // and server restart until explicitly turned off.
                         label: `${kicon('shield')} Auto: Always`,
                         type: 'danger',
-                        onClick: () => this._enableGlobalAutoFromModal('always', wrappedResolve)
+                        onClick: () => this._enableGlobalAutoFromModal('always', wrappedResolve, approvalModal)
                     }
                 ],
                 onClose: () => wrappedResolve({ approved: false, scope: 'once' })
             });
+            if (approvalModal.isCurrent()) this._activeApprovalModal = approvalModal;
         });
     },
 
     // Enable global Auto at the chosen tier from the approval modal, then
     // approve the in-flight request once (global Auto will auto-handle the
     // rest). Red toast for the persistent 'always' tier, orange for session.
-    async _enableGlobalAutoFromModal(scope, wrappedResolve) {
+    async _enableGlobalAutoFromModal(scope, wrappedResolve, approvalModal) {
         try {
             const response = await this.setGlobalAutoScope(scope);
             // The request can outlive this approval modal. Its onClose clears
             // the resolver identity, so only the still-active owner may settle
             // the approval and close the shared Modal singleton. Otherwise a
             // stale Auto completion could close a replacement dialog.
-            if (this._activeApprovalResolver === wrappedResolve) {
+            if (this._activeApprovalResolver === wrappedResolve && approvalModal.isCurrent()) {
                 wrappedResolve({ approved: true, scope: 'once', suppressToast: true });
-                Modal.hide();
+                approvalModal.close();
             }
             Toast[this.globalAutoScope === 'always' ? 'danger' : 'warning'](response.warning);
             await this.loadPermissionTree();
@@ -947,7 +953,8 @@ export const Security = {
     // 'always', or null (cancelled).
     _chooseAutoScope() {
         return new Promise((resolve) => {
-            Modal.show({
+            let chooserModal;
+            chooserModal = Modal.show({
                 title: 'Enable Global Auto Mode',
                 content: `
                     <p style="margin: 0 0 0.75rem 0; color: var(--text-secondary);">
@@ -962,9 +969,9 @@ export const Security = {
                     </p>
                 `,
                 buttons: [
-                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(null); Modal.hide(); } },
-                    { label: `${kicon('shield')} This Session`, type: 'primary', onClick: () => { resolve('session'); Modal.hide(); } },
-                    { label: `${kicon('shield')} Always`, type: 'danger', onClick: () => { resolve('always'); Modal.hide(); } }
+                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(null); chooserModal.close(); } },
+                    { label: `${kicon('shield')} This Session`, type: 'primary', onClick: () => { resolve('session'); chooserModal.close(); } },
+                    { label: `${kicon('shield')} Always`, type: 'danger', onClick: () => { resolve('always'); chooserModal.close(); } }
                 ],
                 onClose: () => resolve(null)
             });
@@ -983,7 +990,8 @@ export const Security = {
     async resetSession() {
         try {
             const confirmed = await new Promise((resolve) => {
-                Modal.show({
+                let resetModal;
+                resetModal = Modal.show({
                     title: 'Reset Session Permissions',
                     content: `
                         <p style="margin: 0; color: var(--text-secondary);">
@@ -992,8 +1000,8 @@ export const Security = {
                         </p>
                     `,
                     buttons: [
-                        { label: 'Cancel', type: 'secondary', onClick: () => { resolve(false); Modal.hide(); } },
-                        { label: 'Reset', type: 'primary', onClick: () => { resolve(true); Modal.hide(); } }
+                        { label: 'Cancel', type: 'secondary', onClick: () => { resolve(false); resetModal.close(); } },
+                        { label: 'Reset', type: 'primary', onClick: () => { resolve(true); resetModal.close(); } }
                     ],
                     onClose: () => resolve(false)
                 });
@@ -1021,7 +1029,8 @@ export const Security = {
 
         try {
             const confirmed = await new Promise((resolve) => {
-                Modal.show({
+                let cancelModal;
+                cancelModal = Modal.show({
                     title: 'Cancel All Pending',
                     content: `
                         <p style="margin: 0; color: var(--text-secondary);">
@@ -1030,8 +1039,8 @@ export const Security = {
                         </p>
                     `,
                     buttons: [
-                        { label: 'Keep Waiting', type: 'secondary', onClick: () => { resolve(false); Modal.hide(); } },
-                        { label: 'Cancel All', type: 'danger', onClick: () => { resolve(true); Modal.hide(); } }
+                        { label: 'Keep Waiting', type: 'secondary', onClick: () => { resolve(false); cancelModal.close(); } },
+                        { label: 'Cancel All', type: 'danger', onClick: () => { resolve(true); cancelModal.close(); } }
                     ],
                     onClose: () => resolve(false)
                 });

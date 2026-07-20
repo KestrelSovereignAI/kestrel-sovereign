@@ -338,21 +338,97 @@ const MODAL_FOCUSABLE_SELECTOR = [
 
 let modalId = 0;
 
+function modalElementIsHidden(element, modal) {
+    for (let current = element; current && current !== modal; current = current.parentElement) {
+        if (current.hidden
+            || current.getAttribute('aria-hidden') === 'true'
+            || current.hasAttribute('inert')) {
+            return true;
+        }
+
+        const style = window.getComputedStyle(current);
+        if (style.display === 'none'
+            || style.visibility === 'hidden'
+            || style.visibility === 'collapse') {
+            return true;
+        }
+
+        if (current.tagName === 'DETAILS' && !current.open) {
+            const summary = Array.from(current.children)
+                .find((child) => child.tagName === 'SUMMARY');
+            if (!summary?.contains(element)) return true;
+        }
+    }
+    return false;
+}
+
 function modalFocusableElements(modal) {
-    return Array.from(modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR)).filter((element) => {
-        const style = window.getComputedStyle(element);
-        return element.tabIndex >= 0
-            && !element.matches(':disabled')
-            && !element.hidden
-            && !element.closest('[hidden], [aria-hidden="true"]')
-            && style.display !== 'none'
-            && style.visibility !== 'hidden';
+    return Array.from(modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR))
+        .map((element, domIndex) => ({ element, domIndex }))
+        .filter(({ element }) => {
+            return element.tabIndex >= 0
+                && !element.matches(':disabled')
+                && !modalElementIsHidden(element, modal);
+        })
+        .sort((left, right) => {
+            const leftTabIndex = left.element.tabIndex;
+            const rightTabIndex = right.element.tabIndex;
+            if (leftTabIndex > 0 && rightTabIndex > 0) {
+                return leftTabIndex - rightTabIndex || left.domIndex - right.domIndex;
+            }
+            if (leftTabIndex > 0) return -1;
+            if (rightTabIndex > 0) return 1;
+            return left.domIndex - right.domIndex;
+        })
+        .map(({ element }) => element);
+}
+
+function addModalListener(lifecycle, target, type, listener, options) {
+    target.addEventListener(type, listener, options);
+    lifecycle.removeListeners.push(() => target.removeEventListener(type, listener, options));
+}
+
+function modalAttribute(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function reportModalActionError(error) {
+    if (typeof window.reportError === 'function') {
+        window.reportError(error);
+        return;
+    }
+    window.setTimeout(() => {
+        throw error;
+    }, 0);
+}
+
+function createModalHandle(controller, lifecycle) {
+    return Object.freeze({
+        isCurrent() {
+            return controller._lifecycle === lifecycle && !lifecycle.closed;
+        },
+        close() {
+            if (controller._lifecycle !== lifecycle || lifecycle.closed) return false;
+            controller._close(lifecycle);
+            return true;
+        },
+        replace(options) {
+            if (controller._lifecycle !== lifecycle || lifecycle.closed) return null;
+            return controller.show(options);
+        },
     });
 }
 
-function addModalListener(lifecycle, target, type, listener) {
-    target.addEventListener(type, listener);
-    lifecycle.removeListeners.push(() => target.removeEventListener(type, listener));
+function createInactiveModalHandle() {
+    return Object.freeze({
+        isCurrent: () => false,
+        close: () => false,
+        replace: () => null,
+    });
 }
 
 // Close contract: X, overlay, Escape, direct hide(), and replacement all run
@@ -360,9 +436,9 @@ function addModalListener(lifecycle, target, type, listener) {
 // restored before onClose runs, and onClose runs at most once. Action buttons
 // remain caller-controlled for compatibility; Modal.confirm()/prompt() record
 // their result before hide(), while Promise observers run after teardown. A
-// throwing action is the exceptional case: its lifecycle is torn down before
-// the original exception continues, so broken caller code cannot strand the
-// dialog or its document listener.
+// throwing or rejecting action is the exceptional case: its lifecycle is torn
+// down before the original error is reported, so broken caller code cannot
+// strand the dialog or its global focus listener.
 export const Modal = {
     _currentModal: null,
     _lifecycle: null,
@@ -374,8 +450,13 @@ export const Modal = {
 
         // An onClose callback may synchronously open a different modal while
         // the previous one is being replaced. The newest show() request wins;
-        // never append a second overlay from the superseded request.
-        if (showSequence !== this._showSequence) return;
+        // never append a second overlay from the superseded request. The
+        // unmounted request is still cancelled through its close callback so
+        // confirm(), prompt(), and approval promises cannot remain pending.
+        if (showSequence !== this._showSequence) {
+            if (typeof options?.onClose === 'function') options.onClose();
+            return createInactiveModalHandle();
+        }
 
         const { title, content, buttons = [], onClose } = options;
         const titleId = `modal-title-${++modalId}`;
@@ -451,7 +532,7 @@ export const Modal = {
                     flex: 0 0 auto;
                 ">
                     ${buttons.map((btn, i) => `
-                        <button type="button" class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}"${btn.disabled ? ' disabled' : ''}${btn.title ? ` title="${String(btn.title).replace(/"/g, '&quot;')}"` : ''} style="
+                        <button type="button" class="modal-btn modal-btn-${btn.type || 'secondary'}" data-btn-index="${i}"${btn.disabled ? ' disabled' : ''}${btn.title ? ` title="${modalAttribute(btn.title)}"` : ''} style="
                             padding: 0.625rem 1.25rem;
                             border: none;
                             border-radius: 8px;
@@ -479,54 +560,27 @@ export const Modal = {
             removeListeners: [],
             closed: false,
             onCloseInvoked: false,
+            lastFocused: null,
+            redirectingFocus: false,
         };
-
-        addModalListener(lifecycle, modal.querySelector('.modal-close-btn'), 'click', () => {
-            this._close(lifecycle);
-        });
-
-        addModalListener(lifecycle, overlay, 'click', (e) => {
-            if (e.target === overlay) {
-                this._close(lifecycle);
-            }
-        });
-
-        modal.querySelectorAll('.modal-btn').forEach(btn => {
-            addModalListener(lifecycle, btn, 'click', () => {
-                const index = parseInt(btn.dataset.btnIndex);
-                // Disabled buttons (e.g. a tier-gated approval scope, #2232) are
-                // rendered but inert — the user should SEE the option, not act
-                // on it. Guard here as well as via the `disabled` attribute.
-                if (buttons[index] && buttons[index].disabled) return;
-                if (buttons[index] && buttons[index].onClick) {
-                    try {
-                        buttons[index].onClick();
-                    } catch (error) {
-                        // A caller-controlled action normally decides whether
-                        // the dialog stays open. Once it throws, however, no
-                        // caller code remains to perform that close. Preserve
-                        // the original error while guaranteeing teardown;
-                        // _close() is idempotent when the action hid first.
-                        try {
-                            this._close(lifecycle);
-                        } finally {
-                            throw error;
-                        }
-                    }
-                }
-            });
-        });
+        const handle = createModalHandle(this, lifecycle);
 
         const keydownHandler = (e) => {
             if (this._lifecycle !== lifecycle || lifecycle.closed) return;
+            // A modal owns every key event from its subtree. Controls still
+            // receive the event first, but document-level application
+            // shortcuts must never act behind the active dialog.
+            e.stopPropagation();
 
             if (e.key === 'Escape') {
+                if (e.defaultPrevented) return;
                 e.preventDefault();
                 this._close(lifecycle);
                 return;
             }
 
             if (e.key !== 'Tab') return;
+            if (e.defaultPrevented) return;
 
             const focusable = modalFocusableElements(modal);
             if (focusable.length === 0) {
@@ -539,7 +593,7 @@ export const Modal = {
             const last = focusable[focusable.length - 1];
             const active = document.activeElement;
 
-            if (!modal.contains(active)) {
+            if (!focusable.includes(active)) {
                 e.preventDefault();
                 (e.shiftKey ? last : first).focus();
             } else if (e.shiftKey && active === first) {
@@ -550,23 +604,129 @@ export const Modal = {
                 first.focus();
             }
         };
-        addModalListener(lifecycle, document, 'keydown', keydownHandler);
+        const documentKeydownHandler = (e) => {
+            if (this._lifecycle !== lifecycle || lifecycle.closed) return;
 
-        overlay.appendChild(modal);
-        getOverlayRoot().appendChild(overlay);
-        this._currentModal = overlay;
-        this._lifecycle = lifecycle;
+            const eventPath = typeof e.composedPath === 'function' ? e.composedPath() : [];
+            if (eventPath.includes(modal) || modal.contains(e.target)) return;
 
-        // Prefer an explicitly-autofocused/content control, then an action,
-        // with the always-present close button as the final fallback.
-        const focusable = modalFocusableElements(modal);
-        const modalBody = modal.querySelector('.modal-body');
-        const initialFocus = focusable.find((element) => element.hasAttribute('autofocus'))
-            || focusable.find((element) => modalBody?.contains(element))
-            || focusable.find((element) => element.classList.contains('modal-btn'))
-            || focusable.find((element) => element.classList.contains('modal-close-btn'))
-            || modal;
-        initialFocus.focus();
+            // Removing or disabling the focused control can move focus to the
+            // document body without firing focusin. Contain that orphaned key
+            // event, then reuse the dialog's normal Escape/Tab behavior.
+            keydownHandler(e);
+            if (this._lifecycle !== lifecycle || lifecycle.closed || e.key === 'Tab') return;
+
+            const focusable = modalFocusableElements(modal);
+            const target = focusable.includes(lifecycle.lastFocused)
+                ? lifecycle.lastFocused
+                : (focusable[0] || modal);
+            target.focus();
+            lifecycle.lastFocused = target;
+        };
+        const focusinHandler = (e) => {
+            if (this._lifecycle !== lifecycle || lifecycle.closed || lifecycle.redirectingFocus) return;
+            if (modal.contains(e.target)) {
+                lifecycle.lastFocused = e.target;
+                return;
+            }
+
+            const focusable = modalFocusableElements(modal);
+            const target = focusable.includes(lifecycle.lastFocused)
+                ? lifecycle.lastFocused
+                : (focusable[0] || modal);
+            lifecycle.redirectingFocus = true;
+            try {
+                target.focus();
+            } finally {
+                lifecycle.redirectingFocus = false;
+            }
+        };
+
+        try {
+            addModalListener(lifecycle, modal.querySelector('.modal-close-btn'), 'click', () => {
+                this._close(lifecycle);
+            });
+
+            addModalListener(lifecycle, overlay, 'click', (e) => {
+                if (e.target === overlay) {
+                    this._close(lifecycle);
+                }
+            });
+
+            modal.querySelectorAll('.modal-btn').forEach(btn => {
+                addModalListener(lifecycle, btn, 'click', () => {
+                    const index = parseInt(btn.dataset.btnIndex, 10);
+                    // Disabled buttons (e.g. a tier-gated approval scope, #2232) are
+                    // rendered but inert — the user should SEE the option, not act
+                    // on it. Guard here as well as via the `disabled` attribute.
+                    if (buttons[index] && buttons[index].disabled) return;
+                    if (!buttons[index] || !buttons[index].onClick) return;
+
+                    try {
+                        const result = buttons[index].onClick();
+                        if (result && typeof result.then === 'function') {
+                            Promise.resolve(result).catch((error) => {
+                                try {
+                                    this._close(lifecycle);
+                                } catch (closeError) {
+                                    reportModalActionError(new AggregateError(
+                                        [error, closeError],
+                                        'Modal action and close both failed',
+                                    ));
+                                    return;
+                                }
+                                reportModalActionError(error);
+                            });
+                        }
+                    } catch (error) {
+                        // A caller-controlled action normally decides whether
+                        // the dialog stays open. Once it fails, however, no
+                        // caller code remains to perform that close. Preserve
+                        // the original error while guaranteeing teardown;
+                        // _close() is idempotent when the action hid first.
+                        try {
+                            this._close(lifecycle);
+                        } catch (closeError) {
+                            throw new AggregateError(
+                                [error, closeError],
+                                'Modal action and close both failed',
+                            );
+                        }
+                        throw error;
+                    }
+                });
+            });
+
+            addModalListener(lifecycle, overlay, 'keydown', keydownHandler);
+
+            overlay.appendChild(modal);
+            getOverlayRoot().appendChild(overlay);
+            this._currentModal = overlay;
+            this._lifecycle = lifecycle;
+            addModalListener(lifecycle, document, 'keydown', documentKeydownHandler, true);
+            addModalListener(lifecycle, document, 'focusin', focusinHandler, true);
+
+            // Prefer an explicitly-autofocused/content control, then an action,
+            // with the always-present close button as the final fallback.
+            const focusable = modalFocusableElements(modal);
+            const modalBody = modal.querySelector('.modal-body');
+            const initialFocus = focusable.find((element) => element.hasAttribute('autofocus'))
+                || focusable.find((element) => modalBody?.contains(element))
+                || focusable.find((element) => element.classList.contains('modal-btn'))
+                || focusable.find((element) => element.classList.contains('modal-close-btn'))
+                || modal;
+            initialFocus.focus();
+            lifecycle.lastFocused = initialFocus;
+        } catch (error) {
+            lifecycle.onClose = null;
+            try {
+                this._close(lifecycle);
+            } catch (cleanupError) {
+                throw new AggregateError([error, cleanupError], 'Modal setup and cleanup both failed');
+            }
+            throw error;
+        }
+        return handle;
     },
 
     hide() {
@@ -579,11 +739,21 @@ export const Modal = {
         if (!lifecycle || lifecycle.closed) return;
         lifecycle.closed = true;
 
+        const errors = [];
+
         for (const removeListener of lifecycle.removeListeners) {
-            removeListener();
+            try {
+                removeListener();
+            } catch (error) {
+                errors.push(error);
+            }
         }
         lifecycle.removeListeners.length = 0;
-        lifecycle.overlay.remove();
+        try {
+            lifecycle.overlay.remove();
+        } catch (error) {
+            errors.push(error);
+        }
 
         if (this._lifecycle === lifecycle) {
             this._lifecycle = null;
@@ -591,29 +761,41 @@ export const Modal = {
         }
 
         // Teardown and focus restoration are complete before onClose runs.
-        // The callback is deliberately not caught: caller errors still fail
-        // visibly, but can no longer strand DOM or document listeners.
+        // Teardown stages are isolated so one failure cannot skip onClose.
+        // Collected caller errors still fail visibly once every stage ran.
         if (lifecycle.opener
             && lifecycle.opener !== document.body
             && lifecycle.opener.isConnected
             && typeof lifecycle.opener.focus === 'function') {
-            lifecycle.opener.focus();
+            try {
+                lifecycle.opener.focus();
+            } catch (error) {
+                errors.push(error);
+            }
         }
 
         if (!lifecycle.onCloseInvoked && typeof lifecycle.onClose === 'function') {
             lifecycle.onCloseInvoked = true;
-            lifecycle.onClose();
+            try {
+                lifecycle.onClose();
+            } catch (error) {
+                errors.push(error);
+            }
         }
+
+        if (errors.length === 1) throw errors[0];
+        if (errors.length > 1) throw new AggregateError(errors, 'Modal close failed');
     },
 
     confirm(title, message) {
         return new Promise((resolve) => {
-            this.show({
+            let handle;
+            handle = this.show({
                 title,
                 content: `<p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">${message}</p>`,
                 buttons: [
-                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(false); this.hide(); } },
-                    { label: 'Confirm', type: 'primary', onClick: () => { resolve(true); this.hide(); } }
+                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(false); handle.close(); } },
+                    { label: 'Confirm', type: 'primary', onClick: () => { resolve(true); handle.close(); } }
                 ],
                 onClose: () => resolve(false)
             });
@@ -622,13 +804,15 @@ export const Modal = {
 
     prompt(title, placeholder = '', defaultValue = '') {
         return new Promise((resolve) => {
-            const inputId = 'modal-prompt-input-' + Date.now();
-            this.show({
+            const inputId = `modal-prompt-input-${++modalId}`;
+            let handle;
+            handle = this.show({
                 title,
                 content: `
                     <input type="text" id="${inputId}"
-                        placeholder="${placeholder}"
-                        value="${defaultValue}"
+                        aria-label="${modalAttribute(title || 'Response')}"
+                        placeholder="${modalAttribute(placeholder)}"
+                        value="${modalAttribute(defaultValue)}"
                         style="
                             width: 100%;
                             padding: 0.75rem 1rem;
@@ -645,27 +829,29 @@ export const Modal = {
                     />
                 `,
                 buttons: [
-                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(null); this.hide(); } },
+                    { label: 'Cancel', type: 'secondary', onClick: () => { resolve(null); handle.close(); } },
                     { label: 'OK', type: 'primary', onClick: () => {
                         const value = document.getElementById(inputId)?.value || '';
                         resolve(value);
-                        this.hide();
+                        handle.close();
                     }}
                 ],
                 onClose: () => resolve(null)
             });
 
-            setTimeout(() => {
-                const input = document.getElementById(inputId);
-                if (input) {
-                    input.addEventListener('keydown', (e) => {
-                        if (e.key === 'Enter') {
-                            resolve(input.value);
-                            this.hide();
-                        }
-                    });
-                }
-            }, 50);
+            const lifecycle = handle.isCurrent() ? this._lifecycle : null;
+            const input = lifecycle?.modal.querySelector(`#${inputId}`);
+            if (input && !lifecycle.closed) {
+                addModalListener(lifecycle, input, 'keydown', (e) => {
+                    if (e.key === 'Enter' && !e.isComposing) {
+                        e.stopPropagation();
+                        if (e.defaultPrevented) return;
+                        e.preventDefault();
+                        resolve(input.value);
+                        handle.close();
+                    }
+                });
+            }
         });
     }
 };

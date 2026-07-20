@@ -25,7 +25,7 @@ const SPAWN_LINK_ID = 'create-agent-spawn-link';
  * Open the Create Agent dialog.
  *
  * @param {object}   deps
- * @param {object}   deps.modal          - shared Modal helper (`show`/`hide`).
+ * @param {object}   deps.modal          - shared Modal helper (`show`).
  * @param {object}   deps.api            - API client exposing `createAgent(name)`.
  * @param {Function} deps.onCreated      - async cb(name) run after a successful
  *                                          create (refresh the list + select).
@@ -72,6 +72,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
     `;
 
     let submitting = false;
+    let dialogHandle;
 
     const showError = (message) => {
         const el = document.getElementById(ERROR_ID);
@@ -105,22 +106,17 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         }
         submitting = true;
         clearError();
-        // Scope the async completion to THIS dialog instance (codex P2): the
-        // user can dismiss the dialog while createAgent is in flight and open
-        // another modal — the eventual resolution must not hide that unrelated
-        // modal or paint errors into a reopened Create Agent. The name input
-        // element is unique to this render; if it's gone or detached, the
-        // dialog this request belonged to no longer exists.
-        const dialogInput = input;
-        const stillCurrent = () => !!(dialogInput && dialogInput.isConnected
-            && document.getElementById(INPUT_ID) === dialogInput);
+        // Scope the async completion to THIS dialog lifecycle. A later modal
+        // may reuse the same DOM ids, so element identity is not an ownership
+        // primitive; the shared Modal handle is.
+        const requestOwner = dialogHandle;
         try {
             const result = await api.createAgent(name);
             // Success: close the dialog first, then let the host refresh the list
             // and select the freshly-minted agent. The refresh/select still runs
             // even if the user dismissed the dialog mid-flight — the agent WAS
-            // created; only the modal.hide() must be scoped.
-            if (stillCurrent()) modal.hide();
+            // created; only the lifecycle close must be scoped.
+            requestOwner.close();
             // Partial failure (codex P2): HTTP 200 with persisted:false means
             // the agent EXISTS but its registration didn't reach
             // multi_agent.toml — it will vanish from the fleet on the next
@@ -139,17 +135,17 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
             // user can correct the name in place without losing the dialog. But
             // only into the SAME dialog instance that submitted.
             submitting = false;
-            if (!stillCurrent()) return;
+            if (!requestOwner.isCurrent()) return;
             const detail = (err && ((err.body && err.body.detail) || err.message)) || 'Failed to create agent.';
             showError(detail);
         }
     };
 
-    modal.show({
+    dialogHandle = modal.show({
         title: 'Create Agent',
         content,
         buttons: [
-            { label: 'Cancel', type: 'secondary', onClick: () => modal.hide() },
+            { label: 'Cancel', type: 'secondary', onClick: () => dialogHandle.close() },
             { label: 'Create', type: 'primary', onClick: () => { submit(); } },
         ],
     });
@@ -157,11 +153,13 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
     // Wire post-render behavior (Enter-to-submit, live error clear, spawn link).
     // Deferred so it runs after Modal.show has appended the content.
     setTimeout(() => {
+        if (!dialogHandle.isCurrent()) return;
         const input = document.getElementById(INPUT_ID);
         if (input) {
             input.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter') {
                     e.preventDefault();
+                    e.stopPropagation();
                     submit();
                 }
             });
@@ -171,7 +169,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         if (link) {
             link.addEventListener('click', (e) => {
                 e.preventDefault();
-                modal.hide();
+                dialogHandle.close();
                 if (onSpawn) onSpawn();
             });
         }

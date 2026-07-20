@@ -130,7 +130,7 @@ function esc(str) {
  * @param {HTMLElement} opts.container - element to render into.
  * @param {object} opts.identity       - identity payload.
  * @param {object} opts.api            - API client.
- * @param {object} opts.Modal          - Modal helper (`show`/`hide`).
+ * @param {object} opts.Modal          - Modal helper (`show` + ownership handle).
  * @param {object} [opts.Toast]        - Toast helper (`success`/`error`).
  * @param {object} [opts.config]       - embed config (defaults to global).
  * @returns {boolean} whether the section was rendered.
@@ -182,7 +182,8 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
     const inputId = 'danger-zone-confirm-input';
     const displayName = (identity && identity.name) || required || 'this agent';
 
-    Modal.show({
+    let confirmModal;
+    confirmModal = Modal.show({
         title: action.label,
         content: `
             <p style="margin: 0 0 1rem 0; color: var(--text-secondary); line-height: 1.6;">
@@ -205,7 +206,7 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
                 " />
         `,
         buttons: [
-            { label: 'Cancel', type: 'secondary', onClick: () => Modal.hide() },
+            { label: 'Cancel', type: 'secondary', onClick: () => confirmModal.close() },
             {
                 label: action.label,
                 type: 'danger',
@@ -218,7 +219,7 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
                         if (input) input.style.borderColor = 'var(--error)';
                         return;
                     }
-                    Modal.hide();
+                    confirmModal.close();
                     _runDelete({ action, displayName, Toast });
                 },
             },
@@ -228,6 +229,7 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
     // Arm/disarm the danger button live as the user types (mirrors the
     // prompt() wiring in ui.js — the modal is already in the DOM by now).
     setTimeout(() => {
+        if (!confirmModal.isCurrent()) return;
         const input = document.getElementById(inputId);
         const dangerBtn = document.querySelector('#modal-overlay .modal-btn-danger');
         if (!input || !dangerBtn) return;
@@ -242,7 +244,9 @@ function _openConfirmModal({ action, identity, Modal, Toast }) {
         input.addEventListener('input', sync);
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && input.value === required) {
-                Modal.hide();
+                e.preventDefault();
+                e.stopPropagation();
+                confirmModal.close();
                 _runDelete({ action, displayName, Toast });
             }
         });
