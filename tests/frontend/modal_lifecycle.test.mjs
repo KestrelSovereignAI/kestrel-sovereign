@@ -222,7 +222,7 @@ test('onClose exceptions propagate only after lifecycle cleanup', () => {
     assert.equal(closes, 1);
 });
 
-test('an action exception after hide cannot strand the modal lifecycle', () => {
+test('an action exception cannot strand the modal lifecycle', () => {
     let reportedError = null;
     window.addEventListener('error', (event) => {
         reportedError = event.error;
@@ -230,9 +230,8 @@ test('an action exception after hide cannot strand the modal lifecycle', () => {
     }, { once: true });
     openModal({
         buttons: [{
-            label: 'Fail after close',
+            label: 'Fail',
             onClick: () => {
-                Modal.hide();
                 throw new Error('action failed');
             },
         }],

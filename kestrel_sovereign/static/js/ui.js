@@ -359,7 +359,10 @@ function addModalListener(lifecycle, target, type, listener) {
 // the same synchronous teardown. DOM/listeners are removed and opener focus is
 // restored before onClose runs, and onClose runs at most once. Action buttons
 // remain caller-controlled for compatibility; Modal.confirm()/prompt() record
-// their result before hide(), while Promise observers run after teardown.
+// their result before hide(), while Promise observers run after teardown. A
+// throwing action is the exceptional case: its lifecycle is torn down before
+// the original exception continues, so broken caller code cannot strand the
+// dialog or its document listener.
 export const Modal = {
     _currentModal: null,
     _lifecycle: null,
@@ -496,7 +499,20 @@ export const Modal = {
                 // on it. Guard here as well as via the `disabled` attribute.
                 if (buttons[index] && buttons[index].disabled) return;
                 if (buttons[index] && buttons[index].onClick) {
-                    buttons[index].onClick();
+                    try {
+                        buttons[index].onClick();
+                    } catch (error) {
+                        // A caller-controlled action normally decides whether
+                        // the dialog stays open. Once it throws, however, no
+                        // caller code remains to perform that close. Preserve
+                        // the original error while guaranteeing teardown;
+                        // _close() is idempotent when the action hid first.
+                        try {
+                            this._close(lifecycle);
+                        } finally {
+                            throw error;
+                        }
+                    }
                 }
             });
         });
