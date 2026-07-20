@@ -68,6 +68,10 @@ function normalizeErrorCode(value) {
 
 function normalizeUserText(value) {
     if (typeof value !== 'string') return '';
+    // An upstream proxy may place an entire HTML error page in a nominal JSON
+    // message field. Treat document/script/style markup as non-displayable,
+    // just as the raw-text response path does, rather than surfacing fragments.
+    if (looksLikeHtml(value)) return '';
     let text = value
         .slice(0, MAX_ERROR_TEXT_LENGTH * 4)
         .replace(/<\/?[A-Za-z][^>]*(?:>|$)/g, ' ')
@@ -125,7 +129,7 @@ function normalizeDetailItem(item) {
 
     const normalized = { message };
     if (locationParts.length) normalized.location = locationParts.join('.');
-    const code = firstUserText(item.code, item.type);
+    const code = normalizeErrorCode(item.code) || normalizeErrorCode(item.type);
     if (code) normalized.code = code;
     return normalized;
 }
@@ -192,9 +196,17 @@ async function readResponseErrorBody(response) {
 }
 
 /** Parse a failed Fetch Response into the console's single ApiError shape. */
-export async function parseResponseError(response, { fallbackMessage = '' } = {}) {
+export async function parseResponseError(response, {
+    fallbackMessage = '',
+    signal = null,
+} = {}) {
+    throwIfAborted(signal);
     const status = Number.isInteger(response?.status) ? response.status : 0;
     const body = await readResponseErrorBody(response || {});
+    // Body readers do not consistently reject with AbortError when callers
+    // supply a custom abort reason. Consult the request signal after the await
+    // so cancellation is never flattened into an HTTP ApiError.
+    throwIfAborted(signal);
     const envelope = body && typeof body === 'object' && !Array.isArray(body)
         && body.error && typeof body.error === 'object' && !Array.isArray(body.error)
         ? body.error
@@ -642,17 +654,26 @@ export function createApiClient({
         // can provide a stronger outcome.
         const unauthorizedError = await parseResponseError(response, {
             fallbackMessage: 'Authentication failed - please refresh the page',
+            signal,
         });
         // The body read above is asynchronous. A user can cancel while it is
         // in progress even when the reader itself resolves normally; never
         // turn that cancellation into an auth refresh or typed 401.
         throwIfAborted(signal);
         try {
+            const recovery = await auth.onUnauthorized();
+            // Cancellation can happen while a refresh/redirect callback is
+            // pending. Do not rebuild credentials or begin a retry afterward.
+            throwIfAborted(signal);
             return {
-                recovery: await auth.onUnauthorized(),
+                recovery,
                 unauthorizedError,
             };
-        } catch (_) {
+        } catch (error) {
+            // Preserve cancellation even when the auth provider reports it by
+            // throwing, including custom abort reasons without AbortError.name.
+            throwIfAborted(signal);
+            if (isAbortError(error)) throw error;
             // A failing refresh/redirect callback must not erase the server's
             // actionable 401 status, body, and correlation reference.
             throw unauthorizedError;
@@ -673,11 +694,16 @@ export function createApiClient({
             try {
                 headers = await buildHeaders(options.headers);
             } catch (error) {
+                throwIfAborted(options.signal);
                 if (pendingUnauthorizedError && !isAbortError(error)) {
                     throw pendingUnauthorizedError;
                 }
                 throw error;
             }
+            // A custom AbortController reason is not necessarily named
+            // AbortError. Re-check the signal after asynchronous credential
+            // setup so an aborted retry never reaches fetch or becomes a 401.
+            throwIfAborted(options.signal);
             if (options.body instanceof FormData) {
                 delete headers['Content-Type'];
             }
@@ -686,6 +712,7 @@ export function createApiClient({
             try {
                 response = await fetchImpl(url, { ...options, headers });
             } catch (error) {
+                throwIfAborted(options.signal);
                 if (pendingUnauthorizedError && !isAbortError(error)) {
                     throw pendingUnauthorizedError;
                 }
@@ -711,7 +738,7 @@ export function createApiClient({
             }
 
             if (!response.ok) {
-                throw await parseResponseError(response);
+                throw await parseResponseError(response, { signal: options.signal });
             }
             return response.json();
         }
@@ -1074,6 +1101,7 @@ export function createApiClient({
                             signal,
                         });
                     } catch (error) {
+                        throwIfAborted(signal);
                         if (pendingUnauthorizedError && !isAbortError(error)) {
                             throw pendingUnauthorizedError;
                         }
@@ -1096,7 +1124,12 @@ export function createApiClient({
                             alreadyRetried = true;
                             try {
                                 headers = await buildHeaders({ 'Content-Type': 'application/json' });
+                                // applyAuth may complete after Stop aborted the
+                                // request with an arbitrary reason. Do not
+                                // start the refreshed fetch in that state.
+                                throwIfAborted(signal);
                             } catch (error) {
+                                throwIfAborted(signal);
                                 if (isAbortError(error)) throw error;
                                 throw unauthorizedError;
                             }
@@ -1107,7 +1140,9 @@ export function createApiClient({
                         throw unauthorizedError;
                     }
 
-                    if (!response.ok) throw await parseResponseError(response);
+                    if (!response.ok) {
+                        throw await parseResponseError(response, { signal });
+                    }
                     state.currentStreamRequestIds.set(dispatchAgent, response.headers.get('X-Request-ID'));
                     // Capture the server-resolved session_id BEFORE the body
                     // streams. sendMessage reads it via getEffectiveSessionId

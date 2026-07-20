@@ -143,6 +143,56 @@ test('extractUpgradeRequired recognizes the canonical nested envelope', async ()
     assert.equal(upgrade.upgradeHref, '/upgrade');
 });
 
+test('canonical upgrade rendering uses normalized ApiError text and correlation', async () => {
+    const { extractUpgradeRequired, upgradeToastHtml } = await loadHelper();
+    const client = createApiClient({
+        fetchFn: async () => ({
+            ...jsonResponse(403, {
+                error: {
+                    code: 'upgrade_required',
+                    message: '<img src=x onerror=alert(1)> secret=do-not-show',
+                    correlation_id: 'upgrade-support-ref',
+                },
+                required_tier: { hostile: 'object' },
+                upgrade_href: '/upgrade',
+            }),
+            headers: { get: () => null },
+            async text() {
+                return JSON.stringify({
+                    error: {
+                        code: 'upgrade_required',
+                        message: '<img src=x onerror=alert(1)> secret=do-not-show',
+                        correlation_id: 'upgrade-support-ref',
+                    },
+                    required_tier: { hostile: 'object' },
+                    upgrade_href: '/upgrade',
+                });
+            },
+        }),
+        sessionStorage: createStorage(),
+        location: { href: '/', search: '' },
+        logger: createLogger(),
+        authProvider: {
+            async ensureAuthenticated() {},
+            async applyAuth(h) { return h; },
+            async onUnauthorized() { return 'failed'; },
+        },
+    });
+
+    let error;
+    try {
+        await client.request('/api/security/approve');
+    } catch (caught) {
+        error = caught;
+    }
+    const upgrade = extractUpgradeRequired(error);
+    assert.ok(upgrade);
+    assert.equal(upgrade.requiredTier, null);
+    assert.match(upgrade.message, /Reference: upgrade-support-ref/);
+    assert.doesNotMatch(upgrade.message, /<img|do-not-show|\[object Object\]/);
+    assert.doesNotMatch(upgradeToastHtml(upgrade), /<img|do-not-show|\[object Object\]/);
+});
+
 test('extractUpgradeRequired returns null for unrelated errors', async () => {
     const { extractUpgradeRequired } = await loadHelper();
     assert.equal(extractUpgradeRequired(null), null);

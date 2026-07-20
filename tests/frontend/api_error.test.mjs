@@ -197,6 +197,19 @@ test('structured details are bounded, normalized, and never stringify object loc
     assert.doesNotMatch(error.message, /<b>|super-secret-token|\[object Object\]/);
 });
 
+test('structured detail codes accept only stable machine-readable values', async () => {
+    const error = await captureRequestError(() => errorResponse(422, {
+        detail: [
+            { loc: ['body', 'good'], msg: 'Good code.', type: 'value_error' },
+            { loc: ['body', 'bad'], msg: 'Bad code.', code: 'secret = do-not-show' },
+        ],
+    }));
+
+    assert.equal(error.details[0].code, 'value_error');
+    assert.equal('code' in error.details[1], false);
+    assert.doesNotMatch(JSON.stringify(error.details), /do-not-show/);
+});
+
 test('host requests use the same parser and never expose raw HTML or credential assignments', async () => {
     const error = await captureRequestError(
         () => errorResponse(
@@ -223,6 +236,18 @@ test('unterminated HTML-like response text is not exposed as an error message', 
 
     assert.equal(error.message, 'Bad Gateway');
     assert.doesNotMatch(error.message, /<img|secret|leaked/i);
+});
+
+test('HTML documents nested in JSON message fields are not exposed', async () => {
+    const error = await captureRequestError(() => errorResponse(
+        502,
+        { error: { code: 'proxy_error', message: '<!doctype html><body>private proxy page</body>' } },
+        { statusText: 'Bad Gateway' },
+    ));
+
+    assert.equal(error.code, 'proxy_error');
+    assert.equal(error.message, 'Bad Gateway');
+    assert.doesNotMatch(error.message, /doctype|private proxy page/i);
 });
 
 test('401 refresh retries once and a failed retried response is still an ApiError', async () => {
@@ -306,6 +331,29 @@ for (const mode of ['request', 'stream']) {
 }
 
 for (const mode of ['request', 'stream']) {
+    test(`${mode} preserves AbortError thrown by auth recovery`, async () => {
+        const abort = new Error('cancelled during auth recovery');
+        abort.name = 'AbortError';
+        const client = clientFor(async () => errorResponse(
+            401,
+            { error: { code: 'authentication_required', message: 'Sign in again.' } },
+        ), {
+            async ensureAuthenticated() {},
+            async applyAuth(value) { return value; },
+            async onUnauthorized() { throw abort; },
+        });
+
+        const operation = mode === 'stream'
+            ? () => client.streamInvoke('hello').next()
+            : () => client.request('/api/example');
+        await assert.rejects(
+            operation,
+            (error) => error === abort && !(error instanceof ApiError),
+        );
+    });
+}
+
+for (const mode of ['request', 'stream']) {
     test(`${mode} preserves the original typed 401 when refreshed auth header setup throws`, async () => {
         const setupFailures = [
             new Error('credential provider leaked a refresh secret'),
@@ -385,6 +433,78 @@ for (const mode of ['request', 'stream']) {
             assert.doesNotMatch(error.message, /transport|connection/i);
             return true;
         });
+        assert.equal(fetchCalls, 2);
+    });
+}
+
+for (const mode of ['request', 'stream']) {
+    test(`${mode} preserves a custom cancellation immediately before the refreshed retry fetch`, async () => {
+        const reason = new Error('custom cancellation before retry fetch');
+        const controller = new AbortController();
+        let applyAuthCalls = 0;
+        let fetchCalls = 0;
+        let client;
+        client = clientFor(async () => {
+            fetchCalls += 1;
+            return errorResponse(401, { detail: 'expired' });
+        }, {
+            async ensureAuthenticated() {},
+            async applyAuth(value) {
+                applyAuthCalls += 1;
+                if (applyAuthCalls === 2) {
+                    if (mode === 'stream') {
+                        client.getStreamAbortController()?.abort(reason);
+                    } else {
+                        controller.abort(reason);
+                    }
+                }
+                return value;
+            },
+            async onUnauthorized() { return 'refreshed'; },
+        });
+
+        const operation = mode === 'stream'
+            ? () => client.streamInvoke('hello').next()
+            : () => client.request('/api/example', { signal: controller.signal });
+        await assert.rejects(
+            operation,
+            (error) => error === reason && error.name !== 'AbortError' && !(error instanceof ApiError),
+        );
+        assert.equal(applyAuthCalls, 2);
+        assert.equal(fetchCalls, 1);
+    });
+}
+
+for (const mode of ['request', 'stream']) {
+    test(`${mode} preserves a custom cancellation rejected by the refreshed retry fetch`, async () => {
+        const reason = new Error('custom cancellation from retry fetch');
+        const controller = new AbortController();
+        let fetchCalls = 0;
+        let client;
+        client = clientFor(async () => {
+            fetchCalls += 1;
+            if (fetchCalls === 2) {
+                if (mode === 'stream') {
+                    client.getStreamAbortController()?.abort(reason);
+                } else {
+                    controller.abort(reason);
+                }
+                throw reason;
+            }
+            return errorResponse(401, { detail: 'expired' });
+        }, {
+            async ensureAuthenticated() {},
+            async applyAuth(value) { return value; },
+            async onUnauthorized() { return 'refreshed'; },
+        });
+
+        const operation = mode === 'stream'
+            ? () => client.streamInvoke('hello').next()
+            : () => client.request('/api/example', { signal: controller.signal });
+        await assert.rejects(
+            operation,
+            (error) => error === reason && error.name !== 'AbortError' && !(error instanceof ApiError),
+        );
         assert.equal(fetchCalls, 2);
     });
 }
@@ -506,3 +626,33 @@ test('stream cancellation after 401 body parsing skips auth recovery', async () 
     );
     assert.equal(unauthorizedCalls, 0);
 });
+
+for (const mode of ['request', 'stream']) {
+    test(`${mode} preserves a custom cancellation reason while parsing an error body`, async () => {
+        const reason = new Error('custom cancellation reason');
+        let client;
+        const controller = new AbortController();
+        client = clientFor(async () => ({
+            ok: false,
+            status: 403,
+            statusText: 'Forbidden',
+            headers: headers(),
+            async text() {
+                if (mode === 'stream') {
+                    client.getStreamAbortController()?.abort(reason);
+                } else {
+                    controller.abort(reason);
+                }
+                return JSON.stringify({ detail: 'must not replace cancellation' });
+            },
+        }));
+
+        const operation = mode === 'stream'
+            ? () => client.streamInvoke('hello').next()
+            : () => client.request('/api/example', { signal: controller.signal });
+        await assert.rejects(
+            operation,
+            (error) => error === reason && !(error instanceof ApiError),
+        );
+    });
+}

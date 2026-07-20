@@ -1445,7 +1445,7 @@ function uploadAndStage(file, inline) {
             renderAttachmentTray();
         } catch (err) {
             const detail = err && err.message ? err.message : 'Request failed.';
-            deps().toast.error(deps().escapeHtml(`Attachment upload failed: ${detail}`));
+            deps().toast.error(`Attachment upload failed: ${detail}`);
         }
     })();
     pane.pendingUploads.add(p);
@@ -1866,8 +1866,8 @@ function showTaskNotification(message, type) {
     // `message` is not local-user authored — it carries A2A peer `sender`
     // identities and task failure text passed straight through from remote
     // submitters (see agent/event_manager.describe_background_task). Escape
-    // it once here so neither the pane innerHTML below nor the Toast render
-    // (the only other consumer of this string) can be an XSS sink (#1650).
+    // the copy inserted into the pane HTML; Toast renders its own copy through
+    // textContent and must receive the original text to avoid showing entities.
     const safeMessage = deps().escapeHtml(message);
 
     const div = document.createElement('div');
@@ -1913,7 +1913,7 @@ function showTaskNotification(message, type) {
     if (c) c.scrollTop = c.scrollHeight;
 
     // Also show a Toast notification
-    deps().toast.show(safeMessage, type === 'failed' ? 'error' : 'info');
+    deps().toast.show(message, type === 'failed' ? 'error' : 'info');
 }
 
 // Dedupe set for rendered cognition wakes (#1522). EventSource
@@ -4277,7 +4277,7 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
             } catch (e) {
                 const detail = e && e.message ? e.message : 'Request failed.';
                 console.warn(`set model request error (${dispatchAgent}):`, detail);
-                deps().toast?.error?.(deps().escapeHtml(`Could not set model ${model}: ${detail}`));
+                deps().toast?.error?.(`Could not set model ${model}: ${detail}`);
                 await revertToServerTruth();
             }
         }

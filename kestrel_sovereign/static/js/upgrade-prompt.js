@@ -22,6 +22,12 @@ import API from './api.js';
 
 export const UPGRADE_REQUIRED_CODE = 'upgrade_required';
 
+function optionalString(value, maxLength = 256) {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim();
+    return normalized ? normalized.slice(0, maxLength) : null;
+}
+
 function esc(s) {
     return String(s == null ? '' : s)
         .replace(/&/g, '&amp;')
@@ -55,11 +61,17 @@ export function extractUpgradeRequired(error) {
     ) {
         return null;
     }
+    // ApiError.message is the normalized display path and includes the safe
+    // correlation reference. Reading payload.message directly here would
+    // bypass that normalization for the upgrade-specific renderer.
+    const message = error.name === 'ApiError'
+        ? optionalString(error.message, 1200)
+        : optionalString(payload.message, 1000);
     return {
-        action: payload.action || null,
-        requiredTier: payload.required_tier || null,
-        currentTier: payload.current_tier || null,
-        message: payload.message || 'This action requires an upgrade.',
+        action: optionalString(payload.action),
+        requiredTier: optionalString(payload.required_tier),
+        currentTier: optionalString(payload.current_tier),
+        message: message || 'This action requires an upgrade.',
         upgradeHref: sanitizeUpgradeHref(payload.upgrade_href),
     };
 }

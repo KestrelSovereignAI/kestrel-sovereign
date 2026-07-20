@@ -1,6 +1,7 @@
 """Canonical API error envelope contracts (#2651)."""
 
 import json
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -40,6 +41,13 @@ def _app() -> FastAPI:
             status_code=304,
             detail="must not be serialized",
             headers={"ETag": '"unchanged"'},
+        )
+
+    @app.get("/jsonable-detail")
+    async def jsonable_detail_error():
+        raise HTTPException(
+            status_code=409,
+            detail={"retry_at": datetime(2026, 7, 20, tzinfo=timezone.utc)},
         )
 
     @app.get("/typed")
@@ -109,6 +117,14 @@ def test_bodyless_http_status_preserves_protocol_and_correlation_header():
     assert response.content == b""
     assert response.headers["ETag"] == '"unchanged"'
     assert response.headers["X-Correlation-ID"]
+
+
+def test_http_exception_retains_fastapi_jsonable_detail_compatibility():
+    response = TestClient(_app()).get("/jsonable-detail")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {"retry_at": "2026-07-20T00:00:00+00:00"}
+    assert response.json()["error"]["message"] == "Conflict"
 
 
 def test_typed_exception_exposes_stable_code_and_safe_details():

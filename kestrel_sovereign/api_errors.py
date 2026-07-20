@@ -7,6 +7,7 @@ from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.utils import is_body_allowed_for_status_code
@@ -91,18 +92,23 @@ def api_error_response(
     if details:
         error["details"] = details
 
+    content = {
+        "error": error,
+        # Existing clients and endpoint tests still consume FastAPI's
+        # historical top-level detail field during the migration window.
+        "detail": (
+            message
+            if legacy_detail is _LEGACY_DETAIL_UNSET
+            else legacy_detail
+        ),
+    }
     return JSONResponse(
         status_code=status_code,
-        content={
-            "error": error,
-            # Existing clients and endpoint tests still consume FastAPI's
-            # historical top-level detail field during the migration window.
-            "detail": (
-                message
-                if legacy_detail is _LEGACY_DETAIL_UNSET
-                else legacy_detail
-            ),
-        },
+        # Match FastAPI's built-in HTTPException handler for JSON-compatible
+        # values such as datetimes, enums, dataclasses, and Pydantic models.
+        # Passing those values straight to JSONResponse would turn a formerly
+        # valid HTTPException into a secondary serialization failure.
+        content=jsonable_encoder(content),
         headers=response_headers,
     )
 
