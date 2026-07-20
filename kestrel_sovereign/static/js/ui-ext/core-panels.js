@@ -205,7 +205,7 @@ const SOVEREIGNTY_BODY = `
     <div class="mt-5 section-divider">
         <div class="row-between mb-3">
             <h3 class="m-0" data-label-key="sovereignty_db_explorer">Database Explorer</h3>
-            <button class="btn btn-secondary" id="toggle-db-explorer" onclick="toggleDbExplorer()"><span class="ki ki-cabinet"></span> <span data-label-key="btn_browse_database">Browse Database</span></button>
+            <button class="btn btn-secondary" id="toggle-db-explorer"><span class="ki ki-cabinet"></span> <span data-label-key="btn_browse_database">Browse Database</span></button>
         </div>
         <p class="text-muted text-md mb-3" data-label-key="sovereignty_db_description">
             Read-only view of agent database tables and contents.

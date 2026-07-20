@@ -10,14 +10,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/db", tags=["database"])
 
-ALLOWED_TABLES = {
+ALLOWED_TABLES = frozenset({
     "conversation_history",
     "graph_nodes",
     "graph_edges",
-    "documents",
-    "document_chunks",
-    "fts_documents",
-}
+})
 
 
 def _agent_scope(table_name, column_names, agent_id, backend_type):
@@ -32,14 +29,17 @@ def _agent_scope(table_name, column_names, agent_id, backend_type):
       - ``graph_edges``: an edge belongs to the agent if it touches one of
         the agent's nodes (mirrors the scoped purge in async_graph_store).
 
-    ``documents`` / ``document_chunks`` / ``fts_documents`` are file-content
-    tables keyed by content hash that the app reads *without* agent scoping,
-    so they are left un-scoped here too. Returns ``(None, [])`` when no agent
-    is known.
+    File-content tables are deliberately not queryable because their current
+    schemas do not carry an agent owner or provide an agent-scoped mapping.
+    Queryable tables fail closed to an empty scope when the requesting agent
+    or the ownership columns required by the schema are unavailable.
     """
-    if agent_id is None:
+    column_names = set(column_names)
+    if not agent_id:
+        if table_name in ALLOWED_TABLES:
+            return "1 = 0", []
         return None, []
-    if "agent_id" in set(column_names):
+    if "agent_id" in column_names:
         return "agent_id = ?", [agent_id]
     node_agent = (
         "(properties::jsonb->>'agent_id')"
@@ -47,13 +47,19 @@ def _agent_scope(table_name, column_names, agent_id, backend_type):
         else "json_extract(properties, '$.agent_id')"
     )
     if table_name == "graph_nodes":
+        if "properties" not in column_names:
+            return "1 = 0", []
         return f"{node_agent} = ?", [agent_id]
     if table_name == "graph_edges":
+        if not {"source_id", "target_id"}.issubset(column_names):
+            return "1 = 0", []
         owned = f"SELECT node_id FROM graph_nodes WHERE {node_agent} = ?"
         return (
             f"(source_id IN ({owned}) OR target_id IN ({owned}))",
             [agent_id, agent_id],
         )
+    if table_name in ALLOWED_TABLES:
+        return "1 = 0", []
     return None, []
 
 
@@ -220,7 +226,10 @@ async def query_database_table(
     if table_name not in ALLOWED_TABLES:
         raise HTTPException(
             status_code=403,
-            detail=f"Table '{table_name}' is not queryable. Allowed: {', '.join(ALLOWED_TABLES)}"
+            detail=(
+                f"Table '{table_name}' is not queryable. Allowed: "
+                f"{', '.join(sorted(ALLOWED_TABLES))}"
+            ),
         )
 
     try:

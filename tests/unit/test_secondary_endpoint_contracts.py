@@ -63,13 +63,18 @@ def test_database_table_query_contract_supports_search_and_pagination():
     db.backend_type = "sqlite"
     db.fetchall = AsyncMock(
         side_effect=[
-            [(0, "id", "TEXT", 1, None, 1), (1, "content", "TEXT", 0, None, 0)],
-            [("msg-1", "alpha " * 120)],
+            [
+                (0, "id", "TEXT", 1, None, 1),
+                (1, "agent_id", "TEXT", 1, None, 0),
+                (2, "content", "TEXT", 0, None, 0),
+            ],
+            [("msg-1", "did:test:database-contract", "alpha " * 120)],
         ]
     )
     db.fetchone = AsyncMock(return_value=(3,))
     storage = MagicMock(db=db)
-    agent = MagicMock(storage=storage)
+    storage.privacy_config = None
+    agent = MagicMock(storage=storage, agent_id="did:test:database-contract")
 
     app, original = _prepare_app(agent)
     try:
@@ -82,7 +87,7 @@ def test_database_table_query_contract_supports_search_and_pagination():
         assert response.status_code == 200
         payload = response.json()
         assert payload["table"] == "conversation_history"
-        assert payload["columns"] == ["id", "content"]
+        assert payload["columns"] == ["id", "agent_id", "content"]
         assert payload["total_rows"] == 3
         assert payload["has_more"] is True
         assert payload["rows"][0]["content"].endswith("...")

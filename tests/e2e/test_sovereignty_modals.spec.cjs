@@ -1066,7 +1066,7 @@ test.describe('Database Explorer (Session 5)', () => {
 
         if (await tableList.count() > 0) {
             // Tables should have names and row counts
-            const tableItems = tableList.locator('.db-table-item, .table-item, button, [onclick*="loadDbTable"]');
+            const tableItems = tableList.locator('.db-table-item, .table-item, button');
             const itemCount = await tableItems.count();
 
             if (itemCount > 0) {
@@ -1083,7 +1083,7 @@ test.describe('Database Explorer (Session 5)', () => {
         await page.waitForTimeout(1000);
 
         // Find clickable table elements
-        const clickableTable = page.locator('[onclick*="loadDbTable"]').first();
+        const clickableTable = page.locator('.db-table-item:not(:disabled)').first();
 
         if (await clickableTable.count() > 0) {
             await clickableTable.click();
@@ -1108,14 +1108,14 @@ test.describe('Database Explorer (Session 5)', () => {
         await page.waitForTimeout(1000);
 
         // Click a table that might have pagination
-        const clickableTable = page.locator('[onclick*="loadDbTable"]').first();
+        const clickableTable = page.locator('.db-table-item:not(:disabled)').first();
 
         if (await clickableTable.count() > 0) {
             await clickableTable.click();
             await page.waitForTimeout(1000);
 
             // Look for pagination elements
-            const pagination = page.locator('.db-pagination, .pagination, [onclick*="loadDbTable"][onclick*="offset"]');
+            const pagination = page.locator('.db-pagination, .pagination');
             // Pagination may or may not exist depending on data size
             // Just check that the UI loads without error
             const container = page.locator('#db-explorer-container');
@@ -1127,7 +1127,7 @@ test.describe('Database Explorer (Session 5)', () => {
         await page.click('#toggle-db-explorer');
         await page.waitForTimeout(1000);
 
-        const clickableTable = page.locator('[onclick*="loadDbTable"]').first();
+        const clickableTable = page.locator('.db-table-item:not(:disabled)').first();
 
         if (await clickableTable.count() > 0) {
             await clickableTable.click();
