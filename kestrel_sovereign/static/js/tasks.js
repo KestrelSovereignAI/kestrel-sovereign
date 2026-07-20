@@ -175,7 +175,9 @@ export async function loadTasks() {
         const tasks = response.tasks || [];
 
         // Count working tasks for badge
-        const newWorkingCount = tasks.filter(t => t.status === 'working').length;
+        const newWorkingCount = tasks.filter(
+            t => t.status === 'working' || t.status === 'running',
+        ).length;
         updateBadge(newWorkingCount);
 
         if (tasks.length === 0) {
@@ -263,13 +265,7 @@ function renderTaskItem(task) {
                     ">${taskId}</span>
                     <span class="expand-icon" style="color: var(--text-tertiary); font-size: 0.75rem;">▶</span>
                 </div>
-                <span class="status-badge ${statusClass}" style="
-                    padding: 0.25rem 0.5rem;
-                    border-radius: 4px;
-                    font-size: 0.75rem;
-                    font-weight: 500;
-                    text-transform: uppercase;
-                ">${task.status}</span>
+                <span class="status-badge ${statusClass}">${escapeHtml(task.status)}</span>
             </div>
             <div class="task-agent" style="
                 font-size: 0.875rem;
@@ -473,8 +469,11 @@ function getStatusIcon(status) {
     switch (status) {
         case 'completed': return kicon('check-circle');
         case 'failed': return kicon('x-circle');
+        case 'cancelled':
         case 'canceled': return kicon('warning');
+        case 'running':
         case 'working': return kicon('hourglass');
+        case 'queued':
         case 'submitted': return kicon('inbox');
         case 'input_required': return kicon('question');
         default: return '•';
@@ -482,15 +481,18 @@ function getStatusIcon(status) {
 }
 
 function getStatusClass(status) {
-    const styles = {
-        completed: 'background: rgba(34, 197, 94, 0.2); color: rgb(34, 197, 94);',
-        failed: 'background: rgba(239, 68, 68, 0.2); color: rgb(239, 68, 68);',
-        canceled: 'background: rgba(245, 158, 11, 0.2); color: rgb(245, 158, 11);',
-        working: 'background: rgba(59, 130, 246, 0.2); color: rgb(59, 130, 246);',
-        submitted: 'background: rgba(147, 51, 234, 0.2); color: rgb(147, 51, 234);',
-        input_required: 'background: rgba(236, 72, 153, 0.2); color: rgb(236, 72, 153);',
+    const classes = {
+        queued: 'status-queued',
+        submitted: 'status-queued',
+        running: 'status-running',
+        working: 'status-running',
+        completed: 'status-completed',
+        failed: 'status-failed',
+        cancelled: 'status-cancelled',
+        canceled: 'status-cancelled',
+        input_required: 'status-input-required',
     };
-    return `style="${styles[status] || ''}"`;
+    return classes[status] || 'status-unknown';
 }
 
 function escapeHtml(text) {
