@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-19
-**Scope:** 2096 tracked files (1384 `.py`, 336 `.md`, 376 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-20
+**Scope:** 2098 tracked files (1385 `.py`, 337 `.md`, 376 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1753,6 +1753,7 @@ Repo entry points and standard project files.
 - **docs/proposals/agent-list-component/DESIGN.md** — Mountable, skinnable agent-list component — **Status:** Design spike (issue #2166) — this document + interface stubs, **not** implementation.
 - **docs/proposals/agent-list-component/contract.js** — (js asset)
 - **docs/proposals/ui-extension-slots/SLOTS.md** — SLOTS.md — UI extension slot taxonomy & contribution contract — **Status:** Spec (design spike, ticket 01 of epic #2038) **Implements against:** nothing yet — this is the contract tickets 02 and 04 build to.
+- **docs/releases/v0.47.0.md** — v0.47.0 — Fail-Closed Constitution Integrity — > **⚠️ Read this BEFORE upgrading a deployment from ≤ 0.46.2.** This release ships fail-closed constitution integrity enforcement.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
 - **docs/research/KV_CACHE_QUANTIZATION.md** — KV Cache Quantization Benchmark — ## Mac Studio M3 Ultra 512GB — Kimi K2.5 (1T params, Q2_K_XL)
@@ -1969,7 +1970,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_constitution_real_llm.py** — Integration tests for Constitutional protections with REAL LLM calls.
   - `def api_key()`; `async def client(monkeypatch)`; `def anyio_backend()`; `async def test_agent_identifies_as_kestrel(client, api_key)`; `async def test_agent_refuses_harmful_request(client, api_key)`; `async def test_agent_acknowledges_constitution(client, api_key)`; `async def test_agent_maintains_sovereignty(client, api_key)`
 - **tests/integration/test_constitution_reanchor_e2e.py** — End-to-end test for ``kestrel constitution reanchor``.
-  - `async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch)`; `async def test_reanchor_no_op_when_already_anchored(tmp_path, monkeypatch)`; `async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch)`; `async def test_reanchor_drift_unforced_does_not_write(tmp_path, monkeypatch)`; `async def test_db_injected_root_and_hash_leave_real_db_unchanged(tmp_path, monkeypatch)`
+  - `async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch)`; `async def test_reanchor_prunes_dangling_governed_by_edges(tmp_path, monkeypatch)`; `async def test_reanchor_unchanged_force_prunes_stale_edges(tmp_path, monkeypatch)`; `async def test_reanchor_unchanged_stale_edges_unforced_reports_drift(tmp_path, monkeypatch)`; `async def test_reanchor_unchanged_stale_edges_force_requires_artifact(tmp_path, monkeypatch)`; `async def test_reanchor_no_op_when_already_anchored(tmp_path, monkeypatch)`; `async def test_doctor_edge_drift_repaired_by_same_hash_reanchor(tmp_path, monkeypatch)`; `async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch)`; `…`
 - **tests/integration/test_context_e2e.py** — End-to-end tests for Context Management with REAL services.
   - `async def real_storage()`; `async def storage_with_history(real_storage)`; `class TestContextWithRealStorage`; `class TestEphemeralMode`; `class TestLongConversationEpisodes`; `class TestBudgetStatusAPI`; `class TestHistoryTruncation`; `class TestDifferentModels`; `…`
 - **tests/integration/test_conversation_archive_round_trip.py** — Integration tests for archive + unarchive round-trip (#2149).
@@ -2913,6 +2914,8 @@ Repo entry points and standard project files.
   - `class TestPersonalityAnalyzer`; `class TestPersonalityAnalyzerDecryption`; `class TestCalibrationPromptGenerator`; `class TestConvenienceFunctions`; `class TestPersonalityConsistency`
 - **tests/unit/test_phase3a_wiring.py** — Unit tests for Phase 3a — Lighthouse + LLM resolver wiring.
   - `class TestLighthouseConstructorContract`; `class TestLLMServiceDisabledFlag`
+- **tests/unit/test_phoenix_assets_redirect.py** — Root-absolute Phoenix chunk requests redirect into the /phoenix cookie scope.
+  - `def client()`; `def test_assets_redirects_unauthenticated_into_phoenix_scope(client)`; `def test_assets_404_when_phoenix_not_supervised(client)`; `def test_assets_post_stays_protected(client)`
 - **tests/unit/test_phoenix_supervisor.py** — Tests for the host-supervised Phoenix subprocess + reverse proxy (#2570).
   - `def test_defaults(monkeypatch)`; `def test_port_overrides(monkeypatch)`; `def test_enabled_requires_installed(monkeypatch)`; `def test_enabled_when_installed(monkeypatch)`; `def test_opt_out_flag(monkeypatch)`; `def test_supervision_suppressed_under_pytest(monkeypatch)`; `def test_supervision_active_outside_pytest(monkeypatch)`; `def test_supervision_off_when_disabled_outside_pytest(monkeypatch)`; `…`
 - **tests/unit/test_pii_detector.py** — Tests for the PII Detection module.
