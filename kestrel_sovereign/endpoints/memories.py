@@ -38,6 +38,8 @@ async def list_memories(request: Request, node_type: str = None, limit: int = Qu
             ],
             "total": len(nodes),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing memories: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving memories.")

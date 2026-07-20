@@ -120,6 +120,8 @@ async def get_agents(request: Request):
             "server_demo_mode": server_demo_mode,
             "can_create_agents": False,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting agents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving agents.")
@@ -355,6 +357,8 @@ async def get_identity(request: Request):
             "avatar_hash": avatar_hash,
             "avatar_url": avatar_url,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting identity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving identity.")
@@ -599,6 +603,8 @@ async def get_constitution(request: Request):
             "metadata": constitution_node.properties if constitution_node else {},
             "verified": constitution_text is not None,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting constitution: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving constitution.")
@@ -607,6 +613,9 @@ async def get_constitution(request: Request):
 @router.get("/api/ipfs/status")
 async def get_ipfs_status(request: Request):
     """Check IPFS node connectivity and status."""
+    # Resolve the agent up front so a missing agent surfaces as the
+    # contractual 503 before any network probing starts (#2495).
+    agent = get_agent(request)
     status = {
         "local_node": {"available": False, "error": None, "peer_id": None, "version": None},
         "backup_tier": {},
@@ -684,7 +693,6 @@ async def get_ipfs_status(request: Request):
             status["gateways"].append(gw_status)
 
     try:
-        agent = get_agent(request)
         if hasattr(agent, 'storage') and agent.storage:
             storage = agent.storage
             if hasattr(storage, 'sovereign_adapter') and storage.sovereign_adapter:
@@ -697,7 +705,7 @@ async def get_ipfs_status(request: Request):
                 else:
                     status["filecoin_adapter"] = {"configured": False}
     except Exception:
-        pass  # Agent not available — skip filecoin status
+        pass  # Filecoin adapter introspection is best-effort
 
     return status
 
@@ -727,6 +735,8 @@ async def get_wallet(request: Request):
                     "currency": "FIL",
                 }
             return {"balance": 0, "audit_reserve": 0, "total": 0, "currency": "FIL"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting wallet: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving wallet.")
@@ -1493,6 +1503,8 @@ async def get_current_model(request: Request):
             # "Auto — currently <model>" and make auto-drift observable.
             "is_auto": selection.get("is_auto", False),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting current model: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error getting current model.")
@@ -2522,6 +2534,8 @@ def list_models_v1(request: Request):
             if active and active != "auto":
                 model_id = active
         return {"object": "list", "data": [{"id": model_id, "object": "model"}]}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing models: {e}")
         return {"object": "list", "data": [{"id": "kestrel-local", "object": "model"}]}

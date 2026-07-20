@@ -423,6 +423,8 @@ async def stop_agent_request(request: Request):
             "request_id": request_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error stopping agent: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error stopping agent.")
@@ -459,6 +461,8 @@ async def get_agent_info(request: Request):
             "features": list(agent.features.keys()) if hasattr(agent, 'features') else [],
             "audit": _audit_status(agent),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting agent info: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving agent info.")
@@ -476,6 +480,8 @@ async def get_privacy_mode(request: Request):
             "allows_cloud_llm": privacy_agent.privacy_config.allows_cloud_llm() if privacy_agent else True,
             "allows_storage": privacy_agent.can_store("conversation") if privacy_agent else True,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting privacy mode: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving privacy mode.")
@@ -701,6 +707,8 @@ async def get_notifications(request: Request):
             "notifications": notifications,
             "count": len(notifications)
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting notifications: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving notifications.")

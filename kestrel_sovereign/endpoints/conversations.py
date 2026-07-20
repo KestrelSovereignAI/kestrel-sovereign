@@ -58,6 +58,8 @@ async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
             "user_messages": user_messages,
             "agent_messages": agent_messages,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing sessions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving sessions.")
@@ -230,6 +232,8 @@ async def list_conversations(
             "total": len(sessions),
             "encrypted_at_rest": encrypted_at_rest
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing conversations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving conversations.")
@@ -389,6 +393,8 @@ async def start_new_conversation(request: Request):
             "started_at": row[1] if row else None,
             "message": "New conversation started"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error starting new conversation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error starting new conversation.")
@@ -811,6 +817,8 @@ async def list_trash(request: Request, limit: int = Query(200, ge=1, le=1000)):
             "messages": history,
             "total": len(history),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing trash: {e}", exc_info=True)
         raise HTTPException(

@@ -195,6 +195,8 @@ async def list_database_tables(request: Request):
             "db_size": db_size,
             "db_path": str(db_path) if db_path else "unknown",
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing database tables: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error listing tables.")
