@@ -1444,7 +1444,7 @@ function uploadAndStage(file, inline) {
             });
             renderAttachmentTray();
         } catch (err) {
-            const detail = err && err.message ? err.message : err;
+            const detail = err && err.message ? err.message : 'Request failed.';
             deps().toast.error(deps().escapeHtml(`Attachment upload failed: ${detail}`));
         }
     })();
@@ -3057,7 +3057,10 @@ export async function sendMessage(overrideText, overrideAgent) {
         } else if (isPaneFresh()) {
             addTextMessage('agent', `Error: ${e && e.message ? e.message : 'Request failed.'}`, pane.element);
         } else {
-            console.warn(`stream error on ${dispatchAgent} (pane stale):`, e.message);
+            console.warn(
+                `stream error on ${dispatchAgent} (pane stale):`,
+                e && e.message ? e.message : 'Request failed.',
+            );
         }
     } finally {
         // #1573: only tear down the pane's stream state if THIS turn
@@ -4272,8 +4275,8 @@ export async function loadModels(expectedAgent = deps().api.getHostAgent()) {
                 // No UI update needed here: the selector already reflects the
                 // user's click; the server is the source of truth from here on.
             } catch (e) {
-                console.warn(`set model request error (${dispatchAgent}):`, e);
                 const detail = e && e.message ? e.message : 'Request failed.';
+                console.warn(`set model request error (${dispatchAgent}):`, detail);
                 deps().toast?.error?.(deps().escapeHtml(`Could not set model ${model}: ${detail}`));
                 await revertToServerTruth();
             }

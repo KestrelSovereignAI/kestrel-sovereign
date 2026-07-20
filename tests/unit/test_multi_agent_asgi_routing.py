@@ -13,6 +13,7 @@ the WebSocket path is verified, not assumed.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -159,6 +160,23 @@ async def test_http_with_unknown_agent_returns_404_json():
     starts = [m for m in sent if m.get("type") == "http.response.start"]
     assert starts, f"no http.response.start sent, got {sent}"
     assert starts[0]["status"] == 404
+    response_headers = {
+        key.decode("latin-1").lower(): value.decode("latin-1")
+        for key, value in starts[0]["headers"]
+    }
+    payload = json.loads(
+        b"".join(
+            message.get("body", b"")
+            for message in sent
+            if message.get("type") == "http.response.body"
+        )
+    )
+    assert payload["detail"] == "Agent 'Ghost' not found"
+    assert payload["error"] == {
+        "code": "agent_not_found",
+        "message": "Agent 'Ghost' not found",
+        "correlation_id": response_headers["x-correlation-id"],
+    }
 
 
 @pytest.mark.asyncio

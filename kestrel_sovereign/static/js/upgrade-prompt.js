@@ -37,21 +37,30 @@ function esc(s) {
  */
 export function extractUpgradeRequired(error) {
     const body = error && error.body;
+    const nested = body && typeof body === 'object'
+        && body.error && typeof body.error === 'object'
+        && !Array.isArray(body.error)
+        ? body.error
+        : null;
+    // Retain host-specific top-level fields while preferring the canonical
+    // nested error fields when both forms are present during migration.
+    const payload = body && typeof body === 'object' && !Array.isArray(body)
+        ? { ...body, ...(nested || {}) }
+        : null;
     if (
         !error ||
         error.status !== 403 ||
-        !body ||
-        typeof body !== 'object' ||
-        body.code !== UPGRADE_REQUIRED_CODE
+        !payload ||
+        (error.code || payload.code) !== UPGRADE_REQUIRED_CODE
     ) {
         return null;
     }
     return {
-        action: body.action || null,
-        requiredTier: body.required_tier || null,
-        currentTier: body.current_tier || null,
-        message: body.message || 'This action requires an upgrade.',
-        upgradeHref: sanitizeUpgradeHref(body.upgrade_href),
+        action: payload.action || null,
+        requiredTier: payload.required_tier || null,
+        currentTier: payload.current_tier || null,
+        message: payload.message || 'This action requires an upgrade.',
+        upgradeHref: sanitizeUpgradeHref(payload.upgrade_href),
     };
 }
 
@@ -128,7 +137,8 @@ export function upgradeBannerHtml(upgrade) {
 /**
  * One-line HTML for a toast (used where a full banner doesn't fit, e.g. the
  * Approvals / Security panel rows). Includes an inline link when a href is
- * present. Toast injects this as innerHTML, so all dynamic text is escaped.
+ * present. Callers must pass this only to ``Toast.showTrustedHtml``; ordinary
+ * toast methods intentionally render their messages through ``textContent``.
  */
 export function upgradeToastHtml(upgrade) {
     if (!upgrade) return '';

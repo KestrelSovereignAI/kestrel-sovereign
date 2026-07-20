@@ -8,12 +8,18 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from kestrel_sovereign.logging_config import correlation_id_var, get_correlation_id
+from kestrel_sovereign.logging_config import (
+    correlation_id_var,
+    resolve_correlation_id,
+)
 
 logger = logging.getLogger(__name__)
+
+_LEGACY_DETAIL_UNSET = object()
 
 
 class ApiHTTPException(HTTPException):
@@ -58,12 +64,25 @@ def api_error_response(
     code: str,
     message: str,
     details: list[dict[str, Any]] | None = None,
-    legacy_detail: Any | None = None,
+    legacy_detail: Any = _LEGACY_DETAIL_UNSET,
     headers: dict[str, str] | None = None,
     correlation_id: str | None = None,
-) -> JSONResponse:
+) -> Response:
     """Build the canonical envelope while retaining ``detail`` compatibility."""
-    correlation_id = correlation_id or get_correlation_id()
+    correlation_id = resolve_correlation_id(correlation_id)
+    response_headers = {
+        key: value
+        for key, value in (headers or {}).items()
+        if key.lower() != "x-correlation-id"
+    }
+    response_headers["X-Correlation-ID"] = correlation_id
+
+    # Match FastAPI's built-in HTTPException behavior for statuses whose wire
+    # contract forbids a body (for example 204 and 304). The correlation header
+    # still gives operators a support handle for the response.
+    if not is_body_allowed_for_status_code(status_code):
+        return Response(status_code=status_code, headers=response_headers)
+
     error: dict[str, Any] = {
         "code": code,
         "message": message,
@@ -72,15 +91,17 @@ def api_error_response(
     if details:
         error["details"] = details
 
-    response_headers = dict(headers or {})
-    response_headers["X-Correlation-ID"] = correlation_id
     return JSONResponse(
         status_code=status_code,
         content={
             "error": error,
             # Existing clients and endpoint tests still consume FastAPI's
             # historical top-level detail field during the migration window.
-            "detail": message if legacy_detail is None else legacy_detail,
+            "detail": (
+                message
+                if legacy_detail is _LEGACY_DETAIL_UNSET
+                else legacy_detail
+            ),
         },
         headers=response_headers,
     )
@@ -89,7 +110,7 @@ def api_error_response(
 async def api_http_exception_handler(
     request: Request,
     exc: StarletteHTTPException,
-) -> JSONResponse:
+) -> Response:
     """Translate framework and typed HTTP exceptions into one envelope."""
     message = getattr(exc, "message", None) or _message_from_detail(
         exc.detail, exc.status_code
@@ -108,7 +129,7 @@ async def api_http_exception_handler(
 async def api_validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
-) -> JSONResponse:
+) -> Response:
     """Return validation locations/messages without echoing rejected inputs."""
     details = [
         {
@@ -133,10 +154,10 @@ async def api_validation_exception_handler(
 async def api_unhandled_exception_handler(
     request: Request,
     exc: Exception,
-) -> JSONResponse:
+) -> Response:
     """Log unexpected failures and return a non-sensitive canonical 500."""
-    correlation_id = (
-        getattr(request.state, "correlation_id", None) or get_correlation_id()
+    correlation_id = resolve_correlation_id(
+        getattr(request.state, "correlation_id", None)
     )
     token = correlation_id_var.set(correlation_id)
     try:

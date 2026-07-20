@@ -14,6 +14,7 @@ from kestrel_sovereign.logging_config import (
     correlation_id_var,
     feature_name_var,
     get_correlation_id,
+    normalize_correlation_id,
     session_id_var,
     setup_logging,
     tool_name_var,
@@ -152,6 +153,25 @@ class TestCorrelationId:
         finally:
             correlation_id_var.set(None)
 
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "contains spaces", "<script>", "a" * 129],
+    )
+    def test_rejects_unsafe_external_ids(self, value):
+        assert normalize_correlation_id(value) is None
+
+    def test_trims_support_safe_external_id(self):
+        assert normalize_correlation_id("  req_01J.safe:123  ") == "req_01J.safe:123"
+
+    def test_replaces_unsafe_ambient_id(self):
+        correlation_id_var.set("<unsafe>")
+        try:
+            cid = get_correlation_id()
+            assert cid != "<unsafe>"
+            assert normalize_correlation_id(cid) == cid
+        finally:
+            correlation_id_var.set(None)
+
 
 # ---------------------------------------------------------------------------
 # setup_logging
@@ -217,6 +237,18 @@ class TestSetupLogging:
         assert "INFO" in captured.err
         assert "hello text" in captured.err
 
+    def test_text_format_includes_request_correlation_id(self, capsys):
+        setup_logging(fmt="text", level="INFO")
+        token = correlation_id_var.set("text-support-2651")
+        try:
+            logging.getLogger("test.text.correlation").error("request failed")
+        finally:
+            correlation_id_var.reset(token)
+
+        captured = capsys.readouterr()
+        assert "correlation_id=text-support-2651" in captured.err
+        assert "request failed" in captured.err
+
     def test_json_format_output(self, capsys):
         """JSON format should produce parseable JSON on stderr."""
         setup_logging(fmt="json", level="INFO")
@@ -229,6 +261,18 @@ class TestSetupLogging:
         assert parsed["message"] == "hello json"
         assert parsed["level"] == "INFO"
         assert parsed["logger"] == "test.json"
+
+    def test_json_format_includes_request_correlation_id(self, capsys):
+        setup_logging(fmt="json", level="INFO")
+        token = correlation_id_var.set("json-support-2651")
+        try:
+            logging.getLogger("test.json.correlation").error("request failed")
+        finally:
+            correlation_id_var.reset(token)
+
+        parsed = json.loads(capsys.readouterr().err.strip())
+        assert parsed["correlation_id"] == "json-support-2651"
+        assert parsed["message"] == "request failed"
 
     def test_existing_log_calls_work_with_json(self, capsys):
         """Existing logger.info("text") calls should produce valid JSON without changes."""

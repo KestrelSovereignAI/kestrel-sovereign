@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, PRIVACY_MODES, Toast, Modal, loadCommands } from './ui.js';
+import { state, PRIVACY_MODES, Toast, Modal, loadCommands, renderTextError } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
 import { generateIdenticon } from './identicon.js';
@@ -408,7 +408,7 @@ export async function loadIdentity(expectedAgent = API.getHostAgent()) {
     } catch (e) {
         if (API.getHostAgent() !== expectedAgent) return;
         const card = document.getElementById('identity-card');
-        if (card) card.innerHTML = `<div style="color: var(--error); padding: 1rem;">Failed to load identity: ${e.message}</div>`;
+        renderTextError(card, `Failed to load identity: ${e.message}`);
     }
 }
 

@@ -62,6 +62,7 @@ test('performRequest attaches status + parsed body to the thrown error', async (
         () => client.request('/api/security/approve', { method: 'POST', body: '{}' }),
         (err) => {
             assert.equal(err.status, 403);
+            assert.equal(err.code, 'upgrade_required');
             assert.ok(err.body, 'error carries the parsed body');
             assert.equal(err.body.code, 'upgrade_required');
             assert.equal(err.body.upgrade_href, 'https://frinz.example/upgrade');
@@ -112,6 +113,34 @@ test('extractUpgradeRequired recognizes the tier-gate envelope', async () => {
     assert.equal(upgrade.currentTier, 'free');
     assert.equal(upgrade.message, 'Session approvals need Premium.');
     assert.equal(upgrade.upgradeHref, 'https://frinz.example/upgrade');
+});
+
+test('extractUpgradeRequired recognizes the canonical nested envelope', async () => {
+    const { extractUpgradeRequired } = await loadHelper();
+    const body = {
+        action: 'session',
+        required_tier: 'premium',
+        current_tier: 'free',
+        upgrade_href: '/upgrade',
+        error: {
+            code: 'upgrade_required',
+            message: 'Canonical upgrade message.',
+            correlation_id: 'support-ref',
+        },
+        detail: 'Canonical upgrade message.',
+    };
+    const err = Object.assign(new Error('Canonical upgrade message.'), {
+        status: 403,
+        code: 'upgrade_required',
+        body,
+    });
+    const upgrade = extractUpgradeRequired(err);
+    assert.ok(upgrade);
+    assert.equal(upgrade.action, 'session');
+    assert.equal(upgrade.requiredTier, 'premium');
+    assert.equal(upgrade.currentTier, 'free');
+    assert.equal(upgrade.message, 'Canonical upgrade message.');
+    assert.equal(upgrade.upgradeHref, '/upgrade');
 });
 
 test('extractUpgradeRequired returns null for unrelated errors', async () => {

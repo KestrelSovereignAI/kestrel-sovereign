@@ -17,17 +17,20 @@ from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
-from kestrel_sovereign.api_errors import api_error_response, register_api_error_handlers
+from kestrel_sovereign.api_errors import (
+    api_error_response,
+    api_unhandled_exception_handler,
+    register_api_error_handlers,
+)
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -65,7 +68,7 @@ from kestrel_sovereign.logging_config import (
     correlation_id_var,
     session_id_var,
     agent_name_var,
-    get_correlation_id,
+    resolve_correlation_id,
 )
 
 setup_logging()
@@ -1019,6 +1022,21 @@ register_api_error_handlers(app)
 _AGENT_PATH_RE_ASGI = re.compile(r"^/api/agents/([^/]+)/(.+)$")
 
 
+def _agent_not_found_response(
+    agent_name: str,
+    *,
+    correlation_id: str | None = None,
+) -> Response:
+    """Return the shared public error contract for an unknown host agent."""
+    message = f"Agent '{agent_name}' not found"
+    return api_error_response(
+        status_code=404,
+        code="agent_not_found",
+        message=message,
+        correlation_id=correlation_id,
+    )
+
+
 class MultiAgentAgentRoutingMiddleware:
     """Strip /api/agents/{name}/ prefix + attach the resolved agent to scope.
 
@@ -1047,10 +1065,9 @@ class MultiAgentAgentRoutingMiddleware:
         agent = agent_manager.get_agent(agent_name)
         if agent is None:
             if scope["type"] == "http":
-                from starlette.responses import JSONResponse as _JR
-                response = _JR(
-                    status_code=404,
-                    content={"detail": f"Agent '{agent_name}' not found"},
+                response = _agent_not_found_response(
+                    agent_name,
+                    correlation_id=scope.get("state", {}).get("correlation_id"),
                 )
                 return await response(scope, receive, send)
             # WebSocket: accept then close with a clear reason — browsers see
@@ -1073,7 +1090,57 @@ app.add_middleware(MultiAgentAgentRoutingMiddleware)
 
 # Rate limiting
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def canonical_rate_limit_exceeded_handler(
+    request: Request,
+    exc: RateLimitExceeded,
+) -> Response:
+    """Return a typed 429 while retaining SlowAPI's rate-limit headers."""
+    response = api_error_response(
+        status_code=429,
+        code="rate_limit_exceeded",
+        message=f"Rate limit exceeded: {exc.detail}",
+        correlation_id=getattr(request.state, "correlation_id", None),
+    )
+    return request.app.state.limiter._inject_headers(
+        response,
+        request.state.view_rate_limit,
+    )
+
+
+app.add_exception_handler(RateLimitExceeded, canonical_rate_limit_exceeded_handler)
+
+
+class CanonicalCORSMiddleware(CORSMiddleware):
+    """Keep rejected preflights on the public API error contract.
+
+    Starlette answers preflight requests inside ``CORSMiddleware`` without
+    entering the inner request-context middleware.  Its stock rejection is a
+    plain-text 400 with no support ID, so normalize only that response here
+    while retaining the CORS headers Starlette already calculated.
+    """
+
+    def preflight_response(self, request_headers):
+        response = super().preflight_response(request_headers)
+        if response.status_code < 400:
+            return response
+
+        headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in {"content-length", "content-type"}
+        }
+        return api_error_response(
+            status_code=400,
+            code="cors_preflight_rejected",
+            message="CORS preflight request rejected.",
+            headers=headers,
+            correlation_id=resolve_correlation_id(
+                request_headers.get("X-Correlation-ID"),
+                use_context=False,
+            ),
+        )
 
 # Mount static files (disabled when running behind Kestrel Host)
 SERVE_UI = os.environ.get("KESTREL_SERVE_UI", "true").lower() == "true"
@@ -1148,8 +1215,12 @@ async def logging_context_middleware(request: Request, call_next):
     Starlette processes middleware in reverse order of addition, so correlation
     context exists before authentication and is cleaned up after the response.
     """
-    # Correlation ID: prefer incoming header, else generate
-    cid = request.headers.get("X-Correlation-ID") or get_correlation_id()
+    # Preserve caller correlation only when it is safe for response headers,
+    # logs, and support UI. Invalid/untrusted values receive a fresh ID.
+    cid = resolve_correlation_id(
+        request.headers.get("X-Correlation-ID"),
+        use_context=False,
+    )
     token_cid = correlation_id_var.set(cid)
     request.state.correlation_id = cid
 
@@ -1230,9 +1301,9 @@ async def agent_routing_middleware(request: Request, call_next):
 
         agent = agent_manager.get_agent(agent_name)
         if agent is None:
-            return JSONResponse(
-                status_code=404,
-                content={"detail": f"Agent '{agent_name}' not found"},
+            return _agent_not_found_response(
+                agent_name,
+                correlation_id=getattr(request.state, "correlation_id", None),
             )
 
         request.state.agent = agent
@@ -1473,18 +1544,44 @@ app.add_middleware(
     https_only=os.environ.get("KESTREL_ENV", "development") == "production",
 )
 
+
+# FastAPI installs ServerErrorMiddleware outside all user middleware. Without
+# this inner boundary, its 500 response bypasses CORSMiddleware and a
+# cross-origin console cannot read either the canonical envelope or support ID.
+# Register this after SessionMiddleware and before CORSMiddleware so CORS wraps
+# every response produced here while this boundary still covers session, auth,
+# routing, and endpoint failures.
+@app.middleware("http")
+async def canonical_unhandled_error_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        return await api_unhandled_exception_handler(request, exc)
+
+
 # CORS middleware — added last so it runs outermost (before auth/session).
 # Origins from KESTREL_CORS_ORIGINS (comma-separated) or built-in defaults;
 # build_cors_origins() rejects a wildcard since credentialed CORS is on.
 from kestrel_sovereign.config import build_cors_origins
 CORS_ORIGINS = build_cors_origins()
 app.add_middleware(
-    CORSMiddleware,
+    CanonicalCORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
-    expose_headers=["X-Correlation-ID"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-API-Key",
+        "X-Correlation-ID",
+        "X-CSRF-Token",
+        "X-Kestrel-Allow-Destructive",
+    ],
+    expose_headers=[
+        "X-Correlation-ID",
+        "X-Request-ID",
+        "X-Session-ID",
+    ],
 )
 
 

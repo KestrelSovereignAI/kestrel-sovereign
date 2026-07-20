@@ -39,6 +39,24 @@ _INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')
 LEGACY_CONTEXT_MODEL = "legacy/unknown"
 
 
+def _invalid_json_message(error: ValueError) -> str:
+    """Describe malformed JSON without echoing submitted body content."""
+    if isinstance(error, json.JSONDecodeError):
+        return f"Invalid JSON at line {error.lineno}, column {error.colno}."
+    return "Invalid JSON request body."
+
+
+def _require_json_object(value: Any) -> dict:
+    """Reject valid JSON scalars/arrays before endpoint code calls ``.get``."""
+    if isinstance(value, dict):
+        return value
+    raise ApiHTTPException(
+        status_code=400,
+        code="invalid_request_body",
+        message="JSON request body must be an object.",
+    )
+
+
 def _latest_assistant_model_identity(
     history: list[Dict[str, Any]],
 ) -> Dict[str, Optional[str]]:
@@ -71,19 +89,19 @@ def _latest_assistant_model_identity(
 async def _parse_json_body(request: Request) -> dict:
     """Parse JSON body, recovering from common shell-escaping issues."""
     try:
-        return await request.json()
+        return _require_json_object(await request.json())
     except (json.JSONDecodeError, ValueError) as orig_err:
         raw = await request.body()
         cleaned = _INVALID_JSON_ESCAPE.sub(lambda m: m.group(1), raw)
         if cleaned != raw:
             try:
-                return json.loads(cleaned)
-            except Exception:
+                return _require_json_object(json.loads(cleaned))
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
         raise ApiHTTPException(
             status_code=400,
             code="invalid_json",
-            message=f"Invalid JSON: {orig_err}",
+            message=_invalid_json_message(orig_err),
         )
 
 
@@ -93,18 +111,18 @@ async def _parse_optional_json_body(request: Request) -> dict:
     if not raw.strip():
         return {}
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as orig_err:
+        return _require_json_object(json.loads(raw))
+    except (json.JSONDecodeError, UnicodeDecodeError) as orig_err:
         cleaned = _INVALID_JSON_ESCAPE.sub(lambda m: m.group(1), raw)
         if cleaned != raw:
             try:
-                return json.loads(cleaned)
-            except Exception:
+                return _require_json_object(json.loads(cleaned))
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
         raise ApiHTTPException(
             status_code=400,
             code="invalid_json",
-            message=f"Invalid JSON: {orig_err}",
+            message=_invalid_json_message(orig_err),
         )
 
 

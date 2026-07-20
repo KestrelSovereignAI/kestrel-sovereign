@@ -420,7 +420,7 @@ export const Security = {
             const upgrade = extractUpgradeRequired(error);
             if (upgrade) {
                 if (!options.returnUpgrade && !options.suppressToast) {
-                    Toast.warning(upgradeToastHtml(upgrade));
+                    Toast.showTrustedHtml(upgradeToastHtml(upgrade), 'warning');
                 }
                 return { success: false, upgradeRequired: true, upgrade };
             }

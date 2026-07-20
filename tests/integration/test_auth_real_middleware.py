@@ -16,11 +16,13 @@ import socket
 import threading
 import time
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -33,6 +35,8 @@ OK_PATH = "/api/_test_2490/ok"
 FAILING_PATH = "/api/_test_2490/boom"
 CONTROLLED_PATH = "/api/_test_2490/teapot"
 LOGIN_PATH = "/api/_test_2490/login"
+RATE_LIMIT_PATH = "/api/_test_2651/rate-limit"
+STREAM_HEADERS_PATH = "/api/_test_2651/stream-headers"
 
 AUTH_LANES = ["header", "bearer", "session"]
 
@@ -67,6 +71,16 @@ def real_app(monkeypatch):
     async def _login(request: Request):
         request.session["user_email"] = "operator@example.com"
         return {"ok": True}
+
+    @app.get(STREAM_HEADERS_PATH)
+    async def _stream_headers():
+        return JSONResponse(
+            {"ok": True},
+            headers={
+                "X-Request-ID": "stream-request-2651",
+                "X-Session-ID": "stream-session-2651",
+            },
+        )
 
     try:
         yield app
@@ -125,6 +139,23 @@ def test_missing_credentials_are_401(client):
     assert response.headers["X-Correlation-ID"] == correlation_id
 
 
+@pytest.mark.parametrize(
+    "unsafe_correlation_id",
+    ["<script>alert(1)</script>", "contains spaces", "a" * 129],
+)
+def test_unsafe_caller_correlation_id_is_replaced(client, unsafe_correlation_id):
+    response = client.get(
+        OK_PATH,
+        headers={"X-Correlation-ID": unsafe_correlation_id},
+    )
+
+    assert response.status_code == 401
+    replacement = response.headers["X-Correlation-ID"]
+    assert replacement != unsafe_correlation_id
+    assert response.json()["error"]["correlation_id"] == replacement
+    assert "<script>" not in response.text
+
+
 def test_cors_exposes_auth_error_correlation_id(client):
     response = client.get(
         OK_PATH,
@@ -141,6 +172,172 @@ def test_cors_exposes_auth_error_correlation_id(client):
     assert response.json()["error"]["correlation_id"] == response.headers[
         "X-Correlation-ID"
     ]
+
+
+def test_cors_allows_caller_correlation_header(client):
+    response = client.options(
+        OK_PATH,
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "X-Correlation-ID",
+        },
+    )
+
+    assert response.status_code == 200
+    allowed = {
+        value.strip().lower()
+        for value in response.headers["Access-Control-Allow-Headers"].split(",")
+    }
+    assert "x-correlation-id" in allowed
+
+
+def test_cors_preflight_allows_console_patch_and_custom_headers(client):
+    response = client.options(
+        OK_PATH,
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "PATCH",
+            "Access-Control-Request-Headers": (
+                "Content-Type, X-CSRF-Token, X-Kestrel-Allow-Destructive"
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    allowed_methods = {
+        value.strip().upper()
+        for value in response.headers["Access-Control-Allow-Methods"].split(",")
+    }
+    allowed_headers = {
+        value.strip().lower()
+        for value in response.headers["Access-Control-Allow-Headers"].split(",")
+    }
+    assert "PATCH" in allowed_methods
+    assert {"content-type", "x-csrf-token", "x-kestrel-allow-destructive"} <= allowed_headers
+
+
+def test_cors_rejected_preflight_uses_canonical_envelope(client):
+    response = client.options(
+        OK_PATH,
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "TRACE",
+            "X-Correlation-ID": "cors-preflight-2651",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
+    assert response.json()["error"] == {
+        "code": "cors_preflight_rejected",
+        "message": "CORS preflight request rejected.",
+        "correlation_id": "cors-preflight-2651",
+    }
+    assert response.headers["X-Correlation-ID"] == "cors-preflight-2651"
+
+
+def test_cors_exposes_stream_request_and_session_headers(client):
+    response = client.get(
+        STREAM_HEADERS_PATH,
+        headers={
+            "X-API-Key": API_KEY,
+            "Origin": "http://localhost:3000",
+        },
+    )
+
+    assert response.status_code == 200
+    exposed = {
+        value.strip().lower()
+        for value in response.headers["Access-Control-Expose-Headers"].split(",")
+    }
+    assert {"x-correlation-id", "x-request-id", "x-session-id"} <= exposed
+    assert response.headers["X-Request-ID"] == "stream-request-2651"
+    assert response.headers["X-Session-ID"] == "stream-session-2651"
+
+
+def test_cors_exposes_canonical_unhandled_error(client):
+    response = client.get(
+        FAILING_PATH,
+        headers={
+            "X-API-Key": API_KEY,
+            "Origin": "http://localhost:3000",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
+    exposed = {
+        value.strip().lower()
+        for value in response.headers["Access-Control-Expose-Headers"].split(",")
+    }
+    assert "x-correlation-id" in exposed
+    assert response.json()["error"] == {
+        "code": "internal_error",
+        "message": "An internal error occurred.",
+        "correlation_id": response.headers["X-Correlation-ID"],
+    }
+
+
+def test_real_multi_agent_unknown_agent_uses_canonical_envelope(
+    client,
+    monkeypatch,
+):
+    manager = SimpleNamespace(get_agent=lambda _name: None)
+    monkeypatch.setattr(
+        server_module.app.state,
+        "agent_manager",
+        manager,
+        raising=False,
+    )
+
+    response = client.get(
+        "/api/agents/Ghost/api/agent/info",
+        headers={"X-API-Key": API_KEY},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Agent 'Ghost' not found"
+    assert response.json()["error"] == {
+        "code": "agent_not_found",
+        "message": "Agent 'Ghost' not found",
+        "correlation_id": response.headers["X-Correlation-ID"],
+    }
+
+
+def test_registered_slowapi_handler_uses_canonical_envelope_and_rate_headers(
+    client,
+    monkeypatch,
+):
+    # Existing endpoints do not accept a Response parameter, so keep header
+    # injection off for the admitted request. Enable it only for the rejected
+    # request to verify the registered exception handler retains SlowAPI's
+    # response metadata.
+    monkeypatch.setattr(server_module.limiter, "_headers_enabled", False)
+    app = server_module.app
+    route_count = len(app.router.routes)
+
+    @app.get(RATE_LIMIT_PATH)
+    @server_module.limiter.limit("1/minute")
+    async def _rate_limited(request: Request):
+        return {"ok": True}
+
+    try:
+        first = client.get(RATE_LIMIT_PATH, headers={"X-API-Key": API_KEY})
+        server_module.limiter._headers_enabled = True
+        response = client.get(RATE_LIMIT_PATH, headers={"X-API-Key": API_KEY})
+    finally:
+        del app.router.routes[route_count:]
+
+    assert first.status_code == 200
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]
+    assert response.json()["detail"].startswith("Rate limit exceeded:")
+    assert response.headers["X-RateLimit-Limit"] == "1"
+    assert "Retry-After" in response.headers
 
 
 @pytest.mark.parametrize("lane", AUTH_LANES)

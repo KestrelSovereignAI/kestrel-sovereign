@@ -81,6 +81,57 @@ class TestOAuthEndpoints:
         """Test /auth/me returns 401 when not authenticated."""
         resp = client.get("/auth/me")
         assert resp.status_code == 401
+        assert resp.json()["error"]["code"] == "authentication_required"
+        assert resp.json()["error"]["correlation_id"] == resp.headers[
+            "X-Correlation-ID"
+        ]
+
+    @pytest.mark.parametrize(
+        "path,request_kwargs,expected_status,expected_code",
+        [
+            (
+                "/auth/token",
+                {"json": {"email": "denied@gmail.com", "password": "wrong"}},
+                403,
+                "email_not_authorized",
+            ),
+            (
+                "/auth/token",
+                {"json": {"email": "allowed@gmail.com", "password": "wrong"}},
+                401,
+                "invalid_credentials",
+            ),
+            ("/auth/verify", {}, 401, "bearer_token_required"),
+            (
+                "/auth/verify",
+                {"headers": {"Authorization": "Bearer invalid-token"}},
+                401,
+                "invalid_or_expired_token",
+            ),
+        ],
+    )
+    def test_json_auth_failures_use_canonical_envelope(
+        self,
+        client,
+        path,
+        request_kwargs,
+        expected_status,
+        expected_code,
+    ):
+        from kestrel_sovereign.rate_limit import limiter
+
+        limiter.reset()
+        if path.endswith("/token"):
+            resp = client.post(path, **request_kwargs)
+        else:
+            resp = client.get(path, **request_kwargs)
+
+        assert resp.status_code == expected_status
+        assert resp.json()["error"]["code"] == expected_code
+        assert resp.json()["error"]["correlation_id"] == resp.headers[
+            "X-Correlation-ID"
+        ]
+
 
 class TestEmailAllowlist:
     """Test email allowlist enforcement."""

@@ -255,7 +255,7 @@ export const Toast = {
         return this._container;
     },
 
-    show(message, type = 'info', duration = 4000) {
+    _show(message, type = 'info', duration = 4000, { trustedHtml = false } = {}) {
         const container = this._getContainer();
         const toast = document.createElement('div');
 
@@ -283,19 +283,36 @@ export const Toast = {
             cursor: pointer;
         `;
 
-        toast.innerHTML = `
-            <span style="font-size: 1.1rem;">${icon}</span>
-            <span style="flex: 1;">${message}</span>
-            <button style="
-                background: rgba(255,255,255,0.2);
-                border: none;
-                border-radius: 4px;
-                color: white;
-                padding: 0.25rem 0.5rem;
-                cursor: pointer;
-                font-size: 0.8rem;
-            ">&times;</button>
+        const iconEl = document.createElement('span');
+        iconEl.style.fontSize = '1.1rem';
+        // Icons come from the console's fixed-name icon registry, never from a
+        // response or user-supplied string.
+        iconEl.innerHTML = icon;
+
+        const messageEl = document.createElement('span');
+        messageEl.style.flex = '1';
+        if (trustedHtml) {
+            messageEl.innerHTML = String(message ?? '');
+        } else {
+            messageEl.textContent = String(message ?? '');
+        }
+
+        const closeButton = document.createElement('button');
+        closeButton.style.cssText = `
+            background: rgba(255,255,255,0.2);
+            border: none;
+            border-radius: 4px;
+            color: white;
+            padding: 0.25rem 0.5rem;
+            cursor: pointer;
+            font-size: 0.8rem;
         `;
+        closeButton.type = 'button';
+        closeButton.ariaLabel = 'Dismiss notification';
+        closeButton.textContent = '\u00d7';
+        toast.appendChild(iconEl);
+        toast.appendChild(messageEl);
+        toast.appendChild(closeButton);
 
         toast.addEventListener('click', () => this._removeToast(toast));
         container.appendChild(toast);
@@ -303,6 +320,17 @@ export const Toast = {
         if (duration > 0) {
             setTimeout(() => this._removeToast(toast), duration);
         }
+    },
+
+    show(message, type = 'info', duration = 4000) {
+        return this._show(message, type, duration);
+    },
+
+    // Explicit escape hatch for small, pre-sanitized console-owned fragments
+    // such as the upgrade CTA. API errors and ordinary caller strings must use
+    // show()/error()/warning(), whose message path is always textContent.
+    showTrustedHtml(trustedHtml, type = 'info', duration = 4000) {
+        return this._show(trustedHtml, type, duration, { trustedHtml: true });
     },
 
     _removeToast(toast) {
@@ -575,8 +603,15 @@ export function showLoading(elementId) {
 }
 
 export function showError(elementId, message) {
-    const el = document.getElementById(elementId);
-    if (el) el.innerHTML = `<div style="color: var(--error); padding: 1rem;">${message}</div>`;
+    renderTextError(document.getElementById(elementId), message);
+}
+
+export function renderTextError(target, message) {
+    if (!target) return;
+    const error = document.createElement('div');
+    error.style.cssText = 'color: var(--error); padding: 1rem;';
+    error.textContent = String(message ?? '');
+    target.replaceChildren(error);
 }
 
 export function escapeHtml(text) {

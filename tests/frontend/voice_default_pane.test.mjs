@@ -88,9 +88,9 @@ test('addTextMessage renders error text through textContent, never innerHTML', (
     const pane = getOrCreateChatPane('text-error');
     mountChatPane('text-error');
 
-    const div = addTextMessage('agent', 'Error: &lt;img src=x onerror=alert(1)&gt;');
+    const div = addTextMessage('agent', 'Error: <img src=x onerror=alert(1)>');
     const content = div.children[0];
 
-    assert.equal(content.textContent, 'Error: &lt;img src=x onerror=alert(1)&gt;');
+    assert.equal(content.textContent, 'Error: <img src=x onerror=alert(1)>');
     assert.equal(content.innerHTML, '');
 });
