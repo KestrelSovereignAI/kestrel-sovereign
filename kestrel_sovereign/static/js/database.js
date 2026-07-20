@@ -15,12 +15,40 @@ state.dbTables = null;
 state.dbCurrentTable = null;
 state.dbCurrentPage = 0;
 state.dbExplorerVisible = false;
-state.dbAgent = API.getHostAgent();
+
+// The standalone console and mountPanels embedders can use different API
+// clients. Keep the explorer's runtime dependencies explicit so database
+// requests never fall back to the process-wide singleton when an embedder
+// supplied a mount-scoped client.
+let explorerApi = API;
+let explorerRoot = document;
+let detachExplorerRuntime = null;
+let awaitingAgentSwitch = false;
+
+function getActiveAgent() {
+    return typeof explorerApi.getHostAgent === 'function'
+        ? explorerApi.getHostAgent()
+        : null;
+}
+
+function findExplorerElement(id) {
+    if (typeof explorerRoot.getElementById === 'function') {
+        return explorerRoot.getElementById(id);
+    }
+    return explorerRoot.querySelector?.(`#${id}`) || null;
+}
+
+function hasSovereigntyCapability() {
+    return typeof explorerApi.hasCapability === 'function'
+        && explorerApi.hasCapability('sovereignty') === true;
+}
+
+state.dbAgent = getActiveAgent();
 
 let dbTablesRequestSeq = 0;
 let dbTableRequestSeq = 0;
 
-function resetDbExplorer(agent = API.getHostAgent()) {
+function resetDbExplorer(agent = getActiveAgent()) {
     // Bump both tokens before clearing the cache so every outstanding response
     // becomes stale, including a request for the same table/page after an
     // A -> B -> A switch.
@@ -31,7 +59,7 @@ function resetDbExplorer(agent = API.getHostAgent()) {
     state.dbCurrentTable = null;
     state.dbCurrentPage = 0;
 
-    const container = document.getElementById('db-explorer-container');
+    const container = findExplorerElement('db-explorer-container');
     if (container) {
         showMessage(
             container,
@@ -42,7 +70,7 @@ function resetDbExplorer(agent = API.getHostAgent()) {
 }
 
 function responseBelongsToCurrentAgent(agent) {
-    return state.dbAgent === agent && API.getHostAgent() === agent;
+    return state.dbAgent === agent && getActiveAgent() === agent;
 }
 
 function element(tagName, { className = '', text = '', style = '' } = {}) {
@@ -66,6 +94,21 @@ function formatSize(bytes) {
     return `${(size / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+function truncateText(value, maxCodePoints) {
+    return Array.from(String(value)).slice(0, maxCodePoints).join('');
+}
+
+function updateToggleButton(button, visible) {
+    const icon = element('span', { className: 'ki ki-cabinet' });
+    icon.setAttribute('aria-hidden', 'true');
+    const label = element('span', {
+        text: visible ? 'Hide Database Explorer' : 'Browse Database',
+    });
+    if (!visible) label.dataset.labelKey = 'btn_browse_database';
+    button.replaceChildren(icon, document.createTextNode(' '), label);
+    button.setAttribute('aria-expanded', String(visible));
+}
+
 function summaryCard(value, label) {
     const card = element('div', {
         style: 'background: var(--bg-tertiary); padding: 0.75rem; border-radius: 8px; text-align: center;',
@@ -84,12 +127,17 @@ function summaryCard(value, label) {
 }
 
 export async function loadDbTables() {
-    const requestAgent = API.getHostAgent();
+    // setHostAgent() fires before the selected agent's capabilities resolve.
+    // Do not cross that boundary until the post-capability agent:switch event
+    // confirms the new panel gate.
+    if (awaitingAgentSwitch || !hasSovereigntyCapability()) return;
+
+    const requestAgent = getActiveAgent();
     if (state.dbAgent !== requestAgent) resetDbExplorer(requestAgent);
     const requestToken = ++dbTablesRequestSeq;
 
     try {
-        const data = await API.getDbTables();
+        const data = await explorerApi.getDbTables(requestAgent);
         if (
             requestToken !== dbTablesRequestSeq
             || !responseBelongsToCurrentAgent(requestAgent)
@@ -101,7 +149,7 @@ export async function loadDbTables() {
             requestToken !== dbTablesRequestSeq
             || !responseBelongsToCurrentAgent(requestAgent)
         ) return;
-        const container = document.getElementById('db-explorer-container');
+        const container = findExplorerElement('db-explorer-container');
         if (container) {
             showMessage(
                 container,
@@ -113,7 +161,7 @@ export async function loadDbTables() {
 }
 
 export function renderDbExplorer(data) {
-    const container = document.getElementById('db-explorer-container');
+    const container = findExplorerElement('db-explorer-container');
     if (!container) return;
 
     if (!data.tables || data.tables.length === 0) {
@@ -222,7 +270,9 @@ export function renderDbExplorer(data) {
 }
 
 export async function loadDbTable(tableName, page = 0) {
-    const requestAgent = API.getHostAgent();
+    if (awaitingAgentSwitch || !hasSovereigntyCapability()) return;
+
+    const requestAgent = getActiveAgent();
     if (state.dbAgent !== requestAgent) {
         resetDbExplorer(requestAgent);
         if (state.dbExplorerVisible) void loadDbTables();
@@ -235,7 +285,7 @@ export async function loadDbTable(tableName, page = 0) {
 
     if (state.dbTables) renderDbExplorer(state.dbTables);
 
-    const viewer = document.getElementById('db-table-viewer');
+    const viewer = findExplorerElement('db-table-viewer');
     if (!viewer) return;
 
     viewer.style.display = 'block';
@@ -247,7 +297,7 @@ export async function loadDbTable(tableName, page = 0) {
     try {
         const limit = 20;
         const offset = page * limit;
-        const data = await API.queryDbTable(tableName, limit, offset);
+        const data = await explorerApi.queryDbTable(tableName, limit, offset, null, requestAgent);
 
         if (
             requestToken !== dbTableRequestSeq
@@ -255,7 +305,10 @@ export async function loadDbTable(tableName, page = 0) {
             || state.dbCurrentTable !== tableName
             || state.dbCurrentPage !== page
         ) return;
-        renderDbTableData(data, page, limit);
+        if (data.table !== tableName) {
+            throw new Error('Database response did not match the requested table.');
+        }
+        renderDbTableData(data, page, limit, tableName);
     } catch (error) {
         if (
             requestToken !== dbTableRequestSeq
@@ -263,7 +316,7 @@ export async function loadDbTable(tableName, page = 0) {
             || state.dbCurrentTable !== tableName
             || state.dbCurrentPage !== page
         ) return;
-        const currentViewer = document.getElementById('db-table-viewer');
+        const currentViewer = findExplorerElement('db-table-viewer');
         if (currentViewer) {
             showMessage(
                 currentViewer,
@@ -274,8 +327,8 @@ export async function loadDbTable(tableName, page = 0) {
     }
 }
 
-export function renderDbTableData(data, page, limit) {
-    const viewer = document.getElementById('db-table-viewer');
+export function renderDbTableData(data, page, limit, requestedTable = data.table) {
+    const viewer = findExplorerElement('db-table-viewer');
     if (!viewer) return;
 
     const totalPages = Math.ceil(data.total_rows / limit);
@@ -298,7 +351,7 @@ export function renderDbTableData(data, page, limit) {
     });
     previous.type = 'button';
     previous.disabled = page === 0;
-    previous.addEventListener('click', () => loadDbTable(data.table, page - 1));
+    previous.addEventListener('click', () => loadDbTable(requestedTable, page - 1));
 
     const next = element('button', {
         className: 'btn btn-secondary',
@@ -307,7 +360,7 @@ export function renderDbTableData(data, page, limit) {
     });
     next.type = 'button';
     next.disabled = !data.has_more;
-    next.addEventListener('click', () => loadDbTable(data.table, page + 1));
+    next.addEventListener('click', () => loadDbTable(requestedTable, page + 1));
 
     pagination.append(
         previous,
@@ -354,7 +407,7 @@ export function renderDbTableData(data, page, limit) {
                         style: 'color: var(--text-tertiary);',
                     }));
                 } else {
-                    cell.textContent = String(value).substring(0, 100);
+                    cell.textContent = truncateText(value, 100);
                 }
                 rowElement.appendChild(cell);
             }
@@ -377,34 +430,145 @@ export function renderDbTableData(data, page, limit) {
 }
 
 export function toggleDbExplorer() {
-    const container = document.getElementById('db-explorer-section');
-    const toggleButton = document.getElementById('toggle-db-explorer');
+    const container = findExplorerElement('db-explorer-section');
+    const toggleButton = findExplorerElement('toggle-db-explorer');
 
     if (!container || !toggleButton) return;
 
-    const activeAgent = API.getHostAgent();
+    const activeAgent = getActiveAgent();
     if (state.dbAgent !== activeAgent) resetDbExplorer(activeAgent);
 
     state.dbExplorerVisible = !state.dbExplorerVisible;
 
     if (state.dbExplorerVisible) {
         container.style.display = 'block';
-        toggleButton.textContent = '\u{1F5C4}\u{FE0F} Hide Database Explorer';
-        if (!state.dbTables) loadDbTables();
+        updateToggleButton(toggleButton, true);
+        if (!state.dbTables && !awaitingAgentSwitch && hasSovereigntyCapability()) {
+            void loadDbTables();
+        }
     } else {
         container.style.display = 'none';
-        toggleButton.textContent = '\u{1F5C4}\u{FE0F} Browse Database';
+        updateToggleButton(toggleButton, false);
     }
 }
 
-document.addEventListener('click', (event) => {
-    if (event.target.closest?.('#toggle-db-explorer')) toggleDbExplorer();
-});
+function handleExplorerClick(event) {
+    const toggleButton = event.target.closest?.('#toggle-db-explorer');
+    if (!toggleButton) return;
 
-bus.on('agent:switch', () => {
-    resetDbExplorer(API.getHostAgent());
-    if (state.dbExplorerVisible) void loadDbTables();
-});
+    // Older hosts embed the explorer button with
+    // onclick="toggleDbExplorer()" (or assign the equivalent onclick
+    // property). That handler runs at the target before this delegated
+    // listener sees the event; invoking the toggle again would immediately
+    // undo it. Delegation owns only buttons that have no compatibility
+    // handler of their own.
+    if (toggleButton.hasAttribute('onclick') || typeof toggleButton.onclick === 'function') {
+        return;
+    }
+    toggleDbExplorer();
+}
+
+function explorerCanReload() {
+    const section = findExplorerElement('db-explorer-section');
+    return state.dbExplorerVisible
+        && section !== null
+        && section.style.display !== 'none'
+        && hasSovereigntyCapability();
+}
+
+function handleApiAgentChange(activeAgent) {
+    if (state.dbAgent === activeAgent) return;
+    // This is the earliest tenant boundary. Evict the previous agent's rows and
+    // invalidate in-flight responses synchronously, but do not fetch for the
+    // new route yet: its capability map has not resolved.
+    awaitingAgentSwitch = true;
+    resetDbExplorer(activeAgent);
+}
+
+function handleAgentSwitch({ next } = {}) {
+    const activeAgent = getActiveAgent();
+
+    // Rapid selections can leave an older host event queued behind the current
+    // route. Only the switch that names the active API agent may release the
+    // capability barrier. External routers intentionally keep that API value
+    // null, so their payload remains opaque and every event is authoritative.
+    if (activeAgent !== null && next != null && next !== activeAgent) return;
+
+    const routeChangedWithoutApiHook = state.dbAgent !== activeAgent;
+
+    // A non-null route was already invalidated synchronously through
+    // onHostAgentChange. A null route is different: embedders may select the
+    // agent in their own router while leaving their API in standalone mode, so
+    // each event remains a tenant boundary even though the visible route is
+    // unchanged.
+    if (activeAgent === null || routeChangedWithoutApiHook) {
+        resetDbExplorer(activeAgent);
+    }
+
+    const wasAwaitingSwitch = awaitingAgentSwitch;
+    awaitingAgentSwitch = false;
+    if (
+        (wasAwaitingSwitch || activeAgent === null || routeChangedWithoutApiHook)
+        && explorerCanReload()
+    ) {
+        void loadDbTables();
+    }
+}
+
+function handlePanelHidden({ panelId } = {}) {
+    if (panelId !== 'sovereignty') return;
+
+    // Capability gating removes and later recreates the panel body. Keep the
+    // module state aligned with the newly mounted explorer's hidden DOM and
+    // invalidate any response targeting the detached panel.
+    state.dbExplorerVisible = false;
+    resetDbExplorer(getActiveAgent());
+}
+
+/**
+ * Bind the explorer to one console/embed mount.
+ *
+ * @param {{api?: object, root?: ParentNode}} [options]
+ * @returns {() => void} teardown callback
+ */
+export function initDatabaseExplorer({ api = API, root = document } = {}) {
+    if (!root || typeof root.addEventListener !== 'function') {
+        throw new TypeError('initDatabaseExplorer requires an event-capable root');
+    }
+    if (detachExplorerRuntime) detachExplorerRuntime();
+
+    explorerApi = api;
+    explorerRoot = root;
+    awaitingAgentSwitch = false;
+    state.dbExplorerVisible = false;
+    resetDbExplorer(getActiveAgent());
+
+    root.addEventListener('click', handleExplorerClick);
+    const agentChangeSubscription = typeof api.onHostAgentChange === 'function'
+        ? api.onHostAgentChange(handleApiAgentChange)
+        : null;
+    const offAgentChange = typeof agentChangeSubscription === 'function'
+        ? agentChangeSubscription
+        : () => {};
+    const offAgentSwitch = bus.on('agent:switch', handleAgentSwitch);
+    const offPanelHidden = bus.on('panel:hidden', handlePanelHidden);
+    let attached = true;
+
+    const detach = () => {
+        if (!attached) return;
+        attached = false;
+        root.removeEventListener('click', handleExplorerClick);
+        offAgentChange();
+        offAgentSwitch();
+        offPanelHidden();
+        awaitingAgentSwitch = false;
+        state.dbExplorerVisible = false;
+        resetDbExplorer(getActiveAgent());
+        if (detachExplorerRuntime === detach) detachExplorerRuntime = null;
+    };
+    detachExplorerRuntime = detach;
+    return detach;
+}
 
 // Retain the public functions for embedders that call them directly. The
 // explorer itself uses bound listeners and never constructs inline handlers.

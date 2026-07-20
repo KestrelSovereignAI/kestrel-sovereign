@@ -145,3 +145,46 @@ test('P2-2 remount: destroy()+mountPanels() again re-runs loaders (body not stuc
 
     h2.destroy();
 });
+
+test('mountPanels wires database explorer to the embed-scoped API without app.js', async () => {
+    Panels._reset();
+    document.body.innerHTML = '';
+
+    const databaseCalls = [];
+    const api = {
+        hasCapability: () => true,
+        getHostAgent: () => 'Embedded Agent',
+        onHostAgentChange: () => () => {},
+        async getDbTables(agent) {
+            databaseCalls.push(agent);
+            return { tables: [], table_count: 0, db_size: 0 };
+        },
+        async queryDbTable() {
+            throw new Error('not used');
+        },
+    };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const handle = await mountPanels(container, {
+        api,
+        loadFeatures: false,
+        wireRuntime: true,
+        activateFirst: false,
+    });
+
+    handle.activate('sovereignty');
+    const toggle = container.querySelector('#toggle-db-explorer');
+    assert.ok(toggle, 'embed runtime rendered the explorer control');
+    assert.equal(toggle.getAttribute('onclick'), null, 'control does not depend on inline wiring');
+    assert.equal(typeof window.toggleDbExplorer, 'function',
+        'database runtime is imported without the standalone app entry point');
+
+    toggle.click();
+    await flush();
+
+    assert.deepEqual(databaseCalls, ['Embedded Agent'],
+        'database request uses config.api and its selected agent');
+    assert.equal(container.querySelector('#db-explorer-section').style.display, 'block');
+
+    handle.destroy();
+});

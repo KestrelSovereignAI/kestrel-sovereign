@@ -280,7 +280,7 @@ export async function mountPanels(containerEl, config = {}) {
         try {
             const runtime = await import('./core-panels-runtime.js');
             if (runtime && typeof runtime.wireCorePanelRuntime === 'function') {
-                runtime.wireCorePanelRuntime({ api });
+                runtime.wireCorePanelRuntime({ api, root: hostEl });
             }
             if (runtime && typeof runtime.resetCorePanelRuntime === 'function') {
                 resetRuntime = runtime.resetCorePanelRuntime;

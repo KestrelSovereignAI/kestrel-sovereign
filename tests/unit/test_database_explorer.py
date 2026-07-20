@@ -104,6 +104,10 @@ async def test_shared_database_scopes_authorized_rows_and_blocks_documents(tmp_p
             table for table in listing["tables"] if table["name"] == "document_chunks"
         )
         assert chunks["queryable"] is False
+        assert chunks["row_count"] == -1
+        assert listing["db_size"] == -1
+        assert "db_path" not in listing
+        assert str(tmp_path / "shared.db") not in repr(listing)
 
         for document_table in ("documents", "document_chunks", "fts_documents"):
             assert document_table not in ALLOWED_TABLES

@@ -402,6 +402,7 @@ export function createApiClient({
         // CSRF-exempt (a browser never auto-attaches those headers).
         csrfToken: null,
     };
+    const hostAgentChangeListeners = new Set();
 
     // Fetch (once) and cache the host CSRF token. Returns null on failure so a
     // caller degrades to sending no header (the server then 403s a genuinely
@@ -682,11 +683,22 @@ export function createApiClient({
                 body: JSON.stringify({ name }),
             },
         ),
-        getDbTables: () => client.request('/api/db/tables'),
-        queryDbTable: (table, limit = 50, offset = 0, search = null) => {
+        // Database responses can contain tenant-private data. Pin both the
+        // initial request and any auth-refresh retry to the agent selected at
+        // dispatch time; client.request() can recapture the current selection
+        // on retry and is therefore wrong for this surface.
+        getDbTables: (agent = state.selectedHostAgent) =>
+            client.requestForAgent('/api/db/tables', {}, agent),
+        queryDbTable: (
+            table,
+            limit = 50,
+            offset = 0,
+            search = null,
+            agent = state.selectedHostAgent,
+        ) => {
             let url = `/api/db/tables/${encodeURIComponent(table)}?limit=${limit}&offset=${offset}`;
             if (search) url += `&search=${encodeURIComponent(search)}`;
-            return client.request(url);
+            return client.requestForAgent(url, {}, agent);
         },
         getIpfsStatus: () => client.request('/api/ipfs/status'),
         getWallet: () => client.request('/api/wallet'),
@@ -876,10 +888,26 @@ export function createApiClient({
             return await auth.applyAuth({ ...headers });
         },
         setHostAgent(agentName) {
+            const previousAgent = state.selectedHostAgent;
             state.selectedHostAgent = agentName;
+            if (previousAgent === agentName) return;
+            for (const listener of [...hostAgentChangeListeners]) {
+                try {
+                    listener(agentName, previousAgent);
+                } catch (error) {
+                    log.error?.('[api] host-agent change listener failed', error);
+                }
+            }
         },
         getHostAgent() {
             return state.selectedHostAgent;
+        },
+        onHostAgentChange(listener) {
+            if (typeof listener !== 'function') {
+                throw new TypeError('onHostAgentChange requires a function');
+            }
+            hostAgentChangeListeners.add(listener);
+            return () => hostAgentChangeListeners.delete(listener);
         },
         isMultiAgentMode() {
             return state.selectedHostAgent !== null;

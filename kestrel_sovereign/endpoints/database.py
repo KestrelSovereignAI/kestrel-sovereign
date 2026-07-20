@@ -1,7 +1,7 @@
 """Database explorer endpoints."""
-from fastapi import APIRouter, HTTPException, Query, Request
-from pathlib import Path
 import logging
+
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
@@ -127,7 +127,7 @@ async def _get_table_columns(db, table_name: str):
 
 @router.get("/tables")
 async def list_database_tables(request: Request):
-    """List SQLite tables with row counts and schema info."""
+    """List database tables with agent-scoped row counts and schema info."""
     try:
         agent = get_agent(request)
         storage = agent.storage
@@ -153,53 +153,53 @@ async def list_database_tables(request: Request):
                 logger.warning(f"Failed to get columns for table {table_name}: {e}")
                 columns = []
 
-            # Scope the row count to this agent the same way the app scopes
-            # the table, so a shared multi-agent DB doesn't report another
-            # agent's row totals through the explorer (#1651).
-            scope_cond, scope_params = _agent_scope(
-                table_name, [c["name"] for c in columns], agent_id,
-                storage.db.backend_type,
-            )
-            # For agent-scoped tables, EPHEMERAL/ISOLATED modes must not even
-            # reveal that persisted rows exist, so report the count as 0.
-            if scope_cond is not None and _privacy_hides_persisted(storage):
-                row_count = 0
+            queryable = table_name in ALLOWED_TABLES
+            if not queryable:
+                # A row count is still information about an unowned table.
+                # Keep its schema visible for diagnostics, but do not disclose
+                # tenant-aggregate metadata for a table whose rows cannot be
+                # scoped to the requesting agent.
+                row_count = -1
             else:
-                where_clause = f"WHERE {scope_cond}" if scope_cond else ""
-                try:
-                    count_row = await storage.db.fetchone(
-                        f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
-                        scope_params,
-                    )
-                    row_count = count_row[0] if count_row else 0
-                except Exception as e:
-                    logger.warning(f"Failed to count rows in table {table_name}: {e}")
+                # Scope the row count to this agent the same way the app scopes
+                # the table, so a shared multi-agent DB doesn't report another
+                # agent's row totals through the explorer (#1651).
+                scope_cond, scope_params = _agent_scope(
+                    table_name, [c["name"] for c in columns], agent_id,
+                    storage.db.backend_type,
+                )
+                # For agent-scoped tables, EPHEMERAL/ISOLATED modes must not
+                # reveal that persisted rows exist, so report the count as 0.
+                if scope_cond is not None and _privacy_hides_persisted(storage):
                     row_count = 0
+                else:
+                    where_clause = f"WHERE {scope_cond}" if scope_cond else ""
+                    try:
+                        count_row = await storage.db.fetchone(
+                            f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
+                            scope_params,
+                        )
+                        row_count = count_row[0] if count_row else 0
+                    except Exception as e:
+                        logger.warning(f"Failed to count rows in table {table_name}: {e}")
+                        row_count = 0
 
             tables.append({
                 "name": table_name,
                 "row_count": row_count,
                 "columns": columns,
-                "queryable": table_name in ALLOWED_TABLES,
+                "queryable": queryable,
             })
 
-        # Get db_path from storage (not storage.db which is AsyncDatabase)
-        db_path = getattr(storage, 'db_path', None)
-        if db_path is None:
-            # Try to get from wrapped storage (PrivacyEnforcingStorage wraps AsyncStorage)
-            inner_storage = getattr(storage, '_storage', None)
-            if inner_storage:
-                db_path = getattr(inner_storage, 'db_path', None)
-
-        db_size = 0
-        if db_path and Path(db_path).exists():
-            db_size = Path(db_path).stat().st_size
-
+        # The endpoint has no trustworthy tenant-exclusivity signal for the
+        # physical database. In shared deployments its aggregate byte size is
+        # cross-agent activity metadata, while its path discloses host layout.
+        # Keep size present as the explorer's established unavailable sentinel
+        # and omit the path entirely until storage can prove exclusive custody.
         return {
             "tables": tables,
             "table_count": len(tables),
-            "db_size": db_size,
-            "db_path": str(db_path) if db_path else "unknown",
+            "db_size": -1,
         }
     except HTTPException:
         raise

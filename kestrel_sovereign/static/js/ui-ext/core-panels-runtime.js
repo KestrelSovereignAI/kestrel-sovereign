@@ -23,6 +23,7 @@ import API from '../api.js';
 import { loadIdentity } from '../identity.js';
 import { loadConstitution, loadMemories, initMemoryFilter } from '../memories.js';
 import { loadExports, initSovereigntyButtons } from '../sovereignty.js';
+import { initDatabaseExplorer } from '../database.js';
 import { initTasks, loadTasks } from '../tasks.js';
 import { loadResources } from '../resources.js';
 import { initMetrics, loadMetrics } from '../metrics.js';
@@ -40,6 +41,7 @@ import { Security } from '../security.js';
 // "Loading…" placeholder because the guarded load was skipped.
 let _wired = false;
 let _off = null;
+let _offDatabaseExplorer = null;
 const _inited = new Set();
 const _loaded = new Set();
 
@@ -69,11 +71,12 @@ function _loadOnce(panelId, fn) {
  * calls are no-ops so a second `mountPanels` does not double-subscribe. Pair with
  * `resetCorePanelRuntime` on `destroy()` so a later remount re-wires + reloads.
  *
- * @param {{api?: object}} [opts]
+ * @param {{api?: object, root?: ParentNode}} [opts]
  */
-export function wireCorePanelRuntime({ api = API } = {}) {
+export function wireCorePanelRuntime({ api = API, root = document } = {}) {
     if (_wired) return;
     _wired = true;
+    _offDatabaseExplorer = initDatabaseExplorer({ api, root });
 
     const handler = (payload) => {
         const panelId = payload && payload.panelId;
@@ -134,6 +137,10 @@ export function wireCorePanelRuntime({ api = API } = {}) {
  */
 export function resetCorePanelRuntime() {
     if (_off) { _safe(_off); _off = null; }
+    if (_offDatabaseExplorer) {
+        _safe(_offDatabaseExplorer);
+        _offDatabaseExplorer = null;
+    }
     _wired = false;
     _inited.clear();
     _loaded.clear();
