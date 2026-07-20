@@ -30,6 +30,18 @@ import json
 import logging
 from typing import Any, List, Optional
 
+# The "tool result under construction" buffer (#2641) lives in the SDK, NOT
+# here: external feature packages subclass the SDK ``Feature`` base, so their
+# tools are wrapped by the SDK's ``DynamicTool`` — which binds the SDK's
+# ContextVar. Sharing that var (re-exported below; ``emit_part`` reads it as
+# its fallback) is what makes the envelope contract hold identically for
+# in-tree and external features. ``tool_result_parts_buffer`` stays importable
+# from this module as the framework-facing name.
+from kestrel_sdk.tools.parts import (  # noqa: F401  (re-export)
+    current_tool_result_parts,
+    tool_result_parts_buffer,
+)
+
 # Wire format mirrors the TOOL/THINK/REVISE sentinels: an ASCII Record
 # Separator (0x1e) bookends a ``KESTREL:PART:`` namespaced JSON payload. The RS
 # byte never appears in normal model prose and ``json.dumps`` escapes it inside
@@ -144,11 +156,20 @@ def emit_part(part_type: str, data: Any, part_id: Optional[str] = None) -> bool:
 
     Buffers ``{type, data, id}`` on the active turn's collector; the
     orchestrator drains it after the current tool and yields a PART sentinel
-    into the live stream. Returns ``True`` if the part was accepted, ``False``
-    if it was rejected (invalid type / non-serializable / oversized) or there is
-    no active turn collector (called outside a streaming turn — a no-op).
+    into the live stream. When no turn collector is bound but a tool result is
+    under construction (#2641), the part buffers onto that result's envelope
+    instead — the subagent/dispatch layers deliver it by contract. Returns
+    ``True`` if the part was accepted, ``False`` if it was rejected (invalid
+    type / non-serializable / oversized) or there is no active turn collector
+    AND no tool result under construction (a no-op).
     """
     collector = _part_collector.get()
+    if collector is None:
+        # Fallback (#2641): the tool result under construction. The buffer is
+        # the SDK's ContextVar — bound by whichever ``DynamicTool.execute``
+        # (SDK or sovereign) wraps the currently-running tool — so the
+        # envelope contract holds for external feature packages too.
+        collector = current_tool_result_parts()
     if collector is None:
         logger.debug("emit_part(%r) called with no active turn collector; ignored", part_type)
         return False
@@ -166,6 +187,35 @@ def emit_part(part_type: str, data: Any, part_id: Optional[str] = None) -> bool:
         return False
     collector.append(part)
     return True
+
+
+def sanitize_part(entry: Any) -> Optional[dict]:
+    """Validate an envelope-carried part entry; return a clean copy or ``None``.
+
+    Envelope-carried parts (``ToolResult.parts`` / a tool-result dict's
+    ``parts`` field, #2641) arrive from feature code without having passed
+    through :func:`emit_part`, so the dispatcher re-applies the SAME type and
+    size sanitization before re-emitting them into a turn collector. The
+    returned dict is freshly built (``{type, data, id?}``) so a caller can
+    never smuggle extra keys into the wire payload.
+    """
+    if not isinstance(entry, dict):
+        return None
+    clean_type = _sanitize_type(entry.get("type"))
+    if not clean_type:
+        logger.warning("sanitize_part: rejected invalid part type %r", entry.get("type"))
+        return None
+    part: dict = {"type": clean_type, "data": entry.get("data")}
+    part_id = entry.get("id")
+    if part_id is not None:
+        part["id"] = str(part_id)[:128]
+    if _serialized_size_ok(part) is None:
+        logger.warning(
+            "sanitize_part: dropped non-serializable or oversized part (type=%s)",
+            clean_type,
+        )
+        return None
+    return part
 
 
 def drain_parts() -> List[dict]:

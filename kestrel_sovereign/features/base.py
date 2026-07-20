@@ -1,3 +1,4 @@
+import contextlib
 import inspect
 import json
 import logging
@@ -101,6 +102,46 @@ def _serialize_tool_result(result: Any) -> Any:
     if hasattr(result, 'value'):  # Enum
         return result.value
     return str(result)
+
+
+def _attach_envelope_parts(
+    response: Dict[str, Any],
+    explicit_parts: Any,
+    buffered_parts: Optional[List[dict]],
+) -> None:
+    """Attach first-class typed parts to a tool-result envelope (#2641).
+
+    ``buffered_parts`` holds ``emit_part`` calls that found no turn collector
+    (buffered on the "tool result under construction" contextvar);
+    ``explicit_parts`` is an optional ``ToolResult.parts`` list a tool returned
+    directly. Both are sanitized with the same type/size rules ``emit_part``
+    applies, then written to ``response["parts"]`` — the envelope-carried form
+    subagent dispatch passes through to the parent turn's collector. The key is
+    only present when at least one valid part exists, so envelopes without
+    parts are byte-identical to the pre-#2641 shape.
+    """
+    entries: List[Any] = []
+    if buffered_parts:
+        entries.extend(buffered_parts)
+    if isinstance(explicit_parts, (list, tuple)):
+        entries.extend(explicit_parts)
+    if not entries:
+        return
+    # Lazy import: features.base is imported very early and importing
+    # ``kestrel_sovereign.agent`` at module scope would re-enter this module
+    # through the agent package's __init__ chain (same class of cycle as #1792).
+    from kestrel_sovereign.agent.parts import sanitize_part
+    clean = [p for p in (sanitize_part(e) for e in entries) if p is not None]
+    if len(clean) != len(entries):
+        logger.warning(
+            "Dropped %d invalid typed part entries from %s tool-result envelope",
+            len(entries) - len(clean), response.get("tool"),
+        )
+    # Overwrite rather than merge: ``explicit_parts`` IS the authoritative
+    # source for anything a serializer may already have copied into the dict.
+    response.pop("parts", None)
+    if clean:
+        response["parts"] = clean
 
 
 @runtime_checkable
@@ -632,8 +673,20 @@ class Feature(_SdkFeature):
                 resolved model (e.g. some external transports).
 
         Returns:
-            Dict with success status and result
+            Dict with success status and result. When any tool in the subagent
+            run produced first-class typed parts (#2641) — via ``emit_part`` or
+            an envelope-carried ``parts`` field — they are returned under a
+            ``parts`` key so the orchestrator's dispatch site can re-emit them
+            into the parent turn's collector. Callers that don't handle parts
+            can ignore the key.
         """
+        # Subagent-local buffer for typed parts (#2641). Tools executed inside
+        # this subagent — via the post-LLM loop OR the codex inline executor,
+        # which runs on a reader-spawned task with a frozen context — deposit
+        # their parts here, and the envelope carries them back to the
+        # dispatching orchestrator by contract instead of ContextVar
+        # happenstance.
+        subagent_parts: List[dict] = []
         try:
             # Get feature's own tools, excluding any denied by security policy
             available_tools = self.get_tools()
@@ -676,7 +729,7 @@ class Feature(_SdkFeature):
             # translation and break Gemini/Vertex routes — codex
             # round 3 P2 on #1461 follow-up.
             tool_executor = (
-                self._make_feature_inline_tool_executor()
+                self._make_feature_inline_tool_executor(parts_sink=subagent_parts)
                 if feature_tools else None
             )
             response = await self.agent.llm_service.generate(
@@ -708,23 +761,42 @@ class Feature(_SdkFeature):
                 user_prompt=user_prompt,
                 tool_executor=tool_executor,
                 model_override=model_override,
+                parts_sink=subagent_parts,
             )
 
             # Debug: Log what we're returning to the orchestrator
             result_preview = str(result)[:500] if result else "None"
             logger.info(f"[SUBAGENT-RESULT] Feature {self.name} returning to orchestrator: {result_preview}")
 
-            return {"success": True, "result": result}
+            envelope: Dict[str, Any] = {"success": True, "result": result}
+            if subagent_parts:
+                envelope["parts"] = subagent_parts
+            return envelope
 
         except Exception as e:
             logger.error(f"Feature {self.name} subagent execution failed: {e}")
-            return {"success": False, "error": str(e)}
+            err_envelope: Dict[str, Any] = {"success": False, "error": str(e)}
+            # Parts emitted before the failure (e.g. a *_pending card) still
+            # travel — matching the direct path, where emit_part delivers
+            # immediately regardless of how the tool call ends.
+            if subagent_parts:
+                err_envelope["parts"] = subagent_parts
+            return err_envelope
 
-    def _make_feature_inline_tool_executor(self):
+    def _make_feature_inline_tool_executor(self, parts_sink: Optional[List[dict]] = None):
         """Build an inline ``(name, args) -> result_dict`` async callable
         bound to this feature's OWN tool palette, gated by the same
         ``PRE_TOOL_USE`` hooks the non-inline ``_handle_feature_tool_calls``
         path enforces.
+
+        ``parts_sink`` (#2641) is the subagent-local typed-parts buffer:
+        threaded into ``_execute_subagent_tool`` so parts emitted by inline
+        tool calls — which the codex app-server dispatches on reader-spawned
+        tasks whose frozen context has NO turn collector — land on the sink
+        and ride the subagent's result envelope instead of being dropped.
+        This is the subagent-path equivalent of the parent-turn
+        ``bind_part_collector`` fix in
+        ``OrchestratorEngineMixin._make_inline_tool_executor``.
 
         Required by adapters that execute tool calls INSIDE the LLM
         turn and block until the result arrives — the codex app-server
@@ -748,6 +820,7 @@ class Feature(_SdkFeature):
                 args=args or {},
                 tools_by_name={t.name: t for t in self.get_tools()},
                 return_with_effective_args=True,
+                parts_sink=parts_sink,
             )
         return _exec
 
@@ -758,6 +831,7 @@ class Feature(_SdkFeature):
         args: Dict[str, Any],
         tools_by_name: Dict[str, Any],
         return_with_effective_args: bool = False,
+        parts_sink: Optional[List[dict]] = None,
     ) -> Any:
         """Execute one of this feature's tools with PRE_TOOL_USE hook
         enforcement. Shared between the inline-executor path (used by
@@ -798,93 +872,126 @@ class Feature(_SdkFeature):
                 ),
             })
 
-        hooks_manager = getattr(self.agent, "hooks_manager", None)
-        effective_args = args
-        if hooks_manager is not None:
-            from kestrel_sdk.hooks.base import (
-                HookEvent, HookInput, PermissionDecision,
-            )
-            hook_input = HookInput(
-                session_id="subagent",
-                hook_event_name=HookEvent.PRE_TOOL_USE.value,
-                tool_name=tool_name,
-                tool_input=args,
-                feature_name=type(self).__name__,
-            )
-            hook_output = await hooks_manager.execute_hooks(
-                HookEvent.PRE_TOOL_USE, hook_input,
-            )
-            # Compute the effective args from the post-hook state FIRST,
-            # before the block check. A hook chain may redact via an
-            # early MODIFY hook (in-place mutation of
-            # ``hook_input.tool_input``) and then DENY via a later
-            # PermissionHook; the blocking branch must surface the
-            # REDACTED args to the codex audit path or PII the
-            # redaction hook removed will leak straight into
-            # ``a2a_tool_dispatches.args_redacted`` /
-            # ``executed_tool_calls``. Codex round 5 P1 on #1461
-            # follow-up.
-            mutated_input = getattr(hook_input, "tool_input", None)
-            if isinstance(mutated_input, dict):
-                effective_args = mutated_input
-            updated = getattr(hook_output, "updated_input", None)
-            if isinstance(updated, dict):
-                effective_args = updated
+        # #2641: bind the subagent-local parts sink as the active collector
+        # for the WHOLE gated call — PRE_TOOL_USE hooks included, not just the
+        # tool body — so ``emit_part`` lands deterministically on THIS
+        # subagent's buffer no matter which task/context the transport
+        # dispatched the call on (the codex app-server runs inline calls on
+        # reader-spawned tasks whose frozen context has no live collector —
+        # the exact gap parts.py documents for the parent-turn executor).
+        # Covering the hooks matters for ordering: a part emitted by a PRE
+        # hook must land on the same buffer as the tool's own parts, in
+        # emission order (hook part first). This binding is the ONLY
+        # ContextVar-side capture the subagent path performs — the ambient
+        # collector outside this scope is the PARENT turn's (the dispatch
+        # loop runs on the parent's task, and orchestrator+feature share one
+        # hooks manager in production), so draining it from subagent code
+        # steals the outer PRE_TOOL_USE gate's parts and reorders them
+        # behind tool-body parts (#2641 review P1, both rounds).
+        if parts_sink is None:
+            sink_scope = contextlib.nullcontext()
+        else:
+            from kestrel_sovereign.agent.parts import bind_part_collector
+            sink_scope = bind_part_collector(parts_sink)
 
-            # Both DENY and ASK must short-circuit. ASK means "human
-            # approval required" — the orchestrator-driven path's
-            # ``execute_named_tool`` blocks both, and the codex inline
-            # subagent path must match that contract or approval-gated
-            # tools silently run without approval (codex round 2 P1
-            # on #1461 follow-up).
-            if hook_output.permission_decision in (
-                PermissionDecision.DENY,
-                PermissionDecision.ASK,
-            ):
-                reason = (
-                    hook_output.permission_reason
-                    or "Blocked by security policy"
+        with sink_scope:
+            hooks_manager = getattr(self.agent, "hooks_manager", None)
+            effective_args = args
+            if hooks_manager is not None:
+                from kestrel_sdk.hooks.base import (
+                    HookEvent, HookInput, PermissionDecision,
                 )
-                decision_label = (
-                    "PERMISSION DENIED"
-                    if hook_output.permission_decision == PermissionDecision.DENY
-                    else "APPROVAL REQUIRED"
+                hook_input = HookInput(
+                    session_id="subagent",
+                    hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                    tool_name=tool_name,
+                    tool_input=args,
+                    feature_name=type(self).__name__,
                 )
-                logger.info(
-                    "[SUBAGENT-TOOL] %s blocked (%s): %s",
-                    tool_name, decision_label, reason,
+                hook_output = await hooks_manager.execute_hooks(
+                    HookEvent.PRE_TOOL_USE, hook_input,
                 )
-                # Surface the POST-hook args even on the block path —
-                # an upstream redaction hook may have run before the
-                # downstream permission hook denied, and the codex
-                # audit row should record the redacted form, not the
-                # raw PII (codex round 5 P1 on #1461 follow-up).
-                return _shape(effective_args, {
-                    "success": False,
-                    "error": (
-                        f"{decision_label}: {reason}. The tool was "
-                        f"NOT executed. Do NOT tell the user this "
-                        f"action succeeded — inform them it was "
-                        f"blocked by security policy."
-                    ),
-                })
-            # ``effective_args`` was already resolved above to the
-            # post-hook state (mutated ``tool_input`` first, then any
-            # ``updated_input`` override) — see the comment block
-            # before the DENY/ASK branch.
+                # Compute the effective args from the post-hook state FIRST,
+                # before the block check. A hook chain may redact via an
+                # early MODIFY hook (in-place mutation of
+                # ``hook_input.tool_input``) and then DENY via a later
+                # PermissionHook; the blocking branch must surface the
+                # REDACTED args to the codex audit path or PII the
+                # redaction hook removed will leak straight into
+                # ``a2a_tool_dispatches.args_redacted`` /
+                # ``executed_tool_calls``. Codex round 5 P1 on #1461
+                # follow-up.
+                mutated_input = getattr(hook_input, "tool_input", None)
+                if isinstance(mutated_input, dict):
+                    effective_args = mutated_input
+                updated = getattr(hook_output, "updated_input", None)
+                if isinstance(updated, dict):
+                    effective_args = updated
 
-        try:
-            result = await tool.execute(**effective_args)
-            return _shape(effective_args, _serialize_tool_result(result))
-        except Exception as e:
-            logger.warning(
-                "[SUBAGENT-TOOL] %s raised %s",
-                tool_name, e,
-            )
-            return _shape(
-                effective_args,
-                {"success": False, "error": f"{type(e).__name__}: {e}"},
-            )
+                # Both DENY and ASK must short-circuit. ASK means "human
+                # approval required" — the orchestrator-driven path's
+                # ``execute_named_tool`` blocks both, and the codex inline
+                # subagent path must match that contract or approval-gated
+                # tools silently run without approval (codex round 2 P1
+                # on #1461 follow-up).
+                if hook_output.permission_decision in (
+                    PermissionDecision.DENY,
+                    PermissionDecision.ASK,
+                ):
+                    reason = (
+                        hook_output.permission_reason
+                        or "Blocked by security policy"
+                    )
+                    decision_label = (
+                        "PERMISSION DENIED"
+                        if hook_output.permission_decision == PermissionDecision.DENY
+                        else "APPROVAL REQUIRED"
+                    )
+                    logger.info(
+                        "[SUBAGENT-TOOL] %s blocked (%s): %s",
+                        tool_name, decision_label, reason,
+                    )
+                    # Surface the POST-hook args even on the block path —
+                    # an upstream redaction hook may have run before the
+                    # downstream permission hook denied, and the codex
+                    # audit row should record the redacted form, not the
+                    # raw PII (codex round 5 P1 on #1461 follow-up).
+                    return _shape(effective_args, {
+                        "success": False,
+                        "error": (
+                            f"{decision_label}: {reason}. The tool was "
+                            f"NOT executed. Do NOT tell the user this "
+                            f"action succeeded — inform them it was "
+                            f"blocked by security policy."
+                        ),
+                    })
+                # ``effective_args`` was already resolved above to the
+                # post-hook state (mutated ``tool_input`` first, then any
+                # ``updated_input`` override) — see the comment block
+                # before the DENY/ASK branch.
+
+            try:
+                result = await tool.execute(**effective_args)
+            except Exception as e:
+                logger.warning(
+                    "[SUBAGENT-TOOL] %s raised %s",
+                    tool_name, e,
+                )
+                return _shape(
+                    effective_args,
+                    {"success": False, "error": f"{type(e).__name__}: {e}"},
+                )
+            serialized = _serialize_tool_result(result)
+            # Harvest envelope-carried parts (``ToolResult.parts`` / a result
+            # dict's ``parts`` field) into the sink too — the explicit,
+            # ContextVar-free half of the #2641 contract. The envelope keeps its
+            # copy; delivery to the outbound stream happens once, at the
+            # orchestrator's dispatch site.
+            if parts_sink is not None and isinstance(serialized, dict):
+                envelope_parts = serialized.get("parts")
+                if isinstance(envelope_parts, list) and envelope_parts:
+                    parts_sink.extend(envelope_parts)
+            return _shape(effective_args, serialized)
 
     def _get_subagent_prompt(self) -> str:
         """
@@ -931,6 +1038,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         user_prompt: Optional[str] = None,
         tool_executor: Optional[Any] = None,
         model_override: Optional[str] = None,
+        parts_sink: Optional[List[dict]] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -944,6 +1052,13 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             system_prompt: The feature's system prompt for continuation
             max_iterations: Maximum tool call iterations to prevent infinite loops.
                            Defaults to KESTREL_MAX_TOOL_ITERATIONS env var (default: 5)
+            parts_sink: Subagent-local buffer for first-class typed parts
+                        (#2641). Threaded into ``_execute_subagent_tool``,
+                        which binds it as the active collector for the whole
+                        gated call and harvests envelope-carried ``parts``
+                        into it, so ``execute_as_subagent`` can return them
+                        by contract. The loop itself never drains the ambient
+                        collector — that is the parent turn's buffer.
 
         Returns:
             Final text response after all tool calls are processed
@@ -1010,6 +1125,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     tool_name=tool_name,
                     args=args,
                     tools_by_name=tools_by_name,
+                    parts_sink=parts_sink,
                 )
                 result_str = json.dumps(result) if isinstance(result, dict) else str(result)
                 logger.info(
@@ -1105,15 +1221,34 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         )
 
                     async def execute(self, **kwargs) -> Dict[str, Any]:
-                        try:
-                            result = await self.func(**kwargs)
-                        except Exception as e:
-                            logger.error(f"Error executing tool {self.name}: {e}")
-                            return {
-                                "success": False,
-                                "error": str(e),
-                                "tool": self.name,
-                            }
+                        # #2641: bind a "tool result under construction"
+                        # buffer for the duration of the wrapped call.
+                        # ``emit_part`` calls that find no turn collector
+                        # (foreign-task transports, subagent loops) land here
+                        # and are attached to the returned envelope's
+                        # ``parts`` field, making delivery an envelope
+                        # contract rather than ContextVar happenstance. Lazy
+                        # import for the same #1792-class cycle reason as
+                        # ``_attach_envelope_parts``.
+                        from kestrel_sovereign.agent.parts import (
+                            tool_result_parts_buffer,
+                        )
+                        with tool_result_parts_buffer() as pending_parts:
+                            try:
+                                result = await self.func(**kwargs)
+                            except Exception as e:
+                                logger.error(f"Error executing tool {self.name}: {e}")
+                                response: Dict[str, Any] = {
+                                    "success": False,
+                                    "error": str(e),
+                                    "tool": self.name,
+                                }
+                                # Parts emitted before the failure (e.g. a
+                                # *_pending card) still travel, matching the
+                                # collector path where emit_part delivers
+                                # immediately.
+                                _attach_envelope_parts(response, None, pending_parts)
+                                return response
 
                         # ToolResult-returning @tool methods (#1042
                         # layer 4 contract) get serialized at the wrap
@@ -1163,10 +1298,17 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             # back-compat courtesy for the many existing readers
                             # that branch on it; ``status`` is the canonical
                             # signal going forward.
-                            response: Dict[str, Any] = result.to_dict()
+                            response = result.to_dict()
                             response["tool"] = self.name
                             response["success"] = (
                                 result.status is not ToolResultStatus.ERROR
+                            )
+                            # ``getattr`` because the pinned SDK's ToolResult
+                            # predates the ``parts`` field (#2641) — this
+                            # honors it as soon as the SDK ships it, and is a
+                            # no-op until then.
+                            _attach_envelope_parts(
+                                response, getattr(result, "parts", None), pending_parts,
                             )
                             return response
 
@@ -1175,11 +1317,13 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         # ``success: True`` here remains transport-
                         # level for un-migrated tools; the #1061
                         # bulk waves migrate them away one by one.
-                        return {
+                        response = {
                             "success": True,
                             "result": result,
                             "tool": self.name,
                         }
+                        _attach_envelope_parts(response, None, pending_parts)
+                        return response
 
                 tools.append(DynamicTool(method, schema_data, agent_skill))
         return tools
