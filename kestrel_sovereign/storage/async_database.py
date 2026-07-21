@@ -852,6 +852,29 @@ class AsyncDatabase:
         await self._migrate_add_column(
             "memory_episodes", "embedding_profile_id", "TEXT DEFAULT NULL"
         )
+        # Managed service-key storage: agent_service_keys gained key_hash +
+        # quota columns after its initial release, but the table is created
+        # with CREATE TABLE IF NOT EXISTS, so databases predating those columns
+        # never received them. store_key then fails its INSERT ("column
+        # key_hash of relation agent_service_keys does not exist"), and because
+        # per-user provider-key injection is fail-open, callers silently fall
+        # back to the shared platform key — disabling per-user metering/caps
+        # with no hard error. Migrate the post-initial columns idempotently.
+        # key_hash is nullable here (not NOT NULL as in the CREATE TABLE) so the
+        # ALTER also succeeds on tables that already hold legacy rows; store_key
+        # always supplies it on new inserts.
+        await self._migrate_add_column(
+            "agent_service_keys", "key_hash", "TEXT"
+        )
+        await self._migrate_add_column(
+            "agent_service_keys", "quota_limit", "INTEGER"
+        )
+        await self._migrate_add_column(
+            "agent_service_keys", "quota_used", "INTEGER DEFAULT 0"
+        )
+        await self._migrate_add_column(
+            "agent_service_keys", "is_active", "INTEGER DEFAULT 1"
+        )
         if await self._column_exists("conversation_history", "deleted_at"):
             await self._backend.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversation_deleted_at "
