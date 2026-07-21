@@ -191,6 +191,14 @@ class NodeSwapResult(str, Enum):
     SWAPPED = "swapped"
     PREDICATE_FAILED = "predicate_failed"
     NOT_FOUND = "not_found"
+    # The caller constrained the swap/create to a set of node types
+    # (``allowed_node_types``) and the *effective* type is outside it: on a
+    # swap the **stored** row's ``node_type`` is not allowed (the row is left
+    # untouched); on a compare-and-create the ``new_node.node_type`` is not
+    # allowed (nothing is inserted). Only ever returned when a caller passes
+    # ``allowed_node_types`` — the privacy wrapper uses it to fail a durable
+    # graph CAS closed in volatile modes (#2672) without a TOCTOU pre-read.
+    TYPE_NOT_ALLOWED = "type_not_allowed"
 
 
 @dataclass
@@ -433,6 +441,7 @@ class AsyncGraphStore:
         node_id: str,
         expected: Optional[Dict[str, Any]],
         new_node: GraphNode,
+        allowed_node_types: Optional[frozenset] = None,
     ) -> NodeSwapResult:
         """Atomically update a node's ``properties`` only if they still match.
 
@@ -468,6 +477,21 @@ class AsyncGraphStore:
                 is written; on a compare-and-create (``expected is None``) the
                 full node — ``node_type``, ``label`` and ``properties`` — is
                 inserted. The row identity always stays ``node_id``.
+            allowed_node_types: Optional set constraining the *effective*
+                ``node_type`` the operation may touch. When given, the swap
+                lands only if the **stored** row's ``node_type`` is in the set
+                (added to the ``UPDATE`` predicate, so a disallowed row matches
+                zero rows and is never rewritten), and a compare-and-create
+                lands only if ``new_node.node_type`` is in the set. A blocked
+                operation returns :attr:`NodeSwapResult.TYPE_NOT_ALLOWED`
+                without writing. This is the atomic, TOCTOU-free hook the
+                privacy wrapper uses to keep a durable graph CAS from silently
+                rewriting a user-derived node under a spoofed structural
+                ``new_node.node_type`` in volatile modes (#2672) — because a
+                swap ignores ``new_node.node_type`` and writes ``properties``
+                onto whatever row already exists. ``None`` (the default) imposes
+                no type constraint, preserving the primitive's original
+                behaviour for every non-privacy caller.
 
         Returns:
             * :attr:`NodeSwapResult.SWAPPED` — the predicate held and the write
@@ -537,9 +561,30 @@ class AsyncGraphStore:
         # snapshot. SQLite serializes this under its per-connection write lock;
         # Postgres runs the conditional UPDATE under a row lock so concurrent
         # swaps block and re-evaluate the predicate against the committed row.
+        # Build the optional "stored/created type must be allowed" predicate
+        # once. For a swap it is AND-ed into the UPDATE so a disallowed stored
+        # row matches zero rows (never rewritten); for a create the new node's
+        # own type is checked before insert. Kept as a set membership so the
+        # SQL uses a parameterized ``IN`` list — no interpolated values.
+        type_clause = ""
+        type_params: tuple = ()
+        if allowed_node_types is not None:
+            allowed_tuple = tuple(allowed_node_types)
+            if allowed_tuple:
+                placeholders = ", ".join("?" for _ in allowed_tuple)
+                type_clause = f" AND node_type IN ({placeholders})"
+                type_params = allowed_tuple
+
         async with self.db.transaction():
             if expected is None:
                 # Compare-and-create: only lands while the node is still absent.
+                # A create writes ``new_node.node_type`` verbatim, so gate on it
+                # directly and insert nothing when it is disallowed.
+                if (
+                    allowed_node_types is not None
+                    and new_node.node_type not in allowed_node_types
+                ):
+                    return NodeSwapResult.TYPE_NOT_ALLOWED
                 affected = await self.db.execute(
                     self._insert_if_absent_node_sql(),
                     (node_id, new_node.node_type, new_node.label, new_properties),
@@ -581,30 +626,41 @@ class AsyncGraphStore:
             affected = await self.db.execute(
                 "UPDATE graph_nodes "
                 "SET properties = ? "
-                f"WHERE node_id = ? AND {self._properties_match_predicate()} "
+                f"WHERE node_id = ? AND {self._properties_match_predicate()}"
+                f"{type_clause} "
                 f"AND {scope}",
                 (
                     new_properties,
                     node_id,
                     expected_properties,
+                    *type_params,
                     *scope_params,
                 ),
             )
             if _rows_affected(affected) > 0:
                 return NodeSwapResult.SWAPPED
 
-            # Zero rows changed: distinguish "predicate no longer holds" from
-            # "row genuinely absent" with a read in the same serialized section.
-            # The read carries the SAME ownership scope, so a foreign-owned node
-            # reads as NOT_FOUND (invisible to this tenant) rather than leaking
-            # its existence as PREDICATE_FAILED.
-            exists = await self.db.fetchone(
-                f"SELECT 1 FROM graph_nodes WHERE node_id = ? AND {scope}",
+            # Zero rows changed: distinguish "predicate no longer holds", "type
+            # not allowed", and "row genuinely absent" with one read in the same
+            # serialized section. The read carries the SAME ownership scope, so a
+            # foreign-owned node reads as NOT_FOUND (invisible to this tenant)
+            # rather than leaking its existence. When the caller passed
+            # ``allowed_node_types``, a visible row whose stored ``node_type`` is
+            # outside the set is TYPE_NOT_ALLOWED (a policy block, not a lost
+            # race) — this is how the wrapper tells "someone else changed it"
+            # apart from "this is a user-derived row I must not rewrite".
+            existing = await self.db.fetchone(
+                f"SELECT node_type FROM graph_nodes WHERE node_id = ? AND {scope}",
                 (node_id, *scope_params),
             )
-            if exists is not None:
-                return NodeSwapResult.PREDICATE_FAILED
-            return NodeSwapResult.NOT_FOUND
+            if existing is None:
+                return NodeSwapResult.NOT_FOUND
+            if (
+                allowed_node_types is not None
+                and existing[0] not in allowed_node_types
+            ):
+                return NodeSwapResult.TYPE_NOT_ALLOWED
+            return NodeSwapResult.PREDICATE_FAILED
 
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
         """Get a node by ID."""

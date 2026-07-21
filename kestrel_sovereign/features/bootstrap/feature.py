@@ -159,7 +159,8 @@ async def rename_agent_core(agent, new_name: str) -> RenameOutcome:
             updated_node.properties = dict(agent_node.properties)
             updated_node.properties["name"] = new_name
             updated_node.label = new_name
-            await agent.storage.add_node(updated_node)
+            # Trusted control-plane write: agent identity node (#2672).
+            await agent.storage.add_node(updated_node, control_plane=True)
             graph_updated = True
     except Exception as e:
         logger.error(f"Agent rename failed after metadata write: {e}", exc_info=True)

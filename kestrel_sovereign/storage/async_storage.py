@@ -773,8 +773,13 @@ class AsyncStorage:
     
     # --- Graph Operations ---
     
-    async def add_node(self, node: GraphNode) -> None:
-        """Add a node to the knowledge graph."""
+    async def add_node(self, node: GraphNode, *, control_plane: bool = False) -> None:
+        """Add a node to the knowledge graph.
+
+        ``control_plane`` is accepted (and ignored) so trusted governance callers
+        can pass it uniformly whether they hold the raw facade or the
+        privacy-enforcing wrapper, which is where it is actually enforced (#2672).
+        """
         if not self._initialized:
             await self.initialize()
         await self.graph.add_node(node)
@@ -784,6 +789,9 @@ class AsyncStorage:
         node_id: str,
         expected: Optional[Dict[str, Any]],
         new_node: GraphNode,
+        allowed_node_types: Optional[frozenset] = None,
+        *,
+        control_plane: bool = False,
     ) -> NodeSwapResult:
         """Atomically update a graph node's properties only if they still match.
 
@@ -791,13 +799,17 @@ class AsyncStorage:
         the race-free, properties-only conditional-update primitive.
         ``expected`` is the ``properties`` snapshot the caller last read
         (``None`` = compare-and-create); on a swap only ``new_node.properties``
-        is written (``node_type`` / ``label`` are left as-is). Returns a
-        :class:`NodeSwapResult` (``swapped`` / ``predicate_failed`` /
-        ``not_found``).
+        is written (``node_type`` / ``label`` are left as-is). ``allowed_node_types``
+        (optional) constrains the effective node type the swap/create may touch
+        — the privacy wrapper uses it to govern durable graph CAS in volatile
+        modes. Returns a :class:`NodeSwapResult` (``swapped`` /
+        ``predicate_failed`` / ``not_found`` / ``type_not_allowed``).
         """
         if not self._initialized:
             await self.initialize()
-        return await self.graph.compare_and_swap_node(node_id, expected, new_node)
+        return await self.graph.compare_and_swap_node(
+            node_id, expected, new_node, allowed_node_types=allowed_node_types
+        )
 
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
         """Get a node by ID."""
@@ -812,8 +824,13 @@ class AsyncStorage:
         return await self.graph.get_nodes_by_type(node_type)
     
     async def add_edge(self, source_id: str, target_id: str, label: str,
-                       properties: Optional[Dict] = None) -> None:
-        """Add an edge between nodes."""
+                       properties: Optional[Dict] = None,
+                       *, control_plane: bool = False) -> None:
+        """Add an edge between nodes.
+
+        ``control_plane`` is accepted (and ignored) here for call-site uniformity
+        with the privacy wrapper, which enforces it (#2672).
+        """
         if not self._initialized:
             await self.initialize()
         await self.graph.add_edge(source_id, target_id, label, properties)

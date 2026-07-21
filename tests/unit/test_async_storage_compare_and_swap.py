@@ -42,7 +42,10 @@ from kestrel_sovereign.storage.async_graph_store import (
     NodeSwapResult,
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PrivacyEnforcingStorage,
+    PrivacyViolationError,
+)
 from kestrel_sovereign.privacy import PrivacyMode
 
 
@@ -441,17 +444,62 @@ class TestFacadeAndPrivacyWrapper:
         finally:
             await storage.close()
 
-    async def test_privacy_wrapper_works_in_ephemeral_mode(self, tmp_path):
-        """Graph CAS is structural metadata, not PII — allowed in EPHEMERAL just
-        like add_node (which the wrapper explicitly permits)."""
+    async def test_privacy_wrapper_governs_graph_cas_in_ephemeral_mode(self, tmp_path):
+        """CAS is privacy-governed in EPHEMERAL (#2672), without decomposing the
+        atomic primitive.
+
+        A durable graph write is not "structural, not PII". Two tiers (review
+        finding P1): a user-derived / unknown node CAS is default-denied and
+        writes no row; a content-free structural type (here ``document``) is
+        admitted on the ordinary path and lands atomically; and a value-bearing
+        control-plane type (``feature_config``) is admitted ONLY through the
+        trusted control-plane capability. In every case the governance inspects
+        ``new_node`` up front and then delegates the single atomic CAS — it never
+        becomes get_node + add_node.
+        """
         storage = await AsyncStorage.create_sqlite(str(tmp_path / "eph.db"))
         wrapped = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
         try:
-            nid = _nid("eph")
+            # Unknown/user-derived node type → fail closed, no durable row.
+            blocked = _nid("eph-blocked")
+            with pytest.raises(PrivacyViolationError):
+                await wrapped.compare_and_swap_node(
+                    blocked, None, _node(blocked, {"status": "fresh"})
+                )
+            assert await storage.get_node(blocked) is None
+
+            # Content-free structural type → admitted on the ordinary path.
+            allowed = _nid("eph-allowed")
             result = await wrapped.compare_and_swap_node(
-                nid, None, _node(nid, {"status": "fresh"})
+                allowed,
+                None,
+                _node(
+                    allowed,
+                    {"hash": allowed, "type": "Constitution",
+                     "created_at": "2026-01-01T00:00:00+00:00"},
+                    label="KESTREL_CONSTITUTION",
+                    node_type="document",
+                ),
             )
             assert result == NodeSwapResult.SWAPPED
+            assert (await storage.get_node(allowed)) is not None
+
+            # Value-bearing control-plane type → denied untrusted, admitted only
+            # through the trusted capability.
+            cp = _nid("eph-control-plane")
+            cp_node = _node(
+                cp, {"config": {"enabled": True}}, node_type="feature_config",
+                label="todo config",
+            )
+            with pytest.raises(PrivacyViolationError):
+                await wrapped.compare_and_swap_node(cp, None, cp_node)
+            assert await storage.get_node(cp) is None
+
+            result = await wrapped.compare_and_swap_node(
+                cp, None, cp_node, control_plane=True
+            )
+            assert result == NodeSwapResult.SWAPPED
+            assert (await storage.get_node(cp)) is not None
         finally:
             await storage.close()
 

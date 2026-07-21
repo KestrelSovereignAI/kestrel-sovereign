@@ -1445,6 +1445,20 @@ class MemoryFeature(Feature):
             )
 
         result = dict(result or {})
+
+        # Privacy boundary (#2672): a volatile privacy mode gates the entire
+        # durable consolidation path, so report "skipped" rather than a false
+        # "complete" that would imply episodes/patterns were persisted.
+        if result.get("skipped"):
+            return ToolResult.ok(
+                confirmation=(
+                    "Consolidation skipped: the current privacy mode forbids "
+                    "durable memory writes, so no episodes, patterns, archival, "
+                    "or forgetting were persisted."
+                ),
+                data=result,
+            )
+
         episodes_deleted = result.get("episodes_deleted", 0)
         episodes_created = result.get("episodes_created", 0)
         patterns_found = result.get("patterns_found", 0)

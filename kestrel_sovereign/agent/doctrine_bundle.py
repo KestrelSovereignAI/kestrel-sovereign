@@ -315,7 +315,7 @@ async def anchor_doctrine_bundle(
     agent_node.properties[PROP_BUNDLE_ANCHORED_AT] = datetime.now(
         timezone.utc
     ).isoformat()
-    await agent.storage.add_node(agent_node)
+    await agent.storage.add_node(agent_node, control_plane=True)
     logger.info(
         f"Doctrine bundle anchored: hash={snapshot.hash[:16]}... "
         f"files={len(snapshot.files)} bytes={snapshot.total_bytes}"
@@ -444,7 +444,7 @@ async def reanchor_doctrine_bundle(
         "expected_hash_prefix": expected_hash,
         "file_count": len(snapshot.files),
     }
-    await agent.storage.add_node(agent_node)
+    await agent.storage.add_node(agent_node, control_plane=True)
     logger.warning(
         f"Doctrine bundle re-anchored by {authorization or 'unspecified'}: "
         f"{old_hash[:16] if old_hash else 'none'}... -> {snapshot.hash[:16]}..."

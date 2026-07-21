@@ -146,7 +146,7 @@ class ConstitutionMixin:
             )
 
         try:
-            await self.storage.add_node(agent_node)
+            await self.storage.add_node(agent_node, control_plane=True)
         except Exception:
             logging.exception(
                 "ensure_doctrine_bundle_anchored: agent_node persist failed"
@@ -1146,7 +1146,7 @@ class ConstitutionMixin:
         if not agent_node:
             return False, "Agent identity node not found; cannot anchor overlay."
         agent_node.properties[self.OVERLAY_HASH_PROPERTY] = overlay_sha
-        await self.storage.add_node(agent_node)  # upsert
+        await self.storage.add_node(agent_node, control_plane=True)  # upsert
         self.constitution_overlay_verified = True
         logging.info("Anchored constitution overlay hash %s", overlay_sha[:16])
         return True, f"Anchored constitution overlay. Hash: {overlay_sha[:16]}..."
@@ -1641,7 +1641,7 @@ class ConstitutionMixin:
                     "authorization": authorization or "unspecified",
                     "expected_hash_prefix": expected_hash,
                 }
-                await self.storage.add_node(agent_node)
+                await self.storage.add_node(agent_node, control_plane=True)
         except Exception as e:
             return (
                 f"Error: Reanchor failed mid-write and was rolled back; "
@@ -1743,7 +1743,7 @@ class ConstitutionMixin:
                     # edge proof (#2463) holds for a lazily-anchored legacy agent.
                     await self._anchor_constitution_governance(constitution_hash)
                     agent_node.properties["constitution_hash"] = constitution_hash
-                    await self.storage.add_node(agent_node)
+                    await self.storage.add_node(agent_node, control_plane=True)
                 logging.info(f"Anchored constitution with hash: {constitution_hash}")
             except Exception as e:
                 return f"Error: Failed to anchor constitution: {e}"
@@ -1803,7 +1803,7 @@ class ConstitutionMixin:
         )
 
         async def _write() -> None:
-            await self.storage.add_node(agent_node)
+            await self.storage.add_node(agent_node, control_plane=True)
             await self.privacy_agent.add_conversation(
                 role="system",
                 content=content,
@@ -1842,7 +1842,7 @@ class ConstitutionMixin:
         existing["last_error"] = code
         existing["audited"] = False
         agent_node.properties["genesis_audit"] = existing
-        await self.storage.add_node(agent_node)
+        await self.storage.add_node(agent_node, control_plane=True)
 
     async def perform_genesis_audit(
         self,
@@ -1899,7 +1899,7 @@ class ConstitutionMixin:
                     }
                 )
                 agent_node.properties["genesis_audit"] = existing
-                await self.storage.add_node(agent_node)
+                await self.storage.add_node(agent_node, control_plane=True)
             if status not in (
                 GENESIS_AUDIT_PENDING,
                 GENESIS_AUDIT_PASSED,
@@ -2006,7 +2006,7 @@ class ConstitutionMixin:
                 provenance="runtime:migrated_legacy_identity",
             )
             agent_node.properties["genesis_audit"] = record
-            await self.storage.add_node(agent_node)
+            await self.storage.add_node(agent_node, control_plane=True)
 
         if not isinstance(record, dict):
             raise GenesisAuditError("Genesis audit state is malformed.")

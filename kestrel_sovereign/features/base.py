@@ -429,7 +429,11 @@ class Feature(_SdkFeature):
                 label=f"{self.name} config",
                 properties={"config": config},
             )
-            await storage.add_node(node)
+            # Trusted control-plane write: ``feature_config`` carries an arbitrary
+            # settings dict, so it may only be persisted through the trusted path
+            # in volatile privacy modes (feature init runs regardless of mode so a
+            # default-volatile agent can still boot its features) (#2672).
+            await storage.add_node(node, control_plane=True)
         except Exception as e:
             logger.warning(f"Failed to persist config for {self.name}: {e}")
 

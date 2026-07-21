@@ -35,7 +35,9 @@ class _Storage:
     async def get_node(self, node_id):
         return self.node if node_id == self.node.node_id else None
 
-    async def add_node(self, node):
+    async def add_node(self, node, *, control_plane: bool = False):
+        # Mirrors the real facade/wrapper signature — governance writers pass
+        # ``control_plane=True`` for the agent identity node (#2672).
         self.saved = node
         self.node = node
 
@@ -807,7 +809,7 @@ class TestPersistAgentDescription:
             async def get_node(self, _id):
                 return _GraphNode(node_id="agent-1", properties={"description": "old"})
 
-            async def add_node(self, _node):
+            async def add_node(self, _node, *, control_plane: bool = False):
                 raise RuntimeError("graph write failed")
 
         with pytest.raises(RuntimeError):
@@ -824,7 +826,7 @@ class TestPersistAgentDescription:
             async def get_node(self, _id):
                 return None
 
-            async def add_node(self, _node):  # pragma: no cover - never reached
+            async def add_node(self, _node, *, control_plane: bool = False):  # pragma: no cover - never reached
                 raise AssertionError("should not be called")
 
         wrote = await persist_agent_description(db, _NoNodeStorage(), "agent-1", "bio")

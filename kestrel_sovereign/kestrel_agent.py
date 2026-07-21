@@ -1810,7 +1810,8 @@ class KestrelAgent(
                     label=f"Agent {self.agent_id}",
                     properties={"initialBalance": "100.0"}
                 )
-                await self.storage.add_node(agent_node)
+                # Trusted control-plane write: agent identity node (#2672).
+                await self.storage.add_node(agent_node, control_plane=True)
                 logging.info("Agent node created")
 
             # A missing durable row or an audit older than 24 hours must be
@@ -1956,7 +1957,12 @@ class KestrelAgent(
             logging.info("Creating MemorySystem")
             self.memory_system = MemorySystem(
                 storage=self._raw_storage,
-                agent_id=self.agent_id
+                agent_id=self.agent_id,
+                # Route durable memory graph writes through the privacy-governing
+                # facade and gate the consolidator's direct memory_episodes write,
+                # so manual / scheduled consolidation can't leak user-derived
+                # memory in a volatile privacy mode (#2672).
+                privacy_storage=self.storage,
             )
             await self.memory_system.initialize()
             # Use MemorySystem's consolidator — it has graph_store for KG episode writing

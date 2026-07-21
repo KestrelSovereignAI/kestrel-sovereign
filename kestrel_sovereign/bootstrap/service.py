@@ -158,7 +158,10 @@ async def persist_agent_description(db, storage, agent_id: str, description: str
         node = await storage.get_node(agent_id)
         if node:
             node.properties["description"] = description
-            await storage.add_node(node)
+            # Trusted control-plane write: the agent identity node carries the
+            # free-text ``description`` and may only be persisted through the
+            # trusted path in volatile privacy modes (#2672).
+            await storage.add_node(node, control_plane=True)
 
     return True
 
@@ -479,7 +482,8 @@ class BootstrapService:
             updated_node.properties["bootstrap_stale_at"] = stale_at
             if age_seconds is not None:
                 updated_node.properties["bootstrap_pending_age_seconds"] = int(age_seconds)
-            await storage.add_node(updated_node)
+            # Trusted control-plane write: agent identity node (#2672).
+            await storage.add_node(updated_node, control_plane=True)
         except Exception as exc:
             logger.warning("Failed to persist stale bootstrap graph state: %s", exc)
 

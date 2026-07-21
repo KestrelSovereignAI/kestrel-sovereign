@@ -16,6 +16,7 @@ check privacy mode, the storage layer will enforce it.
 
 import json
 import logging
+import re
 import warnings
 from contextlib import asynccontextmanager
 
@@ -36,6 +37,7 @@ from kestrel_sovereign.storage.async_conversation_store import (
     _escape_like_session_value,
     search_session_summaries,
 )
+from kestrel_sovereign.storage.async_graph_store import NodeSwapResult
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -100,6 +102,203 @@ class OperationType(Enum):
     READ = "read"
     WRITE = "write"
     DELETE = "delete"
+
+
+# ── Privacy-aware graph write policy (#2672) ─────────────────────────────────
+#
+# The knowledge graph is durable storage. In a volatile privacy mode —
+# EPHEMERAL ("leave no trace"), ISOLATED ("session buffer only"), and
+# DEIDENTIFIED (fail-closed until the Safe Harbor pipeline lands): every mode
+# whose policy disallows persistent writes — a durable graph write is a real
+# privacy leak. Facts, todos, decisions, concepts, and consolidated episodes
+# are all derived from user conversation input. The pre-#2672 wrapper waved
+# every graph write through as "structural, not PII", which let those
+# user-derived nodes reach the backend directly, *outside* the #1760
+# post-response gate, and let feature code bypass enforcement entirely by
+# reaching through the raw ``.graph`` / ``.graph_store`` surfaces.
+#
+# The interim #2672 fix admitted a small allowlist by node-type/key/label alone.
+# That was still insufficient (review finding P1): the allowlist was reachable by
+# ANY caller, so a feature/tool could smuggle user text through a value-bearing
+# field of an allowlisted type — ``feature_config.config`` (an arbitrary dict) or
+# ``agent.description`` (free text) — merely by matching a known key. Key/label
+# matching cannot make a free-text VALUE content-free.
+#
+# The policy now has TWO tiers, and volatile-mode writes are default-deny outside
+# them:
+#
+#   1. Content-free structural types — ``document`` (constitution byte-anchor),
+#      ``constitution_amendment_artifact`` (signed receipt), ``audit_anchor``
+#      (tamper-evidence receipt), and the ``governed_by`` governance edge. Their
+#      payload is hashes / counts / timestamps BY CONSTRUCTION, so they are
+#      admitted on the ordinary (untrusted) path — but every property VALUE is
+#      validated content-free-shaped (bounded scalar / bounded shallow container,
+#      no free-text blob; see ``_is_content_free_value``), so a caller cannot
+#      stuff conversation text into a ``hash`` / ``type`` field. Their labels are
+#      pinned to exact literals / a fixed regex.
+#
+#   2. Value-bearing control-plane types — the ``agent`` identity node (DID,
+#      constitution / doctrine anchors, genesis audit, bootstrap + lifecycle
+#      state, and the free-text ``description``) and ``feature_config`` (an
+#      arbitrary settings ``config`` dict). These carry fields whose values
+#      cannot be proven content-free by shape, so they are admitted ONLY through
+#      the dedicated trusted control-plane write path (``control_plane=True``) —
+#      which the identity / governance / bootstrap / feature-framework writers
+#      pass and no user-facing tool does. An untrusted durable write to them is
+#      default-denied, closing the finding-P1 smuggling vector.
+#
+# Everything else — known user-derived types AND unknown types AND payload-bearing
+# structural edges — fails closed with a ``PrivacyViolationError`` the tool caller
+# can see. NORMAL / PUBLIC / ANONYMOUS (any mode that allows persistent writes) is
+# unaffected, preserving durable-mode behavior. The startup constitution audit,
+# doctrine anchoring, and feature init all use the trusted path, so a
+# default-volatile agent can still bind its constitution and boot.
+#
+# The ``agent`` key set is the COMPLETE governance vocabulary the production
+# writers set (inception_service, agent/constitution, agent/doctrine_bundle,
+# bootstrap/service, features/bootstrap, graduate_service, kestrel_agent,
+# setup/constitution_reanchor, setup/overlay_anchor). A field missing here makes
+# a born-volatile agent fail closed on a legitimate governance write (review
+# finding P3 — the omitted doctrine-anchor fields ``doctrine_bundle_files`` /
+# ``doctrine_bundle_anchored_at`` silently disabled drift detection), so a NEW
+# governance field must be added here consciously. ``label`` is one of: a
+# frozenset of exact literal labels, a regex the label must fully match, or
+# ``None`` for identity-derived labels (the agent's own name / ``"<feature>
+# config"``). Adding a type or key REQUIRES a test proving the written node
+# carries no user content (see ``tests/unit/test_privacy_graph_boundary.py``).
+
+
+_MAX_CONTENT_FREE_STR = 512
+
+
+def _is_content_free_value(value: Any, _depth: int = 0) -> bool:
+    """Whether ``value`` is content-free by SHAPE, not just by its property key.
+
+    A content-free value is a bounded scalar (``None`` / bool / int / float, or a
+    short single-line string) or a bounded shallow container of such values. This
+    is what lets the content-free structural types (``document`` /
+    ``constitution_amendment_artifact`` / ``audit_anchor``) be admitted on the
+    ordinary path without letting a caller stuff a conversation paragraph into a
+    ``hash`` / ``type`` field (review finding P1). The value-bearing control-plane
+    types (``agent`` / ``feature_config``) are NOT validated this way — their
+    free-text / arbitrary-dict fields are legitimate, so they instead require the
+    trusted control-plane capability.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return True
+    if isinstance(value, str):
+        return len(value) <= _MAX_CONTENT_FREE_STR and "\n" not in value
+    if _depth >= 4:
+        return False
+    if isinstance(value, (list, tuple)):
+        return all(_is_content_free_value(v, _depth + 1) for v in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(k, str)
+            and len(k) <= 128
+            and _is_content_free_value(v, _depth + 1)
+            for k, v in value.items()
+        )
+    return False
+
+
+@dataclass(frozen=True)
+class _StructuralNodeShape:
+    """The canonical shape of one allowlisted structural node type.
+
+    ``control_plane_only`` marks a value-bearing type (``agent`` /
+    ``feature_config``) that may only be written via the trusted control-plane
+    path in volatile modes; such types skip content-free VALUE validation (their
+    free-text / arbitrary-dict fields are legitimate and the trust boundary is the
+    guard). Content-free types leave it ``False`` and are value-validated on the
+    ordinary path.
+    """
+    keys: frozenset
+    label_literals: Optional[frozenset] = None
+    label_regex: Optional[Any] = None  # compiled ``re.Pattern`` or None
+    control_plane_only: bool = False
+
+
+_STRUCTURAL_NODE_SHAPES: Dict[str, _StructuralNodeShape] = {
+    # Value-bearing control-plane identity node — TRUSTED PATH ONLY. Accretes
+    # governance/lifecycle metadata over the agent's life (bootstrap status,
+    # doctrine-bundle + constitution reanchor anchors, genesis audit,
+    # emancipation contract, graduation). Every field is agent/governance state
+    # written by identity/governance/bootstrap code — NEVER conversation content.
+    # The free-text ``description`` and structured governance receipts
+    # (genesis_audit, emancipation_contract, *_reanchor) are why this type is
+    # content-free by TRUST (the control-plane capability), not by value shape.
+    # The set below is the complete vocabulary the production writers use
+    # (inception_service, agent/constitution, agent/doctrine_bundle,
+    # bootstrap/service, features/bootstrap, graduate_service, kestrel_agent,
+    # setup/constitution_reanchor, setup/overlay_anchor). A NEW governance field
+    # must be added here consciously; until it is, a *volatile-mode* agent fails
+    # closed on that write. (Persistent-mode agents are unaffected — governance
+    # gating is off there.)
+    "agent": _StructuralNodeShape(
+        keys=frozenset({
+            "agent_id", "did", "created_at", "constitution_hash",
+            "constitution_overlay_hash",
+            "initialBalance", "name", "description", "avatar_hash",
+            "bootstrap_state", "bootstrap_status", "bootstrap_stale_at",
+            "bootstrap_pending_age_seconds",
+            "genesis_audit", "emancipation_contract",
+            "constitution_reanchor",
+            "doctrine_bundle_hash", "doctrine_bundle_files",
+            "doctrine_bundle_anchored_at", "doctrine_bundle_reanchor",
+            "doctrine_anchored_paths",
+            "graduated_at",
+            "is_test_instance", "test_cycle_id", "expected_duration", "is_demo",
+        }),
+        control_plane_only=True,
+        # label = the agent's own name, or ``f"Agent {did}"`` — identity.
+    ),
+    "feature_config": _StructuralNodeShape(
+        keys=frozenset({"config"}),
+        control_plane_only=True,
+        # label = ``f"{feature.name} config"`` — a feature identity.
+    ),
+    "document": _StructuralNodeShape(
+        keys=frozenset({"hash", "type", "created_at"}),
+        label_literals=frozenset({"KESTREL_CONSTITUTION"}),
+    ),
+    "constitution_amendment_artifact": _StructuralNodeShape(
+        keys=frozenset({
+            "hash", "type", "artifact_type", "constitution_hash", "signer",
+            "source_path", "created_at", "anchored_at", "verification",
+        }),
+        label_literals=frozenset({"Signed Constitution Reanchor Artifact"}),
+    ),
+    "audit_anchor": _StructuralNodeShape(
+        keys=frozenset({
+            "anchor_hash", "storage_ref", "entries_count",
+            "first_entry_at", "last_entry_at", "created_at",
+        }),
+        label_regex=re.compile(r"^Audit Anchor \(\d+ entries\)$"),
+    ),
+}
+
+# Derived from the shape table so the two can never drift out of sync.
+STRUCTURAL_GRAPH_NODE_TYPES = frozenset(_STRUCTURAL_NODE_SHAPES)
+
+# The subset of structural node types that carry value-bearing fields (free text
+# / arbitrary dicts) and may therefore ONLY be written through the trusted
+# control-plane path (``control_plane=True``) in a volatile privacy mode. An
+# untrusted durable write to one of these is default-denied (review finding P1).
+CONTROL_PLANE_ONLY_NODE_TYPES = frozenset(
+    node_type
+    for node_type, shape in _STRUCTURAL_NODE_SHAPES.items()
+    if shape.control_plane_only
+)
+
+# The only structural edge that must survive a volatile-mode write is the
+# governance binding ``agent --governed_by--> constitution``, written during the
+# startup constitution audit regardless of the agent's configured mode. Every
+# content edge (knows / records_action / records_decision / concept
+# co-occurrence / memory / todo links) fails closed.
+STRUCTURAL_GRAPH_EDGE_LABELS = frozenset({
+    "governed_by",
+})
 
 
 @dataclass
@@ -631,42 +830,304 @@ class PrivacyEnforcingStorage:
             return self._session_files[content_hash]
         return await self._storage.retrieve_file(content_hash)
     
-    # === Graph Storage (Pass-through - structural, not PII-sensitive) ===
+    # === Graph Storage (privacy-governed durable writes — #2672) ===
+    #
+    # The knowledge graph is durable storage, so its writes are governed by the
+    # same privacy contract as conversation history. In a volatile privacy mode
+    # (EPHEMERAL / ISOLATED / DEIDENTIFIED — every mode whose policy disallows
+    # persistent writes) node, edge, and compare-and-swap writes default-deny.
+    # Only two things reach the backend: (1) content-free structural types
+    # (``document`` / ``constitution_amendment_artifact`` / ``audit_anchor`` and
+    # the ``governed_by`` edge), value-validated so no user text can ride in a
+    # ``hash`` / ``type`` field; and (2) the value-bearing control-plane types
+    # (``agent`` / ``feature_config``), but ONLY when the trusted governance
+    # caller passes ``control_plane=True``. Everything else — user-derived and
+    # unknown writes, and any untrusted write to a control-plane type — raises
+    # ``PrivacyViolationError`` so the tool caller sees the rejection instead of a
+    # silent "success". Reads and deletes are never gated. NORMAL / PUBLIC /
+    # ANONYMOUS pass through unchanged.
 
-    async def add_node(self, node) -> None:
-        """
-        Add a graph node.
+    @property
+    def _graph_writes_governed(self) -> bool:
+        """True when durable graph writes must be privacy-governed.
 
-        Graph operations are allowed even in EPHEMERAL mode because they are
-        structural metadata (agent nodes, edges) rather than user content.
-        The privacy protection focuses on conversation history and file storage.
+        Governed in every mode whose policy disallows persistent writes —
+        EPHEMERAL, ISOLATED, and DEIDENTIFIED. NORMAL / PUBLIC / ANONYMOUS
+        (persistent-write modes) pass through unchanged, preserving the
+        pre-#2672 durable-mode behaviour. ISOLATED is governed too: unlike
+        conversation history it has no in-memory graph buffer, so a durable
+        graph write there is a real leak, not a session-local write.
         """
-        # Graph operations bypass privacy check - they're structural, not PII
+        return not self._policy.allow_persistent_write
+
+    def allows_persistent_writes(self) -> bool:
+        """Whether durable, user-derived writes are permitted in the current mode.
+
+        ``True`` in persistent modes (NORMAL / PUBLIC / ANONYMOUS); ``False`` in
+        the volatile modes (EPHEMERAL / ISOLATED / DEIDENTIFIED) whose contract
+        forbids persisting user-derived content. The memory consolidator consults
+        this before persisting a durable episode summary, so manual / scheduled
+        consolidation cannot leak a user-derived episode into ``memory_episodes``
+        while the agent is volatile (#2672).
+        """
+        return self._policy.allow_persistent_write
+
+    def _assert_graph_node_write_allowed(
+        self, node, operation: str, *, validate_label: bool = True,
+        control_plane: bool = False,
+    ) -> None:
+        """Fail closed on a durable graph node write in a volatile mode.
+
+        Two admit paths (review finding P1):
+
+        * Content-free structural types (``document`` /
+          ``constitution_amendment_artifact`` / ``audit_anchor``) are admitted on
+          the ordinary path, but each property VALUE must be content-free-shaped
+          (see :func:`_is_content_free_value`) so a caller can't stuff user text
+          into a ``hash`` / ``type`` field.
+        * Value-bearing control-plane types (``agent`` / ``feature_config``) carry
+          free-text / arbitrary-dict fields that cannot be proven content-free by
+          shape, so they are admitted ONLY when the trusted governance caller
+          passes ``control_plane=True``. An untrusted write to one is
+          default-denied — this is what stops user content being smuggled through
+          ``agent.description`` / ``feature_config.config``.
+
+        In every case the node must match its type's COMPLETE canonical shape —
+        a known ``node_type``, property keys drawn only from that type's key set,
+        and (when ``validate_label``) a label matching that type's rule. Unknown
+        types, unrecognized keys, and non-canonical labels all raise.
+
+        ``validate_label`` is ``False`` on a compare-and-swap *update*, where the
+        primitive writes only ``properties`` and leaves the stored label
+        untouched, so ``new_node.label`` is never persisted and must not be
+        judged.
+        """
+        if not self._graph_writes_governed:
+            return
+        node_type = getattr(node, "node_type", None)
+        shape = _STRUCTURAL_NODE_SHAPES.get(node_type)
+        if shape is None:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: node_type={node_type!r} is "
+                f"not a content-free structural type, and durable graph writes "
+                f"are disabled in the current privacy config "
+                f"(storage={self._privacy_config.storage}). User-derived and "
+                f"unknown graph nodes are default-denied in volatile privacy "
+                f"modes (#2672)."
+            )
+        if shape.control_plane_only and not control_plane:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: node_type={node_type!r} is a "
+                f"value-bearing control-plane node (it carries identity / config "
+                f"state such as free-text or an arbitrary settings dict), so an "
+                f"untrusted durable write to it is default-denied in the current "
+                f"privacy config (storage={self._privacy_config.storage}). It may "
+                f"only be written through the trusted control-plane path so user "
+                f"content cannot be smuggled through its value-bearing fields "
+                f"(#2672)."
+            )
+        properties = getattr(node, "properties", None) or {}
+        if not isinstance(properties, dict):
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: {node_type!r} node "
+                f"properties must be a mapping of content-free fields, got "
+                f"{type(properties).__name__} (#2672)."
+            )
+        extra_keys = set(properties) - shape.keys
+        if extra_keys:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: {node_type!r} node carries "
+                f"non-canonical propert{'y' if len(extra_keys) == 1 else 'ies'} "
+                f"{sorted(extra_keys)!r}. A structural node may hold only its "
+                f"content-free identity/governance fields in the current privacy "
+                f"config (storage={self._privacy_config.storage}); any other key "
+                f"could carry user content and is default-denied (#2672)."
+            )
+        if not shape.control_plane_only:
+            # Content-free structural type: every VALUE must be content-free by
+            # shape too, so admitting on a known key can't let a caller stuff
+            # conversation text into a ``hash`` / ``type`` field (review finding
+            # P1). Control-plane types skip this — their value-bearing fields are
+            # legitimate and are gated by the trusted capability instead.
+            for key, value in properties.items():
+                if not _is_content_free_value(value):
+                    raise PrivacyViolationError(
+                        f"Graph write '{operation}' blocked: {node_type!r} node "
+                        f"property {key!r} carries a value that is not "
+                        f"content-free (a bounded scalar or shallow container of "
+                        f"scalars). A free-text or oversized value could carry "
+                        f"user content and is default-denied in the current "
+                        f"privacy config (storage={self._privacy_config.storage}) "
+                        f"(#2672)."
+                    )
+        if validate_label:
+            self._assert_structural_label_allowed(
+                node_type, getattr(node, "label", None), shape, operation
+            )
+
+    def _assert_structural_label_allowed(
+        self, node_type, label, shape: "_StructuralNodeShape", operation: str
+    ) -> None:
+        """Fail closed unless a structural node's label matches its type's rule."""
+        if shape.label_literals is None and shape.label_regex is None:
+            # Identity-derived label (agent name / "<feature> config"): agent or
+            # operator state, not conversation content. It must still be a plain
+            # string, never a structured payload smuggling content.
+            if label is not None and not isinstance(label, str):
+                raise PrivacyViolationError(
+                    f"Graph write '{operation}' blocked: {node_type!r} node label "
+                    f"must be a string identity, got {type(label).__name__} "
+                    f"(#2672)."
+                )
+            return
+        if isinstance(label, str):
+            if shape.label_literals is not None and label in shape.label_literals:
+                return
+            if shape.label_regex is not None and shape.label_regex.match(label):
+                return
+        raise PrivacyViolationError(
+            f"Graph write '{operation}' blocked: {node_type!r} node label "
+            f"{label!r} is not the canonical content-free label for this "
+            f"structural type. A non-canonical label could carry user content "
+            f"and is default-denied in the current privacy config "
+            f"(storage={self._privacy_config.storage}) (#2672)."
+        )
+
+    def _assert_graph_edge_write_allowed(
+        self, label, operation: str, properties: Optional[Dict] = None,
+        *, control_plane: bool = False,
+    ) -> None:
+        """Fail closed on a durable graph edge write in a volatile mode.
+
+        Allows only the structural governance relationship(s), AND only as a pure
+        binding: a structural edge must carry no properties, so user content
+        cannot ride in the edge payload (review finding P1). Every content edge,
+        and any structural edge with a non-empty payload, raises
+        ``PrivacyViolationError``. ``governed_by`` is a content-free binding, so
+        it is admitted on the ordinary path; ``control_plane`` is accepted for
+        call-site uniformity but the edge allowlist does not depend on it.
+        """
+        if not self._graph_writes_governed:
+            return
+        if label not in STRUCTURAL_GRAPH_EDGE_LABELS:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: edge label={label!r} is not "
+                f"a content-free structural relationship, and durable graph "
+                f"writes are disabled in the current privacy config "
+                f"(storage={self._privacy_config.storage}). User-derived and "
+                f"unknown graph edges are default-denied in volatile privacy "
+                f"modes (#2672)."
+            )
+        if properties:
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: structural edge {label!r} "
+                f"must be a pure binding with no properties, but got keys "
+                f"{sorted(properties)!r}. An edge payload could carry user "
+                f"content and is default-denied in volatile privacy modes "
+                f"(#2672)."
+            )
+
+    async def _governed_compare_and_swap(
+        self, store, node_id, expected, new_node, operation: str,
+        *, control_plane: bool = False,
+    ):
+        """Shared, TOCTOU-free CAS governance for the wrapper and the ``.graph``
+        proxy.
+
+        In a durable-write mode this is a straight passthrough. In a volatile
+        mode it (1) validates ``new_node`` against the structural canonical
+        shape — the label only on a compare-and-create, since a swap never
+        writes it, and gated by ``control_plane`` for the value-bearing types —
+        and (2) pins the operation to that exact node type via the primitive's
+        ``allowed_node_types`` predicate. That pin is what stops the
+        finding-P1/P2 exploit: a swap ignores ``new_node.node_type`` and writes
+        ``properties`` onto whatever row exists, so authorizing on
+        ``new_node.node_type`` alone would let a caller rewrite an existing
+        user-derived node (e.g. a ``concept``) under a spoofed structural type.
+        The storage layer instead refuses the swap unless the STORED row is of
+        the validated structural type, atomically, without a wrapper pre-read.
+        """
+        if not self._graph_writes_governed:
+            return await store.compare_and_swap_node(node_id, expected, new_node)
+        self._assert_graph_node_write_allowed(
+            new_node, operation, validate_label=(expected is None),
+            control_plane=control_plane,
+        )
+        result = await store.compare_and_swap_node(
+            node_id,
+            expected,
+            new_node,
+            allowed_node_types=frozenset({getattr(new_node, "node_type", None)}),
+        )
+        if result == NodeSwapResult.TYPE_NOT_ALLOWED:
+            node_type = getattr(new_node, "node_type", None)
+            raise PrivacyViolationError(
+                f"Graph write '{operation}' blocked: the existing node at "
+                f"{node_id!r} is not a {node_type!r} structural node, so a "
+                f"durable properties swap onto it is a user-derived write and is "
+                f"default-denied in the current privacy config "
+                f"(storage={self._privacy_config.storage}). CAS cannot relabel a "
+                f"user-derived node as structural to smuggle content through "
+                f"(#2672)."
+            )
+        return result
+
+    async def add_node(self, node, *, control_plane: bool = False) -> None:
+        """Add a graph node, governed by the volatile-mode write policy.
+
+        In a durable-write mode this is a straight pass-through. In a volatile
+        mode it default-denies: only content-free structural nodes (value-
+        validated) are admitted on the ordinary path, and the value-bearing
+        control-plane types (``agent`` / ``feature_config``) only when the trusted
+        governance caller passes ``control_plane=True``. User-derived (facts,
+        concepts, todos, decisions, episodes), unknown types, non-canonical
+        fields, and untrusted control-plane writes raise ``PrivacyViolationError``
+        before any row is written.
+
+        ``control_plane`` is the trusted-write capability the identity /
+        governance / bootstrap / feature-framework writers pass; user-facing tools
+        never do, so they cannot reach the value-bearing types (#2672).
+        """
+        self._assert_graph_node_write_allowed(
+            node, "add_node", control_plane=control_plane
+        )
         await self._storage.add_node(node)
 
-    async def compare_and_swap_node(self, node_id, expected, new_node):
-        """Atomically compare-and-swap a graph node.
+    async def compare_and_swap_node(
+        self, node_id, expected, new_node, *, control_plane: bool = False
+    ):
+        """Atomically compare-and-swap a graph node, governed by the policy.
 
-        Structural, not PII-sensitive — same rationale as :meth:`add_node`.
-        This MUST stay a single passthrough: the whole point of the primitive
-        is that the check and the write are one atomic unit, so the wrapper
-        cannot decompose it into ``get_node`` + ``add_node`` (that would
-        reintroduce exactly the TOCTOU race the caller is trying to close).
+        The write intent is governed *before* delegating — the primitive itself
+        stays a single atomic passthrough. The wrapper never decomposes it into
+        ``get_node`` + ``add_node``: that would reintroduce exactly the TOCTOU
+        race the caller is trying to close. See :meth:`_governed_compare_and_swap`.
         """
-        return await self._storage.compare_and_swap_node(
-            node_id, expected, new_node
+        return await self._governed_compare_and_swap(
+            self._storage, node_id, expected, new_node, "compare_and_swap_node",
+            control_plane=control_plane,
         )
 
     async def get_node(self, node_id: str):
-        """Get a graph node."""
+        """Get a graph node. Read — never privacy-gated."""
         return await self._storage.get_node(node_id)
-    
-    async def add_edge(self, source_id: str, target_id: str, label: str, properties: Optional[Dict] = None):
-        """Add a graph edge. Structural, not PII-sensitive."""
+
+    async def add_edge(self, source_id: str, target_id: str, label: str, properties: Optional[Dict] = None,
+                        *, control_plane: bool = False):
+        """Add a graph edge, governed by the volatile-mode write policy.
+
+        In a volatile mode only structural governance edges (``governed_by``),
+        carrying no properties, are admitted; content edges and payload-bearing
+        edges raise ``PrivacyViolationError``. ``control_plane`` is accepted for
+        call-site uniformity with the node writers.
+        """
+        self._assert_graph_edge_write_allowed(
+            label, "add_edge", properties, control_plane=control_plane
+        )
         await self._storage.add_edge(source_id, target_id, label, properties)
 
     async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
-        """Remove a graph edge. Structural, not PII-sensitive."""
+        """Remove a graph edge. Delete — never privacy-gated (removal is not a leak)."""
         await self._storage.delete_edge(source_id, target_id, label)
 
     @asynccontextmanager
@@ -1734,13 +2195,21 @@ class PrivacyEnforcingStorage:
 
     @property
     def graph_store(self):
-        """Access to graph store."""
-        return self._storage.graph
+        """Privacy-governing view of the graph store (#2672).
+
+        Returns a proxy that applies the SAME volatile-mode graph-write policy
+        as this wrapper's own :meth:`add_node` / :meth:`add_edge` /
+        :meth:`compare_and_swap_node` — so feature code reaching through
+        ``.graph_store`` can no longer bypass privacy enforcement (pre-#2672
+        this returned the raw store). Reads, deletes, ``bind_agent``, and every
+        other attribute forward straight through.
+        """
+        return _PrivacyGoverningGraphStore(self, self._storage.graph)
 
     @property
     def graph(self):
-        """Access to graph store (alias for graph_store)."""
-        return self._storage.graph
+        """Privacy-governing view of the graph store (alias for graph_store)."""
+        return _PrivacyGoverningGraphStore(self, self._storage.graph)
 
     @property
     def conversation(self):
@@ -1769,6 +2238,68 @@ class PrivacyEnforcingStorage:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
+
+
+class _PrivacyGoverningGraphStore:
+    """Privacy-governing view over the underlying ``AsyncGraphStore`` (#2672).
+
+    Returned by :attr:`PrivacyEnforcingStorage.graph` /
+    :attr:`~PrivacyEnforcingStorage.graph_store` so that feature code reaching
+    through those surfaces is subject to the SAME default-deny graph-write
+    policy as the wrapper's own ``add_node`` / ``add_edge`` /
+    ``compare_and_swap_node`` methods — closing the bypass where ``.graph``
+    returned the raw store. The four write entry points are governed; reads,
+    deletes, ``bind_agent``, ``db``, and every other attribute forward straight
+    through to the wrapped store via :meth:`__getattr__`.
+    """
+
+    __slots__ = ("_wrapper", "_store")
+
+    def __init__(self, wrapper: "PrivacyEnforcingStorage", store) -> None:
+        object.__setattr__(self, "_wrapper", wrapper)
+        object.__setattr__(self, "_store", store)
+
+    async def add_node(self, node, *, control_plane: bool = False) -> None:
+        self._wrapper._assert_graph_node_write_allowed(
+            node, "graph.add_node", control_plane=control_plane
+        )
+        return await self._store.add_node(node)
+
+    async def compare_and_swap_node(
+        self, node_id, expected, new_node, *, control_plane: bool = False
+    ):
+        # Govern the write intent without decomposing the atomic primitive: the
+        # shared helper validates new_node's structural shape and pins the swap
+        # to the stored node's type via the primitive's allowed_node_types
+        # predicate, then delegates the single atomic CAS on THIS store.
+        return await self._wrapper._governed_compare_and_swap(
+            self._store, node_id, expected, new_node,
+            "graph.compare_and_swap_node", control_plane=control_plane,
+        )
+
+    async def add_edge(self, source_id, target_id, label, properties=None,
+                       *, control_plane: bool = False):
+        self._wrapper._assert_graph_edge_write_allowed(
+            label, "graph.add_edge", properties, control_plane=control_plane
+        )
+        return await self._store.add_edge(source_id, target_id, label, properties)
+
+    async def add_trusted_cross_agent_edge(
+        self, source_id, target_id, label, properties=None,
+        *, control_plane: bool = False,
+    ):
+        self._wrapper._assert_graph_edge_write_allowed(
+            label, "graph.add_trusted_cross_agent_edge", properties,
+            control_plane=control_plane,
+        )
+        return await self._store.add_trusted_cross_agent_edge(
+            source_id, target_id, label, properties
+        )
+
+    def __getattr__(self, name):
+        # Only reached for attributes not defined on this proxy (i.e. anything
+        # but the four governed writers): reads, deletes, bind_agent, db, etc.
+        return getattr(self._store, name)
 
 
 def wrap_storage_with_privacy(storage, privacy_mode: Union[PrivacyMode, PrivacyConfig, str]) -> PrivacyEnforcingStorage:

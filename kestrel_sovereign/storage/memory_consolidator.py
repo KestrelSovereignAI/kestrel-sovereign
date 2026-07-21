@@ -70,24 +70,35 @@ class MemoryConsolidator:
         return _GAP
 
     def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None,
-                 llm_service=None):
+                 llm_service=None, persist_policy=None):
         """
         Initialize consolidator.
 
         Args:
             db: AsyncDatabase instance
             agent_id: Agent ID to consolidate memories for
-            graph_store: Optional AsyncGraphStore for writing episodes to the KG
+            graph_store: Optional AsyncGraphStore for writing episodes to the KG.
+                When the memory system wires the privacy-governing graph proxy
+                here, volatile-mode episode KG writes fail closed at the storage
+                boundary (#2672).
             llm_service: Optional agent-scoped LLM service used to resolve the
                 provider embedding service for episode embeddings + semantic
                 recall (#1674 P2). When absent (or no embedding provider is
                 configured), episode recall degrades to keyword search and no
                 embeddings are written — both paths stay functional.
+            persist_policy: Optional privacy authority exposing
+                ``allows_persistent_writes() -> bool``. Consulted before the
+                direct ``memory_episodes`` write so manual / scheduled
+                consolidation cannot persist a user-derived episode summary
+                while the agent is in a volatile privacy mode (#2672). ``None``
+                (raw storage, tests) imposes no gate — durable persistence
+                proceeds, preserving prior behaviour.
         """
         self._db = db
         self.agent_id = agent_id
         self._graph_store = graph_store
         self._llm_service = llm_service
+        self._persist_policy = persist_policy
         # Lazily-built SQLAlchemy session factory for the shared vector
         # backend (mirrors SavedItemsStore). None when unavailable.
         self._sqla_factory = None
@@ -151,6 +162,27 @@ class MemoryConsolidator:
             "skip_reasons": [],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+        # Privacy boundary (#2672): gate the ENTIRE durable consolidation path,
+        # not just the episode row. ``_create_episodes`` is already gated at
+        # ``_save_episode``, but ``_detect_patterns`` writes durable
+        # ``temporal_patterns`` (e.g. "User is most active late at night") through
+        # the raw DB, ``_archive_decayed`` mutates ``conversation_history``, and
+        # ``_backfill_episode_embeddings`` writes embeddings — all user-derived
+        # and all outside the graph proxy. In a volatile privacy mode none of them
+        # may persist, so fail closed here and return an explicit privacy-blocked
+        # report so the manual ``memory_consolidate`` tool reports "skipped", not
+        # "complete".
+        if not self._durable_writes_allowed():
+            report["skipped"] = True
+            report["skipped_reason"] = "privacy_mode_forbids_persistence"
+            report["privacy_blocked"] = True
+            logger.info(
+                "Consolidation skipped: current privacy mode forbids durable "
+                "memory writes; no episodes, patterns, archival, or embeddings "
+                "persisted (#2672)"
+            )
+            return report
 
         try:
             # 1. Create episodes from high-importance clusters
@@ -647,8 +679,41 @@ class MemoryConsolidator:
         ranked = sorted(counts, key=lambda term: (-counts[term], first_seen[term], term))
         return ranked[:limit]
 
+    def _durable_writes_allowed(self) -> bool:
+        """Whether the current privacy mode permits persisting an episode.
+
+        ``memory_episodes`` and the KG episode node both hold user-derived
+        conversation summaries, so a durable episode write while volatile
+        (EPHEMERAL / ISOLATED / DEIDENTIFIED) is a leak. Manual ``memory_consolidate``
+        and the scheduled ``sleep`` flow call ``_save_episode`` directly, outside
+        the #1760 post-response gate, so this is the boundary that stops them
+        (#2672). ``None`` policy (raw storage, tests) → allowed, preserving prior
+        behaviour.
+        """
+        policy = self._persist_policy
+        if policy is None:
+            return True
+        try:
+            return bool(policy.allows_persistent_writes())
+        except Exception as e:  # noqa: BLE001 - never let a policy probe crash consolidation
+            logger.debug("episode persist-policy probe failed, denying: %s", e)
+            return False
+
     async def _save_episode(self, episode: MemoryEpisode) -> None:
         """Save episode to database and optionally to the Knowledge Graph."""
+        if not self._durable_writes_allowed():
+            # Volatile privacy mode: an episode summary is user-derived content
+            # that must not reach durable storage. Skip BOTH the memory_episodes
+            # row and the KG node/edge; the KG path is separately governed by the
+            # privacy-graph proxy, but gating here also blocks the direct table
+            # write the proxy cannot see (#2672).
+            logger.debug(
+                "consolidator: skipping durable episode persist for %s — "
+                "persistent writes are disabled in the current privacy mode "
+                "(#2672)",
+                episode.id,
+            )
+            return
         await self._db.execute(
             """INSERT INTO memory_episodes
                (id, agent_id, title, summary, timespan_start, timespan_end,

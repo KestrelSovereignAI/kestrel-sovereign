@@ -83,18 +83,29 @@ class MemorySystem:
         self,
         storage: AsyncStorage,
         agent_id: str,
-        enable_spacy: bool = False
+        enable_spacy: bool = False,
+        privacy_storage=None,
     ):
         """
         Initialize the memory system.
 
         Args:
-            storage: AsyncStorage instance
+            storage: AsyncStorage instance used for the memory system's direct
+                SQL (temporal analysis, decay, conversation reads).
             agent_id: Agent identifier
             enable_spacy: Enable spaCy for enhanced sentiment analysis
+            privacy_storage: Optional privacy-enforcing storage facade. When
+                provided, durable graph writes (episode nodes, concept links,
+                schema-routed action/decision nodes) flow through its
+                privacy-governing ``.graph`` proxy, and the consolidator gates
+                its direct ``memory_episodes`` write on the same policy — so
+                manual / scheduled consolidation cannot leak user-derived memory
+                into durable storage in a volatile privacy mode (#2672). ``None``
+                (raw storage, tests) leaves writes ungoverned, as before.
         """
         self.storage = storage
         self.agent_id = agent_id
+        self._privacy_storage = privacy_storage
 
         # Initialize components
         self.tagger = EmotionalTagger(use_spacy=enable_spacy)
@@ -116,9 +127,20 @@ class MemorySystem:
             return
 
         # Components that need database/graph access
-        # AsyncStorage uses 'db' not 'database'
+        # AsyncStorage uses 'db' not 'database'.
+        #
+        # Durable graph writes route through the privacy-governing proxy when a
+        # privacy facade was injected, so volatile-mode writes (episode nodes,
+        # concept links, schema-routed nodes) fail closed at the storage boundary
+        # (#2672). Direct SQL still uses the raw storage handed in as ``storage``
+        # so temporal/decay reads stay unchanged and warning-free.
+        governed_graph = (
+            self._privacy_storage.graph
+            if self._privacy_storage is not None
+            else self.storage.graph
+        )
         self.analyzer = TemporalAnalyzer(self.storage.db)
-        self.linker = AssociativeLinker(self.storage.graph)
+        self.linker = AssociativeLinker(governed_graph)
         llm_service = getattr(self.storage, "llm_service", None)
         answerability_enabled, answerability_timeout, answerability_model = (
             _answerability_settings()
@@ -140,11 +162,15 @@ class MemorySystem:
         self.consolidator = MemoryConsolidator(
             self.storage.db,
             self.agent_id,
-            graph_store=self.storage.graph,
+            graph_store=governed_graph,
             # Reuse the agent-scoped LLM service for episode embeddings +
             # semantic recall (#1674 P2). None-safe: recall degrades to
             # keyword search when no embedding provider is configured.
             llm_service=llm_service,
+            # Gate the direct memory_episodes write on the privacy policy so
+            # manual / scheduled consolidation can't persist user-derived
+            # episodes in a volatile mode (#2672).
+            persist_policy=self._privacy_storage,
         )
 
         # Schema-aware routing: promote extracted structure (action items,
@@ -153,7 +179,7 @@ class MemorySystem:
         # no-op — the call is kept for forward-compat if a later router
         # variant needs setup.
         self.router = SchemaRouter(
-            graph=self.storage.graph,
+            graph=governed_graph,
             db=self.storage.db,
             agent_id=self.agent_id,
         )
@@ -523,9 +549,13 @@ class MemorySystem:
         report = dict(await self.consolidator.run_consolidation() or {})
         # Only ride a SUCCESSFUL pass: run_consolidation reports many internal
         # failures as {"error": ...} instead of raising, and destructive
-        # forgetting must never follow a failed/partial consolidation.
+        # forgetting must never follow a failed/partial consolidation. A
+        # privacy-skipped pass (volatile mode, #2672) likewise short-circuits the
+        # forgetting tier — the whole durable path is gated, not just the writes.
         report["episodes_deleted"] = (
-            0 if "error" in report else await self._forget_decayed_episodes()
+            0
+            if ("error" in report or report.get("skipped"))
+            else await self._forget_decayed_episodes()
         )
         return report
 
