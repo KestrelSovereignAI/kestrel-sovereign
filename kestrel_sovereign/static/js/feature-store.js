@@ -377,16 +377,25 @@ async function removeFeature(name) {
 // ============================================================================
 
 async function showDetail(name) {
+    const loadingModal = Modal.show({
+        title: 'Feature Details',
+        content: '<p style="margin:0;color:var(--text-secondary)">Loading…</p>',
+    });
+    let responseReceived = false;
     try {
         const detail = await API.request(`/api/features/${encodeURIComponent(name)}`);
-        renderDetailModal(detail);
+        if (!loadingModal.isCurrent()) return;
+        responseReceived = true;
+        renderDetailModal(detail, loadingModal);
     } catch (error) {
+        if (!responseReceived && !loadingModal.isCurrent()) return;
+        loadingModal.close();
         console.error('Failed to load feature detail:', error);
         Toast.error(`Failed to load details for ${name}`);
     }
 }
 
-function renderDetailModal(detail) {
+function renderDetailModal(detail, owner) {
     const name = detail.name || 'Unknown';
     const iconHtml = renderFeatureIcon(detail.icon, '1.25rem');
     const description = detail.description || detail.tool_description || 'No description';
@@ -507,46 +516,59 @@ function renderDetailModal(detail) {
         ">${escapeHtml(installInstructions)}</code>`);
     }
 
-    // Action buttons for modal footer
+    // Action buttons for modal footer. Every callback closes the exact detail
+    // lifecycle that installed it; it can never dismiss a later permission or
+    // configuration dialog.
+    let detailModal;
     const buttons = [];
     if (status === 'enabled' && !isCore) {
         buttons.push({
             label: 'Disable',
             type: 'secondary',
-            onClick: () => { Modal.hide(); disableFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { disableFeature(name); }
+            }
         });
         buttons.push({
             label: 'Remove',
             type: 'danger',
-            onClick: () => { Modal.hide(); removeFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { removeFeature(name); }
+            }
         });
     } else if (status === 'disabled' || status === 'installed') {
         buttons.push({
             label: 'Enable',
             type: 'primary',
-            onClick: () => { Modal.hide(); enableFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { enableFeature(name); }
+            }
         });
         if (!isCore) {
             buttons.push({
                 label: 'Remove',
                 type: 'danger',
-                onClick: () => { Modal.hide(); removeFeature(name); }
+                onClick: () => {
+                    try { detailModal.close(); } finally { removeFeature(name); }
+                }
             });
         }
     } else if (status === 'available') {
         buttons.push({
             label: 'Install',
             type: 'primary',
-            onClick: () => { Modal.hide(); installFeature(name); }
+            onClick: () => {
+                try { detailModal.close(); } finally { installFeature(name); }
+            }
         });
     }
     buttons.push({
         label: 'Close',
         type: 'secondary',
-        onClick: () => Modal.hide()
+        onClick: () => detailModal.close()
     });
 
-    Modal.show({
+    detailModal = owner.replace({
         title: `${iconHtml} ${escapeHtml(name)}`,
         content: `
             <div style="max-height: 60vh; overflow-y: auto;">
@@ -571,6 +593,7 @@ function renderDetailModal(detail) {
         `,
         buttons,
     });
+    return detailModal;
 }
 
 // ============================================================================
@@ -702,7 +725,8 @@ async function runConfigAction(btn) {
         if (!ok) return;
     }
 
-    const resultEl = document.getElementById('feature-config-action-result');
+    const resultEl = btn.closest('.modal-container')
+        ?.querySelector('#feature-config-action-result');
     const setResult = (text, color) => {
         if (resultEl) {
             resultEl.textContent = text;
@@ -740,13 +764,21 @@ async function runConfigAction(btn) {
 }
 
 async function showConfigForm(name) {
+    const loadingModal = Modal.show({
+        title: `Configure ${escapeHtml(name)}`,
+        content: '<p style="margin:0;color:var(--text-secondary)">Loading…</p>',
+    });
+    let responseReceived = false;
     try {
         const data = await API.request(`/api/features/${encodeURIComponent(name)}/config`);
+        if (!loadingModal.isCurrent()) return;
+        responseReceived = true;
         const schema = data.config_schema;
         const currentConfig = data.config || {};
         const secretsSet = data.secrets_set || {};
 
         if (!schema || !schema.properties) {
+            loadingModal.close();
             Toast.info('This feature has no configurable options.');
             return;
         }
@@ -771,7 +803,8 @@ async function showConfigForm(name) {
 
         const actionsHtml = renderConfigActions(ui.actions);
 
-        Modal.show({
+        let configModal;
+        configModal = loadingModal.replace({
             title: `Configure ${escapeHtml(name)}`,
             content: `
                 <div style="max-height: 60vh; overflow-y: auto;">
@@ -785,23 +818,25 @@ async function showConfigForm(name) {
                 {
                     label: 'Cancel',
                     type: 'secondary',
-                    onClick: () => Modal.hide()
+                    onClick: () => configModal.close()
                 },
                 {
                     label: 'Save',
                     type: 'primary',
-                    onClick: () => saveConfig(name, properties)
+                    onClick: () => saveConfig(name, properties, configModal)
                 },
             ],
         });
     } catch (error) {
+        if (!responseReceived && !loadingModal.isCurrent()) return;
+        loadingModal.close();
         console.error('Failed to load config:', error);
         Toast.error(`Failed to load configuration for ${name}`);
     }
 }
 
-async function saveConfig(name, properties) {
-    const form = document.getElementById('feature-config-form');
+async function saveConfig(name, properties, owner) {
+    const form = owner.querySelector('#feature-config-form');
     if (!form) return;
 
     const config = {};
@@ -835,7 +870,7 @@ async function saveConfig(name, properties) {
             method: 'PATCH',
             body: JSON.stringify({ config }),
         });
-        Modal.hide();
+        owner.close();
         Toast.success('Configuration saved');
     } catch (error) {
         console.error('Failed to save config:', error);

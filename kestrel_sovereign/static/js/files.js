@@ -158,10 +158,19 @@ window.filterLocalFiles = function(query) {
 };
 
 window.previewFile = async function(filename) {
+    const loadingModal = Modal.show({
+        title: 'File Preview',
+        content: '<p style="margin:0;color:var(--text-secondary)">Loading…</p>',
+    });
+    let responseReceived = false;
     try {
         const preview = await API.getSovereigntyFilePreview(filename);
-        showFilePreviewModal(preview);
+        if (!loadingModal.isCurrent()) return;
+        responseReceived = true;
+        showFilePreviewModal(preview, loadingModal);
     } catch (e) {
+        if (!responseReceived && !loadingModal.isCurrent()) return;
+        loadingModal.close();
         Toast.error(`Failed to preview file: ${e.message}`);
     }
 };
@@ -174,7 +183,7 @@ window.downloadFile = function(filename) {
     Toast.success('Download started');
 };
 
-function showFilePreviewModal(preview) {
+function showFilePreviewModal(preview, owner) {
     const contentDisplay = preview.is_text
         ? (preview.content_type === 'json'
             ? `<pre style="
@@ -210,7 +219,8 @@ function showFilePreviewModal(preview) {
             ${preview.content}
         </div>`;
 
-    Modal.show({
+    let previewModal;
+    previewModal = owner.replace({
         title: `File Preview`,
         content: `
             <div style="margin-bottom: 1rem;">
@@ -244,9 +254,10 @@ function showFilePreviewModal(preview) {
         `,
         buttons: [
             { label: 'Download', type: 'secondary', onClick: () => { window.downloadFile(preview.filename); } },
-            { label: 'Close', type: 'primary', onClick: () => Modal.hide() }
+            { label: 'Close', type: 'primary', onClick: () => previewModal.close() }
         ]
     });
+    return previewModal;
 }
 
 window.toggleFileBrowser = function() {

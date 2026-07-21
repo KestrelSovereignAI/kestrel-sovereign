@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml, getOverlayRoot } from './ui.js';
+import { state, AGENT_COMMANDS, Modal, Toast, getOrCreateChatPane, escapeHtml, getOverlayRoot } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import bus from './ui-ext/bus.js';
 import {
@@ -3383,7 +3383,6 @@ function showContextWarning(warnings, paneElement = null) {
  * active" — the auto-detect invariant from the design doc.
  */
 window.openContextBreakdownPopup = async function () {
-    const { Modal } = await import('./ui.js');
     const sessionId = deps().state.currentSessionId || null;
     if (!sessionId) {
         Modal.show({
@@ -3393,7 +3392,7 @@ window.openContextBreakdownPopup = async function () {
         return;
     }
 
-    Modal.show({
+    const loadingModal = Modal.show({
         title: 'Context breakdown',
         content: '<p style="margin:0;color:var(--text-secondary)">Loading…</p>',
     });
@@ -3406,14 +3405,16 @@ window.openContextBreakdownPopup = async function () {
         // ``e.message`` by the API client; that string is **not**
         // trusted (could contain HTML from a proxy / framework error
         // page). Escape before injecting (codex round 2 residual P1).
-        Modal.show({
+        loadingModal.replace({
             title: 'Context breakdown',
             content: `<p style="margin:0;color:var(--error)">Could not load breakdown: ${_esc(e && e.message ? e.message : e)}</p>`,
         });
         return;
     }
 
-    Modal.show({
+    if (!loadingModal.isCurrent()) return;
+    let breakdownModal;
+    breakdownModal = loadingModal.replace({
         title: 'Context breakdown',
         content: renderContextBreakdown(status),
         buttons: [
@@ -3422,12 +3423,15 @@ window.openContextBreakdownPopup = async function () {
                     label: 'Save older turns into a durable note (!compact)',
                     type: 'primary',
                     onClick: () => {
-                        Modal.hide();
-                        window.compactContext();
+                        try {
+                            breakdownModal.close();
+                        } finally {
+                            window.compactContext();
+                        }
                     },
                 }]
                 : []),
-            { label: 'Close', type: 'secondary', onClick: () => Modal.hide() },
+            { label: 'Close', type: 'secondary', onClick: () => breakdownModal.close() },
         ],
     });
 };
