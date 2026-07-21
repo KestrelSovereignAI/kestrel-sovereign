@@ -179,21 +179,17 @@ _RUNNING_TALON_STATES = frozenset({"dispatched", "running"})
 # Observability-backed job status source (#2646). Talon jobs dispatched OUTSIDE
 # this coordinator's local registry — driven by a Claude Code session or a peer
 # host — never land in ``_jobs``. Those external orchestrators emit job-lifecycle
-# telemetry into the FLEET observability store: a host-level, tenant-scoped store
-# owned by the ``observability-fleet`` host feature, ingested via
-# ``POST /api/host/observability/events`` and read back via
-# ``GET /api/host/observability/events``. That host endpoint is the real
-# producer/consumer contract this status source consumes.
+# telemetry into the shared observability store as ``talon_job`` events. This
+# status source reads those events back through the agent's ``observability_store``
+# (the per-agent ``a2a_observability`` store, ``ObservabilityStore.query_events``)
+# and folds them into per-job status so ``talon_status`` surfaces externally-driven
+# jobs that would otherwise be invisible.
 #
-# It is deliberately NOT the per-agent ``a2a_observability`` store: that store is
-# scoped to a single agent's own runs and never receives cross-agent/host Talon
-# telemetry (which is the whole point of #2646). The fleet ingest endpoint also
-# only accepts a closed set of event types (``tool_call``/``tool_response``/
-# ``agent_response``/``subagent_call``/``subagent_response``/``error``/``metric``/
-# ``gate_started``/``gate_passed``/``gate_failed``) — so there is no bespoke
-# ``talon_job`` event type to invent; a Talon run is correlated by its
-# ``workflow_run_id`` across the events its ``agent_name`` emits.
-_FLEET_OBSERVABILITY_EVENTS_PATH = "/api/host/observability/events"
+# Reader-only contract: this coordinator never WRITES ``talon_job`` events — the
+# external orchestrator (Claude Code session, peer host, kestrel-talon) is the
+# producer. A stock single-agent deployment whose store holds no ``talon_job``
+# rows simply reports registry jobs only, which is expected, not a bug.
+_TALON_JOB_EVENT_TYPE = "talon_job"
 
 # Provenance markers stamped on every ``talon_status`` job entry (#2646) so a
 # consumer can tell a locally-dispatched job from one only seen via observability.
@@ -211,72 +207,42 @@ _SOURCE_FILTER_OBSERVABILITY = frozenset(
     {"observability", "external", "observed"}
 )
 
-# Default lookback window / row cap when reducing fleet events into per-job
-# status. A talon run takes 10-30 min, so a day of lookback comfortably covers
-# in-flight and recently-finished external jobs without an unbounded scan.
+# Default lookback window / row cap when reducing observability events into
+# per-job status. A talon run takes 10-30 min, so a day of lookback comfortably
+# covers in-flight and recently-finished external jobs without an unbounded scan.
 _OBSERVABILITY_LOOKBACK_MINUTES = 1440
 _OBSERVABILITY_EVENT_LIMIT = 1000
 
-# A fleet observability event belongs to a Talon run when its friendly
-# ``agent_name`` names the Talon coordinator agent or one of its stage subagents
-# (kestrel-talon emits ``talon``, ``talon/implement``, ``talon/review``,
-# ``talon/coordinate``, ``talon/gate`` …). Matched case-insensitively so producer
-# naming variance still correlates, but anchored on ``talon`` / ``talon/`` so an
-# unrelated ``talonx`` agent is not swept in.
-_TALON_AGENT_NAME = "talon"
-_TALON_AGENT_NAME_PREFIX = "talon/"
 
+def _talon_event_status(phase: Any) -> str:
+    """Map a ``talon_job`` event's lifecycle ``talon_event`` phase to a status.
 
-def _is_talon_agent_name(name: Any) -> bool:
-    """True when a fleet event's ``agent_name`` names the Talon agent/subagent."""
-    if not isinstance(name, str):
-        return False
-    lowered = name.strip().lower()
-    return lowered == _TALON_AGENT_NAME or lowered.startswith(_TALON_AGENT_NAME_PREFIX)
-
-
-def _fleet_event_status(event_type: Any, success: Optional[bool]) -> str:
-    """Map a fleet observability event to a coordinator status.
-
-    A Talon run's terminal marker is the Stop-hook ``agent_response`` — complete
-    unless its ``success`` flag is explicitly ``False``. A failed gate or an
-    ``error`` event is a failure. Every other lifecycle event (tool call/response,
-    gate start/pass, subagent, metric) means the run is still in flight. The fleet
-    query returns newest-first (``ORDER BY ts DESC``), so the latest event per job
-    defines the current status — this never invents a terminal state from a
-    still-running stream.
+    kestrel-talon emits ``claimed`` / ``started`` / ``iteration`` while a run is in
+    flight and ``completed`` / ``failed`` / ``rejected`` as terminal markers. The
+    store returns events newest-first (``ORDER BY timestamp DESC``), so the latest
+    event per job defines the current status — this never invents a terminal state
+    from a still-running stream.
     """
-    et = event_type.strip().lower() if isinstance(event_type, str) else ""
-    if et == "agent_response":
-        return "failed" if success is False else "complete"
-    if et in ("gate_failed", "error"):
+    p = phase.strip().lower() if isinstance(phase, str) else ""
+    if p == "completed":
+        return "complete"
+    if p == "failed":
         return "failed"
+    if p in ("rejected", "reject"):
+        return "reject"
+    # claimed / started / iteration / anything non-terminal → still in flight.
     return "running"
 
 
-def _first_meta(meta: Dict[str, Any], *keys: str) -> Optional[str]:
-    """First non-empty string value among ``keys`` in ``meta``, else None."""
-    for key in keys:
-        value = meta.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+def _coerce_issue(raw: Any) -> Optional[int]:
+    """Best-effort int coercion of a ``talon_job`` event's ``issue`` field."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().lstrip("-").isdigit():
+        return int(raw.strip())
     return None
-
-
-def _split_run_id(run_id: Any) -> "tuple[Optional[str], Optional[int]]":
-    """Best-effort ``repo#issue`` split of a talon ``workflow_run_id``.
-
-    kestrel-talon sets ``workflow_run_id`` to ``owner/repo#issue`` for an issue
-    claim. Return ``(repo, issue)`` when it parses, else ``(None, None)`` — a run
-    id set to a bare token (env override) simply yields no repo/issue correlation.
-    """
-    if not isinstance(run_id, str) or "#" not in run_id:
-        return None, None
-    repo, _, issue = run_id.partition("#")
-    repo = repo.strip() or None
-    issue = issue.strip()
-    issue_num = int(issue) if issue.isdigit() else None
-    return repo, issue_num
 
 
 _PR_NUMBER_FROM_URL_RE = re.compile(r"/pull/(\d+)")
@@ -3675,161 +3641,96 @@ class TalonCoordinatorFeature(Feature):
         since_minutes: int = _OBSERVABILITY_LOOKBACK_MINUTES,
         limit: int = _OBSERVABILITY_EVENT_LIMIT,
     ) -> Dict[str, Dict[str, Any]]:
-        """Reduce fleet Talon job-lifecycle events into per-job status (#2646).
+        """Reduce ``talon_job`` observability events into per-job status (#2646).
 
-        Reads the fleet observability host store via its public
-        ``GET /api/host/observability/events`` query seam (see
-        ``_FLEET_OBSERVABILITY_EVENTS_PATH``) and folds the events into a
-        ``job_key -> descriptor`` map. This is the observability-backed status
-        source of #2646: it surfaces Talon jobs dispatched OUTSIDE this
-        coordinator's local registry (Claude Code sessions, peer hosts) that
-        would otherwise be invisible to ``talon_status``.
+        Reads the agent's observability store (``ObservabilityStore.query_events``
+        over the ``a2a_observability`` table) for ``talon_job`` lifecycle events
+        and folds them into a ``job_id -> descriptor`` map. This is the
+        observability-backed status source of #2646: it surfaces Talon jobs
+        dispatched OUTSIDE this coordinator's local registry (Claude Code
+        sessions, peer hosts) that would otherwise be invisible to
+        ``talon_status``.
 
-        Read-only and best-effort: when no fleet host feature is reachable (no
-        host URL, endpoint absent/unauthorized, network error) it degrades to an
-        empty map rather than breaking status reporting — a stock single-agent
-        deployment with no fleet host simply reports registry jobs only.
+        Read-only and best-effort: when no observability store is attached, or the
+        query fails for any reason, it degrades to an empty map rather than
+        breaking status reporting — a stock deployment whose store holds no
+        ``talon_job`` rows simply reports registry jobs only.
         """
-        events = await self._fleet_observability_events(
-            since_minutes=since_minutes, limit=limit
+        store = getattr(self.agent, "observability_store", None)
+        if store is None:
+            return {}
+        since = datetime.now(timezone.utc) - timedelta(
+            minutes=max(1, int(since_minutes))
         )
-        return self._reduce_fleet_talon_jobs(events)
-
-    async def _fleet_observability_events(
-        self,
-        *,
-        since_minutes: int = _OBSERVABILITY_LOOKBACK_MINUTES,
-        limit: int = _OBSERVABILITY_EVENT_LIMIT,
-    ) -> List[Dict[str, Any]]:
-        """Fetch recent fleet observability events over the host query seam.
-
-        GETs ``{host_url}/api/host/observability/events`` (the tenant-scoped
-        endpoint owned by the ``observability-fleet`` host feature) with a short
-        timeout, attaching the host API key when one is configured. Returns the
-        raw event dicts (the fleet store's ``to_dict`` shape). Any failure —
-        no discoverable host, endpoint absent, auth rejected, network blip,
-        malformed body — degrades to an empty list so status never hard-fails.
-        """
-        host_url = self._discover_host_url()
-        if not host_url:
-            return []
-
-        since = (
-            datetime.now(timezone.utc)
-            - timedelta(minutes=max(1, int(since_minutes)))
-        ).isoformat()
-        query = urllib.parse.urlencode({"since": since, "limit": int(limit)})
-        url = f"{host_url}{_FLEET_OBSERVABILITY_EVENTS_PATH}?{query}"
-
-        headers = {"Content-Type": "application/json"}
-        api_key = os.environ.get("KESTREL_API_KEY")
-        if api_key:
-            # The fleet endpoint takes the host's auth (API-key header or Bearer);
-            # attach both forms so whichever the host enforces is satisfied.
-            headers["X-API-Key"] = api_key
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        req = urllib.request.Request(url, method="GET", headers=headers)
         try:
-            raw = await asyncio.to_thread(
-                lambda: urllib.request.urlopen(req, timeout=5).read()
+            events = await store.query_events(
+                event_type=_TALON_JOB_EVENT_TYPE,
+                since=since,
+                limit=int(limit),
             )
-            payload = json.loads(raw)
-        except (
-            urllib.error.URLError,
-            urllib.error.HTTPError,
-            ValueError,
-            OSError,
-        ) as exc:
-            logger.debug("fleet observability query failed: %s", exc)
-            return []
+        except Exception as exc:  # best-effort: never break status reporting
+            logger.debug("talon_job observability query failed: %s", exc)
+            return {}
+        return self._reduce_observability_talon_jobs(events)
 
-        if isinstance(payload, dict):
-            events = payload.get("events")
-            if isinstance(events, list):
-                return events
-        return []
-
-    def _reduce_fleet_talon_jobs(
-        self, events: List[Dict[str, Any]]
+    def _reduce_observability_talon_jobs(
+        self, events: Any
     ) -> Dict[str, Dict[str, Any]]:
-        """Fold fleet observability events into a ``job_key -> descriptor`` map.
+        """Fold ``talon_job`` observability events into a ``job_id -> descriptor``.
 
-        Pure over the fleet event contract (``FleetObservabilityStore.query`` /
-        ``GET /api/host/observability/events`` ``to_dict`` shape): each event is a
-        dict with top-level ``agent_name``/``event_type``/``success``/
-        ``orchestrator``/``workflow_run_id``/``stage``/``session_id``/``ts`` and a
-        ``metadata`` dict. Only events whose ``agent_name`` names the Talon
-        agent/subagent are considered; they are keyed by ``workflow_run_id``
-        (``owner/repo#issue``), falling back to ``session_id`` when a producer
-        omitted the run id.
+        Pure over the ``ObservabilityEvent`` shape (attribute access:
+        ``.metadata``/``.timestamp``/``.agent_name``/``.session_id``). A Talon run
+        is correlated by ``metadata["talon_job_id"]``; events lacking one are
+        ignored. The lifecycle phase lives in ``metadata["talon_event"]``
+        (claimed/started/iteration/completed/failed) and defines status.
 
-        The fleet query returns newest-first, so the first event seen per job
-        defines the current status while older events backfill any correlation
-        (repo/issue/orchestrator/stage/pr) the latest event lacked and extend the
-        first-seen timestamp / observed-event count.
+        The store returns newest-first, so the first event seen per job defines the
+        current status while older events backfill any correlation
+        (repo/issue/orchestrator/stage/pr/workflow_run_id) the latest event lacked,
+        extend the first-seen timestamp, and bump the observed-event count.
         """
         jobs: Dict[str, Dict[str, Any]] = {}
         for event in events or []:
-            if not isinstance(event, dict):
-                continue
-            if not _is_talon_agent_name(event.get("agent_name")):
-                continue
-
-            run_id = event.get("workflow_run_id")
-            run_id = run_id.strip() if isinstance(run_id, str) and run_id.strip() else None
-            session_id = event.get("session_id")
-            session_id = (
-                session_id.strip()
-                if isinstance(session_id, str) and session_id.strip()
-                else None
-            )
-            job_key = run_id or session_id
-            if not job_key:
-                # No run id and no session id: nothing to correlate a job on.
-                continue
-
-            meta = event.get("metadata")
+            meta = getattr(event, "metadata", None)
             meta = meta if isinstance(meta, dict) else {}
-            ts = event.get("ts")
+
+            job_id = meta.get("talon_job_id")
+            if not isinstance(job_id, str) or not job_id.strip():
+                # No job id: nothing to correlate a job on.
+                continue
+            job_id = job_id.strip()
+
+            phase = meta.get("talon_event")
+            ts = getattr(event, "timestamp", None)
             ts_iso = str(ts) if ts is not None else None
 
-            repo, issue = _split_run_id(run_id)
-            if repo is None:
-                repo = _first_meta(meta, "repo")
-            if issue is None:
-                raw_issue = meta.get("issue")
-                if isinstance(raw_issue, int):
-                    issue = raw_issue
-                elif isinstance(raw_issue, str) and raw_issue.strip().isdigit():
-                    issue = int(raw_issue.strip())
+            repo = meta.get("repo") or None
+            issue = _coerce_issue(meta.get("issue"))
             correlation = (
-                f"{repo}#{issue}" if repo and issue is not None else run_id
+                f"{repo}#{issue}" if repo and issue is not None else None
             )
-            orchestrator = event.get("orchestrator") or _first_meta(
-                meta, "orchestrator"
-            )
-            stage = event.get("stage") or _first_meta(meta, "stage")
+            orchestrator = meta.get("orchestrator")
+            stage = meta.get("stage")
+            pr = meta.get("pr")
+            workflow_run_id = meta.get("workflow_run_id")
 
-            existing = jobs.get(job_key)
+            existing = jobs.get(job_id)
             if existing is None:
                 # First (== latest, newest-first) event defines status.
-                jobs[job_key] = {
-                    "id": job_key,
+                jobs[job_id] = {
+                    "id": job_id,
                     "source": JOB_SOURCE_OBSERVABILITY,
-                    "status": _fleet_event_status(
-                        event.get("event_type"), event.get("success")
-                    ),
-                    "event_type": event.get("event_type"),
-                    "workflow_run_id": run_id,
-                    "correlation": correlation,
+                    "status": _talon_event_status(phase),
+                    "talon_event": phase,
                     "repo": repo,
                     "issue": issue,
-                    "pr": meta.get("pr"),
+                    "pr": pr,
                     "orchestrator": orchestrator,
                     "stage": stage,
-                    "agent_name": event.get("agent_name"),
-                    "session_id": session_id,
+                    "workflow_run_id": workflow_run_id,
+                    "correlation": correlation,
+                    "agent_name": getattr(event, "agent_name", None),
+                    "session_id": getattr(event, "session_id", None),
                     "last_event_at": ts_iso,
                     "first_event_at": ts_iso,
                     "observed_events": 1,
@@ -3844,10 +3745,11 @@ class TalonCoordinatorFeature(Feature):
             for key, value in (
                 ("repo", repo),
                 ("issue", issue),
-                ("correlation", correlation),
+                ("pr", pr),
                 ("orchestrator", orchestrator),
                 ("stage", stage),
-                ("pr", meta.get("pr")),
+                ("workflow_run_id", workflow_run_id),
+                ("correlation", correlation),
             ):
                 if existing.get(key) is None and value is not None:
                     existing[key] = value

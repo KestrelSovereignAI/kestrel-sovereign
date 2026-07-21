@@ -3,6 +3,7 @@
 import json
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1283,8 +1284,6 @@ class TestTalonWait:
         legacy last_signaled_status must seed the generic ledger so the first
         wait_reconcile tick doesn't re-fire talon.job_complete for an
         already-delivered terminal job."""
-        from types import SimpleNamespace
-
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.async_wait_signal_store import (
             WaitSignalStore,
