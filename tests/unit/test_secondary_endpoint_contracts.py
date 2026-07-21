@@ -63,13 +63,19 @@ def test_database_table_query_contract_supports_search_and_pagination():
     db.backend_type = "sqlite"
     db.fetchall = AsyncMock(
         side_effect=[
-            [(0, "id", "TEXT", 1, None, 1), (1, "content", "TEXT", 0, None, 0)],
-            [("msg-1", "alpha " * 120)],
+            [
+                (0, "id", "TEXT", 1, None, 1),
+                (1, "agent_id", "TEXT", 1, None, 0),
+                (2, "content", "TEXT", 0, None, 0),
+            ],
+            [("msg-1", "did:test:database-contract", "alpha " * 120)],
         ]
     )
     db.fetchone = AsyncMock(return_value=(3,))
     storage = MagicMock(db=db)
-    agent = MagicMock(storage=storage)
+    storage.privacy_config = None
+    storage.agent_id = "did:test:database-contract"
+    agent = MagicMock(storage=storage, agent_id="did:test:database-contract")
 
     app, original = _prepare_app(agent)
     try:
@@ -82,7 +88,7 @@ def test_database_table_query_contract_supports_search_and_pagination():
         assert response.status_code == 200
         payload = response.json()
         assert payload["table"] == "conversation_history"
-        assert payload["columns"] == ["id", "content"]
+        assert payload["columns"] == ["id", "agent_id", "content"]
         assert payload["total_rows"] == 3
         assert payload["has_more"] is True
         assert payload["rows"][0]["content"].endswith("...")
@@ -111,9 +117,13 @@ def test_file_get_and_observability_summary_contracts():
         duration_ms=12,
     )
     observability_store = MagicMock(query_events=AsyncMock(return_value=[event_error, event_tool]))
-    storage = MagicMock(files=file_store)
+    storage = MagicMock(files=file_store, agent_id="did:test:file-get")
     storage.retrieve_file = AsyncMock(return_value=b"image-bytes")
-    agent = MagicMock(storage=storage, observability_store=observability_store)
+    agent = MagicMock(
+        storage=storage,
+        agent_id="did:test:file-get",
+        observability_store=observability_store,
+    )
 
     app, original = _prepare_app(agent)
     try:

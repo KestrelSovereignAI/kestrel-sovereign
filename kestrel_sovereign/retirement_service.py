@@ -166,7 +166,7 @@ async def retire_agent(
 
     # Add retirement record to the graph
     db = await AsyncDatabase.sqlite(str(db_path))
-    graph = AsyncGraphStore(db)
+    graph = AsyncGraphStore(db, agent_id=agent_did)
 
     retired_at = datetime.now(timezone.utc).isoformat()
 

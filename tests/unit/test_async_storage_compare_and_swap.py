@@ -456,5 +456,160 @@ class TestFacadeAndPrivacyWrapper:
             await storage.close()
 
 
+# =====================================================================
+# Bound-store tenant ownership — CAS honours the same isolation boundary
+# as add_node / get_node when the store is bound to an agent (#2649)
+# =====================================================================
+
+
+@pytest_asyncio.fixture
+async def bound_pair(db_backend):
+    """Two AsyncGraphStores bound to different agents over one shared DB.
+
+    The unbound ``graph_store`` fixture above exercises the ownerless CAS
+    behaviour; these two bound stores exercise cross-tenant isolation.
+    """
+    db = AsyncDatabase(db_backend)
+    await db._init_schema()
+    db._initialized = True
+    return (
+        AsyncGraphStore(db, agent_id="agent-a"),
+        AsyncGraphStore(db, agent_id="agent-b"),
+    )
+
+
+class TestBoundOwnershipCAS:
+    """When bound, ``compare_and_swap_node`` must (a) record ownership on
+    compare-and-create so the creator can read its own node back, and (b) scope
+    the swap/failure-classification through the ownership predicate so one tenant
+    can never overwrite — or even observe — another tenant's node. Regression for
+    the #2649 review: the primitive merged in from #2661 bypassed both."""
+
+    async def test_bound_compare_and_create_is_visible_and_owned(self, bound_pair):
+        store_a, store_b = bound_pair
+        nid = _nid("bound-create")
+
+        result = await store_b.compare_and_swap_node(
+            nid, None, _node(nid, {"status": "fresh"})
+        )
+        assert result == NodeSwapResult.SWAPPED
+
+        # The creator can read its own new node back...
+        created = await store_b.get_node(nid)
+        assert created is not None
+        assert created.properties == {"status": "fresh"}
+
+        # ...backed by exactly one ownership witness (the creator)...
+        owners = await store_b.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?", (nid,)
+        )
+        assert {row[0] for row in owners} == {"agent-b"}
+
+        # ...and the node is invisible to a different tenant.
+        assert await store_a.get_node(nid) is None
+
+    async def test_bound_swap_cannot_overwrite_foreign_node(self, bound_pair):
+        store_a, store_b = bound_pair
+        nid = _nid("bound-foreign")
+
+        # Agent A owns the node.
+        await store_a.add_node(_node(nid, {"status": "A-owned"}))
+        snapshot = (await store_a.get_node(nid)).properties
+
+        # Agent B knows the id AND the exact properties, yet still cannot swap
+        # it: the node is outside B's ownership scope, so it reads as NOT_FOUND
+        # (invisible), never PREDICATE_FAILED (leaks existence) or SWAPPED (the
+        # pre-fix hijack).
+        result = await store_b.compare_and_swap_node(
+            nid, snapshot, _node(nid, {"status": "B-hijacked"})
+        )
+        assert result == NodeSwapResult.NOT_FOUND
+
+        # A's node is completely untouched, and B still cannot see it.
+        after = await store_a.get_node(nid)
+        assert after.properties == {"status": "A-owned"}
+        assert await store_b.get_node(nid) is None
+
+    async def test_bound_owner_can_swap_its_own_node(self, bound_pair):
+        """The isolation predicate must not lock the legitimate owner out."""
+        store_a, _store_b = bound_pair
+        nid = _nid("bound-own")
+        await store_a.add_node(_node(nid, {"status": "pending"}))
+        snapshot = (await store_a.get_node(nid)).properties
+
+        result = await store_a.compare_and_swap_node(
+            nid, snapshot, _node(nid, {"status": "done"})
+        )
+        assert result == NodeSwapResult.SWAPPED
+        assert (await store_a.get_node(nid)).properties == {"status": "done"}
+
+    async def test_bound_create_rejects_foreign_declared_owner(self, bound_pair):
+        """A bound store refuses a new_node that declares a different agent_id —
+        the same guard add_node applies, so ownership can't be spoofed via CAS."""
+        _store_a, store_b = bound_pair
+        nid = _nid("bound-spoof")
+        with pytest.raises(ValueError):
+            await store_b.compare_and_swap_node(
+                nid, None, _node(nid, {"agent_id": "agent-a"})
+            )
+        # The guard runs before any write, so nothing was created.
+        assert await store_b.get_node(nid) is None
+
+    async def test_bound_create_conflict_on_foreign_node_is_not_found(
+        self, bound_pair
+    ):
+        """Compare-and-create against an id already taken by ANOTHER tenant
+        cannot insert (the node_id primary key blocks it), but it must NOT report
+        PREDICATE_FAILED: that would let B tell a foreign-owned id apart from an
+        absent one, an existence leak across the tenant boundary. The scoped
+        re-read makes the foreign row invisible, so it reports NOT_FOUND exactly
+        like get_node — and the foreign row stays owned solely by its original
+        tenant (no shadow row, no B witness)."""
+        store_a, store_b = bound_pair
+        nid = _nid("bound-create-conflict")
+        await store_a.add_node(_node(nid, {"status": "A-owned"}))
+
+        result = await store_b.compare_and_swap_node(
+            nid, None, _node(nid, {"status": "B-shadow"})
+        )
+        # NOT_FOUND (invisible), never PREDICATE_FAILED (leaks existence) or
+        # SWAPPED (would shadow-create) — the same verdict get_node gives B.
+        assert result == NodeSwapResult.NOT_FOUND
+        assert await store_b.get_node(nid) is None
+
+        # No B ownership witness was recorded, and A's node is unchanged.
+        owners = await store_a.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?", (nid,)
+        )
+        assert {row[0] for row in owners} == {"agent-a"}
+        assert (await store_a.get_node(nid)).properties == {"status": "A-owned"}
+
+    async def test_bound_create_conflict_on_own_node_is_predicate_failed(
+        self, bound_pair
+    ):
+        """Compare-and-create against an id this SAME tenant already owns is a
+        genuine, visible conflict — the node is inside B's scope, so B is
+        entitled to learn it exists. That path stays PREDICATE_FAILED (distinct
+        from the foreign NOT_FOUND above), and the existing row is untouched."""
+        _store_a, store_b = bound_pair
+        nid = _nid("bound-create-own-conflict")
+
+        first = await store_b.compare_and_swap_node(
+            nid, None, _node(nid, {"status": "B-first"})
+        )
+        assert first == NodeSwapResult.SWAPPED
+
+        again = await store_b.compare_and_swap_node(
+            nid, None, _node(nid, {"status": "B-second"})
+        )
+        assert again == NodeSwapResult.PREDICATE_FAILED
+        # The original create is left untouched (no clobber via the create path).
+        assert (await store_b.get_node(nid)).properties == {"status": "B-first"}
+        owners = await store_b.db.fetchall(
+            "SELECT agent_id FROM graph_node_owners WHERE node_id = ?", (nid,)
+        )
+        assert {row[0] for row in owners} == {"agent-b"}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

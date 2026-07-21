@@ -43,3 +43,11 @@ def get_agent(request: Request):
         return agent
 
     raise HTTPException(status_code=503, detail="Agent not initialized.")
+
+
+def privacy_hides_persisted(storage) -> bool:
+    """Whether persisted rows are outside the agent's current visible state."""
+    privacy_config = getattr(storage, "privacy_config", None)
+    return privacy_config is not None and (
+        privacy_config.is_ephemeral() or privacy_config.uses_temp_storage()
+    )

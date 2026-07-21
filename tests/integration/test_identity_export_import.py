@@ -23,6 +23,10 @@ from kestrel_sovereign.identity import (
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+from kestrel_sovereign.identity.graph_namespace import (
+    namespace_imported_graph_node,
+    namespace_imported_record,
+)
 
 
 @pytest_asyncio.fixture
@@ -171,6 +175,10 @@ async def populated_db(test_db):
             "constitution_hash": "test_constitution_hash",
         }))
     )
+    await test_db.execute(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+        (agent_id, agent_id),
+    )
 
     # Insert conversation history
     for i in range(5):
@@ -247,11 +255,13 @@ class TestIdentityExporter:
         db = await AsyncDatabase.sqlite(str(tmp_path / "encrypted-export.db"))
         try:
             constitution = b"# Encrypted governing constitution\n"
-            constitution_hash = await AsyncFileStore(db).store_file(
+            agent_id = "did:test:encrypted-export"
+            constitution_hash = await AsyncFileStore(
+                db, agent_id=agent_id
+            ).store_file(
                 constitution,
                 "KESTREL_CONSTITUTION.md",
             )
-            agent_id = "did:test:encrypted-export"
             await db.execute(
                 """INSERT INTO graph_nodes
                    (node_id, node_type, label, properties)
@@ -260,6 +270,10 @@ class TestIdentityExporter:
                     agent_id,
                     json.dumps({"constitution_hash": constitution_hash}),
                 ),
+            )
+            await db.execute(
+                "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+                (agent_id, agent_id),
             )
             await db.commit()
 
@@ -270,6 +284,125 @@ class TestIdentityExporter:
                 constitution_hash
             )
             assert exported["text"] == constitution.decode("utf-8")
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_upgrade_backfills_provable_legacy_import_graph_records(self, tmp_path):
+        """Pre-ledger relationships, skills, and migration history stay visible."""
+        db_path = tmp_path / "legacy-import-graph.db"
+        agent_id = "did:key:legacy-agent-xxxxxxxxxxxxxxxx"
+        other_agent_id = "did:key:legacy-agent-yyyyyyyyyyyyyyyy"
+        prefix = f"{agent_id[:20]}_"
+        user_id = f"{prefix}alice"
+        skill_id = f"{prefix}summarize"
+        migration_id = "mig_legacy_import"
+        ambiguous_user_id = f"{prefix}shared"
+        ambiguous_migration_id = "mig_legacy_collision"
+
+        import sqlite3
+
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE graph_nodes (
+                    node_id TEXT PRIMARY KEY,
+                    node_type TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    properties TEXT
+                );
+                CREATE TABLE graph_edges (
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    properties TEXT,
+                    PRIMARY KEY (source_id, target_id, label)
+                );
+                """
+            )
+            conn.executemany(
+                "INSERT INTO graph_nodes VALUES (?, ?, ?, ?)",
+                [
+                    (agent_id, "agent", "Legacy", "{}"),
+                    (other_agent_id, "agent", "Other Legacy", "{}"),
+                    (user_id, "user", "Alice", '{"notes":"legacy bond"}'),
+                    (skill_id, "skill", "Summarize", '{"times_used":7}'),
+                    (ambiguous_user_id, "user", "Shared", "{}"),
+                    (
+                        migration_id,
+                        "migration_record",
+                        "Legacy migration",
+                        '{"timestamp":"2025-01-01T00:00:00Z",'
+                        '"source_substrate":"local",'
+                        '"target_substrate":"cloud"}',
+                    ),
+                    (
+                        ambiguous_migration_id,
+                        "migration_record",
+                        "Ambiguous migration",
+                        "{}",
+                    ),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO graph_edges VALUES (?, ?, ?, ?)",
+                [
+                    (agent_id, user_id, "known_user", "{}"),
+                    (agent_id, skill_id, "has_skill", "{}"),
+                    (agent_id, migration_id, "migrated_via", "{}"),
+                    (agent_id, ambiguous_user_id, "known_user", "{}"),
+                    (other_agent_id, ambiguous_user_id, "known_user", "{}"),
+                    (
+                        agent_id,
+                        ambiguous_migration_id,
+                        "migrated_via",
+                        "{}",
+                    ),
+                    (
+                        other_agent_id,
+                        ambiguous_migration_id,
+                        "migrated_via",
+                        "{}",
+                    ),
+                ],
+            )
+
+        db = await AsyncDatabase.sqlite(str(db_path))
+        try:
+            exporter = IdentityExporter(db, agent_id)
+            relationships = await exporter._get_relationships()
+            skills = await exporter._get_skills()
+            migrations = await exporter._get_migration_history()
+
+            assert [(r.user_id, r.relationship_notes) for r in relationships] == [
+                ("alice", "legacy bond")
+            ]
+            assert [(s.skill_id, s.times_used) for s in skills] == [
+                ("summarize", 7)
+            ]
+            assert [(m.migration_id, m.source_substrate) for m in migrations] == [
+                (migration_id, "local")
+            ]
+
+            ambiguous_owners = await db.fetchall(
+                "SELECT node_id, agent_id FROM graph_node_owners "
+                "WHERE node_id IN (?, ?) ORDER BY node_id, agent_id",
+                (ambiguous_user_id, ambiguous_migration_id),
+            )
+            assert ambiguous_owners == []
+
+            # Re-running the migration is idempotent.
+            await db._backfill_graph_ownership()
+            owner_count = await db.fetchone(
+                "SELECT COUNT(*) FROM graph_node_owners WHERE agent_id = ?",
+                (agent_id,),
+            )
+            edge_count = await db.fetchone(
+                "SELECT COUNT(*) FROM graph_edge_owners WHERE agent_id = ?",
+                (agent_id,),
+            )
+            assert owner_count == (4,)
+            assert edge_count == (3,)
         finally:
             await db.close()
 
@@ -296,6 +429,15 @@ class TestIdentityExporter:
             "VALUES (?, ?, 'known_user', '{}')",
             (agent_id, namespaced_user),
         )
+        await db.execute(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (namespaced_user, agent_id),
+        )
+        await db.execute(
+            "INSERT INTO graph_edge_owners "
+            "(source_id, target_id, label, agent_id) VALUES (?, ?, 'known_user', ?)",
+            (agent_id, namespaced_user, agent_id),
+        )
         await db.commit()
 
         exporter = IdentityExporter(db, agent_id)
@@ -303,6 +445,33 @@ class TestIdentityExporter:
         assert len(rels) == 1
         # Exported with the RAW id — not the namespaced one.
         assert rels[0].user_id == "alice", rels[0].user_id
+
+    @pytest.mark.asyncio
+    async def test_relationship_export_strips_v2_full_did_namespace(self, test_db):
+        """The collision-resistant namespace is also stable across export hops."""
+        db = test_db
+        agent_id = "did:pkh:eip155:1:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        namespaced_user = namespace_imported_graph_node(agent_id, "alice")
+        await db.execute(
+            "INSERT INTO graph_nodes VALUES (?, 'user', 'Alice', '{}')",
+            (namespaced_user,),
+        )
+        await db.execute(
+            "INSERT INTO graph_edges VALUES (?, ?, 'known_user', '{}')",
+            (agent_id, namespaced_user),
+        )
+        await db.execute(
+            "INSERT INTO graph_node_owners VALUES (?, ?)",
+            (namespaced_user, agent_id),
+        )
+        await db.execute(
+            "INSERT INTO graph_edge_owners VALUES (?, ?, 'known_user', ?)",
+            (agent_id, namespaced_user, agent_id),
+        )
+
+        relationships = await IdentityExporter(db, agent_id)._get_relationships()
+
+        assert [record.user_id for record in relationships] == ["alice"]
 
     @pytest.mark.asyncio
     async def test_graphonly_skill_export_strips_own_namespace(self, test_db):
@@ -321,6 +490,15 @@ class TestIdentityExporter:
             "INSERT INTO graph_edges (source_id, target_id, label, properties) "
             "VALUES (?, ?, 'has_skill', '{}')",
             (agent_id, namespaced_skill),
+        )
+        await db.execute(
+            "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+            (namespaced_skill, agent_id),
+        )
+        await db.execute(
+            "INSERT INTO graph_edge_owners "
+            "(source_id, target_id, label, agent_id) VALUES (?, ?, 'has_skill', ?)",
+            (agent_id, namespaced_skill, agent_id),
         )
         await db.commit()
 
@@ -662,8 +840,10 @@ class TestIdentityImporter:
 
         assert result.stats.get("episodes_imported") == 1
 
-        # Verify in database - ID is prefixed with agent_id[:20]
-        expected_id = f"{sample_package.did[:20]}_ep_import_001"
+        # Imported row ids use the complete DID so peer agents cannot collide.
+        expected_id = namespace_imported_record(
+            sample_package.did, "ep_import_001"
+        )
         row = await test_db.fetchone(
             "SELECT title FROM memory_episodes WHERE id = ?",
             (expected_id,)
@@ -679,8 +859,10 @@ class TestIdentityImporter:
 
         assert result.stats.get("saved_items_imported") == 1
 
-        # Verify in database - ID is prefixed with agent_id[:20]
-        expected_id = f"{sample_package.did[:20]}_item_import_001"
+        # Imported row ids use the complete DID so peer agents cannot collide.
+        expected_id = namespace_imported_record(
+            sample_package.did, "item_import_001"
+        )
         row = await test_db.fetchone(
             "SELECT name FROM saved_items WHERE id = ?",
             (expected_id,)

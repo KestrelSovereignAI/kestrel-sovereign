@@ -24,8 +24,13 @@ from kestrel_sovereign.a2a.types import (
 )
 from kestrel_sovereign.features.webhooks.feature import WebhookFeature
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.associative_linker import AssociativeLinker
+from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
+from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+from kestrel_sovereign.storage.schema_router import SchemaRouter
 
 
 @pytest.mark.asyncio
@@ -305,11 +310,11 @@ async def test_db_explorer_scopes_rows_to_requesting_agent(db_backend):
     agent's rows for agent-scoped tables, never another agent's data in a
     shared multi-agent database — and the scope must survive a free-text
     search."""
-    storage = AsyncStorage.from_backend(db_backend)
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
     await storage.initialize()
     privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-    agent_id = f"did:test:{uuid4()}"
     other_agent_id = f"did:test:{uuid4()}"
     start = datetime(2026, 4, 16, 12, 0, 0)
 
@@ -351,14 +356,43 @@ async def test_db_explorer_scopes_rows_to_requesting_agent(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_rag_chunks_are_scoped_through_file_ownership(db_backend):
+    """All backend-neutral RAG reads enforce the document capability."""
+    agent_a = f"did:test:{uuid4()}"
+    agent_b = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_a)
+    await storage.initialize()
+    files_b = AsyncFileStore(storage.db, agent_id=agent_b)
+    rag_b = AsyncRAGStore(storage.db, agent_id=agent_b)
+
+    hash_a = await storage.files.store_file(b"alpha", "alpha.txt")
+    hash_b = await files_b.store_file(b"bravo", "bravo.txt")
+    await storage.rag.chunk_document(
+        hash_a, "alpha-backend-private", compute_embeddings=False
+    )
+    await rag_b.chunk_document(
+        hash_b, "bravo-backend-private", compute_embeddings=False
+    )
+
+    assert await storage.rag.get_chunks_for_file(hash_b) == []
+    assert await storage.rag._search_by_like("bravo-backend-private") == []
+    assert await rag_b.get_chunks_for_file(hash_b) == ["bravo-backend-private"]
+    with pytest.raises(ValueError, match="outside the bound agent"):
+        await storage.rag.chunk_document(
+            hash_b, "unauthorized", compute_embeddings=False
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend):
     """#1651: for agent-scoped tables, EPHEMERAL/ISOLATED modes must not
     surface persisted rows through the raw explorer."""
-    storage = AsyncStorage.from_backend(db_backend)
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
     await storage.initialize()
     privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-    agent_id = f"did:test:{uuid4()}"
     await storage.db.execute_many(
         """
         INSERT INTO conversation_history (agent_id, role, content, metadata, created_at)
@@ -386,24 +420,36 @@ async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_db_explorer_scopes_graph_nodes_by_properties_agent_id(db_backend):
-    """#1651: graph_nodes stores agent ownership in the JSON `properties`
-    (no agent_id column), and the app scopes by it — the explorer must too,
-    or another agent's graph leaks via /api/db/tables/graph_nodes."""
-    storage = AsyncStorage.from_backend(db_backend)
+async def test_db_explorer_scopes_graph_nodes_by_canonical_ownership(db_backend):
+    """Graph ownership includes the untagged canonical root and tagged nodes."""
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
     await storage.initialize()
     privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-    agent_id = f"did:test:{uuid4()}"
     other_agent_id = f"did:test:{uuid4()}"
 
     await storage.db.execute_many(
         "INSERT INTO graph_nodes (node_id, node_type, label, properties) VALUES (?, ?, ?, ?)",
         [
+            (agent_id, "agent", "my-root", "{}"),
             (f"n-{uuid4()}", "concept", "mine", json.dumps({"agent_id": agent_id})),
             (f"n-{uuid4()}", "concept", "also-mine", json.dumps({"agent_id": agent_id})),
+            (other_agent_id, "agent", "their-root", "{}"),
             (f"n-{uuid4()}", "concept", "theirs", json.dumps({"agent_id": other_agent_id})),
         ],
+    )
+    rows = await storage.db.fetchall(
+        "SELECT node_id, properties FROM graph_nodes "
+        "WHERE label IN ('my-root', 'mine', 'also-mine', 'their-root', 'theirs')"
+    )
+    owners = []
+    for node_id, properties in rows:
+        parsed = json.loads(properties or "{}")
+        owners.append((node_id, parsed.get("agent_id") or node_id))
+    await storage.db.execute_many(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+        owners,
     )
 
     agent = SimpleNamespace(agent_id=agent_id, storage=privacy_storage)
@@ -413,41 +459,62 @@ async def test_db_explorer_scopes_graph_nodes_by_properties_agent_id(db_backend)
         request, "graph_nodes", limit=50, offset=0, search=None
     )
     labels = {r["label"] for r in result["rows"]}
-    assert labels == {"mine", "also-mine"}
-    assert result["total_rows"] == 2
+    assert labels == {"my-root", "mine", "also-mine"}
+    assert result["total_rows"] == 3
 
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_db_explorer_scopes_graph_edges_via_node_membership(db_backend):
-    """#1651: graph_edges have no direct owner — an edge belongs to the agent
-    if it touches one of the agent's nodes. Exercises the two-subquery scope
-    and the [agent_id, agent_id] + search params ordering."""
-    storage = AsyncStorage.from_backend(db_backend)
+async def test_db_explorer_keeps_associative_edges_and_excludes_cross_tenant_edge(
+    db_backend,
+):
+    """#2649: production AssociativeLinker edges retain direct ownership.
+
+    This exercises the production writer that historically omitted message
+    ownership.  Its own ``mentions`` edges must remain visible while an edge
+    from that message to another tenant's node stays unowned and invisible.
+    """
+    agent_id = f"did:test:{uuid4()}"
+    other = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
     await storage.initialize()
     privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
 
-    agent_id = f"did:test:{uuid4()}"
-    other = f"did:test:{uuid4()}"
-    a1, a2 = f"a1-{uuid4()}", f"a2-{uuid4()}"
-    b1, b2 = f"b1-{uuid4()}", f"b2-{uuid4()}"
-
-    await storage.db.execute_many(
-        "INSERT INTO graph_nodes (node_id, node_type, label, properties) VALUES (?, ?, ?, ?)",
-        [
-            (a1, "concept", "a1", json.dumps({"agent_id": agent_id})),
-            (a2, "concept", "a2", json.dumps({"agent_id": agent_id})),
-            (b1, "concept", "b1", json.dumps({"agent_id": other})),
-            (b2, "concept", "b2", json.dumps({"agent_id": other})),
-        ],
+    await storage.graph.add_node(
+        GraphNode(agent_id, "agent", "my-root", {})
     )
-    await storage.db.execute_many(
-        "INSERT INTO graph_edges (source_id, target_id, label, properties) VALUES (?, ?, ?, ?)",
-        [
-            (a1, a2, "mine_internal", "{}"),    # both endpoints A -> agent's
-            (b1, b2, "theirs_internal", "{}"),  # both endpoints B -> not agent's
-            (a1, b1, "mine_crosslink", "{}"),   # source is A's -> agent's
-        ],
+    linker = AssociativeLinker(storage.graph)
+    linked = await linker.extract_and_link(
+        "message-a", "I called mom before work", agent_id
+    )
+    assert linked
+    stored_message = await storage.graph.get_node(
+        f"message:{agent_id}:message-a"
+    )
+    assert stored_message.properties["agent_id"] == agent_id
+
+    other_graph = AsyncGraphStore(storage.db, agent_id=other)
+    await other_graph.add_node(GraphNode(other, "agent", "their-root", {}))
+    foreign_node = f"concept:{other}:foreign"
+    await other_graph.add_node(
+        GraphNode(
+            foreign_node,
+            "concept",
+            "their-private-concept",
+            {"agent_id": other},
+        )
+    )
+
+    message_node = f"message:{agent_id}:message-a"
+    await storage.db.execute(
+        "INSERT INTO graph_edges (source_id, target_id, label, properties) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            message_node,
+            foreign_node,
+            "cross_tenant",
+            json.dumps({"secret": "foreign-edge"}),
+        ),
     )
 
     agent = SimpleNamespace(agent_id=agent_id, storage=privacy_storage)
@@ -456,15 +523,55 @@ async def test_db_explorer_scopes_graph_edges_via_node_membership(db_backend):
     result = await query_database_table(
         request, "graph_edges", limit=50, offset=0, search=None
     )
-    assert {r["label"] for r in result["rows"]} == {"mine_internal", "mine_crosslink"}
-    assert result["total_rows"] == 2
+    labels = {r["label"] for r in result["rows"]}
+    assert "mentions" in labels
+    assert "cross_tenant" not in labels
+    assert result["total_rows"] >= len(linked)
+    assert other not in repr(result)
+    assert foreign_node not in repr(result)
+    assert "foreign-edge" not in repr(result)
 
-    # Scope must AND with search: "theirs_internal" matches the term but is
-    # excluded by node membership — proving scope params precede search params.
+    # Scope must AND with search: the stored secret matches but its unowned
+    # cross-tenant edge remains excluded, proving scope params precede search.
     searched = await query_database_table(
-        request, "graph_edges", limit=50, offset=0, search="internal"
+        request, "graph_edges", limit=50, offset=0, search="foreign-edge"
     )
-    assert {r["label"] for r in searched["rows"]} == {"mine_internal"}
+    assert searched["rows"] == []
+    assert searched["total_rows"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_action_routing_without_concepts_keeps_message_edge_atomic(db_backend):
+    """A concept-free commitment still has an owned message source node."""
+    agent_id = f"did:test:{uuid4()}"
+    storage = AsyncStorage(backend=db_backend, agent_id=agent_id)
+    await storage.initialize()
+    await storage.graph.add_node(GraphNode(agent_id, "agent", "root", {}))
+    linker = AssociativeLinker(storage.graph)
+    router = SchemaRouter(storage.graph, storage.db, agent_id)
+    message_id = "concept-free-action"
+
+    concepts = await linker.extract_and_link(
+        message_id, "I need to buy milk.", agent_id
+    )
+    assert concepts == []
+    summary = await router.route(
+        message_id,
+        "I need to buy milk.",
+        concepts,
+        role="user",
+    )
+
+    assert summary["action_items"] == 1
+    message_node = f"message:{agent_id}:{message_id}"
+    assert await storage.graph.get_node(message_node) is not None
+    action_nodes = await storage.graph.get_nodes_by_type("action_item")
+    assert len(action_nodes) == 1
+    edges = await storage.graph.get_edges(message_node, direction="out")
+    assert [(edge.target_id, edge.label) for edge in edges] == [
+        (action_nodes[0].node_id, "records_action")
+    ]
 
 
 @pytest.mark.asyncio

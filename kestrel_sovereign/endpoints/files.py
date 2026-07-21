@@ -19,6 +19,18 @@ router = APIRouter(tags=["files"])
 _CHANNEL_TYPE_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
+def _require_bound_file_scope(agent, storage) -> str:
+    """Return the request agent id only when storage is bound to that tenant."""
+    agent_id = getattr(agent, "agent_id", None)
+    storage_agent_id = getattr(storage, "agent_id", None)
+    if not agent_id or storage_agent_id != agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent-scoped file storage is not available.",
+        )
+    return agent_id
+
+
 def channel_artifact_path(agent, channel_type: str, name: str) -> Path | None:
     """Resolve a channel linking artifact path under the agent's data dir.
 
@@ -77,6 +89,7 @@ async def serve_file(content_hash: str, request: Request):
 
         if not storage or not hasattr(storage, 'retrieve_file'):
             raise HTTPException(status_code=503, detail="Storage not available.")
+        _require_bound_file_scope(agent, storage)
 
         # Retrieve through the privacy wrapper so ISOLATED-mode files buffered
         # in the session store (#1662 attachments) are served too — going
@@ -124,6 +137,7 @@ async def check_file(content_hash: str, request: Request):
 
         if not storage or not hasattr(storage, 'files'):
             raise HTTPException(status_code=503, detail="Storage not available.")
+        _require_bound_file_scope(agent, storage)
 
         file_store = storage.files
 

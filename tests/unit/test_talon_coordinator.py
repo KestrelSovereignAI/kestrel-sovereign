@@ -744,8 +744,11 @@ def _obs_event(
 def _agent_with_obs_events(events):
     """Agent whose observability_store.query_events returns ``events``.
 
-    ``query_events`` asserts it is filtered to the talon-job event_type so a
-    regression that drops the filter (and scans every event type) is caught.
+    The captured kwargs let a test assert the query is scoped to the talon-job
+    event_type AND to this agent's own ``agent_name`` — so a regression that
+    drops either filter (scanning every event type, or every tenant's rows) is
+    caught. The fake itself ignores the filters and returns ``events`` verbatim;
+    real store-level filtering is proved by the SQLite tests below.
     """
     agent = _make_agent()
     captured = {}
@@ -785,8 +788,10 @@ class TestTalonStatusObservability:
         assert job["repo"] == "org/repo"
         assert job["issue"] == 42
         assert job["orchestrator"] == "ClaudeCode"
-        # The query is scoped to the talon-job event type.
+        # The query is scoped to the talon-job event type AND to this agent's
+        # own identity (tenant isolation on a shared store, #2649 review).
         assert agent._obs_query_kwargs["event_type"] == "talon_job"
+        assert agent._obs_query_kwargs["agent_name"] == "kestrel"
 
     @pytest.mark.asyncio
     async def test_merged_view_registry_and_observability(self):
@@ -961,12 +966,49 @@ class TestTalonStatusObservability:
 
 
 class TestTalonStatusObservabilityRealStore:
-    """End-to-end against a real SQLite ObservabilityStore (#2646)."""
+    """End-to-end against a real SQLite ObservabilityStore (#2646, #2649)."""
 
-    @pytest.mark.asyncio
-    async def test_real_store_talon_job_events_surface(self, tmp_path):
+    @staticmethod
+    async def _write_talon_job(store, backend, *, evt_id, owner, job_id,
+                               repo, issue, orchestrator="ClaudeCode"):
+        """Write one owned ``talon_job`` lifecycle event, tagged with ``owner``.
+
+        The ``agent_name`` column is the OWNERSHIP boundary talon_status scopes
+        on — the dispatching agent whose status should surface the job, not the
+        worker that ran it.
+        """
         import json as _json
 
+        await backend.execute(
+            """
+            INSERT INTO a2a_observability
+            (id, timestamp, agent_name, session_id, event_type,
+             tool_name, duration_ms, success, error_message, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evt_id,
+                store.now_utc_param(),
+                owner,
+                f"sess-{evt_id}",
+                "talon_job",
+                None,
+                None,
+                store.to_bool_param(True),
+                None,
+                _json.dumps({
+                    "talon_job_id": job_id,
+                    "talon_event": "completed",
+                    "repo": repo,
+                    "issue": issue,
+                    "orchestrator": orchestrator,
+                }),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_store_owned_talon_job_surfaces(self, tmp_path):
+        """The owning agent sees its own talon-job lifecycle event end-to-end."""
         from kestrel_sovereign.a2a.stores.unified.observability_store import (
             ObservabilityStore,
         )
@@ -977,42 +1019,20 @@ class TestTalonStatusObservabilityRealStore:
         store = ObservabilityStore(backend)
         await store.initialize()
         try:
-            # An external producer (Claude Code session / peer host) writes a
-            # talon-job lifecycle event straight into the shared store.
-            await backend.execute(
-                """
-                INSERT INTO a2a_observability
-                (id, timestamp, agent_name, session_id, event_type,
-                 tool_name, duration_ms, success, error_message, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "evt-1",
-                    store.now_utc_param(),
-                    "did:web:peer",
-                    "sess-x",
-                    "talon_job",
-                    None,
-                    None,
-                    store.to_bool_param(True),
-                    None,
-                    _json.dumps({
-                        "talon_job_id": "ext-real",
-                        "talon_event": "completed",
-                        "repo": "org/repo",
-                        "issue": 314,
-                        "orchestrator": "ClaudeCode",
-                    }),
-                ),
+            # A producer writes a talon-job lifecycle event OWNED by "kestrel"
+            # (the reading agent's own identity).
+            await self._write_talon_job(
+                store, backend, evt_id="evt-1", owner="kestrel",
+                job_id="ext-real", repo="org/repo", issue=314,
             )
             # A non-talon observability row that must be ignored.
             await store.log_metric(
-                agent_name="did:web:peer",
+                agent_name="kestrel",
                 metric_name="feature_tools_built",
                 metric_value=5,
             )
 
-            agent = _make_agent()
+            agent = _make_agent()  # agent_name == "kestrel"
             agent.observability_store = store
             feature = TalonCoordinatorFeature(agent)
             result = await feature.talon_status()
@@ -1026,6 +1046,56 @@ class TestTalonStatusObservabilityRealStore:
             assert job["repo"] == "org/repo"
             assert job["issue"] == 314
             assert job["orchestrator"] == "ClaudeCode"
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_real_store_isolates_talon_jobs_across_agents(self, tmp_path):
+        """Shared-store multi-agent regression (#2649): on ONE shared store, each
+        agent's talon_status surfaces only the jobs it owns — never a peer's
+        external job ids, repos, issues, or orchestrator metadata."""
+        from kestrel_sovereign.a2a.stores.unified.observability_store import (
+            ObservabilityStore,
+        )
+        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+        backend = SQLiteBackend(str(tmp_path / "obs.db"))
+        await backend.connect()
+        store = ObservabilityStore(backend)
+        await store.initialize()
+        try:
+            # Two agents share the same store/table (the shared-pool topology).
+            await self._write_talon_job(
+                store, backend, evt_id="evt-a", owner="kestrel",
+                job_id="job-kestrel", repo="org/kestrel-repo", issue=11,
+            )
+            await self._write_talon_job(
+                store, backend, evt_id="evt-b", owner="did:web:peer",
+                job_id="job-peer", repo="org/peer-secret", issue=99,
+            )
+
+            def _feature_for(name):
+                agent = _make_agent()
+                agent.agent_name = name
+                agent._agent_name = name
+                agent.observability_store = store
+                return TalonCoordinatorFeature(agent)
+
+            kestrel_jobs = (await _feature_for("kestrel").talon_status()).data
+            peer_jobs = (await _feature_for("did:web:peer").talon_status()).data
+
+            # kestrel sees ONLY its own job; the peer's is invisible.
+            k_ids = {j["id"] for j in kestrel_jobs["jobs"]}
+            assert k_ids == {"job-kestrel"}
+            assert kestrel_jobs["observability_count"] == 1
+            assert all(
+                j.get("repo") != "org/peer-secret" for j in kestrel_jobs["jobs"]
+            )
+
+            # ...and symmetrically, the peer sees ONLY its own job.
+            p_ids = {j["id"] for j in peer_jobs["jobs"]}
+            assert p_ids == {"job-peer"}
+            assert peer_jobs["observability_count"] == 1
         finally:
             await store.close()
 

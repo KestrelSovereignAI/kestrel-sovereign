@@ -66,7 +66,8 @@ class TestFilesEndpoint:
         file_store.file_exists = AsyncMock(return_value=True)
         file_store.get_file_metadata = AsyncMock(return_value=None)
 
-        agent = MagicMock(storage=MagicMock(files=file_store))
+        storage = MagicMock(files=file_store, agent_id="did:test:file-endpoint")
+        agent = MagicMock(storage=storage, agent_id="did:test:file-endpoint")
         app = FastAPI()
         app.include_router(files_router)
         app.state.agent = agent

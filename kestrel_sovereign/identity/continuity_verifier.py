@@ -19,6 +19,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from kestrel_sovereign.storage.async_graph_store import (
+    record_graph_edge_owner,
+    record_graph_node_owner,
+)
+
 from .identity_package import (
     AgentIdentityPackage,
     MigrationRecord,
@@ -610,21 +615,33 @@ class AuditTrail:
             "timestamp": certificate.timestamp,
         }
 
-        await self.db.execute(
-            """INSERT INTO graph_nodes (node_id, node_type, label, properties)
-               VALUES (?, 'migration_record', ?, ?)""",
-            (certificate.migration_id, f"Migration to {certificate.target_substrate}",
-             json.dumps(properties))
-        )
+        async with self.db.transaction():
+            await self.db.execute(
+                """INSERT INTO graph_nodes (node_id, node_type, label, properties)
+                   VALUES (?, 'migration_record', ?, ?)""",
+                (
+                    certificate.migration_id,
+                    f"Migration to {certificate.target_substrate}",
+                    json.dumps(properties),
+                ),
+            )
+            await record_graph_node_owner(
+                self.db, certificate.migration_id, agent_id
+            )
 
-        # Link to agent
-        await self.db.execute(
-            """INSERT INTO graph_edges (source_id, target_id, label)
-               VALUES (?, ?, 'migrated_via')""",
-            (agent_id, certificate.migration_id)
-        )
-
-        await self.db.commit()
+            # Link to agent
+            await self.db.execute(
+                """INSERT INTO graph_edges (source_id, target_id, label)
+                   VALUES (?, ?, 'migrated_via')""",
+                (agent_id, certificate.migration_id),
+            )
+            await record_graph_edge_owner(
+                self.db,
+                agent_id,
+                certificate.migration_id,
+                "migrated_via",
+                agent_id,
+            )
         logger.info(f"Recorded migration {certificate.migration_id}")
         return certificate.migration_id
 
@@ -645,9 +662,17 @@ class AuditTrail:
             """SELECT gn.node_id, gn.properties
                FROM graph_nodes gn
                JOIN graph_edges ge ON gn.node_id = ge.target_id
-               WHERE ge.source_id = ? AND gn.node_type = 'migration_record'
+               JOIN graph_node_owners gno
+                 ON gno.node_id = gn.node_id AND gno.agent_id = ?
+               JOIN graph_edge_owners geo
+                 ON geo.source_id = ge.source_id
+                AND geo.target_id = ge.target_id
+                AND geo.label = ge.label
+                AND geo.agent_id = ?
+               WHERE ge.source_id = ? AND ge.label = 'migrated_via'
+                 AND gn.node_type = 'migration_record'
                ORDER BY gn.node_id DESC""",
-            (agent_id,)
+            (agent_id, agent_id, agent_id),
         )
 
         history = []

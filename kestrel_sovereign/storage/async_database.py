@@ -22,6 +22,21 @@ CREATE TABLE IF NOT EXISTS files (
     metadata TEXT
 );
 
+-- A content-addressed blob can be referenced by more than one agent, but the
+-- physical ``files`` row is not itself a tenant boundary.  Keep the reference
+-- metadata beside the authoritative owner witness so a tenant-bound reader
+-- never learns another tenant's filename or metadata through deduplication.
+CREATE TABLE IF NOT EXISTS file_owners (
+    content_hash TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    metadata TEXT,
+    PRIMARY KEY (content_hash, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_owners_agent
+    ON file_owners(agent_id, content_hash);
+
 CREATE TABLE IF NOT EXISTS graph_nodes (
     node_id TEXT PRIMARY KEY,
     node_type TEXT NOT NULL,
@@ -43,12 +58,48 @@ CREATE TABLE IF NOT EXISTS graph_edges (
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_id, label);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_label ON graph_edges(label);
 
+-- Authoritative tenant ownership for graph rows.  Ownership is kept outside
+-- properties JSON because graph nodes such as content-addressed constitutions
+-- can legitimately be shared by multiple agents, while an edge has its own
+-- disclosure boundary independent of either endpoint (#2649).
+CREATE TABLE IF NOT EXISTS graph_node_owners (
+    node_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    PRIMARY KEY (node_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_node_owners_agent
+    ON graph_node_owners(agent_id, node_id);
+
+CREATE TABLE IF NOT EXISTS graph_edge_owners (
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    PRIMARY KEY (source_id, target_id, label, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_edge_owners_agent
+    ON graph_edge_owners(agent_id, source_id, target_id, label);
+
 CREATE TABLE IF NOT EXISTS document_chunks (
     chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_hash TEXT NOT NULL,
     content TEXT NOT NULL,
     embedding BLOB
 );
+
+-- Chunk text is caller-supplied and is therefore a separate tenant
+-- capability from the content-addressed file bytes. Two agents may own the
+-- same file without sharing annotations or derived chunk content.
+CREATE TABLE IF NOT EXISTS document_chunk_owners (
+    chunk_id INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunk_owners_agent
+    ON document_chunk_owners(agent_id, chunk_id);
 
 CREATE TABLE IF NOT EXISTS conversation_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -710,6 +761,26 @@ class AsyncDatabase:
             if statement:
                 await self._backend.execute(statement)
 
+        # #2649: legacy graph rows predate the authoritative ownership
+        # ledgers above.  Backfill only ownership that can be proven from an
+        # existing agent tag/root, a canonical agent-namespaced node id, or a
+        # constitution edge that agrees with the root's anchored hash.  The
+        # migration is idempotent and deliberately leaves ambiguous/cross-
+        # tenant rows unowned so explorer reads fail closed.
+        await self._backfill_graph_ownership()
+
+        # File blobs need the same explicit tenant capability as graph rows.
+        # Only a pre-existing owned document/avatar graph node is strong enough
+        # to backfill a legacy reference. Generic/unreferenced legacy blobs stay
+        # unowned and therefore inaccessible to tenant-bound stores.
+        await self._backfill_file_ownership()
+
+        # Legacy chunks are visible to a tenant only when the corresponding
+        # file has one unambiguous owner. Shared/ownerless documents remain
+        # unowned rather than granting one tenant another tenant's derived
+        # plaintext during upgrade.
+        await self._backfill_document_chunk_ownership()
+
         # Soft-delete migration (#763): add deleted_at to conversation_history
         # for databases created before soft-delete shipped. Idempotent — does
         # nothing on fresh databases (column already in CREATE TABLE). The
@@ -939,6 +1010,365 @@ class AsyncDatabase:
             )
 
         logger.debug(f"Database schema initialized ({self.backend_type})")
+
+    async def _backfill_graph_ownership(self) -> None:
+        """Backfill authoritative graph ownership without guessing.
+
+        Existing databases used ``properties.agent_id`` for most private
+        nodes, but message nodes and agent roots were known exceptions.  Edge
+        ownership was previously inferred from endpoint membership, which is
+        unsafe for cross-tenant links and loses valid edges to shared nodes.
+        This migration records only mechanically provable ownership.
+        """
+
+        def insert_ignore(table: str, columns: str, select_sql: str) -> str:
+            if self.backend_type == "postgres":
+                return (
+                    f"INSERT INTO {table} ({columns}) {select_sql} "
+                    "ON CONFLICT DO NOTHING"
+                )
+            return f"INSERT OR IGNORE INTO {table} ({columns}) {select_sql}"
+
+        node_agent = (
+            "(properties::jsonb->>'agent_id')"
+            if self.backend_type == "postgres"
+            else "json_extract(properties, '$.agent_id')"
+        )
+        root_constitution_hash = (
+            "(root.properties::jsonb->>'constitution_hash')"
+            if self.backend_type == "postgres"
+            else "json_extract(root.properties, '$.constitution_hash')"
+        )
+
+        async with self.transaction():
+            # Explicit legacy tags remain authoritative.
+            await self.execute(
+                insert_ignore(
+                    "graph_node_owners",
+                    "node_id, agent_id",
+                    "SELECT node_id, " + node_agent + " FROM graph_nodes "
+                    "WHERE " + node_agent + " IS NOT NULL "
+                    "AND " + node_agent + " <> ''",
+                )
+            )
+
+            # The DID-keyed agent row is its own canonical owner.
+            await self.execute(
+                insert_ignore(
+                    "graph_node_owners",
+                    "node_id, agent_id",
+                    "SELECT node_id, node_id FROM graph_nodes "
+                    "WHERE node_type = 'agent' AND node_id <> ''",
+                )
+            )
+
+            # These writers encode the complete agent DID between a stable
+            # prefix and the next colon.  Compare by exact prefix length rather
+            # than LIKE so hostile '%'/'_' identifiers cannot act as wildcards.
+            for prefix in ("message:", "concept:", "action:", "decision:", "graduation:"):
+                prefix_len = len(prefix)
+                await self.execute(
+                    insert_ignore(
+                        "graph_node_owners",
+                        "node_id, agent_id",
+                        "SELECT n.node_id, roots.agent_id "
+                        "FROM graph_nodes n "
+                        "JOIN graph_node_owners roots ON roots.node_id = roots.agent_id "
+                        "WHERE substr(n.node_id, 1, ? + length(roots.agent_id) + 1) "
+                        "= ? || roots.agent_id || ':'",
+                    ),
+                    (prefix_len, prefix),
+                )
+
+            # The pre-v2 identity importer namespaced relationship and skill
+            # nodes as ``{agent_id[:20]}_<raw-id>``.  The prefix alone is not
+            # ownership proof because many did:pkh identities share those
+            # first 20 characters.  Admit it only when exactly one canonical
+            # agent root references the node; a collision referenced by two
+            # roots deliberately remains unowned.
+            await self.execute(
+                insert_ignore(
+                    "graph_node_owners",
+                    "node_id, agent_id",
+                    "SELECT n.node_id, roots.agent_id "
+                    "FROM graph_nodes n "
+                    "JOIN graph_edges e ON e.target_id = n.node_id "
+                    "JOIN graph_node_owners roots "
+                    "  ON roots.node_id = e.source_id "
+                    " AND roots.agent_id = e.source_id "
+                    "WHERE n.node_type IN ('user', 'skill') "
+                    "AND substr(n.node_id, 1, length(substr(roots.agent_id, 1, 20)) + 1) "
+                    "    = substr(roots.agent_id, 1, 20) || '_' "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM graph_edges other_e "
+                    "  JOIN graph_node_owners other_roots "
+                    "    ON other_roots.node_id = other_e.source_id "
+                    "   AND other_roots.agent_id = other_e.source_id "
+                    "  WHERE other_e.target_id = n.node_id "
+                    "    AND other_roots.agent_id <> roots.agent_id"
+                    ")",
+                )
+            )
+
+            # Legacy migration records were not namespaced.  A migrated_via
+            # edge from exactly one self-owned agent root is the durable proof
+            # of ownership; duplicate/colliding references fail closed.
+            await self.execute(
+                insert_ignore(
+                    "graph_node_owners",
+                    "node_id, agent_id",
+                    "SELECT n.node_id, roots.agent_id "
+                    "FROM graph_nodes n "
+                    "JOIN graph_edges e "
+                    "  ON e.target_id = n.node_id AND e.label = 'migrated_via' "
+                    "JOIN graph_node_owners roots "
+                    "  ON roots.node_id = e.source_id "
+                    " AND roots.agent_id = e.source_id "
+                    "WHERE n.node_type = 'migration_record' "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM graph_edges other_e "
+                    "  JOIN graph_node_owners other_roots "
+                    "    ON other_roots.node_id = other_e.source_id "
+                    "   AND other_roots.agent_id = other_e.source_id "
+                    "  WHERE other_e.target_id = n.node_id "
+                    "    AND other_e.label = 'migrated_via' "
+                    "    AND other_roots.agent_id <> roots.agent_id"
+                    ")",
+                )
+            )
+
+            await self.execute(
+                insert_ignore(
+                    "graph_node_owners",
+                    "node_id, agent_id",
+                    "SELECT n.node_id, roots.agent_id "
+                    "FROM graph_nodes n "
+                    "JOIN graph_node_owners roots ON roots.node_id = roots.agent_id "
+                    "WHERE n.node_id = roots.agent_id || '#soul'",
+                )
+            )
+
+            # Consolidated episode graph nodes use the same stable id as the
+            # authoritative memory_episodes row, whose physical agent_id
+            # column predates the graph ownership ledger.
+            await self.execute(
+                insert_ignore(
+                    "graph_node_owners",
+                    "node_id, agent_id",
+                    "SELECT n.node_id, episodes.agent_id "
+                    "FROM graph_nodes n "
+                    "JOIN memory_episodes episodes ON episodes.id = n.node_id "
+                    "WHERE n.node_type = 'episode' "
+                    "AND episodes.agent_id <> ''",
+                )
+            )
+
+            # A legacy constitution node is shared content, but each root can
+            # prove its own ownership reference by matching the target to the
+            # hash persisted on that exact root.  This is stronger than
+            # trusting a governed_by label on an arbitrary edge.
+            await self.execute(
+                insert_ignore(
+                    "graph_node_owners",
+                    "node_id, agent_id",
+                    "SELECT target.node_id, roots.agent_id "
+                    "FROM graph_edges e "
+                    "JOIN graph_nodes root ON root.node_id = e.source_id "
+                    "JOIN graph_nodes target ON target.node_id = e.target_id "
+                    "JOIN graph_node_owners roots "
+                    "  ON roots.node_id = root.node_id "
+                    " AND roots.agent_id = root.node_id "
+                    "WHERE e.label = 'governed_by' "
+                    "AND root.node_type = 'agent' "
+                    "AND target.node_type = 'document' "
+                    "AND " + root_constitution_hash + " = e.target_id",
+                )
+            )
+
+            # A spawned child authors its outbound lineage witness even when
+            # the parent node is absent from the child's private database or is
+            # owned only by the parent in a shared database. The canonical
+            # agent-root source proves which child owns this intentional
+            # cross-agent edge; endpoint co-ownership is not required.
+            await self.execute(
+                insert_ignore(
+                    "graph_edge_owners",
+                    "source_id, target_id, label, agent_id",
+                    "SELECT e.source_id, e.target_id, e.label, roots.agent_id "
+                    "FROM graph_edges e "
+                    "JOIN graph_node_owners roots "
+                    "  ON roots.node_id = e.source_id "
+                    " AND roots.agent_id = e.source_id "
+                    "WHERE e.label = 'spawned_by'",
+                )
+            )
+
+            # An ownerless legacy edge can be assigned only when its endpoints
+            # have exactly one common owner.  Existing edge ownership is
+            # authoritative and independent of endpoint ownership: rerunning
+            # this migration must never grant a newly-added common node owner
+            # access to another tenant's already-owned edge payload.
+            await self.execute(
+                insert_ignore(
+                    "graph_edge_owners",
+                    "source_id, target_id, label, agent_id",
+                    "SELECT e.source_id, e.target_id, e.label, MIN(src.agent_id) "
+                    "FROM graph_edges e "
+                    "JOIN graph_node_owners src ON src.node_id = e.source_id "
+                    "JOIN graph_node_owners dst "
+                    "  ON dst.node_id = e.target_id "
+                    " AND dst.agent_id = src.agent_id "
+                    "WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM graph_edge_owners existing_owner "
+                    "  WHERE existing_owner.source_id = e.source_id "
+                    "    AND existing_owner.target_id = e.target_id "
+                    "    AND existing_owner.label = e.label"
+                    ") "
+                    "GROUP BY e.source_id, e.target_id, e.label "
+                    "HAVING COUNT(DISTINCT src.agent_id) = 1",
+                )
+            )
+
+    async def _backfill_file_ownership(self) -> None:
+        """Backfill only legacy files anchored by a canonical agent root.
+
+        Generic blobs historically had no authoritative owner.  Metadata JSON
+        is intentionally not trusted for migration because it was not an
+        isolation boundary and may be caller-controlled. An orphan graph node
+        is insufficient too: a tenant could name it after a known foreign
+        content hash. Only a canonical constitution/avatar pointer on a
+        self-owned agent root, with its matching relationship and typed target,
+        is accepted; ambiguous roots fail closed.
+        """
+
+        root_constitution_hash = (
+            "(root.properties::jsonb->>'constitution_hash')"
+            if self.backend_type == "postgres"
+            else "json_extract(root.properties, '$.constitution_hash')"
+        )
+        root_avatar_hash = (
+            "(root.properties::jsonb->>'avatar_hash')"
+            if self.backend_type == "postgres"
+            else "json_extract(root.properties, '$.avatar_hash')"
+        )
+        target_avatar_hash = (
+            "COALESCE(target.properties::jsonb->>'hash', e.target_id)"
+            if self.backend_type == "postgres"
+            else "COALESCE(json_extract(target.properties, '$.hash'), e.target_id)"
+        )
+        proven_owners = f"""
+            SELECT DISTINCT e.target_id AS content_hash,
+                   roots.agent_id AS agent_id,
+                   'constitution' AS reference_kind
+            FROM graph_edges e
+            JOIN graph_nodes root ON root.node_id = e.source_id
+            JOIN graph_nodes target ON target.node_id = e.target_id
+            JOIN graph_node_owners roots
+              ON roots.node_id = root.node_id
+             AND roots.agent_id = root.node_id
+            WHERE e.label = 'governed_by'
+              AND root.node_type = 'agent'
+              AND target.node_type = 'document'
+              AND target.label = 'KESTREL_CONSTITUTION'
+              AND {root_constitution_hash} = e.target_id
+            UNION ALL
+            SELECT avatar_witnesses.content_hash,
+                   MIN(avatar_witnesses.agent_id) AS agent_id,
+                   'avatar' AS reference_kind
+            FROM (
+                SELECT {target_avatar_hash} AS content_hash,
+                       roots.agent_id AS agent_id
+                FROM graph_edges e
+                JOIN graph_nodes root ON root.node_id = e.source_id
+                JOIN graph_nodes target ON target.node_id = e.target_id
+                JOIN graph_node_owners roots
+                  ON roots.node_id = root.node_id
+                 AND roots.agent_id = root.node_id
+                WHERE e.label = 'has_avatar'
+                  AND root.node_type = 'agent'
+                  AND target.node_type = 'avatar'
+                  AND {root_avatar_hash} = {target_avatar_hash}
+            ) avatar_witnesses
+            GROUP BY avatar_witnesses.content_hash
+            HAVING COUNT(DISTINCT avatar_witnesses.agent_id) = 1
+        """
+
+        if self.backend_type == "postgres":
+            sql = f"""
+                INSERT INTO file_owners
+                    (content_hash, agent_id, original_name, metadata)
+                SELECT f.content_hash, owners.agent_id,
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN 'KESTREL_CONSTITUTION.md'
+                            ELSE f.original_name END,
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN '{{}}'
+                            ELSE f.metadata END
+                FROM files f
+                JOIN ({proven_owners}) owners
+                  ON owners.content_hash = f.content_hash
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM file_owners existing_owner
+                      WHERE existing_owner.content_hash = f.content_hash
+                        AND existing_owner.agent_id = owners.agent_id
+                  )
+                ON CONFLICT DO NOTHING
+            """
+        else:
+            sql = f"""
+                INSERT OR IGNORE INTO file_owners
+                    (content_hash, agent_id, original_name, metadata)
+                SELECT f.content_hash, owners.agent_id,
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN 'KESTREL_CONSTITUTION.md'
+                            ELSE f.original_name END,
+                       CASE WHEN owners.reference_kind = 'constitution'
+                            THEN '{{}}'
+                            ELSE f.metadata END
+                FROM files f
+                JOIN ({proven_owners}) owners
+                  ON owners.content_hash = f.content_hash
+                WHERE NOT EXISTS (
+                      SELECT 1 FROM file_owners existing_owner
+                      WHERE existing_owner.content_hash = f.content_hash
+                        AND existing_owner.agent_id = owners.agent_id
+                  )
+            """
+        await self.execute(sql)
+
+    async def _backfill_document_chunk_ownership(self) -> None:
+        """Assign legacy chunks only from an unambiguous file capability."""
+
+        if self.backend_type == "postgres":
+            sql = """
+                INSERT INTO document_chunk_owners (chunk_id, agent_id)
+                SELECT chunks.chunk_id, MIN(owners.agent_id)
+                FROM document_chunks chunks
+                JOIN file_owners owners
+                  ON owners.content_hash = chunks.file_hash
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_chunk_owners existing_owner
+                    WHERE existing_owner.chunk_id = chunks.chunk_id
+                )
+                GROUP BY chunks.chunk_id
+                HAVING COUNT(DISTINCT owners.agent_id) = 1
+                ON CONFLICT DO NOTHING
+            """
+        else:
+            sql = """
+                INSERT OR IGNORE INTO document_chunk_owners (chunk_id, agent_id)
+                SELECT chunks.chunk_id, MIN(owners.agent_id)
+                FROM document_chunks chunks
+                JOIN file_owners owners
+                  ON owners.content_hash = chunks.file_hash
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_chunk_owners existing_owner
+                    WHERE existing_owner.chunk_id = chunks.chunk_id
+                )
+                GROUP BY chunks.chunk_id
+                HAVING COUNT(DISTINCT owners.agent_id) = 1
+            """
+        await self.execute(sql)
 
     async def _migrate_add_column(
         self, table: str, column: str, col_def: str

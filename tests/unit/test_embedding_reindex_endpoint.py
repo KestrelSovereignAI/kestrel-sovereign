@@ -141,7 +141,7 @@ class _FakeRequest:
 def _agent(db, service, route: str = "ollama:local", agent_id: str = "a1"):
     return SimpleNamespace(
         llm_service=_FakeLLM(service, route=route),
-        storage=SimpleNamespace(db=db),
+        storage=SimpleNamespace(db=db, agent_id=agent_id),
         agent_id=agent_id,
     )
 
@@ -183,6 +183,22 @@ async def test_reindex_dry_run_reports_counts_and_touches_nothing(seeded_db):
     assert svc.calls == 0
     remaining = EmbeddingReindexer(seeded_db, svc, TARGET, column_dim=DIM)
     assert sum((await remaining.count_all_stale(agent_id="a1")).values()) == 6
+
+
+@pytest.mark.asyncio
+async def test_reindex_rejects_crosswired_storage_before_corpus_sql(seeded_db):
+    svc = FakeEmbeddingService()
+    agent = _agent(seeded_db, svc, agent_id="a1")
+    agent.storage.agent_id = "a2"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await model_endpoints.reindex_embeddings(
+            _FakeRequest(agent, {"dry_run": True})
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Storage not available."
+    assert svc.calls == 0
 
 
 @pytest.mark.asyncio
@@ -326,6 +342,19 @@ async def _seed_unembeddable_chunk(db) -> None:
         "INSERT INTO document_chunks (file_hash, content, embedding_profile_id) "
         "VALUES (?, ?, ?)",
         ("blankchunk", "   ", None),
+    )
+    row = await db.fetchone(
+        "SELECT chunk_id FROM document_chunks "
+        "WHERE file_hash = 'blankchunk' ORDER BY chunk_id DESC LIMIT 1"
+    )
+    await db.execute_commit(
+        "INSERT OR IGNORE INTO file_owners "
+        "(content_hash, agent_id, original_name, metadata) VALUES (?, ?, ?, ?)",
+        ("blankchunk", "a1", "blank.txt", "{}"),
+    )
+    await db.execute_commit(
+        "INSERT INTO document_chunk_owners (chunk_id, agent_id) VALUES (?, ?)",
+        (row[0], "a1"),
     )
 
 
@@ -514,7 +543,7 @@ async def test_reindex_refuses_when_persisted_route_cannot_be_applied(seeded_db)
     svc = FakeEmbeddingService()
     agent = SimpleNamespace(
         llm_service=_RaisingLLM(svc, route="ollama:local"),
-        storage=SimpleNamespace(db=seeded_db),
+        storage=SimpleNamespace(db=seeded_db, agent_id="a1"),
         agent_id="a1",
     )
     request = _FakeRequest(agent, {"dry_run": True})

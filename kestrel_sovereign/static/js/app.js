@@ -40,8 +40,8 @@ import { initMetrics, loadMetrics } from './metrics.js';
 // body through the panel registry like any out-of-tree feature panel.
 import { initFeatureStore, loadFeatureStore } from './feature-store.js';
 import { initApprovals, loadApprovals } from './approvals.js';
-// Import modules with side effects that define window.* functions
-import './database.js';  // Defines window.toggleDbExplorer
+// Import compatibility globals and explicit runtime initializers.
+import { initDatabaseExplorer } from './database.js';
 import './ipfs.js';      // Defines window.toggleIpfsStatus
 
 // ============================================================================
@@ -50,6 +50,11 @@ import './ipfs.js';      // Defines window.toggleIpfsStatus
 
 async function init() {
     console.log('Kestrel Sovereign Console initializing...');
+
+    // Bind the standalone database explorer to this console's API + DOM. The
+    // embeddable mountPanels runtime performs the same initialization with its
+    // mount-scoped API and panel root.
+    initDatabaseExplorer({ api: API, root: document });
 
     // Check for agent parameter in URL (multi-agent mode)
     initAgentFromUrl();

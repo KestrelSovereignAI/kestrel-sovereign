@@ -465,12 +465,12 @@
                 <div class="mt-5 section-divider">
                     <div class="row-between mb-3">
                         <h3 class="m-0" data-label-key="sovereignty_db_explorer">Database Explorer</h3>
-                        <button class="btn btn-secondary" id="toggle-db-explorer" onclick="toggleDbExplorer()"><span class="ki ki-cabinet"></span> <span data-label-key="btn_browse_database">Browse Database</span></button>
+                        <button class="btn btn-secondary" id="toggle-db-explorer" type="button" aria-controls="db-explorer-section" aria-expanded="false"><span class="ki ki-cabinet" aria-hidden="true"></span> <span data-label-key="btn_browse_database">Browse Database</span></button>
                     </div>
                     <p class="text-muted text-md mb-3" data-label-key="sovereignty_db_description">
                         Read-only view of agent database tables and contents.
                     </p>
-                    <div id="db-explorer-section" style="display: none;">
+                    <div id="db-explorer-section" style="display: none;" hidden>
                         <div id="db-explorer-container">
                             <div class="loading" data-label-key="loading_database">Loading database...</div>
                         </div>

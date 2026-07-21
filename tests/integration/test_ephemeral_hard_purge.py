@@ -120,7 +120,7 @@ async def test_purge_destroys_leaked_graph_nodes(tmp_path):
     stamp it).  Pre-stint nodes are now correctly preserved by the
     scoped purge — that's the safety improvement on the table.
     """
-    from kestrel_sovereign.storage.async_graph_store import GraphNode
+    from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
     db_path = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.EPHEMERAL)
@@ -136,7 +136,8 @@ async def test_purge_destroys_leaked_graph_nodes(tmp_path):
             node_id="leak-2", node_type="memory", label="memory-leak-2",
             properties={"agent_id": AGENT_ID, "created_at": leak_ts},
         ))
-        await storage.graph.add_node(GraphNode(
+        other_graph = AsyncGraphStore(storage.db, agent_id=OTHER_AGENT_ID)
+        await other_graph.add_node(GraphNode(
             node_id="other-1", node_type="memory", label="other",
             properties={"agent_id": OTHER_AGENT_ID, "created_at": leak_ts},
         ))
@@ -151,7 +152,8 @@ async def test_purge_destroys_leaked_graph_nodes(tmp_path):
         assert await storage.graph.get_node("leak-2") is None
 
         # Other agent's node untouched — per-agent scoping is preserved
-        survivor = await storage.graph.get_node("other-1")
+        assert await storage.graph.get_node("other-1") is None
+        survivor = await other_graph.get_node("other-1")
         assert survivor is not None
         assert survivor.label == "other"
 

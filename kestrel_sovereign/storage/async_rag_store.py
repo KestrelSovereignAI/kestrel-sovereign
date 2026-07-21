@@ -81,11 +81,51 @@ class AsyncRAGStore:
     Results are merged using Reciprocal Rank Fusion (RRF).
     """
 
-    def __init__(self, db: AsyncDatabase, llm_service: Optional[Any] = None):
+    def __init__(
+        self,
+        db: AsyncDatabase,
+        llm_service: Optional[Any] = None,
+        agent_id: str = "",
+    ):
         self.db = db
         self._bm25_index: Optional[AsyncBM25Index] = None
         self._bm25_built = False
         self._llm_service = llm_service
+        self.agent_id = agent_id
+
+    def bind_agent(self, agent_id: str) -> None:
+        """Bind document reads and writes to one tenant capability."""
+        if not agent_id:
+            raise ValueError("RAG ownership binding requires a non-empty agent_id")
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError("RAG store is already bound to a different agent")
+        self.agent_id = agent_id
+        self._bm25_index = None
+        self._bm25_built = False
+
+    def _owner_scope(
+        self,
+        chunk_table: str = "document_chunks",
+        owner_alias: str = "rag_chunk_owner",
+    ) -> Tuple[str, Tuple[Any, ...]]:
+        """Return chunk and file capability predicates for tenant reads."""
+        # Some narrowly-scoped callers construct a store with ``__new__`` to
+        # exercise retrieval without initializing an ownership capability.
+        # Preserve that legacy unbound behavior; ordinary construction always
+        # defines ``agent_id`` in ``__init__``.
+        agent_id = getattr(self, "agent_id", "")
+        if not agent_id:
+            return "1 = 1", ()
+        file_owner_alias = f"{owner_alias}_file"
+        return (
+            "EXISTS (SELECT 1 FROM document_chunk_owners AS "
+            f"{owner_alias} WHERE {owner_alias}.chunk_id = "
+            f"{chunk_table}.chunk_id AND {owner_alias}.agent_id = ?) "
+            "AND EXISTS (SELECT 1 FROM file_owners AS "
+            f"{file_owner_alias} WHERE {file_owner_alias}.content_hash = "
+            f"{chunk_table}.file_hash AND {file_owner_alias}.agent_id = ?)",
+            (agent_id, agent_id),
+        )
 
     def _get_embedding_service(self):
         llm_service = getattr(self, "_llm_service", None)
@@ -112,6 +152,15 @@ class AsyncRAGStore:
         Returns:
             Number of chunks created
         """
+        if self.agent_id:
+            owned = await self.db.fetchone(
+                "SELECT 1 FROM file_owners "
+                "WHERE content_hash = ? AND agent_id = ?",
+                (file_hash, self.agent_id),
+            )
+            if not owned:
+                raise ValueError("Cannot index a file outside the bound agent")
+
         # Simple chunking by character count with overlap
         chunks = []
         overlap = chunk_size // 5  # 20% overlap
@@ -151,30 +200,36 @@ class AsyncRAGStore:
             if embedding:
                 embedding_blob = _serialize_embedding(embedding)
 
-            cursor = await self.db.execute(
-                "INSERT INTO document_chunks (file_hash, content, embedding) VALUES (?, ?, ?)",
-                (file_hash, chunk, embedding_blob)
-            )
-            if embedding:
-                # Capture chunk_id so we can populate embedding_vec
-                # outside the INSERT (the column may not exist yet on
-                # a DB whose migration hasn't run; _write_embedding_vec
-                # handles that gracefully).
-                chunk_id = getattr(cursor, "lastrowid", None)
-                if chunk_id is None:
-                    # Fallback for backends that don't expose lastrowid
-                    # on the execute() return — look up by file_hash +
-                    # content. Slow but only runs on backends that lack
-                    # cursor.lastrowid support.
+            chunk_id: int
+            async with self.db.transaction():
+                if self.db.backend_type == "postgres":
                     row = await self.db.fetchone(
-                        "SELECT chunk_id FROM document_chunks WHERE file_hash = ? "
-                        "AND content = ? ORDER BY chunk_id DESC LIMIT 1",
-                        (file_hash, chunk),
+                        "INSERT INTO document_chunks "
+                        "(file_hash, content, embedding) VALUES (?, ?, ?) "
+                        "RETURNING chunk_id",
+                        (file_hash, chunk, embedding_blob),
                     )
-                    if row:
-                        chunk_id = row[0]
-                if chunk_id is not None:
-                    new_chunk_ids.append((chunk_id, embedding))
+                else:
+                    await self.db.execute(
+                        "INSERT INTO document_chunks "
+                        "(file_hash, content, embedding) VALUES (?, ?, ?)",
+                        (file_hash, chunk, embedding_blob),
+                    )
+                    row = await self.db.fetchone("SELECT last_insert_rowid()")
+                if not row:
+                    raise RuntimeError("Could not resolve inserted RAG chunk id")
+                chunk_id = int(row[0])
+                if self.agent_id:
+                    # Chunk plaintext is caller-supplied, so ownership must be
+                    # recorded atomically with the row. File co-owners do not
+                    # implicitly share derived annotations or chunk content.
+                    await self.db.execute(
+                        "INSERT INTO document_chunk_owners "
+                        "(chunk_id, agent_id) VALUES (?, ?)",
+                        (chunk_id, self.agent_id),
+                    )
+            if embedding:
+                new_chunk_ids.append((chunk_id, embedding))
 
         # #1477 — derive the active embedding profile id once (same
         # for every chunk we just batched) so kNN can filter
@@ -386,7 +441,16 @@ class AsyncRAGStore:
             logger.warning(f"Failed to embed query: {e}")
             return []
 
-        sf = self._get_vector_session_factory()
+        # The generic document-chunk vector spec has no ownership join. Bound
+        # stores therefore use the scoped legacy path until the vector layer
+        # can express a file_owners semi-join; filtering only after top-k could
+        # both starve results and expose cross-tenant candidates.
+        # ``__new__``-constructed legacy stores are unbound, just as a store
+        # constructed with the default empty ``agent_id`` is. They may use the
+        # generic vector backend; a bound store must stay on the ownership-
+        # scoped path.
+        agent_id = getattr(self, "agent_id", "")
+        sf = None if agent_id else self._get_vector_session_factory()
         if sf is not None:
             scored = await self._search_via_vector_backend(
                 sf, query_embedding, limit, min_score,
@@ -496,10 +560,11 @@ class AsyncRAGStore:
                 chunk_id = int(chunk_id_str)
             except (TypeError, ValueError):
                 continue
+            owner_scope, owner_params = self._owner_scope()
             row = await self.db.fetchone(
                 "SELECT chunk_id, file_hash, content FROM document_chunks "
-                "WHERE chunk_id = ?",
-                (chunk_id,),
+                f"WHERE chunk_id = ? AND {owner_scope}",
+                (chunk_id,) + owner_params,
             )
             if not row:
                 # Row deleted between knn() and the lookup — skip.
@@ -550,14 +615,15 @@ class AsyncRAGStore:
                         "search: %s", exc,
                     )
 
+            owner_scope, owner_params = self._owner_scope()
             if current_profile_id is not None:
                 try:
                     rows = await self.db.fetchall(
                         "SELECT chunk_id, file_hash, content, embedding "
                         "FROM document_chunks "
-                        "WHERE embedding IS NOT NULL "
+                        f"WHERE {owner_scope} AND embedding IS NOT NULL "
                         "AND embedding_profile_id = ?",
-                        (current_profile_id,),
+                        owner_params + (current_profile_id,),
                     )
                 except Exception as exc:
                     # Profile column doesn't exist yet (#1477 migration
@@ -568,12 +634,16 @@ class AsyncRAGStore:
                     )
                     rows = await self.db.fetchall(
                         "SELECT chunk_id, file_hash, content, embedding "
-                        "FROM document_chunks WHERE embedding IS NOT NULL"
+                        "FROM document_chunks "
+                        f"WHERE {owner_scope} AND embedding IS NOT NULL",
+                        owner_params,
                     )
             else:
                 rows = await self.db.fetchall(
                     "SELECT chunk_id, file_hash, content, embedding "
-                    "FROM document_chunks WHERE embedding IS NOT NULL"
+                    "FROM document_chunks "
+                    f"WHERE {owner_scope} AND embedding IS NOT NULL",
+                    owner_params,
                 )
             if not rows:
                 return []
@@ -655,7 +725,10 @@ class AsyncRAGStore:
                 raw_limit = max(doc_count, limit)
             results = await self._bm25_index.asearch(query, raw_limit)
 
-            if current_profile_id is not None and results:
+            if results and (
+                current_profile_id is not None
+                or getattr(self, "agent_id", "")
+            ):
                 # Lookup profile ids for the candidate chunk_ids in
                 # bounded batches so SQLite's default ~999-variable
                 # parameter limit doesn't crash the IN-list and
@@ -668,8 +741,8 @@ class AsyncRAGStore:
                 ids = [int(r.doc_id) for r in results]
 
                 # First detect pre-migration shape: if the column
-                # doesn't exist, fall back to the unfiltered legacy
-                # behaviour rather than dropping every BM25 result.
+                # doesn't exist, skip only the profile comparison. Ownership
+                # candidates are still revalidated before they can return.
                 column_present = True
                 try:
                     await self.db.fetchall(
@@ -680,50 +753,52 @@ class AsyncRAGStore:
                     column_present = False
                     logger.debug(
                         "BM25 profile filter unavailable (column missing): "
-                        "%s; returning unfiltered results.", exc,
+                        "%s; applying ownership filter only.", exc,
                     )
 
-                if not column_present:
-                    results = results[:limit]
-                else:
-                    profile_by_id: Dict[int, Optional[str]] = {}
-                    # Track which ids we successfully looked up so a
-                    # transient batch failure can't be confused with
-                    # a legitimate NULL stamp (codex P2 round 6).
-                    looked_up: set[int] = set()
-                    for start in range(0, len(ids), _BATCH):
-                        chunk = ids[start:start + _BATCH]
-                        placeholders = ",".join("?" for _ in chunk)
-                        try:
+                profile_by_id: Dict[int, Optional[str]] = {}
+                # Track which ids we successfully looked up so a transient
+                # failure cannot admit an unverified ownership candidate.
+                looked_up: set[int] = set()
+                owner_scope, owner_params = self._owner_scope()
+                for start in range(0, len(ids), _BATCH):
+                    chunk = ids[start:start + _BATCH]
+                    placeholders = ",".join("?" for _ in chunk)
+                    try:
+                        if column_present:
                             profile_rows = await self.db.fetchall(
                                 f"SELECT chunk_id, embedding_profile_id "
                                 f"FROM document_chunks "
-                                f"WHERE chunk_id IN ({placeholders})",
-                                tuple(chunk),
+                                f"WHERE chunk_id IN ({placeholders}) "
+                                f"AND {owner_scope}",
+                                tuple(chunk) + owner_params,
                             )
                             for row in profile_rows:
                                 profile_by_id[row[0]] = row[1]
-                            looked_up.update(chunk)
-                        except Exception as exc:
-                            # Mid-batch error (transient, partial
-                            # result). Fail closed: candidates from
-                            # this batch stay OUT of ``looked_up``
-                            # so the final filter drops them.
-                            # Safer than treating an unknown lookup
-                            # as a legitimate NULL stamp.
-                            logger.warning(
-                                "BM25 profile lookup batch %d-%d failed "
-                                "(%s); dropping those candidates to "
-                                "avoid leaking foreign-profile rows.",
-                                start, start + len(chunk), exc,
+                        else:
+                            profile_rows = await self.db.fetchall(
+                                f"SELECT chunk_id FROM document_chunks "
+                                f"WHERE chunk_id IN ({placeholders}) "
+                                f"AND {owner_scope}",
+                                tuple(chunk) + owner_params,
                             )
+                        looked_up.update(row[0] for row in profile_rows)
+                    except Exception as exc:
+                        logger.warning(
+                            "BM25 ownership/profile lookup batch %d-%d failed "
+                            "(%s); dropping those candidates.",
+                            start, start + len(chunk), exc,
+                        )
 
-                    results = [
-                        r for r in results
-                        if int(r.doc_id) in looked_up
-                        and profile_by_id.get(int(r.doc_id))
+                results = [
+                    r for r in results
+                    if int(r.doc_id) in looked_up
+                    and (
+                        current_profile_id is None
+                        or profile_by_id.get(int(r.doc_id))
                         in (current_profile_id, None)
-                    ][:limit]
+                    )
+                ][:limit]
 
             return [
                 {
@@ -745,11 +820,16 @@ class AsyncRAGStore:
         if not BM25_AVAILABLE:
             return
 
+        owner_scope, owner_params = self._owner_scope()
         rows = await self.db.fetchall(
-            "SELECT chunk_id, file_hash, content FROM document_chunks"
+            "SELECT chunk_id, file_hash, content FROM document_chunks "
+            f"WHERE {owner_scope}",
+            owner_params,
         )
 
         if not rows:
+            self._bm25_index = None
+            self._bm25_built = True
             return
 
         self._bm25_index = AsyncBM25Index()
@@ -808,11 +888,12 @@ class AsyncRAGStore:
             )
             profile_params = (current_profile_id,)
 
+        owner_scope, owner_params = self._owner_scope()
         try:
             rows = await self.db.fetchall(
                 f"SELECT chunk_id, file_hash, content FROM document_chunks "
-                f"WHERE ({conditions}){profile_clause} LIMIT ?",
-                like_params + profile_params + (limit,),
+                f"WHERE {owner_scope} AND ({conditions}){profile_clause} LIMIT ?",
+                owner_params + like_params + profile_params + (limit,),
             )
         except Exception as exc:
             # Pre-migration DB → retry unfiltered.
@@ -822,8 +903,8 @@ class AsyncRAGStore:
             )
             rows = await self.db.fetchall(
                 f"SELECT chunk_id, file_hash, content FROM document_chunks "
-                f"WHERE {conditions} LIMIT ?",
-                like_params + (limit,),
+                f"WHERE {owner_scope} AND ({conditions}) LIMIT ?",
+                owner_params + like_params + (limit,),
             )
 
         return [
@@ -883,18 +964,55 @@ class AsyncRAGStore:
     
     async def get_chunks_for_file(self, file_hash: str) -> List[str]:
         """Get all chunks for a specific file."""
+        owner_scope, owner_params = self._owner_scope()
         rows = await self.db.fetchall(
-            "SELECT content FROM document_chunks WHERE file_hash = ? ORDER BY chunk_id",
-            (file_hash,)
+            "SELECT content FROM document_chunks "
+            f"WHERE file_hash = ? AND {owner_scope} ORDER BY chunk_id",
+            (file_hash,) + owner_params,
         )
         return [row[0] for row in rows]
     
     async def delete_chunks_for_file(self, file_hash: str) -> None:
-        """Delete all chunks for a file."""
-        await self.db.execute_commit(
-            "DELETE FROM document_chunks WHERE file_hash = ?",
-            (file_hash,)
-        )
+        """Delete only chunks owned by this tenant capability."""
+        if self.agent_id:
+            async with self.db.transaction():
+                owned_rows = await self.db.fetchall(
+                    "SELECT chunks.chunk_id FROM document_chunks chunks "
+                    "JOIN document_chunk_owners owners "
+                    "  ON owners.chunk_id = chunks.chunk_id "
+                    " AND owners.agent_id = ? "
+                    "WHERE chunks.file_hash = ?",
+                    (self.agent_id, file_hash),
+                )
+                owned_ids = [int(row[0]) for row in owned_rows]
+                for start in range(0, len(owned_ids), 500):
+                    batch = owned_ids[start:start + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    await self.db.execute(
+                        "DELETE FROM document_chunk_owners "
+                        f"WHERE agent_id = ? AND chunk_id IN ({placeholders})",
+                        (self.agent_id, *batch),
+                    )
+                    await self.db.execute(
+                        "DELETE FROM document_chunks "
+                        f"WHERE chunk_id IN ({placeholders}) AND NOT EXISTS ("
+                        "  SELECT 1 FROM document_chunk_owners owners "
+                        "  WHERE owners.chunk_id = document_chunks.chunk_id"
+                        ")",
+                        tuple(batch),
+                    )
+            return
+        async with self.db.transaction():
+            await self.db.execute(
+                "DELETE FROM document_chunk_owners WHERE chunk_id IN ("
+                "  SELECT chunk_id FROM document_chunks WHERE file_hash = ?"
+                ")",
+                (file_hash,),
+            )
+            await self.db.execute(
+                "DELETE FROM document_chunks WHERE file_hash = ?",
+                (file_hash,),
+            )
     
     async def search_case_law(self, query: str, failures: List[Dict],
                               top_k: int = 3) -> List[Dict[str, Any]]:

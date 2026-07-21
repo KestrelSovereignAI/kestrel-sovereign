@@ -3635,6 +3635,33 @@ class TalonCoordinatorFeature(Feature):
             data=data,
         )
 
+    def _self_agent_name(self) -> Optional[str]:
+        """This coordinator's owning agent identity, or ``None`` when unbound.
+
+        ``talon_job`` lifecycle events are recorded on the shared
+        ``a2a_observability`` table tagged (in the ``agent_name`` column) with
+        the agent that OWNS the job — the dispatcher whose ``talon_status`` is
+        meant to surface it — not the worker that ran it. In a shared multi-agent
+        deployment (one PostgreSQL pool, one table) every agent's store reads the
+        SAME rows, so ``talon_status`` MUST scope its read to this agent's own
+        identity; otherwise one agent's status would leak other tenants' external
+        job ids, repos, issues, PRs, and workflow metadata (the cross-agent
+        disclosure this hardening closes).
+
+        Resolving to ``None`` — an unbound / single-tenant standalone agent —
+        leaves the query unscoped, because there is no other tenant to leak to.
+        This mirrors the graph store's unbound ``1 = 1`` ownership scope, and
+        reads ``_agent_name`` first / ``agent_name`` second exactly like the rest
+        of the coordinator (see ``_observability_context``).
+        """
+        agent = getattr(self, "agent", None)
+        if agent is not None:
+            for attr in ("_agent_name", "agent_name"):
+                candidate = getattr(agent, attr, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+        return None
+
     async def _observability_talon_jobs(
         self,
         *,
@@ -3651,10 +3678,17 @@ class TalonCoordinatorFeature(Feature):
         sessions, peer hosts) that would otherwise be invisible to
         ``talon_status``.
 
+        The read is **tenant-scoped**: it filters ``query_events`` by this
+        agent's own ``agent_name`` (see :meth:`_self_agent_name`), so on a shared
+        store one agent never sees another agent's Talon jobs. An unbound
+        standalone agent (no name) reads unscoped — there is no peer tenant to
+        isolate from.
+
         Read-only and best-effort: when no observability store is attached, or the
         query fails for any reason, it degrades to an empty map rather than
         breaking status reporting — a stock deployment whose store holds no
-        ``talon_job`` rows simply reports registry jobs only.
+        ``talon_job`` rows (owned by this agent) simply reports registry jobs
+        only.
         """
         store = getattr(self.agent, "observability_store", None)
         if store is None:
@@ -3664,6 +3698,7 @@ class TalonCoordinatorFeature(Feature):
         )
         try:
             events = await store.query_events(
+                agent_name=self._self_agent_name(),
                 event_type=_TALON_JOB_EVENT_TYPE,
                 since=since,
                 limit=int(limit),

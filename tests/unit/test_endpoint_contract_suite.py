@@ -39,8 +39,9 @@ def test_database_tables_endpoint_returns_shape_from_storage():
         [(0, "id", "TEXT", 1, None, 1)],
     ])
     db.fetchone = AsyncMock(return_value=(3,))
-    storage = MagicMock(db=db, db_path="/tmp/fake.db")
-    agent = MagicMock(storage=storage)
+    agent_id = "did:test:database-list-contract"
+    storage = MagicMock(db=db, db_path="/tmp/fake.db", agent_id=agent_id)
+    agent = MagicMock(storage=storage, agent_id=agent_id)
 
     app, original = _prepare_app(agent)
     try:
@@ -60,8 +61,8 @@ def test_files_head_uses_existence_check_contract():
     file_store = MagicMock()
     file_store.file_exists = AsyncMock(return_value=True)
     file_store.get_file_metadata = AsyncMock(return_value=None)
-    storage = MagicMock(files=file_store)
-    agent = MagicMock(storage=storage)
+    storage = MagicMock(files=file_store, agent_id="did:test:file-head")
+    agent = MagicMock(storage=storage, agent_id="did:test:file-head")
 
     app, original = _prepare_app(agent)
     try:

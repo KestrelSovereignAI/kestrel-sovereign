@@ -76,7 +76,7 @@ async def test_inception_with_parent_did_records_spawned_by_edge(tmp_dir, consti
     # Re-open the database to check the graph
     db_path = os.path.join(tmp_dir, "kestrel_prime.db")
     db = await AsyncDatabase.sqlite(db_path)
-    graph = AsyncGraphStore(db)
+    graph = AsyncGraphStore(db, agent_id=creds.agent_did)
 
     edges = await graph.get_edges(creds.agent_did, direction="out")
     spawned_edges = [e for e in edges if e.label == "spawned_by"]
@@ -84,6 +84,12 @@ async def test_inception_with_parent_did_records_spawned_by_edge(tmp_dir, consti
     assert len(spawned_edges) == 1
     assert spawned_edges[0].target_id == parent_did
     assert spawned_edges[0].source_id == creds.agent_did
+    owner = await db.fetchone(
+        "SELECT agent_id FROM graph_edge_owners "
+        "WHERE source_id = ? AND target_id = ? AND label = 'spawned_by'",
+        (creds.agent_did, parent_did),
+    )
+    assert owner == (creds.agent_did,)
 
     await db.close()
 
@@ -135,7 +141,7 @@ async def test_inception_with_spawn_mandate_records_properties(tmp_dir, constitu
     # Check the edge properties
     db_path = os.path.join(tmp_dir, "kestrel_prime.db")
     db = await AsyncDatabase.sqlite(db_path)
-    graph = AsyncGraphStore(db)
+    graph = AsyncGraphStore(db, agent_id=creds.agent_did)
 
     edges = await graph.get_edges(creds.agent_did, direction="out")
     spawned_edges = [e for e in edges if e.label == "spawned_by"]

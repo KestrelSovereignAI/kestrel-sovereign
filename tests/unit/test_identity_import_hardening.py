@@ -12,6 +12,11 @@ import pytest
 import pytest_asyncio
 
 from kestrel_sovereign.identity import AgentIdentityPackage, IdentityImporter
+from kestrel_sovereign.identity.exporter import IdentityExporter
+from kestrel_sovereign.identity.graph_namespace import (
+    namespace_imported_graph_node,
+    namespace_imported_record,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 
@@ -130,7 +135,7 @@ async def test_relationship_cannot_overwrite_identity_node(graph_db):
 
     # The relationship node was written under a namespaced id, not the
     # identity id.
-    namespaced = f"{agent_did[:20]}_{agent_did}"
+    namespaced = namespace_imported_graph_node(agent_did, agent_did)
     ns_row = await graph_db.fetchone(
         "SELECT node_type FROM graph_nodes WHERE node_id = ?", (namespaced,)
     )
@@ -144,7 +149,7 @@ async def test_skill_refuses_reserved_node_collision(graph_db):
     the importer refuses the upsert (defense-in-depth)."""
     agent_did = "did:pkh:eip155:1:0xAgentB"
     raw_skill_id = "evil"
-    namespaced = f"{agent_did[:20]}_{raw_skill_id}"
+    namespaced = namespace_imported_graph_node(agent_did, raw_skill_id)
     # Pre-seed a reserved-type node exactly at the namespaced id.
     await graph_db.execute(
         "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
@@ -168,3 +173,139 @@ async def test_skill_refuses_reserved_node_collision(graph_db):
     assert row[0] == "migration_record"
     assert json.loads(row[1]) == {"protected": True}
     assert "skills_imported" not in importer.stats
+
+
+@pytest.mark.asyncio
+async def test_did_pkh_import_namespaces_use_the_complete_identity(graph_db):
+    """Ethereum DIDs with the same method/chain prefix cannot replace peers."""
+    agent_a = "did:pkh:eip155:1:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    agent_b = "did:pkh:eip155:1:0xaBbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert agent_a[:20] == agent_b[:20]
+
+    importer_a = IdentityImporter(graph_db, target_agent_id=agent_a)
+    importer_b = IdentityImporter(graph_db, target_agent_id=agent_b)
+    await importer_a._import_relationships(
+        agent_a,
+        [{"user_id": "owner", "relationship_notes": "agent-a-private"}],
+    )
+    await importer_b._import_relationships(
+        agent_b,
+        [{"user_id": "owner", "relationship_notes": "agent-b-private"}],
+    )
+
+    node_a = namespace_imported_graph_node(agent_a, "owner")
+    node_b = namespace_imported_graph_node(agent_b, "owner")
+    assert node_a != node_b
+    rows = await graph_db.fetchall(
+        "SELECT node_id, properties FROM graph_nodes WHERE node_id IN (?, ?)",
+        (node_a, node_b),
+    )
+    properties = {node_id: json.loads(raw) for node_id, raw in rows}
+    assert properties[node_a]["notes"] == "agent-a-private"
+    assert properties[node_b]["notes"] == "agent-b-private"
+
+    owners = await graph_db.fetchall(
+        "SELECT node_id, agent_id FROM graph_node_owners "
+        "WHERE node_id IN (?, ?) ORDER BY node_id, agent_id",
+        (node_a, node_b),
+    )
+    assert set(owners) == {(node_a, agent_a), (node_b, agent_b)}
+
+
+@pytest.mark.asyncio
+async def test_did_pkh_import_row_ids_cannot_replace_peer_records(graph_db):
+    """All imported row PKs use the complete identity and export raw ids."""
+    agent_a = "did:pkh:eip155:1:0x1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    agent_b = "did:pkh:eip155:1:0x1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert agent_a[:20] == agent_b[:20]
+
+    for agent_id, marker in ((agent_a, "agent-a"), (agent_b, "agent-b")):
+        importer = IdentityImporter(graph_db, target_agent_id=agent_id)
+        await importer._import_episodes(
+            agent_id,
+            [{"id": "shared", "title": marker}],
+        )
+        await importer._import_saved_items(
+            agent_id,
+            [{
+                "id": "shared",
+                "item_type": "note",
+                "name": marker,
+                "content": marker,
+            }],
+        )
+        await importer._import_temporal_patterns(
+            agent_id,
+            [{
+                "id": "shared",
+                "pattern_type": "test",
+                "description": marker,
+            }],
+        )
+        await importer._import_reflection_insights(
+            agent_id,
+            [{
+                "id": "shared",
+                "insight_type": "test",
+                "title": marker,
+            }],
+        )
+
+    for table in (
+        "memory_episodes",
+        "saved_items",
+        "temporal_patterns",
+        "reflection_insights",
+    ):
+        rows = await graph_db.fetchall(
+            f"SELECT id, agent_id FROM {table} ORDER BY agent_id"
+        )
+        assert set(rows) == {
+            (namespace_imported_record(agent_a, "shared"), agent_a),
+            (namespace_imported_record(agent_b, "shared"), agent_b),
+        }
+
+    for agent_id in (agent_a, agent_b):
+        exporter = IdentityExporter(graph_db, agent_id)
+        assert [row["id"] for row in await exporter._get_memory_episodes()] == [
+            "shared"
+        ]
+        assert [row["id"] for row in await exporter._get_saved_items()] == [
+            "shared"
+        ]
+        assert [row["id"] for row in await exporter._get_temporal_patterns()] == [
+            "shared"
+        ]
+        assert [row["id"] for row in await exporter._get_reflection_insights()] == [
+            "shared"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_import_rejects_preexisting_foreign_owned_namespace(graph_db):
+    """Even a pre-seeded v2 namespace cannot be claimed with an upsert."""
+    attacker = "did:pkh:eip155:1:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    victim = "did:pkh:eip155:1:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    node_id = namespace_imported_graph_node(victim, "owner")
+    await graph_db.execute(
+        "INSERT INTO graph_nodes VALUES (?, 'user', 'foreign', ?)",
+        (node_id, json.dumps({"notes": "must-survive"})),
+    )
+    await graph_db.execute(
+        "INSERT INTO graph_node_owners (node_id, agent_id) VALUES (?, ?)",
+        (node_id, attacker),
+    )
+
+    importer = IdentityImporter(graph_db, target_agent_id=victim)
+    with pytest.raises(ValueError, match="owned by another agent"):
+        await importer._import_relationships(
+            victim,
+            [{"user_id": "owner", "relationship_notes": "replacement"}],
+        )
+
+    row = await graph_db.fetchone(
+        "SELECT label, properties FROM graph_nodes WHERE node_id = ?",
+        (node_id,),
+    )
+    assert row[0] == "foreign"
+    assert json.loads(row[1]) == {"notes": "must-survive"}

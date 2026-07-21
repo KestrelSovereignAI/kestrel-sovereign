@@ -174,6 +174,117 @@ test('invokeForAgent without explicit agent falls back to current selected (pres
     assert.equal(calls[0].url, '/api/agents/selected/api/agent/invoke');
 });
 
+test('database reads keep their dispatch agent across an auth-refresh retry', async () => {
+    const calls = [];
+    const r401 = {
+        ok: false,
+        status: 401,
+        json: async () => ({ detail: 'auth' }),
+        headers: { get: () => null },
+    };
+    let client;
+    const authProvider = makeAuthProvider({ on401: 'refreshed' });
+    const originalUnauthorized = authProvider.onUnauthorized;
+    authProvider.onUnauthorized = async () => {
+        client.setHostAgent('Agent B');
+        return originalUnauthorized();
+    };
+    client = createApiClient({
+        fetchFn: fakeFetchSequence([
+            r401,
+            { ok: true, status: 200, json: async () => ({ tables: [] }) },
+        ], calls),
+        sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+        location: { href: '/', search: '' },
+        AbortControllerCtor: StubAbort,
+        TextDecoderCtor: StubDecoder,
+        authProvider,
+    });
+
+    client.setHostAgent('Agent A');
+    await client.getDbTables();
+
+    assert.deepEqual(
+        calls.map((call) => call.url),
+        [
+            '/api/agents/Agent%20A/api/db/tables',
+            '/api/agents/Agent%20A/api/db/tables',
+        ],
+        'the retry must not follow the newly selected agent',
+    );
+});
+
+test('database row queries pin retries and encode every query component', async () => {
+    const calls = [];
+    const r401 = {
+        ok: false,
+        status: 401,
+        json: async () => ({ detail: 'auth' }),
+        headers: { get: () => null },
+    };
+    let client;
+    const authProvider = makeAuthProvider({ on401: 'refreshed' });
+    const originalUnauthorized = authProvider.onUnauthorized;
+    authProvider.onUnauthorized = async () => {
+        client.setHostAgent('Agent B');
+        return originalUnauthorized();
+    };
+    client = createApiClient({
+        fetchFn: fakeFetchSequence([
+            r401,
+            {
+                ok: true,
+                status: 200,
+                json: async () => ({
+                    table: 'conversation_history',
+                    columns: [],
+                    rows: [],
+                }),
+            },
+        ], calls),
+        sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+        location: { href: '/', search: '' },
+        AbortControllerCtor: StubAbort,
+        TextDecoderCtor: StubDecoder,
+        authProvider,
+    });
+
+    client.setHostAgent('Agent A');
+    await client.queryDbTable(
+        'conversation_history',
+        '20&offset=999',
+        '0&search=leak',
+        'mine&_scope=foreign',
+    );
+
+    const expected = '/api/agents/Agent%20A/api/db/tables/conversation_history'
+        + '?limit=20%26offset%3D999&offset=0%26search%3Dleak'
+        + '&search=mine%26_scope%3Dforeign';
+    assert.deepEqual(calls.map((call) => call.url), [expected, expected]);
+});
+
+test('host-agent change listeners run synchronously at the routing boundary', () => {
+    const calls = [];
+    const client = createApiClient({
+        fetchFn: fakeFetchSequence([], []),
+        sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+        location: { href: '/', search: '' },
+        AbortControllerCtor: StubAbort,
+        TextDecoderCtor: StubDecoder,
+        authProvider: makeAuthProvider(),
+    });
+    const unsubscribe = client.onHostAgentChange((next, previous) => {
+        calls.push({ next, previous });
+    });
+
+    client.setHostAgent('Agent A');
+    client.setHostAgent('Agent A');
+    unsubscribe();
+    client.setHostAgent('Agent B');
+
+    assert.deepEqual(calls, [{ next: 'Agent A', previous: null }]);
+});
+
 test('streamInvoke propagates AbortError instead of swallowing it (sendMessage relies on this)', async () => {
     const calls = [];
     const client = createApiClient({

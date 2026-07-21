@@ -437,8 +437,7 @@ def add_embeddings_subparser(subparsers: argparse._SubParsersAction) -> None:
     reindex_p.add_argument(
         "--agent-id",
         default=None,
-        help="Restrict to one agent's rows (conversation_history / "
-             "saved_items). document_chunks is global so this is ignored.",
+        help="Restrict every table to one agent's owned rows.",
     )
     _add_db_target_args(reindex_p)
     reindex_p.add_argument(
@@ -505,11 +504,23 @@ async def _audit(db: "Any", *, table: Optional[str], agent_id: Optional[str]) ->
         print(f"# agent_id filter: {agent_id}")
 
     for tname in tables:
-        # Build the WHERE clause. Empty agent filter means "all agents".
-        # document_chunks has no agent_id — drop the filter there.
+        # Build the WHERE clause. Empty agent filter means "all agents";
+        # document chunks use their independent ownership ledger.
         agent_clause = ""
         agent_params: Tuple[Any, ...] = ()
-        if agent_id and tname != "document_chunks":
+        if agent_id and tname == "document_chunks":
+            agent_clause = (
+                " WHERE EXISTS ("
+                "SELECT 1 FROM document_chunk_owners owners "
+                "WHERE owners.chunk_id = document_chunks.chunk_id "
+                "AND owners.agent_id = ?)"
+                " AND EXISTS ("
+                "SELECT 1 FROM file_owners file_owner "
+                "WHERE file_owner.content_hash = document_chunks.file_hash "
+                "AND file_owner.agent_id = ?)"
+            )
+            agent_params = (agent_id, agent_id)
+        elif agent_id:
             agent_clause = " WHERE agent_id = ?"
             agent_params = (agent_id,)
         try:

@@ -18,6 +18,7 @@ produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
 import json
 import logging
+from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass
@@ -26,6 +27,158 @@ from .async_database import AsyncDatabase
 from .async_conversation_store import _rows_affected
 
 logger = logging.getLogger(__name__)
+
+_DELETE_ID_BATCH = 500
+
+
+def _is_shareable_constitution_properties(
+    properties: Dict[str, Any], node_id: str
+) -> bool:
+    """Validate the bounded public metadata allowed on a shared anchor."""
+    if set(properties) > {"hash", "type", "created_at"}:
+        return False
+    if (
+        properties.get("hash") != node_id
+        or properties.get("type") != "Constitution"
+    ):
+        return False
+    created_at = properties.get("created_at")
+    if created_at is None:
+        return True
+    if not isinstance(created_at, str) or len(created_at) > 64:
+        return False
+    try:
+        parsed = datetime.fromisoformat(created_at)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _insert_owner_sql(db: AsyncDatabase, table: str, columns: str) -> str:
+    """Return a backend-neutral insert-if-absent statement for an owner row."""
+    placeholders = ", ".join("?" for _ in columns.split(","))
+    if db.backend_type == "postgres":
+        return (
+            f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) "
+            "ON CONFLICT DO NOTHING"
+        )
+    return f"INSERT OR IGNORE INTO {table} ({columns}) VALUES ({placeholders})"
+
+
+async def record_graph_node_owner(
+    db: AsyncDatabase, node_id: str, agent_id: str
+) -> None:
+    """Record authoritative ownership for one graph node.
+
+    This low-level helper intentionally does not open a transaction so callers
+    performing a larger import can keep the graph row and its ownership witness
+    in the same transaction.  :class:`AsyncGraphStore` wraps its ordinary
+    writes atomically.
+    """
+    if not node_id or not agent_id:
+        raise ValueError("Graph node ownership requires node_id and agent_id")
+    await db.execute(
+        _insert_owner_sql(db, "graph_node_owners", "node_id, agent_id"),
+        (node_id, agent_id),
+    )
+
+
+async def record_graph_edge_owner(
+    db: AsyncDatabase,
+    source_id: str,
+    target_id: str,
+    label: str,
+    agent_id: str,
+) -> None:
+    """Record authoritative ownership for one graph edge."""
+    if not source_id or not target_id or not label or not agent_id:
+        raise ValueError(
+            "Graph edge ownership requires source_id, target_id, label, and agent_id"
+        )
+    await db.execute(
+        _insert_owner_sql(
+            db,
+            "graph_edge_owners",
+            "source_id, target_id, label, agent_id",
+        ),
+        (source_id, target_id, label, agent_id),
+    )
+
+
+async def release_graph_node_owners(
+    db: AsyncDatabase,
+    node_ids: List[str],
+    agent_id: str,
+) -> int:
+    """Release one tenant's graph ownership without touching foreign lineage.
+
+    Shared nodes retain their other ownership witnesses and edges.  An
+    explicitly trusted cross-agent edge may intentionally reference a target
+    outside its owner's private graph (including a target that is later
+    removed), so foreign edge witnesses must survive this tenant's cleanup.
+    Only edges that become completely ownerless are physically reclaimed.
+
+    The caller owns the surrounding transaction so imports, purges, and
+    ordinary deletes can compose this cleanup into their larger atomic unit.
+    """
+    if not agent_id:
+        raise ValueError("Graph node ownership release requires an agent_id")
+
+    unique_node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+    affected = 0
+    for start in range(0, len(unique_node_ids), _DELETE_ID_BATCH):
+        batch = unique_node_ids[start:start + _DELETE_ID_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        incident_params = tuple(batch) + tuple(batch)
+
+        await db.execute(
+            "DELETE FROM graph_edge_owners WHERE agent_id = ? AND ("
+            f"source_id IN ({placeholders}) OR target_id IN ({placeholders}))",
+            (agent_id,) + incident_params,
+        )
+        await db.execute(
+            "DELETE FROM graph_node_owners WHERE agent_id = ? "
+            f"AND node_id IN ({placeholders})",
+            (agent_id,) + tuple(batch),
+        )
+
+        ownerless_rows = await db.fetchall(
+            "SELECT node_id FROM graph_nodes "
+            f"WHERE node_id IN ({placeholders}) AND NOT EXISTS ("
+            "  SELECT 1 FROM graph_node_owners AS remaining_owner "
+            "  WHERE remaining_owner.node_id = graph_nodes.node_id"
+            ")",
+            tuple(batch),
+        )
+        ownerless_ids = [row[0] for row in ownerless_rows]
+        # Remove only physical edges whose final ownership witness belonged to
+        # this tenant. Foreign trusted cross-agent references deliberately
+        # survive even when the referenced node no longer exists locally.
+        await db.execute(
+            "DELETE FROM graph_edges WHERE ("
+            f"source_id IN ({placeholders}) OR target_id IN ({placeholders})) "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM graph_edge_owners AS remaining_owner "
+            "  WHERE remaining_owner.source_id = graph_edges.source_id "
+            "  AND remaining_owner.target_id = graph_edges.target_id "
+            "  AND remaining_owner.label = graph_edges.label"
+            ")",
+            incident_params,
+        )
+
+        if ownerless_ids:
+            ownerless_placeholders = ", ".join("?" for _ in ownerless_ids)
+            removed = await db.execute(
+                f"DELETE FROM graph_nodes WHERE node_id IN ({ownerless_placeholders}) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM graph_node_owners AS remaining_owner "
+                "  WHERE remaining_owner.node_id = graph_nodes.node_id"
+                ")",
+                tuple(ownerless_ids),
+            )
+            if isinstance(removed, int):
+                affected += removed
+    return affected
 
 
 class NodeSwapResult(str, Enum):
@@ -59,10 +212,66 @@ class Edge:
 
 
 class AsyncGraphStore:
-    """Async knowledge graph storage."""
+    """Async knowledge graph storage.
 
-    def __init__(self, db: AsyncDatabase):
+    A store bound to ``agent_id`` is a tenant capability: every ordinary read,
+    update, and delete is constrained by the ownership ledgers. Constructing a
+    separate unbound store is the explicit privileged path used by migrations
+    and single-database maintenance; a bound store has no per-call scope bypass.
+    """
+
+    def __init__(self, db: AsyncDatabase, agent_id: str = ""):
         self.db = db
+        self.agent_id = agent_id
+
+    def bind_agent(self, agent_id: str) -> None:
+        """Bind subsequent graph writes to one authoritative agent owner.
+
+        Rebinding a live store to a different agent would turn an isolation
+        boundary into mutable ambient state, so it is rejected.  Construct a
+        separate store for a separate agent instead.
+        """
+        if not agent_id:
+            raise ValueError("Graph ownership binding requires a non-empty agent_id")
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError("Graph store is already bound to a different agent")
+        self.agent_id = agent_id
+
+    def _node_owner(self, node: GraphNode) -> str:
+        declared = node.properties.get("agent_id") if node.properties else None
+        if node.node_type == "agent":
+            if declared and declared != node.node_id:
+                raise ValueError("Agent graph node declares a different agent_id")
+            declared = node.node_id
+        if declared is not None and not isinstance(declared, str):
+            raise ValueError("Graph node properties.agent_id must be a string")
+        if self.agent_id and declared and declared != self.agent_id:
+            raise ValueError("Graph node owner does not match the bound agent")
+        return self.agent_id or declared or ""
+
+    def _node_scope(self, alias: str = "graph_nodes") -> tuple[str, tuple[str, ...]]:
+        """Return the authoritative predicate for this store's node capability."""
+        if not self.agent_id:
+            return "1 = 1", ()
+        return (
+            "EXISTS (SELECT 1 FROM graph_node_owners AS node_scope_owner "
+            f"WHERE node_scope_owner.node_id = {alias}.node_id "
+            "AND node_scope_owner.agent_id = ?)",
+            (self.agent_id,),
+        )
+
+    def _edge_scope(self, alias: str = "graph_edges") -> tuple[str, tuple[str, ...]]:
+        """Return the authoritative predicate for this store's edge capability."""
+        if not self.agent_id:
+            return "1 = 1", ()
+        return (
+            "EXISTS (SELECT 1 FROM graph_edge_owners AS edge_scope_owner "
+            f"WHERE edge_scope_owner.source_id = {alias}.source_id "
+            f"AND edge_scope_owner.target_id = {alias}.target_id "
+            f"AND edge_scope_owner.label = {alias}.label "
+            "AND edge_scope_owner.agent_id = ?)",
+            (self.agent_id,),
+        )
 
     def _upsert_node_sql(self) -> str:
         """Get upsert SQL for nodes based on database backend."""
@@ -133,19 +342,91 @@ class AsyncGraphStore:
         return "json(COALESCE(NULLIF(properties, ''), '{}')) = json(?)"
 
     async def add_node(self, node: GraphNode) -> None:
-        """Add or update a node.
+        """Add or update a node and its ownership witness atomically.
 
-        This is a whole-row upsert (REPLACE / ON CONFLICT DO UPDATE): it
-        clobbers any concurrent writer's changes between a caller's read and
-        this write. When you need "update X only if nobody changed it since I
-        read it", use :meth:`compare_and_swap_node` instead — it closes the
+        The content write is a whole-row upsert (REPLACE / ON CONFLICT DO
+        UPDATE) for the owning tenant: it clobbers that tenant's own prior
+        row between a caller's read and this write. When you need "update X
+        only if nobody changed it since I read it", use
+        :meth:`compare_and_swap_node` instead — it closes the
         read-modify-write race that a hand-rolled retry loop around
         ``add_node`` can only ever narrow.
         """
-        await self.db.execute_commit(
-            self._upsert_node_sql(),
-            (node.node_id, node.node_type, node.label, json.dumps(node.properties))
-        )
+        owner = self._node_owner(node)
+        async with self.db.transaction():
+            existing = await self.db.fetchone(
+                "SELECT node_type, label, properties FROM graph_nodes "
+                "WHERE node_id = ?",
+                (node.node_id,),
+            )
+            existing_owner_rows = await self.db.fetchall(
+                "SELECT agent_id FROM graph_node_owners WHERE node_id = ?",
+                (node.node_id,),
+            )
+            existing_owners = {row[0] for row in existing_owner_rows}
+            if existing and owner and not existing_owners:
+                raise ValueError(
+                    "Cannot claim or overwrite an unowned graph node"
+                )
+            foreign_owned = bool(owner and existing_owners and owner not in existing_owners)
+            existing_properties = (
+                json.loads(existing[2]) if existing and existing[2] else {}
+            )
+            owns_content_reference = False
+            if (
+                existing
+                and owner
+                and existing[0] == "document"
+                and node.node_type == "document"
+                and existing[1] == node.label
+                and existing_properties.get("hash") == node.node_id
+                and node.properties.get("hash") == node.node_id
+            ):
+                file_owner = await self.db.fetchone(
+                    "SELECT 1 FROM file_owners "
+                    "WHERE content_hash = ? AND agent_id = ?",
+                    (node.node_id, owner),
+                )
+                owns_content_reference = file_owner is not None
+            compatible_content_node = bool(
+                existing
+                and existing[0] == "document"
+                and node.node_type == "document"
+                and existing[1] == "KESTREL_CONSTITUTION"
+                and node.label == "KESTREL_CONSTITUTION"
+                and _is_shareable_constitution_properties(
+                    existing_properties, node.node_id
+                )
+                and _is_shareable_constitution_properties(
+                    node.properties, node.node_id
+                )
+                and owns_content_reference
+            )
+            if (
+                foreign_owned or len(existing_owners) > 1
+            ) and not compatible_content_node:
+                raise ValueError(
+                    "Cannot overwrite a graph node owned by another agent"
+                )
+
+            # For an identical shared node, retain the canonical row bytes and
+            # add only the second ownership witness.  This avoids one tenant
+            # rewriting another tenant's content-addressed row serialization.
+            current_owner_can_update = bool(
+                not existing or not owner or existing_owners == {owner}
+            )
+            if current_owner_can_update:
+                await self.db.execute(
+                    self._upsert_node_sql(),
+                    (
+                        node.node_id,
+                        node.node_type,
+                        node.label,
+                        json.dumps(node.properties),
+                    ),
+                )
+            if owner:
+                await record_graph_node_owner(self.db, node.node_id, owner)
 
     async def compare_and_swap_node(
         self,
@@ -191,13 +472,19 @@ class AsyncGraphStore:
         Returns:
             * :attr:`NodeSwapResult.SWAPPED` — the predicate held and the write
               landed.
-            * :attr:`NodeSwapResult.PREDICATE_FAILED` — the node exists but its
-              stored ``properties`` no longer match ``expected`` (a concurrent
-              writer won), or ``expected is None`` and the node already exists.
-              The existing row — including whatever the other writer wrote — is
-              left untouched.
-            * :attr:`NodeSwapResult.NOT_FOUND` — ``expected`` was a snapshot but
-              the row is genuinely absent (nothing to update).
+            * :attr:`NodeSwapResult.PREDICATE_FAILED` — the node exists *and is
+              visible to this caller* but its stored ``properties`` no longer
+              match ``expected`` (a concurrent writer won), or
+              ``expected is None`` and this caller already owns a node at
+              ``node_id`` (a genuine create conflict). The existing row —
+              including whatever the other writer wrote — is left untouched.
+            * :attr:`NodeSwapResult.NOT_FOUND` — the row is absent *from this
+              caller's scope*: either genuinely absent, or (on a bound store)
+              owned by another tenant and therefore invisible here. Returned both
+              when ``expected`` was a snapshot of a now-missing row and when
+              ``expected is None`` conflicted with a foreign-owned id — so a
+              bound tenant cannot distinguish "absent" from "another tenant owns
+              it", matching :meth:`get_node`.
 
         Note:
             Equality is on the *JSON value* of ``properties``, not the raw stored
@@ -217,8 +504,33 @@ class AsyncGraphStore:
             a wider whole-node predicate (also pinning ``node_type`` /
             ``label``), add it as a distinct signature rather than loosening this
             one.
+
+        Tenant scoping:
+            On a store bound to an agent (:meth:`bind_agent`) this primitive is
+            ownership-scoped exactly like :meth:`add_node` and :meth:`get_node`.
+            The swap ``UPDATE`` and its failure-classification read run through
+            this store's ownership predicate, so a bound agent can never swap a
+            node owned by another tenant (the write matches zero rows and the
+            node reads back as ``NOT_FOUND``, not ``PREDICATE_FAILED``). The same
+            holds for compare-and-create: an insert that loses to a foreign-owned
+            ``node_id`` re-reads under this store's scope and reports
+            ``NOT_FOUND`` (the row is invisible here), never ``PREDICATE_FAILED``
+            — so the create path leaks no more existence than :meth:`get_node`.
+            A successful compare-and-create records the caller's ownership
+            witness in the same transaction, so the freshly-created row is
+            visible to its creator on the next scoped read. An unbound store (no
+            ``agent_id``) records no ownership and scopes to ``1 = 1`` — the
+            ownerless behaviour the primitive shipped with, where any existing
+            row is a visible ``PREDICATE_FAILED`` conflict.
         """
         new_properties = json.dumps(new_node.properties)
+        # Resolve the caller's authoritative owner up front, exactly like
+        # add_node: a bound store may only write nodes it owns, and rejects a
+        # new_node that declares a foreign agent_id. For an unbound store this
+        # is "" and every scope below collapses to ``1 = 1`` — preserving the
+        # ownerless CAS semantics the primitive shipped with.
+        owner = self._node_owner(new_node)
+        scope, scope_params = self._node_scope()
 
         # One serialized write unit: the check and the write commit or roll back
         # together, and the failure-classification read sees the same committed
@@ -233,21 +545,49 @@ class AsyncGraphStore:
                     (node_id, new_node.node_type, new_node.label, new_properties),
                 )
                 if _rows_affected(affected) > 0:
+                    # Record ownership inside the same transaction so a bound
+                    # creator can actually read its new node back through the
+                    # scoped predicate; without this the row is orphaned and
+                    # invisible to the very agent that created it.
+                    if owner:
+                        await record_graph_node_owner(self.db, node_id, owner)
                     return NodeSwapResult.SWAPPED
-                return NodeSwapResult.PREDICATE_FAILED
+                # The insert matched no row: the ``node_id`` primary key is
+                # already taken. Classify with the SAME ownership scope the swap
+                # path uses (below), not an unscoped "it exists": ``INSERT OR
+                # IGNORE`` / ``ON CONFLICT DO NOTHING`` gates on the global PK, so
+                # a bare "0 rows -> PREDICATE_FAILED" would let a bound tenant
+                # tell a *foreign-owned* id (invisible to it under get_node) apart
+                # from an absent one — an existence leak across the tenant
+                # boundary. Re-read under this store's scope so a foreign node
+                # reads back as NOT_FOUND exactly like get_node, and only a row
+                # this caller can actually see (its own prior create) is a real
+                # PREDICATE_FAILED conflict.
+                exists = await self.db.fetchone(
+                    f"SELECT 1 FROM graph_nodes WHERE node_id = ? AND {scope}",
+                    (node_id, *scope_params),
+                )
+                if exists is not None:
+                    return NodeSwapResult.PREDICATE_FAILED
+                return NodeSwapResult.NOT_FOUND
 
             expected_properties = json.dumps(expected)
             # Properties-only: the SET touches the same single column the
             # predicate gates on, so a concurrent node_type/label change is
-            # never overwritten (we don't write those columns).
+            # never overwritten (we don't write those columns). The scope
+            # predicate binds the write to this store's ownership capability so
+            # a bound agent can never swap a node it does not own — the UPDATE
+            # simply matches zero rows, exactly like every other bound write.
             affected = await self.db.execute(
                 "UPDATE graph_nodes "
                 "SET properties = ? "
-                f"WHERE node_id = ? AND {self._properties_match_predicate()}",
+                f"WHERE node_id = ? AND {self._properties_match_predicate()} "
+                f"AND {scope}",
                 (
                     new_properties,
                     node_id,
                     expected_properties,
+                    *scope_params,
                 ),
             )
             if _rows_affected(affected) > 0:
@@ -255,8 +595,12 @@ class AsyncGraphStore:
 
             # Zero rows changed: distinguish "predicate no longer holds" from
             # "row genuinely absent" with a read in the same serialized section.
+            # The read carries the SAME ownership scope, so a foreign-owned node
+            # reads as NOT_FOUND (invisible to this tenant) rather than leaking
+            # its existence as PREDICATE_FAILED.
             exists = await self.db.fetchone(
-                "SELECT 1 FROM graph_nodes WHERE node_id = ?", (node_id,)
+                f"SELECT 1 FROM graph_nodes WHERE node_id = ? AND {scope}",
+                (node_id, *scope_params),
             )
             if exists is not None:
                 return NodeSwapResult.PREDICATE_FAILED
@@ -264,9 +608,11 @@ class AsyncGraphStore:
 
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
         """Get a node by ID."""
+        scope, scope_params = self._node_scope()
         row = await self.db.fetchone(
-            "SELECT node_id, node_type, label, properties FROM graph_nodes WHERE node_id = ?",
-            (node_id,)
+            "SELECT node_id, node_type, label, properties FROM graph_nodes "
+            f"WHERE node_id = ? AND {scope}",
+            (node_id,) + scope_params,
         )
         if not row:
             return None
@@ -279,9 +625,11 @@ class AsyncGraphStore:
     
     async def get_nodes_by_type(self, node_type: str) -> List[GraphNode]:
         """Get all nodes of a specific type."""
+        scope, scope_params = self._node_scope()
         rows = await self.db.fetchall(
-            "SELECT node_id, node_type, label, properties FROM graph_nodes WHERE node_type = ?",
-            (node_type,)
+            "SELECT node_id, node_type, label, properties FROM graph_nodes "
+            f"WHERE node_type = ? AND {scope}",
+            (node_type,) + scope_params,
         )
         return [
             GraphNode(
@@ -339,6 +687,10 @@ class AsyncGraphStore:
         clauses: List[str] = ["node_type = ?"]
         params: List[Any] = [node_type]
 
+        scope, scope_params = self._node_scope()
+        clauses.append(scope)
+        params.extend(scope_params)
+
         for key, value in (filters or {}).items():
             clauses.append(f"{self._json_extract('properties', key)} = ?")
             params.append(value)
@@ -370,11 +722,40 @@ class AsyncGraphStore:
         ]
 
     async def delete_node(self, node_id: str) -> None:
-        """Delete a node and its edges."""
+        """Release this store's node witness and reclaim ownerless rows.
+
+        A bound delete never removes another tenant's witness. Shared physical
+        nodes and edges remain until their final owner releases them. An
+        unbound maintenance store preserves the legacy physical-delete
+        behavior.
+        """
         async with self.db.transaction():
+            if self.agent_id:
+                owned = await self.db.fetchone(
+                    "SELECT 1 FROM graph_node_owners "
+                    "WHERE node_id = ? AND agent_id = ?",
+                    (node_id, self.agent_id),
+                )
+                if not owned:
+                    return
+
+                await release_graph_node_owners(
+                    self.db, [node_id], self.agent_id
+                )
+                return
+
+            await self.db.execute(
+                "DELETE FROM graph_edge_owners "
+                "WHERE source_id = ? OR target_id = ?",
+                (node_id, node_id),
+            )
             await self.db.execute(
                 "DELETE FROM graph_edges WHERE source_id = ? OR target_id = ?",
                 (node_id, node_id)
+            )
+            await self.db.execute(
+                "DELETE FROM graph_node_owners WHERE node_id = ?",
+                (node_id,),
             )
             await self.db.execute(
                 "DELETE FROM graph_nodes WHERE node_id = ?",
@@ -384,17 +765,16 @@ class AsyncGraphStore:
     async def purge_agent_nodes(
         self, agent_id: str, *, since_iso: Optional[str] = None
     ) -> int:
-        """Hard-delete graph_nodes tagged with this ``agent_id`` (#767/#867).
+        """Release graph rows authoritatively owned by ``agent_id`` (#767/#867).
 
         EPHEMERAL agents are not supposed to write to ``graph_nodes`` —
         the privacy wrapper rejects persistent writes in that mode. This
         method exists as the safety net for the case where a write
         slipped through anyway.
 
-        Scoping uses the same JSON-path predicate as the
-        ``idx_graph_nodes_agent`` partial index so the DELETE matches a
-        live index. Edges are scrubbed too — any edge touching a node
-        owned by this agent goes with it.
+        Ownership is selected from ``graph_node_owners``. Shared physical rows
+        survive with their other ownership witnesses; ownerless nodes and
+        edges are reclaimed. A bound store may purge only its own agent.
 
         Args:
             agent_id: agent's DID.
@@ -414,9 +794,10 @@ class AsyncGraphStore:
         """
         if not agent_id:
             return 0
+        if self.agent_id and self.agent_id != agent_id:
+            raise ValueError("A bound graph store cannot purge another agent")
 
         if self.db.backend_type == "postgres":
-            agent_path = "(properties::jsonb->>'agent_id')"
             # graph_nodes.properties.created_at is documented as
             # ``YYYY-MM-DDTHH:MM:SS+00:00`` (ISO with T separator, fixed
             # offset).  Normalise it to ``YYYY-MM-DD HH:MM:SS`` so it can
@@ -433,7 +814,6 @@ class AsyncGraphStore:
                 ") AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
             )
         else:
-            agent_path = "json_extract(properties, '$.agent_id')"
             # SQLite normalisation: ``T`` → space, then truncate to
             # ``YYYY-MM-DD HH:MM:SS`` (length 19).  Handles both ISO
             # (``2026-04-26T16:31:06+00:00``) and SQLite-format (``2026-04-26
@@ -445,6 +825,11 @@ class AsyncGraphStore:
                 ")"
             )
 
+        ownership_clause = (
+            "EXISTS (SELECT 1 FROM graph_node_owners AS purge_owner "
+            "WHERE purge_owner.node_id = graph_nodes.node_id "
+            "AND purge_owner.agent_id = ?)"
+        )
         if since_iso:
             # Nodes without a ``created_at`` are excluded from the scoped
             # purge — we can't prove they're in-window leaks, so we
@@ -452,12 +837,12 @@ class AsyncGraphStore:
             # data.  Operators get a WARNING below if any such nodes
             # exist for this agent (visible-but-skipped surface).
             agent_clause = (
-                f"({agent_path} = ? AND {created_normalized} IS NOT NULL "
+                f"({ownership_clause} AND {created_normalized} IS NOT NULL "
                 f"AND {created_normalized} >= ?)"
             )
             agent_args: tuple = (agent_id, since_iso)
         else:
-            agent_clause = f"{agent_path} = ?"
+            agent_clause = ownership_clause
             agent_args = (agent_id,)
 
         # When scoping by since_iso, count nodes for this agent that have
@@ -468,7 +853,7 @@ class AsyncGraphStore:
             try:
                 untimed_row = await self.db.fetchone(
                     f"SELECT COUNT(*) FROM graph_nodes "
-                    f"WHERE {agent_path} = ? "
+                    f"WHERE {ownership_clause} "
                     f"  AND {created_normalized} IS NULL",
                     (agent_id,),
                 )
@@ -486,48 +871,220 @@ class AsyncGraphStore:
                 pass
 
         async with self.db.transaction():
-            # Wipe edges that touch any node we're about to remove first
-            # (foreign-key-like consistency, even though we don't have
-            # FK constraints on these tables).
-            await self.db.execute(
-                f"DELETE FROM graph_edges "
-                f"WHERE source_id IN (SELECT node_id FROM graph_nodes WHERE {agent_clause}) "
-                f"   OR target_id IN (SELECT node_id FROM graph_nodes WHERE {agent_clause})",
-                agent_args + agent_args,
-            )
-            affected = await self.db.execute(
-                f"DELETE FROM graph_nodes WHERE {agent_clause}",
+            selected = await self.db.fetchall(
+                f"SELECT node_id FROM graph_nodes WHERE {agent_clause}",
                 agent_args,
             )
-        return affected if isinstance(affected, int) else 0
+            node_ids = [row[0] for row in selected]
+            return await release_graph_node_owners(self.db, node_ids, agent_id)
     
-    async def add_edge(self, source_id: str, target_id: str, label: str,
-                       properties: Optional[Dict] = None) -> None:
+    async def add_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        label: str,
+        properties: Optional[Dict] = None,
+    ) -> None:
         """Add an edge between nodes.
 
         Upserts by (source_id, target_id, label) — calling add_edge twice
         with the same triple updates the properties, not duplicates the edge.
+        A tenant-bound writer must own both endpoints; intentional lineage
+        edges to an external parent use :meth:`add_trusted_cross_agent_edge`.
         """
-        await self.db.execute_commit(
-            self._upsert_edge_sql(),
-            (source_id, target_id, label, json.dumps(properties) if properties else None)
+        await self._add_edge(
+            source_id,
+            target_id,
+            label,
+            properties,
+            trusted_cross_agent=False,
         )
 
-    async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
-        """Remove a specific edge by its (source, target, label) triple."""
-        await self.db.execute_commit(
-            "DELETE FROM graph_edges WHERE source_id = ? AND target_id = ? AND label = ?",
-            (source_id, target_id, label),
+    async def add_trusted_cross_agent_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        label: str,
+        properties: Optional[Dict] = None,
+    ) -> None:
+        """Add an intentionally cross-agent edge owned by this bound agent.
+
+        This is a narrow infrastructure writer for relationships such as a
+        child's ``spawned_by`` edge when the parent node lives in another
+        tenant database (or is owned only by the parent in a shared database).
+        The source must be owned by the bound agent; unbound callers and
+        arbitrary foreign-source writes are rejected.
+        """
+        if not self.agent_id:
+            raise ValueError("Trusted cross-agent edges require a bound graph store")
+        await self._add_edge(
+            source_id,
+            target_id,
+            label,
+            properties,
+            trusted_cross_agent=True,
         )
+
+    async def _add_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        label: str,
+        properties: Optional[Dict],
+        *,
+        trusted_cross_agent: bool,
+    ) -> None:
+        """Implement ordinary and explicitly trusted edge writes atomically."""
+        declared = properties.get("agent_id") if properties else None
+        if declared is not None and not isinstance(declared, str):
+            raise ValueError("Graph edge properties.agent_id must be a string")
+        if self.agent_id and declared and declared != self.agent_id:
+            raise ValueError("Graph edge owner does not match the bound agent")
+        requested_owner = self.agent_id or declared or ""
+
+        async with self.db.transaction():
+            if requested_owner:
+                endpoint_owners = await self.db.fetchone(
+                    "SELECT "
+                    "EXISTS(SELECT 1 FROM graph_node_owners "
+                    "       WHERE node_id = ? AND agent_id = ?), "
+                    "EXISTS(SELECT 1 FROM graph_node_owners "
+                    "       WHERE node_id = ? AND agent_id = ?)",
+                    (source_id, requested_owner, target_id, requested_owner),
+                )
+                owns_source = bool(endpoint_owners and endpoint_owners[0])
+                owns_target = bool(endpoint_owners and endpoint_owners[1])
+                if trusted_cross_agent:
+                    if not owns_source:
+                        raise ValueError(
+                            "Trusted cross-agent edge source is not owned by the bound agent"
+                        )
+                elif not (owns_source and owns_target):
+                    raise ValueError(
+                        "Graph edge endpoints are not both owned by the bound agent"
+                    )
+
+            existing = await self.db.fetchone(
+                "SELECT properties FROM graph_edges "
+                "WHERE source_id = ? AND target_id = ? AND label = ?",
+                (source_id, target_id, label),
+            )
+            existing_owner_rows = await self.db.fetchall(
+                "SELECT agent_id FROM graph_edge_owners "
+                "WHERE source_id = ? AND target_id = ? AND label = ?",
+                (source_id, target_id, label),
+            )
+            existing_owners = {row[0] for row in existing_owner_rows}
+            if existing and requested_owner and not existing_owners:
+                raise ValueError(
+                    "Cannot claim or overwrite an unowned graph edge"
+                )
+            foreign_owned = bool(
+                requested_owner
+                and existing_owners
+                and requested_owner not in existing_owners
+            )
+            if foreign_owned or (
+                len(existing_owners) > 1
+                and requested_owner
+                and existing_owners != {requested_owner}
+            ):
+                raise ValueError(
+                    "Cannot overwrite a graph edge owned by another agent"
+                )
+
+            current_owner_can_update = bool(
+                not existing
+                or not requested_owner
+                or existing_owners == {requested_owner}
+            )
+            if current_owner_can_update:
+                await self.db.execute(
+                    self._upsert_edge_sql(),
+                    (
+                        source_id,
+                        target_id,
+                        label,
+                        json.dumps(properties) if properties else None,
+                    ),
+                )
+
+            if requested_owner:
+                await record_graph_edge_owner(
+                    self.db, source_id, target_id, label, requested_owner
+                )
+            else:
+                # An unbound store may still connect two nodes with an
+                # existing common owner (legacy/direct service usage).  Record
+                # every common owner; different-owner endpoints yield none.
+                if self.db.backend_type == "postgres":
+                    owner_sql = (
+                        "INSERT INTO graph_edge_owners "
+                        "(source_id, target_id, label, agent_id) "
+                        "SELECT ?, ?, ?, src.agent_id "
+                        "FROM graph_node_owners src "
+                        "JOIN graph_node_owners dst ON dst.agent_id = src.agent_id "
+                        "WHERE src.node_id = ? AND dst.node_id = ? "
+                        "ON CONFLICT DO NOTHING"
+                    )
+                else:
+                    owner_sql = (
+                        "INSERT OR IGNORE INTO graph_edge_owners "
+                        "(source_id, target_id, label, agent_id) "
+                        "SELECT ?, ?, ?, src.agent_id "
+                        "FROM graph_node_owners src "
+                        "JOIN graph_node_owners dst ON dst.agent_id = src.agent_id "
+                        "WHERE src.node_id = ? AND dst.node_id = ?"
+                    )
+                await self.db.execute(
+                    owner_sql,
+                    (source_id, target_id, label, source_id, target_id),
+                )
+
+    async def delete_edge(self, source_id: str, target_id: str, label: str) -> None:
+        """Release this tenant's edge witness, reclaiming only ownerless rows."""
+        async with self.db.transaction():
+            if self.agent_id:
+                await self.db.execute(
+                    "DELETE FROM graph_edge_owners "
+                    "WHERE source_id = ? AND target_id = ? AND label = ? "
+                    "AND agent_id = ?",
+                    (source_id, target_id, label, self.agent_id),
+                )
+                await self.db.execute(
+                    "DELETE FROM graph_edges "
+                    "WHERE source_id = ? AND target_id = ? AND label = ? "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM graph_edge_owners AS remaining_owner "
+                    "  WHERE remaining_owner.source_id = graph_edges.source_id "
+                    "  AND remaining_owner.target_id = graph_edges.target_id "
+                    "  AND remaining_owner.label = graph_edges.label"
+                    ")",
+                    (source_id, target_id, label),
+                )
+                return
+
+            await self.db.execute(
+                "DELETE FROM graph_edge_owners "
+                "WHERE source_id = ? AND target_id = ? AND label = ?",
+                (source_id, target_id, label),
+            )
+            await self.db.execute(
+                "DELETE FROM graph_edges "
+                "WHERE source_id = ? AND target_id = ? AND label = ?",
+                (source_id, target_id, label),
+            )
     
     async def get_edges(self, node_id: str, direction: str = "both") -> List[Edge]:
         """Get edges connected to a node."""
         edges = []
+        scope, scope_params = self._edge_scope()
         
         if direction in ("out", "both"):
             rows = await self.db.fetchall(
-                "SELECT source_id, target_id, label, properties FROM graph_edges WHERE source_id = ?",
-                (node_id,)
+                "SELECT source_id, target_id, label, properties FROM graph_edges "
+                f"WHERE source_id = ? AND {scope}",
+                (node_id,) + scope_params,
             )
             edges.extend([
                 Edge(
@@ -541,8 +1098,9 @@ class AsyncGraphStore:
         
         if direction in ("in", "both"):
             rows = await self.db.fetchall(
-                "SELECT source_id, target_id, label, properties FROM graph_edges WHERE target_id = ?",
-                (node_id,)
+                "SELECT source_id, target_id, label, properties FROM graph_edges "
+                f"WHERE target_id = ? AND {scope}",
+                (node_id,) + scope_params,
             )
             edges.extend([
                 Edge(

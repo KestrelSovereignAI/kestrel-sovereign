@@ -32,6 +32,7 @@ import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
+from kestrel_sovereign.storage.bm25_index import BM25Result
 from kestrel_sovereign.storage.sqla import (
     DocumentChunk,
     build_document_chunk_spec,
@@ -230,6 +231,62 @@ async def test_search_caches_session_factory_unavailable():
     # Second call doesn't re-attempt construction.
     sf2 = store._get_vector_session_factory()
     assert sf2 is None
+
+
+@pytest.mark.asyncio
+async def test_unbound_legacy_store_searches_bm25_without_agent_id(monkeypatch):
+    """An ``__new__`` legacy store has no ownership capability attribute."""
+    import kestrel_sovereign.storage.async_rag_store as rag_mod
+
+    class _LegacyIndex:
+        documents = []
+
+        async def asearch(self, _query, _limit):
+            return [
+                BM25Result(
+                    doc_id="7",
+                    content="legacy result",
+                    score=1.0,
+                    metadata={"file_hash": "legacy-file"},
+                )
+            ]
+
+    store = AsyncRAGStore.__new__(AsyncRAGStore)
+    store._bm25_built = True
+    store._bm25_index = _LegacyIndex()
+    store._get_embedding_service = lambda: None
+    monkeypatch.setattr(rag_mod, "BM25_AVAILABLE", True)
+
+    assert await store._search_by_bm25("legacy") == [
+        {
+            "chunk_id": 7,
+            "file_hash": "legacy-file",
+            "content": "legacy result",
+            "score": 1.0,
+            "source": "bm25",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bound_store_skips_generic_vector_backend(monkeypatch):
+    """Bound RAG reads must keep their ownership-scoped retrieval path."""
+    import kestrel_sovereign.llm.embedding_service as embedding_mod
+
+    class _EmbeddingService:
+        pass
+
+    async def _embed_query(_service, _query):
+        return [1.0, 0.0]
+
+    store = AsyncRAGStore(MagicMock(), agent_id="did:test:rag-owner")
+    store._get_embedding_service = lambda: _EmbeddingService()
+    store._get_vector_session_factory = MagicMock()
+    store._legacy_in_python_search = AsyncMock(return_value=[])
+    monkeypatch.setattr(embedding_mod, "aembed_retrieval_query", _embed_query)
+
+    assert await store._search_by_embedding("private", limit=5) == []
+    store._get_vector_session_factory.assert_not_called()
 
 
 # ----------------------------------------------------------------- end-to-end SQLite

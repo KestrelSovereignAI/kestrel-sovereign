@@ -1,26 +1,38 @@
 """Database explorer endpoints."""
-from fastapi import APIRouter, HTTPException, Query, Request
-from pathlib import Path
 import logging
 
+from fastapi import APIRouter, HTTPException, Query, Request
+
 from kestrel_sovereign.sql_utils import safe_table_name, safe_column_name
-from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    privacy_hides_persisted,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/db", tags=["database"])
 
-ALLOWED_TABLES = {
+ALLOWED_TABLES = frozenset({
     "conversation_history",
     "graph_nodes",
     "graph_edges",
-    "documents",
-    "document_chunks",
-    "fts_documents",
-}
+})
 
 
-def _agent_scope(table_name, column_names, agent_id, backend_type):
+def _require_bound_database_scope(agent, storage) -> str:
+    """Return the request agent id only for its matching storage capability."""
+    agent_id = getattr(agent, "agent_id", None)
+    storage_agent_id = getattr(storage, "agent_id", None)
+    if not agent_id or storage_agent_id != agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent-scoped database storage is not available.",
+        )
+    return agent_id
+
+
+def _agent_scope(table_name, column_names, agent_id, _backend_type):
     """Return ``(condition, params)`` scoping a query to one agent, else ``(None, [])``.
 
     Cross-agent isolation only matters in a shared-DB deployment (the default
@@ -28,40 +40,50 @@ def _agent_scope(table_name, column_names, agent_id, backend_type):
     scopes it*, so the explorer never exposes more than the app does:
 
       - ``conversation_history``: physical ``agent_id`` column.
-      - ``graph_nodes``: ``agent_id`` lives inside the JSON ``properties``.
-      - ``graph_edges``: an edge belongs to the agent if it touches one of
-        the agent's nodes (mirrors the scoped purge in async_graph_store).
+      - ``graph_nodes``: ``graph_node_owners`` is the authoritative,
+        many-to-many ownership ledger (shared content-addressed nodes may have
+        more than one owner).
+      - ``graph_edges``: ``graph_edge_owners`` scopes the edge itself.  Edge
+        visibility is never inferred from one endpoint, which would disclose
+        another tenant's node identifier and edge payload.
 
-    ``documents`` / ``document_chunks`` / ``fts_documents`` are file-content
-    tables keyed by content hash that the app reads *without* agent scoping,
-    so they are left un-scoped here too. Returns ``(None, [])`` when no agent
-    is known.
+    File-content tables remain deliberately non-queryable even though
+    ``file_owners`` now scopes file access: the explorer has no reason to emit
+    raw BLOBs or per-reference metadata when the file API is the narrower
+    capability.
+    Queryable tables fail closed to an empty scope when the requesting agent
+    or the ownership columns required by the schema are unavailable.
     """
-    if agent_id is None:
+    column_names = set(column_names)
+    if not agent_id:
+        if table_name in ALLOWED_TABLES:
+            return "1 = 0", []
         return None, []
-    if "agent_id" in set(column_names):
+    if "agent_id" in column_names:
         return "agent_id = ?", [agent_id]
-    node_agent = (
-        "(properties::jsonb->>'agent_id')"
-        if backend_type == "postgres"
-        else "json_extract(properties, '$.agent_id')"
-    )
     if table_name == "graph_nodes":
-        return f"{node_agent} = ?", [agent_id]
-    if table_name == "graph_edges":
-        owned = f"SELECT node_id FROM graph_nodes WHERE {node_agent} = ?"
+        if "node_id" not in column_names:
+            return "1 = 0", []
         return (
-            f"(source_id IN ({owned}) OR target_id IN ({owned}))",
-            [agent_id, agent_id],
+            "EXISTS (SELECT 1 FROM graph_node_owners AS graph_scope_owner "
+            "WHERE graph_scope_owner.node_id = graph_nodes.node_id "
+            "AND graph_scope_owner.agent_id = ?)",
+            [agent_id],
         )
+    if table_name == "graph_edges":
+        if not {"source_id", "target_id", "label"}.issubset(column_names):
+            return "1 = 0", []
+        return (
+            "EXISTS (SELECT 1 FROM graph_edge_owners AS graph_scope_owner "
+            "WHERE graph_scope_owner.source_id = graph_edges.source_id "
+            "AND graph_scope_owner.target_id = graph_edges.target_id "
+            "AND graph_scope_owner.label = graph_edges.label "
+            "AND graph_scope_owner.agent_id = ?)",
+            [agent_id],
+        )
+    if table_name in ALLOWED_TABLES:
+        return "1 = 0", []
     return None, []
-
-
-def _privacy_hides_persisted(storage) -> bool:
-    """True when the agent's privacy mode (EPHEMERAL/ISOLATED) means persisted
-    rows are not part of its visible state and must not be surfaced raw."""
-    pconf = getattr(storage, "privacy_config", None)
-    return pconf is not None and (pconf.is_ephemeral() or pconf.uses_temp_storage())
 
 
 async def _list_table_names(db):
@@ -121,11 +143,11 @@ async def _get_table_columns(db, table_name: str):
 
 @router.get("/tables")
 async def list_database_tables(request: Request):
-    """List SQLite tables with row counts and schema info."""
+    """List database tables with agent-scoped row counts and schema info."""
     try:
         agent = get_agent(request)
         storage = agent.storage
-        agent_id = getattr(agent, "agent_id", None)
+        agent_id = _require_bound_database_scope(agent, storage)
 
         # Use async database query
         all_tables = await _list_table_names(storage.db)
@@ -147,53 +169,56 @@ async def list_database_tables(request: Request):
                 logger.warning(f"Failed to get columns for table {table_name}: {e}")
                 columns = []
 
-            # Scope the row count to this agent the same way the app scopes
-            # the table, so a shared multi-agent DB doesn't report another
-            # agent's row totals through the explorer (#1651).
-            scope_cond, scope_params = _agent_scope(
-                table_name, [c["name"] for c in columns], agent_id,
-                storage.db.backend_type,
-            )
-            # For agent-scoped tables, EPHEMERAL/ISOLATED modes must not even
-            # reveal that persisted rows exist, so report the count as 0.
-            if scope_cond is not None and _privacy_hides_persisted(storage):
-                row_count = 0
+            queryable = table_name in ALLOWED_TABLES
+            if not queryable:
+                # A row count is still information about an unowned table.
+                # Keep its schema visible for diagnostics, but do not disclose
+                # tenant-aggregate metadata for a table whose rows cannot be
+                # scoped to the requesting agent.
+                row_count = -1
             else:
-                where_clause = f"WHERE {scope_cond}" if scope_cond else ""
-                try:
-                    count_row = await storage.db.fetchone(
-                        f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
-                        scope_params,
-                    )
-                    row_count = count_row[0] if count_row else 0
-                except Exception as e:
-                    logger.warning(f"Failed to count rows in table {table_name}: {e}")
+                # Scope the row count to this agent the same way the app scopes
+                # the table, so a shared multi-agent DB doesn't report another
+                # agent's row totals through the explorer (#1651).
+                scope_cond, scope_params = _agent_scope(
+                    table_name, [c["name"] for c in columns], agent_id,
+                    storage.db.backend_type,
+                )
+                # For agent-scoped tables, EPHEMERAL/ISOLATED modes must not
+                # reveal that persisted rows exist, so report the count as 0.
+                if scope_cond is not None and privacy_hides_persisted(storage):
                     row_count = 0
+                else:
+                    where_clause = f"WHERE {scope_cond}" if scope_cond else ""
+                    try:
+                        count_row = await storage.db.fetchone(
+                            f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
+                            scope_params,
+                        )
+                        row_count = count_row[0] if count_row else 0
+                    except Exception as e:
+                        logger.warning(f"Failed to count rows in table {table_name}: {e}")
+                        row_count = 0
 
             tables.append({
                 "name": table_name,
                 "row_count": row_count,
                 "columns": columns,
-                "queryable": table_name in ALLOWED_TABLES,
+                "queryable": queryable,
             })
 
-        # Get db_path from storage (not storage.db which is AsyncDatabase)
-        db_path = getattr(storage, 'db_path', None)
-        if db_path is None:
-            # Try to get from wrapped storage (PrivacyEnforcingStorage wraps AsyncStorage)
-            inner_storage = getattr(storage, '_storage', None)
-            if inner_storage:
-                db_path = getattr(inner_storage, 'db_path', None)
-
-        db_size = 0
-        if db_path and Path(db_path).exists():
-            db_size = Path(db_path).stat().st_size
-
+        # The endpoint has no trustworthy tenant-exclusivity signal for the
+        # physical database. In shared deployments its aggregate byte size is
+        # cross-agent activity metadata, while its path discloses host layout.
+        # Keep both established response fields present with non-disclosing
+        # sentinels until storage can prove exclusive custody.  ``db_path`` was
+        # part of the public response before the isolation fix, so removing the
+        # key outright needlessly breaks API consumers.
         return {
             "tables": tables,
             "table_count": len(tables),
-            "db_size": db_size,
-            "db_path": str(db_path) if db_path else "unknown",
+            "db_size": -1,
+            "db_path": None,
         }
     except HTTPException:
         raise
@@ -220,13 +245,16 @@ async def query_database_table(
     if table_name not in ALLOWED_TABLES:
         raise HTTPException(
             status_code=403,
-            detail=f"Table '{table_name}' is not queryable. Allowed: {', '.join(ALLOWED_TABLES)}"
+            detail=(
+                f"Table '{table_name}' is not queryable. Allowed: "
+                f"{', '.join(sorted(ALLOWED_TABLES))}"
+            ),
         )
 
     try:
         agent = get_agent(request)
         storage = agent.storage
-        agent_id = getattr(agent, "agent_id", None)
+        agent_id = _require_bound_database_scope(agent, storage)
 
         # Validate table name for safe SQL interpolation (defense-in-depth;
         # ALLOWED_TABLES check above is the primary gate)
@@ -244,7 +272,7 @@ async def query_database_table(
         # bypassing the privacy wrapper. For agent-scoped tables, EPHEMERAL
         # and ISOLATED modes promise the persisted rows are not part of the
         # agent's visible state, so don't surface them here either (#1651).
-        if scope_cond is not None and _privacy_hides_persisted(storage):
+        if scope_cond is not None and privacy_hides_persisted(storage):
             return {
                 "table": table_name,
                 "columns": columns,
