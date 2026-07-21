@@ -4,6 +4,7 @@ Async Database for Kestrel Storage.
 Unified async database interface supporting SQLite and PostgreSQL.
 All queries use SQLite-style ? placeholders - automatically converted for PostgreSQL.
 """
+import hashlib
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from .db import DatabaseBackend, SQLiteBackend, get_backend, normalize_schema
 
 logger = logging.getLogger(__name__)
+
+
+_BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
+
+
+def _backfill_lock_id(name: str) -> int:
+    """Stable signed-64-bit PostgreSQL advisory-lock key for a one-time backfill.
+
+    Used to serialize the first post-upgrade run across concurrent initializers
+    so a request burst doesn't stampede the heavy migration. Hash collisions
+    only serialize unrelated backfills; they cannot affect correctness.
+    """
+    payload = _BACKFILL_LOCK_DOMAIN + name.encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=True)
 
 
 # Core schema - written in SQLite style, converted for PostgreSQL
@@ -100,6 +115,15 @@ CREATE TABLE IF NOT EXISTS document_chunk_owners (
 
 CREATE INDEX IF NOT EXISTS idx_document_chunk_owners_agent
     ON document_chunk_owners(agent_id, chunk_id);
+
+-- One-time data-migration markers. Expensive backfills (e.g. the #2649
+-- ownership ledgers) record a row here once they succeed so they are not
+-- re-run on every _init_schema()/from_pool() — repeated multi-join scans on a
+-- populated database caused lock contention and statement timeouts.
+CREATE TABLE IF NOT EXISTS schema_backfills (
+    name TEXT PRIMARY KEY,
+    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 CREATE TABLE IF NOT EXISTS conversation_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -761,25 +785,21 @@ class AsyncDatabase:
             if statement:
                 await self._backend.execute(statement)
 
-        # #2649: legacy graph rows predate the authoritative ownership
-        # ledgers above.  Backfill only ownership that can be proven from an
-        # existing agent tag/root, a canonical agent-namespaced node id, or a
-        # constitution edge that agrees with the root's anchored hash.  The
-        # migration is idempotent and deliberately leaves ambiguous/cross-
-        # tenant rows unowned so explorer reads fail closed.
-        await self._backfill_graph_ownership()
-
-        # File blobs need the same explicit tenant capability as graph rows.
-        # Only a pre-existing owned document/avatar graph node is strong enough
-        # to backfill a legacy reference. Generic/unreferenced legacy blobs stay
-        # unowned and therefore inaccessible to tenant-bound stores.
-        await self._backfill_file_ownership()
-
-        # Legacy chunks are visible to a tenant only when the corresponding
-        # file has one unambiguous owner. Shared/ownerless documents remain
-        # unowned rather than granting one tenant another tenant's derived
-        # plaintext during upgrade.
-        await self._backfill_document_chunk_ownership()
+        # #2649: legacy graph/file/chunk rows predate the authoritative
+        # ownership ledgers above. These backfills prove ownership only from
+        # existing agent tags/roots/edges, leaving ambiguous rows unowned so
+        # explorer reads fail closed. They are ONE-TIME migrations for legacy
+        # data — new rows record ownership at write time (async_graph_store /
+        # async_file_store / async_rag_store) — but each does heavy multi-join
+        # INSERT...SELECT scans. _init_schema runs on every from_pool(), which
+        # frinz calls per request, so running them unconditionally made
+        # concurrent inits contend on the ownership tables and time out
+        # (statement timeout / hung companion creation). Gate behind a
+        # persistent marker so they run at most once; after that _init_schema
+        # stays cheap. The steady-state fast path skips without taking any lock;
+        # only the first post-upgrade run enters the serialized runner below.
+        if not await self._backfill_completed("ownership_2649"):
+            await self._run_ownership_backfills_once("ownership_2649")
 
         # Soft-delete migration (#763): add deleted_at to conversation_history
         # for databases created before soft-delete shipped. Idempotent — does
@@ -1360,38 +1380,105 @@ class AsyncDatabase:
         await self.execute(sql)
 
     async def _backfill_document_chunk_ownership(self) -> None:
-        """Assign legacy chunks only from an unambiguous file capability."""
+        """Assign legacy chunks only from an unambiguous file capability.
 
-        if self.backend_type == "postgres":
-            sql = """
-                INSERT INTO document_chunk_owners (chunk_id, agent_id)
-                SELECT chunks.chunk_id, MIN(owners.agent_id)
-                FROM document_chunks chunks
-                JOIN file_owners owners
-                  ON owners.content_hash = chunks.file_hash
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM document_chunk_owners existing_owner
-                    WHERE existing_owner.chunk_id = chunks.chunk_id
-                )
-                GROUP BY chunks.chunk_id
-                HAVING COUNT(DISTINCT owners.agent_id) = 1
-                ON CONFLICT DO NOTHING
-            """
-        else:
-            sql = """
-                INSERT OR IGNORE INTO document_chunk_owners (chunk_id, agent_id)
-                SELECT chunks.chunk_id, MIN(owners.agent_id)
-                FROM document_chunks chunks
-                JOIN file_owners owners
-                  ON owners.content_hash = chunks.file_hash
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM document_chunk_owners existing_owner
-                    WHERE existing_owner.chunk_id = chunks.chunk_id
-                )
-                GROUP BY chunks.chunk_id
-                HAVING COUNT(DISTINCT owners.agent_id) = 1
-            """
+        Resolve single-owner files FIRST (aggregate ``file_owners`` by
+        content_hash), then join to chunks. Grouping after the chunk×owner
+        join instead — the original shape — explodes on a content_hash owned
+        by many agents (e.g. a shared default/constitution blob): 26k chunks ×
+        1.4k owners is tens of millions of rows just to discard them via
+        ``HAVING COUNT(DISTINCT ...) = 1``. Pre-aggregating keeps the driving
+        set at one row per single-owner file. Semantically identical: a chunk
+        is owned iff its file has exactly one distinct owner.
+        """
+
+        insert = (
+            "INSERT INTO document_chunk_owners (chunk_id, agent_id)"
+            if self.backend_type == "postgres"
+            else "INSERT OR IGNORE INTO document_chunk_owners (chunk_id, agent_id)"
+        )
+        conflict = " ON CONFLICT DO NOTHING" if self.backend_type == "postgres" else ""
+        sql = f"""
+            {insert}
+            SELECT chunks.chunk_id, single_owner.agent_id
+            FROM document_chunks chunks
+            JOIN (
+                SELECT content_hash, MIN(agent_id) AS agent_id
+                FROM file_owners
+                GROUP BY content_hash
+                HAVING COUNT(DISTINCT agent_id) = 1
+            ) single_owner
+              ON single_owner.content_hash = chunks.file_hash
+            WHERE NOT EXISTS (
+                SELECT 1 FROM document_chunk_owners existing_owner
+                WHERE existing_owner.chunk_id = chunks.chunk_id
+            ){conflict}
+        """
         await self.execute(sql)
+
+    async def _backfill_completed(self, name: str) -> bool:
+        """True if the named one-time backfill has already recorded success.
+
+        Backed by the ``schema_backfills`` marker table (created in
+        CORE_SCHEMA, so it exists before this is called). Lets ``_init_schema``
+        skip expensive one-time migrations on the vast majority of
+        ``from_pool()`` calls instead of re-scanning every time.
+        """
+        row = await self._backend.fetch_one(
+            "SELECT 1 FROM schema_backfills WHERE name = ?", (name,)
+        )
+        return row is not None
+
+    async def _mark_backfill_completed(self, name: str) -> None:
+        """Record that the named one-time backfill has completed. Idempotent."""
+        if self.backend_type == "postgres":
+            await self._backend.execute(
+                "INSERT INTO schema_backfills (name) VALUES (?) "
+                "ON CONFLICT DO NOTHING",
+                (name,),
+            )
+        else:
+            await self._backend.execute(
+                "INSERT OR IGNORE INTO schema_backfills (name) VALUES (?)",
+                (name,),
+            )
+
+    async def _run_ownership_backfills_once(self, name: str) -> None:
+        """Run the #2649 ownership backfills exactly once, serialized.
+
+        ``_init_schema`` runs on every ``from_pool()`` (frinz calls it per
+        request), so a post-upgrade request burst would otherwise have every
+        initializer observe no marker and run the heavy scans concurrently —
+        the lock contention/timeout this fix targets. Take a transaction-scoped
+        advisory lock (Postgres) so exactly one initializer performs the
+        migration while the rest wait, then re-check the marker under the lock
+        and skip. The whole migration + marker commit atomically, so an
+        interrupted upgrade leaves no marker and retries on the next boot.
+        SQLite needs no advisory lock — its single writer already serializes.
+        """
+        async with self.transaction():
+            if self.backend_type == "postgres":
+                await self._backend.execute(
+                    "SELECT pg_advisory_xact_lock(?)", (_backfill_lock_id(name),)
+                )
+            else:
+                # SQLite transactions BEGIN deferred, so two initializers could
+                # both read a missing marker and the second would raise
+                # "database is locked" when it upgrades mid-backfill. Promote to
+                # the single write slot with a no-op write BEFORE the marker
+                # read (busy_timeout makes the loser wait, then it skips) —
+                # mirroring the lexical-cleanup serialization.
+                await self._backend.execute(
+                    "DELETE FROM schema_backfills WHERE 0"
+                )
+            # Double-checked: a concurrent initializer may have completed the
+            # migration between the fast-path check and acquiring the lock.
+            if await self._backfill_completed(name):
+                return
+            await self._backfill_graph_ownership()
+            await self._backfill_file_ownership()
+            await self._backfill_document_chunk_ownership()
+            await self._mark_backfill_completed(name)
 
     async def _migrate_add_column(
         self, table: str, column: str, col_def: str
