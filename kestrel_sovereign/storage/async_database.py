@@ -4,6 +4,7 @@ Async Database for Kestrel Storage.
 Unified async database interface supporting SQLite and PostgreSQL.
 All queries use SQLite-style ? placeholders - automatically converted for PostgreSQL.
 """
+import hashlib
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from .db import DatabaseBackend, SQLiteBackend, get_backend, normalize_schema
 
 logger = logging.getLogger(__name__)
+
+
+_BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
+
+
+def _backfill_lock_id(name: str) -> int:
+    """Stable signed-64-bit PostgreSQL advisory-lock key for a one-time backfill.
+
+    Used to serialize the first post-upgrade run across concurrent initializers
+    so a request burst doesn't stampede the heavy migration. Hash collisions
+    only serialize unrelated backfills; they cannot affect correctness.
+    """
+    payload = _BACKFILL_LOCK_DOMAIN + name.encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=True)
 
 
 # Core schema - written in SQLite style, converted for PostgreSQL
@@ -781,13 +796,10 @@ class AsyncDatabase:
         # concurrent inits contend on the ownership tables and time out
         # (statement timeout / hung companion creation). Gate behind a
         # persistent marker so they run at most once; after that _init_schema
-        # stays cheap. Marked only after all three succeed (each is atomic via
-        # its own transaction), so an interrupted upgrade retries next boot.
+        # stays cheap. The steady-state fast path skips without taking any lock;
+        # only the first post-upgrade run enters the serialized runner below.
         if not await self._backfill_completed("ownership_2649"):
-            await self._backfill_graph_ownership()
-            await self._backfill_file_ownership()
-            await self._backfill_document_chunk_ownership()
-            await self._mark_backfill_completed("ownership_2649")
+            await self._run_ownership_backfills_once("ownership_2649")
 
         # Soft-delete migration (#763): add deleted_at to conversation_history
         # for databases created before soft-delete shipped. Idempotent — does
@@ -1430,6 +1442,33 @@ class AsyncDatabase:
                 "INSERT OR IGNORE INTO schema_backfills (name) VALUES (?)",
                 (name,),
             )
+
+    async def _run_ownership_backfills_once(self, name: str) -> None:
+        """Run the #2649 ownership backfills exactly once, serialized.
+
+        ``_init_schema`` runs on every ``from_pool()`` (frinz calls it per
+        request), so a post-upgrade request burst would otherwise have every
+        initializer observe no marker and run the heavy scans concurrently —
+        the lock contention/timeout this fix targets. Take a transaction-scoped
+        advisory lock (Postgres) so exactly one initializer performs the
+        migration while the rest wait, then re-check the marker under the lock
+        and skip. The whole migration + marker commit atomically, so an
+        interrupted upgrade leaves no marker and retries on the next boot.
+        SQLite needs no advisory lock — its single writer already serializes.
+        """
+        async with self.transaction():
+            if self.backend_type == "postgres":
+                await self._backend.execute(
+                    "SELECT pg_advisory_xact_lock(?)", (_backfill_lock_id(name),)
+                )
+            # Double-checked: a concurrent initializer may have completed the
+            # migration between the fast-path check and acquiring the lock.
+            if await self._backfill_completed(name):
+                return
+            await self._backfill_graph_ownership()
+            await self._backfill_file_ownership()
+            await self._backfill_document_chunk_ownership()
+            await self._mark_backfill_completed(name)
 
     async def _migrate_add_column(
         self, table: str, column: str, col_def: str
