@@ -101,6 +101,15 @@ CREATE TABLE IF NOT EXISTS document_chunk_owners (
 CREATE INDEX IF NOT EXISTS idx_document_chunk_owners_agent
     ON document_chunk_owners(agent_id, chunk_id);
 
+-- One-time data-migration markers. Expensive backfills (e.g. the #2649
+-- ownership ledgers) record a row here once they succeed so they are not
+-- re-run on every _init_schema()/from_pool() — repeated multi-join scans on a
+-- populated database caused lock contention and statement timeouts.
+CREATE TABLE IF NOT EXISTS schema_backfills (
+    name TEXT PRIMARY KEY,
+    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS conversation_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id TEXT NOT NULL DEFAULT '',
@@ -761,25 +770,24 @@ class AsyncDatabase:
             if statement:
                 await self._backend.execute(statement)
 
-        # #2649: legacy graph rows predate the authoritative ownership
-        # ledgers above.  Backfill only ownership that can be proven from an
-        # existing agent tag/root, a canonical agent-namespaced node id, or a
-        # constitution edge that agrees with the root's anchored hash.  The
-        # migration is idempotent and deliberately leaves ambiguous/cross-
-        # tenant rows unowned so explorer reads fail closed.
-        await self._backfill_graph_ownership()
-
-        # File blobs need the same explicit tenant capability as graph rows.
-        # Only a pre-existing owned document/avatar graph node is strong enough
-        # to backfill a legacy reference. Generic/unreferenced legacy blobs stay
-        # unowned and therefore inaccessible to tenant-bound stores.
-        await self._backfill_file_ownership()
-
-        # Legacy chunks are visible to a tenant only when the corresponding
-        # file has one unambiguous owner. Shared/ownerless documents remain
-        # unowned rather than granting one tenant another tenant's derived
-        # plaintext during upgrade.
-        await self._backfill_document_chunk_ownership()
+        # #2649: legacy graph/file/chunk rows predate the authoritative
+        # ownership ledgers above. These backfills prove ownership only from
+        # existing agent tags/roots/edges, leaving ambiguous rows unowned so
+        # explorer reads fail closed. They are ONE-TIME migrations for legacy
+        # data — new rows record ownership at write time (async_graph_store /
+        # async_file_store / async_rag_store) — but each does heavy multi-join
+        # INSERT...SELECT scans. _init_schema runs on every from_pool(), which
+        # frinz calls per request, so running them unconditionally made
+        # concurrent inits contend on the ownership tables and time out
+        # (statement timeout / hung companion creation). Gate behind a
+        # persistent marker so they run at most once; after that _init_schema
+        # stays cheap. Marked only after all three succeed (each is atomic via
+        # its own transaction), so an interrupted upgrade retries next boot.
+        if not await self._backfill_completed("ownership_2649"):
+            await self._backfill_graph_ownership()
+            await self._backfill_file_ownership()
+            await self._backfill_document_chunk_ownership()
+            await self._mark_backfill_completed("ownership_2649")
 
         # Soft-delete migration (#763): add deleted_at to conversation_history
         # for databases created before soft-delete shipped. Idempotent — does
@@ -1360,38 +1368,68 @@ class AsyncDatabase:
         await self.execute(sql)
 
     async def _backfill_document_chunk_ownership(self) -> None:
-        """Assign legacy chunks only from an unambiguous file capability."""
+        """Assign legacy chunks only from an unambiguous file capability.
 
-        if self.backend_type == "postgres":
-            sql = """
-                INSERT INTO document_chunk_owners (chunk_id, agent_id)
-                SELECT chunks.chunk_id, MIN(owners.agent_id)
-                FROM document_chunks chunks
-                JOIN file_owners owners
-                  ON owners.content_hash = chunks.file_hash
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM document_chunk_owners existing_owner
-                    WHERE existing_owner.chunk_id = chunks.chunk_id
-                )
-                GROUP BY chunks.chunk_id
-                HAVING COUNT(DISTINCT owners.agent_id) = 1
-                ON CONFLICT DO NOTHING
-            """
-        else:
-            sql = """
-                INSERT OR IGNORE INTO document_chunk_owners (chunk_id, agent_id)
-                SELECT chunks.chunk_id, MIN(owners.agent_id)
-                FROM document_chunks chunks
-                JOIN file_owners owners
-                  ON owners.content_hash = chunks.file_hash
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM document_chunk_owners existing_owner
-                    WHERE existing_owner.chunk_id = chunks.chunk_id
-                )
-                GROUP BY chunks.chunk_id
-                HAVING COUNT(DISTINCT owners.agent_id) = 1
-            """
+        Resolve single-owner files FIRST (aggregate ``file_owners`` by
+        content_hash), then join to chunks. Grouping after the chunk×owner
+        join instead — the original shape — explodes on a content_hash owned
+        by many agents (e.g. a shared default/constitution blob): 26k chunks ×
+        1.4k owners is tens of millions of rows just to discard them via
+        ``HAVING COUNT(DISTINCT ...) = 1``. Pre-aggregating keeps the driving
+        set at one row per single-owner file. Semantically identical: a chunk
+        is owned iff its file has exactly one distinct owner.
+        """
+
+        insert = (
+            "INSERT INTO document_chunk_owners (chunk_id, agent_id)"
+            if self.backend_type == "postgres"
+            else "INSERT OR IGNORE INTO document_chunk_owners (chunk_id, agent_id)"
+        )
+        conflict = " ON CONFLICT DO NOTHING" if self.backend_type == "postgres" else ""
+        sql = f"""
+            {insert}
+            SELECT chunks.chunk_id, single_owner.agent_id
+            FROM document_chunks chunks
+            JOIN (
+                SELECT content_hash, MIN(agent_id) AS agent_id
+                FROM file_owners
+                GROUP BY content_hash
+                HAVING COUNT(DISTINCT agent_id) = 1
+            ) single_owner
+              ON single_owner.content_hash = chunks.file_hash
+            WHERE NOT EXISTS (
+                SELECT 1 FROM document_chunk_owners existing_owner
+                WHERE existing_owner.chunk_id = chunks.chunk_id
+            ){conflict}
+        """
         await self.execute(sql)
+
+    async def _backfill_completed(self, name: str) -> bool:
+        """True if the named one-time backfill has already recorded success.
+
+        Backed by the ``schema_backfills`` marker table (created in
+        CORE_SCHEMA, so it exists before this is called). Lets ``_init_schema``
+        skip expensive one-time migrations on the vast majority of
+        ``from_pool()`` calls instead of re-scanning every time.
+        """
+        row = await self._backend.fetch_one(
+            "SELECT 1 FROM schema_backfills WHERE name = ?", (name,)
+        )
+        return row is not None
+
+    async def _mark_backfill_completed(self, name: str) -> None:
+        """Record that the named one-time backfill has completed. Idempotent."""
+        if self.backend_type == "postgres":
+            await self._backend.execute(
+                "INSERT INTO schema_backfills (name) VALUES (?) "
+                "ON CONFLICT DO NOTHING",
+                (name,),
+            )
+        else:
+            await self._backend.execute(
+                "INSERT OR IGNORE INTO schema_backfills (name) VALUES (?)",
+                (name,),
+            )
 
     async def _migrate_add_column(
         self, table: str, column: str, col_def: str
