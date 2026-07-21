@@ -2196,3 +2196,306 @@ async def test_migration_backfills_wake_delivered_for_old_completed_rows(tmp_pat
     await ensure_restart_requests_table(db)
     nu = await get_request(db, "new-undelivered")
     assert nu.wake_delivered is False  # not clobbered by a re-run backfill
+
+
+# ---------------------------------------------------------------------------
+# Best-effort update steps: the reattach_branch step legitimately fails for
+# tag/sha targets (refs/remotes/origin/<ref> doesn't resolve), so a failing
+# allow_failure step must not abort the update — while mutating steps stay
+# fatal-on-failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_update_continues_past_failing_allow_failure_step(tmp_path):
+    import sys
+
+    from kestrel_sovereign.features.restart_coordinator.update_profiles import (
+        UpdateProfile,
+        UpdateStep,
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+
+    def _build(repo_path, target_ref, allow_migrations):
+        return [
+            UpdateStep(
+                "reattach_branch",
+                [sys.executable, "-c", "import sys; sys.exit(1)"],
+                allow_failure=True,
+            ),
+            UpdateStep(
+                "resolve_ref",
+                [sys.executable, "-c", "print('deadbeef')"],
+                read_only=True,
+            ),
+        ]
+
+    profile = UpdateProfile(
+        name="probe", description="", supports_migrations=False, _build=_build,
+    )
+    req = SimpleNamespace(
+        id="req-probe",
+        update_repo_path=str(tmp_path),
+        update_target_ref="v0.31.1",
+        update_allow_migrations=False,
+    )
+
+    update = await feat._run_update(req, profile)
+    assert update["ok"] is True
+    assert update["failed_step"] is None
+    # Later steps still ran after the best-effort failure.
+    assert update["resolved_ref"] == "deadbeef"
+    reattach = next(s for s in update["steps"] if s["step"] == "reattach_branch")
+    assert reattach["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_update_still_fails_on_mutating_step(tmp_path):
+    import sys
+
+    from kestrel_sovereign.features.restart_coordinator.update_profiles import (
+        UpdateProfile,
+        UpdateStep,
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+
+    def _build(repo_path, target_ref, allow_migrations):
+        return [
+            UpdateStep(
+                "install",
+                [sys.executable, "-c", "import sys; sys.exit(1)"],
+            ),
+            UpdateStep(
+                "resolve_ref",
+                [sys.executable, "-c", "print('deadbeef')"],
+                read_only=True,
+            ),
+        ]
+
+    profile = UpdateProfile(
+        name="probe", description="", supports_migrations=False, _build=_build,
+    )
+    req = SimpleNamespace(
+        id="req-probe",
+        update_repo_path=str(tmp_path),
+        update_target_ref="main",
+        update_allow_migrations=False,
+    )
+
+    update = await feat._run_update(req, profile)
+    assert update["ok"] is False
+    assert update["failed_step"] == "install"
+    # Stopped at the failure: resolve_ref never ran.
+    assert update["resolved_ref"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Native reattach_branch routine: attach for branch targets, stay detached
+# for tags, and never follow a same-named branch when the fetch landed on a
+# tag (codex P2 on the reattach change — a name can be both).
+# ---------------------------------------------------------------------------
+
+
+def _real_origin_and_clone(tmp_path):
+    """A real origin with branch `main`, plus a local clone."""
+    origin = tmp_path / "origin"
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(origin)], check=True
+    )
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(origin), "config", k, v], check=True)
+    (origin / "f.txt").write_text("one\n")
+    subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(origin), "commit", "-q", "-m", "one"], check=True
+    )
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)], check=True
+    )
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(clone), "config", k, v], check=True)
+    return origin, clone
+
+
+def _git_out(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+async def _run_git_steps(feat, repo, target_ref):
+    """Run the profile's git steps (fetch/checkout/reattach) for real,
+    skipping install/feature_sync which need a real project."""
+    profile = get_update_profile("sovereign_local_uv_sync")
+    steps = profile.build_steps(
+        repo_path=str(repo), target_ref=target_ref, allow_migrations=False
+    )
+    outcomes = {}
+    for step in steps:
+        if step.name in ("install", "feature_sync"):
+            continue
+        outcomes[step.name] = await feat._run_update_step(step)
+    return outcomes
+
+
+@pytest.mark.asyncio
+async def test_reattach_attaches_branch_target_on_fetched_commit(tmp_path):
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Advance origin/main past the clone.
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "HEAD")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "main")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    # Attached to main, exactly at the fetched origin tip.
+    assert _git_out(clone, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert _git_out(clone, "rev-parse", "HEAD") == origin_tip
+
+
+@pytest.mark.asyncio
+async def test_reattach_stays_detached_for_tag_target(tmp_path):
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    subprocess.run(["git", "-C", str(origin), "tag", "v9.9.9"], check=True)
+    tag_sha = _git_out(origin, "rev-parse", "v9.9.9^{commit}")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "v9.9.9")
+
+    out = outcomes["reattach_branch"]
+    assert out["ok"] is True
+    assert "skip" in out["stdout_tail"]
+    assert _git_out(clone, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert _git_out(clone, "rev-parse", "HEAD") == tag_sha
+
+
+@pytest.mark.asyncio
+async def test_reattach_ignores_branch_shadowing_a_tag(tmp_path):
+    """Name exists as BOTH tag and branch: the fetch lands on the TAG
+    commit, so the reattach must NOT move to the same-named branch."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Tag the first commit as 'v1', then grow a *branch* also named 'v1'.
+    subprocess.run(["git", "-C", str(origin), "tag", "v1"], check=True)
+    tag_sha = _git_out(origin, "rev-parse", "v1^{commit}")
+    subprocess.run(
+        ["git", "-C", str(origin), "checkout", "-q", "-b", "v1-branch-tmp"],
+        check=True,
+    )
+    (origin / "f.txt").write_text("branch-two\n")
+    subprocess.run(
+        ["git", "-C", str(origin), "commit", "-qam", "branch two"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(origin), "branch", "-m", "v1-branch-tmp", "v1"],
+        check=True,
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "v1")
+
+    out = outcomes["reattach_branch"]
+    assert out["ok"] is True
+    assert "skip" in out["stdout_tail"]
+    # Still detached on the TAG commit — never the shadowing branch tip.
+    assert _git_out(clone, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert _git_out(clone, "rev-parse", "HEAD") == tag_sha
+
+
+@pytest.mark.asyncio
+async def test_reattach_ignores_stale_local_tag_named_like_branch(tmp_path):
+    """A stale LOCAL tag named like the branch must not force tag intent:
+    the fetch selected the branch, so the reattach must attach (codex
+    round-2)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Stale local-only tag in the CLONE shadowing the branch name.
+    subprocess.run(["git", "-C", str(clone), "tag", "main"], check=True)
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "HEAD")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "main")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    # Full symbolic-ref: --short would report 'heads/main' here because
+    # the stale tag makes the bare name ambiguous.
+    assert _git_out(clone, "symbolic-ref", "HEAD") == "refs/heads/main"
+    assert _git_out(clone, "rev-parse", "refs/heads/main") == origin_tip
+
+
+@pytest.mark.asyncio
+async def test_reattach_sets_upstream_for_new_local_branch(tmp_path):
+    """Attaching to a branch the clone never had locally must configure
+    @{u}, or the next `kestrel update` bare pull fails (codex round-2)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    subprocess.run(
+        ["git", "-C", str(origin), "checkout", "-q", "-b", "deploy"],
+        check=True,
+    )
+    (origin / "f.txt").write_text("deploy\n")
+    subprocess.run(
+        ["git", "-C", str(origin), "commit", "-qam", "deploy"], check=True
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "deploy")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    assert _git_out(clone, "symbolic-ref", "--short", "HEAD") == "deploy"
+    assert (
+        _git_out(clone, "rev-parse", "--abbrev-ref", "deploy@{upstream}")
+        == "origin/deploy"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reattach_handles_fully_qualified_branch_ref(tmp_path):
+    """refs/heads/<name> is a valid target ref; FETCH_HEAD records the
+    short name, so the routine must normalize before matching (codex
+    round-3)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "HEAD")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "refs/heads/main")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    assert _git_out(clone, "symbolic-ref", "HEAD") == "refs/heads/main"
+    assert _git_out(clone, "rev-parse", "HEAD") == origin_tip
+    assert (
+        _git_out(clone, "rev-parse", "--abbrev-ref", "main@{upstream}")
+        == "origin/main"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reattach_ignores_incidental_not_for_merge_tag_line(tmp_path):
+    """An origin tag sharing the branch's short name arrives as a
+    not-for-merge FETCH_HEAD line when the branch was explicitly
+    requested; intent must come from the for-merge line only (codex
+    round-4)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Origin-side tag named exactly like the branch, on the old commit.
+    subprocess.run(["git", "-C", str(origin), "tag", "main"], check=True)
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "refs/heads/main")
+
+    feat, _db = await _make_feature(tmp_path)
+    # Fully qualified: the fetch selects the BRANCH; --tags still writes
+    # a not-for-merge line for the colliding tag.
+    outcomes = await _run_git_steps(feat, clone, "refs/heads/main")
+
+    out = outcomes["reattach_branch"]
+    assert out["ok"] is True
+    assert "skip" not in out["stdout_tail"]
+    assert _git_out(clone, "symbolic-ref", "HEAD") == "refs/heads/main"
+    assert _git_out(clone, "rev-parse", "refs/heads/main") == origin_tip

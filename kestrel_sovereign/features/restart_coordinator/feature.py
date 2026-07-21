@@ -27,6 +27,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
@@ -1332,7 +1333,9 @@ class RestartCoordinatorFeature(Feature):
             results.append(outcome)
             if step.name == "resolve_ref" and outcome.get("ok"):
                 resolved_ref = (outcome.get("stdout_tail") or "").strip()
-            if not outcome.get("ok") and not step.read_only:
+            if not outcome.get("ok") and not (
+                step.read_only or step.allow_failure
+            ):
                 ok = False
                 failed_step = step.name
                 break
@@ -1372,6 +1375,8 @@ class RestartCoordinatorFeature(Feature):
         Uses ``create_subprocess_exec`` (argv list, never a shell) so a
         crafted ref/path can never inject a command.
         """
+        if getattr(step, "native", None) == "reattach_branch":
+            return await self._reattach_branch_step(step)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *step.argv,
@@ -1400,6 +1405,137 @@ class RestartCoordinatorFeature(Feature):
             "stdout_tail": _tail(stdout),
             "stderr_tail": _tail(stderr),
         }
+
+    async def _reattach_branch_step(self, step) -> Dict[str, Any]:
+        """Native reattach: land the local branch on the fetched commit.
+
+        Runs after the profile's ``checkout --detach FETCH_HEAD``. A single
+        argv command cannot express the required guard — a name can exist
+        as BOTH a tag and a branch, and ``git fetch <name>`` lands on the
+        TAG commit, so attaching to ``origin/<name>`` could install a
+        different commit than the one fetched (codex P2 on the reattach
+        change). Intent is decided from what the fetch actually selected —
+        the ``FETCH_HEAD`` file records ``tag '<ref>'`` / ``branch
+        '<ref>'`` per fetched ref — never from local tag state (a stale
+        local tag shadowing a branch must not force tag intent, codex
+        round-2). Plain plumbing throughout (each call
+        ``create_subprocess_exec``, never a shell):
+
+        1. fetch selected ``tag '<ref>'``    → skip, stay detached.
+        2. fetch selected no ``branch '<ref>'`` (sha target) → skip.
+        3. ``origin/<ref>`` != FETCH_HEAD    → skip (defensive).
+        4. otherwise ``checkout -B <ref> FETCH_HEAD`` and set the branch
+           upstream to ``origin/<ref>`` — a NEW local branch without
+           ``@{u}`` would fail the next ``kestrel update``'s bare
+           ``git pull --ff-only`` (codex round-2).
+
+        Skips report ``ok=True`` with the reason in ``stdout_tail``; the
+        step is additionally ``allow_failure`` so even unexpected git
+        errors never abort the update.
+        """
+        repo, ref = step.native_args
+        # A caller may pass the fully-qualified form (refs/heads/main —
+        # accepted by is_valid_target_ref); FETCH_HEAD records the SHORT
+        # name ("branch 'main'"), and checkout/upstream want it too
+        # (codex round-3).
+        if ref.startswith("refs/heads/"):
+            ref = ref[len("refs/heads/"):]
+
+        async def _git(*args: str):
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", repo, *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            return proc.returncode, _tail(stdout), _tail(stderr)
+
+        def _outcome(ok: bool, rc, out: str, err: str = "") -> Dict[str, Any]:
+            return {
+                "step": step.name,
+                "argv": list(step.argv),
+                "returncode": rc,
+                "ok": ok,
+                "stdout_tail": out,
+                "stderr_tail": err,
+            }
+
+        try:
+            # What did the fetch select for <ref>? FETCH_HEAD lines look
+            # like: "<sha>\t(not-for-merge)?\tbranch 'x' of <url>".
+            rc, fetch_head_rel, _err = await _git(
+                "rev-parse", "--git-path", "FETCH_HEAD"
+            )
+            if rc != 0:
+                return _outcome(
+                    True, 0, "skip: no FETCH_HEAD; staying detached"
+                )
+            fh = Path(fetch_head_rel.strip())
+            if not fh.is_absolute():
+                fh = Path(repo) / fh
+            try:
+                fetch_lines = fh.read_text().splitlines()
+            except OSError:
+                return _outcome(
+                    True, 0, "skip: unreadable FETCH_HEAD; staying detached"
+                )
+            # Only the FOR-MERGE line(s) (empty second tab-field) name the
+            # ref the fetch selected for the requested refspec; ``--tags``
+            # also writes incidental ``not-for-merge`` tag lines which
+            # must not decide intent (codex round-4: an origin tag merely
+            # sharing the branch's short name would otherwise force a
+            # skip even though the branch was selected).
+            selected = []
+            for line in fetch_lines:
+                parts = line.split("\t")
+                if len(parts) >= 3 and not parts[1].strip():
+                    selected.append(parts[2])
+            if any(f"tag '{ref}'" in desc for desc in selected):
+                return _outcome(
+                    True, 0,
+                    f"skip: fetch selected tag {ref!r}; staying detached",
+                )
+            if not any(f"branch '{ref}'" in desc for desc in selected):
+                return _outcome(
+                    True, 0,
+                    f"skip: fetch selected no branch {ref!r}; "
+                    "staying detached",
+                )
+            rc, branch_sha, _err = await _git(
+                "rev-parse", "--verify", "--quiet",
+                f"refs/remotes/origin/{ref}^{{commit}}",
+            )
+            if rc != 0:
+                return _outcome(
+                    True, 0,
+                    f"skip: no origin branch {ref!r}; staying detached",
+                )
+            rc, fetch_sha, _err = await _git(
+                "rev-parse", "--verify", "FETCH_HEAD^{commit}"
+            )
+            if rc != 0 or branch_sha.strip() != fetch_sha.strip():
+                return _outcome(
+                    True, 0,
+                    f"skip: origin/{ref} != FETCH_HEAD; staying detached",
+                )
+            rc, out, err = await _git("checkout", "-B", ref, fetch_sha.strip())
+            if rc != 0:
+                return _outcome(False, rc, out, err)
+            rc, up_out, up_err = await _git(
+                "branch", f"--set-upstream-to=refs/remotes/origin/{ref}", ref
+            )
+            return _outcome(rc == 0, rc, out + "\n" + up_out, err + up_err)
+        except Exception as e:
+            return {
+                "step": step.name,
+                "argv": list(step.argv),
+                "returncode": None,
+                "ok": False,
+                "error": str(e),
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
 
     def _spawn_restart_subprocess(self) -> None:
         """Spawn a detached ``kestrel restart`` subprocess.

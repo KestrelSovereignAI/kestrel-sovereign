@@ -3045,7 +3045,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign-sdk", extras = ["metrics", "tracing"], marker = "extra == 'observability'", specifier = ">=0.31.0,<0.32" },
-    { name = "kestrel-sovereign-sdk", extras = ["tracing"], specifier = ">=0.31.0,<0.32" },
+    { name = "kestrel-sovereign-sdk", extras = ["tracing"], specifier = ">=0.31.1,<0.32" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
     { name = "numpy", marker = "extra == 'local'", specifier = "==2.4.6" },
@@ -3125,14 +3125,14 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.31.0"
+version = "0.31.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7e/dd/b8ce533ab02640113f0d428b664177d84403445d57a7bb48386c0965bbb4/kestrel_sovereign_sdk-0.31.0.tar.gz", hash = "sha256:da2a9fa80b51e52d476dca36ffd6f8b267aa9eda4a788003d1e3c928cbc49677", size = 128938, upload-time = "2026-07-19T23:49:25.019Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/75/7dfbe63432e6fbdd8af90c440cc908f94d59e1420535fad8759998496652/kestrel_sovereign_sdk-0.31.1.tar.gz", hash = "sha256:3ed3badc059be979cc99070b622179b3238570cc0973ec04acd13b050ef55eeb", size = 128936, upload-time = "2026-07-21T15:37:19.654Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/0d/3be74270eccd2dc3dd254704d64b06c77f7ed6667d99979108a1c20c00fc/kestrel_sovereign_sdk-0.31.0-py3-none-any.whl", hash = "sha256:77b7189f497483dffad10e075c7008014fdaab579c84d86cda463f3419123303", size = 161101, upload-time = "2026-07-19T23:49:23.28Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/ba/1787ed8d67113c87986abf5d18841565fc6642c70deea6be87bcbe8c92f6/kestrel_sovereign_sdk-0.31.1-py3-none-any.whl", hash = "sha256:aa1948bd68a10dfd96e80a8589c3d2514a9bf12c47b0beef0c317f455c6bc848", size = 161101, upload-time = "2026-07-21T15:37:18.315Z" },
 ]
 
 [package.optional-dependencies]

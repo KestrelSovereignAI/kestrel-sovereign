@@ -72,6 +72,18 @@ class UpdateStep:
     # Read-only steps (e.g. resolving HEAD) observe state; they never
     # mutate the checkout and a non-zero exit is non-fatal to the update.
     read_only: bool = False
+    # Best-effort steps may mutate but are expected to fail in some
+    # legitimate configurations (e.g. reattaching a branch when the target
+    # ref is a tag/sha); a non-zero exit is non-fatal to the update.
+    allow_failure: bool = False
+    # Coordinator-native routine name. Most steps are a single argv exec;
+    # a native step is a small fixed routine implemented in the coordinator
+    # (still argv-exec subprocesses, never a shell) for logic that needs a
+    # runtime ref comparison a single command can't express. ``argv`` then
+    # documents the mutating command the routine may run; ``native_args``
+    # carries its validated parameters.
+    native: Optional[str] = None
+    native_args: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +132,29 @@ def _sovereign_local_uv_sync(
         # lands on the fetched commit regardless of whether the ref is a
         # branch, tag, or sha.
         UpdateStep("checkout", git + ["checkout", "--detach", "FETCH_HEAD"]),
+        # Reattach the local branch for branch targets. The detach above
+        # guarantees we run the fetched commit, but left as-is it strands
+        # the checkout on a detached HEAD after every update, breaking the
+        # operator's `git status`/`kestrel update` pull step ("not
+        # currently on a branch"). Reattaching needs a runtime ref
+        # comparison no single git command expresses — a name can exist as
+        # BOTH a tag and a branch, and `fetch <name>` lands on the TAG
+        # commit (tags win), so blindly attaching to origin/<name> would
+        # install a different commit than the one fetched. The
+        # coordinator-native routine mirrors the fetch's own precedence:
+        # skip when the name is a tag (stay detached on the tag commit),
+        # skip when origin has no such branch (sha targets), verify the
+        # branch tip equals FETCH_HEAD, then `checkout -B` — forcing the
+        # local branch onto the fetched commit (a deploy checkout must
+        # land on origin's tip; stray local commits stay recoverable via
+        # the reflog).
+        UpdateStep(
+            "reattach_branch",
+            git + ["checkout", "-B", target_ref, "FETCH_HEAD"],
+            allow_failure=True,
+            native="reattach_branch",
+            native_args=(repo_path, target_ref),
+        ),
         UpdateStep("install", ["uv", "sync"], cwd=repo_path),
     ]
 
@@ -159,11 +194,11 @@ def _sovereign_local_uv_sync(
 SOVEREIGN_LOCAL_UV_SYNC = UpdateProfile(
     name="sovereign_local_uv_sync",
     description=(
-        "Update a local Sovereign checkout: git fetch the target ref and "
-        "detach onto the fetched commit (so branch targets actually "
-        "advance), then `uv sync` to install. Schema migrates "
-        "additively on the subsequent boot, so this profile defines no "
-        "explicit migration step."
+        "Update a local Sovereign checkout: git fetch the target ref, "
+        "land on the fetched commit (reattaching the local branch for "
+        "branch targets, detached for tags/shas), then `uv sync` to "
+        "install. Schema migrates additively on the subsequent boot, so "
+        "this profile defines no explicit migration step."
     ),
     supports_migrations=False,
     _build=_sovereign_local_uv_sync,

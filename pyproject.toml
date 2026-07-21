@@ -63,14 +63,20 @@ dependencies = [
     # spans without importing a feature package (stays on the right side of the
     # core-never-imports-features boundary). Tracing is still a runtime no-op
     # unless an OTLP endpoint is configured.
-    # 0.31.0 floor: first-class typed parts on the ToolResult envelope (#2641).
+    # 0.31.1 floor: first-class typed parts on the ToolResult envelope (#2641).
     # kestrel_sdk.tools.parts hosts the pending-parts buffer ContextVar that
     # agent/parts.py re-exports (emit_part's tool-result fallback), and
     # DynamicTool.execute attaches buffered/explicit parts to the serialized
     # envelope — the SDK owns the buffer so in-tree and external features share
     # it. This floor also covers the obs#32 KESTREL_OTEL_PROJECT reader that
-    # landed in 0.30.2.
-    "kestrel-sovereign-sdk[tracing]>=0.31.0,<0.32",
+    # landed in 0.30.2. The floor is 0.31.1 — NOT 0.31.0 — because parts.py
+    # landed in the SDK without a version bump: source/editable builds of
+    # pre-parts trees are also labeled 0.31.0, and uv's build cache (keyed on
+    # source + version) served such a stale build during feature
+    # reconciliation, repeatedly breaking the CLI with ModuleNotFoundError
+    # (2026-07-20/21 host incidents). >=0.31.1 makes every pre-parts artifact
+    # unsatisfiable regardless of cache state.
+    "kestrel-sovereign-sdk[tracing]>=0.31.1,<0.32",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
