@@ -22,7 +22,7 @@ from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore
 from .destructive_audit import DestructiveAuditLog, audit_db_path_for
-from .async_graph_store import AsyncGraphStore, GraphNode, Edge
+from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
 from .async_rag_store import AsyncRAGStore
 from .agent_resource_store import (
     AgentResourceStore,
@@ -774,7 +774,25 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         await self.graph.add_node(node)
-    
+
+    async def compare_and_swap_node(
+        self,
+        node_id: str,
+        expected: Optional[Dict[str, Any]],
+        new_node: GraphNode,
+    ) -> NodeSwapResult:
+        """Atomically update a graph node only if its stored state still matches.
+
+        Facade delegator onto :meth:`AsyncGraphStore.compare_and_swap_node` —
+        the race-free conditional-update primitive. ``expected`` is the
+        ``properties`` snapshot the caller last read (``None`` = compare-and-
+        create). Returns a :class:`NodeSwapResult`
+        (``swapped`` / ``predicate_failed`` / ``not_found``).
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.graph.compare_and_swap_node(node_id, expected, new_node)
+
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
         """Get a node by ID."""
         if not self._initialized:
