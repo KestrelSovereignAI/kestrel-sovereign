@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-07-20
-**Scope:** 2098 tracked files (1385 `.py`, 337 `.md`, 376 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-07-21
+**Scope:** 2104 tracked files (1391 `.py`, 337 `.md`, 376 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -156,7 +156,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/orchestrator_engine.py** — Orchestrator engine mixin for tool execution and response handling.
   - `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
 - **kestrel_sovereign/agent/parts.py** — In-band typed-part emission for first-class console components (#1914).
-  - `def part_collector()`; `def current_part_collector()`; `def bind_part_collector(collector)`; `def emit_part(part_type, data, part_id)`; `def drain_parts()`; `def build_part_sentinel(part)`
+  - `def part_collector()`; `def current_part_collector()`; `def bind_part_collector(collector)`; `def emit_part(part_type, data, part_id)`; `def sanitize_part(entry)`; `def drain_parts()`; `def build_part_sentinel(part)`
 - **kestrel_sovereign/agent/preturn_state.py** — Pre-turn state-load block (epic #1290, D3).
   - `async def build_preturn_state_block(agent)`; `async def build_operational_state_block(agent)`
 - **kestrel_sovereign/agent/request_lifecycle.py** — Request lifecycle mixin for KestrelAgent.
@@ -1108,7 +1108,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/async_file_store.py** — Async File Store for Kestrel Storage.
   - `class AsyncFileStore`
 - **kestrel_sovereign/storage/async_graph_store.py** — Async Graph Store for Kestrel Storage.
-  - `class GraphNode`; `class Edge`; `class AsyncGraphStore`
+  - `class NodeSwapResult`; `class GraphNode`; `class Edge`; `class AsyncGraphStore`
 - **kestrel_sovereign/storage/async_pending_a2a_question_store.py** — Sender-side store for in-flight ``send_a2a_question`` correlation rows.
   - `class PendingA2AQuestion`; `class PendingA2AQuestionStore`
 - **kestrel_sovereign/storage/async_rag_store.py** — Async RAG Store for Kestrel Storage.
@@ -1939,8 +1939,12 @@ Repo entry points and standard project files.
   - `def temp_db()`; `def temp_db_2()`; `async def test_no_restorers_preserves_pre_1391_behavior(temp_db)`; `async def test_inline_asset_decrypted_and_handed_to_restorer(temp_db)`; `async def test_pre_encrypted_asset_passes_raw_bytes_through(temp_db)`; `async def test_restorer_only_sees_its_declared_types(temp_db)`; `async def test_unhandled_asset_type_recorded_as_skipped(temp_db)`; `async def test_multiple_restorers_for_same_type_both_called(temp_db)`; `…`
 - **tests/integration/test_asset_restorer_external_ref.py** — Integration tests for #1438 — external-ref asset restoration via the filecoin adapter (Phase-2 follow-up to #1391).
   - `def temp_db()`; `async def test_external_ref_asset_fetched_and_routed(temp_db)`; `async def test_inline_and_external_ref_in_one_car(temp_db)`; `async def test_external_ref_fetch_failure_lands_on_skipped(temp_db)`; `async def test_malformed_external_ref_lands_on_skipped(temp_db)`; `async def test_pre_1438_inline_only_path_unchanged(temp_db)`
+- **tests/integration/test_async_storage_compare_and_swap_postgres.py** — compare_and_swap_node atomicity on the real production DB — Postgres (#2661).
+  - `async def graph_store(db_backend)`; `async def test_exactly_one_swap_wins_on_backend(graph_store, n_writers)`; `async def test_concurrent_create_exactly_one_wins_on_backend(graph_store)`; `async def test_predicate_failed_leaves_post_read_update_untouched_on_backend(graph_store)`; `async def test_swap_does_not_clobber_concurrent_type_or_label_change_on_backend(graph_store)`
 - **tests/integration/test_atomic_increment_metadata.py** — Integration tests for ``AsyncConversationStore.atomic_increment_metadata_counter``.
   - `async def test_increment_creates_counter_when_absent(tmp_path)`; `async def test_increment_is_monotonic_across_serial_calls(tmp_path)`; `async def test_increment_does_not_collide_concurrent_calls(tmp_path)`; `async def test_increment_preserves_other_metadata_fields(tmp_path)`; `async def test_atomic_metadata_merge_preserves_counter_and_json_null(tmp_path)`; `async def test_bounded_history_returns_newest_rows_oldest_first(tmp_path)`; `async def test_bounded_history_filters_hidden_rows_before_limit(tmp_path)`; `async def test_postgres_sql_shape_uses_jsonb_cast(tmp_path)`; `…`
+- **tests/integration/test_auth_real_middleware.py** — Real-middleware-stack auth status-correctness tests (#2490).
+  - `def real_app(monkeypatch)`; `def client(real_app)`; `def test_valid_credentials_reach_route(client, lane)`; `def test_invalid_credentials_are_401(client, lane)`; `def test_missing_credentials_are_401(client)`; `def test_authenticated_downstream_failure_is_generic_500_not_401(client, lane)`; `def test_authenticated_downstream_http_exception_status_is_preserved(client, lane)`; `def test_live_server_auth_status_trio(monkeypatch)`
 - **tests/integration/test_avatar_api_e2e.py** — Integration tests for avatar API endpoints
   - `def client(monkeypatch)`; `class TestFileEndpoint`; `class TestIdentityEndpoint`; `class TestAvatarStorageIntegration`; `class TestVisualIdentityFeatureIntegration`; `class TestFileServing`
 - **tests/integration/test_backup_e2e.py** — —
@@ -2216,6 +2220,8 @@ Repo entry points and standard project files.
   - `class TestExtractAndLinkTypedReturn`; `class TestPersonNameCategorization`
 - **tests/unit/test_async_ownership.py** — Contract tests for cancellation-safe ownership of internal tasks.
   - `async def test_owned_task_result_is_retrieved()`; `async def test_owned_task_exception_retains_original_type()`; `async def test_repeated_cancellation_waits_for_owned_task_completion()`; `async def test_cancellation_remains_primary_when_owned_task_fails()`; `async def test_preexisting_cancellation_is_propagated_after_owned_result()`; `async def test_blocking_operation_finishes_before_cancellation_propagates()`
+- **tests/unit/test_async_storage_compare_and_swap.py** — compare_and_swap_node — the atomic conditional-update primitive (#2661).
+  - `async def graph_store(db_backend)`; `class TestNodeSwapResult`; `class TestCompareAndSwap`; `class TestNonCanonicalRows`; `class TestGenesisAuditScenario`; `class TestConcurrentWriters`; `class TestAddNodeUnchanged`; `class TestFacadeAndPrivacyWrapper`
 - **tests/unit/test_async_storage_conversation_delegators.py** — Regression test: ``AsyncStorage`` exposes delegator methods for every conversation-session write path the privacy wrapper calls through it.
   - `async def storage()`; `async def test_async_storage_exposes_conversation_session_delegators(storage, method, kwargs, description)`; `async def test_delete_conversation_session_returns_zero_for_unknown_session(storage)`; `async def test_set_conversation_name_roundtrips_through_facade(storage)`
 - **tests/unit/test_attachments.py** — Chat attachments (#1662) — upload-ref sanitization + user-turn persistence.
@@ -2584,10 +2590,14 @@ Repo entry points and standard project files.
   - `def test_database_tables_endpoint_returns_shape_from_storage()`; `def test_files_head_uses_existence_check_contract()`; `def test_observability_summary_endpoint_returns_serialized_summary()`; `def test_saved_items_structured_endpoint_uses_store_contract()`; `def test_openai_compatible_endpoints_return_minimal_contracts()`; `def test_v1_models_reports_mandated_model_not_provider_default()`; `def test_chat_completions_reports_active_model_not_request_echo()`; `def test_chat_completions_preserves_503_when_no_agent_bound()`; `…`
 - **tests/unit/test_endpoint_contracts.py** — —
   - `class TestCommandsEndpoint`; `class TestObservabilityEndpoints`; `class TestFilesEndpoint`; `class TestDatabaseExplorerHelpers`
+- **tests/unit/test_endpoint_httpexception_contract.py** — HTTPException contract tests for agent-dependent endpoints (#2495).
+  - `def test_agent_dependent_route_returns_503_when_no_agent_bound(method, path)`; `def test_commands_discovery_stays_gracefully_degraded_without_agent()`; `def test_sessions_route_preserves_handler_authored_4xx()`; `def test_memories_route_preserves_handler_authored_4xx()`; `def test_sessions_route_sanitizes_unexpected_runtime_failure_to_500()`; `def test_memories_route_sanitizes_unexpected_runtime_failure_to_500()`; `def test_no_get_agent_broad_except_laundering_in_endpoints()`; `def test_graceful_degradation_allowlist_matches_reality()`
 - **tests/unit/test_enum_coerce.py** — Unit tests for the shared enum-parameter coercion helpers (#1923).
   - `class TestNormalizeChoice`; `class TestCoerceEnum`
 - **tests/unit/test_enum_param_normalization.py** — End-to-end regression tests for #1923: agent-facing @tool params validated against a fixed set now normalize the synonyms LLMs reach for, while genuine typos still fail with a value-listing error.
   - `class TestSaveItemType`; `class TestStrategicSeverity`; `class TestMemoryActionItemStatus`; `class TestPerDomainAliasesDoNotCollide`
+- **tests/unit/test_envelope_parts_passthrough.py** — First-class typed-part passthrough on subagent dispatch (#2641).
+  - `def test_emit_part_falls_back_to_tool_result_buffer()`; `def test_emit_part_prefers_turn_collector_over_buffer()`; `def test_emit_part_buffer_still_enforces_sanitization()`; `def test_sanitize_part_valid_entry_strips_extra_keys()`; `def test_sanitize_part_rejects_invalid_entries()`; `async def test_dynamic_tool_attaches_buffered_parts_when_no_collector()`; `async def test_dynamic_tool_legacy_dict_envelope_carries_parts()`; `async def test_dynamic_tool_honors_explicit_toolresult_parts()`; `…`
 - **tests/unit/test_ephemeral_purge_transition.py** — Unit tests for the EPHEMERAL hard-purge transition wiring (#767).
   - `async def test_clean_ephemeral_exit_calls_purge_and_skips_audit()`; `async def test_leaked_ephemeral_exit_writes_audit_with_breakdown()`; `async def test_normal_to_ephemeral_does_not_purge()`; `async def test_public_to_ephemeral_stages_pending_and_confirm_applies_atomically()`; `async def test_confirm_with_nothing_pending_is_a_safe_noop()`; `async def test_normal_to_isolated_does_not_purge()`; `async def test_ephemeral_to_ephemeral_does_not_purge()`; `async def test_audit_failure_does_not_block_purge_or_transition()`; `…`
 - **tests/unit/test_epistemic_status.py** — Tests for the epistemic status layer (#680).
@@ -3056,6 +3066,8 @@ Repo entry points and standard project files.
   - `class TestSSEParsing`; `class TestSupervisorHappyPath`; `class TestSupervisor404HardCut`; `class TestSupervisorDeadlineAccurateExpiry`; `class TestSupervisorDeadlineInsideStreamLoop`; `class TestSupervisorStalledStream`; `class TestSupervisorDedupSignal`
 - **tests/unit/test_send_task_endpoint.py** — ``POST /api/agent/tasks/send`` — send-side artifact ingress (#1525).
   - `def app_with_send(monkeypatch)`; `def test_send_task_persists_sender_artifacts(app_with_send)`; `def test_send_task_without_artifacts_passes_none(app_with_send)`; `def test_send_task_rejects_non_list_artifacts(app_with_send)`; `def test_send_task_rejects_malformed_artifact(app_with_send)`; `def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send)`; `def test_valid_signed_envelope_verifies(app_with_send)`; `def test_valid_signed_envelope_with_artifacts_verifies(app_with_send)`; `…`
+- **tests/unit/test_server_auth.py** — Auth middleware status-correctness tests (#2490).
+  - `def client(monkeypatch)`; `def test_valid_credentials_reach_route(client, lane)`; `def test_invalid_credentials_are_401(client, lane, path)`; `def test_missing_credentials_are_401(client)`; `def test_query_param_lane_stays_restricted_to_sse_paths(client)`; `def test_authenticated_downstream_failure_is_generic_500_not_401(client, lane)`; `def test_authenticated_downstream_http_exception_status_is_preserved(client, lane)`; `def test_credential_evaluation_crash_still_produces_auth_401(client, monkeypatch)`
 - **tests/unit/test_server_cli.py** — Direct-server command-line contract tests (issue #2612).
   - `def test_main_honors_cli_environment_and_default_precedence(monkeypatch, environment, arguments, expected_host, …)`; `def test_main_rejects_invalid_cli_ports_before_starting_uvicorn(monkeypatch, capsys, port)`; `def test_main_rejects_invalid_port_environment_before_starting_uvicorn(monkeypatch, capsys)`; `def test_main_rejects_empty_host_before_starting_uvicorn(monkeypatch, capsys)`; `def test_main_rejects_unknown_arguments_with_usage(monkeypatch, capsys)`; `def test_module_entry_point_rejects_unknown_arguments_in_a_subprocess()`; `def test_effective_module_address_updates_host_feature_context()`; `def test_managed_container_entrypoints_keep_platform_bind_contract(entrypoint)`; `…`
 - **tests/unit/test_server_health.py** — Focused tests for server health endpoint behavior.
