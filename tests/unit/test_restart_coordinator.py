@@ -2474,3 +2474,28 @@ async def test_reattach_handles_fully_qualified_branch_ref(tmp_path):
         _git_out(clone, "rev-parse", "--abbrev-ref", "main@{upstream}")
         == "origin/main"
     )
+
+
+@pytest.mark.asyncio
+async def test_reattach_ignores_incidental_not_for_merge_tag_line(tmp_path):
+    """An origin tag sharing the branch's short name arrives as a
+    not-for-merge FETCH_HEAD line when the branch was explicitly
+    requested; intent must come from the for-merge line only (codex
+    round-4)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Origin-side tag named exactly like the branch, on the old commit.
+    subprocess.run(["git", "-C", str(origin), "tag", "main"], check=True)
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "refs/heads/main")
+
+    feat, _db = await _make_feature(tmp_path)
+    # Fully qualified: the fetch selects the BRANCH; --tags still writes
+    # a not-for-merge line for the colliding tag.
+    outcomes = await _run_git_steps(feat, clone, "refs/heads/main")
+
+    out = outcomes["reattach_branch"]
+    assert out["ok"] is True
+    assert "skip" not in out["stdout_tail"]
+    assert _git_out(clone, "symbolic-ref", "HEAD") == "refs/heads/main"
+    assert _git_out(clone, "rev-parse", "refs/heads/main") == origin_tip

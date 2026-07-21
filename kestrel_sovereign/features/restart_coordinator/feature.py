@@ -1480,12 +1480,23 @@ class RestartCoordinatorFeature(Feature):
                 return _outcome(
                     True, 0, "skip: unreadable FETCH_HEAD; staying detached"
                 )
-            if any(f"tag '{ref}'" in line for line in fetch_lines):
+            # Only the FOR-MERGE line(s) (empty second tab-field) name the
+            # ref the fetch selected for the requested refspec; ``--tags``
+            # also writes incidental ``not-for-merge`` tag lines which
+            # must not decide intent (codex round-4: an origin tag merely
+            # sharing the branch's short name would otherwise force a
+            # skip even though the branch was selected).
+            selected = []
+            for line in fetch_lines:
+                parts = line.split("\t")
+                if len(parts) >= 3 and not parts[1].strip():
+                    selected.append(parts[2])
+            if any(f"tag '{ref}'" in desc for desc in selected):
                 return _outcome(
                     True, 0,
                     f"skip: fetch selected tag {ref!r}; staying detached",
                 )
-            if not any(f"branch '{ref}'" in line for line in fetch_lines):
+            if not any(f"branch '{ref}'" in desc for desc in selected):
                 return _outcome(
                     True, 0,
                     f"skip: fetch selected no branch {ref!r}; "
