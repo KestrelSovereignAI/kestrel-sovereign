@@ -18,12 +18,26 @@ produces a fixed-offset ``+00:00`` suffix, never a bare naive string).
 """
 import json
 import logging
+from enum import Enum
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass
 
 from .async_database import AsyncDatabase
+from .async_conversation_store import _rows_affected
 
 logger = logging.getLogger(__name__)
+
+
+class NodeSwapResult(str, Enum):
+    """Outcome of :meth:`AsyncGraphStore.compare_and_swap_node`.
+
+    A ``str`` enum so the value compares equal to its plain-string form
+    (``NodeSwapResult.SWAPPED == "swapped"``) and passes cleanly through
+    the privacy wrapper and any JSON boundary a caller puts it behind.
+    """
+    SWAPPED = "swapped"
+    PREDICATE_FAILED = "predicate_failed"
+    NOT_FOUND = "not_found"
 
 
 @dataclass
@@ -74,13 +88,180 @@ class AsyncGraphStore:
             """
         return "INSERT OR REPLACE INTO graph_edges (source_id, target_id, label, properties) VALUES (?, ?, ?, ?)"
 
+    def _insert_if_absent_node_sql(self) -> str:
+        """Backend-appropriate "insert only if node_id is still free" SQL.
+
+        The dual of the upsert used by :meth:`add_node`: it inserts a brand-new
+        row and does nothing (affecting zero rows) if the node already exists,
+        which is exactly the atomic compare-and-create primitive that
+        :meth:`compare_and_swap_node` needs for the ``expected is None`` case.
+        """
+        if self.db.backend_type == "postgres":
+            return (
+                "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (node_id) DO NOTHING"
+            )
+        return (
+            "INSERT OR IGNORE INTO graph_nodes "
+            "(node_id, node_type, label, properties) VALUES (?, ?, ?, ?)"
+        )
+
+    def _properties_match_predicate(self) -> str:
+        """Backend WHERE fragment for "stored properties still equal the
+        caller's snapshot", compared by JSON *value* rather than raw bytes.
+
+        The trailing ``?`` binds the caller's snapshot re-serialized with
+        ``json.dumps``. Both sides are normalized through the backend's JSON
+        engine so the comparison is immune to representational drift that does
+        not change the JSON value — which is exactly what a byte-exact
+        ``properties = ?`` comparison got wrong:
+
+        * ``properties IS NULL`` (or ``''``) is treated as ``{}`` — the same way
+          :meth:`get_node` decodes such a row — so a caller who read ``{}`` back
+          from a NULL/empty row can still swap it.
+        * Minified vs. spaced serialization (``{"a":1}`` vs ``{"a": 1}``)
+          compares equal, so a row persisted by any non-``add_node`` writer is
+          still swappable against a ``get_node`` snapshot.
+
+        SQLite uses ``json()`` (a minifying normalizer); Postgres uses ``jsonb``
+        equality (order- and whitespace-independent). The predicate is always
+        AND-ed with a ``node_id = ?`` primary-key match, so it only ever
+        normalizes the single addressed row.
+        """
+        if self.db.backend_type == "postgres":
+            return "COALESCE(NULLIF(properties, '')::jsonb, '{}'::jsonb) = ?::jsonb"
+        return "json(COALESCE(NULLIF(properties, ''), '{}')) = json(?)"
+
     async def add_node(self, node: GraphNode) -> None:
-        """Add or update a node."""
+        """Add or update a node.
+
+        This is a whole-row upsert (REPLACE / ON CONFLICT DO UPDATE): it
+        clobbers any concurrent writer's changes between a caller's read and
+        this write. When you need "update X only if nobody changed it since I
+        read it", use :meth:`compare_and_swap_node` instead — it closes the
+        read-modify-write race that a hand-rolled retry loop around
+        ``add_node`` can only ever narrow.
+        """
         await self.db.execute_commit(
             self._upsert_node_sql(),
             (node.node_id, node.node_type, node.label, json.dumps(node.properties))
         )
-    
+
+    async def compare_and_swap_node(
+        self,
+        node_id: str,
+        expected: Optional[Dict[str, Any]],
+        new_node: GraphNode,
+    ) -> NodeSwapResult:
+        """Atomically update a node's ``properties`` only if they still match.
+
+        This is the race-free conditional-update primitive for the knowledge
+        graph. Unlike :meth:`add_node` (a whole-row clobber), the check and the
+        write happen as one serialized unit at the storage layer, so no
+        concurrent writer can slip a change in between — closing the TOCTOU
+        window that a read-then-``add_node`` retry loop can only narrow.
+
+        The primitive is deliberately **properties-only**: it compares — and,
+        for an existing node, writes — the ``properties`` column alone. A node's
+        ``node_type`` and ``label`` are set once at creation and are *not*
+        touched by a swap (``new_node.node_type`` / ``new_node.label`` are
+        ignored on the swap path; they are used only when compare-and-create
+        inserts a brand-new row). This alignment — predicate, write, and the
+        ``expected`` snapshot all on ``properties`` — is also why a swap cannot
+        clobber a concurrent ``node_type`` / ``label`` change: it never writes
+        those columns. A callsite that also needs to change ``node_type`` /
+        ``label`` uses :meth:`add_node`, or gates on properties here and lets the
+        type/label ride along in the properties it swaps.
+
+        Args:
+            node_id: The node to conditionally update.
+            expected: The ``properties`` snapshot the caller last read (exactly
+                what :meth:`get_node` returned for this node's ``properties``).
+                The swap succeeds only if the row's stored ``properties`` still
+                decode to the same JSON *value* as this snapshot — i.e. no writer
+                has changed the node's properties since the read. Pass ``None``
+                to mean "I read no node": the swap then acts as
+                compare-and-create, succeeding only while the node is still
+                absent.
+            new_node: The replacement state. On a swap only ``new_node.properties``
+                is written; on a compare-and-create (``expected is None``) the
+                full node — ``node_type``, ``label`` and ``properties`` — is
+                inserted. The row identity always stays ``node_id``.
+
+        Returns:
+            * :attr:`NodeSwapResult.SWAPPED` — the predicate held and the write
+              landed.
+            * :attr:`NodeSwapResult.PREDICATE_FAILED` — the node exists but its
+              stored ``properties`` no longer match ``expected`` (a concurrent
+              writer won), or ``expected is None`` and the node already exists.
+              The existing row — including whatever the other writer wrote — is
+              left untouched.
+            * :attr:`NodeSwapResult.NOT_FOUND` — ``expected`` was a snapshot but
+              the row is genuinely absent (nothing to update).
+
+        Note:
+            Equality is on the *JSON value* of ``properties``, not the raw stored
+            bytes. Both the stored ``properties`` and ``expected`` are normalized
+            through the backend's JSON engine (SQLite ``json()`` / Postgres
+            ``jsonb``), so a swap is accepted whenever no writer changed the
+            value — even if the row was persisted with different-but-equivalent
+            JSON text (minified vs. spaced) or with a ``NULL``/empty
+            ``properties`` column that :meth:`get_node` decodes to ``{}``. A
+            byte-exact comparison rejected both of those (they are valid,
+            unchanged rows) — see :meth:`_properties_match_predicate`. It stays
+            fail-closed on a real ``properties`` change: a writer that touched
+            ``properties`` since your read yields ``PREDICATE_FAILED`` rather
+            than overwriting their change. A concurrent ``node_type`` / ``label``
+            change is neither detected nor clobbered — it simply coexists,
+            because CAS reads and writes ``properties`` only. If a callsite needs
+            a wider whole-node predicate (also pinning ``node_type`` /
+            ``label``), add it as a distinct signature rather than loosening this
+            one.
+        """
+        new_properties = json.dumps(new_node.properties)
+
+        # One serialized write unit: the check and the write commit or roll back
+        # together, and the failure-classification read sees the same committed
+        # snapshot. SQLite serializes this under its per-connection write lock;
+        # Postgres runs the conditional UPDATE under a row lock so concurrent
+        # swaps block and re-evaluate the predicate against the committed row.
+        async with self.db.transaction():
+            if expected is None:
+                # Compare-and-create: only lands while the node is still absent.
+                affected = await self.db.execute(
+                    self._insert_if_absent_node_sql(),
+                    (node_id, new_node.node_type, new_node.label, new_properties),
+                )
+                if _rows_affected(affected) > 0:
+                    return NodeSwapResult.SWAPPED
+                return NodeSwapResult.PREDICATE_FAILED
+
+            expected_properties = json.dumps(expected)
+            # Properties-only: the SET touches the same single column the
+            # predicate gates on, so a concurrent node_type/label change is
+            # never overwritten (we don't write those columns).
+            affected = await self.db.execute(
+                "UPDATE graph_nodes "
+                "SET properties = ? "
+                f"WHERE node_id = ? AND {self._properties_match_predicate()}",
+                (
+                    new_properties,
+                    node_id,
+                    expected_properties,
+                ),
+            )
+            if _rows_affected(affected) > 0:
+                return NodeSwapResult.SWAPPED
+
+            # Zero rows changed: distinguish "predicate no longer holds" from
+            # "row genuinely absent" with a read in the same serialized section.
+            exists = await self.db.fetchone(
+                "SELECT 1 FROM graph_nodes WHERE node_id = ?", (node_id,)
+            )
+            if exists is not None:
+                return NodeSwapResult.PREDICATE_FAILED
+            return NodeSwapResult.NOT_FOUND
+
     async def get_node(self, node_id: str) -> Optional[GraphNode]:
         """Get a node by ID."""
         row = await self.db.fetchone(
