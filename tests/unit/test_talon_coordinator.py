@@ -1,6 +1,8 @@
 """Tests for TalonCoordinatorFeature."""
 
 import json
+import urllib.error
+import urllib.request
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -684,6 +686,347 @@ class TestTalonStatus:
         assert result.status is ToolResultStatus.OK
         assert result.data["running"] == 1
         assert result.data["completed"] == 1
+        # Every registry job carries its provenance marker (#2646).
+        assert all(job["source"] == "registry" for job in result.data["jobs"])
+        assert result.data["registry_count"] == 2
+        assert result.data["observability_count"] == 0
+
+
+class _FakeObsEvent(SimpleNamespace):
+    """Minimal stand-in for ObservabilityEvent — the reducer reads attrs."""
+
+
+def _obs_event(
+    job_id,
+    phase,
+    *,
+    ts,
+    repo=None,
+    issue=None,
+    pr=None,
+    orchestrator=None,
+    workflow_run_id=None,
+    stage=None,
+    success=None,
+    agent_name="did:web:peer",
+    session_id=None,
+):
+    meta = {"talon_job_id": job_id}
+    if phase is not None:
+        meta["talon_event"] = phase
+    if repo is not None:
+        meta["repo"] = repo
+    if issue is not None:
+        meta["issue"] = issue
+    if pr is not None:
+        meta["pr"] = pr
+    if orchestrator is not None:
+        meta["orchestrator"] = orchestrator
+    if workflow_run_id is not None:
+        meta["workflow_run_id"] = workflow_run_id
+    if stage is not None:
+        meta["stage"] = stage
+    return _FakeObsEvent(
+        event_id=f"{job_id}-{phase}-{ts}",
+        timestamp=ts,
+        agent_name=agent_name,
+        session_id=session_id,
+        event_type="talon_job",
+        tool_name=None,
+        duration_ms=None,
+        success=success,
+        error_message=None,
+        metadata=meta,
+    )
+
+
+def _agent_with_obs_events(events):
+    """Agent whose observability_store.query_events returns ``events``.
+
+    ``query_events`` asserts it is filtered to the talon-job event_type so a
+    regression that drops the filter (and scans every event type) is caught.
+    """
+    agent = _make_agent()
+    captured = {}
+
+    async def fake_query_events(**kwargs):
+        captured.update(kwargs)
+        return list(events)
+
+    store = MagicMock()
+    store.query_events = fake_query_events
+    agent.observability_store = store
+    agent._obs_query_kwargs = captured
+    return agent
+
+
+class TestTalonStatusObservability:
+    """Observability-event-backed job status source (#2646)."""
+
+    @pytest.mark.asyncio
+    async def test_observability_only_job_surfaces(self):
+        agent = _agent_with_obs_events([
+            _obs_event(
+                "ext-1", "completed", ts="2026-07-21T10:00:00+00:00",
+                repo="org/repo", issue=42, orchestrator="ClaudeCode",
+            ),
+        ])
+        feature = TalonCoordinatorFeature(agent)
+        result = await feature.talon_status()
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["completed"] == 1
+        assert result.data["observability_count"] == 1
+        assert result.data["registry_count"] == 0
+        job = next(j for j in result.data["jobs"] if j["id"] == "ext-1")
+        assert job["source"] == "observability"
+        assert job["status"] == "complete"
+        assert job["repo"] == "org/repo"
+        assert job["issue"] == 42
+        assert job["orchestrator"] == "ClaudeCode"
+        # The query is scoped to the talon-job event type.
+        assert agent._obs_query_kwargs["event_type"] == "talon_job"
+
+    @pytest.mark.asyncio
+    async def test_merged_view_registry_and_observability(self):
+        agent = _agent_with_obs_events([
+            _obs_event(
+                "ext-run", "iteration", ts="2026-07-21T11:00:00+00:00",
+                repo="org/repo", issue=7,
+            ),
+        ])
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["local-1"] = {
+            "repo": "a/b", "issue": 1, "status": "complete",
+        }
+        result = await feature.talon_status()
+
+        by_id = {j["id"]: j for j in result.data["jobs"]}
+        assert set(by_id) == {"local-1", "ext-run"}
+        assert by_id["local-1"]["source"] == "registry"
+        assert by_id["ext-run"]["source"] == "observability"
+        # local-1 complete (done), ext-run iteration -> running.
+        assert result.data["running"] == 1
+        assert result.data["completed"] == 1
+        assert result.data["registry_count"] == 1
+        assert result.data["observability_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_registry_wins_over_observability_on_same_job_id(self):
+        # A job the registry already tracks must NOT be duplicated from
+        # observability (its live handle/exit sidecar is authoritative).
+        agent = _agent_with_obs_events([
+            _obs_event(
+                "dup", "failed", ts="2026-07-21T12:00:00+00:00",
+                repo="org/repo", issue=9,
+            ),
+        ])
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["dup"] = {
+            "repo": "a/b", "issue": 9, "status": "complete",
+        }
+        result = await feature.talon_status()
+
+        matching = [j for j in result.data["jobs"] if j["id"] == "dup"]
+        assert len(matching) == 1
+        assert matching[0]["source"] == "registry"
+        assert matching[0]["status"] == "complete"
+        assert result.data["observability_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_filter_observability_only(self):
+        agent = _agent_with_obs_events([
+            _obs_event("ext-1", "started", ts="2026-07-21T13:00:00+00:00"),
+        ])
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["local-1"] = {
+            "repo": "a/b", "issue": 1, "status": "complete",
+        }
+        result = await feature.talon_status(source="observability")
+
+        ids = {j["id"] for j in result.data["jobs"]}
+        assert ids == {"ext-1"}
+        assert result.data["registry_count"] == 0
+        assert result.data["observability_count"] == 1
+        assert result.data["source_filter"] == "observability"
+
+    @pytest.mark.asyncio
+    async def test_filter_registry_only(self):
+        agent = _agent_with_obs_events([
+            _obs_event("ext-1", "started", ts="2026-07-21T14:00:00+00:00"),
+        ])
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["local-1"] = {
+            "repo": "a/b", "issue": 1, "status": "dispatched",
+        }
+        result = await feature.talon_status(source="registry")
+
+        ids = {j["id"] for j in result.data["jobs"]}
+        assert ids == {"local-1"}
+        assert result.data["observability_count"] == 0
+        assert result.data["registry_count"] == 1
+        # A registry-only request never touches the observability store.
+        assert agent._obs_query_kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_unknown_source_filter_is_rejected(self):
+        # A typo'd filter fails fast with the valid values rather than silently
+        # reporting zero jobs. It must also short-circuit before any reap runs.
+        agent = _agent_with_obs_events([
+            _obs_event("ext-1", "started", ts="2026-07-21T14:30:00+00:00"),
+        ])
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["local-1"] = {
+            "repo": "a/b", "issue": 1, "status": "dispatched",
+        }
+        result = await feature.talon_status(source="claude")
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "claude" in result.error
+        assert "registry" in result.error
+        assert "observability" in result.error
+        assert "claude" not in result.data["valid_sources"]
+        # No observability query was issued for the invalid request.
+        assert agent._obs_query_kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_latest_event_defines_status_older_backfills_correlation(self):
+        # query_events returns newest-first. The latest event (failed) sets the
+        # status; an earlier event carries the repo/issue the latest omitted.
+        agent = _agent_with_obs_events([
+            _obs_event("ext-1", "failed", ts="2026-07-21T16:00:00+00:00"),
+            _obs_event(
+                "ext-1", "claimed", ts="2026-07-21T15:00:00+00:00",
+                repo="org/repo", issue=5,
+            ),
+        ])
+        feature = TalonCoordinatorFeature(agent)
+        result = await feature.talon_status()
+
+        job = next(j for j in result.data["jobs"] if j["id"] == "ext-1")
+        assert job["status"] == "failed"
+        assert job["repo"] == "org/repo"
+        assert job["issue"] == 5
+        assert job["observed_events"] == 2
+        assert job["first_event_at"] == "2026-07-21T15:00:00+00:00"
+        assert job["last_event_at"] == "2026-07-21T16:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_store_failure_degrades_to_registry_only(self):
+        agent = _make_agent()
+
+        async def boom(**kwargs):
+            raise RuntimeError("store offline")
+
+        store = MagicMock()
+        store.query_events = boom
+        agent.observability_store = store
+
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["local-1"] = {
+            "repo": "a/b", "issue": 1, "status": "dispatched",
+        }
+        result = await feature.talon_status()
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["running"] == 1
+        assert result.data["observability_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_observability_store_is_registry_only(self):
+        agent = _make_agent()
+        del agent.observability_store  # agent without an observability store
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["local-1"] = {
+            "repo": "a/b", "issue": 1, "status": "complete",
+        }
+        result = await feature.talon_status()
+        assert result.data["completed"] == 1
+        assert result.data["observability_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_events_without_job_id_are_ignored(self):
+        bad = _FakeObsEvent(
+            event_id="x", timestamp="2026-07-21T10:00:00+00:00",
+            agent_name="did:web:peer", session_id=None,
+            event_type="talon_job", tool_name=None, duration_ms=None,
+            success=None, error_message=None, metadata={"repo": "org/repo"},
+        )
+        agent = _agent_with_obs_events([bad])
+        feature = TalonCoordinatorFeature(agent)
+        result = await feature.talon_status()
+        assert result.data["observability_count"] == 0
+        assert result.data["jobs"] == []
+
+
+class TestTalonStatusObservabilityRealStore:
+    """End-to-end against a real SQLite ObservabilityStore (#2646)."""
+
+    @pytest.mark.asyncio
+    async def test_real_store_talon_job_events_surface(self, tmp_path):
+        import json as _json
+
+        from kestrel_sovereign.a2a.stores.unified.observability_store import (
+            ObservabilityStore,
+        )
+        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+        backend = SQLiteBackend(str(tmp_path / "obs.db"))
+        await backend.connect()
+        store = ObservabilityStore(backend)
+        await store.initialize()
+        try:
+            # An external producer (Claude Code session / peer host) writes a
+            # talon-job lifecycle event straight into the shared store.
+            await backend.execute(
+                """
+                INSERT INTO a2a_observability
+                (id, timestamp, agent_name, session_id, event_type,
+                 tool_name, duration_ms, success, error_message, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "evt-1",
+                    store.now_utc_param(),
+                    "did:web:peer",
+                    "sess-x",
+                    "talon_job",
+                    None,
+                    None,
+                    store.to_bool_param(True),
+                    None,
+                    _json.dumps({
+                        "talon_job_id": "ext-real",
+                        "talon_event": "completed",
+                        "repo": "org/repo",
+                        "issue": 314,
+                        "orchestrator": "ClaudeCode",
+                    }),
+                ),
+            )
+            # A non-talon observability row that must be ignored.
+            await store.log_metric(
+                agent_name="did:web:peer",
+                metric_name="feature_tools_built",
+                metric_value=5,
+            )
+
+            agent = _make_agent()
+            agent.observability_store = store
+            feature = TalonCoordinatorFeature(agent)
+            result = await feature.talon_status()
+
+            assert result.data["observability_count"] == 1
+            job = next(
+                j for j in result.data["jobs"] if j["id"] == "ext-real"
+            )
+            assert job["source"] == "observability"
+            assert job["status"] == "complete"
+            assert job["repo"] == "org/repo"
+            assert job["issue"] == 314
+            assert job["orchestrator"] == "ClaudeCode"
+        finally:
+            await store.close()
 
 
 class TestTalonPauseResume:
