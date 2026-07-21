@@ -153,7 +153,7 @@ class AsyncGraphStore:
         expected: Optional[Dict[str, Any]],
         new_node: GraphNode,
     ) -> NodeSwapResult:
-        """Atomically replace a node only if its stored state still matches.
+        """Atomically update a node's ``properties`` only if they still match.
 
         This is the race-free conditional-update primitive for the knowledge
         graph. Unlike :meth:`add_node` (a whole-row clobber), the check and the
@@ -161,44 +161,62 @@ class AsyncGraphStore:
         concurrent writer can slip a change in between — closing the TOCTOU
         window that a read-then-``add_node`` retry loop can only narrow.
 
+        The primitive is deliberately **properties-only**: it compares — and,
+        for an existing node, writes — the ``properties`` column alone. A node's
+        ``node_type`` and ``label`` are set once at creation and are *not*
+        touched by a swap (``new_node.node_type`` / ``new_node.label`` are
+        ignored on the swap path; they are used only when compare-and-create
+        inserts a brand-new row). This alignment — predicate, write, and the
+        ``expected`` snapshot all on ``properties`` — is also why a swap cannot
+        clobber a concurrent ``node_type`` / ``label`` change: it never writes
+        those columns. A callsite that also needs to change ``node_type`` /
+        ``label`` uses :meth:`add_node`, or gates on properties here and lets the
+        type/label ride along in the properties it swaps.
+
         Args:
             node_id: The node to conditionally update.
             expected: The ``properties`` snapshot the caller last read (exactly
-                what :meth:`get_node` returned for this node). The swap succeeds
-                only if the row's stored ``properties`` still decode to the same
-                JSON *value* as this snapshot — i.e. no writer has touched the
-                node since the read. Pass ``None`` to mean "I read no node": the
-                swap then acts as compare-and-create, succeeding only while the
-                node is still absent.
-            new_node: The replacement. Its ``node_type``, ``label`` and
-                ``properties`` are written; the row identity stays ``node_id``.
+                what :meth:`get_node` returned for this node's ``properties``).
+                The swap succeeds only if the row's stored ``properties`` still
+                decode to the same JSON *value* as this snapshot — i.e. no writer
+                has changed the node's properties since the read. Pass ``None``
+                to mean "I read no node": the swap then acts as
+                compare-and-create, succeeding only while the node is still
+                absent.
+            new_node: The replacement state. On a swap only ``new_node.properties``
+                is written; on a compare-and-create (``expected is None``) the
+                full node — ``node_type``, ``label`` and ``properties`` — is
+                inserted. The row identity always stays ``node_id``.
 
         Returns:
             * :attr:`NodeSwapResult.SWAPPED` — the predicate held and the write
               landed.
             * :attr:`NodeSwapResult.PREDICATE_FAILED` — the node exists but its
-              stored state no longer matches ``expected`` (a concurrent writer
-              won), or ``expected is None`` and the node already exists. The
-              existing row — including whatever the other writer wrote — is left
-              untouched.
+              stored ``properties`` no longer match ``expected`` (a concurrent
+              writer won), or ``expected is None`` and the node already exists.
+              The existing row — including whatever the other writer wrote — is
+              left untouched.
             * :attr:`NodeSwapResult.NOT_FOUND` — ``expected`` was a snapshot but
               the row is genuinely absent (nothing to update).
 
         Note:
-            Equality is on the *JSON value*, not the raw stored bytes. Both the
-            stored ``properties`` and ``expected`` are normalized through the
-            backend's JSON engine (SQLite ``json()`` / Postgres ``jsonb``), so a
-            swap is accepted whenever no writer changed the value — even if the
-            row was persisted with different-but-equivalent JSON text (minified
-            vs. spaced) or with a ``NULL``/empty ``properties`` column that
-            :meth:`get_node` decodes to ``{}``. A byte-exact comparison rejected
-            both of those (they are valid, unchanged rows) — see
-            :meth:`_properties_match_predicate`. It stays deliberately
-            fail-closed on real changes: a writer touching *any* field (even a
-            benign one) since your read yields ``PREDICATE_FAILED`` rather than
-            silently overwriting their change. If a callsite needs a narrower
-            field-level predicate, add it as a distinct signature rather than
-            loosening this one.
+            Equality is on the *JSON value* of ``properties``, not the raw stored
+            bytes. Both the stored ``properties`` and ``expected`` are normalized
+            through the backend's JSON engine (SQLite ``json()`` / Postgres
+            ``jsonb``), so a swap is accepted whenever no writer changed the
+            value — even if the row was persisted with different-but-equivalent
+            JSON text (minified vs. spaced) or with a ``NULL``/empty
+            ``properties`` column that :meth:`get_node` decodes to ``{}``. A
+            byte-exact comparison rejected both of those (they are valid,
+            unchanged rows) — see :meth:`_properties_match_predicate`. It stays
+            fail-closed on a real ``properties`` change: a writer that touched
+            ``properties`` since your read yields ``PREDICATE_FAILED`` rather
+            than overwriting their change. A concurrent ``node_type`` / ``label``
+            change is neither detected nor clobbered — it simply coexists,
+            because CAS reads and writes ``properties`` only. If a callsite needs
+            a wider whole-node predicate (also pinning ``node_type`` /
+            ``label``), add it as a distinct signature rather than loosening this
+            one.
         """
         new_properties = json.dumps(new_node.properties)
 
@@ -219,13 +237,14 @@ class AsyncGraphStore:
                 return NodeSwapResult.PREDICATE_FAILED
 
             expected_properties = json.dumps(expected)
+            # Properties-only: the SET touches the same single column the
+            # predicate gates on, so a concurrent node_type/label change is
+            # never overwritten (we don't write those columns).
             affected = await self.db.execute(
                 "UPDATE graph_nodes "
-                "SET node_type = ?, label = ?, properties = ? "
+                "SET properties = ? "
                 f"WHERE node_id = ? AND {self._properties_match_predicate()}",
                 (
-                    new_node.node_type,
-                    new_node.label,
                     new_properties,
                     node_id,
                     expected_properties,

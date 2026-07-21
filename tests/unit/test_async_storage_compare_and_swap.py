@@ -19,7 +19,12 @@ Coverage:
 
 The dual-backend tests run against SQLite always and real PostgreSQL when
 TEST_POSTGRES_URL / KESTREL_DATABASE_URL / DATABASE_URL is set (skipped
-otherwise) — see the ``db_backend`` fixture in tests/conftest.py.
+otherwise) — see the ``db_backend`` fixture in tests/conftest.py. The unit CI
+job supplies none of those, so the Postgres path is skipped here; the atomicity
+guarantees are re-exercised against the live pgvector service in the
+integration job — see
+``tests/integration/test_async_storage_compare_and_swap_postgres.py`` (#2661
+review P2).
 """
 
 from __future__ import annotations
@@ -149,20 +154,52 @@ class TestCompareAndSwap:
         after = await graph_store.get_node(nid)
         assert after.properties == {"status": "existing"}
 
-    async def test_swap_updates_type_and_label_too(self, graph_store):
+    async def test_swap_updates_properties_only(self, graph_store):
+        """CAS is properties-only: a swap rewrites ``properties`` but leaves the
+        existing node's ``node_type`` / ``label`` untouched (they are set at
+        creation). ``new_node``'s type/label are ignored on the swap path."""
         nid = _nid()
         await graph_store.add_node(
-            _node(nid, {"k": "v"}, node_type="old_type", label="Old")
+            _node(nid, {"k": "v"}, node_type="orig_type", label="Orig")
         )
         snapshot = (await graph_store.get_node(nid)).properties
         result = await graph_store.compare_and_swap_node(
-            nid, snapshot, _node(nid, {"k": "v2"}, node_type="new_type", label="New")
+            nid, snapshot, _node(nid, {"k": "v2"}, node_type="ignored_type", label="Ignored")
         )
         assert result == NodeSwapResult.SWAPPED
         after = await graph_store.get_node(nid)
-        assert after.node_type == "new_type"
-        assert after.label == "New"
-        assert after.properties == {"k": "v2"}
+        assert after.node_type == "orig_type"   # unchanged — set at creation
+        assert after.label == "Orig"            # unchanged — set at creation
+        assert after.properties == {"k": "v2"}  # swapped
+
+    async def test_swap_does_not_clobber_concurrent_type_or_label_change(self, graph_store):
+        """P1 regression (#2661 review): a properties swap must not silently
+        revert a concurrent writer's ``node_type`` / ``label`` change. Because
+        CAS is properties-only, a writer that changed only ``label`` (leaving
+        ``properties`` intact) keeps its label AND our properties swap still
+        lands — the two coexist rather than one clobbering the other."""
+        nid = _nid()
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="t", label="Before")
+        )
+        snapshot = (await graph_store.get_node(nid)).properties
+
+        # Concurrent writer relabels the node but leaves properties unchanged.
+        await graph_store.add_node(
+            _node(nid, {"status": "pending"}, node_type="t", label="After")
+        )
+
+        # Our properties snapshot still holds, so the swap succeeds...
+        result = await graph_store.compare_and_swap_node(
+            nid, snapshot, _node(nid, {"status": "done"}, node_type="t", label="Ours")
+        )
+        assert result == NodeSwapResult.SWAPPED
+        after = await graph_store.get_node(nid)
+        # ...but the concurrent writer's label survives (never clobbered, and
+        # our own new_node.label="Ours" is ignored on the swap path)...
+        assert after.label == "After"
+        # ...and our properties change landed.
+        assert after.properties == {"status": "done"}
 
     async def test_snapshot_round_trips_through_get_node(self, graph_store):
         """A snapshot obtained via get_node must be an accepted predicate even

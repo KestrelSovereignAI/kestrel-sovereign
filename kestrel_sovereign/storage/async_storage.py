@@ -781,13 +781,15 @@ class AsyncStorage:
         expected: Optional[Dict[str, Any]],
         new_node: GraphNode,
     ) -> NodeSwapResult:
-        """Atomically update a graph node only if its stored state still matches.
+        """Atomically update a graph node's properties only if they still match.
 
         Facade delegator onto :meth:`AsyncGraphStore.compare_and_swap_node` —
-        the race-free conditional-update primitive. ``expected`` is the
-        ``properties`` snapshot the caller last read (``None`` = compare-and-
-        create). Returns a :class:`NodeSwapResult`
-        (``swapped`` / ``predicate_failed`` / ``not_found``).
+        the race-free, properties-only conditional-update primitive.
+        ``expected`` is the ``properties`` snapshot the caller last read
+        (``None`` = compare-and-create); on a swap only ``new_node.properties``
+        is written (``node_type`` / ``label`` are left as-is). Returns a
+        :class:`NodeSwapResult` (``swapped`` / ``predicate_failed`` /
+        ``not_found``).
         """
         if not self._initialized:
             await self.initialize()
