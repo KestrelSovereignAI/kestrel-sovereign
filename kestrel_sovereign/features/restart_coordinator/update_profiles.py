@@ -76,6 +76,14 @@ class UpdateStep:
     # legitimate configurations (e.g. reattaching a branch when the target
     # ref is a tag/sha); a non-zero exit is non-fatal to the update.
     allow_failure: bool = False
+    # Coordinator-native routine name. Most steps are a single argv exec;
+    # a native step is a small fixed routine implemented in the coordinator
+    # (still argv-exec subprocesses, never a shell) for logic that needs a
+    # runtime ref comparison a single command can't express. ``argv`` then
+    # documents the mutating command the routine may run; ``native_args``
+    # carries its validated parameters.
+    native: Optional[str] = None
+    native_args: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -128,21 +136,24 @@ def _sovereign_local_uv_sync(
         # guarantees we run the fetched commit, but left as-is it strands
         # the checkout on a detached HEAD after every update, breaking the
         # operator's `git status`/`kestrel update` pull step ("not
-        # currently on a branch"). After the fetch, refs/remotes/origin/<ref>
-        # exists if and only if the target is a branch, so `checkout -B`
-        # off that ref reattaches exactly when a branch was requested; for
-        # a tag/sha target the ref does not resolve, the step fails, and
-        # ``allow_failure`` keeps the update going with HEAD correctly
-        # detached. ``-B`` deliberately forces the local branch onto the
-        # fetched commit: a deploy checkout must land on origin's tip, and
-        # stray local commits remain recoverable via the reflog.
+        # currently on a branch"). Reattaching needs a runtime ref
+        # comparison no single git command expresses — a name can exist as
+        # BOTH a tag and a branch, and `fetch <name>` lands on the TAG
+        # commit (tags win), so blindly attaching to origin/<name> would
+        # install a different commit than the one fetched. The
+        # coordinator-native routine mirrors the fetch's own precedence:
+        # skip when the name is a tag (stay detached on the tag commit),
+        # skip when origin has no such branch (sha targets), verify the
+        # branch tip equals FETCH_HEAD, then `checkout -B` — forcing the
+        # local branch onto the fetched commit (a deploy checkout must
+        # land on origin's tip; stray local commits stay recoverable via
+        # the reflog).
         UpdateStep(
             "reattach_branch",
-            git + [
-                "checkout", "-B", target_ref,
-                f"refs/remotes/origin/{target_ref}",
-            ],
+            git + ["checkout", "-B", target_ref, "FETCH_HEAD"],
             allow_failure=True,
+            native="reattach_branch",
+            native_args=(repo_path, target_ref),
         ),
         UpdateStep("install", ["uv", "sync"], cwd=repo_path),
     ]

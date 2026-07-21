@@ -1374,6 +1374,8 @@ class RestartCoordinatorFeature(Feature):
         Uses ``create_subprocess_exec`` (argv list, never a shell) so a
         crafted ref/path can never inject a command.
         """
+        if getattr(step, "native", None) == "reattach_branch":
+            return await self._reattach_branch_step(step)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *step.argv,
@@ -1402,6 +1404,87 @@ class RestartCoordinatorFeature(Feature):
             "stdout_tail": _tail(stdout),
             "stderr_tail": _tail(stderr),
         }
+
+    async def _reattach_branch_step(self, step) -> Dict[str, Any]:
+        """Native reattach: land the local branch on the fetched commit.
+
+        Runs after the profile's ``checkout --detach FETCH_HEAD``. A single
+        argv command cannot express the required guard — a name can exist
+        as BOTH a tag and a branch, and ``git fetch <name>`` lands on the
+        TAG commit, so attaching to ``origin/<name>`` could install a
+        different commit than the one fetched (codex P2 on the reattach
+        change). Mirror the fetch's own precedence with plain plumbing
+        (each call ``create_subprocess_exec``, never a shell):
+
+        1. ``<ref>`` names a tag        → skip, stay detached (tag intent).
+        2. no ``origin/<ref>`` branch   → skip, stay detached (sha target).
+        3. ``origin/<ref>`` != FETCH_HEAD → skip (defensive; ambiguous).
+        4. otherwise ``checkout -B <ref> FETCH_HEAD`` — attach, forcing
+           the local branch onto the fetched commit.
+
+        Skips report ``ok=True`` with the reason in ``stdout_tail``; the
+        step is additionally ``allow_failure`` so even unexpected git
+        errors never abort the update.
+        """
+        repo, ref = step.native_args
+
+        async def _git(*args: str):
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", repo, *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            return proc.returncode, _tail(stdout), _tail(stderr)
+
+        def _outcome(ok: bool, rc, out: str, err: str = "") -> Dict[str, Any]:
+            return {
+                "step": step.name,
+                "argv": list(step.argv),
+                "returncode": rc,
+                "ok": ok,
+                "stdout_tail": out,
+                "stderr_tail": err,
+            }
+
+        try:
+            rc, _out, _err = await _git(
+                "rev-parse", "--verify", "--quiet", f"refs/tags/{ref}^{{commit}}"
+            )
+            if rc == 0:
+                return _outcome(
+                    True, 0, f"skip: {ref!r} is a tag; staying detached"
+                )
+            rc, branch_sha, _err = await _git(
+                "rev-parse", "--verify", "--quiet",
+                f"refs/remotes/origin/{ref}^{{commit}}",
+            )
+            if rc != 0:
+                return _outcome(
+                    True, 0,
+                    f"skip: no origin branch {ref!r}; staying detached",
+                )
+            rc, fetch_sha, _err = await _git(
+                "rev-parse", "--verify", "FETCH_HEAD^{commit}"
+            )
+            if rc != 0 or branch_sha.strip() != fetch_sha.strip():
+                return _outcome(
+                    True, 0,
+                    f"skip: origin/{ref} != FETCH_HEAD; staying detached",
+                )
+            rc, out, err = await _git("checkout", "-B", ref, fetch_sha.strip())
+            return _outcome(rc == 0, rc, out, err)
+        except Exception as e:
+            return {
+                "step": step.name,
+                "argv": list(step.argv),
+                "returncode": None,
+                "ok": False,
+                "error": str(e),
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
 
     def _spawn_restart_subprocess(self) -> None:
         """Spawn a detached ``kestrel restart`` subprocess.

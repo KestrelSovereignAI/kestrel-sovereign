@@ -2289,3 +2289,119 @@ async def test_run_update_still_fails_on_mutating_step(tmp_path):
     assert update["failed_step"] == "install"
     # Stopped at the failure: resolve_ref never ran.
     assert update["resolved_ref"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Native reattach_branch routine: attach for branch targets, stay detached
+# for tags, and never follow a same-named branch when the fetch landed on a
+# tag (codex P2 on the reattach change — a name can be both).
+# ---------------------------------------------------------------------------
+
+
+def _real_origin_and_clone(tmp_path):
+    """A real origin with branch `main`, plus a local clone."""
+    origin = tmp_path / "origin"
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(origin)], check=True
+    )
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(origin), "config", k, v], check=True)
+    (origin / "f.txt").write_text("one\n")
+    subprocess.run(["git", "-C", str(origin), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(origin), "commit", "-q", "-m", "one"], check=True
+    )
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)], check=True
+    )
+    for k, v in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(clone), "config", k, v], check=True)
+    return origin, clone
+
+
+def _git_out(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+async def _run_git_steps(feat, repo, target_ref):
+    """Run the profile's git steps (fetch/checkout/reattach) for real,
+    skipping install/feature_sync which need a real project."""
+    profile = get_update_profile("sovereign_local_uv_sync")
+    steps = profile.build_steps(
+        repo_path=str(repo), target_ref=target_ref, allow_migrations=False
+    )
+    outcomes = {}
+    for step in steps:
+        if step.name in ("install", "feature_sync"):
+            continue
+        outcomes[step.name] = await feat._run_update_step(step)
+    return outcomes
+
+
+@pytest.mark.asyncio
+async def test_reattach_attaches_branch_target_on_fetched_commit(tmp_path):
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Advance origin/main past the clone.
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "HEAD")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "main")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    # Attached to main, exactly at the fetched origin tip.
+    assert _git_out(clone, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert _git_out(clone, "rev-parse", "HEAD") == origin_tip
+
+
+@pytest.mark.asyncio
+async def test_reattach_stays_detached_for_tag_target(tmp_path):
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    subprocess.run(["git", "-C", str(origin), "tag", "v9.9.9"], check=True)
+    tag_sha = _git_out(origin, "rev-parse", "v9.9.9^{commit}")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "v9.9.9")
+
+    out = outcomes["reattach_branch"]
+    assert out["ok"] is True
+    assert "skip" in out["stdout_tail"]
+    assert _git_out(clone, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert _git_out(clone, "rev-parse", "HEAD") == tag_sha
+
+
+@pytest.mark.asyncio
+async def test_reattach_ignores_branch_shadowing_a_tag(tmp_path):
+    """Name exists as BOTH tag and branch: the fetch lands on the TAG
+    commit, so the reattach must NOT move to the same-named branch."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Tag the first commit as 'v1', then grow a *branch* also named 'v1'.
+    subprocess.run(["git", "-C", str(origin), "tag", "v1"], check=True)
+    tag_sha = _git_out(origin, "rev-parse", "v1^{commit}")
+    subprocess.run(
+        ["git", "-C", str(origin), "checkout", "-q", "-b", "v1-branch-tmp"],
+        check=True,
+    )
+    (origin / "f.txt").write_text("branch-two\n")
+    subprocess.run(
+        ["git", "-C", str(origin), "commit", "-qam", "branch two"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(origin), "branch", "-m", "v1-branch-tmp", "v1"],
+        check=True,
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "v1")
+
+    out = outcomes["reattach_branch"]
+    assert out["ok"] is True
+    assert "skip" in out["stdout_tail"]
+    # Still detached on the TAG commit — never the shadowing branch tip.
+    assert _git_out(clone, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert _git_out(clone, "rev-parse", "HEAD") == tag_sha
