@@ -1434,6 +1434,12 @@ class RestartCoordinatorFeature(Feature):
         errors never abort the update.
         """
         repo, ref = step.native_args
+        # A caller may pass the fully-qualified form (refs/heads/main —
+        # accepted by is_valid_target_ref); FETCH_HEAD records the SHORT
+        # name ("branch 'main'"), and checkout/upstream want it too
+        # (codex round-3).
+        if ref.startswith("refs/heads/"):
+            ref = ref[len("refs/heads/"):]
 
         async def _git(*args: str):
             proc = await asyncio.create_subprocess_exec(

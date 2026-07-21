@@ -2452,3 +2452,25 @@ async def test_reattach_sets_upstream_for_new_local_branch(tmp_path):
         _git_out(clone, "rev-parse", "--abbrev-ref", "deploy@{upstream}")
         == "origin/deploy"
     )
+
+
+@pytest.mark.asyncio
+async def test_reattach_handles_fully_qualified_branch_ref(tmp_path):
+    """refs/heads/<name> is a valid target ref; FETCH_HEAD records the
+    short name, so the routine must normalize before matching (codex
+    round-3)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "HEAD")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "refs/heads/main")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    assert _git_out(clone, "symbolic-ref", "HEAD") == "refs/heads/main"
+    assert _git_out(clone, "rev-parse", "HEAD") == origin_tip
+    assert (
+        _git_out(clone, "rev-parse", "--abbrev-ref", "main@{upstream}")
+        == "origin/main"
+    )
