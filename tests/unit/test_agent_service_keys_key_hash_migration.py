@@ -35,12 +35,14 @@ def _kestrel_data_key(monkeypatch) -> Iterator[None]:
     yield
 
 
-async def _legacy_db(tmp_path) -> AsyncDatabase:
-    """AsyncDatabase whose agent_service_keys predates the key_hash/quota columns.
+@pytest_asyncio.fixture
+async def legacy_db(tmp_path):
+    """AsyncDatabase whose agent_service_keys predates key_hash/quota columns.
 
     The pre-existing legacy table makes ``CREATE TABLE IF NOT EXISTS`` a no-op,
     so only the migration can add the missing columns — exactly the drift a
-    real upgraded deployment hits.
+    real upgraded deployment hits. Yields so the aiosqlite worker thread is
+    closed before its event loop exits (no leaked-thread warnings).
     """
     raw = SQLiteBackend(str(tmp_path / "legacy-agent-service-keys.db"))
     await raw.connect()
@@ -57,7 +59,10 @@ async def _legacy_db(tmp_path) -> AsyncDatabase:
     )
     db = AsyncDatabase(raw)
     await db._init_schema()
-    return db
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 async def _columns(db: AsyncDatabase) -> set:
@@ -67,18 +72,16 @@ async def _columns(db: AsyncDatabase) -> set:
 
 
 @pytest.mark.asyncio
-async def test_init_schema_backfills_missing_columns(tmp_path):
-    db = await _legacy_db(tmp_path)
-    cols = await _columns(db)
+async def test_init_schema_backfills_missing_columns(legacy_db):
+    cols = await _columns(legacy_db)
     for col in _MIGRATED_COLUMNS:
         assert col in cols, f"{col} was not added to legacy agent_service_keys"
 
 
 @pytest.mark.asyncio
-async def test_store_key_roundtrips_after_migration(tmp_path):
+async def test_store_key_roundtrips_after_migration(legacy_db):
     """The real payoff: store_key's INSERT (which names key_hash) now succeeds."""
-    db = await _legacy_db(tmp_path)
-    storage = ServiceKeyStorage(db, "did:web:agents.frinz.ai:kestrel-agent-test")
+    storage = ServiceKeyStorage(legacy_db, "did:web:agents.frinz.ai:kestrel-agent-test")
 
     await storage.store_key("openrouter", "sk-or-v1-secret-value")
 
@@ -87,11 +90,10 @@ async def test_store_key_roundtrips_after_migration(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_migration_is_idempotent(tmp_path):
+async def test_migration_is_idempotent(legacy_db):
     """Re-running _init_schema on an already-migrated DB is a clean no-op."""
-    db = await _legacy_db(tmp_path)
-    await db._init_schema()  # second pass must not raise
-    cols = await _columns(db)
+    await legacy_db._init_schema()  # second pass must not raise
+    cols = await _columns(legacy_db)
     for col in _MIGRATED_COLUMNS:
         assert col in cols
 
@@ -100,6 +102,9 @@ async def test_migration_is_idempotent(tmp_path):
 async def test_fresh_db_already_has_columns(tmp_path):
     """A DB created from CORE_SCHEMA (no legacy table) is unaffected."""
     db = await AsyncDatabase.sqlite(str(tmp_path / "fresh.db"))
-    cols = await _columns(db)
-    for col in _MIGRATED_COLUMNS:
-        assert col in cols
+    try:
+        cols = await _columns(db)
+        for col in _MIGRATED_COLUMNS:
+            assert col in cols
+    finally:
+        await db.close()
