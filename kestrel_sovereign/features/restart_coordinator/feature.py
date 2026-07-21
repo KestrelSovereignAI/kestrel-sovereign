@@ -1332,7 +1332,9 @@ class RestartCoordinatorFeature(Feature):
             results.append(outcome)
             if step.name == "resolve_ref" and outcome.get("ok"):
                 resolved_ref = (outcome.get("stdout_tail") or "").strip()
-            if not outcome.get("ok") and not step.read_only:
+            if not outcome.get("ok") and not (
+                step.read_only or step.allow_failure
+            ):
                 ok = False
                 failed_step = step.name
                 break

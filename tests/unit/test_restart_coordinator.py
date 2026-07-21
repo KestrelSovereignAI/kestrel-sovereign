@@ -2196,3 +2196,96 @@ async def test_migration_backfills_wake_delivered_for_old_completed_rows(tmp_pat
     await ensure_restart_requests_table(db)
     nu = await get_request(db, "new-undelivered")
     assert nu.wake_delivered is False  # not clobbered by a re-run backfill
+
+
+# ---------------------------------------------------------------------------
+# Best-effort update steps: the reattach_branch step legitimately fails for
+# tag/sha targets (refs/remotes/origin/<ref> doesn't resolve), so a failing
+# allow_failure step must not abort the update — while mutating steps stay
+# fatal-on-failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_update_continues_past_failing_allow_failure_step(tmp_path):
+    import sys
+
+    from kestrel_sovereign.features.restart_coordinator.update_profiles import (
+        UpdateProfile,
+        UpdateStep,
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+
+    def _build(repo_path, target_ref, allow_migrations):
+        return [
+            UpdateStep(
+                "reattach_branch",
+                [sys.executable, "-c", "import sys; sys.exit(1)"],
+                allow_failure=True,
+            ),
+            UpdateStep(
+                "resolve_ref",
+                [sys.executable, "-c", "print('deadbeef')"],
+                read_only=True,
+            ),
+        ]
+
+    profile = UpdateProfile(
+        name="probe", description="", supports_migrations=False, _build=_build,
+    )
+    req = SimpleNamespace(
+        id="req-probe",
+        update_repo_path=str(tmp_path),
+        update_target_ref="v0.31.1",
+        update_allow_migrations=False,
+    )
+
+    update = await feat._run_update(req, profile)
+    assert update["ok"] is True
+    assert update["failed_step"] is None
+    # Later steps still ran after the best-effort failure.
+    assert update["resolved_ref"] == "deadbeef"
+    reattach = next(s for s in update["steps"] if s["step"] == "reattach_branch")
+    assert reattach["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_update_still_fails_on_mutating_step(tmp_path):
+    import sys
+
+    from kestrel_sovereign.features.restart_coordinator.update_profiles import (
+        UpdateProfile,
+        UpdateStep,
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+
+    def _build(repo_path, target_ref, allow_migrations):
+        return [
+            UpdateStep(
+                "install",
+                [sys.executable, "-c", "import sys; sys.exit(1)"],
+            ),
+            UpdateStep(
+                "resolve_ref",
+                [sys.executable, "-c", "print('deadbeef')"],
+                read_only=True,
+            ),
+        ]
+
+    profile = UpdateProfile(
+        name="probe", description="", supports_migrations=False, _build=_build,
+    )
+    req = SimpleNamespace(
+        id="req-probe",
+        update_repo_path=str(tmp_path),
+        update_target_ref="main",
+        update_allow_migrations=False,
+    )
+
+    update = await feat._run_update(req, profile)
+    assert update["ok"] is False
+    assert update["failed_step"] == "install"
+    # Stopped at the failure: resolve_ref never ran.
+    assert update["resolved_ref"] == ""

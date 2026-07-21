@@ -46,4 +46,36 @@ def test_no_feature_sync_step_when_manifest_absent(tmp_path, monkeypatch):
     names = _step_names(steps)
     assert "feature_sync" not in names
     # Unchanged shape for a host with no out-of-tree features.
-    assert names == ["fetch", "checkout", "install", "resolve_ref"]
+    assert names == [
+        "fetch", "checkout", "reattach_branch", "install", "resolve_ref",
+    ]
+
+
+def test_reattach_branch_step_shape(tmp_path, monkeypatch):
+    """The reattach step lands the local branch on the fetched commit.
+
+    It must target refs/remotes/origin/<ref> — which exists after the
+    fetch if and only if the target is a branch — and be allow_failure so
+    tag/sha targets (where the ref doesn't resolve) stay detached without
+    aborting the update.
+    """
+    monkeypatch.chdir(tmp_path)  # no manifest
+    steps = PROFILE.build_steps(
+        repo_path="/repo", target_ref="main", allow_migrations=False
+    )
+    names = _step_names(steps)
+    # Reattach runs after the detach checkout, before install.
+    assert names.index("checkout") < names.index("reattach_branch")
+    assert names.index("reattach_branch") < names.index("install")
+
+    reattach = next(s for s in steps if s.name == "reattach_branch")
+    assert reattach.argv == [
+        "git", "-C", "/repo",
+        "checkout", "-B", "main", "refs/remotes/origin/main",
+    ]
+    assert reattach.allow_failure is True
+    assert reattach.read_only is False
+    # The mutating steps stay fatal-on-failure.
+    for name in ("fetch", "checkout", "install"):
+        step = next(s for s in steps if s.name == name)
+        assert step.allow_failure is False

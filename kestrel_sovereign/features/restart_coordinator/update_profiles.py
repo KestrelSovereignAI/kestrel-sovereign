@@ -72,6 +72,10 @@ class UpdateStep:
     # Read-only steps (e.g. resolving HEAD) observe state; they never
     # mutate the checkout and a non-zero exit is non-fatal to the update.
     read_only: bool = False
+    # Best-effort steps may mutate but are expected to fail in some
+    # legitimate configurations (e.g. reattaching a branch when the target
+    # ref is a tag/sha); a non-zero exit is non-fatal to the update.
+    allow_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,26 @@ def _sovereign_local_uv_sync(
         # lands on the fetched commit regardless of whether the ref is a
         # branch, tag, or sha.
         UpdateStep("checkout", git + ["checkout", "--detach", "FETCH_HEAD"]),
+        # Reattach the local branch for branch targets. The detach above
+        # guarantees we run the fetched commit, but left as-is it strands
+        # the checkout on a detached HEAD after every update, breaking the
+        # operator's `git status`/`kestrel update` pull step ("not
+        # currently on a branch"). After the fetch, refs/remotes/origin/<ref>
+        # exists if and only if the target is a branch, so `checkout -B`
+        # off that ref reattaches exactly when a branch was requested; for
+        # a tag/sha target the ref does not resolve, the step fails, and
+        # ``allow_failure`` keeps the update going with HEAD correctly
+        # detached. ``-B`` deliberately forces the local branch onto the
+        # fetched commit: a deploy checkout must land on origin's tip, and
+        # stray local commits remain recoverable via the reflog.
+        UpdateStep(
+            "reattach_branch",
+            git + [
+                "checkout", "-B", target_ref,
+                f"refs/remotes/origin/{target_ref}",
+            ],
+            allow_failure=True,
+        ),
         UpdateStep("install", ["uv", "sync"], cwd=repo_path),
     ]
 
@@ -159,11 +183,11 @@ def _sovereign_local_uv_sync(
 SOVEREIGN_LOCAL_UV_SYNC = UpdateProfile(
     name="sovereign_local_uv_sync",
     description=(
-        "Update a local Sovereign checkout: git fetch the target ref and "
-        "detach onto the fetched commit (so branch targets actually "
-        "advance), then `uv sync` to install. Schema migrates "
-        "additively on the subsequent boot, so this profile defines no "
-        "explicit migration step."
+        "Update a local Sovereign checkout: git fetch the target ref, "
+        "land on the fetched commit (reattaching the local branch for "
+        "branch targets, detached for tags/shas), then `uv sync` to "
+        "install. Schema migrates additively on the subsequent boot, so "
+        "this profile defines no explicit migration step."
     ),
     supports_migrations=False,
     _build=_sovereign_local_uv_sync,
