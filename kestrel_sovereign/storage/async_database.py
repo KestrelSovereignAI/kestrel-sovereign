@@ -1461,6 +1461,16 @@ class AsyncDatabase:
                 await self._backend.execute(
                     "SELECT pg_advisory_xact_lock(?)", (_backfill_lock_id(name),)
                 )
+            else:
+                # SQLite transactions BEGIN deferred, so two initializers could
+                # both read a missing marker and the second would raise
+                # "database is locked" when it upgrades mid-backfill. Promote to
+                # the single write slot with a no-op write BEFORE the marker
+                # read (busy_timeout makes the loser wait, then it skips) —
+                # mirroring the lexical-cleanup serialization.
+                await self._backend.execute(
+                    "DELETE FROM schema_backfills WHERE 0"
+                )
             # Double-checked: a concurrent initializer may have completed the
             # migration between the fast-path check and acquiring the lock.
             if await self._backfill_completed(name):
