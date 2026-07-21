@@ -2405,3 +2405,50 @@ async def test_reattach_ignores_branch_shadowing_a_tag(tmp_path):
     # Still detached on the TAG commit — never the shadowing branch tip.
     assert _git_out(clone, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
     assert _git_out(clone, "rev-parse", "HEAD") == tag_sha
+
+
+@pytest.mark.asyncio
+async def test_reattach_ignores_stale_local_tag_named_like_branch(tmp_path):
+    """A stale LOCAL tag named like the branch must not force tag intent:
+    the fetch selected the branch, so the reattach must attach (codex
+    round-2)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    # Stale local-only tag in the CLONE shadowing the branch name.
+    subprocess.run(["git", "-C", str(clone), "tag", "main"], check=True)
+    (origin / "f.txt").write_text("two\n")
+    subprocess.run(["git", "-C", str(origin), "commit", "-qam", "two"], check=True)
+    origin_tip = _git_out(origin, "rev-parse", "HEAD")
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "main")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    # Full symbolic-ref: --short would report 'heads/main' here because
+    # the stale tag makes the bare name ambiguous.
+    assert _git_out(clone, "symbolic-ref", "HEAD") == "refs/heads/main"
+    assert _git_out(clone, "rev-parse", "refs/heads/main") == origin_tip
+
+
+@pytest.mark.asyncio
+async def test_reattach_sets_upstream_for_new_local_branch(tmp_path):
+    """Attaching to a branch the clone never had locally must configure
+    @{u}, or the next `kestrel update` bare pull fails (codex round-2)."""
+    origin, clone = _real_origin_and_clone(tmp_path / "repos")
+    subprocess.run(
+        ["git", "-C", str(origin), "checkout", "-q", "-b", "deploy"],
+        check=True,
+    )
+    (origin / "f.txt").write_text("deploy\n")
+    subprocess.run(
+        ["git", "-C", str(origin), "commit", "-qam", "deploy"], check=True
+    )
+
+    feat, _db = await _make_feature(tmp_path)
+    outcomes = await _run_git_steps(feat, clone, "deploy")
+
+    assert outcomes["reattach_branch"]["ok"] is True
+    assert _git_out(clone, "symbolic-ref", "--short", "HEAD") == "deploy"
+    assert (
+        _git_out(clone, "rev-parse", "--abbrev-ref", "deploy@{upstream}")
+        == "origin/deploy"
+    )

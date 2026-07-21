@@ -27,6 +27,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
@@ -1413,14 +1414,20 @@ class RestartCoordinatorFeature(Feature):
         as BOTH a tag and a branch, and ``git fetch <name>`` lands on the
         TAG commit, so attaching to ``origin/<name>`` could install a
         different commit than the one fetched (codex P2 on the reattach
-        change). Mirror the fetch's own precedence with plain plumbing
-        (each call ``create_subprocess_exec``, never a shell):
+        change). Intent is decided from what the fetch actually selected —
+        the ``FETCH_HEAD`` file records ``tag '<ref>'`` / ``branch
+        '<ref>'`` per fetched ref — never from local tag state (a stale
+        local tag shadowing a branch must not force tag intent, codex
+        round-2). Plain plumbing throughout (each call
+        ``create_subprocess_exec``, never a shell):
 
-        1. ``<ref>`` names a tag        → skip, stay detached (tag intent).
-        2. no ``origin/<ref>`` branch   → skip, stay detached (sha target).
-        3. ``origin/<ref>`` != FETCH_HEAD → skip (defensive; ambiguous).
-        4. otherwise ``checkout -B <ref> FETCH_HEAD`` — attach, forcing
-           the local branch onto the fetched commit.
+        1. fetch selected ``tag '<ref>'``    → skip, stay detached.
+        2. fetch selected no ``branch '<ref>'`` (sha target) → skip.
+        3. ``origin/<ref>`` != FETCH_HEAD    → skip (defensive).
+        4. otherwise ``checkout -B <ref> FETCH_HEAD`` and set the branch
+           upstream to ``origin/<ref>`` — a NEW local branch without
+           ``@{u}`` would fail the next ``kestrel update``'s bare
+           ``git pull --ff-only`` (codex round-2).
 
         Skips report ``ok=True`` with the reason in ``stdout_tail``; the
         step is additionally ``allow_failure`` so even unexpected git
@@ -1449,12 +1456,34 @@ class RestartCoordinatorFeature(Feature):
             }
 
         try:
-            rc, _out, _err = await _git(
-                "rev-parse", "--verify", "--quiet", f"refs/tags/{ref}^{{commit}}"
+            # What did the fetch select for <ref>? FETCH_HEAD lines look
+            # like: "<sha>\t(not-for-merge)?\tbranch 'x' of <url>".
+            rc, fetch_head_rel, _err = await _git(
+                "rev-parse", "--git-path", "FETCH_HEAD"
             )
-            if rc == 0:
+            if rc != 0:
                 return _outcome(
-                    True, 0, f"skip: {ref!r} is a tag; staying detached"
+                    True, 0, "skip: no FETCH_HEAD; staying detached"
+                )
+            fh = Path(fetch_head_rel.strip())
+            if not fh.is_absolute():
+                fh = Path(repo) / fh
+            try:
+                fetch_lines = fh.read_text().splitlines()
+            except OSError:
+                return _outcome(
+                    True, 0, "skip: unreadable FETCH_HEAD; staying detached"
+                )
+            if any(f"tag '{ref}'" in line for line in fetch_lines):
+                return _outcome(
+                    True, 0,
+                    f"skip: fetch selected tag {ref!r}; staying detached",
+                )
+            if not any(f"branch '{ref}'" in line for line in fetch_lines):
+                return _outcome(
+                    True, 0,
+                    f"skip: fetch selected no branch {ref!r}; "
+                    "staying detached",
                 )
             rc, branch_sha, _err = await _git(
                 "rev-parse", "--verify", "--quiet",
@@ -1474,7 +1503,12 @@ class RestartCoordinatorFeature(Feature):
                     f"skip: origin/{ref} != FETCH_HEAD; staying detached",
                 )
             rc, out, err = await _git("checkout", "-B", ref, fetch_sha.strip())
-            return _outcome(rc == 0, rc, out, err)
+            if rc != 0:
+                return _outcome(False, rc, out, err)
+            rc, up_out, up_err = await _git(
+                "branch", f"--set-upstream-to=refs/remotes/origin/{ref}", ref
+            )
+            return _outcome(rc == 0, rc, out + "\n" + up_out, err + up_err)
         except Exception as e:
             return {
                 "step": step.name,
