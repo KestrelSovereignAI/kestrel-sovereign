@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from contextvars import ContextVar
@@ -170,6 +171,79 @@ _TERMINAL_TALON_STATES = frozenset(
 # through a passing pipeline). Every other terminal state is a FAILURE — a PR it
 # left behind must not be accepted as CI-green (#2303).
 _SUCCESSFUL_TALON_STATE = "complete"
+
+# Non-terminal ("still working") talon job states, the complement of
+# ``_TERMINAL_TALON_STATES`` for status bucketing.
+_RUNNING_TALON_STATES = frozenset({"dispatched", "running"})
+
+# Observability-backed job status source (#2646). Talon jobs dispatched OUTSIDE
+# this coordinator's local registry — driven by a Claude Code session or a peer
+# host — never land in ``_jobs``. Those external orchestrators emit job-lifecycle
+# telemetry into the shared observability store as ``talon_job`` events. This
+# status source reads those events back through the agent's ``observability_store``
+# (the per-agent ``a2a_observability`` store, ``ObservabilityStore.query_events``)
+# and folds them into per-job status so ``talon_status`` surfaces externally-driven
+# jobs that would otherwise be invisible.
+#
+# Reader-only contract: this coordinator never WRITES ``talon_job`` events — the
+# external orchestrator (Claude Code session, peer host, kestrel-talon) is the
+# producer. A stock single-agent deployment whose store holds no ``talon_job``
+# rows simply reports registry jobs only, which is expected, not a bug.
+_TALON_JOB_EVENT_TYPE = "talon_job"
+
+# Provenance markers stamped on every ``talon_status`` job entry (#2646) so a
+# consumer can tell a locally-dispatched job from one only seen via observability.
+JOB_SOURCE_REGISTRY = "registry"
+JOB_SOURCE_OBSERVABILITY = "observability"
+
+# Accepted ``source`` filter values for ``talon_status`` (#2646). ``None``/""
+# and ``"all"`` merge both provenances; the registry/observability aliases
+# restrict to one. An unrecognized value is REJECTED (rather than silently
+# returning an empty set) so a typo'd filter is discoverable — mirroring the
+# scheduler's task-name validation.
+_SOURCE_FILTER_ALL = frozenset({"", "all"})
+_SOURCE_FILTER_REGISTRY = frozenset({"registry", "local"})
+_SOURCE_FILTER_OBSERVABILITY = frozenset(
+    {"observability", "external", "observed"}
+)
+
+# Default lookback window / row cap when reducing observability events into
+# per-job status. A talon run takes 10-30 min, so a day of lookback comfortably
+# covers in-flight and recently-finished external jobs without an unbounded scan.
+_OBSERVABILITY_LOOKBACK_MINUTES = 1440
+_OBSERVABILITY_EVENT_LIMIT = 1000
+
+
+def _talon_event_status(phase: Any) -> str:
+    """Map a ``talon_job`` event's lifecycle ``talon_event`` phase to a status.
+
+    kestrel-talon emits ``claimed`` / ``started`` / ``iteration`` while a run is in
+    flight and ``completed`` / ``failed`` / ``rejected`` as terminal markers. The
+    store returns events newest-first (``ORDER BY timestamp DESC``), so the latest
+    event per job defines the current status — this never invents a terminal state
+    from a still-running stream.
+    """
+    p = phase.strip().lower() if isinstance(phase, str) else ""
+    if p == "completed":
+        return "complete"
+    if p == "failed":
+        return "failed"
+    if p in ("rejected", "reject"):
+        return "reject"
+    # claimed / started / iteration / anything non-terminal → still in flight.
+    return "running"
+
+
+def _coerce_issue(raw: Any) -> Optional[int]:
+    """Best-effort int coercion of a ``talon_job`` event's ``issue`` field."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().lstrip("-").isdigit():
+        return int(raw.strip())
+    return None
+
 
 _PR_NUMBER_FROM_URL_RE = re.compile(r"/pull/(\d+)")
 
@@ -3384,17 +3458,57 @@ class TalonCoordinatorFeature(Feature):
 
     @tool(
         name="talon_status",
-        description="Check status of Talon jobs (running, completed, failed).",
+        description=(
+            "Check status of Talon jobs (running, completed, failed). "
+            "Merges locally-dispatched jobs (the durable registry) with jobs "
+            "only observed via the shared observability store — e.g. runs "
+            "driven by a Claude Code session or a peer host. Each job carries a "
+            "'source' provenance field ('registry' vs 'observability'). Pass "
+            "source='observability' to list only externally-driven jobs, or "
+            "source='registry' for only local ones."
+        ),
         category=ToolCategory.UTILITY,
         command_prefix="!talon status",
     )
-    async def talon_status(self) -> ToolResult:
-        """Check status of dispatched Talon jobs.
+    async def talon_status(self, source: Optional[str] = None) -> ToolResult:
+        """Check status of Talon jobs across the registry and observability.
 
-        Reaps any background CLI subprocess that has finished since
-        the last call (updates ``status`` to ``complete`` or
-        ``failed`` based on returncode), then summarises.
+        Reaps any background CLI subprocess that has finished since the last
+        call (updates ``status`` to ``complete`` or ``failed`` based on
+        returncode), reconciles A2A jobs, then merges the durable registry with
+        the observability-event-backed view of externally-dispatched jobs.
+
+        Args:
+            source: Provenance filter. ``None``/``"all"`` merges both sources;
+                ``"registry"``/``"local"`` restricts to locally-dispatched jobs;
+                ``"observability"``/``"external"`` restricts to jobs seen only
+                via observability events. Every returned job carries its own
+                ``source`` marker regardless of the filter.
         """
+        # Validate the provenance filter up front so a typo fails fast (with the
+        # valid values) instead of silently reporting zero jobs — and before any
+        # reap/reconcile side effects run.
+        norm = (source or "").strip().lower()
+        if (
+            norm not in _SOURCE_FILTER_ALL
+            and norm not in _SOURCE_FILTER_REGISTRY
+            and norm not in _SOURCE_FILTER_OBSERVABILITY
+        ):
+            valid = sorted(
+                v
+                for v in (
+                    _SOURCE_FILTER_ALL
+                    | _SOURCE_FILTER_REGISTRY
+                    | _SOURCE_FILTER_OBSERVABILITY
+                )
+                if v
+            )
+            return ToolResult.failed(
+                f"Unknown source filter {source!r}. Valid values: "
+                f"{', '.join(valid)} (or omit for all).",
+                data={"source_filter": norm, "valid_sources": valid},
+            )
+
         # Pull in any CLI jobs persisted before a restart so they are
         # visible again even without an in-memory process handle.
         self._reload_persisted_jobs()
@@ -3421,7 +3535,7 @@ class TalonCoordinatorFeature(Feature):
         a2a_jobs_to_check = [
             (jid, info) for jid, info in self._jobs.items()
             if info.get("method") == "a2a"
-            and info.get("status") in ("dispatched", "running")
+            and info.get("status") in _RUNNING_TALON_STATES
         ]
         if host_url and a2a_jobs_to_check:
             a2a_changed = False
@@ -3438,30 +3552,209 @@ class TalonCoordinatorFeature(Feature):
                 if k != "process"
             }
 
-        running = [
-            {**_public(info), "id": jid}
+        # Local registry jobs, tagged with their provenance. These are the
+        # ground truth for anything this coordinator dispatched.
+        registry_jobs = [
+            {**_public(info), "id": jid, "source": JOB_SOURCE_REGISTRY}
             for jid, info in self._jobs.items()
-            if info.get("status") in ("dispatched", "running")
         ]
-        done = [
-            {**_public(info), "id": jid}
-            for jid, info in self._jobs.items()
-            if info.get("status") in (
-                "complete", "failed", "reject", "finished_unknown",
-            )
-        ]
+        # Correlation keys the registry already owns: raw job ids AND the
+        # ``repo#issue`` a fleet ``workflow_run_id`` uses. A fleet event stream
+        # keys on ``workflow_run_id`` (``owner/repo#issue``), which never equals
+        # a registry job id, so dedup has to compare the derived ``repo#issue``
+        # too — otherwise a job this coordinator dispatched would double-count as
+        # both a registry job and an observability job.
+        registry_corr = {job["id"] for job in registry_jobs}
+        for info in self._jobs.values():
+            repo = info.get("repo")
+            issue = info.get("issue")
+            if repo and issue is not None:
+                registry_corr.add(f"{repo}#{issue}")
+
+        include_registry = (
+            norm in _SOURCE_FILTER_ALL or norm in _SOURCE_FILTER_REGISTRY
+        )
+        include_observability = (
+            norm in _SOURCE_FILTER_ALL or norm in _SOURCE_FILTER_OBSERVABILITY
+        )
+
+        # Observability-observed jobs. A job the registry already knows about
+        # wins (its live process handle / exit sidecar is authoritative), so
+        # only observability-ONLY jobs are merged in — matched by job key and by
+        # ``repo#issue`` correlation — no double-counting, no regression to
+        # registry-based reporting. A registry-only request skips the fleet
+        # query entirely.
+        observability_jobs: List[Dict[str, Any]] = []
+        if include_observability:
+            observed = await self._observability_talon_jobs()
+            observability_jobs = [
+                desc for jid, desc in observed.items()
+                if jid not in registry_corr
+                and desc.get("correlation") not in registry_corr
+            ]
+
+        selected: List[Dict[str, Any]] = []
+        if include_registry:
+            selected.extend(registry_jobs)
+        if include_observability:
+            selected.extend(observability_jobs)
+
+        running: List[Dict[str, Any]] = []
+        done: List[Dict[str, Any]] = []
+        # Anything that classified as neither (defensive; observability phases
+        # all map into the two buckets) is still surfaced rather than dropped.
+        other: List[Dict[str, Any]] = []
+        for job in selected:
+            status = job.get("status")
+            if status in _RUNNING_TALON_STATES:
+                running.append(job)
+            elif status in _TERMINAL_TALON_STATES:
+                done.append(job)
+            else:
+                other.append(job)
 
         data = {
             "running": len(running),
             "completed": len(done),
-            "jobs": running + done,
+            "jobs": running + done + other,
+            "registry_count": sum(
+                1 for job in selected if job.get("source") == JOB_SOURCE_REGISTRY
+            ),
+            "observability_count": sum(
+                1 for job in selected
+                if job.get("source") == JOB_SOURCE_OBSERVABILITY
+            ),
+            "source_filter": norm or "all",
         }
         return ToolResult.ok(
             confirmation=(
-                f"Talon jobs: running={len(running)}, completed={len(done)}"
+                f"Talon jobs: running={len(running)}, completed={len(done)} "
+                f"(registry={data['registry_count']}, "
+                f"observability={data['observability_count']})"
             ),
             data=data,
         )
+
+    async def _observability_talon_jobs(
+        self,
+        *,
+        since_minutes: int = _OBSERVABILITY_LOOKBACK_MINUTES,
+        limit: int = _OBSERVABILITY_EVENT_LIMIT,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Reduce ``talon_job`` observability events into per-job status (#2646).
+
+        Reads the agent's observability store (``ObservabilityStore.query_events``
+        over the ``a2a_observability`` table) for ``talon_job`` lifecycle events
+        and folds them into a ``job_id -> descriptor`` map. This is the
+        observability-backed status source of #2646: it surfaces Talon jobs
+        dispatched OUTSIDE this coordinator's local registry (Claude Code
+        sessions, peer hosts) that would otherwise be invisible to
+        ``talon_status``.
+
+        Read-only and best-effort: when no observability store is attached, or the
+        query fails for any reason, it degrades to an empty map rather than
+        breaking status reporting — a stock deployment whose store holds no
+        ``talon_job`` rows simply reports registry jobs only.
+        """
+        store = getattr(self.agent, "observability_store", None)
+        if store is None:
+            return {}
+        since = datetime.now(timezone.utc) - timedelta(
+            minutes=max(1, int(since_minutes))
+        )
+        try:
+            events = await store.query_events(
+                event_type=_TALON_JOB_EVENT_TYPE,
+                since=since,
+                limit=int(limit),
+            )
+        except Exception as exc:  # best-effort: never break status reporting
+            logger.debug("talon_job observability query failed: %s", exc)
+            return {}
+        return self._reduce_observability_talon_jobs(events)
+
+    def _reduce_observability_talon_jobs(
+        self, events: Any
+    ) -> Dict[str, Dict[str, Any]]:
+        """Fold ``talon_job`` observability events into a ``job_id -> descriptor``.
+
+        Pure over the ``ObservabilityEvent`` shape (attribute access:
+        ``.metadata``/``.timestamp``/``.agent_name``/``.session_id``). A Talon run
+        is correlated by ``metadata["talon_job_id"]``; events lacking one are
+        ignored. The lifecycle phase lives in ``metadata["talon_event"]``
+        (claimed/started/iteration/completed/failed) and defines status.
+
+        The store returns newest-first, so the first event seen per job defines the
+        current status while older events backfill any correlation
+        (repo/issue/orchestrator/stage/pr/workflow_run_id) the latest event lacked,
+        extend the first-seen timestamp, and bump the observed-event count.
+        """
+        jobs: Dict[str, Dict[str, Any]] = {}
+        for event in events or []:
+            meta = getattr(event, "metadata", None)
+            meta = meta if isinstance(meta, dict) else {}
+
+            job_id = meta.get("talon_job_id")
+            if not isinstance(job_id, str) or not job_id.strip():
+                # No job id: nothing to correlate a job on.
+                continue
+            job_id = job_id.strip()
+
+            phase = meta.get("talon_event")
+            ts = getattr(event, "timestamp", None)
+            ts_iso = str(ts) if ts is not None else None
+
+            repo = meta.get("repo") or None
+            issue = _coerce_issue(meta.get("issue"))
+            correlation = (
+                f"{repo}#{issue}" if repo and issue is not None else None
+            )
+            orchestrator = meta.get("orchestrator")
+            stage = meta.get("stage")
+            pr = meta.get("pr")
+            workflow_run_id = meta.get("workflow_run_id")
+
+            existing = jobs.get(job_id)
+            if existing is None:
+                # First (== latest, newest-first) event defines status.
+                jobs[job_id] = {
+                    "id": job_id,
+                    "source": JOB_SOURCE_OBSERVABILITY,
+                    "status": _talon_event_status(phase),
+                    "talon_event": phase,
+                    "repo": repo,
+                    "issue": issue,
+                    "pr": pr,
+                    "orchestrator": orchestrator,
+                    "stage": stage,
+                    "workflow_run_id": workflow_run_id,
+                    "correlation": correlation,
+                    "agent_name": getattr(event, "agent_name", None),
+                    "session_id": getattr(event, "session_id", None),
+                    "last_event_at": ts_iso,
+                    "first_event_at": ts_iso,
+                    "observed_events": 1,
+                }
+                continue
+
+            # Older event for a known job: bump the count, keep the earliest
+            # timestamp, and backfill any correlation the latest event lacked.
+            existing["observed_events"] += 1
+            if ts_iso is not None:
+                existing["first_event_at"] = ts_iso
+            for key, value in (
+                ("repo", repo),
+                ("issue", issue),
+                ("pr", pr),
+                ("orchestrator", orchestrator),
+                ("stage", stage),
+                ("workflow_run_id", workflow_run_id),
+                ("correlation", correlation),
+            ):
+                if existing.get(key) is None and value is not None:
+                    existing[key] = value
+
+        return jobs
 
     @tool(
         name="talon_job_log",
