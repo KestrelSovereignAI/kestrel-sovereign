@@ -137,7 +137,7 @@ test('messageAttachmentsHtml is empty for no attachments', () => {
 
 // --- composer wiring: paste → upload → stage → tray → remove ----------------
 
-function wireComposer() {
+function wireComposer({ uploadAttachment = null, toast = null } = {}) {
     // Build the DOM the composer binds to.
     const container = makeNode('section');
     for (const id of ['chat-container', 'message-input', 'send-button',
@@ -156,12 +156,13 @@ function wireComposer() {
             api: {
                 hasCapability: () => true,
                 getHostAgent: () => 'agent-1',
-                uploadAttachment: async (file) => {
+                uploadAttachment: uploadAttachment || (async (file) => {
                     uploaded.push(file);
                     return { hash: 'e'.repeat(64), kind: 'image', mime: 'image/png',
                         name: file.name, url: '/api/files/' + 'e'.repeat(64) };
-                },
+                }),
             },
+            ...(toast ? { toast } : {}),
             getOrCreateChatPane: () => pendingPane,
         },
     });
@@ -194,4 +195,28 @@ test('the attach button stages a NON-inline (lazy) ref', async () => {
     const staged = pane().pendingAttachments;
     assert.equal(staged.length, 1);
     assert.equal(staged[0].inline, false, 'attach-button file must be a lazy ref, not inline');
+});
+
+test('attachment failures pass literal text to the text-safe toast renderer', async () => {
+    const messages = [];
+    const { container } = wireComposer({
+        uploadAttachment: async () => { throw new Error('bad <reference> & retry'); },
+        toast: { error(message) { messages.push(message); } },
+    });
+    const input = container.querySelector('#message-input');
+    input.dispatch('paste', {
+        clipboardData: {
+            items: [{
+                kind: 'file',
+                type: 'image/png',
+                getAsFile: () => ({ name: 'bad.png', type: 'image/png' }),
+            }],
+        },
+        preventDefault: () => {},
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(messages, [
+        'Attachment upload failed: bad <reference> & retry',
+    ]);
 });

@@ -19,7 +19,7 @@ globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.window.kicon = (name) => `<span class="ki ki-${name}" aria-hidden="true"></span>`;
 globalThis.kicon = globalThis.window.kicon;
 
-const { Modal } = await import('../../kestrel_sovereign/static/js/ui.js');
+const { Modal, setOverlayRoot } = await import('../../kestrel_sovereign/static/js/ui.js');
 const { openCreateAgentDialog } = await import('../../kestrel_sovereign/static/js/new_agent_dialog.js');
 
 function tick() { return new Promise((r) => setTimeout(r, 0)); }
@@ -68,6 +68,35 @@ test('valid name POSTs to /api/agents, then refreshes + selects on success', asy
     assert.equal(document.getElementById('modal-overlay'), null, 'dialog closed on success');
 });
 
+test('created agents still refresh and select when focus restoration fails', async () => {
+    Modal.hide();
+    const opener = document.createElement('button');
+    document.body.appendChild(opener);
+    opener.focus();
+    const created = [];
+    openCreateAgentDialog({
+        modal: Modal,
+        api: { createAgent: async (name) => ({ success: true, agent: { name } }) },
+        onCreated: async (name) => { created.push(name); },
+    });
+    await tick();
+    typeName('Kestrel');
+    opener.focus = () => { throw new Error('create opener focus failed'); };
+    const reportedError = new Promise((resolve) => {
+        window.addEventListener('error', (event) => {
+            event.preventDefault();
+            resolve(event.error);
+        }, { once: true });
+    });
+
+    clickCreate();
+
+    assert.match((await reportedError).message, /create opener focus failed/);
+    assert.deepEqual(created, ['Kestrel'],
+        'post-create host reconciliation runs after the durable create succeeds');
+    assert.equal(document.getElementById('modal-overlay'), null);
+});
+
 test('a 409 duplicate-name failure renders inline (not a toast)', async () => {
     Modal.hide();
     const err = new Error("Agent 'Kestrel' already exists.");
@@ -103,6 +132,87 @@ test('a client-invalid name is rejected before any POST', async () => {
 
     assert.equal(posted, false, 'no POST for a client-invalid name');
     assert.match(errorText(), /must start with a letter/, 'inline validation message shown');
+});
+
+test('closed-shadow Create Agent validates and submits through its modal handle', async () => {
+    Modal.hide();
+    const host = document.createElement('div');
+    const shadow = host.attachShadow({ mode: 'closed' });
+    const mount = document.createElement('div');
+    shadow.appendChild(mount);
+    document.body.appendChild(host);
+    const posted = [];
+    setOverlayRoot(mount);
+    try {
+        openCreateAgentDialog({
+            modal: Modal,
+            api: {
+                createAgent: async (name) => {
+                    posted.push(name);
+                    return { success: true, agent: { name } };
+                },
+            },
+            onCreated: async () => {},
+        });
+        await tick();
+
+        const input = mount.querySelector('#create-agent-name-input');
+        const create = [...mount.querySelectorAll('.modal-btn')]
+            .find((button) => button.textContent === 'Create');
+        assert.ok(input && create, 'dialog controls render below the closed shadow root');
+        assert.equal(document.getElementById('create-agent-name-input'), null,
+            'the integration cannot accidentally pass through document lookup');
+
+        input.value = '1bad name';
+        create.click();
+        assert.match(mount.querySelector('#create-agent-error').textContent, /must start with a letter/);
+        assert.deepEqual(posted, []);
+
+        input.value = 'Kestrel';
+        input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+        create.click();
+        await tick();
+        await tick();
+
+        assert.deepEqual(posted, ['Kestrel']);
+        assert.equal(mount.querySelector('.modal-overlay'), null);
+    } finally {
+        Modal.hide();
+        setOverlayRoot(null);
+        host.remove();
+    }
+});
+
+test('IME composition Enter does not submit the create-agent dialog', async () => {
+    Modal.hide();
+    const posted = [];
+    const api = {
+        createAgent: async (name) => {
+            posted.push(name);
+            return { success: true, agent: { name } };
+        },
+    };
+    openCreateAgentDialog({ modal: Modal, api, onCreated: async () => {} });
+    await tick();
+    const input = typeName('Kestrel');
+
+    input.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+        key: 'Enter',
+        isComposing: true,
+        bubbles: true,
+        cancelable: true,
+    }));
+    await tick();
+    assert.deepEqual(posted, [], 'composition confirmation is not treated as form submission');
+    assert.ok(document.getElementById('modal-overlay'));
+
+    input.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+        key: 'Enter',
+        bubbles: true,
+        cancelable: true,
+    }));
+    await tick();
+    assert.deepEqual(posted, ['Kestrel']);
 });
 
 test('the secondary spawn link routes to the spawn flow', async () => {

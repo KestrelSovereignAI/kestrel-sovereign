@@ -17,11 +17,12 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Request
-from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from authlib.integrations.starlette_client import OAuth
 from pydantic import BaseModel, EmailStr
 
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.api_errors import api_error_response
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,11 @@ async def me(request: Request):
                 "auth_method": "jwt",
             }
 
-    return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    return api_error_response(
+        status_code=401,
+        code="authentication_required",
+        message="Not authenticated",
+    )
 
 
 # --- JWT Email/Password Auth ---
@@ -281,7 +286,11 @@ async def login_token(request: Request, body: LoginRequest):
     email = body.email.lower()
 
     if not _email_authorized(email):
-        return JSONResponse({"detail": "Email not authorized"}, status_code=403)
+        return api_error_response(
+            status_code=403,
+            code="email_not_authorized",
+            message="Email not authorized",
+        )
 
     # Check user-specific passwords: "email1:pass1,email2:pass2"
     user_passwords = os.environ.get("KESTREL_USER_PASSWORDS", "")
@@ -303,7 +312,11 @@ async def login_token(request: Request, body: LoginRequest):
             authenticated = True
 
     if not authenticated:
-        return JSONResponse({"detail": "Invalid credentials"}, status_code=401)
+        return api_error_response(
+            status_code=401,
+            code="invalid_credentials",
+            message="Invalid credentials",
+        )
 
     token = _create_jwt(email)
     logger.info(f"JWT login: {email}")
@@ -315,10 +328,18 @@ async def verify_token(request: Request):
     """Verify a JWT token from the Authorization header."""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        return JSONResponse({"detail": "No bearer token"}, status_code=401)
+        return api_error_response(
+            status_code=401,
+            code="bearer_token_required",
+            message="No bearer token",
+        )
 
     payload = _verify_jwt(auth_header[7:])
     if not payload:
-        return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
+        return api_error_response(
+            status_code=401,
+            code="invalid_or_expired_token",
+            message="Invalid or expired token",
+        )
 
     return {"valid": True, "email": payload["sub"], "name": payload.get("name", "")}

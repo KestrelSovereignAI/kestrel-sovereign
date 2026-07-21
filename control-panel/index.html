@@ -6,15 +6,15 @@
     <title>Kestrel Control Panel</title>
     <style>
         :root {
-            --bg: #0a0a0f;
-            --card: #12121a;
-            --border: #2a2a3a;
-            --text: #e0e0e0;
-            --text-dim: #808090;
-            --accent: #6366f1;
-            --green: #22c55e;
-            --red: #ef4444;
-            --orange: #f59e0b;
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --border-color: #2a2a3a;
+            --text-primary: #e0e0e0;
+            --text-secondary: #808090;
+            --accent-color: #6366f1;
+            --success: #22c55e;
+            --error: #ef4444;
+            --warning: #f59e0b;
         }
         
         * {
@@ -25,8 +25,8 @@
         
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: var(--bg);
-            color: var(--text);
+            background: var(--bg-primary);
+            color: var(--text-primary);
             min-height: 100vh;
             padding: 2rem;
         }
@@ -54,8 +54,8 @@
         }
         
         .agent-card {
-            background: var(--card);
-            border: 1px solid var(--border);
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
             border-radius: 12px;
             padding: 1.25rem;
             display: grid;
@@ -67,7 +67,7 @@
         .agent-avatar {
             width: 48px;
             height: 48px;
-            background: var(--border);
+            background: var(--border-color);
             border-radius: 50%;
             display: flex;
             align-items: center;
@@ -86,7 +86,7 @@
         .agent-info .did {
             font-family: 'SF Mono', Monaco, monospace;
             font-size: 0.75rem;
-            color: var(--text-dim);
+            color: var(--text-secondary);
             margin-top: 0.25rem;
         }
         
@@ -104,21 +104,21 @@
         }
         
         .badge.test {
-            background: var(--orange);
+            background: var(--warning);
             color: #000;
         }
         
         .badge.graduated {
-            background: var(--green);
+            background: var(--success);
             color: #000;
         }
         
         .status.running {
-            color: var(--green);
+            color: var(--success);
         }
         
         .status.stopped {
-            color: var(--text-dim);
+            color: var(--text-secondary);
         }
         
         .agent-actions {
@@ -142,7 +142,7 @@
         }
         
         button.primary {
-            background: var(--accent);
+            background: var(--accent-color);
             color: white;
         }
         
@@ -151,8 +151,8 @@
         }
         
         button.secondary {
-            background: var(--border);
-            color: var(--text);
+            background: var(--border-color);
+            color: var(--text-primary);
         }
         
         button.secondary:hover:not(:disabled) {
@@ -160,12 +160,12 @@
         }
         
         button.danger {
-            background: var(--red);
+            background: var(--error);
             color: white;
         }
         
         a.chat-link {
-            color: var(--accent);
+            color: var(--accent-color);
             text-decoration: none;
             font-size: 0.85rem;
         }
@@ -177,13 +177,13 @@
         .loading {
             text-align: center;
             padding: 2rem;
-            color: var(--text-dim);
+            color: var(--text-secondary);
         }
         
         .error {
             background: rgba(239, 68, 68, 0.1);
-            border: 1px solid var(--red);
-            color: var(--red);
+            border: 1px solid var(--error);
+            color: var(--error);
             padding: 1rem;
             border-radius: 8px;
             margin-bottom: 1rem;

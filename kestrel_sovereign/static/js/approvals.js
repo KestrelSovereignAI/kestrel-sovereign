@@ -84,7 +84,7 @@ async function decide(approvalId, approved, scope, remember) {
         // (#2232). Render it as an upgrade prompt instead of a generic error.
         const upgrade = extractUpgradeRequired(e);
         if (upgrade) {
-            Toast.warning(upgradeToastHtml(upgrade));
+            Toast.showTrustedHtml(upgradeToastHtml(upgrade), 'warning');
         } else {
             Toast.error(`Decision failed: ${e.message || e}`);
         }
@@ -122,7 +122,7 @@ function renderPending(pending) {
             const preview = esc(r.command_preview || '');
             const id = esc(r.id);
             return `
-            <div class="approval-row" style="border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:1rem;">
+            <div class="approval-row" style="border:1px solid var(--border-color);border-radius:8px;padding:1rem;margin-bottom:1rem;">
               <div class="row-between mb-2">
                 <strong>${agent}</strong>
                 <span class="text-muted text-sm">${esc(r.timestamp)}</span>
@@ -148,7 +148,7 @@ function renderRules(rules) {
     rulesEl.innerHTML = rules
         .map(
             (r) => `
-        <div class="row-between" style="border:1px solid var(--border);border-radius:6px;padding:0.5rem 0.75rem;margin-bottom:0.5rem;">
+        <div class="row-between" style="border:1px solid var(--border-color);border-radius:6px;padding:0.5rem 0.75rem;margin-bottom:0.5rem;">
           <div>
             <code>${esc(r.pattern)}</code>
             <span class="text-muted text-sm"> · ${esc(r.agent || 'any agent')} · ${esc(r.repo_scope || 'any repo')}</span>
@@ -172,7 +172,7 @@ function renderAudit(rows) {
                     ? 'running…'
                     : `exit ${a.exit_code}`;
             return `
-        <div style="border:1px solid var(--border);border-radius:6px;padding:0.5rem 0.75rem;margin-bottom:0.5rem;">
+        <div style="border:1px solid var(--border-color);border-radius:6px;padding:0.5rem 0.75rem;margin-bottom:0.5rem;">
           <div class="text-sm"><code>${esc(a.command)}</code></div>
           <div class="text-muted text-sm">${esc(a.agent_did || '?')} · ${esc(a.created_at)} · ${esc(ec)} · ${esc(a.rule_source || '')}</div>
         </div>`;

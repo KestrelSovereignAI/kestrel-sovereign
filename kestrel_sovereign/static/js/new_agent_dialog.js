@@ -25,7 +25,7 @@ const SPAWN_LINK_ID = 'create-agent-spawn-link';
  * Open the Create Agent dialog.
  *
  * @param {object}   deps
- * @param {object}   deps.modal          - shared Modal helper (`show`/`hide`).
+ * @param {object}   deps.modal          - shared Modal helper (`show`).
  * @param {object}   deps.api            - API client exposing `createAgent(name)`.
  * @param {Function} deps.onCreated      - async cb(name) run after a successful
  *                                          create (refresh the list + select).
@@ -72,9 +72,10 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
     `;
 
     let submitting = false;
+    let dialogHandle;
 
     const showError = (message) => {
-        const el = document.getElementById(ERROR_ID);
+        const el = dialogHandle?.querySelector(`#${ERROR_ID}`);
         if (el) {
             // textContent (not innerHTML) so a server-supplied detail string can
             // never inject markup into the dialog.
@@ -84,7 +85,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
     };
 
     const clearError = () => {
-        const el = document.getElementById(ERROR_ID);
+        const el = dialogHandle?.querySelector(`#${ERROR_ID}`);
         if (el) {
             el.textContent = '';
             el.style.display = 'none';
@@ -93,7 +94,7 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
 
     const submit = async () => {
         if (submitting) return;
-        const input = document.getElementById(INPUT_ID);
+        const input = dialogHandle?.querySelector(`#${INPUT_ID}`);
         const name = (input?.value || '').trim();
         if (!name) {
             showError('Agent name is required.');
@@ -105,74 +106,100 @@ export function openCreateAgentDialog({ modal, api, onCreated, spawnAvailable = 
         }
         submitting = true;
         clearError();
-        // Scope the async completion to THIS dialog instance (codex P2): the
-        // user can dismiss the dialog while createAgent is in flight and open
-        // another modal — the eventual resolution must not hide that unrelated
-        // modal or paint errors into a reopened Create Agent. The name input
-        // element is unique to this render; if it's gone or detached, the
-        // dialog this request belonged to no longer exists.
-        const dialogInput = input;
-        const stillCurrent = () => !!(dialogInput && dialogInput.isConnected
-            && document.getElementById(INPUT_ID) === dialogInput);
+        // Scope the async completion to THIS dialog lifecycle. A later modal
+        // may reuse the same DOM ids, so element identity is not an ownership
+        // primitive; the shared Modal handle is.
+        const requestOwner = dialogHandle;
+        let created = false;
         try {
             const result = await api.createAgent(name);
+            created = true;
             // Success: close the dialog first, then let the host refresh the list
             // and select the freshly-minted agent. The refresh/select still runs
             // even if the user dismissed the dialog mid-flight — the agent WAS
-            // created; only the modal.hide() must be scoped.
-            if (stillCurrent()) modal.hide();
+            // created; only the lifecycle close must be scoped.
+            const completionErrors = [];
+            try {
+                requestOwner.close();
+            } catch (error) {
+                completionErrors.push(error);
+            }
             // Partial failure (codex P2): HTTP 200 with persisted:false means
             // the agent EXISTS but its registration didn't reach
             // multi_agent.toml — it will vanish from the fleet on the next
-            // restart. That must never masquerade as full success.
-            if (result && result.persisted === false && toast && typeof toast.warning === 'function') {
-                toast.warning(
-                    `Agent "${name}" was created but could NOT be saved to the server's `
-                    + 'multi_agent config — it will disappear on the next restart. '
-                    + 'Check the server logs.',
-                    12000,
-                );
+            // restart. That must never masquerade as full success. Each
+            // completion stage is isolated so a UI callback failure cannot
+            // skip host reconciliation for an agent that already exists.
+            try {
+                if (result && result.persisted === false && toast && typeof toast.warning === 'function') {
+                    toast.warning(
+                        `Agent "${name}" was created but could NOT be saved to the server's `
+                        + 'multi_agent config — it will disappear on the next restart. '
+                        + 'Check the server logs.',
+                        12000,
+                    );
+                }
+            } catch (error) {
+                completionErrors.push(error);
             }
-            if (onCreated) await onCreated(name);
+            try {
+                if (onCreated) await onCreated(name);
+            } catch (error) {
+                completionErrors.push(error);
+            }
+            if (completionErrors.length === 1) throw completionErrors[0];
+            if (completionErrors.length > 1) {
+                throw new AggregateError(completionErrors, 'Create-agent completion failed');
+            }
         } catch (err) {
+            // Once creation succeeds, close/focus or host-refresh failures are
+            // not validation failures and must not be painted into a stale
+            // dialog. Let Modal's async action boundary report them instead.
+            if (created) throw err;
             // Surface the 409/400 (or any) failure inline — never a toast, so the
             // user can correct the name in place without losing the dialog. But
             // only into the SAME dialog instance that submitted.
             submitting = false;
-            if (!stillCurrent()) return;
+            if (!requestOwner.isCurrent()) return;
             const detail = (err && ((err.body && err.body.detail) || err.message)) || 'Failed to create agent.';
             showError(detail);
         }
     };
 
-    modal.show({
+    dialogHandle = modal.show({
         title: 'Create Agent',
         content,
         buttons: [
-            { label: 'Cancel', type: 'secondary', onClick: () => modal.hide() },
-            { label: 'Create', type: 'primary', onClick: () => { submit(); } },
+            { label: 'Cancel', type: 'secondary', onClick: () => dialogHandle.close() },
+            { label: 'Create', type: 'primary', onClick: () => submit() },
         ],
     });
 
     // Wire post-render behavior (Enter-to-submit, live error clear, spawn link).
     // Deferred so it runs after Modal.show has appended the content.
     setTimeout(() => {
-        const input = document.getElementById(INPUT_ID);
+        if (!dialogHandle.isCurrent()) return;
+        const input = dialogHandle.querySelector(`#${INPUT_ID}`);
         if (input) {
             input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
+                if (e.key === 'Enter' && !e.isComposing) {
                     e.preventDefault();
-                    submit();
+                    e.stopPropagation();
+                    if (!dialogHandle.isCurrent()) return;
+                    dialogHandle.querySelector('.modal-btn-primary')?.click();
                 }
             });
             input.addEventListener('input', clearError);
         }
-        const link = document.getElementById(SPAWN_LINK_ID);
+        const link = dialogHandle.querySelector(`#${SPAWN_LINK_ID}`);
         if (link) {
             link.addEventListener('click', (e) => {
                 e.preventDefault();
-                modal.hide();
-                if (onSpawn) onSpawn();
+                try {
+                    dialogHandle.close();
+                } finally {
+                    if (onSpawn) onSpawn();
+                }
             });
         }
     }, 0);

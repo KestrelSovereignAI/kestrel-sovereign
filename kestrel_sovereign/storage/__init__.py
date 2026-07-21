@@ -31,7 +31,7 @@ from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore
 from .destructive_audit import DestructiveAuditLog, destructive_audit_caller
-from .async_graph_store import AsyncGraphStore, GraphNode, Edge
+from .async_graph_store import AsyncGraphStore, GraphNode, Edge, NodeSwapResult
 from .async_rag_store import AsyncRAGStore
 from .agent_resource_store import (
     AgentResourceStore,
@@ -102,6 +102,7 @@ __all__ = [
     # Graph types
     "GraphNode",
     "Edge",
+    "NodeSwapResult",
     # Privacy
     "PrivacyEnforcingStorage",
     "PrivacyViolationError",

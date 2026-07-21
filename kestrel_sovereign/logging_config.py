@@ -16,6 +16,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -39,11 +40,48 @@ feature_name_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar
 )
 
 
+MAX_CORRELATION_ID_LENGTH = 128
+_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
+def normalize_correlation_id(value: object) -> Optional[str]:
+    """Return a support-safe correlation ID or ``None`` when invalid."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or len(candidate) > MAX_CORRELATION_ID_LENGTH:
+        return None
+    if _CORRELATION_ID_RE.fullmatch(candidate) is None:
+        return None
+    return candidate
+
+
+def generate_correlation_id() -> str:
+    """Generate a new opaque, support-safe request correlation ID."""
+    return uuid.uuid4().hex[:16]
+
+
+def resolve_correlation_id(
+    value: object = None,
+    *,
+    use_context: bool = True,
+) -> str:
+    """Resolve a safe supplied/ambient ID, or generate a fresh one."""
+    return (
+        normalize_correlation_id(value)
+        or (
+            normalize_correlation_id(correlation_id_var.get())
+            if use_context
+            else None
+        )
+        or generate_correlation_id()
+    )
+
+
 def get_correlation_id() -> str:
-    """Get the current correlation ID, generating one if not set."""
-    cid = correlation_id_var.get()
-    if cid is None:
-        cid = uuid.uuid4().hex[:16]
+    """Get the current safe correlation ID, generating one if not set."""
+    cid = resolve_correlation_id()
+    if cid != correlation_id_var.get():
         correlation_id_var.set(cid)
     return cid
 
@@ -88,6 +126,14 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(entry, default=str)
 
 
+class CorrelationContextFilter(logging.Filter):
+    """Attach request correlation context for non-JSON formatters."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.correlation_id = correlation_id_var.get() or "-"
+        return True
+
+
 def setup_logging(
     fmt: Optional[str] = None,
     level: Optional[str] = None,
@@ -107,12 +153,13 @@ def setup_logging(
     root.handlers.clear()
 
     handler = logging.StreamHandler()
+    handler.addFilter(CorrelationContextFilter())
 
     if log_format == "json":
         handler.setFormatter(JSONFormatter())
     else:
         handler.setFormatter(logging.Formatter(
-            "%(levelname)s:%(name)s:%(message)s"
+            "%(levelname)s:%(name)s:[correlation_id=%(correlation_id)s]:%(message)s"
         ))
 
     root.addHandler(handler)

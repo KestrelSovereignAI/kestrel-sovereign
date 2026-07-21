@@ -14,7 +14,7 @@ globalThis.location = dom.window.location;
 globalThis.window.kicon = (n) => `<span class="ki ki-${n}"></span>`;
 globalThis.kicon = globalThis.window.kicon;
 
-const { Modal, Toast, setOverlayRoot, getOverlayRoot } = await import(
+const { Modal, Toast, setOverlayRoot, getOverlayRoot, renderTextError } = await import(
     '../../kestrel_sovereign/static/js/ui.js'
 );
 
@@ -50,4 +50,36 @@ test('a disconnected root falls back to body (never a dead mount)', () => {
     setOverlayRoot(root); // never attached to the document
     assert.equal(getOverlayRoot(), document.body, 'disconnected root -> body fallback');
     setOverlayRoot(null);
+});
+
+test('default toast and error renderers treat API messages as literal text', () => {
+    const hostile = '<img src=x onerror="window.toastPwned=true"> API failed';
+
+    Toast.error(hostile, 0);
+    const toast = document.querySelector('.toast-item:last-child');
+    assert.ok(toast);
+    assert.equal(toast.querySelector('img'), null, 'message did not create markup');
+    assert.match(toast.textContent, /<img src=x/);
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    renderTextError(target, hostile);
+    assert.equal(target.querySelector('img'), null, 'panel error did not create markup');
+    assert.equal(target.textContent, hostile);
+
+    toast.remove();
+    target.remove();
+});
+
+test('trusted upgrade toast path retains its sanitized rich link', () => {
+    Toast.showTrustedHtml(
+        'Upgrade required. <a href="/upgrade" rel="noopener noreferrer">Upgrade</a>',
+        'warning',
+        0,
+    );
+    const toast = document.querySelector('.toast-item:last-child');
+    const link = toast?.querySelector('a');
+    assert.ok(link);
+    assert.equal(link.getAttribute('href'), '/upgrade');
+    toast.remove();
 });

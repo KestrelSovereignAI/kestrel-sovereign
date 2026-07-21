@@ -255,7 +255,8 @@ async def test_proxy_rejects_excluded_repo(monkeypatch):
         )
 
     assert response.status_code == 403
-    assert "outside the configured GitHub scope" in response.json()["error"]
+    assert response.json()["error"]["code"] == "github_repository_out_of_scope"
+    assert "outside the configured GitHub scope" in response.json()["error"]["message"]
     await app.state.http_client.aclose()
 
 
@@ -279,7 +280,8 @@ async def test_proxy_rejects_repo_not_in_scope(monkeypatch):
         response = await client.get("/api/github/repos/someoneelse/secret/issues")
 
     assert response.status_code == 403
-    assert "outside the configured GitHub scope" in response.json()["error"]
+    assert response.json()["error"]["code"] == "github_repository_out_of_scope"
+    assert "outside the configured GitHub scope" in response.json()["error"]["message"]
     await app.state.http_client.aclose()
 
 
@@ -316,7 +318,8 @@ async def test_proxy_rejects_non_repo_scoped_paths(monkeypatch, path):
         response = await client.get(f"/api/github/{path}")
 
     assert response.status_code == 403
-    assert "repos/{owner}/{repo}" in response.json()["error"]
+    assert response.json()["error"]["code"] == "github_proxy_scope_required"
+    assert "repos/{owner}/{repo}" in response.json()["error"]["message"]
     await app.state.http_client.aclose()
 
 
@@ -340,3 +343,70 @@ async def test_proxy_requires_token(monkeypatch):
         )
 
     assert response.status_code == 503
+    assert response.json()["error"]["code"] == "github_not_configured"
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_proxy_intentionally_preserves_upstream_github_error(monkeypatch):
+    upstream_error = {
+        "message": "Not Found",
+        "documentation_url": "https://docs.github.com/rest",
+        "status": "404",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/orgs/" in str(request.url):
+            return httpx.Response(200, json=_ORG_REPOS)
+        return httpx.Response(404, json=upstream_error)
+
+    app = _scoped_proxy_app(
+        monkeypatch,
+        handler=handler,
+        config={"orgs": ["KestrelSovereignAI"]},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.get(
+            "/api/github/repos/KestrelSovereignAI/kestrel-sovereign/issues/999999"
+        )
+
+    assert response.status_code == 404
+    assert response.json() == upstream_error
+    await app.state.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_proxy_transport_failure_uses_sanitized_canonical_error(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/orgs/" in str(request.url):
+            return httpx.Response(200, json=_ORG_REPOS)
+        raise httpx.ConnectError(
+            "private upstream credential and socket details",
+            request=request,
+        )
+
+    app = _scoped_proxy_app(
+        monkeypatch,
+        handler=handler,
+        config={"orgs": ["KestrelSovereignAI"]},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.get(
+            "/api/github/repos/KestrelSovereignAI/kestrel-sovereign/issues"
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "github_upstream_unavailable"
+    assert "credential" not in response.text
+    assert response.json()["error"]["correlation_id"] == response.headers[
+        "X-Correlation-ID"
+    ]
+    await app.state.http_client.aclose()

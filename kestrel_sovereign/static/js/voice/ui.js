@@ -1767,7 +1767,10 @@ async function refreshVoiceList(
     }
   } catch (err) {
     if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
-    selectEl.innerHTML = `<option value="">Failed to load voices: ${err.message}</option>`;
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = `Failed to load voices: ${err.message}`;
+    selectEl.replaceChildren(option);
   }
 }
 

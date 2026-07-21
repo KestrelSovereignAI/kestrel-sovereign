@@ -643,7 +643,20 @@ class PrivacyEnforcingStorage:
         """
         # Graph operations bypass privacy check - they're structural, not PII
         await self._storage.add_node(node)
-    
+
+    async def compare_and_swap_node(self, node_id, expected, new_node):
+        """Atomically compare-and-swap a graph node.
+
+        Structural, not PII-sensitive — same rationale as :meth:`add_node`.
+        This MUST stay a single passthrough: the whole point of the primitive
+        is that the check and the write are one atomic unit, so the wrapper
+        cannot decompose it into ``get_node`` + ``add_node`` (that would
+        reintroduce exactly the TOCTOU race the caller is trying to close).
+        """
+        return await self._storage.compare_and_swap_node(
+            node_id, expected, new_node
+        )
+
     async def get_node(self, node_id: str):
         """Get a graph node."""
         return await self._storage.get_node(node_id)

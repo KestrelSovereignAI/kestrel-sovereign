@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state } from './ui.js';
+import { state, renderTextError } from './ui.js';
 
 // ============================================================================
 // IPFS Status
@@ -20,9 +20,7 @@ export async function loadIpfsStatus() {
         renderIpfsStatus(data);
     } catch (e) {
         const container = document.getElementById('ipfs-status-container');
-        if (container) {
-            container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load IPFS status: ${e.message}</p>`;
-        }
+        renderTextError(container, `Failed to load IPFS status: ${e.message}`);
     }
 }
 

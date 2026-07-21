@@ -18,7 +18,8 @@ globalThis.location = dom.window.location;
 globalThis.window.kicon = (n) => `<span class="ki ki-${n}"></span>`;
 globalThis.kicon = globalThis.window.kicon;
 
-const { Modal, setOverlayRoot } = await import('../../kestrel_sovereign/static/js/ui.js');
+const { Modal, Toast, setOverlayRoot } = await import('../../kestrel_sovereign/static/js/ui.js');
+const { default: API } = await import('../../kestrel_sovereign/static/js/api.js');
 const { Security } = await import('../../kestrel_sovereign/static/js/security.js');
 
 function normStyle(el) {
@@ -96,4 +97,64 @@ test('the modal is a bounded flex column with a SCROLLABLE body — wrapped foot
     const footer = container.querySelector('.modal-footer');
     assert.match(footer.style.flex, /0 0 auto/, 'footer never shrinks/clips');
     Modal.hide();
+});
+
+test('delayed Auto completion cannot close a replacement modal', async () => {
+    const originalRequest = API.request;
+    const originalWarning = Toast.warning;
+    const originalAutoScope = Security.globalAutoScope;
+    const originalAutoMode = Security.globalAutoMode;
+    let completeAutoRequest;
+    let permissionTreeReloaded;
+    const autoResponse = new Promise((resolve) => { completeAutoRequest = resolve; });
+    const reloadComplete = new Promise((resolve) => { permissionTreeReloaded = resolve; });
+    let replacementCloses = 0;
+
+    API.request = async (path, options = {}) => {
+        if (path === '/api/security/auto-mode') {
+            assert.equal(options.method, 'POST');
+            assert.deepEqual(JSON.parse(options.body), { scope: 'session' });
+            return autoResponse;
+        }
+        if (path === '/api/security/permissions/tree') {
+            permissionTreeReloaded();
+            return { tree: [] };
+        }
+        throw new Error(`Unexpected API request: ${path}`);
+    };
+    Toast.warning = () => {};
+
+    try {
+        const approval = Security.showApprovalModal({
+            id: 'req-delayed-auto', feature: 'image', tool: 'generate', args: {},
+        });
+        const autoButton = [...document.querySelectorAll('.modal-btn')]
+            .find((button) => button.textContent.includes('Auto: Session'));
+        assert.ok(autoButton, 'Auto: Session action rendered');
+        autoButton.click();
+
+        // Replacement dismisses the approval and clears its resolver identity
+        // while the Auto request remains in flight.
+        Modal.show({
+            title: 'Replacement dialog',
+            content: '<p>This dialog must remain open.</p>',
+            onClose: () => { replacementCloses += 1; },
+        });
+        assert.deepEqual(await approval, { approved: false, scope: 'once' });
+
+        completeAutoRequest({ enabled: true, scope: 'session', warning: 'Auto enabled' });
+        await reloadComplete;
+
+        assert.equal(document.querySelector('.modal-header h3').textContent, 'Replacement dialog');
+        assert.equal(replacementCloses, 0, 'stale completion did not close the replacement');
+    } finally {
+        Modal.hide();
+        API.request = originalRequest;
+        Toast.warning = originalWarning;
+        Security.globalAutoScope = originalAutoScope;
+        Security.globalAutoMode = originalAutoMode;
+        Security._activeApprovalId = null;
+        Security._activeApprovalResolver = null;
+        setOverlayRoot(null);
+    }
 });

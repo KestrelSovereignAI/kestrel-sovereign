@@ -943,6 +943,49 @@ nav {
     padding: 1.5rem;
 }
 
+/* Background task state badges. These selectors intentionally remain
+   panel-agnostic so the Tasks component keeps the same presentation when it
+   is mounted inside a scoped embed. */
+.status-badge {
+    display: inline-block;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    text-transform: uppercase;
+}
+
+.status-badge.status-queued {
+    background: color-mix(in srgb, var(--warning) 20%, transparent);
+    color: var(--warning);
+}
+
+.status-badge.status-running {
+    background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+    color: var(--accent-color);
+}
+
+.status-badge.status-completed {
+    background: color-mix(in srgb, var(--success) 20%, transparent);
+    color: var(--success);
+}
+
+.status-badge.status-failed {
+    background: color-mix(in srgb, var(--error) 20%, transparent);
+    color: var(--error);
+}
+
+.status-badge.status-cancelled,
+.status-badge.status-unknown {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.status-badge.status-input-required {
+    background: color-mix(in srgb, var(--warning) 20%, transparent);
+    color: var(--warning);
+}
+
 /* Identity Panel */
 .identity-card {
     background: var(--bg-secondary);
@@ -1117,9 +1160,9 @@ nav {
     transition: background 0.15s;
 }
 .avatar-actions button:hover {
-    background: var(--accent);
+    background: var(--accent-color);
     color: #fff;
-    border-color: var(--accent);
+    border-color: var(--accent-color);
 }
 .profile-editor-name {
     font-size: 1rem;
@@ -1186,7 +1229,7 @@ nav {
     padding: 0.25rem 0.75rem;
     border-radius: 6px;
     border: none;
-    background: var(--accent);
+    background: var(--accent-color);
     color: #fff;
     cursor: pointer;
 }
@@ -1210,7 +1253,7 @@ nav {
     transition: border-color 0.15s;
 }
 .avatar-options img:hover {
-    border-color: var(--accent);
+    border-color: var(--accent-color);
 }
 
 .identity-did-text {
@@ -1317,7 +1360,7 @@ nav {
    wake, etc.) rendered live into the active pane. A subtle accent +
    attribution header distinguishes it from a reply to a user prompt. */
 .signal-wake-message {
-    border-left: 3px solid var(--accent, #6366f1);
+    border-left: 3px solid var(--accent-color);
 }
 
 .signal-wake-attribution {
@@ -1359,7 +1402,7 @@ nav {
    reason) rather than trusting agent prose. The left-border accent is
    set inline per lifecycle state by handleRestartStatus(). */
 .restart-status-message {
-    border-left: 3px solid var(--accent, #6366f1);
+    border-left: 3px solid var(--accent-color);
     background: var(--surface-2, rgba(127, 127, 127, 0.06));
     border-radius: 8px;
     padding: 0.625rem 0.875rem;

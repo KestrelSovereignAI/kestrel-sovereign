@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, Toast, Modal, truncate, escapeHtml, truncateId } from './ui.js';
+import { state, Toast, Modal, truncate, escapeHtml, truncateId, showError } from './ui.js';
 
 // ============================================================================
 // UI Helpers
@@ -13,11 +13,6 @@ import { state, Toast, Modal, truncate, escapeHtml, truncateId } from './ui.js';
 function showLoading(elementId) {
     const el = document.getElementById(elementId);
     if (el) el.innerHTML = '<div class="loading">Loading</div>';
-}
-
-function showError(elementId, message) {
-    const el = document.getElementById(elementId);
-    if (el) el.innerHTML = `<div style="color: var(--error); padding: 1rem;">${message}</div>`;
 }
 
 // ============================================================================
