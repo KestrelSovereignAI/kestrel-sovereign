@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from kestrel_sovereign.api_errors import api_error_response
 from kestrel_sovereign.config import load_section
 
 router = APIRouter(tags=["github"])
@@ -274,18 +275,21 @@ async def github_proxy(path: str, request: Request):
     """
     token = _github_token()
     if not token:
-        return JSONResponse({"error": "No GITHUB_TOKEN configured"}, status_code=503)
+        return api_error_response(
+            status_code=503,
+            code="github_not_configured",
+            message="No GITHUB_TOKEN configured",
+        )
 
     scoped = _repo_scoped_request(path)
     if scoped is None:
-        return JSONResponse(
-            {
-                "error": (
-                    "Only repos/{owner}/{repo} paths are permitted via this "
-                    "proxy; organization, user, and global endpoints are blocked"
-                )
-            },
+        return api_error_response(
             status_code=403,
+            code="github_proxy_scope_required",
+            message=(
+                "Only repos/{owner}/{repo} paths are permitted via this "
+                "proxy; organization, user, and global endpoints are blocked"
+            ),
         )
     slug, upstream = scoped
 
@@ -303,14 +307,13 @@ async def github_proxy(path: str, request: Request):
         # require the requested repo to be in it before proxying.
         allowed = await discover_accessible_repos(client=client)
         if slug.lower() not in {repo.lower() for repo in allowed}:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"Repository '{slug}' is outside the configured GitHub "
-                        "scope"
-                    )
-                },
+            return api_error_response(
                 status_code=403,
+                code="github_repository_out_of_scope",
+                message=(
+                    f"Repository '{slug}' is outside the configured GitHub "
+                    "scope"
+                ),
             )
 
         response = await client.get(
@@ -322,11 +325,26 @@ async def github_proxy(path: str, request: Request):
             },
             timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
         )
+        # This endpoint intentionally preserves GitHub's JSON and status for an
+        # HTTP response received from GitHub.  Locally-authored validation and
+        # transport failures use Kestrel's canonical envelope above/below.
         return JSONResponse(content=response.json(), status_code=response.status_code)
-    except HTTPException as exc:
-        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=502)
+    except HTTPException:
+        # Discovery raises controlled HTTP errors; let the application's
+        # canonical HTTPException handler preserve their status and detail.
+        raise
+    except httpx.HTTPError:
+        return api_error_response(
+            status_code=502,
+            code="github_upstream_unavailable",
+            message="GitHub request failed.",
+        )
+    except ValueError:
+        return api_error_response(
+            status_code=502,
+            code="github_invalid_response",
+            message="GitHub returned an invalid JSON response.",
+        )
     finally:
         if owns_client:
             await client.aclose()

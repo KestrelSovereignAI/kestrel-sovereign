@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { Toast } from './ui.js';
+import { Toast, renderTextError } from './ui.js';
 
 // ============================================================================
 // DOM References
@@ -461,7 +461,7 @@ window.loadTaskArtifacts = async function(taskId) {
             </div>
         `).join('');
     } catch (e) {
-        container.innerHTML = `<div style="color: rgb(239, 68, 68); font-size: 0.75rem;">Error: ${e.message}</div>`;
+        renderTextError(container, `Error: ${e.message}`);
     }
 };
 

@@ -84,7 +84,7 @@ async function decide(approvalId, approved, scope, remember) {
         // (#2232). Render it as an upgrade prompt instead of a generic error.
         const upgrade = extractUpgradeRequired(e);
         if (upgrade) {
-            Toast.warning(upgradeToastHtml(upgrade));
+            Toast.showTrustedHtml(upgradeToastHtml(upgrade), 'warning');
         } else {
             Toast.error(`Decision failed: ${e.message || e}`);
         }

@@ -36,6 +36,226 @@ const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 // server's CSRF_HEADER_NAME.
 const CSRF_HEADER_NAME = 'X-CSRF-Token';
 
+const MAX_ERROR_TEXT_LENGTH = 1000;
+const MAX_ERROR_DETAILS = 20;
+const MAX_ERROR_CODE_LENGTH = 128;
+
+function isAbortError(error) {
+    return !!(error && error.name === 'AbortError');
+}
+
+function throwIfAborted(signal) {
+    if (!signal?.aborted) return;
+    if (signal.reason) throw signal.reason;
+    const error = new Error('The operation was aborted.');
+    error.name = 'AbortError';
+    throw error;
+}
+
+function normalizeCorrelationId(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > 128) return null;
+    return /^[A-Za-z0-9._:-]+$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeErrorCode(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > MAX_ERROR_CODE_LENGTH) return null;
+    return /^[A-Za-z0-9._:-]+$/.test(trimmed) ? trimmed : null;
+}
+
+function normalizeUserText(value) {
+    if (typeof value !== 'string') return '';
+    // An upstream proxy may place an entire HTML error page in a nominal JSON
+    // message field. Treat document/script/style markup as non-displayable,
+    // just as the raw-text response path does, rather than surfacing fragments.
+    if (looksLikeHtml(value)) return '';
+    let text = value
+        .slice(0, MAX_ERROR_TEXT_LENGTH * 4)
+        .replace(/<\/?[A-Za-z][^>]*(?:>|$)/g, ' ')
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    // Error payloads sometimes contain exception strings from upstream SDKs.
+    // Redact common credential assignments before anything becomes visible.
+    text = text
+        .replace(/\b(authorization)\s*[:=]\s*(?:bearer\s+)?\S+/gi, '$1: [redacted]')
+        .replace(/\b(api[ _-]?key|access[ _-]?token|password|secret)\s*[:=]\s*\S+/gi, '$1: [redacted]')
+        .replace(/\bbearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [redacted]')
+        .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, '[redacted]');
+    return text.slice(0, MAX_ERROR_TEXT_LENGTH);
+}
+
+function looksLikeHtml(value) {
+    return typeof value === 'string' && /<\s*(?:!doctype|html|head|body|script|style)\b/i.test(value);
+}
+
+function firstUserText(...values) {
+    for (const value of values) {
+        const text = normalizeUserText(value);
+        if (text) return text;
+    }
+    return '';
+}
+
+function normalizeDetailItem(item) {
+    if (typeof item === 'string') {
+        const message = normalizeUserText(item);
+        return message ? { message } : null;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+
+    const rawLocation = item.location ?? item.loc;
+    const rawLocationParts = Array.isArray(rawLocation)
+        ? rawLocation
+        : (typeof rawLocation === 'string' || typeof rawLocation === 'number'
+            ? [rawLocation]
+            : []);
+    const locationParts = rawLocationParts
+        .filter((part) => typeof part === 'string' || typeof part === 'number')
+        .map((part) => normalizeUserText(String(part)))
+        .filter(Boolean);
+    const message = firstUserText(
+        item.message,
+        item.msg,
+        item.reason,
+        typeof item.detail === 'string' ? item.detail : '',
+        typeof item.error === 'string' ? item.error : '',
+        item.title,
+    );
+    if (!message) return null;
+
+    const normalized = { message };
+    if (locationParts.length) normalized.location = locationParts.join('.');
+    const code = normalizeErrorCode(item.code) || normalizeErrorCode(item.type);
+    if (code) normalized.code = code;
+    return normalized;
+}
+
+function normalizeDetails(value) {
+    const items = Array.isArray(value) ? value : [value];
+    return items
+        .slice(0, MAX_ERROR_DETAILS)
+        .map(normalizeDetailItem)
+        .filter(Boolean);
+}
+
+function detailDisplay(detail) {
+    return detail.location ? `${detail.location}: ${detail.message}` : detail.message;
+}
+
+/**
+ * Typed error returned for every non-successful HTTP response.
+ *
+ * `body` is retained for structured consumers such as upgrade/tier gates.
+ * `message` and `details` are separately normalized for safe user display.
+ */
+export class ApiError extends Error {
+    constructor({ status, body, code = null, message, details = [], correlationId = null }) {
+        const safeCorrelationId = normalizeCorrelationId(correlationId);
+        const baseMessage = normalizeUserText(message) || `HTTP ${status}`;
+        super(safeCorrelationId
+            ? `${baseMessage} (Reference: ${safeCorrelationId})`
+            : baseMessage);
+        this.name = 'ApiError';
+        this.status = status;
+        this.body = body;
+        this.code = normalizeErrorCode(code);
+        this.details = normalizeDetails(details).slice(0, MAX_ERROR_DETAILS);
+        this.correlationId = safeCorrelationId;
+    }
+}
+
+async function readResponseErrorBody(response) {
+    if (typeof response.text === 'function') {
+        try {
+            const raw = await response.text();
+            if (!raw || !raw.trim()) return null;
+            try {
+                return JSON.parse(raw);
+            } catch (_) {
+                return raw;
+            }
+        } catch (error) {
+            if (isAbortError(error)) throw error;
+            // Some test doubles and non-standard fetch implementations expose
+            // json() but no usable text() body. Fall through to that path.
+        }
+    }
+    if (typeof response.json === 'function') {
+        try {
+            return await response.json();
+        } catch (error) {
+            if (isAbortError(error)) throw error;
+            return null;
+        }
+    }
+    return null;
+}
+
+/** Parse a failed Fetch Response into the console's single ApiError shape. */
+export async function parseResponseError(response, {
+    fallbackMessage = '',
+    signal = null,
+} = {}) {
+    throwIfAborted(signal);
+    const status = Number.isInteger(response?.status) ? response.status : 0;
+    const body = await readResponseErrorBody(response || {});
+    // Body readers do not consistently reject with AbortError when callers
+    // supply a custom abort reason. Consult the request signal after the await
+    // so cancellation is never flattened into an HTTP ApiError.
+    throwIfAborted(signal);
+    const envelope = body && typeof body === 'object' && !Array.isArray(body)
+        && body.error && typeof body.error === 'object' && !Array.isArray(body.error)
+        ? body.error
+        : null;
+
+    const details = [
+        ...normalizeDetails(envelope?.details),
+        ...normalizeDetails(body && typeof body === 'object' && !Array.isArray(body)
+            ? body.detail
+            : null),
+    ].filter((detail, index, all) => all.findIndex((candidate) => (
+        candidate.message === detail.message
+        && candidate.location === detail.location
+        && candidate.code === detail.code
+    )) === index).slice(0, MAX_ERROR_DETAILS);
+
+    const objectBody = body && typeof body === 'object' && !Array.isArray(body) ? body : null;
+    let message = firstUserText(
+        envelope?.message,
+        objectBody?.message,
+        typeof objectBody?.detail === 'string' ? objectBody.detail : '',
+        typeof objectBody?.error === 'string' ? objectBody.error : '',
+    );
+
+    const detailSummary = details.slice(0, 3).map(detailDisplay).join('; ');
+    if (detailSummary && (!message || /^request validation failed\.?$/i.test(message))) {
+        const prefix = message || (status === 422 ? 'Request validation failed.' : 'Request failed.');
+        message = `${prefix} ${detailSummary}`;
+    }
+    if (!message && typeof body === 'string' && !looksLikeHtml(body)) {
+        message = normalizeUserText(body);
+    }
+    message = message
+        || normalizeUserText(fallbackMessage)
+        || normalizeUserText(response?.statusText)
+        || `HTTP ${status}`;
+
+    let correlationId = null;
+    try {
+        correlationId = normalizeCorrelationId(response?.headers?.get?.('X-Correlation-ID'));
+    } catch (_) { /* malformed/non-standard headers — use the envelope fallback */ }
+    correlationId = correlationId || normalizeCorrelationId(envelope?.correlation_id);
+
+    const code = normalizeErrorCode(envelope?.code)
+        || normalizeErrorCode(objectBody?.code);
+
+    return new ApiError({ status, body, code, message, details, correlationId });
+}
+
 // Canonical list of known UI capability keys (#879, #2041).
 //
 // Two classes live here:
@@ -412,7 +632,10 @@ export function createApiClient({
             const data = await performRequest(buildHostUrl('/api/host/csrf'), { method: 'GET' });
             if (data && data.csrf_token) state.csrfToken = data.csrf_token;
         } catch (e) {
-            log.warn?.('[csrf] failed to fetch host CSRF token', e);
+            log.warn?.(
+                '[csrf] failed to fetch host CSRF token',
+                e && e.message ? e.message : 'Request failed.',
+            );
         }
         return state.csrfToken;
     }
@@ -424,39 +647,101 @@ export function createApiClient({
         return typeof auth.getApiKey === 'function' && !!auth.getApiKey();
     }
 
+    async function recoverUnauthorized(response, signal = null) {
+        // Parse the response before invoking mutable auth state. This retained
+        // typed error is the safe fallback if refresh succeeds but rebuilding
+        // credentials or starting the retry fails before a new HTTP response
+        // can provide a stronger outcome.
+        const unauthorizedError = await parseResponseError(response, {
+            fallbackMessage: 'Authentication failed - please refresh the page',
+            signal,
+        });
+        // The body read above is asynchronous. A user can cancel while it is
+        // in progress even when the reader itself resolves normally; never
+        // turn that cancellation into an auth refresh or typed 401.
+        throwIfAborted(signal);
+        try {
+            const recovery = await auth.onUnauthorized();
+            // Cancellation can happen while a refresh/redirect callback is
+            // pending. Do not rebuild credentials or begin a retry afterward.
+            throwIfAborted(signal);
+            return {
+                recovery,
+                unauthorizedError,
+            };
+        } catch (error) {
+            // Preserve cancellation even when the auth provider reports it by
+            // throwing, including custom abort reasons without AbortError.name.
+            throwIfAborted(signal);
+            if (isAbortError(error)) throw error;
+            // A failing refresh/redirect callback must not erase the server's
+            // actionable 401 status, body, and correlation reference.
+            throw unauthorizedError;
+        }
+    }
+
     // Single-source the fetch + auth + 401-retry pipeline so both
     // request() and requestForAgent() share it. Without this factor
     // out, an explicit-agent call would either skip auth-refresh or
     // re-implement it (drift risk). The url passed in is FINAL — the
     // caller has already applied host-agent prefixing if needed.
-    async function performRequest(url, options = {}, retried = false, retryCb = null) {
-        const headers = await buildHeaders(options.headers);
-        if (options.body instanceof FormData) {
-            delete headers['Content-Type'];
-        }
-        const response = await fetchImpl(url, { ...options, headers });
+    async function performRequest(url, options = {}, retried = false) {
+        let alreadyRetried = retried;
+        let pendingUnauthorizedError = null;
 
-        if (response.status === 401 && !retried) {
-            const recovery = await auth.onUnauthorized();
-            if (recovery === 'redirected') return;
-            if (recovery === 'refreshed' && retryCb) return retryCb();
+        while (true) {
+            let headers;
+            try {
+                headers = await buildHeaders(options.headers);
+            } catch (error) {
+                throwIfAborted(options.signal);
+                if (pendingUnauthorizedError && !isAbortError(error)) {
+                    throw pendingUnauthorizedError;
+                }
+                throw error;
+            }
+            // A custom AbortController reason is not necessarily named
+            // AbortError. Re-check the signal after asynchronous credential
+            // setup so an aborted retry never reaches fetch or becomes a 401.
+            throwIfAborted(options.signal);
+            if (options.body instanceof FormData) {
+                delete headers['Content-Type'];
+            }
 
-            const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
-            throw new Error(error.detail || 'Authentication failed - please refresh the page');
-        }
+            let response;
+            try {
+                response = await fetchImpl(url, { ...options, headers });
+            } catch (error) {
+                throwIfAborted(options.signal);
+                if (pendingUnauthorizedError && !isAbortError(error)) {
+                    throw pendingUnauthorizedError;
+                }
+                throw error;
+            }
+            // A retry response is authoritative. Any ApiError parsed below
+            // must propagate instead of being replaced by the original 401.
+            pendingUnauthorizedError = null;
 
-        if (!response.ok) {
-            const error = await response.json().catch(() => ({ detail: response.statusText }));
-            // Preserve the HTTP status and the full parsed body on the thrown
-            // Error so callers can react to structured envelopes (e.g. a host
-            // policy layer's ``403 {code: 'upgrade_required', ...}`` tier gate,
-            // #2232) instead of only seeing a flattened message string.
-            const err = new Error(error.detail || `HTTP ${response.status}`);
-            err.status = response.status;
-            err.body = error;
-            throw err;
+            if (response.status === 401 && !alreadyRetried) {
+                const { recovery, unauthorizedError } = await recoverUnauthorized(
+                    response,
+                    options.signal,
+                );
+                if (recovery === 'redirected') return;
+                if (recovery === 'refreshed') {
+                    alreadyRetried = true;
+                    pendingUnauthorizedError = unauthorizedError;
+                    continue;
+                }
+
+                throw unauthorizedError;
+            }
+
+            if (!response.ok) {
+                throw await parseResponseError(response, { signal: options.signal });
+            }
+            return response.json();
         }
-        return response.json();
     }
 
     const client = {
@@ -466,7 +751,7 @@ export function createApiClient({
 
         async request(endpoint, options = {}, retried = false) {
             const url = applyHostAgentPrefix(endpoint, state.selectedHostAgent);
-            return performRequest(url, options, retried, () => this.request(endpoint, options, true));
+            return performRequest(url, options, retried);
         },
 
         // Like request() but pins the host-agent prefix to the explicit
@@ -478,7 +763,7 @@ export function createApiClient({
         // path; routing is applied here so we don't double-prefix.
         async requestForAgent(endpoint, options = {}, agent, retried = false) {
             const url = applyHostAgentPrefix(endpoint, agent);
-            return performRequest(url, options, retried, () => this.requestForAgent(endpoint, options, agent, true));
+            return performRequest(url, options, retried);
         },
 
         // Request a host-ROOT endpoint (#2293). Unlike request(), the URL is
@@ -498,7 +783,7 @@ export function createApiClient({
                     };
                 }
             }
-            return performRequest(url, options, retried, () => this.requestHost(endpoint, options, true));
+            return performRequest(url, options, retried);
         },
 
         health: () => client.request('/health'),
@@ -777,17 +1062,16 @@ export function createApiClient({
             // its own dispatch boundary and pass it through, so the user
             // switching agents between sendMessage's capture and
             // streamInvoke's first await can't drift the URL to the
-            // wrong backend. The 401 retry path also passes this value
-            // to itself instead of recapturing state.selectedHostAgent
-            // — that recursion was the original bug: an auth refresh
-            // on Agent A's stream could yield to a switched-to Agent B.
+            // wrong backend. The 401 retry loop also retains this value
+            // instead of recapturing state.selectedHostAgent — recapturing
+            // after an auth refresh could route Agent A's retry to Agent B.
             const dispatchAgent = agent === undefined ? state.selectedHostAgent : agent;
 
             // Build auth headers BEFORE installing the abort controller in
             // the per-agent map. If buildHeaders() throws (auth provider
             // failure, bearer-token unavailable, etc.) we must not leave a
             // stale controller behind for the next Stop click to fire on.
-            const headers = await buildHeaders({ 'Content-Type': 'application/json' });
+            let headers = await buildHeaders({ 'Content-Type': 'application/json' });
 
             const controller = new AbortCtor();
             const signal = controller.signal;
@@ -795,55 +1079,93 @@ export function createApiClient({
 
             try {
                 const url = applyHostAgentPrefix('/api/agent/stream', dispatchAgent);
-                const response = await fetchImpl(url, {
-                    method: 'POST',
-                    headers,
-                    body: JSON.stringify({
-                        input, model, session_id: sessionId, provider,
-                        // #1662: attachment refs for this turn (uploaded
-                        // separately via /api/agent/attachments). Omitted when
-                        // there are none so non-attachment turns are unchanged.
-                        ...(attachments && attachments.length ? { attachments } : {}),
-                    }),
-                    signal,
+                const body = JSON.stringify({
+                    input, model, session_id: sessionId, provider,
+                    // #1662: attachment refs for this turn (uploaded
+                    // separately via /api/agent/attachments). Omitted when
+                    // there are none so non-attachment turns are unchanged.
+                    ...(attachments && attachments.length ? { attachments } : {}),
                 });
+                let alreadyRetried = retried;
+                let pendingUnauthorizedError = null;
 
-                if (response.status === 401 && !retried) {
-                    const recovery = await auth.onUnauthorized();
-                    if (recovery === 'redirected') return;
-                    if (recovery === 'refreshed') {
-                        // Pass the SAME dispatchAgent to the retry — do
-                        // NOT let it recapture state.selectedHostAgent.
-                        yield* client.streamInvoke(input, model, sessionId, provider, true, dispatchAgent, attachments);
-                        return;
+                while (true) {
+                    throwIfAborted(signal);
+
+                    let response;
+                    try {
+                        response = await fetchImpl(url, {
+                            method: 'POST',
+                            headers,
+                            body,
+                            signal,
+                        });
+                    } catch (error) {
+                        throwIfAborted(signal);
+                        if (pendingUnauthorizedError && !isAbortError(error)) {
+                            throw pendingUnauthorizedError;
+                        }
+                        throw error;
+                    }
+                    // Once the retry receives an HTTP response, that response
+                    // supersedes the original 401 regardless of its status.
+                    pendingUnauthorizedError = null;
+
+                    if (response.status === 401 && !alreadyRetried) {
+                        const { recovery, unauthorizedError } = await recoverUnauthorized(
+                            response,
+                            signal,
+                        );
+                        if (recovery === 'redirected') return;
+                        if (recovery === 'refreshed') {
+                            // Keep the original controller and dispatch target.
+                            // A Stop during token refresh must abort this turn,
+                            // not allow a recursive retry to resurrect it.
+                            alreadyRetried = true;
+                            try {
+                                headers = await buildHeaders({ 'Content-Type': 'application/json' });
+                                // applyAuth may complete after Stop aborted the
+                                // request with an arbitrary reason. Do not
+                                // start the refreshed fetch in that state.
+                                throwIfAborted(signal);
+                            } catch (error) {
+                                throwIfAborted(signal);
+                                if (isAbortError(error)) throw error;
+                                throw unauthorizedError;
+                            }
+                            pendingUnauthorizedError = unauthorizedError;
+                            continue;
+                        }
+
+                        throw unauthorizedError;
                     }
 
-                    const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
-                    throw new Error(error.detail || 'Authentication failed - please refresh the page');
-                }
-
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                state.currentStreamRequestIds.set(dispatchAgent, response.headers.get('X-Request-ID'));
-                // Capture the server-resolved session_id BEFORE the body
-                // streams. sendMessage reads it via getEffectiveSessionId
-                // immediately so pane.sessionId can be set on the very
-                // first turn; subsequent turns send it back as an
-                // explicit value, anchoring the pane to a durable id.
-                const headerSid = response.headers.get('X-Session-Id');
-                if (headerSid) {
-                    state.effectiveSessionIds.set(dispatchAgent, headerSid);
-                }
-                const reader = response.body.getReader();
-                const decoder = new DecoderCtor();
-
-                try {
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        yield decoder.decode(value, { stream: true });
+                    if (!response.ok) {
+                        throw await parseResponseError(response, { signal });
                     }
-                } finally {
-                    reader.releaseLock();
+                    state.currentStreamRequestIds.set(dispatchAgent, response.headers.get('X-Request-ID'));
+                    // Capture the server-resolved session_id BEFORE the body
+                    // streams. sendMessage reads it via getEffectiveSessionId
+                    // immediately so pane.sessionId can be set on the very
+                    // first turn; subsequent turns send it back as an
+                    // explicit value, anchoring the pane to a durable id.
+                    const headerSid = response.headers.get('X-Session-Id');
+                    if (headerSid) {
+                        state.effectiveSessionIds.set(dispatchAgent, headerSid);
+                    }
+                    const reader = response.body.getReader();
+                    const decoder = new DecoderCtor();
+
+                    try {
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            yield decoder.decode(value, { stream: true });
+                        }
+                    } finally {
+                        reader.releaseLock();
+                    }
+                    return;
                 }
             } catch (error) {
                 // Re-throw AbortError so sendMessage can distinguish a
@@ -851,7 +1173,7 @@ export function createApiClient({
                 // silent return swallowed the signal — sendMessage then
                 // toasted "agent finished responding" on a non-visible
                 // agent the user had just stopped from the sidebar.
-                if (error.name === 'AbortError') {
+                if (error && error.name === 'AbortError') {
                     log.log('Stream aborted by user');
                 }
                 throw error;
@@ -875,6 +1197,7 @@ export function createApiClient({
         async applyAuth(headers = {}) {
             return await auth.applyAuth({ ...headers });
         },
+        parseResponseError,
         setHostAgent(agentName) {
             state.selectedHostAgent = agentName;
         },
@@ -941,7 +1264,10 @@ export function createApiClient({
                     this.applyServerCapabilities(data.capabilities);
                 }
             } catch (e) {
-                log.warn?.('[capabilities] refresh failed; keeping current set', e);
+                log.warn?.(
+                    '[capabilities] refresh failed; keeping current set',
+                    e && e.message ? e.message : 'Request failed.',
+                );
             }
             return capsMap;
         },

@@ -2,6 +2,8 @@ import {
     createApiClient,
     createBearerTokenAuthProvider,
     createKestrelStandaloneAuthProvider,
+    ApiError,
+    parseResponseError,
     CAPABILITY_KEYS,
 } from './api_client.mjs';
 
@@ -52,5 +54,7 @@ export {
     createApiClient,
     createBearerTokenAuthProvider,
     createKestrelStandaloneAuthProvider,
+    ApiError,
+    parseResponseError,
     CAPABILITY_KEYS,
 };

@@ -8,7 +8,7 @@
  */
 
 import API from './api.js';
-import { state, Toast, Modal, formatBytes } from './ui.js';
+import { state, Toast, Modal, formatBytes, showError } from './ui.js';
 import { subscribeSSE } from './chat.js';
 
 // Re-export from related modules
@@ -22,11 +22,6 @@ export { loadIpfsStatus } from './ipfs.js';
 function showLoading(elementId) {
     const el = document.getElementById(elementId);
     if (el) el.innerHTML = '<div class="loading">Loading</div>';
-}
-
-function showError(elementId, message) {
-    const el = document.getElementById(elementId);
-    if (el) el.innerHTML = `<div style="color: var(--error); padding: 1rem;">${message}</div>`;
 }
 
 let progressSubscribed = false;

@@ -50,7 +50,7 @@ globalThis.kicon = () => '';
 globalThis.CSS = { escape: (s) => String(s) };
 
 const { state, getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
-const { mountChatPane, addMessageStreaming, addMessage } = await import(
+const { mountChatPane, addMessageStreaming, addMessage, addTextMessage } = await import(
     '../../kestrel_sovereign/static/js/chat.js'
 );
 
@@ -82,4 +82,15 @@ test('addMessage() with no paneElement also defaults to the mounted pane', async
     await addMessage('user', 'hi');
 
     assert.equal(paneZ.element.children.length, 1);
+});
+
+test('addTextMessage renders error text through textContent, never innerHTML', () => {
+    const pane = getOrCreateChatPane('text-error');
+    mountChatPane('text-error');
+
+    const div = addTextMessage('agent', 'Error: <img src=x onerror=alert(1)>');
+    const content = div.children[0];
+
+    assert.equal(content.textContent, 'Error: <img src=x onerror=alert(1)>');
+    assert.equal(content.innerHTML, '');
 });

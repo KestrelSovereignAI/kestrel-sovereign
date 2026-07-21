@@ -19,6 +19,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.api_errors import ApiHTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,24 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 _INVALID_JSON_ESCAPE = re.compile(rb'\\([^"\\/bfnrtu])')
 
 LEGACY_CONTEXT_MODEL = "legacy/unknown"
+
+
+def _invalid_json_message(error: ValueError) -> str:
+    """Describe malformed JSON without echoing submitted body content."""
+    if isinstance(error, json.JSONDecodeError):
+        return f"Invalid JSON at line {error.lineno}, column {error.colno}."
+    return "Invalid JSON request body."
+
+
+def _require_json_object(value: Any) -> dict:
+    """Reject valid JSON scalars/arrays before endpoint code calls ``.get``."""
+    if isinstance(value, dict):
+        return value
+    raise ApiHTTPException(
+        status_code=400,
+        code="invalid_request_body",
+        message="JSON request body must be an object.",
+    )
 
 
 def _latest_assistant_model_identity(
@@ -70,16 +89,20 @@ def _latest_assistant_model_identity(
 async def _parse_json_body(request: Request) -> dict:
     """Parse JSON body, recovering from common shell-escaping issues."""
     try:
-        return await request.json()
+        return _require_json_object(await request.json())
     except (json.JSONDecodeError, ValueError) as orig_err:
         raw = await request.body()
         cleaned = _INVALID_JSON_ESCAPE.sub(lambda m: m.group(1), raw)
         if cleaned != raw:
             try:
-                return json.loads(cleaned)
-            except Exception:
+                return _require_json_object(json.loads(cleaned))
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {orig_err}")
+        raise ApiHTTPException(
+            status_code=400,
+            code="invalid_json",
+            message=_invalid_json_message(orig_err),
+        )
 
 
 async def _parse_optional_json_body(request: Request) -> dict:
@@ -88,15 +111,19 @@ async def _parse_optional_json_body(request: Request) -> dict:
     if not raw.strip():
         return {}
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as orig_err:
+        return _require_json_object(json.loads(raw))
+    except (json.JSONDecodeError, UnicodeDecodeError) as orig_err:
         cleaned = _INVALID_JSON_ESCAPE.sub(lambda m: m.group(1), raw)
         if cleaned != raw:
             try:
-                return json.loads(cleaned)
-            except Exception:
+                return _require_json_object(json.loads(cleaned))
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {orig_err}")
+        raise ApiHTTPException(
+            status_code=400,
+            code="invalid_json",
+            message=_invalid_json_message(orig_err),
+        )
 
 
 @router.post("/invoke")
@@ -118,7 +145,11 @@ async def invoke_agent(request: Request):
         user_passphrase = data.get("user_passphrase")
 
         if user_input is None:
-            raise HTTPException(status_code=400, detail="Input not provided.")
+            raise ApiHTTPException(
+                status_code=400,
+                code="input_required",
+                message="Input not provided.",
+            )
 
         # Combine provider and model for proper routing
         if provider_override and model_override:
@@ -156,7 +187,11 @@ async def invoke_agent(request: Request):
         raise
     except Exception as e:
         logger.error(f"Error invoking agent: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+        raise ApiHTTPException(
+            status_code=500,
+            code="invoke_failed",
+            message="An internal error occurred.",
+        )
 
 
 # Chat attachments (#1662). Images can be sent to the model as vision input
@@ -302,7 +337,11 @@ async def stream_agent_response(request: Request):
         attachments = _sanitize_attachments(data.get("attachments"))
 
         if user_input is None:
-            raise HTTPException(status_code=400, detail="Input not provided.")
+            raise ApiHTTPException(
+                status_code=400,
+                code="input_required",
+                message="Input not provided.",
+            )
 
         agent = get_agent(request)
         caller = getattr(request.state, "caller", None)
@@ -403,7 +442,11 @@ async def stream_agent_response(request: Request):
         raise
     except Exception as e:
         logger.error(f"Error setting up stream: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error setting up stream.")
+        raise ApiHTTPException(
+            status_code=500,
+            code="stream_setup_failed",
+            message="Error setting up stream.",
+        )
 
 
 @router.post("/stop")

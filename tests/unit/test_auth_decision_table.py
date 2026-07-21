@@ -111,6 +111,10 @@ def test_auth_me_rejects_api_key_without_session():
                 response = client.get("/auth/me", headers={"X-API-Key": "test-key"})
         assert response.status_code == 401
         assert response.json()["detail"] == "Not authenticated"
+        assert response.json()["error"]["code"] == "authentication_required"
+        assert response.json()["error"]["correlation_id"] == response.headers[
+            "X-Correlation-ID"
+        ]
     finally:
         _restore_app(app, original)
 
@@ -148,6 +152,48 @@ def test_sse_query_param_auth_reaches_stream_endpoint_and_preserves_400():
                 response = client.post("/api/agent/stream?api_key=test-key", json={})
         assert response.status_code == 400
         assert response.json()["detail"] == "Input not provided."
+    finally:
+        _restore_app(app, original)
+
+
+@pytest.mark.parametrize("path", ["/api/agent/invoke", "/api/agent/stream"])
+def test_agent_endpoints_reject_non_object_json_with_typed_400(path):
+    app, original = _prepare_app()
+    app.state.agent = _make_agent()
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    path,
+                    json=[{"input": "must-not-be-treated-as-an-object"}],
+                    headers={"X-API-Key": "test-key"},
+                )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_request_body"
+        assert response.json()["detail"] == "JSON request body must be an object."
+    finally:
+        _restore_app(app, original)
+
+
+@pytest.mark.parametrize("path", ["/api/agent/invoke", "/api/agent/stream"])
+def test_agent_endpoints_do_not_echo_malformed_json_content(path):
+    app, original = _prepare_app()
+    app.state.agent = _make_agent()
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    path,
+                    content=b'{"password":"do-not-echo",',
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-API-Key": "test-key",
+                    },
+                )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_json"
+        assert response.json()["detail"].startswith("Invalid JSON at line ")
+        assert "do-not-echo" not in response.text
     finally:
         _restore_app(app, original)
 

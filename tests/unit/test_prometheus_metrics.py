@@ -11,6 +11,7 @@ Covers:
 7. Request middleware records metrics
 """
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -120,6 +121,11 @@ class TestMetricsEndpoint:
             response = await endpoint_module.prometheus_metrics()
             assert response.status_code == 404
             assert b"observability" in response.body
+            payload = json.loads(response.body)
+            assert payload["error"]["code"] == "metrics_unavailable"
+            assert payload["error"]["correlation_id"] == response.headers[
+                "X-Correlation-ID"
+            ]
 
 
 # ---------------------------------------------------------------------------

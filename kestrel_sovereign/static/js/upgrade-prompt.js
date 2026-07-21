@@ -22,6 +22,12 @@ import API from './api.js';
 
 export const UPGRADE_REQUIRED_CODE = 'upgrade_required';
 
+function optionalString(value, maxLength = 256) {
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim();
+    return normalized ? normalized.slice(0, maxLength) : null;
+}
+
 function esc(s) {
     return String(s == null ? '' : s)
         .replace(/&/g, '&amp;')
@@ -32,27 +38,41 @@ function esc(s) {
 
 /**
  * Normalize an API error into upgrade info, or null when it is not a
- * tier-gate rejection. `performRequest` (api_client.mjs) attaches `status`
- * and the parsed `body` to every thrown Error, so a caller can inspect the
- * structured envelope here.
+ * tier-gate rejection. The shared `ApiError` (api_client.mjs) retains `status`
+ * and the parsed `body`, so a caller can inspect the structured envelope here.
  */
 export function extractUpgradeRequired(error) {
     const body = error && error.body;
+    const nested = body && typeof body === 'object'
+        && body.error && typeof body.error === 'object'
+        && !Array.isArray(body.error)
+        ? body.error
+        : null;
+    // Retain host-specific top-level fields while preferring the canonical
+    // nested error fields when both forms are present during migration.
+    const payload = body && typeof body === 'object' && !Array.isArray(body)
+        ? { ...body, ...(nested || {}) }
+        : null;
     if (
         !error ||
         error.status !== 403 ||
-        !body ||
-        typeof body !== 'object' ||
-        body.code !== UPGRADE_REQUIRED_CODE
+        !payload ||
+        (error.code || payload.code) !== UPGRADE_REQUIRED_CODE
     ) {
         return null;
     }
+    // ApiError.message is the normalized display path and includes the safe
+    // correlation reference. Reading payload.message directly here would
+    // bypass that normalization for the upgrade-specific renderer.
+    const message = error.name === 'ApiError'
+        ? optionalString(error.message, 1200)
+        : optionalString(payload.message, 1000);
     return {
-        action: body.action || null,
-        requiredTier: body.required_tier || null,
-        currentTier: body.current_tier || null,
-        message: body.message || 'This action requires an upgrade.',
-        upgradeHref: sanitizeUpgradeHref(body.upgrade_href),
+        action: optionalString(payload.action),
+        requiredTier: optionalString(payload.required_tier),
+        currentTier: optionalString(payload.current_tier),
+        message: message || 'This action requires an upgrade.',
+        upgradeHref: sanitizeUpgradeHref(payload.upgrade_href),
     };
 }
 
@@ -129,7 +149,8 @@ export function upgradeBannerHtml(upgrade) {
 /**
  * One-line HTML for a toast (used where a full banner doesn't fit, e.g. the
  * Approvals / Security panel rows). Includes an inline link when a href is
- * present. Toast injects this as innerHTML, so all dynamic text is escaped.
+ * present. Callers must pass this only to ``Toast.showTrustedHtml``; ordinary
+ * toast methods intentionally render their messages through ``textContent``.
  */
 export function upgradeToastHtml(upgrade) {
     if (!upgrade) return '';

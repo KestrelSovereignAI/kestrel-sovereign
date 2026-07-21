@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state } from './ui.js';
+import { state, renderTextError } from './ui.js';
 
 // ============================================================================
 // Database Explorer
@@ -22,9 +22,7 @@ export async function loadDbTables() {
         renderDbExplorer(data);
     } catch (e) {
         const container = document.getElementById('db-explorer-container');
-        if (container) {
-            container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load database: ${e.message}</p>`;
-        }
+        renderTextError(container, `Failed to load database: ${e.message}`);
     }
 }
 
@@ -121,7 +119,7 @@ window.loadDbTable = async function(tableName, page = 0) {
 
         if (state.dbTables) renderDbExplorer(state.dbTables);
     } catch (e) {
-        viewer.innerHTML = `<p style="color: var(--error);">Failed to load table: ${e.message}</p>`;
+        renderTextError(viewer, `Failed to load table: ${e.message}`);
     }
 };
 

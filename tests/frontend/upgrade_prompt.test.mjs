@@ -1,5 +1,5 @@
 // #2232: host tier-gate ("upgrade_required") rendering. Covers the API error
-// enrichment (status + parsed body survive on the thrown Error) and the pure
+// enrichment (status + parsed body survive on the thrown ApiError) and the pure
 // rendering helpers that turn the structured 403 envelope into an upsell.
 
 import test from 'node:test';
@@ -62,11 +62,12 @@ test('performRequest attaches status + parsed body to the thrown error', async (
         () => client.request('/api/security/approve', { method: 'POST', body: '{}' }),
         (err) => {
             assert.equal(err.status, 403);
+            assert.equal(err.code, 'upgrade_required');
             assert.ok(err.body, 'error carries the parsed body');
             assert.equal(err.body.code, 'upgrade_required');
             assert.equal(err.body.upgrade_href, 'https://frinz.example/upgrade');
-            // message still flattens to `detail`-or-fallback for legacy callers
-            assert.match(err.message, /HTTP 403|upgrade/i);
+            // The normalized message now surfaces the actionable envelope text.
+            assert.equal(err.message, 'Session approvals need Premium.');
             return true;
         },
     );
@@ -112,6 +113,84 @@ test('extractUpgradeRequired recognizes the tier-gate envelope', async () => {
     assert.equal(upgrade.currentTier, 'free');
     assert.equal(upgrade.message, 'Session approvals need Premium.');
     assert.equal(upgrade.upgradeHref, 'https://frinz.example/upgrade');
+});
+
+test('extractUpgradeRequired recognizes the canonical nested envelope', async () => {
+    const { extractUpgradeRequired } = await loadHelper();
+    const body = {
+        action: 'session',
+        required_tier: 'premium',
+        current_tier: 'free',
+        upgrade_href: '/upgrade',
+        error: {
+            code: 'upgrade_required',
+            message: 'Canonical upgrade message.',
+            correlation_id: 'support-ref',
+        },
+        detail: 'Canonical upgrade message.',
+    };
+    const err = Object.assign(new Error('Canonical upgrade message.'), {
+        status: 403,
+        code: 'upgrade_required',
+        body,
+    });
+    const upgrade = extractUpgradeRequired(err);
+    assert.ok(upgrade);
+    assert.equal(upgrade.action, 'session');
+    assert.equal(upgrade.requiredTier, 'premium');
+    assert.equal(upgrade.currentTier, 'free');
+    assert.equal(upgrade.message, 'Canonical upgrade message.');
+    assert.equal(upgrade.upgradeHref, '/upgrade');
+});
+
+test('canonical upgrade rendering uses normalized ApiError text and correlation', async () => {
+    const { extractUpgradeRequired, upgradeToastHtml } = await loadHelper();
+    const client = createApiClient({
+        fetchFn: async () => ({
+            ...jsonResponse(403, {
+                error: {
+                    code: 'upgrade_required',
+                    message: '<img src=x onerror=alert(1)> secret=do-not-show',
+                    correlation_id: 'upgrade-support-ref',
+                },
+                required_tier: { hostile: 'object' },
+                upgrade_href: '/upgrade',
+            }),
+            headers: { get: () => null },
+            async text() {
+                return JSON.stringify({
+                    error: {
+                        code: 'upgrade_required',
+                        message: '<img src=x onerror=alert(1)> secret=do-not-show',
+                        correlation_id: 'upgrade-support-ref',
+                    },
+                    required_tier: { hostile: 'object' },
+                    upgrade_href: '/upgrade',
+                });
+            },
+        }),
+        sessionStorage: createStorage(),
+        location: { href: '/', search: '' },
+        logger: createLogger(),
+        authProvider: {
+            async ensureAuthenticated() {},
+            async applyAuth(h) { return h; },
+            async onUnauthorized() { return 'failed'; },
+        },
+    });
+
+    let error;
+    try {
+        await client.request('/api/security/approve');
+    } catch (caught) {
+        error = caught;
+    }
+    const upgrade = extractUpgradeRequired(error);
+    assert.ok(upgrade);
+    assert.equal(upgrade.requiredTier, null);
+    assert.match(upgrade.message, /Reference: upgrade-support-ref/);
+    assert.doesNotMatch(upgrade.message, /<img|do-not-show|\[object Object\]/);
+    assert.doesNotMatch(upgradeToastHtml(upgrade), /<img|do-not-show|\[object Object\]/);
 });
 
 test('extractUpgradeRequired returns null for unrelated errors', async () => {

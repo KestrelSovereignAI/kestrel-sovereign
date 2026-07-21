@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, Toast, Modal, formatBytes, escapeHtml } from './ui.js';
+import { state, Toast, Modal, formatBytes, escapeHtml, renderTextError } from './ui.js';
 
 // ============================================================================
 // Local File Browser
@@ -20,9 +20,7 @@ export async function loadLocalFiles() {
         renderLocalFiles(data);
     } catch (e) {
         const container = document.getElementById('file-browser-container');
-        if (container) {
-            container.innerHTML = `<p style="color: var(--error); padding: 1rem;">Failed to load files: ${e.message}</p>`;
-        }
+        renderTextError(container, `Failed to load files: ${e.message}`);
     }
 }
 

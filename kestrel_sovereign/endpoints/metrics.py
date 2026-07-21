@@ -4,8 +4,8 @@ If prometheus-client is not installed, returns 404 with an informative message.
 """
 
 from fastapi import APIRouter, Response
-from fastapi.responses import JSONResponse
 
+from kestrel_sovereign.api_errors import api_error_response
 from kestrel_sdk.metrics import (
     PROMETHEUS_AVAILABLE,
     generate_metrics,
@@ -23,12 +23,13 @@ async def prometheus_metrics() -> Response:
     installed, or 404 with a helpful message otherwise.
     """
     if not PROMETHEUS_AVAILABLE:
-        return JSONResponse(
+        return api_error_response(
             status_code=404,
-            content={
-                "detail": "Prometheus metrics not available. "
+            code="metrics_unavailable",
+            message=(
+                "Prometheus metrics not available. "
                 "Install with: pip install kestrel_sovereign[observability]"
-            },
+            ),
         )
 
     body = generate_metrics()
