@@ -148,18 +148,37 @@ def _tail(raw: Any) -> str:
 
 
 # Background-task name prefixes for *infrastructure* work that must never
-# hold off an idle restart (#1626). Two shapes both wedged
+# hold off an idle restart (#1626). Three shapes all wedged
 # ``idle_agents_only`` forever by being counted as "busy":
 #   - ``signal_log:`` — fire-and-forget log writes that complete in well
 #     under a second but are minted continuously by heartbeats/scheduler
 #     ticks, so one is almost always alive when the idle check runs.
 #   - ``a2a_question_expiry_sweep`` — an intentionally permanent ``while
 #     True`` maintenance daemon (peers feature) that never completes.
-# Neither is user/signal work; real work (``signal_dispatch:*``) still
+#   - ``a2a_question_supervisor:`` — the sender-side SSE subscription
+#     supervisor spawned by ``send_a2a_question`` (covers both the live
+#     ``a2a_question_supervisor:<recipient>:<task_id>`` name and the
+#     ``a2a_question_supervisor:replay:...`` startup-replay variant). It is
+#     a passive, deadline-bounded wait for a peer's answer, NOT held
+#     cognition: the correlation lives durably in ``pending_a2a_questions``
+#     and the startup replay re-arms an in-flight supervisor (or terminalizes
+#     a past-deadline row) after a restart, so killing one to restart loses
+#     nothing. Counting it wedged ``idle_agents_only`` with a phantom "N
+#     background tasks in flight" that survived restarts while the task store
+#     read empty — an unanswered question during a peer/model outage pinned
+#     the count immortally (#2666). Safe to exclude only BECAUSE the
+#     supervisor is deadline-bounded (it exits at ``timeout_seconds`` and
+#     replay expires past-deadline rows); do not exclude any peer wait that
+#     lacks that guarantee.
+# None is user/signal work; real work (``signal_dispatch:*``) still
 # defers a restart. The name is already stamped on the task at creation —
 # it was just never read here. New long-lived/bookkeeping daemons must be
 # named with a prefix listed here (or excluded from ``_background_tasks``).
-_INFRA_TASK_PREFIXES = ("signal_log:", "a2a_question_expiry_sweep")
+_INFRA_TASK_PREFIXES = (
+    "signal_log:",
+    "a2a_question_expiry_sweep",
+    "a2a_question_supervisor:",
+)
 
 
 def _is_infra_background_task(task) -> bool:
