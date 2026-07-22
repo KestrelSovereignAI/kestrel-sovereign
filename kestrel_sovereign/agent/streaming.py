@@ -1060,7 +1060,10 @@ class StreamingMixin:
         # Start OTEL span for streaming request lifecycle
         _otel_span = start_span("agent.process_input_streaming", {
             OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
-            KESTREL_AGENT_NAME: self.agent_name,
+            # Defensive read — the StreamingMixin can be hosted by a minimal /
+            # duck-typed object with no ``agent_name`` (#2699). ``start_span``
+            # drops the None so telemetry stamping never crashes the turn.
+            KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
             "agent.did": self.did,
             "agent.session_id": session_id or "",
             "agent.input_length": len(user_input),

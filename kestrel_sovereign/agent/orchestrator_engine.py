@@ -1232,7 +1232,12 @@ class OrchestratorEngineMixin:
         try:
             with optional_span("agent.feature_dispatch", {
                 OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
-                KESTREL_AGENT_NAME: self.agent_name,
+                # Read defensively: this mixin can be hosted by a minimal /
+                # duck-typed object with no ``agent_name`` (see the dispatcher
+                # site in #2699). ``optional_span`` drops the None, so telemetry
+                # stamping never turns into a hard dependency that crashes an
+                # otherwise-valid dispatch.
+                KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
                 "feature.name": getattr(feature, "tool_name", feature_name),
                 "tool.source": source,
             }):
@@ -1777,7 +1782,9 @@ class OrchestratorEngineMixin:
             logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
             with optional_span("agent.feature_dispatch", {
                 OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
-                KESTREL_AGENT_NAME: self.agent_name,
+                # Defensive read — minimal mixin hosts may lack ``agent_name``;
+                # ``optional_span`` drops the None (matches the site above).
+                KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
                 "feature.name": f.tool_name,
             }):
                 r = await f.execute_as_subagent(
