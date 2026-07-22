@@ -49,7 +49,12 @@ from kestrel_sovereign.agent.streaming import (
     _build_tool_sentinel,
 )
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
-from kestrel_sovereign.telemetry import optional_span
+from kestrel_sovereign.telemetry import (
+    KESTREL_AGENT_NAME,
+    OI_SPAN_KIND,
+    OI_SPAN_KIND_CHAIN,
+    optional_span,
+)
 
 # These constants are also defined in kestrel_agent.py — import from there at
 # runtime so that env-var overrides are respected.  The mixin accesses them via
@@ -1226,6 +1231,8 @@ class OrchestratorEngineMixin:
         # dispatch outcome.
         try:
             with optional_span("agent.feature_dispatch", {
+                OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+                KESTREL_AGENT_NAME: self.agent_name,
                 "feature.name": getattr(feature, "tool_name", feature_name),
                 "tool.source": source,
             }):
@@ -1768,7 +1775,11 @@ class OrchestratorEngineMixin:
                 context = f"User's original request: {user_message}"
             log_tag = "[STREAM] " if streaming else ""
             logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
-            with optional_span("agent.feature_dispatch", {"feature.name": f.tool_name}):
+            with optional_span("agent.feature_dispatch", {
+                OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+                KESTREL_AGENT_NAME: self.agent_name,
+                "feature.name": f.tool_name,
+            }):
                 r = await f.execute_as_subagent(
                     task=task, context=context, denied_tools=dt, model_override=em,
                 )

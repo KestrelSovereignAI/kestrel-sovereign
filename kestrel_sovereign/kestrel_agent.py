@@ -68,7 +68,12 @@ from kestrel_sovereign.security.input_guardrails import (
     check_prompt_injection,
     append_security_addendum,
 )
-from kestrel_sovereign.telemetry import optional_span
+from kestrel_sovereign.telemetry import (
+    KESTREL_AGENT_NAME,
+    OI_SPAN_KIND,
+    OI_SPAN_KIND_CHAIN,
+    optional_span,
+)
 
 # Optional ollama import (not available in remote-only containers)
 try:
@@ -3537,6 +3542,8 @@ Expected Duration: {expected_duration}
 
             # --- OpenTelemetry span for the full request lifecycle ---
             with optional_span("agent.process_input", {
+                OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+                KESTREL_AGENT_NAME: self.agent_name,
                 "agent.did": self.did,
                 "agent.session_id": session_id or "",
                 "agent.input_length": len(user_input),

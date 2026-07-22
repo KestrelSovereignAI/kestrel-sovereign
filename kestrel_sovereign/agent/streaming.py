@@ -26,7 +26,13 @@ from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
 )
-from kestrel_sovereign.telemetry import start_span, end_span
+from kestrel_sovereign.telemetry import (
+    KESTREL_AGENT_NAME,
+    OI_SPAN_KIND,
+    OI_SPAN_KIND_CHAIN,
+    start_span,
+    end_span,
+)
 
 
 def resolve_turn_invocation_context(
@@ -1053,6 +1059,8 @@ class StreamingMixin:
 
         # Start OTEL span for streaming request lifecycle
         _otel_span = start_span("agent.process_input_streaming", {
+            OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+            KESTREL_AGENT_NAME: self.agent_name,
             "agent.did": self.did,
             "agent.session_id": session_id or "",
             "agent.input_length": len(user_input),
